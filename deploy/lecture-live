@@ -1,0 +1,662 @@
+#!/usr/bin/env bash
+# ============================================================
+# LectureLive 一键管理脚本
+# 安装后可直接在终端输入 lecture-live 使用
+# ============================================================
+set -euo pipefail
+
+VERSION="1.0.0"
+APP_DIR="/opt/lecturelive"
+WS_DIR="/opt/lecturelive/ws-server"
+SRC_DIR="/opt/lecturelive/src"
+BACKUP_DIR="/opt/lecturelive/backups"
+REPO_URL="https://github.com/PLus123456/lecture-live.git"
+WEB_SERVICE="lecturelive-web"
+WS_SERVICE="lecturelive-ws"
+WEB_PORT=3000
+WS_PORT=3001
+
+# ── 颜色定义 ──
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ── 工具函数 ──
+info()  { echo -e "${GREEN}[✓]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
+error() { echo -e "${RED}[✗]${NC} $*"; }
+fatal() { error "$*"; exit 1; }
+step()  { echo -e "${CYAN}[→]${NC} $*"; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] || fatal "此操作需要 root 权限，请使用: sudo lecture-live $*"
+}
+
+# ── 分隔线 ──
+divider() {
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+}
+
+# ── 获取服务状态（带颜色） ──
+service_status_text() {
+    local svc=$1
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo -e "${GREEN}运行中${NC}"
+    elif systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+        echo -e "${YELLOW}已停止${NC}"
+    else
+        echo -e "${DIM}未安装${NC}"
+    fi
+}
+
+# ── 获取服务运行时间 ──
+service_uptime() {
+    local svc=$1
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        local ts
+        ts=$(systemctl show "$svc" --property=ActiveEnterTimestamp --value 2>/dev/null)
+        if [[ -n "$ts" ]]; then
+            local start_epoch now_epoch diff
+            start_epoch=$(date -d "$ts" +%s 2>/dev/null) || return
+            now_epoch=$(date +%s)
+            diff=$((now_epoch - start_epoch))
+            local days=$((diff / 86400))
+            local hours=$(( (diff % 86400) / 3600 ))
+            local mins=$(( (diff % 3600) / 60 ))
+            if [[ $days -gt 0 ]]; then
+                echo "${days}天${hours}时${mins}分"
+            elif [[ $hours -gt 0 ]]; then
+                echo "${hours}时${mins}分"
+            else
+                echo "${mins}分钟"
+            fi
+        fi
+    fi
+}
+
+# ── 获取服务内存占用 ──
+service_memory() {
+    local svc=$1
+    local pid
+    pid=$(systemctl show "$svc" --property=MainPID --value 2>/dev/null)
+    if [[ -n "$pid" && "$pid" != "0" ]]; then
+        local rss
+        rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+        if [[ -n "$rss" ]]; then
+            echo "$((rss / 1024))MB"
+        fi
+    fi
+}
+
+# ══════════════════════════════════════════
+#  命令实现
+# ══════════════════════════════════════════
+
+cmd_start() {
+    need_root start
+    step "启动 LectureLive 服务..."
+    systemctl start "$WEB_SERVICE" "$WS_SERVICE"
+    sleep 2
+    # 检查启动结果
+    local web_ok=false ws_ok=false
+    systemctl is-active --quiet "$WEB_SERVICE" && web_ok=true
+    systemctl is-active --quiet "$WS_SERVICE" && ws_ok=true
+    if $web_ok && $ws_ok; then
+        info "所有服务已启动"
+    else
+        $web_ok || error "Web 服务启动失败"
+        $ws_ok  || error "WebSocket 服务启动失败"
+        echo ""
+        warn "请使用 lecture-live log 查看详细日志"
+    fi
+}
+
+cmd_stop() {
+    need_root stop
+    step "停止 LectureLive 服务..."
+    systemctl stop "$WEB_SERVICE" 2>/dev/null || true
+    systemctl stop "$WS_SERVICE" 2>/dev/null || true
+    info "所有服务已停止"
+}
+
+cmd_restart() {
+    need_root restart
+    step "重启 LectureLive 服务..."
+    systemctl restart "$WEB_SERVICE" "$WS_SERVICE"
+    sleep 2
+    local web_ok=false ws_ok=false
+    systemctl is-active --quiet "$WEB_SERVICE" && web_ok=true
+    systemctl is-active --quiet "$WS_SERVICE" && ws_ok=true
+    if $web_ok && $ws_ok; then
+        info "所有服务已重启"
+    else
+        $web_ok || error "Web 服务重启失败"
+        $ws_ok  || error "WebSocket 服务重启失败"
+        warn "请使用 lecture-live log 查看详细日志"
+    fi
+}
+
+cmd_status() {
+    echo ""
+    echo -e "${BOLD}  LectureLive 服务状态${NC}"
+    divider
+
+    # Web 服务
+    local web_status ws_status
+    web_status=$(service_status_text "$WEB_SERVICE")
+    ws_status=$(service_status_text "$WS_SERVICE")
+    local web_uptime ws_uptime web_mem ws_mem
+    web_uptime=$(service_uptime "$WEB_SERVICE")
+    ws_uptime=$(service_uptime "$WS_SERVICE")
+    web_mem=$(service_memory "$WEB_SERVICE")
+    ws_mem=$(service_memory "$WS_SERVICE")
+
+    printf "  %-14s %b" "Web 服务:" "$web_status"
+    [[ -n "$web_uptime" ]] && printf "  (运行 %s" "$web_uptime" && [[ -n "$web_mem" ]] && printf ", %s" "$web_mem"; printf ")"
+    echo ""
+
+    printf "  %-14s %b" "WebSocket:" "$ws_status"
+    [[ -n "$ws_uptime" ]] && printf "  (运行 %s" "$ws_uptime" && [[ -n "$ws_mem" ]] && printf ", %s" "$ws_mem"; printf ")"
+    echo ""
+
+    divider
+
+    # 端口监听检测
+    local web_listen=false ws_listen=false
+    ss -tlnp 2>/dev/null | grep -q ":${WEB_PORT} " && web_listen=true
+    ss -tlnp 2>/dev/null | grep -q ":${WS_PORT} " && ws_listen=true
+
+    printf "  %-14s" "端口监听:"
+    $web_listen && echo -en " ${GREEN}:${WEB_PORT}${NC}" || echo -en " ${DIM}:${WEB_PORT}${NC}"
+    $ws_listen  && echo -e  " ${GREEN}:${WS_PORT}${NC}" || echo -e  " ${DIM}:${WS_PORT}${NC}"
+
+    # 健康检查
+    printf "  %-14s" "健康检查:"
+    if curl -fsS "http://127.0.0.1:${WEB_PORT}/api/health" >/dev/null 2>&1; then
+        echo -e " ${GREEN}正常${NC}"
+    else
+        echo -e " ${RED}异常${NC}"
+    fi
+
+    # 磁盘使用
+    if [[ -d "$APP_DIR" ]]; then
+        local disk_usage
+        disk_usage=$(du -sh "$APP_DIR" 2>/dev/null | cut -f1)
+        printf "  %-14s %s\n" "磁盘占用:" "$disk_usage"
+    fi
+
+    # 备份数量
+    if [[ -d "$BACKUP_DIR" ]]; then
+        local backup_count
+        backup_count=$(ls "$BACKUP_DIR"/app-*.tar.gz 2>/dev/null | wc -l)
+        printf "  %-14s %s 个\n" "备份数量:" "$backup_count"
+    fi
+
+    divider
+    echo ""
+}
+
+cmd_log() {
+    local service="all"
+    local lines=50
+    local follow=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            web)    service="web"; shift ;;
+            ws)     service="ws"; shift ;;
+            -f)     follow=true; shift ;;
+            -n)     lines="$2"; shift 2 ;;
+            *)      shift ;;
+        esac
+    done
+
+    local journal_args=(-n "$lines" --no-pager)
+    $follow && journal_args+=(-f)
+
+    case "$service" in
+        web)
+            echo -e "${BOLD}  Web 服务日志${NC}"
+            divider
+            journalctl -u "$WEB_SERVICE" "${journal_args[@]}"
+            ;;
+        ws)
+            echo -e "${BOLD}  WebSocket 服务日志${NC}"
+            divider
+            journalctl -u "$WS_SERVICE" "${journal_args[@]}"
+            ;;
+        all)
+            echo -e "${BOLD}  全部服务日志${NC}"
+            divider
+            journalctl -u "$WEB_SERVICE" -u "$WS_SERVICE" "${journal_args[@]}"
+            ;;
+    esac
+}
+
+cmd_update() {
+    need_root update
+
+    # 检测源码目录
+    local src="$SRC_DIR"
+    if [[ ! -d "$src/.git" ]]; then
+        # 尝试常见位置
+        for try_dir in /root/lecture-live /home/*/lecture-live; do
+            if [[ -d "$try_dir/.git" ]]; then
+                src="$try_dir"
+                break
+            fi
+        done
+    fi
+    [[ -d "$src/.git" ]] || fatal "未找到源码目录，请先使用 lecture-live install 安装"
+
+    echo ""
+    echo -e "${BOLD}  LectureLive 更新${NC}"
+    divider
+
+    step "拉取最新代码..."
+    (cd "$src" && git pull --ff-only)
+
+    step "执行升级流程..."
+    bash "$src/deploy/upgrade.sh"
+}
+
+cmd_install() {
+    need_root install
+
+    echo ""
+    echo -e "${BOLD}  LectureLive 安装${NC}"
+    divider
+
+    # 检查依赖
+    for cmd in node npm git; do
+        if ! command -v "$cmd" &>/dev/null; then
+            fatal "缺少必要工具: $cmd，请先安装"
+        fi
+    done
+    info "依赖检查通过"
+
+    # 克隆源码
+    if [[ ! -d "$SRC_DIR" ]]; then
+        step "克隆仓库..."
+        git clone "$REPO_URL" "$SRC_DIR"
+    else
+        step "源码目录已存在，拉取更新..."
+        (cd "$SRC_DIR" && git pull --ff-only)
+    fi
+
+    # 安装依赖
+    step "安装依赖..."
+    (cd "$SRC_DIR" && npm ci)
+
+    # 配置环境变量
+    if [[ ! -f "$APP_DIR/.env" ]]; then
+        if [[ -f "$SRC_DIR/.env.example" ]]; then
+            cp "$SRC_DIR/.env.example" "$APP_DIR/.env"
+            warn "已创建 .env 配置文件，请编辑: $APP_DIR/.env"
+            warn "编辑完成后运行: sudo lecture-live update"
+            echo ""
+            return
+        elif [[ -f "$SRC_DIR/.env.local" ]]; then
+            cp "$SRC_DIR/.env.local" "$APP_DIR/.env"
+            warn "已从 .env.local 复制配置，请检查生产环境值"
+        fi
+    fi
+
+    # 编译 + 部署
+    step "编译项目..."
+    (cd "$SRC_DIR" && npm run build && npm run build:ws)
+
+    step "部署服务..."
+    bash "$SRC_DIR/deploy/install.sh"
+
+    # 安装管理脚本自身
+    _install_self "$SRC_DIR"
+
+    echo ""
+    info "安装完成！"
+    echo ""
+    echo "  使用 lecture-live 管理系统"
+    echo "  Web:       http://127.0.0.1:${WEB_PORT}"
+    echo "  WebSocket: http://127.0.0.1:${WS_PORT}"
+    echo ""
+}
+
+cmd_uninstall() {
+    need_root uninstall
+
+    echo ""
+    echo -e "${BOLD}${RED}  LectureLive 卸载${NC}"
+    divider
+    warn "此操作将停止服务并删除程序文件"
+    warn "数据目录 $APP_DIR/data 和 .env 将被保留"
+    echo ""
+    read -rp "  确认卸载? 输入 YES 继续: " confirm
+    [[ "$confirm" == "YES" ]] || { echo "  已取消"; exit 0; }
+    echo ""
+
+    step "停止服务..."
+    systemctl stop "$WEB_SERVICE" 2>/dev/null || true
+    systemctl stop "$WS_SERVICE" 2>/dev/null || true
+    systemctl disable "$WEB_SERVICE" 2>/dev/null || true
+    systemctl disable "$WS_SERVICE" 2>/dev/null || true
+
+    step "移除 systemd 服务文件..."
+    rm -f /etc/systemd/system/lecturelive-web.service
+    rm -f /etc/systemd/system/lecturelive-ws.service
+    systemctl daemon-reload
+
+    step "清理程序文件（保留数据和配置）..."
+    # 保留 data、.env、backups、src
+    find "$APP_DIR" -mindepth 1 -maxdepth 1 \
+        ! -name "data" ! -name ".env" ! -name "backups" ! -name "src" \
+        -exec rm -rf {} +
+
+    info "卸载完成"
+    echo ""
+    echo "  保留的内容:"
+    echo "    数据:   $APP_DIR/data"
+    echo "    配置:   $APP_DIR/.env"
+    echo "    备份:   $APP_DIR/backups"
+    echo "    源码:   $SRC_DIR"
+    echo ""
+    echo "  如需完全删除: sudo rm -rf $APP_DIR"
+    echo "  如需删除管理命令: sudo rm /usr/local/bin/lecture-live"
+    echo ""
+}
+
+cmd_rollback() {
+    need_root rollback
+
+    echo ""
+    echo -e "${BOLD}  LectureLive 回滚${NC}"
+    divider
+
+    # 列出可用备份
+    if [[ ! -d "$BACKUP_DIR" ]] || ! ls "$BACKUP_DIR"/app-*.tar.gz &>/dev/null; then
+        fatal "没有可用的备份文件"
+    fi
+
+    echo "  可用备份:"
+    echo ""
+    local i=1
+    local -a backups=()
+    while IFS= read -r f; do
+        backups+=("$f")
+        local fname size
+        fname=$(basename "$f")
+        size=$(du -h "$f" | cut -f1)
+        # 从文件名中提取时间
+        local ts
+        ts=$(echo "$fname" | sed 's/app-\([0-9]*\)_\([0-9]*\).*/\1 \2/' | sed 's/\(....\)\(..\)\(..\) \(..\)\(..\)\(..\)/\1-\2-\3 \4:\5:\6/')
+        printf "    ${CYAN}%d${NC}) %s  (%s)  %s\n" "$i" "$fname" "$size" "$ts"
+        ((i++))
+    done < <(ls -t "$BACKUP_DIR"/app-*.tar.gz)
+
+    echo ""
+    read -rp "  选择备份编号 [1]: " choice
+    choice=${choice:-1}
+
+    if [[ $choice -lt 1 || $choice -gt ${#backups[@]} ]]; then
+        fatal "无效的选择"
+    fi
+
+    local selected="${backups[$((choice-1))]}"
+    echo ""
+    bash "$(dirname "$(readlink -f "$0")")/rollback-wrapper.sh" "$selected" 2>/dev/null \
+        || bash -c "
+            set -euo pipefail
+            echo -e '${CYAN}[→]${NC} 停止服务...'
+            systemctl stop $WEB_SERVICE 2>/dev/null || true
+            systemctl stop $WS_SERVICE 2>/dev/null || true
+            echo -e '${CYAN}[→]${NC} 恢复备份...'
+            find $APP_DIR -mindepth 1 -maxdepth 1 \
+                ! -name data ! -name .env ! -name backups \
+                -exec rm -rf {} +
+            tar xzf '$selected' -C $APP_DIR
+            chown -R lecturelive:lecturelive $APP_DIR
+            chmod 600 $APP_DIR/.env
+            [[ -d $WS_DIR ]] && ln -sfn $APP_DIR/data $WS_DIR/data && ln -sfn $APP_DIR/.env $WS_DIR/.env
+            echo -e '${CYAN}[→]${NC} 启动服务...'
+            systemctl start $WEB_SERVICE $WS_SERVICE
+            sleep 2
+            echo -e '${GREEN}[✓]${NC} 回滚完成'
+        "
+}
+
+cmd_env() {
+    local env_file="$APP_DIR/.env"
+    if [[ ! -f "$env_file" ]]; then
+        fatal ".env 文件不存在: $env_file"
+    fi
+
+    if [[ "${1:-}" == "edit" ]]; then
+        need_root "env edit"
+        ${EDITOR:-nano} "$env_file"
+        echo ""
+        warn "修改 .env 后需要重启服务才能生效"
+        read -rp "  立即重启? [y/N] " confirm
+        [[ "$confirm" =~ ^[yY]$ ]] && cmd_restart
+    else
+        echo ""
+        echo -e "${BOLD}  环境配置${NC} ${DIM}($env_file)${NC}"
+        divider
+        # 脱敏显示
+        while IFS= read -r line; do
+            # 跳过空行和注释
+            [[ -z "$line" || "$line" =~ ^# ]] && echo "  $line" && continue
+            # 对值做脱敏
+            local key val
+            key="${line%%=*}"
+            val="${line#*=}"
+            # 敏感字段脱敏
+            if echo "$key" | grep -qiE '(password|secret|key|token)'; then
+                echo -e "  ${key}=${DIM}********${NC}"
+            else
+                echo "  $line"
+            fi
+        done < "$env_file"
+        divider
+        echo -e "  ${DIM}提示: lecture-live env edit 可编辑配置${NC}"
+        echo ""
+    fi
+}
+
+cmd_self_install() {
+    need_root "self-install"
+    local script_path
+    script_path="$(readlink -f "$0")"
+    _install_self "$(dirname "$(dirname "$script_path")")"
+}
+
+_install_self() {
+    local src_dir="${1:-}"
+    local target="/usr/local/bin/lecture-live"
+    local script_src
+
+    # 优先从源码 deploy 目录复制
+    if [[ -n "$src_dir" && -f "$src_dir/deploy/lecture-live" ]]; then
+        script_src="$src_dir/deploy/lecture-live"
+    elif [[ -f "$APP_DIR/src/deploy/lecture-live" ]]; then
+        script_src="$APP_DIR/src/deploy/lecture-live"
+    else
+        # 如果找不到源文件，就复制自身
+        script_src="$(readlink -f "$0")"
+    fi
+
+    cp "$script_src" "$target"
+    chmod +x "$target"
+    info "管理命令已安装到 $target"
+}
+
+# ══════════════════════════════════════════
+#  交互式菜单
+# ══════════════════════════════════════════
+
+show_menu() {
+    clear
+    echo ""
+    echo -e "${BOLD}${BLUE}  ╔═══════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${BLUE}  ║     LectureLive 管理面板 v${VERSION}    ║${NC}"
+    echo -e "${BOLD}${BLUE}  ╚═══════════════════════════════════╝${NC}"
+    echo ""
+
+    # 快速状态概览
+    local web_st ws_st
+    web_st=$(service_status_text "$WEB_SERVICE")
+    ws_st=$(service_status_text "$WS_SERVICE")
+    echo -e "  当前状态:  Web ${web_st}  │  WebSocket ${ws_st}"
+    echo ""
+    divider
+    echo ""
+    echo -e "  ${BOLD}服务管理${NC}"
+    echo -e "    ${CYAN}1${NC}) 启动服务         ${CYAN}2${NC}) 停止服务"
+    echo -e "    ${CYAN}3${NC}) 重启服务         ${CYAN}4${NC}) 查看状态"
+    echo ""
+    echo -e "  ${BOLD}运维操作${NC}"
+    echo -e "    ${CYAN}5${NC}) 更新系统         ${CYAN}6${NC}) 回滚版本"
+    echo -e "    ${CYAN}7${NC}) 安装系统         ${CYAN}8${NC}) 卸载系统"
+    echo ""
+    echo -e "  ${BOLD}日志与配置${NC}"
+    echo -e "    ${CYAN}9${NC}) 查看日志         ${CYAN}10${NC}) 实时日志"
+    echo -e "    ${CYAN}11${NC}) 查看配置        ${CYAN}12${NC}) 编辑配置"
+    echo ""
+    divider
+    echo -e "    ${CYAN}0${NC}) 退出"
+    echo ""
+}
+
+interactive_log_menu() {
+    echo ""
+    echo -e "  查看哪个服务的日志?"
+    echo -e "    ${CYAN}1${NC}) 全部       ${CYAN}2${NC}) Web       ${CYAN}3${NC}) WebSocket"
+    echo ""
+    read -rp "  请选择 [1]: " log_choice
+    log_choice=${log_choice:-1}
+    case "$log_choice" in
+        1) cmd_log ;;
+        2) cmd_log web ;;
+        3) cmd_log ws ;;
+        *) warn "无效选择" ;;
+    esac
+}
+
+interactive_log_follow() {
+    echo ""
+    echo -e "  实时跟踪哪个服务?"
+    echo -e "    ${CYAN}1${NC}) 全部       ${CYAN}2${NC}) Web       ${CYAN}3${NC}) WebSocket"
+    echo ""
+    read -rp "  请选择 [1]: " log_choice
+    log_choice=${log_choice:-1}
+    case "$log_choice" in
+        1) cmd_log -f ;;
+        2) cmd_log web -f ;;
+        3) cmd_log ws -f ;;
+        *) warn "无效选择" ;;
+    esac
+}
+
+run_interactive() {
+    while true; do
+        show_menu
+        read -rp "  请输入编号: " choice
+        echo ""
+        case "$choice" in
+            1)  cmd_start ;;
+            2)  cmd_stop ;;
+            3)  cmd_restart ;;
+            4)  cmd_status ;;
+            5)  cmd_update ;;
+            6)  cmd_rollback ;;
+            7)  cmd_install ;;
+            8)  cmd_uninstall ;;
+            9)  interactive_log_menu ;;
+            10) interactive_log_follow ;;
+            11) cmd_env ;;
+            12) cmd_env edit ;;
+            0|q|Q|exit) echo "  再见！"; exit 0 ;;
+            *)  warn "无效选择，请重试" ;;
+        esac
+        echo ""
+        read -rp "  按 Enter 返回菜单..." _
+    done
+}
+
+# ══════════════════════════════════════════
+#  帮助信息
+# ══════════════════════════════════════════
+
+show_help() {
+    echo ""
+    echo -e "${BOLD}LectureLive 管理工具 v${VERSION}${NC}"
+    echo ""
+    echo "用法: lecture-live [命令] [选项]"
+    echo ""
+    echo "  不带参数运行将进入交互式菜单"
+    echo ""
+    echo "命令:"
+    echo "  start              启动所有服务"
+    echo "  stop               停止所有服务"
+    echo "  restart             重启所有服务"
+    echo "  status              查看服务状态"
+    echo "  log [web|ws] [-f]  查看日志 (-f 实时跟踪)"
+    echo "  update              从 GitHub 更新到最新版"
+    echo "  install             全新安装系统"
+    echo "  uninstall           卸载系统（保留数据）"
+    echo "  rollback            回滚到之前的版本"
+    echo "  env                 查看环境配置（脱敏）"
+    echo "  env edit            编辑环境配置"
+    echo "  self-install        将此脚本安装到 /usr/local/bin"
+    echo "  help                显示此帮助信息"
+    echo ""
+    echo "示例:"
+    echo "  sudo lecture-live start        # 启动服务"
+    echo "  sudo lecture-live restart      # 重启服务"
+    echo "  lecture-live status             # 查看状态"
+    echo "  lecture-live log -f             # 实时日志"
+    echo "  lecture-live log web -n 100     # 查看 Web 最近 100 行日志"
+    echo "  sudo lecture-live update       # 更新系统"
+    echo ""
+}
+
+# ══════════════════════════════════════════
+#  入口
+# ══════════════════════════════════════════
+
+main() {
+    # 无参数：交互式菜单
+    if [[ $# -eq 0 ]]; then
+        run_interactive
+        return
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        start)        cmd_start "$@" ;;
+        stop)         cmd_stop "$@" ;;
+        restart)      cmd_restart "$@" ;;
+        status)       cmd_status "$@" ;;
+        log|logs)     cmd_log "$@" ;;
+        update|upgrade) cmd_update "$@" ;;
+        install)      cmd_install "$@" ;;
+        uninstall)    cmd_uninstall "$@" ;;
+        rollback)     cmd_rollback "$@" ;;
+        env)          cmd_env "$@" ;;
+        self-install) cmd_self_install "$@" ;;
+        help|-h|--help) show_help ;;
+        version|-v|--version) echo "lecture-live v${VERSION}" ;;
+        *)
+            error "未知命令: $cmd"
+            echo "  运行 lecture-live help 查看可用命令"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

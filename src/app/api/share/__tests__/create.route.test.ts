@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createJsonRequest, readJson } from '../../../../../tests/utils/http';
 
 const {
@@ -45,6 +45,10 @@ vi.mock('@/lib/prisma', () => ({
 }));
 
 import { DELETE, GET, POST } from '@/app/api/share/create/route';
+
+beforeAll(() => {
+  process.env.NEXT_PUBLIC_APP_URL = 'http://localhost:3000';
+});
 
 describe('/api/share/create route', () => {
   beforeEach(() => {

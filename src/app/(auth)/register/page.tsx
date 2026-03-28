@@ -6,6 +6,7 @@ import Link from 'next/link';
 import { useAuth } from '@/hooks/useAuth';
 import { BookOpen, Loader2 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
+import DOMPurify from 'dompurify';
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -177,7 +178,7 @@ export default function RegisterPage() {
       {footerCode && (
         <div
           className="w-full max-w-sm py-4 text-center text-xs text-charcoal-400"
-          dangerouslySetInnerHTML={{ __html: footerCode }}
+          dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(footerCode) }}
         />
       )}
     </div>

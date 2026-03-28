@@ -127,9 +127,16 @@ const nextConfig = {
 
     if (!dev && !isServer) {
       // Transformers.js 的预编译 bundle 会导致 Terser 解析失败。
-      // TODO [M25]: 当 Transformers.js 修复 Terser 兼容性后，移除此行，
-      //   改用 minimizer exclude 仅排除该模块，避免全量禁用压缩暴露源码。
-      config.optimization.minimize = false;
+      // 这里通过排查并为压缩插件设置 exclude 的方法，避免全量禁用压缩暴露源码。
+      config.optimization.minimize = true;
+      if (Array.isArray(config.optimization.minimizer)) {
+        config.optimization.minimizer.forEach((minimizer) => {
+          if (minimizer) {
+            minimizer.options = minimizer.options || {};
+            minimizer.options.exclude = /@huggingface[\\/]transformers|onnxruntime-web/;
+          }
+        });
+      }
     }
 
     return config;

@@ -1,0 +1,240 @@
+// prisma/schema.prisma
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum UserRole {
+  ADMIN
+  PRO
+  FREE
+}
+
+enum SessionStatus {
+  CREATED       // 刚创建，未开始录音
+  RECORDING     // 录音中
+  PAUSED        // 暂停
+  FINALIZING    // 正在结束
+  COMPLETED     // 已完成，文件已保存
+  ARCHIVED      // 归档
+}
+
+model User {
+  id                  String    @id @default(cuid())
+  email               String    @unique
+  passwordHash        String
+  displayName         String
+  avatarPath          String?                     // 头像路径
+  role                UserRole  @default(FREE)
+  status              Int       @default(1)       // 用户状态：1=正常, 0=禁用
+  points              Int       @default(0)       // 积分
+  originalRole        UserRole?                   // 原始用户组（购买到期后回退至此）
+  roleExpiresAt       DateTime?                   // 用户组过期日期，null=永久有效
+  tokenVersion        Int       @default(0)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  // 配额
+  transcriptionMinutesUsed    Int     @default(0)
+  transcriptionMinutesLimit   Int     @default(60)     // FREE=60min/月, PRO=600, ADMIN=unlimited
+  quotaResetAt                DateTime?
+  storageHoursUsed            Float   @default(0)
+  storageHoursLimit           Float   @default(10)     // FREE=10h录音, PRO=100h, ADMIN=unlimited
+  allowedModels               String  @default("local") // 逗号分隔: "local,gpt,claude,deepseek"
+
+  sessions    Session[]
+  shareLinks  ShareLink[]
+}
+
+model Session {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id])
+  title           String
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  durationMs      Int       @default(0)
+  status          SessionStatus @default(CREATED)
+  serverStartedAt DateTime?
+  serverPausedMs  Int       @default(0)
+  serverPausedAt  DateTime?
+  finalizeLockedAt DateTime?
+
+  // v2.1: 音频源 & 区域
+  audioSource     String    @default("microphone")  // "microphone" | "system_audio"
+  sonioxRegion    String    @default("auto")        // "us" | "eu" | "jp" | "auto"
+
+  // Cloudreve 存储路径
+  recordingPath   String?   // e.g., "/{userId}/recordings/{sessionId}.webm"
+  transcriptPath  String?   // e.g., "/{userId}/transcripts/{sessionId}.json"
+  summaryPath     String?   // e.g., "/{userId}/summaries/{sessionId}.json"
+  reportPath      String?   // e.g., "/{userId}/reports/{sessionId}.json"
+
+  // 元数据
+  courseName      String?
+  sourceLang      String    @default("en")
+  targetLang      String    @default("zh")
+  llmProvider     String    @default("claude")
+
+  shareLinks      ShareLink[]
+  folders         FolderSession[]
+
+  @@index([userId])
+}
+
+model Folder {
+  id          String    @id @default(cuid())
+  userId      String
+  name        String
+  parentId    String?
+  parent      Folder?   @relation("FolderTree", fields: [parentId], references: [id])
+  children    Folder[]  @relation("FolderTree")
+  sessions    FolderSession[]
+  keywordPool FolderKeyword[]
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@index([parentId])
+}
+
+model FolderKeyword {
+  id          String   @id @default(cuid())
+  folderId    String
+  folder      Folder   @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  keyword     String
+  source      String   // "auto:{sessionId}" | "manual" | "file:{fileName}"
+  confidence  Float    @default(1.0)   // LLM 给的重要度评分 0-1
+  usageCount  Int      @default(0)     // 被多少个 session 使用过
+  createdAt   DateTime @default(now())
+
+  @@unique([folderId, keyword]) // 同文件夹内不重复
+  @@index([folderId])
+}
+
+model FolderSession {
+  folderId  String
+  folder    Folder  @relation(fields: [folderId], references: [id])
+  sessionId String
+  session   Session @relation(fields: [sessionId], references: [id])
+
+  @@id([folderId, sessionId])
+  @@index([sessionId])
+}
+
+model ShareLink {
+  id          String    @id @default(cuid())
+  sessionId   String
+  session     Session   @relation(fields: [sessionId], references: [id])
+  createdBy   String
+  creator     User      @relation(fields: [createdBy], references: [id])
+  token       String    @unique @default(cuid())  // 分享链接 token
+  isLive      Boolean   @default(false)            // 是否实时分享
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([sessionId])
+  @@index([createdBy])
+}
+
+// ─── 审计日志 ───
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String                           // 操作类型，如 "user.login", "admin.settings.update"
+  detail    String?  @db.Text               // 操作详情（JSON 或纯文本）
+  userId    String?                          // 操作者用户 ID（系统事件无用户）
+  userName  String?                          // 操作者显示名称（冗余存储，用户删除后仍可显示）
+  ip        String?                          // 客户端 IP 地址
+  createdAt DateTime @default(now())
+
+  @@index([action])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// ─── 对账运行记录 ───
+model ReconciliationRun {
+  id              String   @id @default(cuid())
+  triggeredBy     String                          // 触发者用户 ID
+  triggeredByName String?                         // 触发者显示名称
+  status          String   @default("running")    // "running" | "completed" | "failed"
+  totalUsers      Int      @default(0)
+  mismatchCount   Int      @default(0)
+  fixedCount      Int      @default(0)
+  errorMessage    String?  @db.Text
+  createdAt       DateTime @default(now())
+  completedAt     DateTime?
+
+  mismatches      ReconciliationMismatch[]
+
+  @@index([createdAt])
+}
+
+// ─── 对账差异明细 ───
+model ReconciliationMismatch {
+  id              String   @id @default(cuid())
+  runId           String
+  run             ReconciliationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  userId          String
+  userEmail       String
+  recordedMinutes Int                              // 从 session 计算的实际用量
+  storedMinutes   Int                              // user.transcriptionMinutesUsed 的值
+  driftMinutes    Int                              // recordedMinutes - storedMinutes
+  fixed           Boolean  @default(false)
+  fixedAt         DateTime?
+  fixedBy         String?                          // 修复者用户 ID
+
+  @@index([runId])
+  @@index([userId])
+}
+
+// ─── 站点设置（Key-Value 存储） ───
+model SiteSetting {
+  key       String   @id          // 如 "site_name", "site_url", "logo_path" 等
+  value     String   @db.Text     // JSON 或纯文本值
+  updatedAt DateTime @updatedAt
+}
+
+// ─── LLM 供应商配置 ───
+model LlmProvider {
+  id          String     @id @default(cuid())
+  name        String                           // 显示名称，如 "OpenAI 主力"
+  apiKey      String     @db.Text              // API 密钥
+  apiBase     String                           // API 地址，如 "https://api.openai.com"
+  isAnthropic Boolean    @default(false)       // 是否使用 Anthropic 原生 API
+  sortOrder   Int        @default(0)           // 排序
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  models      LlmModel[]
+}
+
+// ─── LLM 模型配置（一个供应商可有多个模型） ───
+enum LlmPurpose {
+  CHAT                // 对话
+  REALTIME_SUMMARY    // 实时摘要
+  FINAL_SUMMARY       // 最终摘要
+  KEYWORD_EXTRACTION  // 关键词提取
+}
+
+model LlmModel {
+  id            String      @id @default(cuid())
+  providerId    String
+  provider      LlmProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  modelId       String                          // 模型标识，如 "gpt-4o", "claude-sonnet-4-6"
+  displayName   String                          // 显示名称
+  thinkingDepth String      @default("medium")  // "low" | "medium" | "high"
+  maxTokens     Int         @default(4096)
+  temperature   Float       @default(0.3)
+  purpose       LlmPurpose  @default(CHAT)      // 用途
+  isDefault     Boolean     @default(false)      // 该用途下的默认模型
+  sortOrder     Int         @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([providerId])
+  @@index([purpose])
+}

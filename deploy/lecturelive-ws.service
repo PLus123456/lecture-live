@@ -1,0 +1,28 @@
+[Unit]
+Description=LectureLive WebSocket Server
+After=network.target mysql.service redis.service
+Wants=mysql.service redis.service
+
+[Service]
+Type=simple
+User=lecturelive
+Group=lecturelive
+WorkingDirectory=/opt/lecturelive/ws-server
+# 使用 node --env-file 加载 .env（正确处理引号），不用 EnvironmentFile
+# websocket.js 是 esbuild 编译的产物，不再依赖 ts-node
+ExecStart=/usr/bin/node --env-file=/opt/lecturelive/.env websocket.js
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lecturelive-ws
+
+# 安全加固
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

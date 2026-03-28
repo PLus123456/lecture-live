@@ -1,0 +1,27 @@
+[Unit]
+Description=LectureLive Next.js Web Server
+After=network.target mysql.service redis.service
+Wants=mysql.service redis.service
+
+[Service]
+Type=simple
+User=lecturelive
+Group=lecturelive
+WorkingDirectory=/opt/lecturelive
+# 使用 node --env-file 加载 .env（正确处理引号），不用 EnvironmentFile
+ExecStart=/usr/bin/node --env-file=/opt/lecturelive/.env server.js
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lecturelive-web
+
+# 安全加固
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

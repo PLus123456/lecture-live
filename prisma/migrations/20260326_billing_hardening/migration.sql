@@ -1,0 +1,8 @@
+ALTER TABLE `User`
+  ADD COLUMN `quotaResetAt` DATETIME(3) NULL;
+
+ALTER TABLE `Session`
+  ADD COLUMN `serverStartedAt` DATETIME(3) NULL,
+  ADD COLUMN `serverPausedMs` INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN `serverPausedAt` DATETIME(3) NULL,
+  ADD COLUMN `finalizeLockedAt` DATETIME(3) NULL;

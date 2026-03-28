@@ -147,12 +147,12 @@ export default function UserSettingsModal() {
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* 背景遮罩 */}
       <div
-        className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+        className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-backdrop-enter"
         onClick={() => setOpen(false)}
       />
 
       {/* 弹窗主体 */}
-      <div className="relative bg-cream-50 rounded-2xl shadow-2xl border border-cream-200 w-full max-w-2xl max-h-[85vh] overflow-hidden flex flex-col mx-4">
+      <div className="relative bg-cream-50 rounded-2xl shadow-2xl border border-cream-200 w-full max-w-2xl max-h-[85vh] overflow-hidden flex flex-col mx-4 animate-modal-enter">
         {/* 标题栏 */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 bg-white flex-shrink-0">
           <h2 className="font-serif text-lg font-bold text-charcoal-800">Settings</h2>

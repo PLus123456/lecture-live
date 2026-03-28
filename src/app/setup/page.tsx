@@ -4,10 +4,11 @@ import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/stores/authStore';
 import {
-  BookOpen, Database, UserCog, Brain, Radio,
+  Database, UserCog, Brain, Radio,
   CheckCircle2, ChevronRight, ChevronLeft,
   Loader2, AlertCircle, Eye, EyeOff, Plus, Trash2,
 } from 'lucide-react';
+import SiteLogo from '@/components/SiteLogo';
 
 /* ------------------------------------------------------------------ */
 /*  类型定义                                                           */
@@ -378,8 +379,8 @@ export default function SetupPage() {
       <div className="max-w-2xl mx-auto">
         {/* Header */}
         <div className="text-center mb-8">
-          <div className="w-14 h-14 bg-rust-500 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg">
-            <BookOpen className="w-7 h-7 text-white" />
+          <div className="mx-auto mb-4">
+            <SiteLogo size="w-14 h-14" iconSize="w-7 h-7" className="rounded-2xl shadow-lg" />
           </div>
           <h1 className="font-serif text-3xl font-bold text-charcoal-800">
             LectureLive

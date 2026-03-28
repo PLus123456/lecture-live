@@ -29,6 +29,7 @@ interface SessionItem {
   serverStartedAt?: string | null;
   serverPausedMs?: number;
   serverPausedAt?: string | null;
+  folders?: { folder: { id: string; name: string } }[];
 }
 
 interface FolderItem {
@@ -222,7 +223,7 @@ export default function HomePage() {
         <div className={`flex-shrink-0 ${isMobile ? 'px-4 pt-5 pb-2' : 'px-8 lg:px-12 pt-8 lg:pt-10 pb-2'}`}>
           {/* 问候语 + New Session 按钮 */}
           <div className={`mb-6 ${isMobile ? 'flex flex-col gap-4' : 'flex items-start justify-between'}`}>
-            <div>
+            <div className="animate-fade-in-up">
               <div className="flex items-center gap-2 mb-1">
                 <Sparkles className="w-5 h-5 text-rust-400" />
                 <span className="text-xs font-medium text-rust-400 tracking-wider uppercase">
@@ -250,7 +251,8 @@ export default function HomePage() {
                          bg-gradient-to-r from-rust-500 to-rust-600 text-white rounded-xl
                          hover:from-rust-600 hover:to-rust-700 active:scale-[0.97]
                          transition-all duration-200
-                         shadow-lg shadow-rust-500/20 hover:shadow-xl hover:shadow-rust-500/30 ${
+                         shadow-lg shadow-rust-500/20 hover:shadow-xl hover:shadow-rust-500/30
+                         animate-fade-in-up stagger-2 ${
                            isMobile ? 'w-full justify-center px-4 py-3' : 'px-5 py-3'
                          }`}
             >
@@ -312,8 +314,8 @@ export default function HomePage() {
               ))}
             </div>
           ) : filteredSessions.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full py-12">
-              <div className="w-16 h-16 rounded-2xl bg-cream-200/50 flex items-center justify-center mb-4">
+            <div className="flex flex-col items-center justify-center h-full py-12 animate-fade-in-up">
+              <div className="w-16 h-16 rounded-2xl bg-cream-200/50 flex items-center justify-center mb-4 animate-breathe">
                 <FileText className="w-7 h-7 text-charcoal-300" />
               </div>
               <p className="text-sm font-medium text-charcoal-500 mb-1">No sessions yet</p>
@@ -323,16 +325,18 @@ export default function HomePage() {
             </div>
           ) : (
             <div className="py-1">
-              {filteredSessions.map((s) => (
+              {filteredSessions.map((s, index) => (
                 <Link
                   key={s.id}
                   href={getSessionHref(s)}
                   className={`group flex items-center gap-4 rounded-xl
-                             hover:bg-white hover:shadow-sm
+                             hover:bg-white hover:shadow-sm card-hover-lift
                              transition-all duration-200 ease-out
-                             border border-transparent hover:border-cream-200 ${
+                             border border-transparent hover:border-cream-200
+                             animate-list-item-in ${
                                isMobile ? 'min-h-[72px] px-4 py-4' : 'py-3.5 px-3 -mx-3'
                              }`}
+                  style={{ animationDelay: `${Math.min(index * 0.05, 0.5)}s` }}
                 >
                   {/* 状态指示点 */}
                   <div className="flex-shrink-0 flex flex-col items-center gap-1">
@@ -352,9 +356,12 @@ export default function HomePage() {
                         <Clock className="w-3 h-3" />
                         {formatDuration(getEffectiveDurationMs(s))}
                       </span>
-                      <span className="inline-block px-2 py-0.5 rounded-md bg-cream-100 border border-cream-200 text-charcoal-500 text-[10px] uppercase tracking-wide">
-                        {s.courseName || 'Lecture'}
-                      </span>
+                      {s.folders && s.folders.length > 0 && (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-cream-100 border border-cream-200 text-charcoal-500 text-[10px] uppercase tracking-wide">
+                          <FolderOpen className="w-2.5 h-2.5" />
+                          {s.folders[0].folder.name}
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -369,7 +376,7 @@ export default function HomePage() {
         {/* 底部统计栏 — 永远显示 */}
         <div className={`flex-shrink-0 border-t border-cream-200/80 bg-white/50 backdrop-blur-sm ${isMobile ? 'px-4 py-3' : 'px-8 lg:px-12 py-4'}`}>
           <div className={`${isMobile ? 'flex items-center justify-between gap-3' : 'grid grid-cols-3 gap-4'}`}>
-            <div className="flex items-center gap-3 group/stat">
+            <div className="flex items-center gap-3 group/stat animate-count-up stagger-1">
               <div className="w-9 h-9 rounded-xl bg-rust-50 flex items-center justify-center group-hover/stat:bg-rust-100 transition-colors">
                 <BarChart3 className="w-4 h-4 text-rust-500" />
               </div>
@@ -382,7 +389,7 @@ export default function HomePage() {
                 </div>
               </div>
             </div>
-            <div className="flex items-center gap-3 group/stat">
+            <div className="flex items-center gap-3 group/stat animate-count-up stagger-2">
               <div className="w-9 h-9 rounded-xl bg-rust-50 flex items-center justify-center group-hover/stat:bg-rust-100 transition-colors">
                 <Clock className="w-4 h-4 text-rust-500" />
               </div>
@@ -395,7 +402,7 @@ export default function HomePage() {
                 </div>
               </div>
             </div>
-            <div className="flex items-center gap-3 group/stat">
+            <div className="flex items-center gap-3 group/stat animate-count-up stagger-3">
               <div className="w-9 h-9 rounded-xl bg-rust-50 flex items-center justify-center group-hover/stat:bg-rust-100 transition-colors">
                 <FolderOpen className="w-4 h-4 text-rust-500" />
               </div>

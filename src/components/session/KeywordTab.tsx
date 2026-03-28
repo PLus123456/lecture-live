@@ -144,8 +144,8 @@ export default function KeywordTab({
       {/* Keyword list */}
       <div className="flex-1 overflow-y-auto px-4 py-3">
         {keywords.length === 0 ? (
-          <div className="text-center py-6 text-charcoal-300">
-            <Tag className="w-6 h-6 mx-auto mb-2 opacity-50" />
+          <div className="text-center py-6 text-charcoal-300 animate-fade-in-up">
+            <Tag className="w-6 h-6 mx-auto mb-2 opacity-50 animate-breathe" />
             <p className="text-[11px]">No keywords yet</p>
             <p className="text-[10px] mt-1">
               Add manually or upload a file to extract
@@ -153,15 +153,17 @@ export default function KeywordTab({
           </div>
         ) : (
           <div className="flex flex-wrap gap-1.5">
-            {keywords.map((kw) => (
+            {keywords.map((kw, index) => (
               <span
                 key={kw.text}
                 className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] border cursor-pointer
+                  animate-tag-pop transition-all duration-200
                   ${
                     kw.active
-                      ? 'bg-rust-50 text-rust-700 border-rust-200'
-                      : 'bg-cream-50 text-charcoal-400 border-cream-200 line-through'
+                      ? 'bg-rust-50 text-rust-700 border-rust-200 hover:bg-rust-100'
+                      : 'bg-cream-50 text-charcoal-400 border-cream-200 line-through hover:bg-cream-100'
                   }`}
+                style={{ animationDelay: `${Math.min(index * 0.03, 0.3)}s` }}
                 onClick={() => toggleKeyword(kw.text)}
               >
                 <span>{sourceIcon(kw.source)}</span>

@@ -10,7 +10,7 @@ export default function LiveShareBadge() {
 
   if (isViewing) {
     return (
-      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-50 border border-blue-200">
+      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-50 border border-blue-200 animate-pop-in">
         <Eye className="w-3 h-3 text-blue-500" />
         <span className="text-[11px] text-blue-600 font-medium">{t('liveShare.viewingLive')}</span>
       </div>
@@ -20,7 +20,7 @@ export default function LiveShareBadge() {
   if (!isSharing) return null;
 
   return (
-    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-red-50 border border-red-200">
+    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-red-50 border border-red-200 animate-pop-in">
       <Radio className="w-3 h-3 text-red-500 animate-pulse" />
       <span className="text-[11px] text-red-600 font-medium">
         {viewerCount === 1

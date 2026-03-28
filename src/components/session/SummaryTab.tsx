@@ -66,7 +66,7 @@ export default function SummaryTab({
         {blocks.map((block) => (
           <div
             key={block.id}
-            className={`px-4 py-3 border-b border-cream-100 ${
+            className={`px-4 py-3 border-b border-cream-100 animate-fade-in-up ${
               block.frozen ? 'bg-cream-50/50' : 'border-l-2 border-l-rust-400'
             }`}
           >

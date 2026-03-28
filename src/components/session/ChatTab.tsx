@@ -235,7 +235,7 @@ export default function ChatTab({
 
           {showModelMenu && availableModels.length > 0 && (
             <div className="absolute top-full mt-1 left-0 w-52 bg-white border border-cream-300
-                            rounded-lg shadow-lg z-50 py-1">
+                            rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
               {availableModels.map((model) => (
                 <button
                   key={model.name}
@@ -290,8 +290,8 @@ export default function ChatTab({
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
         {messages.length === 0 && (
-          <div className="text-center py-8 text-charcoal-300">
-            <Bot className="w-8 h-8 mx-auto mb-2 opacity-50" />
+          <div className="text-center py-8 text-charcoal-300 animate-fade-in-up">
+            <Bot className="w-8 h-8 mx-auto mb-2 opacity-50 animate-breathe" />
             <p className="text-xs">Ask questions about the lecture</p>
             <p className="text-[11px] mt-1 text-charcoal-400">
               Try: &quot;Explain the main concept&quot; or /keyword
@@ -302,7 +302,7 @@ export default function ChatTab({
         {messages.map((msg) => (
           <div
             key={msg.id}
-            className={`flex gap-2 ${msg.role === 'user' ? 'justify-end' : ''}`}
+            className={`flex gap-2 ${msg.role === 'user' ? 'justify-end animate-chat-bubble-right' : 'animate-chat-bubble-left'}`}
           >
             {msg.role === 'assistant' && (
               <div className="w-6 h-6 rounded-full bg-rust-100 flex items-center justify-center flex-shrink-0">

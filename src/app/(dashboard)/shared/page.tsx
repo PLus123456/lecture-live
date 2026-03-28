@@ -105,10 +105,10 @@ export default function SharedPage() {
 
   return (
     <div className={isMobile ? 'p-4 pb-28' : 'p-8 lg:p-12'}>
-      <h1 className="font-serif text-2xl font-bold text-charcoal-800 mb-2">
+      <h1 className="font-serif text-2xl font-bold text-charcoal-800 mb-2 animate-fade-in-up">
         Shared
       </h1>
-      <p className="mb-6 text-sm text-charcoal-400">
+      <p className="mb-6 text-sm text-charcoal-400 animate-fade-in-up stagger-1">
         Track your live share links and jump back into active viewer sessions.
       </p>
 
@@ -119,7 +119,7 @@ export default function SharedPage() {
       )}
 
       <div className={`grid gap-6 ${isMobile ? 'grid-cols-1' : 'xl:grid-cols-2'}`}>
-        <section className="rounded-2xl border border-cream-200 bg-white p-5 shadow-sm">
+        <section className="rounded-2xl border border-cream-200 bg-white p-5 shadow-sm animate-fade-in-up stagger-2">
           <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-charcoal-700">
             <Radio className="h-4 w-4 text-rust-500" />
             Shared By Me
@@ -131,8 +131,8 @@ export default function SharedPage() {
               Loading share links...
             </div>
           ) : activeLinks.length === 0 && expiredLinks.length === 0 ? (
-            <div className="rounded-xl border border-dashed border-cream-300 bg-cream-50/70 px-4 py-10 text-center">
-              <Share2 className="mx-auto mb-3 h-8 w-8 text-charcoal-200" />
+            <div className="rounded-xl border border-dashed border-cream-300 bg-cream-50/70 px-4 py-10 text-center animate-fade-in">
+              <Share2 className="mx-auto mb-3 h-8 w-8 text-charcoal-200 animate-breathe" />
               <p className="text-sm text-charcoal-500">No shared links yet</p>
               <p className="mt-1 text-xs text-charcoal-400">
                 Start a live share from any recording session and it will show up here.
@@ -146,10 +146,11 @@ export default function SharedPage() {
                     Active
                   </div>
                   <div className="space-y-3">
-                    {activeLinks.map((link) => (
+                    {activeLinks.map((link, index) => (
                       <article
                         key={link.id}
-                        className="rounded-xl border border-cream-200 bg-cream-50/50 p-4"
+                        className="rounded-xl border border-cream-200 bg-cream-50/50 p-4 animate-list-item-in card-hover-lift"
+                        style={{ animationDelay: `${index * 0.08}s` }}
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div>
@@ -219,15 +220,15 @@ export default function SharedPage() {
           )}
         </section>
 
-        <section className="rounded-2xl border border-cream-200 bg-white p-5 shadow-sm">
+        <section className="rounded-2xl border border-cream-200 bg-white p-5 shadow-sm animate-fade-in-up stagger-3">
           <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-charcoal-700">
             <Eye className="h-4 w-4 text-rust-500" />
             Shared With Me
           </div>
 
           {viewedLinks.length === 0 ? (
-            <div className="rounded-xl border border-dashed border-cream-300 bg-cream-50/70 px-4 py-10 text-center">
-              <Eye className="mx-auto mb-3 h-8 w-8 text-charcoal-200" />
+            <div className="rounded-xl border border-dashed border-cream-300 bg-cream-50/70 px-4 py-10 text-center animate-fade-in">
+              <Eye className="mx-auto mb-3 h-8 w-8 text-charcoal-200 animate-breathe" />
               <p className="text-sm text-charcoal-500">No viewer links opened yet</p>
               <p className="mt-1 text-xs text-charcoal-400">
                 Open any received live-share URL and it will show up here for quick access.

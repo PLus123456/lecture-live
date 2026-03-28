@@ -21,16 +21,25 @@ export async function generateMetadata(): Promise<Metadata> {
   const description =
     settings?.site_description?.trim() ||
     'Real-time speech-to-text transcription, translation, and AI-powered note-taking for academic lectures.';
-  const icon = settings?.favicon_path?.trim();
+  const favicon = settings?.favicon_path?.trim();
   const iconMedium = settings?.icon_medium_path?.trim();
   const iconLarge = settings?.icon_large_path?.trim();
 
-  const icons: Record<string, unknown> = {};
-  if (icon) icons.icon = icon;
+  // favicon：优先使用管理员上传的，否则回退到 public/ 默认图标
+  const icons: Record<string, unknown> = {
+    icon: favicon || '/icon.svg',
+  };
   const apple: { url: string; sizes: string }[] = [];
-  if (iconMedium) apple.push({ url: iconMedium, sizes: '120x120' });
-  if (iconLarge) apple.push({ url: iconLarge, sizes: '180x180' });
-  if (apple.length > 0) icons.apple = apple;
+  if (iconMedium) {
+    apple.push({ url: iconMedium, sizes: '120x120' });
+  }
+  if (iconLarge) {
+    apple.push({ url: iconLarge, sizes: '180x180' });
+  } else {
+    // 回退到 public/ 默认 PWA 图标
+    apple.push({ url: '/icon-192.png', sizes: '192x192' });
+  }
+  icons.apple = apple;
 
   return {
     title,
@@ -41,7 +50,7 @@ export async function generateMetadata(): Promise<Metadata> {
       statusBarStyle: 'black-translucent',
       title: settings?.site_name?.trim() || 'LectureLive',
     },
-    ...(Object.keys(icons).length > 0 ? { icons } : {}),
+    icons,
   };
 }
 

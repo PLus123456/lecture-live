@@ -30,6 +30,7 @@ export interface SiteSettings {
   cloudreve_token: string;
   local_path: string;
   max_file_size: number;
+  local_retention_days: number;
   theme: 'cream' | 'dark';
   language: 'en' | 'zh';
   default_region: 'auto' | 'us' | 'eu' | 'jp';
@@ -73,6 +74,7 @@ const DEFAULT_SITE_SETTINGS: SiteSettings = {
   cloudreve_token: '',
   local_path: './data',
   max_file_size: 500,
+  local_retention_days: 0,
   theme: 'cream',
   language: 'en',
   default_region: 'auto',
@@ -162,6 +164,11 @@ function normalizeSiteSettings(raw: Record<string, string>): SiteSettings {
       DEFAULT_SITE_SETTINGS.max_file_size,
       { min: 1, max: 10240 }
     ),
+    local_retention_days: parseInteger(
+      raw.local_retention_days,
+      DEFAULT_SITE_SETTINGS.local_retention_days,
+      { min: 0, max: 3650 }
+    ),
     theme: parseEnum(
       raw.theme,
       ['cream', 'dark'] as const,
@@ -244,6 +251,7 @@ export function serializeSiteSettingsForAdmin(settings: SiteSettings) {
     password_min_length: String(settings.password_min_length),
     smtp_port: String(settings.smtp_port),
     max_file_size: String(settings.max_file_size),
+    local_retention_days: String(settings.local_retention_days),
     rate_limit_auth: String(settings.rate_limit_auth),
     rate_limit_api: String(settings.rate_limit_api),
     jwt_expiry: String(settings.jwt_expiry),

@@ -120,6 +120,61 @@
     to { opacity: 1; }
   }
 
+  /* ─── 交错动画延迟工具类 ─── */
+  .stagger-1 { animation-delay: 0.05s; }
+  .stagger-2 { animation-delay: 0.1s; }
+  .stagger-3 { animation-delay: 0.15s; }
+  .stagger-4 { animation-delay: 0.2s; }
+  .stagger-5 { animation-delay: 0.25s; }
+  .stagger-6 { animation-delay: 0.3s; }
+  .stagger-7 { animation-delay: 0.35s; }
+  .stagger-8 { animation-delay: 0.4s; }
+  .stagger-9 { animation-delay: 0.45s; }
+  .stagger-10 { animation-delay: 0.5s; }
+
+  /* ─── 错误提示抖动 ─── */
+  .error-shake {
+    animation: shake 0.4s ease-in-out;
+  }
+
+  /* ─── 卡片悬浮提升 ─── */
+  .card-hover-lift {
+    transition: transform 0.25s ease, box-shadow 0.25s ease;
+  }
+
+  .card-hover-lift:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px -5px rgba(0, 0, 0, 0.08), 0 4px 10px -4px rgba(0, 0, 0, 0.04);
+  }
+
+  /* ─── 按钮弹性点击 ─── */
+  .btn-bounce {
+    transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  .btn-bounce:active {
+    transform: scale(0.95);
+  }
+
+  /* ─── 输入框聚焦光晕 ─── */
+  .input-glow:focus {
+    box-shadow: 0 0 0 3px rgba(196, 75, 32, 0.1);
+  }
+
+  /* ─── Tab 指示器滑动 ─── */
+  .tab-indicator {
+    transition: left 0.25s cubic-bezier(0.16, 1, 0.3, 1), width 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* ─── 渐减动画 — 用于 prefers-reduced-motion ─── */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
   /* Expandable button */
   .expand-btn .expand-label {
     max-width: 0;

@@ -63,6 +63,76 @@ const config: Config = {
           '0%': { opacity: '0', transform: 'scale(0.92)' },
           '100%': { opacity: '1', transform: 'scale(1)' },
         },
+        /* ─── 页面 & 内容入场 ─── */
+        'fade-in-up': {
+          '0%': { opacity: '0', transform: 'translateY(16px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        'fade-in': {
+          '0%': { opacity: '0' },
+          '100%': { opacity: '1' },
+        },
+        'fade-in-scale': {
+          '0%': { opacity: '0', transform: 'scale(0.95)' },
+          '100%': { opacity: '1', transform: 'scale(1)' },
+        },
+        /* ─── 滑入 ─── */
+        'slide-in-right': {
+          '0%': { transform: 'translateX(100%)' },
+          '100%': { transform: 'translateX(0)' },
+        },
+        'slide-in-left': {
+          '0%': { transform: 'translateX(-100%)' },
+          '100%': { transform: 'translateX(0)' },
+        },
+        'slide-up': {
+          '0%': { opacity: '0', transform: 'translateY(24px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        /* ─── 气泡弹入 ─── */
+        'pop-in': {
+          '0%': { opacity: '0', transform: 'scale(0.8)' },
+          '60%': { transform: 'scale(1.04)' },
+          '100%': { opacity: '1', transform: 'scale(1)' },
+        },
+        /* ─── 错误抖动 ─── */
+        'shake': {
+          '0%, 100%': { transform: 'translateX(0)' },
+          '20%': { transform: 'translateX(-6px)' },
+          '40%': { transform: 'translateX(6px)' },
+          '60%': { transform: 'translateX(-4px)' },
+          '80%': { transform: 'translateX(4px)' },
+        },
+        /* ─── 空状态呼吸 ─── */
+        'breathe': {
+          '0%, 100%': { transform: 'scale(1)', opacity: '0.5' },
+          '50%': { transform: 'scale(1.05)', opacity: '0.7' },
+        },
+        /* ─── 列表项交错 ─── */
+        'list-item-in': {
+          '0%': { opacity: '0', transform: 'translateX(-8px)' },
+          '100%': { opacity: '1', transform: 'translateX(0)' },
+        },
+        /* ─── 聊天消息 ─── */
+        'chat-bubble-left': {
+          '0%': { opacity: '0', transform: 'translateX(-12px) scale(0.95)' },
+          '100%': { opacity: '1', transform: 'translateX(0) scale(1)' },
+        },
+        'chat-bubble-right': {
+          '0%': { opacity: '0', transform: 'translateX(12px) scale(0.95)' },
+          '100%': { opacity: '1', transform: 'translateX(0) scale(1)' },
+        },
+        /* ─── 标签弹入 ─── */
+        'tag-pop': {
+          '0%': { opacity: '0', transform: 'scale(0.6)' },
+          '70%': { transform: 'scale(1.08)' },
+          '100%': { opacity: '1', transform: 'scale(1)' },
+        },
+        /* ─── 统计数字计数效果 ─── */
+        'count-up': {
+          '0%': { opacity: '0', transform: 'translateY(8px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
       },
       animation: {
         'modal-enter': 'modal-enter 0.2s ease-out',
@@ -70,6 +140,20 @@ const config: Config = {
         'toolbar-in': 'toolbar-in 0.18s ease-out forwards',
         'toolbar-out': 'toolbar-out 0.12s ease-in forwards',
         'ctx-menu-in': 'ctx-menu-in 0.12s ease-out forwards',
+        'fade-in-up': 'fade-in-up 0.4s ease-out both',
+        'fade-in': 'fade-in 0.3s ease-out both',
+        'fade-in-scale': 'fade-in-scale 0.35s ease-out both',
+        'slide-in-right': 'slide-in-right 0.3s cubic-bezier(0.16, 1, 0.3, 1) both',
+        'slide-in-left': 'slide-in-left 0.3s cubic-bezier(0.16, 1, 0.3, 1) both',
+        'slide-up': 'slide-up 0.4s ease-out both',
+        'pop-in': 'pop-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) both',
+        'shake': 'shake 0.4s ease-in-out',
+        'breathe': 'breathe 3s ease-in-out infinite',
+        'list-item-in': 'list-item-in 0.3s ease-out both',
+        'chat-bubble-left': 'chat-bubble-left 0.25s ease-out both',
+        'chat-bubble-right': 'chat-bubble-right 0.25s ease-out both',
+        'tag-pop': 'tag-pop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) both',
+        'count-up': 'count-up 0.5s ease-out both',
       },
       fontFamily: {
         serif: ['Georgia', 'Cambria', '"Times New Roman"', 'Times', 'serif'],

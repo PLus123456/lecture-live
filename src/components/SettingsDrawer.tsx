@@ -293,14 +293,14 @@ export default function SettingsDrawer({
     <>
       {/* Backdrop */}
       <div
-        className="fixed inset-0 bg-charcoal-900/30 backdrop-blur-sm z-50"
+        className="fixed inset-0 bg-charcoal-900/30 backdrop-blur-sm z-50 animate-backdrop-enter"
         onClick={onClose}
       />
 
       {/* Drawer */}
       <div
         className="fixed right-0 top-0 h-full w-[420px] max-w-[90vw] bg-white
-                   shadow-2xl z-50 overflow-y-auto"
+                   shadow-2xl z-50 overflow-y-auto animate-slide-in-right"
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">

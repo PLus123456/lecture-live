@@ -792,8 +792,8 @@ export default function FoldersPage() {
 
         <div className="space-y-3 px-4 py-4">
           {rootFolders.length === 0 && unarchivedSessions.length === 0 ? (
-            <div className="rounded-3xl border border-dashed border-cream-300 bg-white px-6 py-16 text-center">
-              <FolderOpen className="mx-auto mb-3 h-10 w-10 text-charcoal-200" />
+            <div className="rounded-3xl border border-dashed border-cream-300 bg-white px-6 py-16 text-center animate-fade-in-up">
+              <FolderOpen className="mx-auto mb-3 h-10 w-10 text-charcoal-200 animate-breathe" />
               <p className="text-sm font-medium text-charcoal-500">No folders yet</p>
               <p className="mt-1 text-xs text-charcoal-400">
                 Create your first folder to organize recordings by course or topic.
@@ -801,7 +801,7 @@ export default function FoldersPage() {
             </div>
           ) : (
             <>
-              {rootFolders.map((folder) => (
+              {rootFolders.map((folder, index) => (
                 <button
                   key={folder.id}
                   onClick={() => {
@@ -811,7 +811,8 @@ export default function FoldersPage() {
                   onTouchStart={() => startLongPress(folder.id)}
                   onTouchEnd={cancelLongPress}
                   onTouchCancel={cancelLongPress}
-                  className="flex w-full items-center justify-between rounded-2xl border border-cream-200 bg-white px-4 py-4 text-left shadow-sm"
+                  className="flex w-full items-center justify-between rounded-2xl border border-cream-200 bg-white px-4 py-4 text-left shadow-sm animate-list-item-in card-hover-lift"
+                  style={{ animationDelay: `${Math.min(index * 0.06, 0.5)}s` }}
                 >
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
@@ -834,7 +835,7 @@ export default function FoldersPage() {
                   onTouchStart={() => startLongPress(UNARCHIVED_ID)}
                   onTouchEnd={cancelLongPress}
                   onTouchCancel={cancelLongPress}
-                  className="flex w-full items-center justify-between rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4 text-left"
+                  className="flex w-full items-center justify-between rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4 text-left transition-all duration-200 animate-list-item-in card-hover-lift"
                 >
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
@@ -1024,8 +1025,8 @@ export default function FoldersPage() {
             Loading...
           </div>
         ) : rootFolders.length === 0 && unarchivedSessions.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center text-center">
-            <FolderOpen className="mb-3 h-12 w-12 text-charcoal-200" />
+          <div className="flex h-full flex-col items-center justify-center text-center animate-fade-in-up">
+            <FolderOpen className="mb-3 h-12 w-12 text-charcoal-200 animate-breathe" />
             <p className="text-sm text-charcoal-500">No folders yet</p>
             <p className="mt-1 text-xs text-charcoal-300">
               Create your first folder to organize recordings by course or topic.
@@ -1060,7 +1061,7 @@ export default function FoldersPage() {
               <div
                 data-folder-id={UNARCHIVED_ID}
                 ref={(el) => setFolderRef(UNARCHIVED_ID, el)}
-                className="flex items-center gap-2"
+                className="flex items-center gap-2 transition-all animate-list-item-in"
               >
                 <div
                   onClick={(e) => {
@@ -1069,7 +1070,7 @@ export default function FoldersPage() {
                     e.stopPropagation();
                     router.push('/folders/unarchived');
                   }}
-                  className={`flex flex-1 cursor-pointer items-center justify-between rounded-xl border px-4 py-2.5 transition-colors ${
+                  className={`flex flex-1 cursor-pointer items-center justify-between rounded-xl border px-4 py-2.5 transition-all duration-200 card-hover-lift ${
                     selectedIds.has(UNARCHIVED_ID)
                       ? 'border-amber-300 bg-amber-50/70'
                       : 'border-cream-200 bg-white hover:border-cream-300 hover:bg-cream-50/70'
@@ -1277,7 +1278,7 @@ function FolderRow({
     <div
       data-folder-id={folder.id}
       ref={setRef}
-      className={`flex items-center gap-2 transition-all ${isCut ? 'opacity-50' : ''}`}
+      className={`flex items-center gap-2 transition-all animate-list-item-in ${isCut ? 'opacity-50' : ''}`}
     >
       <div
         onClick={(e) => {
@@ -1288,7 +1289,7 @@ function FolderRow({
           e.stopPropagation();
           onBodyClick();
         }}
-        className={`flex flex-1 cursor-pointer items-center justify-between rounded-xl border px-4 py-2.5 transition-colors ${
+        className={`flex flex-1 cursor-pointer items-center justify-between rounded-xl border px-4 py-2.5 transition-all duration-200 card-hover-lift ${
           isSelected
             ? 'border-rust-300 bg-rust-50/70'
             : 'border-cream-200 bg-white hover:border-cream-300 hover:bg-cream-50/70'

@@ -137,12 +137,12 @@ export default function SettingsPage() {
 
   return (
     <div className="p-8 lg:p-12">
-      <h1 className="font-serif text-2xl font-bold text-charcoal-800 mb-6">
+      <h1 className="font-serif text-2xl font-bold text-charcoal-800 mb-6 animate-fade-in-up">
         Settings
       </h1>
 
       <div className="space-y-6">
-        <section className="bg-white rounded-xl border border-cream-200 p-5">
+        <section className="bg-white rounded-xl border border-cream-200 p-5 animate-fade-in-up stagger-1">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
             <Settings className="w-4 h-4" />
             Account
@@ -165,7 +165,7 @@ export default function SettingsPage() {
           )}
         </section>
 
-        <section className="bg-white rounded-xl border border-cream-200 p-5">
+        <section className="bg-white rounded-xl border border-cream-200 p-5 animate-fade-in-up stagger-2">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
             <Lock className="w-4 h-4" />
             Change Password
@@ -219,7 +219,7 @@ export default function SettingsPage() {
           </div>
         </section>
 
-        <section className="bg-white rounded-xl border border-cream-200 p-5">
+        <section className="bg-white rounded-xl border border-cream-200 p-5 animate-fade-in-up">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
             <Globe className="w-4 h-4" />
             Language
@@ -251,7 +251,7 @@ export default function SettingsPage() {
           </div>
         </section>
 
-        <section className="bg-white rounded-xl border border-cream-200 p-5">
+        <section className="bg-white rounded-xl border border-cream-200 p-5 animate-fade-in-up">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
             <Cpu className="w-4 h-4" />
             LLM & Summary
@@ -349,7 +349,7 @@ export default function SettingsPage() {
           </div>
         </section>
 
-        <section className="bg-white rounded-xl border border-cream-200 p-5">
+        <section className="bg-white rounded-xl border border-cream-200 p-5 animate-fade-in-up">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
             <Mic className="w-4 h-4" />
             ASR Defaults
@@ -420,7 +420,7 @@ export default function SettingsPage() {
           </div>
         </section>
 
-        <section className="bg-white rounded-xl border border-cream-200 p-5">
+        <section className="bg-white rounded-xl border border-cream-200 p-5 animate-fade-in-up">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
             <Scissors className="w-4 h-4" />
             Transcript Segment

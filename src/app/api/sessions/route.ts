@@ -60,6 +60,11 @@ export const GET = withRequestLogging('sessions:list', async (req: Request) => {
     orderBy: { createdAt: 'desc' },
     ...(limit ? { take: limit + 1 } : {}),
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    include: {
+      folders: {
+        include: { folder: { select: { id: true, name: true } } },
+      },
+    },
   });
 
   // 如果有分页参数，返回带 nextCursor 的响应

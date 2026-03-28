@@ -13,11 +13,11 @@ import {
   UserCog,
   AlertTriangle,
   ArrowLeft,
-  BookOpen,
   ChevronRight,
   ScrollText,
   Scale,
 } from 'lucide-react';
+import SiteLogo from '@/components/SiteLogo';
 
 import DashboardPanel from '@/components/admin/DashboardPanel';
 import SettingsPanel from '@/components/admin/SettingsPanel';
@@ -191,9 +191,7 @@ export default function AdminPage() {
         {/* 品牌 + 返回 */}
         <div className="flex items-center justify-between px-3 h-16 border-b border-cream-200 dark:border-charcoal-700">
           <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 bg-gradient-to-br from-rust-500 to-rust-600 rounded-lg flex items-center justify-center flex-shrink-0 shadow-sm">
-              <BookOpen className="w-4 h-4 text-white" />
-            </div>
+            <SiteLogo size="w-8 h-8" iconSize="w-4 h-4" />
             <div>
               <h1 className="font-serif font-bold text-charcoal-800 dark:text-cream-100 text-sm leading-tight">{t('admin.title')}</h1>
               <p className="text-[10px] text-charcoal-400 tracking-wider uppercase">{t('nav.appName')}</p>

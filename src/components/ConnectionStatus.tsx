@@ -147,7 +147,7 @@ export default function ConnectionStatus() {
           ref={tooltipRef}
           className="absolute top-full mt-2 right-0 w-72 z-50
                      bg-white border border-cream-200 rounded-xl shadow-2xl
-                     overflow-hidden animate-in fade-in slide-in-from-top-1 duration-150"
+                     overflow-hidden animate-fade-in-scale"
         >
           {/* Header */}
           <div className={`px-4 py-3 ${

@@ -22,8 +22,8 @@ export function SessionFinalizingOverlay({ steps, visible }: SessionFinalizingOv
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-charcoal-900/40 backdrop-blur-sm" />
-      <div className="relative bg-white rounded-2xl shadow-2xl border border-cream-200 p-8 w-[380px]">
+      <div className="absolute inset-0 bg-charcoal-900/40 backdrop-blur-sm animate-backdrop-enter" />
+      <div className="relative bg-white rounded-2xl shadow-2xl border border-cream-200 p-8 w-[380px] animate-modal-enter">
         <div className="text-center mb-6">
           <Loader2 className="w-8 h-8 text-rust-500 animate-spin mx-auto mb-3" />
           <h2 className="font-serif font-bold text-charcoal-800 text-lg">{t('session.finalizing.title')}</h2>

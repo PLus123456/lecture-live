@@ -42,6 +42,7 @@ next-env.d.ts
 
 # runtime data
 /data
+/prisma/dev.db
 
 # local deployment artifacts
 lecturelive-deploy.tar.gz

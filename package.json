@@ -28,7 +28,7 @@
     "billing:reconcile": "node scripts/reconcile-transcription-usage.mjs",
     "billing:maintenance": "ts-node scripts/billing-maintenance.ts",
     "security:reencrypt-llm-keys": "node scripts/reencrypt-llm-provider-keys.mjs",
-    "postinstall": "prisma generate"
+    "postinstall": "node scripts/patch-next-minify.mjs && prisma generate"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.4.0",

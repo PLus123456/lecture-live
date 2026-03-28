@@ -126,17 +126,39 @@ const nextConfig = {
     ];
 
     if (!dev && !isServer) {
-      // Transformers.js 的预编译 bundle 会导致 Terser 解析失败。
-      // 这里通过排查并为压缩插件设置 exclude 的方法，避免全量禁用压缩暴露源码。
-      config.optimization.minimize = true;
-      if (Array.isArray(config.optimization.minimizer)) {
-        config.optimization.minimizer.forEach((minimizer) => {
-          if (minimizer) {
-            minimizer.options = minimizer.options || {};
-            minimizer.options.exclude = /@huggingface[\\/]transformers|onnxruntime-web/;
-          }
-        });
-      }
+      // Transformers.js 的预编译 bundle 包含 ESM 语法被包裹在 CJS wrapper 中，
+      // 导致 SWC 压缩器无法解析。通过自定义插件遍历 chunk 的模块列表，
+      // 将包含这些模块的 asset 标记为 minimized，使 MinifyPlugin 跳过。
+      const mlPattern = /[\\/]node_modules[\\/](@huggingface[\\/]transformers|onnxruntime-web)[\\/]/;
+      config.plugins.push({
+        apply(compiler) {
+          compiler.hooks.compilation.tap('SkipMLMinify', (compilation) => {
+            compilation.hooks.processAssets.tap(
+              // PROCESS_ASSETS_STAGE_OPTIMIZE_SIZE = 100，在其之前执行
+              { name: 'SkipMLMinify', stage: 99 },
+              () => {
+                // 收集包含 ML 模块的 chunk 对应的所有文件名
+                const filesToSkip = new Set();
+                for (const chunk of compilation.chunks) {
+                  const modules = compilation.chunkGraph.getChunkModules(chunk);
+                  const hasML = modules.some((m) => {
+                    const resource = m.resource || (m.rootModule && m.rootModule.resource);
+                    return resource && mlPattern.test(resource);
+                  });
+                  if (hasML) {
+                    for (const file of chunk.files) {
+                      filesToSkip.add(file);
+                    }
+                  }
+                }
+                for (const file of filesToSkip) {
+                  compilation.updateAsset(file, (x) => x, { minimized: true });
+                }
+              }
+            );
+          });
+        },
+      });
     }
 
     return config;

@@ -167,9 +167,9 @@ export default function ExportModal({
 
   return (
     <>
-      <div className="fixed inset-0 bg-charcoal-900/30 backdrop-blur-sm z-50" onClick={onClose} />
+      <div className="fixed inset-0 bg-charcoal-900/30 backdrop-blur-sm z-50 animate-backdrop-enter" onClick={onClose} />
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-2xl w-[420px] max-w-full">
+        <div className="bg-white rounded-2xl shadow-2xl w-[420px] max-w-full animate-modal-enter">
           {/* Header */}
           <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200">
             <div className="flex items-center gap-2">

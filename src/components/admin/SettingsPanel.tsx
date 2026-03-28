@@ -68,6 +68,7 @@ interface SiteSettingsData {
   cloudreve_token: string;
   local_path: string;
   max_file_size: string;
+  local_retention_days: string;
   // 外观相关
   theme: string;
   language: string;
@@ -270,6 +271,7 @@ const defaultSettings: SiteSettingsData = {
   cloudreve_token: '',
   local_path: './data',
   max_file_size: '500',
+  local_retention_days: '0',
   theme: 'cream',
   language: 'en',
   default_region: 'auto',
@@ -432,6 +434,14 @@ function ToggleSwitch({
   );
 }
 
+/** 图标类型 → 数据库设置键的映射 */
+const ICON_TYPE_TO_SETTING_KEY: Record<string, string> = {
+  logo: 'logo_path',
+  favicon: 'favicon_path',
+  icon_medium: 'icon_medium_path',
+  icon_large: 'icon_large_path',
+};
+
 /** 图标上传组件（预览 + 上传按钮） */
 function IconUpload({
   label,
@@ -463,7 +473,17 @@ function IconUpload({
       });
       if (res.ok) {
         const data = await res.json();
-        onUploaded(data.path || '');
+        const newPath = data.path || '';
+        onUploaded(newPath);
+        // 上传成功后立即将路径保存到数据库，无需手动点保存
+        const settingKey = ICON_TYPE_TO_SETTING_KEY[uploadType];
+        if (settingKey && newPath) {
+          await fetch('/api/admin/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ [settingKey]: newPath }),
+          });
+        }
       }
     } catch (err) {
       console.error('图标上传失败:', err);
@@ -1046,6 +1066,56 @@ function StoragePanel({
   onChange: (key: string, value: string) => void;
 }) {
   const { t } = useI18n();
+  const [migrating, setMigrating] = useState(false);
+  const [migrateResult, setMigrateResult] = useState<string | null>(null);
+  const [cleaning, setCleaning] = useState(false);
+  const [cleanResult, setCleanResult] = useState<string | null>(null);
+
+  const handleMigrate = async () => {
+    setMigrating(true);
+    setMigrateResult(null);
+    try {
+      const res = await fetch('/api/admin/storage/migrate', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        setMigrateResult(
+          t('adminSettings.migrateSuccess')
+            .replace('{migrated}', String(data.migratedCount))
+            .replace('{skipped}', String(data.skippedCount))
+            .replace('{errors}', String(data.errorCount))
+        );
+      } else {
+        setMigrateResult(data.error || t('adminSettings.migrateFailed'));
+      }
+    } catch {
+      setMigrateResult(t('adminSettings.migrateFailed'));
+    } finally {
+      setMigrating(false);
+    }
+  };
+
+  const handleCleanup = async () => {
+    setCleaning(true);
+    setCleanResult(null);
+    try {
+      const res = await fetch('/api/admin/storage/cleanup', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        setCleanResult(
+          t('adminSettings.cleanupSuccess')
+            .replace('{deleted}', String(data.deletedCount))
+            .replace('{errors}', String(data.errorCount))
+        );
+      } else {
+        setCleanResult(data.error || t('adminSettings.cleanupFailed'));
+      }
+    } catch {
+      setCleanResult(t('adminSettings.cleanupFailed'));
+    } finally {
+      setCleaning(false);
+    }
+  };
+
   return (
     <div>
       <SettingField label={t('adminSettings.storageMode')} description={t('adminSettings.storageModeDesc')}>
@@ -1071,6 +1141,42 @@ function StoragePanel({
           <SettingField label={t('adminSettings.cloudreveToken')} description={t('adminSettings.cloudreveTokenDesc')}>
             <TextInput value={settings.cloudreve_token} onChange={(v) => onChange('cloudreve_token', v)} type="password" />
           </SettingField>
+          <SettingField label={t('adminSettings.localRetentionDays')} description={t('adminSettings.localRetentionDaysDesc')}>
+            <TextInput value={settings.local_retention_days} onChange={(v) => onChange('local_retention_days', v)} type="number" placeholder="0" />
+          </SettingField>
+
+          {/* 迁移与清理操作 */}
+          <div className="mt-4 space-y-3 rounded-lg border border-charcoal-200 bg-charcoal-50 p-4 dark:border-charcoal-700 dark:bg-charcoal-800">
+            <p className="text-sm font-medium text-charcoal-700 dark:text-charcoal-300">
+              {t('adminSettings.storageActions')}
+            </p>
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={handleMigrate}
+                disabled={migrating}
+                className="inline-flex items-center gap-1.5 rounded-md bg-rust-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-rust-600 disabled:opacity-50"
+              >
+                <Upload size={14} />
+                {migrating ? t('adminSettings.migrating') : t('adminSettings.migrateNow')}
+              </button>
+              <button
+                type="button"
+                onClick={handleCleanup}
+                disabled={cleaning || Number(settings.local_retention_days) <= 0}
+                className="inline-flex items-center gap-1.5 rounded-md bg-charcoal-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-charcoal-600 disabled:opacity-50"
+              >
+                <Trash2 size={14} />
+                {cleaning ? t('adminSettings.cleaning') : t('adminSettings.cleanupNow')}
+              </button>
+            </div>
+            {migrateResult && (
+              <p className="text-sm text-charcoal-600 dark:text-charcoal-400">{migrateResult}</p>
+            )}
+            {cleanResult && (
+              <p className="text-sm text-charcoal-600 dark:text-charcoal-400">{cleanResult}</p>
+            )}
+          </div>
         </>
       )}
       <SettingField label={t('adminSettings.maxUploadSize')} description={t('adminSettings.maxUploadSizeDesc')}>

@@ -45,10 +45,12 @@ export default function AiPanel({
       </div>
 
       {/* Tab content */}
-      <div className="flex-1 overflow-hidden">
-        {activeTab === 'summary' && <SummaryTab onManualTrigger={onManualSummary} />}
-        {activeTab === 'chat' && <ChatTab onInjectKeywords={onInjectKeywords} />}
-        {activeTab === 'keyword' && <KeywordTab onInjectKeywords={onInjectKeywords} />}
+      <div className="flex-1 overflow-hidden" key={activeTab}>
+        <div className="h-full animate-fade-in">
+          {activeTab === 'summary' && <SummaryTab onManualTrigger={onManualSummary} />}
+          {activeTab === 'chat' && <ChatTab onInjectKeywords={onInjectKeywords} />}
+          {activeTab === 'keyword' && <KeywordTab onInjectKeywords={onInjectKeywords} />}
+        </div>
       </div>
     </div>
   );

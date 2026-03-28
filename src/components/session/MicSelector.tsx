@@ -52,7 +52,7 @@ export default function MicSelector({
 
       {open && (
         <div className="absolute top-full mt-1 right-0 w-64 bg-white border border-cream-300
-                        rounded-lg shadow-lg z-50 py-1">
+                        rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
           {availableMics.map((mic) => (
             <button
               key={mic.deviceId}

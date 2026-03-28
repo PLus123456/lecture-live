@@ -9,6 +9,7 @@ import {
 } from '@/lib/siteSettings';
 import { invalidateSonioxDbConfigCache } from '@/lib/soniox/env';
 import { invalidateTrustedProxyCache } from '@/lib/clientIp';
+import { migrateLocalToCloudreve } from '@/lib/storage/migration';
 
 // 获取所有站点设置
 export async function GET(req: Request) {
@@ -81,6 +82,7 @@ export async function PUT(req: Request) {
       'cloudreve_token',
       'local_path',
       'max_file_size',
+      'local_retention_days',
       // 外观相关
       'theme',
       'language',
@@ -104,6 +106,9 @@ export async function PUT(req: Request) {
     if (entries.length === 0) {
       return NextResponse.json({ error: '没有有效的设置项' }, { status: 400 });
     }
+
+    // 记录切换前的存储模式，用于检测是否需要迁移
+    const previousSettings = await getSiteSettings({ fresh: true });
 
     logAction(req, 'admin.settings.update', {
       user: admin,
@@ -142,7 +147,26 @@ export async function PUT(req: Request) {
     invalidateTrustedProxyCache();
     const settings = await getSiteSettings({ fresh: true });
 
-    return NextResponse.json(serializeSiteSettingsForAdmin(settings));
+    // 如果存储模式从 local 切换到 cloudreve，后台触发迁移
+    const switchedToCloudreve =
+      previousSettings.storage_mode !== 'cloudreve' &&
+      settings.storage_mode === 'cloudreve';
+
+    if (switchedToCloudreve) {
+      // 后台执行，不阻塞响应
+      migrateLocalToCloudreve()
+        .then((r) =>
+          console.log(
+            `[存储迁移] 完成: 迁移 ${r.migratedCount} 个文件, 跳过 ${r.skippedCount}, 错误 ${r.errorCount}`
+          )
+        )
+        .catch((err) => console.error('[存储迁移] 失败:', err));
+    }
+
+    return NextResponse.json({
+      ...serializeSiteSettingsForAdmin(settings),
+      _migrationTriggered: switchedToCloudreve,
+    });
   } catch (err) {
     console.error('更新站点设置失败:', err);
     return NextResponse.json({ error: '更新设置失败' }, { status: 500 });

@@ -26,7 +26,7 @@ export default function SessionCard({
     <Link
       href={`/session/${id}`}
       className="group flex items-center justify-between py-5 px-2 border-b border-cream-200
-                 hover:bg-cream-50 transition-colors -mx-2 rounded-lg"
+                 hover:bg-cream-50 transition-all duration-200 -mx-2 rounded-lg card-hover-lift"
     >
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-3 text-xs text-charcoal-400 mb-1.5">

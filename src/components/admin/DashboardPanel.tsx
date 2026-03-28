@@ -429,7 +429,7 @@ export default function DashboardPanel() {
           return (
             <div
               key={item.key}
-              className="flex items-center gap-3 bg-white rounded-xl border border-cream-200 p-4 min-w-[160px] flex-shrink-0 md:min-w-0"
+              className="flex items-center gap-3 bg-white rounded-xl border border-cream-200 p-4 min-w-[160px] flex-shrink-0 md:min-w-0 animate-fade-in-up card-hover-lift"
             >
               <div
                 className="w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0"
@@ -449,7 +449,7 @@ export default function DashboardPanel() {
       </div>
 
       {/* 趋势图 */}
-      <div className="bg-white rounded-xl border border-cream-200 p-5 min-w-0">
+      <div className="bg-white rounded-xl border border-cream-200 p-5 min-w-0 animate-fade-in-up stagger-3">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-base font-bold text-charcoal-800">{t('admin.trends')}</h3>
           {agoText && (

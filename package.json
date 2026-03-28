@@ -2,6 +2,7 @@
   "name": "lecture-live",
   "version": "0.2.0",
   "private": true,
+  "license": "GPL-3.0-only",
   "scripts": {
     "db:ensure": "node scripts/ensure-database.mjs",
     "dev": "next dev",

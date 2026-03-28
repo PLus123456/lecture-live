@@ -1,0 +1,34 @@
+import { NextResponse } from 'next/server';
+import { getSiteSettings, toPublicSiteConfig } from '@/lib/siteSettings';
+
+export async function GET() {
+  try {
+    const settings = await getSiteSettings();
+    return NextResponse.json(toPublicSiteConfig(settings));
+  } catch (error) {
+    console.error('Failed to load public site config:', error);
+    return NextResponse.json(
+      {
+        site_name: 'LectureLive',
+        site_description: '',
+        site_announcement: '',
+        footer_code: '',
+        terms_url: '/terms',
+        privacy_url: '/privacy',
+        logo_path: '',
+        favicon_path: '',
+        site_url: '',
+        site_url_alt: '',
+        allow_registration: true,
+        password_min_length: 8,
+        theme: 'cream',
+        language: 'en',
+        default_region: 'auto',
+        default_source_lang: 'en',
+        default_target_lang: 'zh',
+        translation_mode: 'soniox',
+      },
+      { status: 200 }
+    );
+  }
+}

@@ -1,0 +1,191 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-cream-50 text-charcoal-800 font-sans dark:bg-charcoal-900 dark:text-cream-100;
+  }
+
+  ::selection {
+    @apply bg-rust-200 text-charcoal-800;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-charcoal-200 rounded-full dark:bg-charcoal-600;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-charcoal-300 dark:bg-charcoal-500;
+  }
+}
+
+@layer components {
+  .panel-card {
+    @apply bg-white rounded-xl border border-cream-300 shadow-sm
+           dark:bg-charcoal-800 dark:border-charcoal-700;
+  }
+
+  .btn-primary {
+    @apply bg-rust-500 text-white px-6 py-2.5 rounded-lg font-medium
+           hover:bg-rust-600 active:bg-rust-700 transition-colors
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-cream-200 text-charcoal-700 px-5 py-2 rounded-lg font-medium
+           hover:bg-cream-300 active:bg-cream-400 transition-colors
+           border border-cream-300
+           dark:bg-charcoal-700 dark:text-cream-200 dark:border-charcoal-600
+           dark:hover:bg-charcoal-600 dark:active:bg-charcoal-500;
+  }
+
+  .btn-ghost {
+    @apply text-charcoal-500 px-3 py-2 rounded-lg
+           hover:bg-cream-200 active:bg-cream-300 transition-colors
+           dark:text-charcoal-300 dark:hover:bg-charcoal-700 dark:active:bg-charcoal-600;
+  }
+
+  .input-field {
+    @apply w-full px-4 py-2.5 rounded-lg border border-cream-300 bg-white
+           text-charcoal-800 placeholder:text-charcoal-300
+           focus:outline-none focus:ring-2 focus:ring-rust-300 focus:border-rust-400
+           transition-all
+           dark:bg-charcoal-700 dark:border-charcoal-600 dark:text-cream-100
+           dark:placeholder:text-charcoal-400
+           dark:focus:ring-rust-400 dark:focus:border-rust-500;
+  }
+
+  .tag-badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-md text-xs font-medium
+           bg-cream-200 text-charcoal-600 border border-cream-300
+           dark:bg-charcoal-700 dark:text-cream-300 dark:border-charcoal-600;
+  }
+
+  /* Pulse animation for recording indicator */
+  .recording-pulse {
+    animation: pulse-ring 1.5s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+  }
+
+  @keyframes pulse-ring {
+    0% { box-shadow: 0 0 0 0 rgba(196, 75, 32, 0.4); }
+    70% { box-shadow: 0 0 0 10px rgba(196, 75, 32, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(196, 75, 32, 0); }
+  }
+
+  /* Typing indicator animation */
+  .typing-dot {
+    animation: typing 1.4s infinite ease-in-out;
+  }
+
+  .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+  @keyframes typing {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+    30% { transform: translateY(-4px); opacity: 1; }
+  }
+
+  /* Segment fade-in animation */
+  .segment-enter {
+    animation: segmentFadeIn 0.3s ease-out;
+  }
+
+  @keyframes segmentFadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Translation fade-in */
+  .translation-enter {
+    animation: translationFadeIn 0.25s ease-out;
+  }
+
+  @keyframes translationFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* Expandable button */
+  .expand-btn .expand-label {
+    max-width: 0;
+    overflow: hidden;
+    transition: all 0.2s ease;
+    white-space: nowrap;
+    padding-right: 0;
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .expand-btn:hover .expand-label {
+      max-width: 120px;
+      padding-right: 0.75rem;
+    }
+
+    .expand-btn:disabled:hover .expand-label {
+      max-width: 0;
+      padding-right: 0;
+    }
+  }
+}
+
+/* ─── 折叠屏适配：屏幕接近正方形且最小边 >= 480px 时，
+       覆盖 max-width:767px 的移动端样式 ─── */
+@media (max-aspect-ratio: 14/10) and (min-width: 480px) and (max-width: 767px) {
+  /* 折叠屏展开时不强制 16px 输入框字体 */
+  input,
+  select,
+  textarea {
+    font-size: inherit !important;
+  }
+}
+
+/* ─── Mobile adaptation ─── */
+
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.safe-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+@media (max-width: 767px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}
+
+@media (hover: none) {
+  .expand-btn .expand-label {
+    max-width: 0 !important;
+    padding: 0 !important;
+    opacity: 0 !important;
+  }
+}
+
+.bottom-tab-safe {
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 0.5rem);
+}
+
+@media (max-width: 767px) {
+  .mobile-scroll {
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+  }
+}

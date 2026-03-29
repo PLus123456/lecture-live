@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership } from '@/lib/security';
 import {
   deleteRecordingDraft,
@@ -63,6 +64,7 @@ export async function POST(
         ...(durationMs > 0 ? { durationMs } : {}),
       },
     });
+    await invalidateSessionsApiCache(user.id);
     await deleteRecordingDraft(session);
 
     return NextResponse.json({

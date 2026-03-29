@@ -2,11 +2,13 @@ import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { withRequestLogging } from '@/lib/requestLogger';
+import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { validatePersistedTranscriptBundle } from '@/lib/sessionApi';
 import {
   finalizeSession,
   FinalizeSessionError,
 } from '@/lib/sessionFinalization';
+import { logAction } from '@/lib/auditLog';
 
 export const POST = withRequestLogging(
   'sessions:finalize',
@@ -60,6 +62,7 @@ export const POST = withRequestLogging(
         finalizeSource,
       });
 
+      await invalidateSessionsApiCache(user.id);
       return NextResponse.json(result);
     } catch (error) {
       if (error instanceof FinalizeSessionError) {

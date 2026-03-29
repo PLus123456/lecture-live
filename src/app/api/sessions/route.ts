@@ -3,6 +3,15 @@ import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { withRequestLogging } from '@/lib/requestLogger';
+import { logAction } from '@/lib/auditLog';
+import {
+  API_RESPONSE_CACHE_TTL,
+  buildSessionsApiCacheKey,
+  getOrSetApiCache,
+  invalidateFoldersApiCache,
+  invalidateSessionsApiCache,
+} from '@/lib/apiResponseCache';
+import { jsonWithCache } from '@/lib/httpCache';
 import {
   normalizeLanguageCode,
   normalizeOptionalString,
@@ -20,62 +29,63 @@ export const GET = withRequestLogging('sessions:list', async (req: Request) => {
   const unarchived = url.searchParams.get('unarchived') === 'true';
   const folderId = url.searchParams.get('folderId');
 
-  const withCache = (data: unknown) => {
-    const response = NextResponse.json(data);
-    response.headers.set('Cache-Control', 'no-store');
-    return response;
-  };
+  const { value: payload } = await getOrSetApiCache(
+    buildSessionsApiCacheKey(user.id, url.searchParams),
+    API_RESPONSE_CACHE_TTL.sessions,
+    async () => {
+      if (unarchived) {
+        return prisma.session.findMany({
+          where: {
+            userId: user.id,
+            folders: { none: {} },
+          },
+          orderBy: { createdAt: 'desc' },
+        });
+      }
 
-  if (unarchived) {
-    // 返回不属于任何文件夹的 session
-    const sessions = await prisma.session.findMany({
-      where: {
-        userId: user.id,
-        folders: { none: {} },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-    return withCache(sessions);
-  }
+      if (folderId) {
+        return prisma.session.findMany({
+          where: {
+            userId: user.id,
+            folders: { some: { folderId } },
+          },
+          orderBy: { createdAt: 'desc' },
+        });
+      }
 
-  if (folderId) {
-    // 返回指定文件夹中的 session
-    const sessions = await prisma.session.findMany({
-      where: {
-        userId: user.id,
-        folders: { some: { folderId } },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-    return withCache(sessions);
-  }
+      const limitParam = url.searchParams.get('limit');
+      const cursor = url.searchParams.get('cursor');
+      const limit = limitParam
+        ? Math.min(Math.max(1, parseInt(limitParam, 10) || 50), 200)
+        : undefined;
 
-  // 支持分页：?limit=N&cursor=LAST_ID
-  const limitParam = url.searchParams.get('limit');
-  const cursor = url.searchParams.get('cursor');
-  const limit = limitParam ? Math.min(Math.max(1, parseInt(limitParam, 10) || 50), 200) : undefined;
+      const sessions = await prisma.session.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        ...(limit ? { take: limit + 1 } : {}),
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        include: {
+          folders: {
+            include: { folder: { select: { id: true, name: true } } },
+          },
+        },
+      });
 
-  const sessions = await prisma.session.findMany({
-    where: { userId: user.id },
-    orderBy: { createdAt: 'desc' },
-    ...(limit ? { take: limit + 1 } : {}),
-    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-    include: {
-      folders: {
-        include: { folder: { select: { id: true, name: true } } },
-      },
-    },
+      if (!limit) {
+        return sessions;
+      }
+
+      const hasMore = sessions.length > limit;
+      const items = hasMore ? sessions.slice(0, limit) : sessions;
+      const nextCursor = hasMore ? items[items.length - 1].id : null;
+      return { items, nextCursor };
+    }
+  );
+
+  return jsonWithCache(req, payload, {
+    cacheControl: 'private, no-cache, must-revalidate',
+    vary: ['Authorization', 'Cookie'],
   });
-
-  // 如果有分页参数，返回带 nextCursor 的响应
-  if (limit) {
-    const hasMore = sessions.length > limit;
-    const items = hasMore ? sessions.slice(0, limit) : sessions;
-    const nextCursor = hasMore ? items[items.length - 1].id : null;
-    return withCache({ items, nextCursor });
-  }
-
-  return withCache(sessions);
 });
 
 export const POST = withRequestLogging('sessions:create', async (req: Request) => {
@@ -150,6 +160,11 @@ export const POST = withRequestLogging('sessions:create', async (req: Request) =
           : {}),
       },
     });
+
+    await invalidateSessionsApiCache(user.id);
+    if (folderId) {
+      await invalidateFoldersApiCache(user.id);
+    }
 
     return NextResponse.json(session, { status: 201 });
   } catch (error) {

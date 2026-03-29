@@ -32,92 +32,19 @@ interface CloudreveTokenSet {
 /** 内存中的 token 缓存 */
 let tokenCache: CloudreveTokenSet | null = null;
 
-/** 内存中的 OAuth 配置缓存（从数据库加载后缓存） */
-let configCache: CloudreveOAuthConfig | null = null;
-let configCacheTime = 0;
-const CONFIG_CACHE_TTL_MS = 60_000;
-
-/* ------------------------------------------------------------------ */
-/*  配置解析：环境变量优先，数据库 siteSettings 兜底                      */
-/* ------------------------------------------------------------------ */
-
-function getConfigFromEnv(): CloudreveOAuthConfig | null {
-  const baseUrl = process.env.CLOUDREVE_BASE_URL?.trim();
-  const clientId = process.env.CLOUDREVE_CLIENT_ID?.trim();
-  const clientSecret = process.env.CLOUDREVE_CLIENT_SECRET?.trim();
-  if (baseUrl && clientId && clientSecret) {
-    return { baseUrl, clientId, clientSecret };
-  }
-  return null;
-}
-
-/**
- * 从数据库 siteSettings 读取 Cloudreve 配置（异步）
- */
-async function getConfigFromDb(): Promise<CloudreveOAuthConfig | null> {
-  try {
-    const { prisma } = await import('@/lib/prisma');
-    const keys = ['cloudreve_url', 'cloudreve_client_id', 'cloudreve_client_secret'];
-    const rows = await prisma.siteSetting.findMany({ where: { key: { in: keys } } });
-    const map = new Map(rows.map((r: { key: string; value: string }) => [r.key, r.value]));
-    const baseUrl = map.get('cloudreve_url')?.trim();
-    const clientId = map.get('cloudreve_client_id')?.trim();
-    const clientSecret = map.get('cloudreve_client_secret')?.trim();
-    if (baseUrl && clientId && clientSecret) {
-      return { baseUrl, clientId, clientSecret };
-    }
-  } catch {
-    // 数据库不可用时静默失败
-  }
-  return null;
-}
-
-/**
- * 解析 Cloudreve OAuth 配置（环境变量优先，数据库兜底，带缓存）
- */
-export async function resolveCloudreveConfig(): Promise<CloudreveOAuthConfig | null> {
-  // 环境变量优先
-  const envConfig = getConfigFromEnv();
-  if (envConfig) return envConfig;
-
-  // 内存缓存
-  if (configCache && Date.now() - configCacheTime < CONFIG_CACHE_TTL_MS) {
-    return configCache;
-  }
-
-  const dbConfig = await getConfigFromDb();
-  if (dbConfig) {
-    configCache = dbConfig;
-    configCacheTime = Date.now();
-  }
-  return dbConfig;
-}
-
-/**
- * 清除配置缓存（设置更新后调用）
- */
-export function invalidateCloudreveConfigCache() {
-  configCache = null;
-  configCacheTime = 0;
-}
-
 /* ------------------------------------------------------------------ */
 /*  公共判断函数                                                       */
 /* ------------------------------------------------------------------ */
 
 /**
- * 同步判断 Cloudreve 是否已通过环境变量配置（用于不方便 await 的场景）
+ * 判断 Cloudreve V4 OAuth 是否已配置（client_id + client_secret + base_url）
  */
 export function isCloudreveConfigured(): boolean {
-  return getConfigFromEnv() !== null;
-}
-
-/**
- * 异步判断 Cloudreve 是否已配置（环境变量或数据库）
- */
-export async function isCloudreveConfiguredAsync(): Promise<boolean> {
-  const config = await resolveCloudreveConfig();
-  return config !== null;
+  return Boolean(
+    process.env.CLOUDREVE_BASE_URL?.trim() &&
+      process.env.CLOUDREVE_CLIENT_ID?.trim() &&
+      process.env.CLOUDREVE_CLIENT_SECRET?.trim()
+  );
 }
 
 /**
@@ -259,16 +186,16 @@ export async function buildAuthorizeUrl(
   codeVerifier: string,
   scope = 'all'
 ): Promise<string> {
-  const config = await resolveCloudreveConfig();
-  if (!config) {
-    throw new Error('Cloudreve OAuth 未配置，请先设置 Cloudreve URL、Client ID、Client Secret');
+  if (!isCloudreveConfigured()) {
+    throw new Error('Cloudreve OAuth 未配置');
   }
 
-  const baseUrl = validateCloudreveBaseUrl(config.baseUrl);
+  const baseUrl = validateCloudreveBaseUrl(process.env.CLOUDREVE_BASE_URL!.trim());
+  const clientId = process.env.CLOUDREVE_CLIENT_ID!.trim();
   const codeChallenge = await generateCodeChallenge(codeVerifier);
 
   const params = new URLSearchParams({
-    client_id: config.clientId,
+    client_id: clientId,
     redirect_uri: redirectUri,
     response_type: 'code',
     scope,
@@ -287,14 +214,13 @@ export async function exchangeAuthorizationCode(
   redirectUri: string,
   codeVerifier: string
 ): Promise<CloudreveTokenSet> {
-  const config = await resolveCloudreveConfig();
-  if (!config) {
+  if (!isCloudreveConfigured()) {
     throw new Error('Cloudreve OAuth 未配置');
   }
 
-  const baseUrl = validateCloudreveBaseUrl(config.baseUrl);
-  const clientId = config.clientId;
-  const clientSecret = config.clientSecret;
+  const baseUrl = validateCloudreveBaseUrl(process.env.CLOUDREVE_BASE_URL!.trim());
+  const clientId = process.env.CLOUDREVE_CLIENT_ID!.trim();
+  const clientSecret = process.env.CLOUDREVE_CLIENT_SECRET!.trim();
 
   const response = await fetch(`${baseUrl}/api/v4/session/oauth/token`, {
     method: 'POST',
@@ -407,19 +333,6 @@ function assertApiSuccess<T>(result: CloudreveApiResponse<T>, action: string): T
 export class CloudreveStorage {
   private config: CloudreveOAuthConfig;
 
-  /**
-   * 构造函数：优先用环境变量，也接受外部传入配置
-   */
-  constructor(overrideConfig?: CloudreveOAuthConfig) {
-    if (overrideConfig) {
-      this.config = {
-        baseUrl: validateCloudreveBaseUrl(overrideConfig.baseUrl),
-        clientId: overrideConfig.clientId,
-        clientSecret: overrideConfig.clientSecret,
-      };
-      return;
-    }
-
     // 尝试从环境变量读取
     const envConfig = getConfigFromEnv();
     if (envConfig) {
@@ -444,6 +357,107 @@ export class CloudreveStorage {
       throw new Error('Cloudreve is not configured');
     }
     return new CloudreveStorage(config);
+  }
+
+  /**
+   * 获取有效的 access_token，必要时自动从数据库恢复或刷新
+   */
+  private async getAccessToken(): Promise<string> {
+    // 缓存中有且未过期（预留 60s 缓冲）
+    if (tokenCache && tokenCache.expiresAt > Date.now() + 60_000) {
+      return tokenCache.accessToken;
+    }
+
+    // 有 refresh_token 则刷新
+    if (tokenCache?.refreshToken) {
+      const refreshed = await refreshAccessToken(
+        this.config.baseUrl,
+        tokenCache.refreshToken
+      );
+      // 触发异步持久化（不阻塞当前请求）
+      this.persistTokensAsync(refreshed);
+      return refreshed.accessToken;
+    }
+
+    // 尝试从数据库恢复 token
+    await this.loadTokensFromDb();
+
+    if (tokenCache && tokenCache.expiresAt > Date.now() + 60_000) {
+      return tokenCache.accessToken;
+    }
+
+    if (tokenCache?.refreshToken) {
+      const refreshed = await refreshAccessToken(
+        this.config.baseUrl,
+        tokenCache.refreshToken
+      );
+      this.persistTokensAsync(refreshed);
+      return refreshed.accessToken;
+    }
+
+    throw new Error(
+      'Cloudreve 未授权：请在管理面板完成 OAuth 授权'
+    );
+  }
+
+  /**
+   * 异步将刷新后的 token 持久化到数据库
+   */
+  private persistTokensAsync(tokens: CloudreveTokenSet) {
+    // 动态导入避免循环依赖
+    import('@/lib/prisma').then(({ prisma }) => {
+      const entries = [
+        { key: 'cloudreve_access_token', value: tokens.accessToken },
+        { key: 'cloudreve_refresh_token', value: tokens.refreshToken },
+        { key: 'cloudreve_token_expires_at', value: String(tokens.expiresAt) },
+      ];
+      return prisma.$transaction(
+        entries.map((entry) =>
+          prisma.siteSetting.upsert({
+            where: { key: entry.key },
+            update: { value: entry.value },
+            create: entry,
+          })
+        )
+      );
+    }).catch((err) => {
+      console.error('[Cloudreve] token 持久化失败:', err);
+    });
+  }
+
+  /**
+   * 从数据库加载 token 到内存缓存
+   */
+  private async loadTokensFromDb(): Promise<void> {
+    try {
+      const { prisma } = await import('@/lib/prisma');
+      const keys = ['cloudreve_access_token', 'cloudreve_refresh_token', 'cloudreve_token_expires_at'];
+      const rows = await prisma.siteSetting.findMany({
+        where: { key: { in: keys } },
+      });
+
+      const map = new Map(rows.map((r: { key: string; value: string }) => [r.key, r.value]));
+      const accessToken = map.get('cloudreve_access_token');
+      const refreshToken = map.get('cloudreve_refresh_token');
+      const expiresAt = map.get('cloudreve_token_expires_at');
+
+      if (refreshToken) {
+        tokenCache = {
+          accessToken: accessToken ?? '',
+          refreshToken,
+          expiresAt: expiresAt ? Number(expiresAt) : 0,
+        };
+      }
+    } catch (err) {
+      console.error('[Cloudreve] 从数据库恢复 token 失败:', err);
+    }
+  }
+
+    this.config = {
+      baseUrl: validateCloudreveBaseUrl(process.env.CLOUDREVE_BASE_URL!.trim()),
+      clientId: process.env.CLOUDREVE_CLIENT_ID!.trim(),
+      clientSecret: process.env.CLOUDREVE_CLIENT_SECRET!.trim(),
+    };
   }
 
   /**

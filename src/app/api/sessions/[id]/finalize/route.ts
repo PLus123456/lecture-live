@@ -8,6 +8,7 @@ import {
   finalizeSession,
   FinalizeSessionError,
 } from '@/lib/sessionFinalization';
+import { logAction } from '@/lib/auditLog';
 
 export const POST = withRequestLogging(
   'sessions:finalize',

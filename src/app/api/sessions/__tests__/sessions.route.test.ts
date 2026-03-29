@@ -30,6 +30,10 @@ vi.mock('@/lib/requestLogger', () => ({
   ) => handler,
 }));
 
+vi.mock('@/lib/auditLog', () => ({
+  logAction: vi.fn(),
+}));
+
 vi.mock('@/lib/prisma', () => ({
   prisma: {
     session: {

@@ -3,6 +3,7 @@ import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { withRequestLogging } from '@/lib/requestLogger';
+import { logAction } from '@/lib/auditLog';
 import {
   API_RESPONSE_CACHE_TTL,
   buildSessionsApiCacheKey,

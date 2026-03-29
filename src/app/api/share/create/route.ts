@@ -11,6 +11,7 @@ import {
 } from '@/lib/apiResponseCache';
 import { jsonWithCache } from '@/lib/httpCache';
 import { assertOwnership, parsePositiveInteger, sanitizeTextInput } from '@/lib/security';
+import { logAction } from '@/lib/auditLog';
 
 const MAX_SHARE_HOURS = 24 * 7;
 
@@ -178,6 +179,13 @@ export async function POST(req: Request) {
     const appBaseUrl = process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, '') || new URL(req.url).origin;
     await invalidateShareLinksApiCache(user.id);
 
+    if (!existingLiveLink) {
+      logAction(req, 'share.create', {
+        user,
+        detail: `${session.title} (${sessionId}), live=${isLive}`,
+      });
+    }
+
     return NextResponse.json(
       {
         id: shareLink.id,
@@ -248,6 +256,11 @@ export async function DELETE(req: Request) {
       },
     });
     await invalidateShareLinksApiCache(user.id);
+
+    logAction(req, 'share.revoke', {
+      user,
+      detail: `${session!.title} (${sessionId})`,
+    });
 
     return NextResponse.json({ success: true });
   } catch (error) {

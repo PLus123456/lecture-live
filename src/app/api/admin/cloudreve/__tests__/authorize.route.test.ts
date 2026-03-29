@@ -37,6 +37,7 @@ import { GET } from '@/app/api/admin/cloudreve/authorize/route';
 
 describe('GET /api/admin/cloudreve/authorize', () => {
   beforeEach(() => {
+    siteSettingUpsertMock.mockReset();
     requireAdminAccessMock.mockResolvedValue({
       user: {
         id: 'admin-1',
@@ -63,13 +64,45 @@ describe('GET /api/admin/cloudreve/authorize', () => {
       authorize_url: 'https://cloud.example.com/session/authorize?client_id=client-1',
     });
     expect(isCloudreveConfiguredAsyncMock).toHaveBeenCalledTimes(1);
-    expect(siteSettingUpsertMock).toHaveBeenCalledWith({
+    const redirectUri = buildAuthorizeUrlMock.mock.calls[0]?.[0];
+    expect(redirectUri).toMatch(/\/api\/admin\/cloudreve\/callback$/);
+    expect(siteSettingUpsertMock).toHaveBeenNthCalledWith(1, {
       where: { key: 'cloudreve_code_verifier' },
       update: { value: 'verifier-123' },
       create: { key: 'cloudreve_code_verifier', value: 'verifier-123' },
     });
+    expect(siteSettingUpsertMock).toHaveBeenNthCalledWith(2, {
+      where: { key: 'cloudreve_redirect_uri' },
+      update: { value: redirectUri },
+      create: {
+        key: 'cloudreve_redirect_uri',
+        value: redirectUri,
+      },
+    });
+    expect(buildAuthorizeUrlMock).toHaveBeenCalledWith(redirectUri, 'verifier-123');
+  });
+
+  it('优先使用当前访问域名生成 Cloudreve 回调地址', async () => {
+    const response = await GET(
+      new Request('http://127.0.0.1:3000/api/admin/cloudreve/authorize', {
+        headers: {
+          host: 'lecture.example.com',
+          'x-forwarded-proto': 'https',
+        },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(siteSettingUpsertMock).toHaveBeenNthCalledWith(2, {
+      where: { key: 'cloudreve_redirect_uri' },
+      update: { value: 'https://lecture.example.com/api/admin/cloudreve/callback' },
+      create: {
+        key: 'cloudreve_redirect_uri',
+        value: 'https://lecture.example.com/api/admin/cloudreve/callback',
+      },
+    });
     expect(buildAuthorizeUrlMock).toHaveBeenCalledWith(
-      'http://localhost:3000/api/admin/cloudreve/callback',
+      'https://lecture.example.com/api/admin/cloudreve/callback',
       'verifier-123'
     );
   });

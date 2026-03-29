@@ -3,6 +3,7 @@ import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { withRequestLogging } from '@/lib/requestLogger';
+import { logAction } from '@/lib/auditLog';
 import {
   normalizeLanguageCode,
   normalizeOptionalString,
@@ -149,6 +150,11 @@ export const POST = withRequestLogging('sessions:create', async (req: Request) =
           ? { folders: { create: { folderId } } }
           : {}),
       },
+    });
+
+    logAction(req, 'session.create', {
+      user,
+      detail: `${title} (${session.id})`,
     });
 
     return NextResponse.json(session, { status: 201 });

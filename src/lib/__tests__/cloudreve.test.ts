@@ -5,7 +5,8 @@ import {
   buildAuthorizeUrl,
   clearCachedTokens,
   exchangeAuthorizationCode,
-  isCloudreveConfigured,
+  invalidateCloudreveConfigCache,
+  isCloudreveConfiguredAsync,
 } from '@/lib/storage/cloudreve';
 
 vi.mock('@/lib/siteSettings', () => ({
@@ -73,6 +74,7 @@ describe('Cloudreve OAuth 配置', () => {
     delete process.env.CLOUDREVE_CLIENT_SECRET;
     mockedGetSiteSettings.mockReset();
     clearCachedTokens();
+    invalidateCloudreveConfigCache();
   });
 
   afterEach(() => {
@@ -95,12 +97,13 @@ describe('Cloudreve OAuth 配置', () => {
     }
 
     clearCachedTokens();
+    invalidateCloudreveConfigCache();
   });
 
   it('在环境变量缺失时会读取后台保存的 Cloudreve 配置', async () => {
     mockedGetSiteSettings.mockResolvedValue(createSiteSettings());
 
-    await expect(isCloudreveConfigured()).resolves.toBe(true);
+    await expect(isCloudreveConfiguredAsync()).resolves.toBe(true);
   });
 
   it('生成符合 Cloudreve V4 文档的授权 URL', async () => {

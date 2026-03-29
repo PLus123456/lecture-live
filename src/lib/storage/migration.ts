@@ -6,7 +6,7 @@ import path from 'path';
 import { prisma } from '@/lib/prisma';
 import {
   CloudreveStorage,
-  isCloudreveConfigured,
+  isCloudreveConfiguredAsync,
   type StorageCategory,
 } from '@/lib/storage/cloudreve';
 
@@ -65,11 +65,11 @@ async function fileExists(filePath: string): Promise<boolean> {
  * 将所有仅存在于本地的文件迁移上传到 Cloudreve，并更新数据库引用
  */
 export async function migrateLocalToCloudreve(): Promise<MigrationResult> {
-  if (!(await isCloudreveConfigured())) {
+  if (!(await isCloudreveConfiguredAsync())) {
     return { migratedCount: 0, skippedCount: 0, errorCount: 0, errors: ['Cloudreve 未配置'] };
   }
 
-  const storage = new CloudreveStorage();
+  const storage = await CloudreveStorage.create();
   const result: MigrationResult = {
     migratedCount: 0,
     skippedCount: 0,

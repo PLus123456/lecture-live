@@ -31,24 +31,95 @@ interface CloudreveTokenSet {
   expiresAt: number;
 }
 
-interface CloudreveOAuthConfigSource {
-  baseUrl: string;
-  clientId: string;
-  clientSecret: string;
-}
-
 /** 内存中的 token 缓存 */
 let tokenCache: CloudreveTokenSet | null = null;
+
+/** 内存中的 OAuth 配置缓存（从数据库加载后缓存） */
+let configCache: CloudreveOAuthConfig | null = null;
+let configCacheTime = 0;
+const CONFIG_CACHE_TTL_MS = 60_000;
+
+/* ------------------------------------------------------------------ */
+/*  配置解析：环境变量优先，数据库 siteSettings 兜底                      */
+/* ------------------------------------------------------------------ */
+
+function getConfigFromEnv(): CloudreveOAuthConfig | null {
+  const baseUrl = process.env.CLOUDREVE_BASE_URL?.trim();
+  const clientId = process.env.CLOUDREVE_CLIENT_ID?.trim();
+  const clientSecret = process.env.CLOUDREVE_CLIENT_SECRET?.trim();
+  if (baseUrl && clientId && clientSecret) {
+    return { baseUrl, clientId, clientSecret };
+  }
+  return null;
+}
+
+async function getConfigFromDb(): Promise<CloudreveOAuthConfig | null> {
+  try {
+    const settings = await getSiteSettings();
+    const baseUrl = settings.cloudreve_url?.trim();
+    const clientId = settings.cloudreve_client_id?.trim();
+    const clientSecret = settings.cloudreve_client_secret?.trim();
+
+    if (
+      settings.storage_mode === 'cloudreve' &&
+      baseUrl &&
+      clientId &&
+      clientSecret
+    ) {
+      return { baseUrl, clientId, clientSecret };
+    }
+  } catch {
+    // 数据库不可用时静默失败
+  }
+  return null;
+}
+
+/**
+ * 解析 Cloudreve OAuth 配置（环境变量优先，数据库兜底，带缓存）
+ */
+export async function resolveCloudreveConfig(): Promise<CloudreveOAuthConfig | null> {
+  // 环境变量优先
+  const envConfig = getConfigFromEnv();
+  if (envConfig) return envConfig;
+
+  // 内存缓存
+  if (configCache && Date.now() - configCacheTime < CONFIG_CACHE_TTL_MS) {
+    return configCache;
+  }
+
+  const dbConfig = await getConfigFromDb();
+  if (dbConfig) {
+    configCache = dbConfig;
+    configCacheTime = Date.now();
+  }
+  return dbConfig;
+}
+
+/**
+ * 清除配置缓存（设置更新后调用）
+ */
+export function invalidateCloudreveConfigCache() {
+  configCache = null;
+  configCacheTime = 0;
+}
 
 /* ------------------------------------------------------------------ */
 /*  公共判断函数                                                       */
 /* ------------------------------------------------------------------ */
 
 /**
- * 判断 Cloudreve V4 OAuth 是否已配置（client_id + client_secret + base_url）
+ * 同步判断 Cloudreve 是否已通过环境变量配置（用于不方便 await 的场景）
  */
-export async function isCloudreveConfigured(): Promise<boolean> {
-  return Boolean(await resolveCloudreveOAuthConfigSource());
+export function isCloudreveConfigured(): boolean {
+  return getConfigFromEnv() !== null;
+}
+
+/**
+ * 异步判断 Cloudreve 是否已配置（环境变量或数据库）
+ */
+export async function isCloudreveConfiguredAsync(): Promise<boolean> {
+  const config = await resolveCloudreveConfig();
+  return config !== null;
 }
 
 /**
@@ -154,57 +225,6 @@ function validateRemotePath(
   return `/${userId}/${category}/${fileName}`;
 }
 
-function trimConfigValue(value: string | null | undefined): string {
-  return value?.trim() ?? '';
-}
-
-async function resolveCloudreveOAuthConfigSource(): Promise<CloudreveOAuthConfigSource | null> {
-  const envConfig = {
-    baseUrl: trimConfigValue(process.env.CLOUDREVE_BASE_URL),
-    clientId: trimConfigValue(process.env.CLOUDREVE_CLIENT_ID),
-    clientSecret: trimConfigValue(process.env.CLOUDREVE_CLIENT_SECRET),
-  };
-
-  if (envConfig.baseUrl && envConfig.clientId && envConfig.clientSecret) {
-    return envConfig;
-  }
-
-  try {
-    const settings = await getSiteSettings();
-    const siteConfig = {
-      baseUrl: trimConfigValue(settings.cloudreve_url),
-      clientId: trimConfigValue(settings.cloudreve_client_id),
-      clientSecret: trimConfigValue(settings.cloudreve_client_secret),
-    };
-
-    if (
-      settings.storage_mode === 'cloudreve' &&
-      siteConfig.baseUrl &&
-      siteConfig.clientId &&
-      siteConfig.clientSecret
-    ) {
-      return siteConfig;
-    }
-  } catch {
-    return null;
-  }
-
-  return null;
-}
-
-async function getCloudreveOAuthConfig(): Promise<CloudreveOAuthConfig> {
-  const source = await resolveCloudreveOAuthConfigSource();
-  if (!source) {
-    throw new Error('Cloudreve OAuth 未配置');
-  }
-
-  return {
-    baseUrl: validateCloudreveBaseUrl(source.baseUrl),
-    clientId: source.clientId,
-    clientSecret: source.clientSecret,
-  };
-}
-
 function normalizeCloudreveScope(scope: string): string {
   return scope.split(/\s+/).filter(Boolean).join(' ');
 }
@@ -276,11 +296,16 @@ export async function buildAuthorizeUrl(
   codeVerifier: string,
   scope = DEFAULT_CLOUDREVE_OAUTH_SCOPE
 ): Promise<string> {
-  const { baseUrl, clientId } = await getCloudreveOAuthConfig();
+  const config = await resolveCloudreveConfig();
+  if (!config) {
+    throw new Error('Cloudreve OAuth 未配置，请先设置 Cloudreve URL、Client ID、Client Secret');
+  }
+
+  const baseUrl = validateCloudreveBaseUrl(config.baseUrl);
   const codeChallenge = await generateCodeChallenge(codeVerifier);
 
   const params = new URLSearchParams({
-    client_id: clientId,
+    client_id: config.clientId,
     redirect_uri: redirectUri,
     response_type: 'code',
     scope: normalizeCloudreveScope(scope),
@@ -299,7 +324,14 @@ export async function exchangeAuthorizationCode(
   redirectUri: string,
   codeVerifier: string
 ): Promise<CloudreveTokenSet> {
-  const { baseUrl, clientId, clientSecret } = await getCloudreveOAuthConfig();
+  const config = await resolveCloudreveConfig();
+  if (!config) {
+    throw new Error('Cloudreve OAuth 未配置');
+  }
+
+  const baseUrl = validateCloudreveBaseUrl(config.baseUrl);
+  const clientId = config.clientId;
+  const clientSecret = config.clientSecret;
 
   const response = await fetch(`${baseUrl}/api/v4/session/oauth/token`, {
     method: 'POST',
@@ -410,14 +442,62 @@ function assertApiSuccess<T>(result: CloudreveApiResponse<T>, action: string): T
 /* ------------------------------------------------------------------ */
 
 export class CloudreveStorage {
-  private config: CloudreveOAuthConfig | null = null;
+  private config: CloudreveOAuthConfig;
+
+  /**
+   * 构造函数：优先用环境变量，也接受外部传入配置
+   */
+  constructor(overrideConfig?: CloudreveOAuthConfig) {
+    if (overrideConfig) {
+      this.config = {
+        baseUrl: validateCloudreveBaseUrl(overrideConfig.baseUrl),
+        clientId: overrideConfig.clientId,
+        clientSecret: overrideConfig.clientSecret,
+      };
+      return;
+    }
+
+    // 尝试从环境变量读取
+    const envConfig = getConfigFromEnv();
+    if (envConfig) {
+      this.config = {
+        baseUrl: validateCloudreveBaseUrl(envConfig.baseUrl),
+        clientId: envConfig.clientId,
+        clientSecret: envConfig.clientSecret,
+      };
+      return;
+    }
+
+    // 同步路径无法读数据库，用占位符；实际调用 API 前会通过 create() 初始化
+    this.config = { baseUrl: '', clientId: '', clientSecret: '' };
+  }
+
+  /**
+   * 异步工厂方法：从环境变量或数据库解析配置后创建实例
+   */
+  static async create(): Promise<CloudreveStorage> {
+    const config = await resolveCloudreveConfig();
+    if (!config) {
+      throw new Error('Cloudreve is not configured');
+    }
+    return new CloudreveStorage(config);
+  }
 
   private async getConfig(): Promise<CloudreveOAuthConfig> {
-    if (this.config) {
+    if (this.config.baseUrl) {
       return this.config;
     }
 
-    this.config = await getCloudreveOAuthConfig();
+    const config = await resolveCloudreveConfig();
+    if (!config) {
+      throw new Error('Cloudreve is not configured');
+    }
+
+    this.config = {
+      baseUrl: validateCloudreveBaseUrl(config.baseUrl),
+      clientId: config.clientId,
+      clientSecret: config.clientSecret,
+    };
     return this.config;
   }
 

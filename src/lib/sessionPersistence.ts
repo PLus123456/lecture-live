@@ -3,7 +3,6 @@ import path from 'path';
 import type { Session } from '@prisma/client';
 import {
   CloudreveStorage,
-  isCloudreveConfigured,
   type StorageCategory,
 } from '@/lib/storage/cloudreve';
 
@@ -123,6 +122,14 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
+async function getCloudreveStorageIfConfigured(): Promise<CloudreveStorage | null> {
+  try {
+    return await CloudreveStorage.create();
+  } catch {
+    return null;
+  }
+}
+
 function parseLocalReference(
   category: StorageCategory,
   reference: string,
@@ -152,7 +159,7 @@ async function readArtifactFromReference(
   category: StorageCategory,
   reference: string | null | undefined
 ): Promise<Buffer | null> {
-  const cloudreve = (await isCloudreveConfigured()) ? new CloudreveStorage() : null;
+  let cloudreve: CloudreveStorage | null | undefined;
   const defaultCandidates =
     category === 'recordings'
       ? [
@@ -180,7 +187,15 @@ async function readArtifactFromReference(
       continue;
     }
 
-    if (cloudreve && candidate.startsWith('/')) {
+    if (candidate.startsWith('/')) {
+      if (cloudreve === undefined) {
+        cloudreve = await getCloudreveStorageIfConfigured();
+      }
+
+      if (!cloudreve) {
+        continue;
+      }
+
       try {
         return await cloudreve.downloadByRemotePath(candidate, session.userId);
       } catch {
@@ -218,11 +233,10 @@ async function persistArtifact(
   await fs.writeFile(buildLocalArtifactPath(category, fileName), data);
 
   const localReference = buildLocalArtifactReference(category, fileName);
-  if (!(await isCloudreveConfigured())) {
+  const storage = await getCloudreveStorageIfConfigured();
+  if (!storage) {
     return { path: localReference, storage: 'local' };
   }
-
-  const storage = new CloudreveStorage();
   const remotePath = await storage.upload(session.userId, category, fileName, data);
   return { path: remotePath, storage: 'cloudreve' };
 }

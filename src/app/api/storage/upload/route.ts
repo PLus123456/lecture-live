@@ -93,7 +93,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Access denied' }, { status: 403 });
     }
 
-    const storage = new CloudreveStorage();
+    const storage = await CloudreveStorage.create();
     const data = Buffer.from(await file.arrayBuffer());
     const remotePath = await storage.upload(user.id, category, fileName, data);
 

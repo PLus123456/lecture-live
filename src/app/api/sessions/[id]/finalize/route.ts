@@ -7,6 +7,7 @@ import {
   finalizeSession,
   FinalizeSessionError,
 } from '@/lib/sessionFinalization';
+import { logAction } from '@/lib/auditLog';
 
 export const POST = withRequestLogging(
   'sessions:finalize',
@@ -58,6 +59,11 @@ export const POST = withRequestLogging(
         clientTitle,
         allowStatusPromotion: true,
         finalizeSource,
+      });
+
+      logAction(req, 'session.finalize', {
+        user,
+        detail: `${clientTitle || id} (${finalizeSource})`,
       });
 
       return NextResponse.json(result);

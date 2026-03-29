@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { sanitizeToken } from '@/lib/security';
+import { logAction } from '@/lib/auditLog';
 
 const LIVE_VIEWABLE_STATUSES = new Set([
   'CREATED',
@@ -109,6 +110,10 @@ export async function GET(
       );
     }
   }
+
+  logAction(req, 'share.view', {
+    detail: `${link.session.title} (${link.sessionId})`,
+  });
 
   return secureResponse({
     sessionId: link.sessionId,

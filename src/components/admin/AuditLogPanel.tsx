@@ -16,6 +16,10 @@ import {
   Server,
   Bot,
   Activity,
+  Mic,
+  MicOff,
+  Share2,
+  Eye,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
@@ -43,6 +47,11 @@ function getActionMeta(action: string): {
   color: string;
   bg: string;
 } {
+  if (action === 'session.create') return { icon: Mic, color: '#059669', bg: '#d1fae5' };
+  if (action === 'session.finalize') return { icon: MicOff, color: '#d97706', bg: '#fef3c7' };
+  if (action === 'share.create') return { icon: Share2, color: '#2563eb', bg: '#dbeafe' };
+  if (action === 'share.revoke') return { icon: Share2, color: '#dc2626', bg: '#fee2e2' };
+  if (action === 'share.view') return { icon: Eye, color: '#8b5cf6', bg: '#f3e8ff' };
   if (action.startsWith('user.login')) {
     return action.includes('failed')
       ? { icon: LogIn, color: '#d97706', bg: '#fef3c7' }
@@ -62,6 +71,9 @@ function getActionMeta(action: string): {
 // 操作类型筛选选项
 const ACTION_FILTERS = [
   { value: '', label: 'auditLog.allActions' },
+  { value: 'session.create', label: 'auditLog.sessionCreate' },
+  { value: 'session.finalize', label: 'auditLog.sessionFinalize' },
+  { value: 'share', label: 'auditLog.share' },
   { value: 'user.login', label: 'auditLog.login' },
   { value: 'user.logout', label: 'auditLog.logout' },
   { value: 'user.register', label: 'auditLog.register' },
@@ -147,6 +159,11 @@ export default function AuditLogPanel() {
   // 获取操作的可读名称
   const getActionLabel = (action: string) => {
     const map: Record<string, string> = {
+      'session.create': t('auditLog.sessionCreate'),
+      'session.finalize': t('auditLog.sessionFinalize'),
+      'share.create': t('auditLog.shareCreate'),
+      'share.revoke': t('auditLog.shareRevoke'),
+      'share.view': t('auditLog.shareView'),
       'user.login': t('auditLog.login'),
       'user.login.failed': t('auditLog.loginFailed'),
       'user.logout': t('auditLog.logout'),

@@ -30,6 +30,10 @@ vi.mock('@/lib/requestLogger', () => ({
   ) => handler,
 }));
 
+vi.mock('@/lib/auditLog', () => ({
+  logAction: vi.fn(),
+}));
+
 vi.mock('@/lib/prisma', () => ({
   prisma: {
     session: {
@@ -67,7 +71,10 @@ describe('sessions route', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(response.headers.get('Cache-Control')).toBe(
+      'private, no-cache, must-revalidate'
+    );
+    expect(response.headers.get('ETag')).toBeTruthy();
     await expect(
       readJson<{
         items: Array<{ id: string; title: string }>;
@@ -86,6 +93,28 @@ describe('sessions route', () => {
         take: 3,
       })
     );
+  });
+
+  it('命中 ETag 时返回 304', async () => {
+    sessionFindManyMock.mockResolvedValue([
+      { id: 'session-1', title: 'First' },
+    ]);
+
+    const firstResponse = await GET(
+      createJsonRequest('http://localhost:3000/api/sessions'),
+      {} as never
+    );
+    const etag = firstResponse.headers.get('ETag');
+
+    const response = await GET(
+      createJsonRequest('http://localhost:3000/api/sessions', {
+        headers: { 'If-None-Match': etag ?? '' },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(304);
+    await expect(response.text()).resolves.toBe('');
   });
 
   it('创建会话时校验文件夹归属并规范化字段', async () => {

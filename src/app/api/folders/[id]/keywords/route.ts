@@ -2,6 +2,7 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { invalidateFoldersApiCache } from '@/lib/apiResponseCache';
 import {
   getFolderKeywords,
   addManualKeyword,
@@ -69,6 +70,7 @@ export async function POST(
   }
 
   const result = await addManualKeyword(id, keyword);
+  await invalidateFoldersApiCache(user.id);
   return NextResponse.json(result, { status: 201 });
 }
 
@@ -94,5 +96,6 @@ export async function DELETE(
   }
 
   await removeKeyword(id, keyword);
+  await invalidateFoldersApiCache(user.id);
   return NextResponse.json({ success: true });
 }

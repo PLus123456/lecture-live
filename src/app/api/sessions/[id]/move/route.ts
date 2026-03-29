@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { invalidateLibraryApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership } from '@/lib/security';
 
 /**
@@ -65,6 +66,8 @@ export async function POST(
       });
     }
   });
+
+  await invalidateLibraryApiCache(user.id);
 
   return NextResponse.json({
     success: true,

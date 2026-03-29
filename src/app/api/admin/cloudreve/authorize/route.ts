@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import {
-  isCloudreveConfiguredAsync,
+  isCloudreveConfigured,
   buildAuthorizeUrl,
   generateCodeVerifier,
 } from '@/lib/storage/cloudreve';
@@ -19,9 +19,9 @@ export async function GET(req: Request) {
   });
   if (response) return response;
 
-  if (!(await isCloudreveConfiguredAsync())) {
+  if (!isCloudreveConfigured()) {
     return NextResponse.json(
-      { error: 'Cloudreve OAuth 未配置，请先设置 Cloudreve URL、Client ID、Client Secret' },
+      { error: 'Cloudreve OAuth 未配置，请先设置 CLOUDREVE_BASE_URL、CLOUDREVE_CLIENT_ID、CLOUDREVE_CLIENT_SECRET' },
       { status: 400 }
     );
   }

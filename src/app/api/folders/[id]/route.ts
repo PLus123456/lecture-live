@@ -2,6 +2,12 @@ import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import {
+  API_RESPONSE_CACHE_TTL,
+  buildFoldersApiCacheKey,
+  getOrSetApiCache,
+  invalidateFoldersApiCache,
+} from '@/lib/apiResponseCache';
+import {
   ensureFolderParentOwnership,
   getOwnedFolder,
   listFoldersForUser,
@@ -9,6 +15,7 @@ import {
   normalizeFolderName,
   validateFolderMove,
 } from '@/lib/folders';
+import { jsonWithCache } from '@/lib/httpCache';
 
 function folderNotFound() {
   return NextResponse.json({ error: 'Folder not found' }, { status: 404 });
@@ -24,15 +31,21 @@ export async function GET(
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const folder = await getOwnedFolder(id, user.id);
-  if (!folder) {
+  const { value: folderList } = await getOrSetApiCache(
+    buildFoldersApiCacheKey(user.id),
+    API_RESPONSE_CACHE_TTL.folders,
+    () => listFoldersForUser(user.id)
+  );
+  const detail = folderList.find((item) => item.id === id);
+
+  if (!detail) {
     return folderNotFound();
   }
 
-  const folderList = await listFoldersForUser(user.id);
-  const detail = folderList.find((item) => item.id === folder.id);
-
-  return NextResponse.json(detail ?? folder);
+  return jsonWithCache(req, detail, {
+    cacheControl: 'private, no-cache, must-revalidate',
+    vary: ['Authorization', 'Cookie'],
+  });
 }
 
 export async function PATCH(
@@ -101,6 +114,7 @@ export async function PATCH(
       },
     });
 
+    await invalidateFoldersApiCache(user.id);
     const folderList = await listFoldersForUser(user.id);
     const detail = folderList.find((item) => item.id === updated.id);
     return NextResponse.json(detail ?? { id: updated.id });
@@ -144,6 +158,7 @@ export async function DELETE(
     await prisma.folder.delete({
       where: { id: folder.id },
     });
+    await invalidateFoldersApiCache(user.id);
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error('Delete folder error:', error);

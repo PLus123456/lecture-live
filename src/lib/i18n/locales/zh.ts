@@ -748,6 +748,12 @@ export default {
   auditLog: {
     searchPlaceholder: '搜索用户名、IP 或详情...',
     allActions: '全部操作',
+    sessionCreate: '开始录音',
+    sessionFinalize: '结束录音',
+    share: '分享',
+    shareCreate: '创建分享链接',
+    shareRevoke: '撤销分享链接',
+    shareView: '访问分享链接',
     login: '用户登录',
     loginFailed: '登录失败',
     logout: '用户登出',

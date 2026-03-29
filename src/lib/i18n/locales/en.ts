@@ -760,6 +760,12 @@ export default {
   auditLog: {
     searchPlaceholder: 'Search by username, IP or details...',
     allActions: 'All Actions',
+    sessionCreate: 'Start Recording',
+    sessionFinalize: 'End Recording',
+    share: 'Share',
+    shareCreate: 'Create Share Link',
+    shareRevoke: 'Revoke Share Link',
+    shareView: 'View Share Link',
     login: 'User Login',
     loginFailed: 'Login Failed',
     logout: 'User Logout',

@@ -1,6 +1,10 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import {
+  invalidateFoldersApiCache,
+  invalidateSessionsApiCache,
+} from '@/lib/apiResponseCache';
 import { assertOwnership } from '@/lib/security';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { callLLM } from '@/lib/llm/gateway';
@@ -110,6 +114,10 @@ export async function POST(
         summaryPath: stored.summary.path,
       },
     });
+    await Promise.all([
+      invalidateSessionsApiCache(user.id),
+      invalidateFoldersApiCache(user.id),
+    ]);
 
     // 转录稿已永久保存，删除草稿临时文件
     try {

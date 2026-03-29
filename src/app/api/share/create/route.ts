@@ -3,6 +3,13 @@ import { randomBytes } from 'crypto';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { enforceRateLimit } from '@/lib/rateLimit';
+import {
+  API_RESPONSE_CACHE_TTL,
+  buildShareLinksApiCacheKey,
+  getOrSetApiCache,
+  invalidateShareLinksApiCache,
+} from '@/lib/apiResponseCache';
+import { jsonWithCache } from '@/lib/httpCache';
 import { assertOwnership, parsePositiveInteger, sanitizeTextInput } from '@/lib/security';
 
 const MAX_SHARE_HOURS = 24 * 7;
@@ -36,35 +43,47 @@ export async function GET(req: Request) {
   }
 
   try {
-    const shareLinks = await prisma.shareLink.findMany({
-      where: { createdBy: user.id },
-      include: {
-        session: {
-          select: {
-            id: true,
-            title: true,
-            status: true,
-            createdAt: true,
-            sourceLang: true,
-            targetLang: true,
+    const { value: payload } = await getOrSetApiCache(
+      buildShareLinksApiCacheKey(user.id),
+      API_RESPONSE_CACHE_TTL.shareLinks,
+      async () => {
+        const shareLinks = await prisma.shareLink.findMany({
+          where: { createdBy: user.id },
+          include: {
+            session: {
+              select: {
+                id: true,
+                title: true,
+                status: true,
+                createdAt: true,
+                sourceLang: true,
+                targetLang: true,
+              },
+            },
           },
-        },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+          orderBy: { createdAt: 'desc' },
+        });
 
-    const appBaseUrl = process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, '') || new URL(req.url).origin;
-    return NextResponse.json(
-      shareLinks.map((link) => ({
-        id: link.id,
-        token: link.token,
-        isLive: link.isLive,
-        expiresAt: link.expiresAt,
-        createdAt: link.createdAt,
-        url: `${appBaseUrl}/session/${link.sessionId}/view?token=${link.token}`,
-        session: link.session,
-      }))
+        const appBaseUrl =
+          process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, '') ||
+          new URL(req.url).origin;
+
+        return shareLinks.map((link) => ({
+          id: link.id,
+          token: link.token,
+          isLive: link.isLive,
+          expiresAt: link.expiresAt,
+          createdAt: link.createdAt,
+          url: `${appBaseUrl}/session/${link.sessionId}/view?token=${link.token}`,
+          session: link.session,
+        }));
+      }
     );
+
+    return jsonWithCache(req, payload, {
+      cacheControl: 'private, no-cache, must-revalidate',
+      vary: ['Authorization', 'Cookie'],
+    });
   } catch (error) {
     console.error('List share links error:', error);
     return NextResponse.json(
@@ -157,6 +176,7 @@ export async function POST(req: Request) {
         });
 
     const appBaseUrl = process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, '') || new URL(req.url).origin;
+    await invalidateShareLinksApiCache(user.id);
 
     return NextResponse.json(
       {
@@ -227,6 +247,7 @@ export async function DELETE(req: Request) {
         expiresAt: new Date(),
       },
     });
+    await invalidateShareLinksApiCache(user.id);
 
     return NextResponse.json({ success: true });
   } catch (error) {

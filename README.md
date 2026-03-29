@@ -1,10 +1,12 @@
 <div align="center">
 
-<img src="public/icon.svg" alt="LectureLive logo" width="120" height="120" />
+<img src="public/icon.svg" alt="LectureLive logo" width="112" height="112" />
 
 # LectureLive
 
-### Real-time Classroom Transcription & Intelligent Note-taking Platform
+**Real-time classroom transcription, translation, and AI note-taking**
+
+Turn every lecture into a searchable learning session with live subtitles, multilingual translation, AI summaries, and export-ready study materials.
 
 [![Next.js](https://img.shields.io/badge/Next.js-15-black?logo=next.js)](https://nextjs.org/)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react)](https://react.dev/)
@@ -17,227 +19,265 @@
 
 [**English**](README.md) | [**中文**](README.zh-CN.md)
 
-<br />
-
-*Turn every lecture into searchable, shareable, AI-enhanced notes — in real time.*
+[Quick Start](#quick-start) | [Architecture](#architecture) | [Repository Map](#repository-map) | [Scripts](#scripts-reference) | [Configuration](#configuration--security)
 
 </div>
 
 ---
 
-## Overview
+## Why LectureLive
 
-LectureLive is a full-stack web application that brings real-time speech recognition, multilingual translation, and AI-powered summarization into the classroom. Instructors start a session, students join via a share link, and everyone gets a live transcript that can be annotated, summarized, and exported.
+LectureLive is a full-stack web application for live teaching scenarios. It combines browser-based speech recognition, real-time collaboration, multilingual translation, and LLM-powered understanding so instructors can run a session once and reuse it as notes, subtitles, summaries, and searchable records.
 
-<details>
-<summary><strong>Key Highlights</strong></summary>
+## At a Glance
 
-- **Live transcription** via Soniox ASR — speech-to-text streams directly in the browser
-- **Real-time collaboration** — multiple users see the same transcript simultaneously via WebSocket
-- **AI summarization** — plug in Claude, GPT, DeepSeek, or any OpenAI-compatible LLM
-- **Multilingual translation** — cloud-based or fully local (ONNX + WebGPU in-browser)
-- **Recording & playback** — record audio alongside transcripts, replay later
-- **Smart folders** — organize sessions with auto-extracted keywords
-- **Multi-format export** — Markdown, SRT subtitles, JSON reports
-- **Mobile-first** — responsive design with dedicated mobile components
-- **Self-hostable** — Docker Compose one-command deployment
+<table>
+  <tr>
+    <td width="50%">
+      <strong>Live transcription</strong><br />
+      Stream speech to text directly in the browser with Soniox for low-latency classroom use.
+    </td>
+    <td width="50%">
+      <strong>Shared live sessions</strong><br />
+      Students can follow the same transcript, summary, and keywords in real time through a share link.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <strong>AI learning aids</strong><br />
+      Plug in Claude, GPT, DeepSeek, or any OpenAI-compatible model for summaries, reports, and Q&amp;A.
+    </td>
+    <td width="50%">
+      <strong>Multilingual translation</strong><br />
+      Use cloud translation or run a local ONNX pipeline in the browser with WebGPU acceleration.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <strong>Recording and playback</strong><br />
+      Keep audio aligned with transcript data so sessions can be reviewed and replayed later.
+    </td>
+    <td width="50%">
+      <strong>Self-hosted operations</strong><br />
+      Deploy with Docker Compose, MySQL, Redis, and Cloudreve for a fully owned stack.
+    </td>
+  </tr>
+</table>
 
-</details>
+## Session Flow
+
+```mermaid
+flowchart LR
+    A[Instructor starts a session] --> B[Browser captures audio]
+    B --> C[Soniox streaming ASR]
+    C --> D[LectureLive transcript workspace]
+    D --> E[Live share for students]
+    D --> F[AI summary and Q&A]
+    D --> G[Translation pipeline]
+    D --> H[Markdown / SRT / JSON export]
+```
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
-│                        Browser                              │
-│  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌───────────┐  │
-│  │ Next.js  │  │ Soniox   │  │ Socket.IO │  │ Local     │  │
-│  │ React UI │  │ ASR SDK  │  │ Client    │  │ ONNX NMT  │  │
-│  └────┬─────┘  └────┬─────┘  └─────┬─────┘  └───────────┘  │
-└───────┼──────────────┼──────────────┼───────────────────────┘
-        │              │              │
-        ▼              ▼              ▼
-┌──────────────┐ ┌───────────┐ ┌───────────────┐
-│  Next.js API │ │ Soniox    │ │  WebSocket    │
-│  (port 3000) │ │ Cloud ASR │ │  (port 3001)  │
-└──────┬───────┘ └───────────┘ └───────┬───────┘
-       │                               │
-       ▼                               ▼
-┌────────────┐  ┌─────────┐    ┌─────────────┐
-│  MySQL 8.4 │  │ Redis 7 │    │  LLM Gateway│
-│  (Prisma)  │  │         │    │  (Multi-vendor)
-└────────────┘  └─────────┘    └─────────────┘
+│                          Browser                            │
+│  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌────────────┐ │
+│  │ Next.js  │  │ Soniox   │  │ Socket.IO │  │ Local ONNX │ │
+│  │ React UI │  │ ASR SDK  │  │ Client    │  │ Translation│ │
+│  └────┬─────┘  └────┬─────┘  └─────┬─────┘  └─────┬──────┘ │
+└───────┼──────────────┼──────────────┼──────────────┼────────┘
+        │              │              │              │
+        ▼              ▼              ▼              ▼
+┌──────────────┐ ┌───────────┐ ┌───────────────┐ ┌──────────────┐
+│  Next.js API │ │ Soniox    │ │  WebSocket    │ │ LLM Gateway  │
+│  (port 3000) │ │ Cloud ASR │ │  (port 3001)  │ │ multi-vendor │
+└──────┬───────┘ └───────────┘ └───────┬───────┘ └──────┬───────┘
+       │                               │                │
+       ▼                               ▼                ▼
+┌────────────┐                  ┌─────────┐      ┌─────────────┐
+│  MySQL 8.4 │                  │ Redis 7 │      │ Cloudreve   │
+│  (Prisma)  │                  │         │      │ file store  │
+└────────────┘                  └─────────┘      └─────────────┘
 ```
 
 ## Tech Stack
 
 | Layer | Technology |
-|:------|:-----------|
+| :---- | :--------- |
 | Frontend | Next.js 15 (App Router) + React 18 + TypeScript |
-| Styling | Tailwind CSS 3.4 (custom cream/charcoal/rust theme) |
+| Styling | Tailwind CSS 3.4 with a custom cream / charcoal / rust palette |
 | State | Zustand 5 |
-| Real-time | Socket.IO 4.8 (independent WebSocket server) |
+| Real-time | Socket.IO 4.8 with an independent WebSocket server |
 | Database | MySQL 8.4 + Prisma ORM 5 |
-| Cache | Redis 7 (token blacklist, rate limiting) |
-| ASR | Soniox (browser-direct streaming) |
-| Translation | Soniox Cloud + Helsinki-NLP ONNX (local, via Transformers.js) |
-| LLM | Multi-vendor gateway (Claude / GPT / DeepSeek / custom) |
-| File Storage | Cloudreve (self-hosted) |
+| Cache | Redis 7 for token blacklist and rate limiting |
+| ASR | Soniox browser-direct streaming |
+| Translation | Soniox Cloud + Helsinki-NLP ONNX via Transformers.js |
+| LLM | Multi-vendor gateway for Claude, GPT, DeepSeek, and custom providers |
+| Storage | Cloudreve |
 | Deployment | Docker Compose + Nginx |
 
-## Getting Started
+## Quick Start
 
 ### Prerequisites
 
-- **Node.js** >= 20
-- **MySQL** 8.x
-- **Redis** 7.x
-- **npm** or **pnpm**
+- Node.js 20+
+- MySQL 8.x
+- Redis 7.x
+- npm or pnpm
 
-### Quick Start (Local Development)
+### Local Development
 
 ```bash
-# 1. Clone the repo
+# 1. Clone the repository
 git clone https://github.com/PLus123456/lecture-live.git
 cd lecture-live
 
 # 2. Install dependencies
 npm install
 
-# 3. Configure environment
+# 3. Configure environment variables
 cp .env.example .env.local
-# Edit .env.local — at minimum set DATABASE_URL, REDIS_URL, JWT_SECRET
+# At minimum set DATABASE_URL, REDIS_URL, JWT_SECRET
 
-# 4. Initialize database
+# 4. Prepare the database
 npm run db:ensure
 
-# 5. Start development servers (two terminals)
-npm run dev        # Next.js → http://localhost:3000
-npm run dev:ws     # WebSocket → ws://localhost:3001
+# 5. Start both development servers
+npm run dev
+npm run dev:ws
 ```
+
+> `npm run dev` serves the Next.js app at `http://localhost:3000`, and `npm run dev:ws` starts the Socket.IO server at `ws://localhost:3001`.
 
 ### Docker Deployment
 
 ```bash
-# 1. Configure environment
+# 1. Configure environment variables
 cp .env.example .env.local
 # Set DB_PASSWORD, MYSQL_ROOT_PASSWORD, REDIS_PASSWORD, JWT_SECRET, ENCRYPTION_KEY
 
-# 2. Launch all services
+# 2. Launch the full stack
 docker-compose up -d
 
-# 3. Verify
+# 3. Verify health
 curl http://localhost:3000/api/health
 ```
 
-The Docker stack includes: **App** (Next.js + WS), **MySQL 8.4**, **Redis 7**, and **Cloudreve** (file storage).
+The Docker stack includes the app server, WebSocket service, MySQL 8.4, Redis 7, and Cloudreve.
 
-## Features
+## Repository Map
 
-### Real-time Transcription
-Connect to Soniox ASR directly from the browser for low-latency, streaming speech-to-text. Supports multiple languages and regional endpoints.
-
-### Live Collaboration
-Share a session link — all participants see transcript updates, AI summaries, and keyword tags in real time via WebSocket.
-
-### AI Summarization & Interpretation
-Integrate with multiple LLM providers through a unified gateway. Supports multi-turn conversation with full session context for deeper Q&A about lecture content.
-
-### Smart Folders & Keywords
-Organize sessions into hierarchical folders. Keywords are auto-extracted via LLM and ranked by confidence scores, making sessions easy to find and cross-reference.
-
-### Multi-format Export
-Export transcripts as **Markdown** documents, **SRT** subtitle files, or structured **JSON** reports.
-
-### Quota & Billing
-Built-in usage tracking with tiered quotas (Free / Pro / Admin). Includes monthly reset scripts and reconciliation tools.
-
-### Admin Dashboard
-Manage users, configure LLM providers (with encrypted API key storage), monitor usage, and adjust system settings — all from the web UI.
-
-## Project Structure
-
-```
+```text
 lecture-live/
 ├── src/
-│   ├── app/                # Next.js App Router (pages + API routes)
-│   │   ├── (auth)/         # Login / Register
-│   │   ├── (dashboard)/    # Home, Folders, Settings, Admin
-│   │   ├── session/        # Recording & Playback
+│   ├── app/                # Next.js App Router pages and API routes
+│   │   ├── (auth)/         # Login and registration
+│   │   ├── (dashboard)/    # Home, folders, settings, admin
+│   │   ├── session/        # Recording, live view, playback
 │   │   ├── library/        # Shared sessions
 │   │   └── api/            # REST API endpoints
-│   ├── components/         # React components (+ mobile variants)
-│   ├── hooks/              # Custom hooks (ASR, live share, auth, etc.)
-│   ├── lib/                # Core logic (LLM, export, quota, auth, etc.)
-│   ├── stores/             # Zustand state stores
-│   └── types/              # TypeScript type definitions
-├── server/
-│   └── websocket.ts        # Independent Socket.IO server
+│   ├── components/         # React UI and mobile-specific components
+│   ├── hooks/              # Custom hooks for ASR, auth, live share, translation
+│   ├── lib/                # Core domain logic, services, security, export, billing
+│   ├── stores/             # Zustand stores
+│   └── types/              # Shared TypeScript types
 ├── prisma/
 │   └── schema.prisma       # Database schema
-├── scripts/                # Utility & maintenance scripts
-├── tests/                  # Vitest unit tests
-├── e2e/                    # Playwright E2E tests
+├── server/
+│   └── websocket.ts        # Independent Socket.IO server
+├── scripts/                # Database, billing, and maintenance scripts
+├── tests/                  # Test assets and shared testing support
+├── e2e/                    # Playwright end-to-end tests
+├── public/                 # App icons and static assets
 ├── docker-compose.yml
 ├── Dockerfile
-└── deploy/                 # Deployment configs
+└── deploy/                 # Deployment shims and runtime helpers
 ```
 
-## Environment Variables
+## Configuration & Security
 
-See [`.env.example`](.env.example) for the full list. Key variables:
+See [`.env.example`](.env.example) for the full environment variable list. The most important values are:
 
-| Variable | Description |
-|:---------|:------------|
+| Variable | Purpose |
+| :------- | :------ |
 | `DATABASE_URL` | MySQL connection string |
 | `REDIS_URL` | Redis connection string |
-| `JWT_SECRET` | JWT signing secret (min 32 chars) |
-| `ENCRYPTION_KEY` | Encryption key for stored API keys |
-| `SONIOX_API_KEY` | Soniox ASR API key (fallback; prefer admin UI) |
-| `NEXT_PUBLIC_APP_URL` | Application URL (default: `http://localhost:3000`) |
-| `NEXT_PUBLIC_WS_URL` | WebSocket URL (default: `http://localhost:3001`) |
+| `JWT_SECRET` | JWT signing secret, minimum 32 characters |
+| `ENCRYPTION_KEY` | Encryption key used for stored provider credentials |
+| `SONIOX_API_KEY` | Soniox API key fallback |
+| `NEXT_PUBLIC_APP_URL` | Public web URL, default `http://localhost:3000` |
+| `NEXT_PUBLIC_WS_URL` | Public WebSocket URL, default `http://localhost:3001` |
 
-> **Security Note**: LLM provider API keys and Soniox credentials should be configured through the Admin Dashboard, where they are stored encrypted in the database. Environment variables serve only as fallback.
+> LLM provider keys and Soniox credentials are best managed from the admin dashboard, where they can be stored encrypted in the database. Environment variables are mainly a fallback path.
+
+### Cloudreve OAuth (v4)
+
+LectureLive uses the Cloudreve v4 OAuth authorization code flow with PKCE for storage access.
+
+#### Required Cloudreve app settings
+
+- `Redirect URI` must exactly match LectureLive's callback URL.
+- Local development: `http://localhost:3000/api/admin/cloudreve/callback`
+- Production: `https://your-domain/api/admin/cloudreve/callback`
+- Recommended scopes: `offline_access Files.Read Files.Write`
+
+#### Important notes
+
+- The `redirect_uri` sent to Cloudreve must be identical to the URI registered in the Cloudreve admin panel, including protocol, host, port, and path.
+- `offline_access` is required if you want Cloudreve to return a `refresh_token`.
+- When you click `Cloudreve Authorize` in the admin panel, LectureLive now saves the current Cloudreve URL, Client ID, and Client Secret before redirecting to Cloudreve.
+- OAuth configuration resolution order is: environment variables first, then saved admin settings.
 
 ## Scripts Reference
 
 | Command | Description |
-|:--------|:------------|
-| `npm run dev` | Start Next.js dev server |
-| `npm run dev:ws` | Start WebSocket dev server |
-| `npm run build` | Production build |
-| `npm run test` | Run unit tests (Vitest) |
-| `npm run test:e2e` | Run E2E tests (Playwright) |
-| `npm run db:ensure` | Auto-sync database schema |
-| `npm run db:studio` | Open Prisma Studio GUI |
+| :------ | :---------- |
+| `npm run dev` | Start the Next.js development server |
+| `npm run dev:ws` | Start the Socket.IO development server |
+| `npm run build` | Build the production Next.js app |
+| `npm run build:ws` | Bundle the WebSocket server for production |
+| `npm run start` | Start the production Next.js app |
+| `npm run start:ws` | Start the WebSocket server in production mode |
+| `npm run lint` | Run ESLint |
+| `npm run type-check` | Run TypeScript type checking |
+| `npm run test` | Run Vitest unit tests |
+| `npm run test:coverage` | Run unit tests with coverage |
+| `npm run test:e2e` | Run Playwright E2E tests |
+| `npm run db:ensure` | Ensure the database exists and schema is synced |
+| `npm run db:migrate` | Run Prisma development migrations |
+| `npm run db:migrate:deploy` | Apply production migrations |
+| `npm run db:studio` | Open Prisma Studio |
 | `npm run billing:reset-quotas` | Reset monthly transcription quotas |
 | `npm run billing:reconcile` | Reconcile transcription usage |
+| `npm run billing:maintenance` | Run billing maintenance tasks |
+| `npm run security:reencrypt-llm-keys` | Re-encrypt stored LLM provider keys |
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues and pull requests.
+Contributions are welcome through issues and pull requests.
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+1. Fork the repository.
+2. Create a feature branch with a descriptive name.
+3. Make changes with tests where appropriate.
+4. Open a pull request that explains the motivation and scope.
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- [Soniox](https://soniox.com/) — Real-time speech recognition
-- [Transformers.js](https://huggingface.co/docs/transformers.js) — In-browser ML inference
-- [Prisma](https://www.prisma.io/) — Type-safe database ORM
-- [Socket.IO](https://socket.io/) — Real-time bidirectional communication
-- [Cloudreve](https://cloudreve.org/) — Self-hosted file storage
+- [Soniox](https://soniox.com/) for real-time speech recognition
+- [Transformers.js](https://huggingface.co/docs/transformers.js) for in-browser machine learning inference
+- [Prisma](https://www.prisma.io/) for type-safe database access
+- [Socket.IO](https://socket.io/) for real-time bidirectional communication
+- [Cloudreve](https://cloudreve.org/) for self-hosted file storage
 
 ---
 
 <div align="center">
 
-**If this project helps you, please consider giving it a star!**
+If LectureLive helps your learning workflow, a Star is always appreciated.
 
 </div>

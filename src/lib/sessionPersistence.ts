@@ -3,7 +3,7 @@ import path from 'path';
 import type { Session } from '@prisma/client';
 import {
   CloudreveStorage,
-  isCloudreveConfigured,
+  isCloudreveConfiguredAsync,
   type StorageCategory,
 } from '@/lib/storage/cloudreve';
 
@@ -152,7 +152,7 @@ async function readArtifactFromReference(
   category: StorageCategory,
   reference: string | null | undefined
 ): Promise<Buffer | null> {
-  const cloudreve = isCloudreveConfigured() ? new CloudreveStorage() : null;
+  const cloudreve = (await isCloudreveConfiguredAsync()) ? await CloudreveStorage.create() : null;
   const defaultCandidates =
     category === 'recordings'
       ? [
@@ -218,11 +218,11 @@ async function persistArtifact(
   await fs.writeFile(buildLocalArtifactPath(category, fileName), data);
 
   const localReference = buildLocalArtifactReference(category, fileName);
-  if (!isCloudreveConfigured()) {
+  if (!(await isCloudreveConfiguredAsync())) {
     return { path: localReference, storage: 'local' };
   }
 
-  const storage = new CloudreveStorage();
+  const storage = await CloudreveStorage.create();
   const remotePath = await storage.upload(session.userId, category, fileName, data);
   return { path: remotePath, storage: 'cloudreve' };
 }

@@ -11,7 +11,7 @@ const {
   enforceApiRateLimitMock,
   getSiteSettingsMock,
   uploadMock,
-  cloudreveCtorMock,
+  createCloudreveStorageMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   checkQuotaMock: vi.fn(),
@@ -19,7 +19,7 @@ const {
   enforceApiRateLimitMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
   uploadMock: vi.fn(),
-  cloudreveCtorMock: vi.fn(),
+  createCloudreveStorageMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({
@@ -47,9 +47,9 @@ vi.mock('@/lib/siteSettings', () => ({
 }));
 
 vi.mock('@/lib/storage/cloudreve', () => ({
-  CloudreveStorage: cloudreveCtorMock.mockImplementation(() => ({
-    upload: uploadMock,
-  })),
+  CloudreveStorage: {
+    create: createCloudreveStorageMock,
+  },
 }));
 
 import { POST } from '@/app/api/storage/upload/route';
@@ -67,6 +67,9 @@ describe('POST /api/storage/upload', () => {
     sessionFindUniqueMock.mockResolvedValue({
       id: 'session-1',
       userId: 'user-1',
+    });
+    createCloudreveStorageMock.mockResolvedValue({
+      upload: uploadMock,
     });
     uploadMock.mockResolvedValue('/user-1/transcripts/notes.txt');
   });
@@ -93,7 +96,7 @@ describe('POST /api/storage/upload', () => {
     await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
       path: '/user-1/transcripts/notes.txt',
     });
-    expect(cloudreveCtorMock).toHaveBeenCalledTimes(1);
+    expect(createCloudreveStorageMock).toHaveBeenCalledTimes(1);
     expect(uploadMock).toHaveBeenCalledWith(
       'user-1',
       'transcripts',

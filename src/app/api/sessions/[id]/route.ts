@@ -2,6 +2,12 @@ import { NextResponse } from 'next/server';
 import type { Prisma, SessionStatus as PrismaSessionStatus } from '@prisma/client';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import {
+  invalidateFoldersApiCache,
+  invalidateSessionsApiCache,
+  invalidateShareLinksApiCache,
+} from '@/lib/apiResponseCache';
+import { jsonWithCache } from '@/lib/httpCache';
 import { assertOwnership } from '@/lib/security';
 import {
   normalizeOptionalString,
@@ -37,7 +43,10 @@ export async function GET(
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
-  return NextResponse.json(session);
+  return jsonWithCache(req, session, {
+    cacheControl: 'private, no-cache, must-revalidate',
+    vary: ['Authorization', 'Cookie'],
+  });
 }
 
 export async function PATCH(
@@ -179,6 +188,7 @@ export async function PATCH(
     }),
   });
 
+  await invalidateSessionsApiCache(user.id);
   return NextResponse.json(updated);
 }
 
@@ -211,6 +221,11 @@ export async function DELETE(
     prisma.folderSession.deleteMany({ where: { sessionId: id } }),
     prisma.shareLink.deleteMany({ where: { sessionId: id } }),
     prisma.session.delete({ where: { id: id } }),
+  ]);
+  await Promise.all([
+    invalidateSessionsApiCache(user.id),
+    invalidateFoldersApiCache(user.id),
+    invalidateShareLinksApiCache(user.id),
   ]);
   return NextResponse.json({ success: true });
 }

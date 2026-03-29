@@ -1,13 +1,17 @@
 import { NextResponse } from 'next/server';
 import { getSiteSettings, toPublicSiteConfig } from '@/lib/siteSettings';
+import { jsonWithCache } from '@/lib/httpCache';
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
     const settings = await getSiteSettings();
-    return NextResponse.json(toPublicSiteConfig(settings));
+    return jsonWithCache(req, toPublicSiteConfig(settings), {
+      cacheControl: 'public, no-cache, must-revalidate',
+    });
   } catch (error) {
     console.error('Failed to load public site config:', error);
-    return NextResponse.json(
+    return jsonWithCache(
+      req,
       {
         site_name: 'LectureLive',
         site_description: '',
@@ -28,7 +32,9 @@ export async function GET() {
         default_target_lang: 'zh',
         translation_mode: 'soniox',
       },
-      { status: 200 }
+      {
+        cacheControl: 'public, no-cache, must-revalidate',
+      }
     );
   }
 }

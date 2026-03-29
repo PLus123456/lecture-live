@@ -10,6 +10,7 @@ import {
 import { invalidateSonioxDbConfigCache } from '@/lib/soniox/env';
 import { invalidateTrustedProxyCache } from '@/lib/clientIp';
 import { migrateLocalToCloudreve } from '@/lib/storage/migration';
+import { invalidateCloudreveConfigCache } from '@/lib/storage/cloudreve';
 
 // 获取所有站点设置
 export async function GET(req: Request) {
@@ -146,6 +147,7 @@ export async function PUT(req: Request) {
     invalidateSiteSettingsCache();
     invalidateSonioxDbConfigCache();
     invalidateTrustedProxyCache();
+    invalidateCloudreveConfigCache();
     const settings = await getSiteSettings({ fresh: true });
 
     // 如果存储模式从 local 切换到 cloudreve，后台触发迁移

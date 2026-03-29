@@ -2,9 +2,11 @@
 // Cloudreve V4 OAuth 应用集成
 
 import path from 'path';
+import { getSiteSettings } from '@/lib/siteSettings';
 import { sanitizePath } from '@/lib/security';
 
 const STORAGE_CATEGORIES = ['recordings', 'transcripts', 'summaries', 'reports'] as const;
+const DEFAULT_CLOUDREVE_OAUTH_SCOPE = 'offline_access Files.Read Files.Write';
 
 export type StorageCategory = (typeof STORAGE_CATEGORIES)[number];
 
@@ -51,19 +53,19 @@ function getConfigFromEnv(): CloudreveOAuthConfig | null {
   return null;
 }
 
-/**
- * 从数据库 siteSettings 读取 Cloudreve 配置（异步）
- */
 async function getConfigFromDb(): Promise<CloudreveOAuthConfig | null> {
   try {
-    const { prisma } = await import('@/lib/prisma');
-    const keys = ['cloudreve_url', 'cloudreve_client_id', 'cloudreve_client_secret'];
-    const rows = await prisma.siteSetting.findMany({ where: { key: { in: keys } } });
-    const map = new Map(rows.map((r: { key: string; value: string }) => [r.key, r.value]));
-    const baseUrl = map.get('cloudreve_url')?.trim();
-    const clientId = map.get('cloudreve_client_id')?.trim();
-    const clientSecret = map.get('cloudreve_client_secret')?.trim();
-    if (baseUrl && clientId && clientSecret) {
+    const settings = await getSiteSettings();
+    const baseUrl = settings.cloudreve_url?.trim();
+    const clientId = settings.cloudreve_client_id?.trim();
+    const clientSecret = settings.cloudreve_client_secret?.trim();
+
+    if (
+      settings.storage_mode === 'cloudreve' &&
+      baseUrl &&
+      clientId &&
+      clientSecret
+    ) {
       return { baseUrl, clientId, clientSecret };
     }
   } catch {
@@ -223,6 +225,41 @@ function validateRemotePath(
   return `/${userId}/${category}/${fileName}`;
 }
 
+function normalizeCloudreveScope(scope: string): string {
+  return scope.split(/\s+/).filter(Boolean).join(' ');
+}
+
+function resolveExpiresAt(
+  payload: Record<string, unknown>,
+  preferredKeys: string[]
+): number {
+  for (const key of preferredKeys) {
+    const rawValue = payload[key];
+    if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
+      return Date.now() + rawValue * 1000;
+    }
+
+    if (typeof rawValue === 'string') {
+      const trimmed = rawValue.trim();
+      if (!trimmed) {
+        continue;
+      }
+
+      const asNumber = Number(trimmed);
+      if (Number.isFinite(asNumber)) {
+        return Date.now() + asNumber * 1000;
+      }
+
+      const asDate = Date.parse(trimmed);
+      if (!Number.isNaN(asDate)) {
+        return asDate;
+      }
+    }
+  }
+
+  return Date.now() + 3600 * 1000;
+}
+
 /* ------------------------------------------------------------------ */
 /*  OAuth 工具函数                                                     */
 /* ------------------------------------------------------------------ */
@@ -257,7 +294,7 @@ export async function generateCodeChallenge(verifier: string): Promise<string> {
 export async function buildAuthorizeUrl(
   redirectUri: string,
   codeVerifier: string,
-  scope = 'all'
+  scope = DEFAULT_CLOUDREVE_OAUTH_SCOPE
 ): Promise<string> {
   const config = await resolveCloudreveConfig();
   if (!config) {
@@ -271,7 +308,7 @@ export async function buildAuthorizeUrl(
     client_id: config.clientId,
     redirect_uri: redirectUri,
     response_type: 'code',
-    scope,
+    scope: normalizeCloudreveScope(scope),
     code_challenge: codeChallenge,
     code_challenge_method: 'S256',
   });
@@ -320,7 +357,7 @@ export async function exchangeAuthorizationCode(
   const tokenSet: CloudreveTokenSet = {
     accessToken: payload.access_token,
     refreshToken: payload.refresh_token,
-    expiresAt: Date.now() + (payload.expires_in ?? 3600) * 1000,
+    expiresAt: resolveExpiresAt(payload, ['expires_in', 'access_expires']),
   };
 
   tokenCache = tokenSet;
@@ -351,7 +388,7 @@ async function refreshAccessToken(
   const tokenSet: CloudreveTokenSet = {
     accessToken: payload.access_token,
     refreshToken: payload.refresh_token ?? currentRefreshToken,
-    expiresAt: Date.now() + (payload.expires_in ?? 3600) * 1000,
+    expiresAt: resolveExpiresAt(payload, ['access_expires', 'expires_in']),
   };
 
   tokenCache = tokenSet;
@@ -446,6 +483,24 @@ export class CloudreveStorage {
     return new CloudreveStorage(config);
   }
 
+  private async getConfig(): Promise<CloudreveOAuthConfig> {
+    if (this.config.baseUrl) {
+      return this.config;
+    }
+
+    const config = await resolveCloudreveConfig();
+    if (!config) {
+      throw new Error('Cloudreve is not configured');
+    }
+
+    this.config = {
+      baseUrl: validateCloudreveBaseUrl(config.baseUrl),
+      clientId: config.clientId,
+      clientSecret: config.clientSecret,
+    };
+    return this.config;
+  }
+
   /**
    * 获取有效的 access_token，必要时自动从数据库恢复或刷新
    */
@@ -457,8 +512,9 @@ export class CloudreveStorage {
 
     // 有 refresh_token 则刷新
     if (tokenCache?.refreshToken) {
+      const config = await this.getConfig();
       const refreshed = await refreshAccessToken(
-        this.config.baseUrl,
+        config.baseUrl,
         tokenCache.refreshToken
       );
       // 触发异步持久化（不阻塞当前请求）
@@ -474,8 +530,9 @@ export class CloudreveStorage {
     }
 
     if (tokenCache?.refreshToken) {
+      const config = await this.getConfig();
       const refreshed = await refreshAccessToken(
-        this.config.baseUrl,
+        config.baseUrl,
         tokenCache.refreshToken
       );
       this.persistTokensAsync(refreshed);
@@ -548,7 +605,8 @@ export class CloudreveStorage {
     init?: RequestInit
   ): Promise<Response> {
     const token = await this.getAccessToken();
-    const url = `${this.config.baseUrl}${urlPath}`;
+    const config = await this.getConfig();
+    const url = `${config.baseUrl}${urlPath}`;
     return fetch(url, {
       ...init,
       headers: {
@@ -654,11 +712,12 @@ export class CloudreveStorage {
       const end = Math.min(start + chunkSize, bodyBytes.byteLength);
       const chunk = bodyBytes.slice(start, end);
       const uploadUrl = session.upload_urls[i] ?? session.upload_urls[0];
+      const config = await this.getConfig();
 
       // upload_url 可能是相对路径或绝对 URL
       const fullUrl = uploadUrl.startsWith('http')
         ? uploadUrl
-        : `${this.config.baseUrl}${uploadUrl}`;
+        : `${config.baseUrl}${uploadUrl}`;
 
       const token = await this.getAccessToken();
       const chunkResponse = await fetch(fullUrl, {

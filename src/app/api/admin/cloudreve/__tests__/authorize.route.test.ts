@@ -83,7 +83,7 @@ describe('GET /api/admin/cloudreve/authorize', () => {
 
     expect(response.status).toBe(400);
     await expect(readJson<{ error: string }>(response)).resolves.toEqual({
-      error: 'Cloudreve OAuth 未配置，请先设置 CLOUDREVE_BASE_URL、CLOUDREVE_CLIENT_ID、CLOUDREVE_CLIENT_SECRET',
+      error: 'Cloudreve OAuth 未配置，请先在环境变量或管理面板中填写 Cloudreve 地址、Client ID、Client Secret',
     });
     expect(siteSettingUpsertMock).not.toHaveBeenCalled();
     expect(buildAuthorizeUrlMock).not.toHaveBeenCalled();

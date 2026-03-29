@@ -21,7 +21,7 @@ export async function GET(req: Request) {
 
   if (!(await isCloudreveConfiguredAsync())) {
     return NextResponse.json(
-      { error: 'Cloudreve OAuth 未配置，请先设置 CLOUDREVE_BASE_URL、CLOUDREVE_CLIENT_ID、CLOUDREVE_CLIENT_SECRET' },
+      { error: 'Cloudreve OAuth 未配置，请先在环境变量或管理面板中填写 Cloudreve 地址、Client ID、Client Secret' },
       { status: 400 }
     );
   }

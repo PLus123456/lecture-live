@@ -6,6 +6,7 @@ import {
   generateCodeVerifier,
 } from '@/lib/storage/cloudreve';
 import { prisma } from '@/lib/prisma';
+import { resolvePublicAppOrigin } from '@/lib/requestOrigin';
 
 /**
  * GET /api/admin/cloudreve/authorize
@@ -27,18 +28,24 @@ export async function GET(req: Request) {
   }
 
   try {
-    const url = new URL(req.url);
-    const origin = url.origin;
+    const origin = await resolvePublicAppOrigin(req);
     const redirectUri = `${origin}/api/admin/cloudreve/callback`;
 
     // 生成 PKCE code_verifier 并临时存入数据库
     const codeVerifier = generateCodeVerifier();
 
-    await prisma.siteSetting.upsert({
-      where: { key: 'cloudreve_code_verifier' },
-      update: { value: codeVerifier },
-      create: { key: 'cloudreve_code_verifier', value: codeVerifier },
-    });
+    await Promise.all([
+      prisma.siteSetting.upsert({
+        where: { key: 'cloudreve_code_verifier' },
+        update: { value: codeVerifier },
+        create: { key: 'cloudreve_code_verifier', value: codeVerifier },
+      }),
+      prisma.siteSetting.upsert({
+        where: { key: 'cloudreve_redirect_uri' },
+        update: { value: redirectUri },
+        create: { key: 'cloudreve_redirect_uri', value: redirectUri },
+      }),
+    ]);
 
     const authorizeUrl = await buildAuthorizeUrl(redirectUri, codeVerifier);
 

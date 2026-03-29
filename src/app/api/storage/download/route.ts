@@ -61,7 +61,7 @@ export async function GET(req: Request) {
   }
 
   try {
-    const storage = new CloudreveStorage();
+    const storage = await CloudreveStorage.create();
     const data = await storage.download(user.id, category, fileName);
 
     return new Response(new Uint8Array(data), {

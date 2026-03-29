@@ -3,11 +3,18 @@ import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import {
+  API_RESPONSE_CACHE_TTL,
+  buildFoldersApiCacheKey,
+  getOrSetApiCache,
+  invalidateFoldersApiCache,
+} from '@/lib/apiResponseCache';
+import {
   ensureFolderParentOwnership,
   listFoldersForUser,
   normalizeFolderId,
   normalizeFolderName,
 } from '@/lib/folders';
+import { jsonWithCache } from '@/lib/httpCache';
 
 export async function GET(req: Request) {
   const user = await verifyAuth(req);
@@ -15,11 +22,16 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const folders = await listFoldersForUser(user.id);
-  const response = NextResponse.json(folders);
-  // 文件夹列表短时缓存
-  response.headers.set('Cache-Control', 'private, max-age=30');
-  return response;
+  const { value: folders } = await getOrSetApiCache(
+    buildFoldersApiCacheKey(user.id),
+    API_RESPONSE_CACHE_TTL.folders,
+    () => listFoldersForUser(user.id)
+  );
+
+  return jsonWithCache(req, folders, {
+    cacheControl: 'private, no-cache, must-revalidate',
+    vary: ['Authorization', 'Cookie'],
+  });
 }
 
 export async function POST(req: Request) {
@@ -88,6 +100,8 @@ export async function POST(req: Request) {
         createdAt: true,
       },
     });
+
+    await invalidateFoldersApiCache(user.id);
 
     return NextResponse.json(
       {

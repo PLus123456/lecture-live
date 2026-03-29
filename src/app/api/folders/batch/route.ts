@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { invalidateFoldersApiCache } from '@/lib/apiResponseCache';
 import { enforceRateLimit } from '@/lib/rateLimit';
 
 /**
@@ -65,6 +66,7 @@ export async function DELETE(req: Request) {
       await prisma.folder.deleteMany({
         where: { id: { in: deletable } },
       });
+      await invalidateFoldersApiCache(user.id);
     }
 
     return NextResponse.json({

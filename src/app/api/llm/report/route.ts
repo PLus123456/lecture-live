@@ -4,6 +4,7 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership } from '@/lib/security';
 import { callLLM } from '@/lib/llm/gateway';
 import { enforceRateLimit } from '@/lib/rateLimit';
@@ -80,6 +81,7 @@ export async function POST(req: Request) {
       where: { id: sessionId },
       data: { reportPath: stored.path },
     });
+    await invalidateSessionsApiCache(user.id);
 
     return NextResponse.json({
       success: true,

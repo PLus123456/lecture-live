@@ -28,6 +28,10 @@ import { callLLM } from '@/lib/llm/gateway';
 import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
 import { generateSessionReport } from '@/lib/llm/reportManager';
 import { logSystemEvent } from '@/lib/auditLog';
+import {
+  invalidateFoldersApiCache,
+  invalidateSessionsApiCache,
+} from '@/lib/apiResponseCache';
 import type { SummaryBlock } from '@/types/summary';
 
 const FINALIZE_LOCK_STALE_MS = 15 * 60_000;
@@ -573,6 +577,10 @@ async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
     })();
 
     await Promise.allSettled([keywordPromise, reportPromise]);
+    await Promise.all([
+      invalidateSessionsApiCache(params.userId),
+      invalidateFoldersApiCache(params.userId),
+    ]);
     console.log(`[finalize-bg] ${params.sessionId}: background tasks completed`);
   } catch (error) {
     console.error(

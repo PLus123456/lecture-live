@@ -3,6 +3,7 @@ import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { listAvailableModels, parseProviders } from '@/lib/llm/gateway';
 import type { ChatModelOption, ChatModelsResponse, ThinkingDepth, LlmPurpose } from '@/types/llm';
+import { jsonWithCache } from '@/lib/httpCache';
 
 /**
  * GET /api/llm/models
@@ -113,7 +114,10 @@ export async function GET(req: Request) {
     }
 
     const response: ChatModelsResponse = { models, defaultModel };
-    return NextResponse.json(response);
+    return jsonWithCache(req, response, {
+      cacheControl: 'private, no-cache, must-revalidate',
+      vary: ['Authorization', 'Cookie'],
+    });
   }
 
   // ── 环境变量 fallback ──
@@ -165,5 +169,8 @@ export async function GET(req: Request) {
     : models[0]?.name || '';
 
   const response: ChatModelsResponse = { models, defaultModel };
-  return NextResponse.json(response);
+  return jsonWithCache(req, response, {
+    cacheControl: 'private, no-cache, must-revalidate',
+    vary: ['Authorization', 'Cookie'],
+  });
 }

@@ -1124,6 +1124,32 @@ function StoragePanel({
     setAuthorizing(true);
     setAuthResult(null);
     try {
+      if (
+        !settings.cloudreve_url.trim() ||
+        !settings.cloudreve_client_id.trim() ||
+        !settings.cloudreve_client_secret.trim()
+      ) {
+        setAuthResult(t('adminSettings.cloudreveAuthFailed'));
+        return;
+      }
+
+      const saveRes = await fetch('/api/admin/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          storage_mode: settings.storage_mode,
+          cloudreve_url: settings.cloudreve_url,
+          cloudreve_client_id: settings.cloudreve_client_id,
+          cloudreve_client_secret: settings.cloudreve_client_secret,
+        }),
+      });
+
+      if (!saveRes.ok) {
+        const saveData = await saveRes.json().catch(() => null);
+        setAuthResult(saveData?.error || t('adminSettings.cloudreveAuthFailed'));
+        return;
+      }
+
       const res = await fetch('/api/admin/cloudreve/authorize');
       const data = await res.json();
       if (res.ok && data.authorize_url) {
@@ -1172,7 +1198,12 @@ function StoragePanel({
             <button
               type="button"
               onClick={handleAuthorize}
-              disabled={authorizing || !settings.cloudreve_url}
+              disabled={
+                authorizing ||
+                !settings.cloudreve_url.trim() ||
+                !settings.cloudreve_client_id.trim() ||
+                !settings.cloudreve_client_secret.trim()
+              }
               className="inline-flex items-center gap-1.5 rounded-md bg-rust-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-rust-600 disabled:opacity-50"
             >
               <Globe size={14} />

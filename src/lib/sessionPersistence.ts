@@ -152,7 +152,7 @@ async function readArtifactFromReference(
   category: StorageCategory,
   reference: string | null | undefined
 ): Promise<Buffer | null> {
-  const cloudreve = isCloudreveConfigured() ? new CloudreveStorage() : null;
+  const cloudreve = (await isCloudreveConfigured()) ? new CloudreveStorage() : null;
   const defaultCandidates =
     category === 'recordings'
       ? [
@@ -218,7 +218,7 @@ async function persistArtifact(
   await fs.writeFile(buildLocalArtifactPath(category, fileName), data);
 
   const localReference = buildLocalArtifactReference(category, fileName);
-  if (!isCloudreveConfigured()) {
+  if (!(await isCloudreveConfigured())) {
     return { path: localReference, storage: 'local' };
   }
 

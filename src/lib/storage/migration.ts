@@ -65,7 +65,7 @@ async function fileExists(filePath: string): Promise<boolean> {
  * 将所有仅存在于本地的文件迁移上传到 Cloudreve，并更新数据库引用
  */
 export async function migrateLocalToCloudreve(): Promise<MigrationResult> {
-  if (!isCloudreveConfigured()) {
+  if (!(await isCloudreveConfigured())) {
     return { migratedCount: 0, skippedCount: 0, errorCount: 0, errors: ['Cloudreve 未配置'] };
   }
 

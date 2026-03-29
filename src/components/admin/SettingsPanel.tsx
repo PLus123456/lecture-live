@@ -65,7 +65,8 @@ interface SiteSettingsData {
   // 存储相关
   storage_mode: string;
   cloudreve_url: string;
-  cloudreve_token: string;
+  cloudreve_client_id: string;
+  cloudreve_client_secret: string;
   local_path: string;
   max_file_size: string;
   local_retention_days: string;
@@ -268,7 +269,8 @@ const defaultSettings: SiteSettingsData = {
   sender_email: '',
   storage_mode: 'local',
   cloudreve_url: '',
-  cloudreve_token: '',
+  cloudreve_client_id: '',
+  cloudreve_client_secret: '',
   local_path: './data',
   max_file_size: '500',
   local_retention_days: '0',
@@ -1070,6 +1072,8 @@ function StoragePanel({
   const [migrateResult, setMigrateResult] = useState<string | null>(null);
   const [cleaning, setCleaning] = useState(false);
   const [cleanResult, setCleanResult] = useState<string | null>(null);
+  const [authorizing, setAuthorizing] = useState(false);
+  const [authResult, setAuthResult] = useState<string | null>(null);
 
   const handleMigrate = async () => {
     setMigrating(true);
@@ -1116,6 +1120,24 @@ function StoragePanel({
     }
   };
 
+  const handleAuthorize = async () => {
+    setAuthorizing(true);
+    setAuthResult(null);
+    try {
+      const res = await fetch('/api/admin/cloudreve/authorize');
+      const data = await res.json();
+      if (res.ok && data.authorize_url) {
+        window.location.href = data.authorize_url;
+      } else {
+        setAuthResult(data.error || t('adminSettings.cloudreveAuthFailed'));
+      }
+    } catch {
+      setAuthResult(t('adminSettings.cloudreveAuthFailed'));
+    } finally {
+      setAuthorizing(false);
+    }
+  };
+
   return (
     <div>
       <SettingField label={t('adminSettings.storageMode')} description={t('adminSettings.storageModeDesc')}>
@@ -1136,11 +1158,30 @@ function StoragePanel({
       {settings.storage_mode === 'cloudreve' && (
         <>
           <SettingField label={t('adminSettings.cloudreveUrl')} description={t('adminSettings.cloudreveUrlDesc')}>
-            <TextInput value={settings.cloudreve_url} onChange={(v) => onChange('cloudreve_url', v)} placeholder="http://localhost:5212" />
+            <TextInput value={settings.cloudreve_url} onChange={(v) => onChange('cloudreve_url', v)} placeholder="https://cloud.example.com" />
           </SettingField>
-          <SettingField label={t('adminSettings.cloudreveToken')} description={t('adminSettings.cloudreveTokenDesc')}>
-            <TextInput value={settings.cloudreve_token} onChange={(v) => onChange('cloudreve_token', v)} type="password" />
+          <SettingField label={t('adminSettings.cloudreveClientId')} description={t('adminSettings.cloudreveClientIdDesc')}>
+            <TextInput value={settings.cloudreve_client_id} onChange={(v) => onChange('cloudreve_client_id', v)} placeholder="OAuth Client ID" />
           </SettingField>
+          <SettingField label={t('adminSettings.cloudreveClientSecret')} description={t('adminSettings.cloudreveClientSecretDesc')}>
+            <TextInput value={settings.cloudreve_client_secret} onChange={(v) => onChange('cloudreve_client_secret', v)} type="password" />
+          </SettingField>
+
+          {/* OAuth 授权按钮 */}
+          <div className="mt-2">
+            <button
+              type="button"
+              onClick={handleAuthorize}
+              disabled={authorizing || !settings.cloudreve_url}
+              className="inline-flex items-center gap-1.5 rounded-md bg-rust-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-rust-600 disabled:opacity-50"
+            >
+              <Globe size={14} />
+              {authorizing ? t('adminSettings.cloudreveAuthorizing') : t('adminSettings.cloudreveAuthorize')}
+            </button>
+            {authResult && (
+              <p className="mt-1 text-sm text-charcoal-600 dark:text-charcoal-400">{authResult}</p>
+            )}
+          </div>
           <SettingField label={t('adminSettings.localRetentionDays')} description={t('adminSettings.localRetentionDaysDesc')}>
             <TextInput value={settings.local_retention_days} onChange={(v) => onChange('local_retention_days', v)} type="number" placeholder="0" />
           </SettingField>

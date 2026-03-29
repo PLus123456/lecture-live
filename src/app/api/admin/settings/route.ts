@@ -79,7 +79,8 @@ export async function PUT(req: Request) {
       // 存储相关
       'storage_mode',
       'cloudreve_url',
-      'cloudreve_token',
+      'cloudreve_client_id',
+      'cloudreve_client_secret',
       'local_path',
       'max_file_size',
       'local_retention_days',

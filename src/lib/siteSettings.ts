@@ -27,7 +27,8 @@ export interface SiteSettings {
   sender_email: string;
   storage_mode: 'local' | 'cloudreve';
   cloudreve_url: string;
-  cloudreve_token: string;
+  cloudreve_client_id: string;
+  cloudreve_client_secret: string;
   local_path: string;
   max_file_size: number;
   local_retention_days: number;
@@ -71,7 +72,8 @@ const DEFAULT_SITE_SETTINGS: SiteSettings = {
   sender_email: '',
   storage_mode: 'local',
   cloudreve_url: '',
-  cloudreve_token: '',
+  cloudreve_client_id: '',
+  cloudreve_client_secret: '',
   local_path: './data',
   max_file_size: 500,
   local_retention_days: 0,

@@ -64,6 +64,8 @@ describe('GET /api/admin/cloudreve/authorize', () => {
       authorize_url: 'https://cloud.example.com/session/authorize?client_id=client-1',
     });
     expect(isCloudreveConfiguredAsyncMock).toHaveBeenCalledTimes(1);
+    const redirectUri = buildAuthorizeUrlMock.mock.calls[0]?.[0];
+    expect(redirectUri).toMatch(/\/api\/admin\/cloudreve\/callback$/);
     expect(siteSettingUpsertMock).toHaveBeenNthCalledWith(1, {
       where: { key: 'cloudreve_code_verifier' },
       update: { value: 'verifier-123' },
@@ -71,16 +73,13 @@ describe('GET /api/admin/cloudreve/authorize', () => {
     });
     expect(siteSettingUpsertMock).toHaveBeenNthCalledWith(2, {
       where: { key: 'cloudreve_redirect_uri' },
-      update: { value: 'http://localhost:3000/api/admin/cloudreve/callback' },
+      update: { value: redirectUri },
       create: {
         key: 'cloudreve_redirect_uri',
-        value: 'http://localhost:3000/api/admin/cloudreve/callback',
+        value: redirectUri,
       },
     });
-    expect(buildAuthorizeUrlMock).toHaveBeenCalledWith(
-      'http://localhost:3000/api/admin/cloudreve/callback',
-      'verifier-123'
-    );
+    expect(buildAuthorizeUrlMock).toHaveBeenCalledWith(redirectUri, 'verifier-123');
   });
 
   it('优先使用当前访问域名生成 Cloudreve 回调地址', async () => {

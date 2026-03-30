@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
-import { assertOwnership } from '@/lib/security';
+import { assertOwnership, sanitizeHeaderFilename } from '@/lib/security';
 import { exportMarkdown } from '@/lib/export/markdown';
 import { exportToSrt } from '@/lib/export/srt';
 import { exportJson } from '@/lib/export/json';
@@ -38,6 +38,8 @@ export async function POST(
 
   const body = await req.json().catch(() => ({}));
   const format = normalizeExportFormat(body.format);
+  const sourceLang = typeof body.sourceLang === 'string' ? body.sourceLang : (session.sourceLang ?? 'en');
+  const targetLang = typeof body.targetLang === 'string' ? body.targetLang : (session.targetLang ?? 'zh');
   if (!format) {
     return NextResponse.json(
       { error: 'Unsupported format' },
@@ -75,23 +77,20 @@ export async function POST(
 
   let content: string;
   let contentType: string;
-  let filename: string;
+  const safeBase = sanitizeHeaderFilename(session.title, 'lecture-recording');
 
   switch (format) {
     case 'markdown':
-      content = exportMarkdown(session.title, segments, translations, summaries, report);
-      contentType = 'text/markdown';
-      filename = `${session.title}.md`;
+      content = exportMarkdown(session.title, segments, translations, summaries, report, sourceLang, targetLang);
+      contentType = 'text/markdown; charset=utf-8';
       break;
     case 'srt':
       content = exportToSrt(segments, translations);
-      contentType = 'text/srt';
-      filename = `${session.title}.srt`;
+      contentType = 'text/srt; charset=utf-8';
       break;
     case 'json':
-      content = exportJson(session.title, segments, translations, summaries);
-      contentType = 'application/json';
-      filename = `${session.title}.json`;
+      content = exportJson(session.title, segments, translations, summaries, sourceLang, targetLang);
+      contentType = 'application/json; charset=utf-8';
       break;
     case 'txt':
       content = segments
@@ -102,8 +101,7 @@ export async function POST(
           }`;
         })
         .join('\n\n');
-      contentType = 'text/plain';
-      filename = `${session.title}.txt`;
+      contentType = 'text/plain; charset=utf-8';
       break;
     default:
       return NextResponse.json(
@@ -112,10 +110,11 @@ export async function POST(
       );
   }
 
+  const ext = format === 'markdown' ? 'md' : format;
   return new Response(content, {
     headers: {
       'Content-Type': contentType,
-      'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(`${safeBase}.${ext}`)}"`,
     },
   });
 }

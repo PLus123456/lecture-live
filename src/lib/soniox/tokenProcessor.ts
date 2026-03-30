@@ -1,5 +1,16 @@
+import {
+  EMPTY_STREAMING_PREVIEW_TRANSLATION,
+  EMPTY_STREAMING_PREVIEW_TEXT,
+  combinePreviewText,
+  hasPreviewContent,
+} from '@/lib/transcriptPreview';
 import type { RealtimeToken } from '@/types/soniox';
-import type { TranscriptSegment } from '@/types/transcript';
+import type {
+  SegmentTranslationState,
+  StreamingPreviewText,
+  StreamingPreviewTranslation,
+  TranscriptSegment,
+} from '@/types/transcript';
 
 let segmentCounter = 0;
 
@@ -17,11 +28,27 @@ interface SessionRecord {
   finalTokens: RealtimeToken[];
 }
 
+interface TranslationMeta {
+  state: SegmentTranslationState;
+  sourceLanguage: string | null;
+}
+
+interface PendingTranslationTarget {
+  segmentId: string;
+  sourceLanguage: string | null;
+  finalTokens: RealtimeToken[];
+  nonFinalTokens: RealtimeToken[];
+}
+
 export class TokenProcessor {
   private sessions: SessionRecord[] = [];
   private currentSessionIndex = 0;
-  private segmentTokens: RealtimeToken[] = [];
-  private accumulatedTranslation = '';
+  private segmentFinalTokens: RealtimeToken[] = [];
+  private segmentNonFinalTokens: RealtimeToken[] = [];
+  private previewTranslationFinalTokens: RealtimeToken[] = [];
+  private previewTranslationNonFinalTokens: RealtimeToken[] = [];
+  private previewTranslationSourceLanguage: string | null = null;
+  private pendingTranslationTargets: PendingTranslationTarget[] = [];
 
   /** 目标翻译语言，用于判断是否需要 passthrough */
   private targetLang = '';
@@ -33,15 +60,27 @@ export class TokenProcessor {
   private static SENTENCE_END_RE = /[.!?。！？；]\s*$/;
 
   private onSegmentFinalized?: (segment: TranscriptSegment) => void;
-  private onPreviewUpdate?: (text: string) => void;
-  private onTranslationToken?: (text: string, segmentId: string) => void;
-  private onPreviewTranslationUpdate?: (text: string) => void;
+  private onPreviewUpdate?: (preview: StreamingPreviewText) => void;
+  private onTranslationToken?: (
+    text: string,
+    segmentId: string,
+    meta?: TranslationMeta
+  ) => void;
+  private onPreviewTranslationUpdate?: (
+    preview: StreamingPreviewTranslation
+  ) => void;
 
   constructor(callbacks: {
     onSegmentFinalized?: (segment: TranscriptSegment) => void;
-    onPreviewUpdate?: (text: string) => void;
-    onTranslationToken?: (text: string, segmentId: string) => void;
-    onPreviewTranslationUpdate?: (text: string) => void;
+    onPreviewUpdate?: (preview: StreamingPreviewText) => void;
+    onTranslationToken?: (
+      text: string,
+      segmentId: string,
+      meta?: TranslationMeta
+    ) => void;
+    onPreviewTranslationUpdate?: (
+      preview: StreamingPreviewTranslation
+    ) => void;
   }) {
     this.onSegmentFinalized = callbacks.onSegmentFinalized;
     this.onPreviewUpdate = callbacks.onPreviewUpdate;
@@ -62,36 +101,6 @@ export class TokenProcessor {
     this.maxSegmentChars = Math.max(chars, 0);
   }
 
-  /**
-   * 判断当前 segment 的主要语言是否就是目标翻译语言。
-   * 通过统计各 token 的 language 字段投票决定。
-   */
-  private isSegmentInTargetLang(): boolean {
-    if (!this.targetLang || this.segmentTokens.length === 0) return false;
-    const langCounts: Record<string, number> = {};
-    for (const t of this.segmentTokens) {
-      const lang = t.language || '';
-      langCounts[lang] = (langCounts[lang] || 0) + 1;
-    }
-    // 找到出现次数最多的语言
-    let dominant = '';
-    let maxCount = 0;
-    for (const [lang, count] of Object.entries(langCounts)) {
-      if (count > maxCount) {
-        dominant = lang;
-        maxCount = count;
-      }
-    }
-    return dominant === this.targetLang;
-  }
-
-  /** 检查是否应在句子边界处自动截断 */
-  private shouldAutoSplit(): boolean {
-    if (this.maxSegmentChars <= 0 || this.segmentTokens.length === 0) return false;
-    const text = this.segmentTokens.map((t) => t.text).join('');
-    return text.length >= this.maxSegmentChars && TokenProcessor.SENTENCE_END_RE.test(text);
-  }
-
   /** 开始新 session（麦克风切换或关键词注入时调用） */
   startNewSession(timeOffsetMs: number) {
     this.currentSessionIndex++;
@@ -104,72 +113,230 @@ export class TokenProcessor {
 
   processTokens(tokens: RealtimeToken[]) {
     const currentSession = this.sessions[this.sessions.length - 1];
-    const nonFinalTokens: RealtimeToken[] = [];
-    const translationTokens: RealtimeToken[] = [];
+    const transcriptionTokens = tokens.filter(
+      (token) => token.translation_status !== 'translation'
+    );
+    const translationTokens = tokens.filter(
+      (token) => token.translation_status === 'translation'
+    );
 
-    for (const token of tokens) {
-      // Separate translation tokens from transcription tokens
-      if (token.translation_status === 'translation') {
-        translationTokens.push(token);
-        continue;
-      }
+    if (transcriptionTokens.length > 0) {
+      const nextNonFinalTokens: RealtimeToken[] = [];
 
-      if (token.is_final) {
-        currentSession.finalTokens.push(token);
-        this.segmentTokens.push(token);
-
-        // 累积文本超过阈值且到达句子边界 → 自动截断
-        if (this.shouldAutoSplit()) {
-          this.flushSegment();
+      for (const token of transcriptionTokens) {
+        if (token.is_final) {
+          currentSession.finalTokens.push(token);
+          this.segmentFinalTokens.push(token);
+        } else {
+          nextNonFinalTokens.push(token);
         }
-      } else {
-        nonFinalTokens.push(token);
       }
+
+      // Soniox 的 non-final 是“当前尾巴快照”，不是追加流
+      this.segmentNonFinalTokens = nextNonFinalTokens;
     }
 
-    // Update preview: show accumulated segment tokens + non-final tokens
-    // This prevents text from "disappearing" when non-final tokens are revised
-    const accText = this.segmentTokens.map((t) => t.text).join('');
-    const nonFinalText = nonFinalTokens.map((t) => t.text).join('');
-    this.onPreviewUpdate?.(accText + nonFinalText);
-
-    // Handle translation tokens — 累积翻译文本，实时推送 preview
     if (translationTokens.length > 0) {
-      const newText = translationTokens.map((t) => t.text).join('');
-      this.accumulatedTranslation += newText;
-      this.onPreviewTranslationUpdate?.(this.accumulatedTranslation);
+      this.processTranslationTokens(translationTokens);
     }
+
+    if (this.shouldAutoSplit()) {
+      this.flushSegment();
+    }
+
+    this.emitPreviewState();
   }
 
   onEndpoint() {
     this.flushSegment();
-    this.onPreviewUpdate?.('');
+    this.emitPreviewState();
+  }
+
+  private processTranslationTokens(tokens: RealtimeToken[]) {
+    const sourceLanguage =
+      tokens.find((token) => token.source_language)?.source_language ??
+      this.getDominantLanguage();
+    const pendingTargetIndex = this.findPendingTranslationTarget(sourceLanguage);
+
+    if (pendingTargetIndex >= 0) {
+      this.applyTranslationTokensToPendingTarget(
+        pendingTargetIndex,
+        tokens,
+        sourceLanguage
+      );
+      return;
+    }
+
+    const finalTokens = tokens.filter((token) => token.is_final);
+    const nonFinalTokens = tokens.filter((token) => !token.is_final);
+
+    if (finalTokens.length > 0) {
+      this.previewTranslationFinalTokens.push(...finalTokens);
+    }
+    this.previewTranslationNonFinalTokens = nonFinalTokens;
+    this.previewTranslationSourceLanguage =
+      sourceLanguage ?? this.previewTranslationSourceLanguage ?? null;
+  }
+
+  private findPendingTranslationTarget(sourceLanguage: string | null): number {
+    if (this.pendingTranslationTargets.length === 0) {
+      return -1;
+    }
+
+    if (sourceLanguage) {
+      const matchIndex = this.pendingTranslationTargets.findIndex(
+        (target) => target.sourceLanguage === sourceLanguage
+      );
+      if (matchIndex >= 0) {
+        return matchIndex;
+      }
+    }
+
+    return this.pendingTranslationTargets.length === 1 ? 0 : -1;
+  }
+
+  private applyTranslationTokensToPendingTarget(
+    index: number,
+    tokens: RealtimeToken[],
+    sourceLanguage: string | null
+  ) {
+    const target = this.pendingTranslationTargets[index];
+    const finalTokens = tokens.filter((token) => token.is_final);
+    const nonFinalTokens = tokens.filter((token) => !token.is_final);
+
+    if (finalTokens.length > 0) {
+      target.finalTokens.push(...finalTokens);
+    }
+    target.nonFinalTokens = nonFinalTokens;
+    target.sourceLanguage = target.sourceLanguage ?? sourceLanguage ?? null;
+
+    const finalText = target.finalTokens.map((token) => token.text).join('').trim();
+    const hasNonFinalText = target.nonFinalTokens.some(
+      (token) => token.text.trim().length > 0
+    );
+    const state: SegmentTranslationState = hasNonFinalText
+      ? 'streaming'
+      : finalText
+        ? 'final'
+        : 'pending';
+
+    this.onTranslationToken?.(finalText, target.segmentId, {
+      state,
+      sourceLanguage: target.sourceLanguage,
+    });
+
+    if (state === 'final') {
+      this.pendingTranslationTargets.splice(index, 1);
+    }
+  }
+
+  private getCurrentSegmentTokens(): RealtimeToken[] {
+    return [...this.segmentFinalTokens, ...this.segmentNonFinalTokens];
+  }
+
+  private getCurrentPreview(): StreamingPreviewText {
+    return {
+      finalText: this.segmentFinalTokens.map((token) => token.text).join(''),
+      nonFinalText: this.segmentNonFinalTokens.map((token) => token.text).join(''),
+    };
+  }
+
+  private getCurrentPreviewTranslation(): StreamingPreviewTranslation {
+    const preview = this.getCurrentPreview();
+    const finalText = this.previewTranslationFinalTokens
+      .map((token) => token.text)
+      .join('');
+    const nonFinalText = this.previewTranslationNonFinalTokens
+      .map((token) => token.text)
+      .join('');
+    const hasTranslationText = `${finalText}${nonFinalText}`.trim().length > 0;
+
+    if (!hasPreviewContent(preview)) {
+      return EMPTY_STREAMING_PREVIEW_TRANSLATION;
+    }
+
+    if (!hasTranslationText) {
+      if (this.targetLang && !this.isCurrentSegmentInTargetLang()) {
+        return {
+          ...EMPTY_STREAMING_PREVIEW_TRANSLATION,
+          state: 'waiting',
+          sourceLanguage: this.getDominantLanguage(),
+        };
+      }
+
+      return {
+        ...EMPTY_STREAMING_PREVIEW_TRANSLATION,
+        sourceLanguage: this.getDominantLanguage(),
+      };
+    }
+
+    return {
+      finalText,
+      nonFinalText,
+      state: nonFinalText.trim() ? 'streaming' : 'final',
+      sourceLanguage:
+        this.previewTranslationSourceLanguage ?? this.getDominantLanguage(),
+    };
+  }
+
+  private emitPreviewState() {
+    this.onPreviewUpdate?.(this.getCurrentPreview());
+    this.onPreviewTranslationUpdate?.(this.getCurrentPreviewTranslation());
+  }
+
+  private clearCurrentPreviewTranslation() {
+    this.previewTranslationFinalTokens = [];
+    this.previewTranslationNonFinalTokens = [];
+    this.previewTranslationSourceLanguage = null;
   }
 
   private flushSegment() {
-    if (this.segmentTokens.length === 0) return;
+    const segmentTokens = this.getCurrentSegmentTokens();
+    if (segmentTokens.length === 0) {
+      this.clearCurrentPreviewTranslation();
+      return;
+    }
 
     const currentSession = this.sessions[this.sessions.length - 1];
-    const text = this.segmentTokens.map((t) => t.text).join('');
-    const rawStartMs = this.segmentTokens[0]?.start_ms ?? 0;
-    const rawEndMs =
-      this.segmentTokens[this.segmentTokens.length - 1]?.end_ms ?? rawStartMs;
+    const rawText = segmentTokens.map((token) => token.text).join('');
+    const text = rawText.trim();
+    if (!text) {
+      this.segmentFinalTokens = [];
+      this.segmentNonFinalTokens = [];
+      this.clearCurrentPreviewTranslation();
+      return;
+    }
+
+    const startToken = segmentTokens.find(
+      (token) => typeof token.start_ms === 'number'
+    );
+    const endToken = [...segmentTokens]
+      .reverse()
+      .find((token) => typeof token.end_ms === 'number');
+    const rawStartMs = startToken?.start_ms ?? 0;
+    const rawEndMs = endToken?.end_ms ?? rawStartMs;
 
     // 全局时间戳对齐
     const globalStartMs = currentSession.timeOffsetMs + rawStartMs;
     const globalEndMs = currentSession.timeOffsetMs + rawEndMs;
 
     const avgConfidence =
-      this.segmentTokens.reduce((sum, t) => sum + t.confidence, 0) /
-      this.segmentTokens.length;
+      segmentTokens.reduce((sum, token) => sum + token.confidence, 0) /
+      segmentTokens.length;
+    const dominantLanguage =
+      this.getDominantLanguage(segmentTokens) ??
+      segmentTokens[0]?.language ??
+      'en';
+    const speaker =
+      segmentTokens.find((token) => token.speaker)?.speaker ?? '';
 
     segmentCounter++;
     const segment: TranscriptSegment = {
       id: `seg-${segmentCounter}`,
       sessionIndex: currentSession.index,
-      speaker: this.segmentTokens[0]?.speaker ?? '',
-      language: this.segmentTokens[0]?.language ?? 'en',
-      text: text.trim(),
+      speaker,
+      language: dominantLanguage,
+      text,
       globalStartMs,
       globalEndMs,
       startMs: globalStartMs,
@@ -179,24 +346,104 @@ export class TokenProcessor {
       timestamp: formatTimestamp(globalStartMs),
     };
 
-    // 将累积的翻译绑定到正确的 segment ID
-    // 如果 Soniox 没有返回翻译（说的语言已经是目标语言），直接 passthrough 原文
-    if (this.accumulatedTranslation) {
-      this.onTranslationToken?.(this.accumulatedTranslation, segment.id);
-    } else if (this.targetLang && this.isSegmentInTargetLang()) {
-      this.onTranslationToken?.(text.trim(), segment.id);
+    const translationFinalText = this.previewTranslationFinalTokens
+      .map((token) => token.text)
+      .join('')
+      .trim();
+    const hasTranslationNonFinal = this.previewTranslationNonFinalTokens.some(
+      (token) => token.text.trim().length > 0
+    );
+    const translationSourceLanguage =
+      this.previewTranslationSourceLanguage ?? dominantLanguage;
+
+    if (translationFinalText || hasTranslationNonFinal) {
+      if (hasTranslationNonFinal) {
+        this.pendingTranslationTargets.push({
+          segmentId: segment.id,
+          sourceLanguage: translationSourceLanguage,
+          finalTokens: [...this.previewTranslationFinalTokens],
+          nonFinalTokens: [...this.previewTranslationNonFinalTokens],
+        });
+        this.onTranslationToken?.(translationFinalText, segment.id, {
+          state: translationFinalText ? 'streaming' : 'pending',
+          sourceLanguage: translationSourceLanguage,
+        });
+      } else if (translationFinalText) {
+        this.onTranslationToken?.(translationFinalText, segment.id, {
+          state: 'final',
+          sourceLanguage: translationSourceLanguage,
+        });
+      }
+    } else if (this.targetLang && this.isCurrentSegmentInTargetLang(segmentTokens)) {
+      // Soniox 没返回翻译且当前段语言已等于目标语言时，最终段落直接 passthrough
+      this.onTranslationToken?.(text, segment.id, {
+        state: 'final',
+        sourceLanguage: dominantLanguage,
+      });
+    } else if (this.targetLang) {
+      this.onTranslationToken?.('', segment.id, {
+        state: 'pending',
+        sourceLanguage: dominantLanguage,
+      });
     }
-    this.accumulatedTranslation = '';
-    this.onPreviewTranslationUpdate?.('');
 
     this.onSegmentFinalized?.(segment);
-    this.segmentTokens = [];
+    this.segmentFinalTokens = [];
+    this.segmentNonFinalTokens = [];
+    this.clearCurrentPreviewTranslation();
+  }
+
+  private getDominantLanguage(tokens = this.getCurrentSegmentTokens()) {
+    if (tokens.length === 0) {
+      return null;
+    }
+
+    const languageCounts: Record<string, number> = {};
+    for (const token of tokens) {
+      if (!token.language) {
+        continue;
+      }
+      languageCounts[token.language] = (languageCounts[token.language] || 0) + 1;
+    }
+
+    let dominantLanguage: string | null = null;
+    let maxCount = 0;
+    for (const [language, count] of Object.entries(languageCounts)) {
+      if (count > maxCount) {
+        dominantLanguage = language;
+        maxCount = count;
+      }
+    }
+
+    return dominantLanguage;
+  }
+
+  private isCurrentSegmentInTargetLang(tokens = this.getCurrentSegmentTokens()) {
+    if (!this.targetLang) {
+      return false;
+    }
+
+    return this.getDominantLanguage(tokens) === this.targetLang;
+  }
+
+  /** 检查是否应在句子边界处自动截断 */
+  private shouldAutoSplit(): boolean {
+    if (this.maxSegmentChars <= 0) {
+      return false;
+    }
+
+    const preview = this.getCurrentPreview();
+    const text = combinePreviewText(preview);
+    return (
+      text.length >= this.maxSegmentChars &&
+      TokenProcessor.SENTENCE_END_RE.test(text)
+    );
   }
 
   /** 获取所有 session 的完整文本 */
   getAllFinalText(): string {
     return this.sessions
-      .flatMap((s) => s.finalTokens.map((t) => t.text))
+      .flatMap((session) => session.finalTokens.map((token) => token.text))
       .join('');
   }
 
@@ -205,10 +452,10 @@ export class TokenProcessor {
     const segments: TranscriptSegment[] = [];
     for (const session of this.sessions) {
       for (const token of session.finalTokens) {
-        const globalStartMs = session.timeOffsetMs + (token.start_ms || 0);
-        const globalEndMs = session.timeOffsetMs + (token.end_ms || 0);
+        const globalStartMs = session.timeOffsetMs + (token.start_ms ?? 0);
+        const globalEndMs = session.timeOffsetMs + (token.end_ms ?? 0);
         segments.push({
-          id: `${session.index}-${token.start_ms}`,
+          id: `${session.index}-${token.start_ms ?? 0}`,
           sessionIndex: session.index,
           speaker: token.speaker || '1',
           language: token.language || 'en',
@@ -233,10 +480,14 @@ export class TokenProcessor {
 
   reset() {
     this.sessions = [];
-    this.segmentTokens = [];
-    this.accumulatedTranslation = '';
+    this.segmentFinalTokens = [];
+    this.segmentNonFinalTokens = [];
+    this.pendingTranslationTargets = [];
+    this.clearCurrentPreviewTranslation();
     this.currentSessionIndex = 0;
     segmentCounter = 0;
     this.startNewSession(0);
+    this.onPreviewUpdate?.(EMPTY_STREAMING_PREVIEW_TEXT);
+    this.onPreviewTranslationUpdate?.(EMPTY_STREAMING_PREVIEW_TRANSLATION);
   }
 }

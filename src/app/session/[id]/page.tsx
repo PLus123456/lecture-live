@@ -881,6 +881,8 @@ export default function ActiveSessionPage() {
       translations: liveSnapshotRef.current.translations,
       summaryBlocks: liveSnapshotRef.current.summaryBlocks,
       status: getShareStatus(),
+      previewText: useTranscriptStore.getState().currentPreviewText,
+      previewTranslation: useTranscriptStore.getState().currentPreviewTranslationText,
     });
     prevSegmentCountRef.current = liveSnapshotRef.current.segments.length;
     prevSummaryCountRef.current = liveSnapshotRef.current.summaryBlocks.length;
@@ -942,23 +944,42 @@ export default function ActiveSessionPage() {
     if (!isSharing || !broadcaster) return;
 
     let throttleTimer: ReturnType<typeof setTimeout> | null = null;
-    let lastPreview = '';
-    let lastPreviewTranslation = '';
-    let pending: { preview: string; previewTranslation: string } | null = null;
+    let lastPreview = useTranscriptStore.getState().currentPreviewText;
+    let lastPreviewTranslation =
+      useTranscriptStore.getState().currentPreviewTranslationText;
+    let pending: {
+      previewText: typeof lastPreview;
+      previewTranslation: typeof lastPreviewTranslation;
+    } | null = null;
 
     const unsubscribe = useTranscriptStore.subscribe((state) => {
-      if (state.currentPreview === lastPreview && state.currentPreviewTranslation === lastPreviewTranslation) return;
-      lastPreview = state.currentPreview;
-      lastPreviewTranslation = state.currentPreviewTranslation;
+      const previewUnchanged =
+        state.currentPreviewText.finalText === lastPreview.finalText &&
+        state.currentPreviewText.nonFinalText === lastPreview.nonFinalText;
+      const previewTranslationUnchanged =
+        state.currentPreviewTranslationText.finalText ===
+          lastPreviewTranslation.finalText &&
+        state.currentPreviewTranslationText.nonFinalText ===
+          lastPreviewTranslation.nonFinalText &&
+        state.currentPreviewTranslationText.state ===
+          lastPreviewTranslation.state &&
+        state.currentPreviewTranslationText.sourceLanguage ===
+          lastPreviewTranslation.sourceLanguage;
+      if (previewUnchanged && previewTranslationUnchanged) return;
 
-      pending = { preview: lastPreview, previewTranslation: lastPreviewTranslation };
+      lastPreview = state.currentPreviewText;
+      lastPreviewTranslation = state.currentPreviewTranslationText;
+      pending = {
+        previewText: lastPreview,
+        previewTranslation: lastPreviewTranslation,
+      };
       if (!throttleTimer) {
-        broadcaster.broadcastPreviewUpdate(pending.preview, pending.previewTranslation);
+        broadcaster.broadcastPreviewUpdate(pending);
         pending = null;
         throttleTimer = setTimeout(() => {
           throttleTimer = null;
           if (pending) {
-            broadcaster.broadcastPreviewUpdate(pending.preview, pending.previewTranslation);
+            broadcaster.broadcastPreviewUpdate(pending);
             pending = null;
           }
         }, 150);

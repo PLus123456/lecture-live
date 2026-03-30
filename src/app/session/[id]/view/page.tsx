@@ -12,6 +12,7 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useLiveShare } from '@/hooks/useLiveShare';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { hasPreviewContent } from '@/lib/transcriptPreview';
 import { useI18n } from '@/lib/i18n';
 import { useTranscriptStore } from '@/stores/transcriptStore';
 import { useSummaryStore } from '@/stores/summaryStore';
@@ -76,8 +77,10 @@ function ViewerTypingIndicator({ theme }: { theme: 'light' | 'dark' }) {
 function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
   const { t } = useI18n();
   const segments = useTranscriptStore((s) => s.segments);
-  const currentPreview = useTranscriptStore((s) => s.currentPreview);
-  const currentPreviewTranslation = useTranscriptStore((s) => s.currentPreviewTranslation);
+  const currentPreviewText = useTranscriptStore((s) => s.currentPreviewText);
+  const currentPreviewTranslationText = useTranscriptStore(
+    (s) => s.currentPreviewTranslationText
+  );
   const translations = useTranslationStore((s) => s.translations);
   const fontSize = useViewerSettingsStore((s) => s.fontSize);
   const autoScrollSetting = useViewerSettingsStore((s) => s.autoScroll);
@@ -116,7 +119,13 @@ function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
     requestAnimationFrame(() => {
       isAutoScrollingRef.current = false;
     });
-  }, [segments, currentPreview, currentPreviewTranslation, autoScroll, autoScrollSetting]);
+  }, [
+    segments,
+    currentPreviewText,
+    currentPreviewTranslationText,
+    autoScroll,
+    autoScrollSetting,
+  ]);
 
   const scrollToBottom = useCallback(() => {
     setAutoScroll(true);
@@ -124,6 +133,12 @@ function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, []);
+  const hasPreview = hasPreviewContent(currentPreviewText);
+  const hasPreviewTranslation = hasPreviewContent(currentPreviewTranslationText);
+  const showPreviewTranslationWaiting =
+    hasPreview &&
+    currentPreviewTranslationText.state === 'waiting' &&
+    !hasPreviewTranslation;
 
   return (
     <div className={`flex flex-col h-full relative rounded-xl border overflow-hidden ${
@@ -152,7 +167,7 @@ function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
         onScroll={handleScroll}
         className={`flex-1 overflow-y-auto px-5 min-h-0 ${compact ? 'py-2' : 'py-4'}`}
       >
-        {segments.length === 0 && (
+        {segments.length === 0 && !hasPreview && (
           <div className={`flex flex-col items-center justify-center h-full ${
             theme === 'dark' ? 'text-charcoal-500' : 'text-charcoal-300'
           }`}>
@@ -199,25 +214,49 @@ function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
           })}
 
           {/* 实时预览：正在说的内容（尚未确认为完整段落） */}
-          {currentPreview && (
+          {hasPreview && (
             <div>
-              <p className={`${fs.text} leading-relaxed ${
-                theme === 'dark' ? 'text-cream-400/70' : 'text-charcoal-400'
-              }`}>
-                {sanitizeDisplayText(currentPreview)}
+              <p className={`${fs.text} leading-relaxed`}>
+                {currentPreviewText.finalText ? (
+                  <span className={theme === 'dark' ? 'text-cream-200' : 'text-charcoal-600'}>
+                    {sanitizeDisplayText(currentPreviewText.finalText)}
+                  </span>
+                ) : null}
+                {currentPreviewText.nonFinalText ? (
+                  <span className={theme === 'dark' ? 'text-cream-400' : 'text-charcoal-400'}>
+                    {sanitizeDisplayText(currentPreviewText.nonFinalText)}
+                  </span>
+                ) : null}
               </p>
-              {currentPreviewTranslation && (
+              {hasPreviewTranslation && (
                 <p className={`${fs.translation} font-medium leading-relaxed mt-0.5 opacity-70 ${
-                  theme === 'dark' ? 'text-rust-400' : 'text-rust-500'
+                  theme === 'dark' ? 'text-rust-400' : 'text-rust-600'
                 }`}>
-                  {sanitizeDisplayText(currentPreviewTranslation)}
+                  {currentPreviewTranslationText.finalText ? (
+                    <span className={theme === 'dark' ? 'text-rust-300' : 'text-rust-700'}>
+                      {sanitizeDisplayText(currentPreviewTranslationText.finalText)}
+                    </span>
+                  ) : null}
+                  {currentPreviewTranslationText.nonFinalText ? (
+                    <span className={theme === 'dark' ? 'text-rust-400' : 'text-rust-500'}>
+                      {sanitizeDisplayText(currentPreviewTranslationText.nonFinalText)}
+                    </span>
+                  ) : null}
+                </p>
+              )}
+
+              {showPreviewTranslationWaiting && (
+                <p className={`${fs.translation} italic leading-relaxed mt-0.5 ${
+                  theme === 'dark' ? 'text-charcoal-500' : 'text-charcoal-300'
+                }`}>
+                  {t('translationPanel.translating')}
                 </p>
               )}
             </div>
           )}
 
           {/* 打字指示器：正在直播但没有预览内容时显示 */}
-          {isLive && !currentPreview && segments.length > 0 && (
+          {isLive && !hasPreview && segments.length > 0 && (
             <ViewerTypingIndicator theme={theme} />
           )}
         </div>
@@ -323,10 +362,21 @@ function ViewerTranslationPanel() {
   const { t } = useI18n();
   const segments = useTranscriptStore((s) => s.segments);
   const translations = useTranslationStore((s) => s.translations);
+  const translationEntries = useTranslationStore((s) => s.translationEntries);
+  const currentPreviewText = useTranscriptStore((s) => s.currentPreviewText);
+  const currentPreviewTranslationText = useTranscriptStore(
+    (s) => s.currentPreviewTranslationText
+  );
   const fontSize = useViewerSettingsStore((s) => s.fontSize);
   const compact = useViewerSettingsStore((s) => s.compact);
   const theme = useViewerSettingsStore((s) => s.theme);
   const fs = FONT_SIZE_MAP[fontSize];
+  const hasPreviewText = hasPreviewContent(currentPreviewText);
+  const hasPreviewTranslation = hasPreviewContent(currentPreviewTranslationText);
+  const showPreviewWaiting =
+    hasPreviewText &&
+    currentPreviewTranslationText.state === 'waiting' &&
+    !hasPreviewTranslation;
 
   return (
     <div className={`flex h-full flex-col rounded-xl border overflow-hidden ${
@@ -348,7 +398,7 @@ function ViewerTranslationPanel() {
         </span>
       </div>
       <div className={`flex-1 overflow-y-auto px-4 ${compact ? 'py-2 space-y-2' : 'py-4 space-y-3'}`}>
-        {segments.length === 0 ? (
+        {segments.length === 0 && !hasPreviewTranslation && !showPreviewWaiting ? (
           <div className={`flex h-full flex-col items-center justify-center ${
             theme === 'dark' ? 'text-charcoal-500' : 'text-charcoal-300'
           }`}>
@@ -357,7 +407,7 @@ function ViewerTranslationPanel() {
           </div>
         ) : (
           segments.map((segment) => {
-            const translation = translations[segment.id];
+            const translation = translationEntries[segment.id]?.text ?? translations[segment.id] ?? '';
             return (
               <div
                 key={segment.id}
@@ -384,6 +434,40 @@ function ViewerTranslationPanel() {
               </div>
             );
           })
+        )}
+
+        {(hasPreviewTranslation || showPreviewWaiting) && (
+          <div
+            className={`border-b pb-3 last:border-0 ${
+              theme === 'dark' ? 'border-charcoal-700' : 'border-cream-100'
+            }`}
+          >
+            <div className={`mb-1 ${fs.timestamp} font-mono ${
+              theme === 'dark' ? 'text-charcoal-500' : 'text-charcoal-300'
+            }`}>
+              {t('translationPanel.translating')}
+            </div>
+            {hasPreviewTranslation ? (
+              <p className={`${fs.translation} leading-relaxed`}>
+                {currentPreviewTranslationText.finalText ? (
+                  <span className={theme === 'dark' ? 'text-rust-300' : 'text-rust-700'}>
+                    {sanitizeDisplayText(currentPreviewTranslationText.finalText)}
+                  </span>
+                ) : null}
+                {currentPreviewTranslationText.nonFinalText ? (
+                  <span className={theme === 'dark' ? 'text-rust-400' : 'text-rust-500'}>
+                    {sanitizeDisplayText(currentPreviewTranslationText.nonFinalText)}
+                  </span>
+                ) : null}
+              </p>
+            ) : (
+              <p className={`${fs.translation} italic ${
+                theme === 'dark' ? 'text-charcoal-500' : 'text-charcoal-300'
+              }`}>
+                {t('translationPanel.translating')}
+              </p>
+            )}
+          </div>
         )}
       </div>
     </div>
@@ -736,8 +820,8 @@ export default function ViewerPage() {
               (snapshot.summaryBlocks as SummaryBlock[]).forEach(addBlock);
             }
             // 恢复当前预览文本
-            if (snapshot.preview) {
-              updatePreview(snapshot.preview);
+            if (snapshot.previewText) {
+              updatePreview(snapshot.previewText);
             }
             if (snapshot.previewTranslation) {
               updatePreviewTranslation(snapshot.previewTranslation);
@@ -746,8 +830,13 @@ export default function ViewerPage() {
           },
           onTranscriptDelta: (delta) => {
             // 新段落到达时清空预览（该段落已从预览变为正式段落）
-            updatePreview('');
-            updatePreviewTranslation('');
+            updatePreview({ finalText: '', nonFinalText: '' });
+            updatePreviewTranslation({
+              finalText: '',
+              nonFinalText: '',
+              state: 'idle',
+              sourceLanguage: null,
+            });
             addFinalSegment(delta as TranscriptSegment);
           },
           onTranslationDelta: ({ segmentId, translation }) => {
@@ -759,14 +848,19 @@ export default function ViewerPage() {
           onStatusUpdate: ({ status: newStatus }) => {
             if (newStatus === 'SHARE_OFFLINE' || newStatus === 'COMPLETED') {
               // 录制结束：清空预览，切换到静态模式
-              updatePreview('');
-              updatePreviewTranslation('');
+              updatePreview({ finalText: '', nonFinalText: '' });
+              updatePreviewTranslation({
+                finalText: '',
+                nonFinalText: '',
+                state: 'idle',
+                sourceLanguage: null,
+              });
               setIsCompleted(true);
               setSessionInfo((prev) => prev ? { ...prev, status: newStatus } : prev);
             }
           },
-          onPreviewUpdate: ({ preview, previewTranslation }) => {
-            updatePreview(preview);
+          onPreviewUpdate: ({ previewText, previewTranslation }) => {
+            updatePreview(previewText);
             updatePreviewTranslation(previewTranslation);
           },
           onError: (err) => {

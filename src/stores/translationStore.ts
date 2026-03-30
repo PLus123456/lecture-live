@@ -2,16 +2,30 @@
 
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
-import type { TranslationMode } from '@/types/transcript';
+import { createSegmentTranslationEntry } from '@/lib/transcriptPreview';
+import type {
+  SegmentTranslationEntry,
+  SegmentTranslationState,
+  TranslationMode,
+} from '@/types/transcript';
 
 interface TranslationStore {
   translations: Record<string, string>; // segmentId → translated text
+  translationEntries: Record<string, SegmentTranslationEntry>;
   mode: TranslationMode;
   localModelLoaded: boolean;
   localModelProgress: number;
   localModelStatus: string;
 
-  setTranslation: (segmentId: string, text: string) => void;
+  setTranslation: (
+    segmentId: string,
+    text: string,
+    options?: {
+      state?: SegmentTranslationState;
+      sourceLanguage?: string | null;
+    }
+  ) => void;
+  setTranslationEntry: (segmentId: string, entry: SegmentTranslationEntry) => void;
   setMode: (mode: TranslationMode) => void;
   setLocalModelLoaded: (loaded: boolean) => void;
   setLocalModelProgress: (progress: number) => void;
@@ -23,14 +37,29 @@ export const useTranslationStore = create<TranslationStore>()(
   persist(
     (set) => ({
       translations: {},
+      translationEntries: {},
       mode: 'soniox',
       localModelLoaded: false,
       localModelProgress: 0,
       localModelStatus: '',
 
-      setTranslation: (segmentId, text) =>
+      setTranslation: (segmentId, text, options) =>
         set((state) => ({
           translations: { ...state.translations, [segmentId]: text },
+          translationEntries: {
+            ...state.translationEntries,
+            [segmentId]: createSegmentTranslationEntry(
+              text,
+              options?.state ?? 'final',
+              options?.sourceLanguage ?? state.translationEntries[segmentId]?.sourceLanguage ?? null
+            ),
+          },
+        })),
+
+      setTranslationEntry: (segmentId, entry) =>
+        set((state) => ({
+          translations: { ...state.translations, [segmentId]: entry.text },
+          translationEntries: { ...state.translationEntries, [segmentId]: entry },
         })),
 
       setMode: (mode) => set({ mode }),
@@ -44,6 +73,7 @@ export const useTranslationStore = create<TranslationStore>()(
       clearAll: () =>
         set({
           translations: {},
+          translationEntries: {},
           localModelLoaded: false,
           localModelProgress: 0,
           localModelStatus: '',
@@ -55,7 +85,31 @@ export const useTranslationStore = create<TranslationStore>()(
       // 只持久化翻译数据，不持久化本地模型状态
       partialize: (state) => ({
         translations: state.translations,
+        translationEntries: state.translationEntries,
       }),
+      merge: (persisted, current) => {
+        const persistedState = (persisted ?? {}) as Partial<TranslationStore>;
+        const translations =
+          persistedState.translations && typeof persistedState.translations === 'object'
+            ? persistedState.translations
+            : current.translations;
+        const translationEntries =
+          persistedState.translationEntries && typeof persistedState.translationEntries === 'object'
+            ? persistedState.translationEntries
+            : Object.fromEntries(
+                Object.entries(translations).map(([segmentId, text]) => [
+                  segmentId,
+                  createSegmentTranslationEntry(text, 'final', null),
+                ])
+              );
+
+        return {
+          ...current,
+          ...persistedState,
+          translations,
+          translationEntries,
+        };
+      },
     }
   )
 );

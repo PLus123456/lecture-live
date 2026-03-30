@@ -148,8 +148,13 @@ describe('setupLiveShare', () => {
       translations: { 'seg-1': '你好' },
       summaryBlocks: [{ id: 'sum-1', text: 'Summary' }],
       status: 'RECORDING',
-      preview: 'Hel',
-      previewTranslation: '你',
+      previewText: { finalText: 'He', nonFinalText: 'l' },
+      previewTranslation: {
+        finalText: '',
+        nonFinalText: '你',
+        state: 'streaming',
+        sourceLanguage: 'en',
+      },
     });
 
     const viewer = createClient(baseUrl, {
@@ -164,8 +169,13 @@ describe('setupLiveShare', () => {
       translations: Record<string, string>;
       summaryBlocks: Array<{ id: string; text: string }>;
       status: string | null;
-      preview: string;
-      previewTranslation: string;
+      previewText: { finalText: string; nonFinalText: string };
+      previewTranslation: {
+        finalText: string;
+        nonFinalText: string;
+        state: string;
+        sourceLanguage: string | null;
+      };
     }>(viewer, 'initial_state');
     const viewerCountPromise = onceSocketEvent<{ count: number }>(
       broadcaster,
@@ -179,8 +189,13 @@ describe('setupLiveShare', () => {
       translations: { 'seg-1': '你好' },
       summaryBlocks: [{ id: 'sum-1', text: 'Summary' }],
       status: 'RECORDING',
-      preview: 'Hel',
-      previewTranslation: '你',
+      previewText: { finalText: 'He', nonFinalText: 'l' },
+      previewTranslation: {
+        finalText: '',
+        nonFinalText: '你',
+        state: 'streaming',
+        sourceLanguage: 'en',
+      },
     });
 
     const transcriptDeltaPromise = onceSocketEvent<{ id: string; text: string }>(

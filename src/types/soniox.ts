@@ -2,14 +2,14 @@ import type { SonioxRegion } from '@/types/transcript';
 
 export interface RealtimeToken {
   text: string;
-  start_ms: number;
-  end_ms: number;
+  start_ms?: number;
+  end_ms?: number;
   confidence: number;
   is_final: boolean;
   speaker?: string;
   language?: string;
-  source_language?: string;
   translation_status?: 'none' | 'original' | 'translation';
+  source_language?: string;
 }
 
 export interface SonioxSessionConfig {

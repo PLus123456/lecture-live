@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
+import { hasPreviewContent } from '@/lib/transcriptPreview';
 import { useTranscriptStore } from '@/stores/transcriptStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -24,6 +25,11 @@ export default function TranslationPanel({
   const { t } = useI18n();
   const segments = useTranscriptStore((s) => s.segments);
   const translations = useTranslationStore((s) => s.translations);
+  const translationEntries = useTranslationStore((s) => s.translationEntries);
+  const currentPreviewText = useTranscriptStore((s) => s.currentPreviewText);
+  const currentPreviewTranslationText = useTranscriptStore(
+    (s) => s.currentPreviewTranslationText
+  );
   const mode = useTranslationStore((s) => s.mode);
   const setMode = useTranslationStore((s) => s.setMode);
   const localModelLoaded = useTranslationStore((s) => s.localModelLoaded);
@@ -36,7 +42,7 @@ export default function TranslationPanel({
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [translations, segments]);
+  }, [translations, translationEntries, segments, currentPreviewTranslationText]);
 
   const targetLanguageLabel = targetLang
     ? (() => {
@@ -44,6 +50,12 @@ export default function TranslationPanel({
         return translated === `languages.${targetLang}` ? targetLang : translated;
       })()
     : '';
+  const hasPreviewText = hasPreviewContent(currentPreviewText);
+  const hasPreviewTranslation = hasPreviewContent(currentPreviewTranslationText);
+  const showPreviewWaiting =
+    hasPreviewText &&
+    currentPreviewTranslationText.state === 'waiting' &&
+    !hasPreviewTranslation;
 
   return (
     <div className={`panel-card flex h-full flex-col ${className}`.trim()}>
@@ -108,7 +120,7 @@ export default function TranslationPanel({
 
       {/* Translated segments */}
       <div ref={scrollRef} className={`flex-1 overflow-y-auto px-5 py-4 space-y-3 ${contentClassName}`.trim()}>
-        {segments.length === 0 && (
+        {segments.length === 0 && !hasPreviewTranslation && !showPreviewWaiting && (
           <div className="flex flex-col items-center justify-center h-full text-charcoal-300">
             <Languages className="w-10 h-10 mb-3 opacity-50" />
             <p className="text-sm">{t('translationPanel.empty')}</p>
@@ -116,7 +128,8 @@ export default function TranslationPanel({
         )}
 
         {segments.map((seg) => {
-          const translation = translations[seg.id];
+          const translationEntry = translationEntries[seg.id];
+          const translation = translationEntry?.text ?? translations[seg.id] ?? '';
           return (
             <div
               key={seg.id}
@@ -137,6 +150,32 @@ export default function TranslationPanel({
             </div>
           );
         })}
+
+        {(hasPreviewTranslation || showPreviewWaiting) && (
+          <div className="py-2 border-b border-cream-100 last:border-0">
+            <span className="text-[11px] text-charcoal-300 font-mono">
+              {t('translationPanel.translating')}
+            </span>
+            {hasPreviewTranslation ? (
+              <p className="text-sm leading-relaxed mt-0.5">
+                {currentPreviewTranslationText.finalText ? (
+                  <span className="text-charcoal-700">
+                    {currentPreviewTranslationText.finalText}
+                  </span>
+                ) : null}
+                {currentPreviewTranslationText.nonFinalText ? (
+                  <span className="text-charcoal-400">
+                    {currentPreviewTranslationText.nonFinalText}
+                  </span>
+                ) : null}
+              </p>
+            ) : (
+              <p className="text-sm text-charcoal-300 italic mt-0.5">
+                {t('translationPanel.translating')}
+              </p>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

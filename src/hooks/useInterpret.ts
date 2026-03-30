@@ -1,12 +1,21 @@
 'use client';
 
 import { useCallback, useRef, useState } from 'react';
+import {
+  EMPTY_STREAMING_PREVIEW_TEXT,
+  EMPTY_STREAMING_PREVIEW_TRANSLATION,
+} from '@/lib/transcriptPreview';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useAuthStore } from '@/stores/authStore';
 import { TokenProcessor } from '@/lib/soniox/tokenProcessor';
 import { buildSonioxConfig, startSonioxRecording } from '@/lib/soniox/client';
 import type { RealtimeToken } from '@/types/soniox';
-import type { TranscriptSegment, SessionConfig } from '@/types/transcript';
+import type {
+  SessionConfig,
+  StreamingPreviewText,
+  StreamingPreviewTranslation,
+  TranscriptSegment,
+} from '@/types/transcript';
 
 export interface InterpretLine {
   id: string;
@@ -39,8 +48,11 @@ export function useInterpret() {
   const [connectionState, setConnectionState] = useState<string>('disconnected');
   const [linesA, setLinesA] = useState<InterpretLine[]>([]);
   const [linesB, setLinesB] = useState<InterpretLine[]>([]);
-  const [previewText, setPreviewText] = useState('');
-  const [previewTranslation, setPreviewTranslation] = useState('');
+  const [previewText, setPreviewText] = useState<StreamingPreviewText>(
+    EMPTY_STREAMING_PREVIEW_TEXT
+  );
+  const [previewTranslation, setPreviewTranslation] =
+    useState<StreamingPreviewTranslation>(EMPTY_STREAMING_PREVIEW_TRANSLATION);
   const [previewLang, setPreviewLang] = useState<string | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
 
@@ -50,8 +62,7 @@ export function useInterpret() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const langARef = useRef('en');
   const langBRef = useRef('zh');
-  // 追踪当前正在说的语言（基于最近的 transcription token）
-  const currentSpokenLangRef = useRef<string | null>(null);
+  const previewLangRef = useRef<string | null>(null);
 
   const token = useAuthStore((s) => s.token);
 
@@ -87,7 +98,6 @@ export function useInterpret() {
 
       langARef.current = langA;
       langBRef.current = langB;
-      currentSpokenLangRef.current = null;
 
       // 构建 two_way 配置
       const settings = useSettingsStore.getState();
@@ -129,52 +139,49 @@ export function useInterpret() {
             setLinesB((prev) => [...prev, line]);
           }
 
-          setPreviewText('');
-          setPreviewTranslation('');
+          setPreviewText(EMPTY_STREAMING_PREVIEW_TEXT);
+          setPreviewTranslation(EMPTY_STREAMING_PREVIEW_TRANSLATION);
           setPreviewLang(null);
+          previewLangRef.current = null;
         },
-        onPreviewUpdate: (text: string) => {
-          setPreviewText(text);
+        onPreviewUpdate: (preview) => {
+          setPreviewText(preview);
         },
-        onTranslationToken: (
-          text: string,
-          segmentId: string,
-          meta?: { sourceLanguage: string }
-        ) => {
-          // 翻译完成后绑定到对应 segment
+        onTranslationToken: (text: string, segmentId: string, meta) => {
+          const sourceLanguage = meta?.sourceLanguage ?? previewLangRef.current;
+          const isLangA = sourceLanguage === langARef.current;
+          const translatedLineId = `${segmentId}-tr`;
           const translatedLine: InterpretLine = {
-            id: `${segmentId}-tr`,
+            id: translatedLineId,
             language: '',
             text,
             timestamp: '',
           };
 
-          // 翻译内容放到另一个面板
-          const sourceLanguage = meta?.sourceLanguage ?? currentSpokenLangRef.current;
-          const isLangA = sourceLanguage === langARef.current;
+          const upsertTranslatedLine = (lines: InterpretLine[]) => {
+            if (!text.trim()) {
+              return lines.filter((line) => line.id !== translatedLineId);
+            }
+            return upsertInterpretLine(lines, translatedLine);
+          };
+
+          const patchOriginalLine = (lines: InterpretLine[]) =>
+            lines.map((line) =>
+              line.id === segmentId
+                ? { ...line, translatedText: text || undefined }
+                : line
+            );
+
           if (isLangA) {
-            // 说的是 A，翻译放到 B 面板
-            setLinesB((prev) => upsertInterpretLine(prev, translatedLine));
-            // 同时更新 A 面板最后一个 line 的 translatedText
-            setLinesA((prev) => {
-              if (prev.length === 0) return prev;
-              return prev.map((line) =>
-                line.id === segmentId ? { ...line, translatedText: text } : line
-              );
-            });
+            setLinesB(upsertTranslatedLine);
+            setLinesA(patchOriginalLine);
           } else {
-            // 说的是 B，翻译放到 A 面板
-            setLinesA((prev) => upsertInterpretLine(prev, translatedLine));
-            setLinesB((prev) => {
-              if (prev.length === 0) return prev;
-              return prev.map((line) =>
-                line.id === segmentId ? { ...line, translatedText: text } : line
-              );
-            });
+            setLinesA(upsertTranslatedLine);
+            setLinesB(patchOriginalLine);
           }
         },
-        onPreviewTranslationUpdate: (text: string) => {
-          setPreviewTranslation(text);
+        onPreviewTranslationUpdate: (preview) => {
+          setPreviewTranslation(preview);
         },
       });
       processorRef.current = processor;
@@ -200,11 +207,11 @@ export function useInterpret() {
           {
             onPartialResult: (tokens) => {
               const rtTokens = tokens as RealtimeToken[];
-              // 追踪当前说的语言（从 transcription token 中获取）
+              // 原文 preview 侧仍基于当前转录 token 的 language 判断
               for (const t of rtTokens) {
                 if (t.translation_status !== 'translation' && t.language) {
-                  currentSpokenLangRef.current = t.language;
                   setPreviewLang(t.language);
+                  previewLangRef.current = t.language;
                 }
               }
               processorRef.current?.processTokens(rtTokens);
@@ -268,9 +275,10 @@ export function useInterpret() {
 
     setIsRunning(false);
     setConnectionState('disconnected');
-    setPreviewText('');
-    setPreviewTranslation('');
+    setPreviewText(EMPTY_STREAMING_PREVIEW_TEXT);
+    setPreviewTranslation(EMPTY_STREAMING_PREVIEW_TRANSLATION);
     setPreviewLang(null);
+    previewLangRef.current = null;
 
     // 扣除配额
     if (duration > 0) {

@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef } from 'react';
+import { combinePreviewText } from '@/lib/transcriptPreview';
 import { useTranscriptStore, type BackupMeta } from '@/stores/transcriptStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -75,6 +76,7 @@ export function useSoniox(
   const setRecordingStartTime = useTranscriptStore((s) => s.setRecordingStartTime);
   const setCurrentMicDeviceId = useTranscriptStore((s) => s.setCurrentMicDeviceId);
   const setTranslation = useTranslationStore((s) => s.setTranslation);
+  const setTranslationEntry = useTranslationStore((s) => s.setTranslationEntry);
   const token = useAuthStore((s) => s.token);
   const recordingState = useTranscriptStore((s) => s.recordingState);
   const setPausedAt = useTranscriptStore((s) => s.setPausedAt);
@@ -413,14 +415,17 @@ export function useSoniox(
       onSegmentFinalized: (segment) => {
         addFinalSegment(segment);
       },
-      onPreviewUpdate: (text) => {
-        updatePreview(text);
+      onPreviewUpdate: (preview) => {
+        updatePreview(preview);
       },
-      onTranslationToken: (text, segmentId) => {
-        setTranslation(segmentId, text);
+      onTranslationToken: (text, segmentId, meta) => {
+        setTranslation(segmentId, text, {
+          state: meta?.state,
+          sourceLanguage: meta?.sourceLanguage,
+        });
       },
-      onPreviewTranslationUpdate: (text) => {
-        updatePreviewTranslation(text);
+      onPreviewTranslationUpdate: (preview) => {
+        updatePreviewTranslation(preview);
       },
     });
 
@@ -430,7 +435,12 @@ export function useSoniox(
 
     processorRef.current = processor;
     return processor;
-  }, [addFinalSegment, setTranslation, updatePreview, updatePreviewTranslation]);
+  }, [
+    addFinalSegment,
+    setTranslation,
+    updatePreview,
+    updatePreviewTranslation,
+  ]);
 
   // 根据窗口高度和用户设置动态计算段落截断阈值
   const segmentSplitRatio = useSettingsStore((s) => s.segmentSplitRatio);
@@ -468,7 +478,12 @@ export function useSoniox(
       let lastEndMs = -1;
       for (let i = tokens.length - 1; i >= 0; i--) {
         const t = tokens[i];
-        if (t.is_final && t.translation_status !== 'translation' && t.end_ms > 0) {
+        if (
+          t.is_final &&
+          t.translation_status !== 'translation' &&
+          typeof t.end_ms === 'number' &&
+          t.end_ms > 0
+        ) {
           lastEndMs = t.end_ms;
           break;
         }
@@ -1260,7 +1275,8 @@ export function useSoniox(
 
     // 把刷新前残留的 preview 文本保存为一个 segment，防止丢失
     let segmentOffset = storeState.segments.length;
-    if (storeState.currentPreview.trim()) {
+    const rescuedPreviewText = combinePreviewText(storeState.currentPreviewText).trim();
+    if (rescuedPreviewText) {
       const lastSeg = storeState.segments[storeState.segments.length - 1];
       const previewStartMs = lastSeg ? lastSeg.globalEndMs : offsetMs;
 
@@ -1270,7 +1286,7 @@ export function useSoniox(
         sessionIndex: storeState.currentSessionIndex,
         speaker: '',
         language: lastSeg?.language ?? 'en',
-        text: storeState.currentPreview.trim(),
+        text: rescuedPreviewText,
         globalStartMs: previewStartMs,
         globalEndMs: previewStartMs,
         startMs: previewStartMs,
@@ -1281,15 +1297,38 @@ export function useSoniox(
       };
       addFinalSegment(rescuedSegment);
 
-      // 如果有对应的 preview 翻译，也保存
-      if (storeState.currentPreviewTranslation.trim()) {
-        setTranslation(rescuedSegment.id, storeState.currentPreviewTranslation.trim());
+      const rescuedTranslationFinalText =
+        storeState.currentPreviewTranslationText.finalText.trim();
+      const rescuedTranslationState =
+        storeState.currentPreviewTranslationText.nonFinalText.trim()
+          ? rescuedTranslationFinalText
+            ? 'streaming'
+            : 'pending'
+          : storeState.currentPreviewTranslationText.state === 'final'
+            ? 'final'
+            : rescuedTranslationFinalText
+              ? 'streaming'
+              : 'pending';
+
+      if (rescuedTranslationFinalText || storeState.currentPreviewTranslationText.state !== 'idle') {
+        setTranslationEntry(rescuedSegment.id, {
+          text: rescuedTranslationFinalText,
+          state: rescuedTranslationState,
+          sourceLanguage:
+            storeState.currentPreviewTranslationText.sourceLanguage ??
+            rescuedSegment.language,
+        });
       }
     }
 
     // 清除 preview（已保存为 segment）
-    updatePreview('');
-    updatePreviewTranslation('');
+    updatePreview({ finalText: '', nonFinalText: '' });
+    updatePreviewTranslation({
+      finalText: '',
+      nonFinalText: '',
+      state: 'idle',
+      sourceLanguage: null,
+    });
 
     // 创建新的 processor，设置正确的时间偏移
     const processor = ensureProcessor();
@@ -1312,7 +1351,7 @@ export function useSoniox(
     setConnectionState,
     setPausedAt,
     setRecordingState,
-    setTranslation,
+    setTranslationEntry,
     startNewRecording,
     updatePreview,
     updatePreviewTranslation,

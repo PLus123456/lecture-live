@@ -34,11 +34,11 @@ export interface LLMProviderConfig {
   purpose?: LlmPurpose;
 }
 
-/** Thinking depth → thinking budget tokens mapping */
+/** Thinking depth → thinking budget tokens 映射（仅 high 启用 extended thinking） */
 const THINKING_BUDGET_MAP: Record<ThinkingDepth, number> = {
-  low: 0,        // No thinking
-  medium: 0,     // No thinking (use default model behavior)
-  high: 10000,   // Extended thinking with budget
+  low: 0,
+  medium: 0,
+  high: 10000,
 };
 const llmLogger = logger.child({ component: 'llm-gateway' });
 
@@ -226,11 +226,11 @@ function resolveThinkingBudget(
   provider: LLMProviderConfig,
   depth?: ThinkingDepth
 ): number {
+  // low / medium / 未指定：不启用 extended thinking
   if (!depth || depth === 'low' || depth === 'medium') {
-    // low/medium: use 0 (no thinking), regardless of provider default
-    return depth === 'low' ? 0 : provider.thinkingBudget;
+    return 0;
   }
-  // high: use our budget map, but only for Anthropic
+  // high：仅 Anthropic 支持 extended thinking
   if (!provider.isAnthropic) return 0;
   return THINKING_BUDGET_MAP[depth];
 }

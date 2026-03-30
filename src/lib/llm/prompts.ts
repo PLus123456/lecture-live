@@ -169,7 +169,7 @@ export function buildSessionReportPrompt(
   const durationMinutes = Math.round(durationMs / 60000);
   const hours = Math.floor(durationMinutes / 60);
   const mins = durationMinutes % 60;
-  const durationStr = hours > 0 ? `${hours}小时${mins}分钟` : `${mins}分钟`;
+  const durationStr = formatDuration(hours, mins, language);
 
   const system = `You are a professional meeting/lecture report writer. Generate a structured report
 from the provided transcript, similar to formal meeting minutes.
@@ -238,6 +238,25 @@ DURATION: ${durationStr}`
     .join('\n\n');
 
   return { system, user };
+}
+
+/** 根据语言格式化时长字符串 */
+function formatDuration(hours: number, mins: number, language: string): string {
+  const lang = language.toLowerCase().slice(0, 2);
+  if (lang === 'zh') {
+    return hours > 0 ? `${hours}小时${mins}分钟` : `${mins}分钟`;
+  }
+  if (lang === 'ja') {
+    return hours > 0 ? `${hours}時間${mins}分` : `${mins}分`;
+  }
+  if (lang === 'ko') {
+    return hours > 0 ? `${hours}시간 ${mins}분` : `${mins}분`;
+  }
+  // 默认英文格式
+  if (hours > 0) {
+    return `${hours}h ${mins}min`;
+  }
+  return `${mins} min`;
 }
 
 /** v2.1 §D.5: File-type-aware keyword extraction prompt */

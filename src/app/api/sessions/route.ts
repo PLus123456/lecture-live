@@ -17,6 +17,7 @@ import {
   normalizeOptionalString,
   normalizeSessionAudioSource,
   normalizeSessionRegion,
+  normalizeTranslationMode,
 } from '@/lib/sessionApi';
 
 export const GET = withRequestLogging('sessions:list', async (req: Request) => {
@@ -152,6 +153,7 @@ export const POST = withRequestLogging('sessions:create', async (req: Request) =
         courseName,
         sourceLang: normalizeLanguageCode(body.sourceLang, 'en'),
         targetLang: normalizeLanguageCode(body.targetLang, 'zh'),
+        translationMode: normalizeTranslationMode(body.translationMode),
         llmProvider,
         audioSource: audioSource ?? 'microphone',
         sonioxRegion: sonioxRegion ?? 'auto',

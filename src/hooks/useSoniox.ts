@@ -671,6 +671,7 @@ export function useSoniox(
               deviceId: sourceType === 'mic' ? selectedMicDeviceId : undefined,
               managedStream,
               regionPreference: settings.sonioxRegionPreference,
+              clientReferenceId: sessionId,
               onAudioLevel: (level) => {
                 if (level >= audioActivityThreshold) {
                   markAudioActivity();
@@ -877,6 +878,7 @@ export function useSoniox(
             deviceId: sourceType === 'mic' ? selectedMicDeviceId : undefined,
             managedStream,
             regionPreference: settings.sonioxRegionPreference,
+            clientReferenceId: sessionId,
             onAudioLevel: (level) => {
               if (level >= audioActivityThreshold) {
                 markAudioActivity();

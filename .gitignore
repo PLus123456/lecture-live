@@ -46,3 +46,13 @@ next-env.d.ts
 
 # local deployment artifacts
 lecturelive-deploy.tar.gz
+
+# local assistant artifacts
+AGENTS.md
+SONIOX_STREAMING_REWORK.zh-CN.md
+.codex-artifacts/
+
+# local planning notes
+MOBILE_PLAN.md
+TIMING_BILLING_ISSUES.md
+TODO.md

@@ -15,13 +15,17 @@ export interface RealtimeToken {
 export interface SonioxSessionConfig {
   model: 'stt-rt-v4';
   language_hints?: string[];
+  language_hints_strict?: boolean;
   enable_speaker_diarization?: boolean;
   enable_language_identification?: boolean;
   enable_endpoint_detection?: boolean;
   max_endpoint_delay_ms?: number;
+  client_reference_id?: string;
   context?: {
     general?: Array<{ key: string; value: string }>;
+    text?: string;
     terms?: string[];
+    translation_terms?: Array<{ source: string; target: string }>;
   };
   translation?: {
     type: 'one_way';

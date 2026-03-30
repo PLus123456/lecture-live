@@ -25,6 +25,20 @@ export interface InterpretLine {
   timestamp: string;
 }
 
+function upsertInterpretLine(
+  lines: InterpretLine[],
+  nextLine: InterpretLine
+): InterpretLine[] {
+  const existingIndex = lines.findIndex((line) => line.id === nextLine.id);
+  if (existingIndex === -1) {
+    return [...lines, nextLine];
+  }
+
+  const next = [...lines];
+  next[existingIndex] = { ...next[existingIndex], ...nextLine };
+  return next;
+}
+
 type RecordingHandle = {
   stop?: () => Promise<void> | void;
 };
@@ -101,6 +115,7 @@ export function useInterpret() {
         topic: '',
         terms: [],
         sonioxRegionPreference: settings.sonioxRegionPreference,
+        clientReferenceId: `interpret:${langA}:${langB}`,
         twoWayTranslation: true,
       };
 
@@ -135,27 +150,19 @@ export function useInterpret() {
         onTranslationToken: (text: string, segmentId: string, meta) => {
           const sourceLanguage = meta?.sourceLanguage ?? previewLangRef.current;
           const isLangA = sourceLanguage === langARef.current;
+          const translatedLineId = `${segmentId}-tr`;
+          const translatedLine: InterpretLine = {
+            id: translatedLineId,
+            language: '',
+            text,
+            timestamp: '',
+          };
 
           const upsertTranslatedLine = (lines: InterpretLine[]) => {
-            const translatedLineId = `${segmentId}-tr`;
-            const translatedLine: InterpretLine = {
-              id: translatedLineId,
-              language: '',
-              text,
-              timestamp: '',
-            };
-            const existingIndex = lines.findIndex((line) => line.id === translatedLineId);
             if (!text.trim()) {
-              return existingIndex >= 0
-                ? lines.filter((line) => line.id !== translatedLineId)
-                : lines;
+              return lines.filter((line) => line.id !== translatedLineId);
             }
-            if (existingIndex >= 0) {
-              return lines.map((line, index) =>
-                index === existingIndex ? translatedLine : line
-              );
-            }
-            return [...lines, translatedLine];
+            return upsertInterpretLine(lines, translatedLine);
           };
 
           const patchOriginalLine = (lines: InterpretLine[]) =>
@@ -227,6 +234,7 @@ export function useInterpret() {
                 ? settings.preferredMicDeviceId
                 : undefined,
             regionPreference: settings.sonioxRegionPreference,
+            clientReferenceId: `interpret:${langA}:${langB}`,
           }
         );
 

@@ -19,12 +19,14 @@ function formatTimestamp(ms: number): string {
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
-  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+  return `${hours.toString().padStart(2, '0')}:${minutes
+    .toString()
+    .padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
 }
 
 interface SessionRecord {
   index: number;
-  timeOffsetMs: number; // 这个 session 相对于录音开始的时间偏移
+  timeOffsetMs: number;
   finalTokens: RealtimeToken[];
 }
 
@@ -33,11 +35,21 @@ interface TranslationMeta {
   sourceLanguage: string | null;
 }
 
-interface PendingTranslationTarget {
-  segmentId: string;
+interface TrackedTranslationSegment {
+  id: string;
+  sourceLanguage: string;
+  startMs: number;
+  endMs: number;
+  finalText: string;
+  nonFinalText: string;
+  usesPassthrough: boolean;
+}
+
+interface PendingTranslationToken {
+  text: string;
+  isFinal: boolean;
+  globalTimeMs: number | null;
   sourceLanguage: string | null;
-  finalTokens: RealtimeToken[];
-  nonFinalTokens: RealtimeToken[];
 }
 
 export class TokenProcessor {
@@ -48,16 +60,16 @@ export class TokenProcessor {
   private previewTranslationFinalTokens: RealtimeToken[] = [];
   private previewTranslationNonFinalTokens: RealtimeToken[] = [];
   private previewTranslationSourceLanguage: string | null = null;
-  private pendingTranslationTargets: PendingTranslationTarget[] = [];
+  private recentTranslationSegments: TrackedTranslationSegment[] = [];
+  private pendingTranslationTargets: string[] = [];
+  private pendingTranslationTokens: PendingTranslationToken[] = [];
 
-  /** 目标翻译语言，用于判断是否需要 passthrough */
   private targetLang = '';
-
-  /** 动态截断阈值（字符数），0 表示不启用 */
   private maxSegmentChars = 0;
 
-  /** 句子结束标点（中英日韩通用） */
   private static SENTENCE_END_RE = /[.!?。！？；]\s*$/;
+  private static readonly TRANSLATION_MATCH_TOLERANCE_MS = 250;
+  private static readonly MAX_RECENT_TRANSLATION_SEGMENTS = 64;
 
   private onSegmentFinalized?: (segment: TranscriptSegment) => void;
   private onPreviewUpdate?: (preview: StreamingPreviewText) => void;
@@ -86,22 +98,17 @@ export class TokenProcessor {
     this.onPreviewUpdate = callbacks.onPreviewUpdate;
     this.onTranslationToken = callbacks.onTranslationToken;
     this.onPreviewTranslationUpdate = callbacks.onPreviewTranslationUpdate;
-
-    // 创建初始 session
     this.startNewSession(0);
   }
 
-  /** 设置目标翻译语言 */
   setTargetLang(lang: string) {
     this.targetLang = lang;
   }
 
-  /** 设置动态截断阈值（字符数），由窗口高度动态计算 */
   setMaxSegmentChars(chars: number) {
     this.maxSegmentChars = Math.max(chars, 0);
   }
 
-  /** 开始新 session（麦克风切换或关键词注入时调用） */
   startNewSession(timeOffsetMs: number) {
     this.currentSessionIndex++;
     this.sessions.push({
@@ -112,7 +119,7 @@ export class TokenProcessor {
   }
 
   processTokens(tokens: RealtimeToken[]) {
-    const currentSession = this.sessions[this.sessions.length - 1];
+    const currentSession = this.getCurrentSession();
     const transcriptionTokens = tokens.filter(
       (token) => token.translation_status !== 'translation'
     );
@@ -132,18 +139,18 @@ export class TokenProcessor {
         }
       }
 
-      // Soniox 的 non-final 是“当前尾巴快照”，不是追加流
       this.segmentNonFinalTokens = nextNonFinalTokens;
-    }
-
-    if (translationTokens.length > 0) {
-      this.processTranslationTokens(translationTokens);
     }
 
     if (this.shouldAutoSplit()) {
       this.flushSegment();
     }
 
+    if (translationTokens.length > 0) {
+      this.processTranslationTokens(translationTokens, currentSession);
+    }
+
+    this.flushPendingTranslationTokens();
     this.emitPreviewState();
   }
 
@@ -152,86 +159,85 @@ export class TokenProcessor {
     this.emitPreviewState();
   }
 
-  private processTranslationTokens(tokens: RealtimeToken[]) {
-    const sourceLanguage =
-      tokens.find((token) => token.source_language)?.source_language ??
-      this.getDominantLanguage();
-    const pendingTargetIndex = this.findPendingTranslationTarget(sourceLanguage);
-
-    if (pendingTargetIndex >= 0) {
-      this.applyTranslationTokensToPendingTarget(
-        pendingTargetIndex,
-        tokens,
-        sourceLanguage
-      );
-      return;
-    }
-
-    const finalTokens = tokens.filter((token) => token.is_final);
-    const nonFinalTokens = tokens.filter((token) => !token.is_final);
-
-    if (finalTokens.length > 0) {
-      this.previewTranslationFinalTokens.push(...finalTokens);
-    }
-    this.previewTranslationNonFinalTokens = nonFinalTokens;
-    this.previewTranslationSourceLanguage =
-      sourceLanguage ?? this.previewTranslationSourceLanguage ?? null;
-  }
-
-  private findPendingTranslationTarget(sourceLanguage: string | null): number {
-    if (this.pendingTranslationTargets.length === 0) {
-      return -1;
-    }
-
-    if (sourceLanguage) {
-      const matchIndex = this.pendingTranslationTargets.findIndex(
-        (target) => target.sourceLanguage === sourceLanguage
-      );
-      if (matchIndex >= 0) {
-        return matchIndex;
-      }
-    }
-
-    return this.pendingTranslationTargets.length === 1 ? 0 : -1;
-  }
-
-  private applyTranslationTokensToPendingTarget(
-    index: number,
-    tokens: RealtimeToken[],
-    sourceLanguage: string | null
-  ) {
-    const target = this.pendingTranslationTargets[index];
-    const finalTokens = tokens.filter((token) => token.is_final);
-    const nonFinalTokens = tokens.filter((token) => !token.is_final);
-
-    if (finalTokens.length > 0) {
-      target.finalTokens.push(...finalTokens);
-    }
-    target.nonFinalTokens = nonFinalTokens;
-    target.sourceLanguage = target.sourceLanguage ?? sourceLanguage ?? null;
-
-    const finalText = target.finalTokens.map((token) => token.text).join('').trim();
-    const hasNonFinalText = target.nonFinalTokens.some(
-      (token) => token.text.trim().length > 0
-    );
-    const state: SegmentTranslationState = hasNonFinalText
-      ? 'streaming'
-      : finalText
-        ? 'final'
-        : 'pending';
-
-    this.onTranslationToken?.(finalText, target.segmentId, {
-      state,
-      sourceLanguage: target.sourceLanguage,
-    });
-
-    if (state === 'final') {
-      this.pendingTranslationTargets.splice(index, 1);
-    }
+  private getCurrentSession(): SessionRecord {
+    return this.sessions[this.sessions.length - 1];
   }
 
   private getCurrentSegmentTokens(): RealtimeToken[] {
     return [...this.segmentFinalTokens, ...this.segmentNonFinalTokens];
+  }
+
+  private getCurrentSegmentRange():
+    | { startMs: number; endMs: number }
+    | null {
+    const tokens = this.getCurrentSegmentTokens();
+    if (tokens.length === 0) return null;
+
+    const currentSession = this.getCurrentSession();
+    const startToken = tokens.find(
+      (token) => typeof token.start_ms === 'number'
+    );
+    const endToken = [...tokens]
+      .reverse()
+      .find((token) => typeof token.end_ms === 'number');
+    const rawStartMs = startToken?.start_ms ?? 0;
+    const rawEndMs = endToken?.end_ms ?? rawStartMs;
+
+    return {
+      startMs: currentSession.timeOffsetMs + rawStartMs,
+      endMs: currentSession.timeOffsetMs + rawEndMs,
+    };
+  }
+
+  private getTokenGlobalTimeMs(
+    token: RealtimeToken,
+    session: SessionRecord
+  ): number | null {
+    const localTimeMs =
+      typeof token.end_ms === 'number'
+        ? token.end_ms
+        : typeof token.start_ms === 'number'
+          ? token.start_ms
+          : null;
+
+    return localTimeMs == null ? null : session.timeOffsetMs + localTimeMs;
+  }
+
+  private distanceToRange(timeMs: number, startMs: number, endMs: number): number {
+    if (timeMs < startMs) return startMs - timeMs;
+    if (timeMs > endMs) return timeMs - endMs;
+    return 0;
+  }
+
+  private getDominantLanguage(tokens = this.getCurrentSegmentTokens()) {
+    if (tokens.length === 0) {
+      return null;
+    }
+
+    const languageCounts: Record<string, number> = {};
+    for (const token of tokens) {
+      if (!token.language) continue;
+      languageCounts[token.language] = (languageCounts[token.language] || 0) + 1;
+    }
+
+    let dominantLanguage: string | null = null;
+    let maxCount = 0;
+    for (const [language, count] of Object.entries(languageCounts)) {
+      if (count > maxCount) {
+        dominantLanguage = language;
+        maxCount = count;
+      }
+    }
+
+    return dominantLanguage;
+  }
+
+  private isCurrentSegmentInTargetLang(tokens = this.getCurrentSegmentTokens()) {
+    if (!this.targetLang) {
+      return false;
+    }
+
+    return this.getDominantLanguage(tokens) === this.targetLang;
   }
 
   private getCurrentPreview(): StreamingPreviewText {
@@ -290,6 +296,300 @@ export class TokenProcessor {
     this.previewTranslationSourceLanguage = null;
   }
 
+  private shouldAutoSplit(): boolean {
+    if (this.maxSegmentChars <= 0) {
+      return false;
+    }
+
+    const text = combinePreviewText(this.getCurrentPreview());
+    return (
+      text.length >= this.maxSegmentChars &&
+      TokenProcessor.SENTENCE_END_RE.test(text)
+    );
+  }
+
+  private addTrackedTranslationSegment(segment: TrackedTranslationSegment) {
+    this.recentTranslationSegments.push(segment);
+    if (
+      this.recentTranslationSegments.length >
+      TokenProcessor.MAX_RECENT_TRANSLATION_SEGMENTS
+    ) {
+      const overflow = this.recentTranslationSegments.length -
+        TokenProcessor.MAX_RECENT_TRANSLATION_SEGMENTS;
+      const removed = this.recentTranslationSegments.splice(0, overflow);
+      if (removed.length > 0) {
+        const removedIds = new Set(removed.map((item) => item.id));
+        this.pendingTranslationTargets = this.pendingTranslationTargets.filter(
+          (segmentId) => !removedIds.has(segmentId)
+        );
+      }
+    }
+  }
+
+  private findTrackedTranslationSegmentById(segmentId: string) {
+    return this.recentTranslationSegments.find((segment) => segment.id === segmentId) ?? null;
+  }
+
+  private findMatchingFinalizedSegment(globalTimeMs: number) {
+    let bestMatch: TrackedTranslationSegment | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (let i = this.recentTranslationSegments.length - 1; i >= 0; i--) {
+      const segment = this.recentTranslationSegments[i];
+      const distance = this.distanceToRange(
+        globalTimeMs,
+        segment.startMs,
+        segment.endMs
+      );
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestMatch = segment;
+        if (distance === 0) break;
+      }
+    }
+
+    if (
+      bestMatch &&
+      bestDistance <= TokenProcessor.TRANSLATION_MATCH_TOLERANCE_MS
+    ) {
+      return bestMatch;
+    }
+
+    return null;
+  }
+
+  private canMatchCurrentSegment(globalTimeMs: number) {
+    const currentRange = this.getCurrentSegmentRange();
+    if (!currentRange) return false;
+
+    return (
+      this.distanceToRange(
+        globalTimeMs,
+        currentRange.startMs,
+        currentRange.endMs
+      ) <= TokenProcessor.TRANSLATION_MATCH_TOLERANCE_MS
+    );
+  }
+
+  private emitTrackedTranslationSegment(segment: TrackedTranslationSegment) {
+    const text = segment.finalText.trim();
+    const state: SegmentTranslationState = text
+      ? segment.nonFinalText.trim()
+        ? 'streaming'
+        : 'final'
+      : 'pending';
+
+    this.onTranslationToken?.(text, segment.id, {
+      state,
+      sourceLanguage: segment.sourceLanguage,
+    });
+
+    if (state === 'final') {
+      this.pendingTranslationTargets = this.pendingTranslationTargets.filter(
+        (segmentId) => segmentId !== segment.id
+      );
+    }
+  }
+
+  private applyTokensToTrackedSegment(
+    segment: TrackedTranslationSegment,
+    tokens: PendingTranslationToken[]
+  ) {
+    if (tokens.length === 0) return;
+
+    const sourceLanguage =
+      tokens.find((token) => token.sourceLanguage)?.sourceLanguage ??
+      segment.sourceLanguage;
+    segment.sourceLanguage = sourceLanguage ?? segment.sourceLanguage;
+
+    const finalTextChunk = tokens
+      .filter((token) => token.isFinal)
+      .map((token) => token.text)
+      .join('');
+    const nonFinalText = tokens
+      .filter((token) => !token.isFinal)
+      .map((token) => token.text)
+      .join('');
+
+    if (finalTextChunk) {
+      if (segment.usesPassthrough) {
+        segment.finalText = '';
+        segment.usesPassthrough = false;
+      }
+      segment.finalText += finalTextChunk;
+    }
+
+    if (nonFinalText) {
+      segment.nonFinalText = nonFinalText;
+    } else if (finalTextChunk) {
+      segment.nonFinalText = '';
+    }
+
+    this.emitTrackedTranslationSegment(segment);
+  }
+
+  private enqueuePendingTarget(segmentId: string) {
+    if (!this.pendingTranslationTargets.includes(segmentId)) {
+      this.pendingTranslationTargets.push(segmentId);
+    }
+  }
+
+  private findPendingTarget(sourceLanguage: string | null) {
+    if (this.pendingTranslationTargets.length === 0) {
+      return null;
+    }
+
+    if (sourceLanguage) {
+      for (const segmentId of this.pendingTranslationTargets) {
+        const target = this.findTrackedTranslationSegmentById(segmentId);
+        if (target?.sourceLanguage === sourceLanguage) {
+          return target;
+        }
+      }
+    }
+
+    if (this.pendingTranslationTargets.length === 1) {
+      return this.findTrackedTranslationSegmentById(this.pendingTranslationTargets[0]);
+    }
+
+    return this.findTrackedTranslationSegmentById(
+      this.pendingTranslationTargets[this.pendingTranslationTargets.length - 1]
+    );
+  }
+
+  private applyTokensToCurrentPreview(tokens: PendingTranslationToken[]) {
+    if (tokens.length === 0) return;
+
+    const sourceLanguage =
+      tokens.find((token) => token.sourceLanguage)?.sourceLanguage ??
+      this.getDominantLanguage();
+    const finalTokens = tokens.filter((token) => token.isFinal);
+    const nonFinalTokens = tokens.filter((token) => !token.isFinal);
+
+    if (finalTokens.length > 0) {
+      this.previewTranslationFinalTokens.push(
+        ...finalTokens.map((token) => ({
+          text: token.text,
+          confidence: 1,
+          is_final: true,
+        }))
+      );
+    }
+    this.previewTranslationNonFinalTokens = nonFinalTokens.map((token) => ({
+      text: token.text,
+      confidence: 1,
+      is_final: false,
+    }));
+    this.previewTranslationSourceLanguage =
+      sourceLanguage ?? this.previewTranslationSourceLanguage ?? null;
+  }
+
+  private routeUntimedTranslationTokens(tokens: PendingTranslationToken[]) {
+    if (tokens.length === 0) return;
+
+    const sourceLanguage =
+      tokens.find((token) => token.sourceLanguage)?.sourceLanguage ?? null;
+    const hasCurrentPreview = hasPreviewContent(this.getCurrentPreview());
+
+    if (hasCurrentPreview) {
+      this.applyTokensToCurrentPreview(tokens);
+      return;
+    }
+
+    const pendingTarget = this.findPendingTarget(sourceLanguage);
+    if (pendingTarget) {
+      this.applyTokensToTrackedSegment(pendingTarget, tokens);
+      return;
+    }
+
+    const latestSegment = this.recentTranslationSegments.at(-1);
+    if (latestSegment) {
+      this.applyTokensToTrackedSegment(latestSegment, tokens);
+      return;
+    }
+
+    this.applyTokensToCurrentPreview(tokens);
+  }
+
+  private processTranslationTokens(
+    tokens: RealtimeToken[],
+    currentSession: SessionRecord
+  ) {
+    const currentPreviewTokens: PendingTranslationToken[] = [];
+    const finalizedGroups = new Map<string, PendingTranslationToken[]>();
+    const untimedTokens: PendingTranslationToken[] = [];
+
+    for (const token of tokens) {
+      const queuedToken: PendingTranslationToken = {
+        text: token.text,
+        isFinal: token.is_final,
+        globalTimeMs: this.getTokenGlobalTimeMs(token, currentSession),
+        sourceLanguage: token.source_language ?? null,
+      };
+
+      if (queuedToken.globalTimeMs == null) {
+        untimedTokens.push(queuedToken);
+        continue;
+      }
+
+      const finalizedSegment = this.findMatchingFinalizedSegment(
+        queuedToken.globalTimeMs
+      );
+      if (finalizedSegment) {
+        const existing = finalizedGroups.get(finalizedSegment.id) ?? [];
+        existing.push(queuedToken);
+        finalizedGroups.set(finalizedSegment.id, existing);
+        continue;
+      }
+
+      if (this.canMatchCurrentSegment(queuedToken.globalTimeMs)) {
+        currentPreviewTokens.push(queuedToken);
+        continue;
+      }
+
+      this.pendingTranslationTokens.push(queuedToken);
+    }
+
+    for (const [segmentId, groupedTokens] of finalizedGroups.entries()) {
+      const trackedSegment = this.findTrackedTranslationSegmentById(segmentId);
+      if (trackedSegment) {
+        this.applyTokensToTrackedSegment(trackedSegment, groupedTokens);
+      }
+    }
+
+    if (currentPreviewTokens.length > 0) {
+      this.applyTokensToCurrentPreview(currentPreviewTokens);
+    }
+
+    if (untimedTokens.length > 0) {
+      this.routeUntimedTranslationTokens(untimedTokens);
+    }
+  }
+
+  private flushPendingTranslationTokens() {
+    if (this.pendingTranslationTokens.length === 0) return;
+
+    const unresolved: PendingTranslationToken[] = [];
+    for (const token of this.pendingTranslationTokens) {
+      if (token.globalTimeMs != null) {
+        const finalizedSegment = this.findMatchingFinalizedSegment(token.globalTimeMs);
+        if (finalizedSegment) {
+          this.applyTokensToTrackedSegment(finalizedSegment, [token]);
+          continue;
+        }
+
+        if (this.canMatchCurrentSegment(token.globalTimeMs)) {
+          this.applyTokensToCurrentPreview([token]);
+          continue;
+        }
+      }
+
+      unresolved.push(token);
+    }
+
+    this.pendingTranslationTokens = unresolved;
+  }
+
   private flushSegment() {
     const segmentTokens = this.getCurrentSegmentTokens();
     if (segmentTokens.length === 0) {
@@ -297,7 +597,7 @@ export class TokenProcessor {
       return;
     }
 
-    const currentSession = this.sessions[this.sessions.length - 1];
+    const currentSession = this.getCurrentSession();
     const rawText = segmentTokens.map((token) => token.text).join('');
     const text = rawText.trim();
     if (!text) {
@@ -316,7 +616,6 @@ export class TokenProcessor {
     const rawStartMs = startToken?.start_ms ?? 0;
     const rawEndMs = endToken?.end_ms ?? rawStartMs;
 
-    // 全局时间戳对齐
     const globalStartMs = currentSession.timeOffsetMs + rawStartMs;
     const globalEndMs = currentSession.timeOffsetMs + rawEndMs;
 
@@ -346,108 +645,55 @@ export class TokenProcessor {
       timestamp: formatTimestamp(globalStartMs),
     };
 
-    const translationFinalText = this.previewTranslationFinalTokens
-      .map((token) => token.text)
-      .join('')
-      .trim();
-    const hasTranslationNonFinal = this.previewTranslationNonFinalTokens.some(
-      (token) => token.text.trim().length > 0
-    );
-    const translationSourceLanguage =
-      this.previewTranslationSourceLanguage ?? dominantLanguage;
+    this.onSegmentFinalized?.(segment);
 
-    if (translationFinalText || hasTranslationNonFinal) {
-      if (hasTranslationNonFinal) {
-        this.pendingTranslationTargets.push({
-          segmentId: segment.id,
-          sourceLanguage: translationSourceLanguage,
-          finalTokens: [...this.previewTranslationFinalTokens],
-          nonFinalTokens: [...this.previewTranslationNonFinalTokens],
-        });
-        this.onTranslationToken?.(translationFinalText, segment.id, {
-          state: translationFinalText ? 'streaming' : 'pending',
-          sourceLanguage: translationSourceLanguage,
-        });
-      } else if (translationFinalText) {
-        this.onTranslationToken?.(translationFinalText, segment.id, {
-          state: 'final',
-          sourceLanguage: translationSourceLanguage,
-        });
+    const trackedTranslationSegment: TrackedTranslationSegment = {
+      id: segment.id,
+      sourceLanguage: dominantLanguage,
+      startMs: globalStartMs,
+      endMs: globalEndMs,
+      finalText: '',
+      nonFinalText: '',
+      usesPassthrough: false,
+    };
+    this.addTrackedTranslationSegment(trackedTranslationSegment);
+
+    const previewTranslationFinalText = this.previewTranslationFinalTokens
+      .map((token) => token.text)
+      .join('');
+    const previewTranslationNonFinalText = this.previewTranslationNonFinalTokens
+      .map((token) => token.text)
+      .join('');
+
+    if (previewTranslationFinalText || previewTranslationNonFinalText) {
+      trackedTranslationSegment.finalText = previewTranslationFinalText;
+      trackedTranslationSegment.nonFinalText = previewTranslationNonFinalText;
+      this.emitTrackedTranslationSegment(trackedTranslationSegment);
+
+      if (previewTranslationNonFinalText.trim()) {
+        this.enqueuePendingTarget(trackedTranslationSegment.id);
       }
     } else if (this.targetLang && this.isCurrentSegmentInTargetLang(segmentTokens)) {
-      // Soniox 没返回翻译且当前段语言已等于目标语言时，最终段落直接 passthrough
-      this.onTranslationToken?.(text, segment.id, {
-        state: 'final',
-        sourceLanguage: dominantLanguage,
-      });
+      trackedTranslationSegment.finalText = text;
+      trackedTranslationSegment.usesPassthrough = true;
+      this.emitTrackedTranslationSegment(trackedTranslationSegment);
     } else if (this.targetLang) {
-      this.onTranslationToken?.('', segment.id, {
-        state: 'pending',
-        sourceLanguage: dominantLanguage,
-      });
+      this.enqueuePendingTarget(trackedTranslationSegment.id);
+      this.emitTrackedTranslationSegment(trackedTranslationSegment);
     }
 
-    this.onSegmentFinalized?.(segment);
     this.segmentFinalTokens = [];
     this.segmentNonFinalTokens = [];
     this.clearCurrentPreviewTranslation();
+    this.flushPendingTranslationTokens();
   }
 
-  private getDominantLanguage(tokens = this.getCurrentSegmentTokens()) {
-    if (tokens.length === 0) {
-      return null;
-    }
-
-    const languageCounts: Record<string, number> = {};
-    for (const token of tokens) {
-      if (!token.language) {
-        continue;
-      }
-      languageCounts[token.language] = (languageCounts[token.language] || 0) + 1;
-    }
-
-    let dominantLanguage: string | null = null;
-    let maxCount = 0;
-    for (const [language, count] of Object.entries(languageCounts)) {
-      if (count > maxCount) {
-        dominantLanguage = language;
-        maxCount = count;
-      }
-    }
-
-    return dominantLanguage;
-  }
-
-  private isCurrentSegmentInTargetLang(tokens = this.getCurrentSegmentTokens()) {
-    if (!this.targetLang) {
-      return false;
-    }
-
-    return this.getDominantLanguage(tokens) === this.targetLang;
-  }
-
-  /** 检查是否应在句子边界处自动截断 */
-  private shouldAutoSplit(): boolean {
-    if (this.maxSegmentChars <= 0) {
-      return false;
-    }
-
-    const preview = this.getCurrentPreview();
-    const text = combinePreviewText(preview);
-    return (
-      text.length >= this.maxSegmentChars &&
-      TokenProcessor.SENTENCE_END_RE.test(text)
-    );
-  }
-
-  /** 获取所有 session 的完整文本 */
   getAllFinalText(): string {
     return this.sessions
       .flatMap((session) => session.finalTokens.map((token) => token.text))
       .join('');
   }
 
-  /** 构建所有 segments（用于导出等场景） */
   buildAllSegments(): TranscriptSegment[] {
     const segments: TranscriptSegment[] = [];
     for (const session of this.sessions) {
@@ -473,7 +719,6 @@ export class TokenProcessor {
     return segments;
   }
 
-  /** 设置 segmentCounter 起始值（刷新恢复时使用） */
   setSegmentCounterOffset(offset: number) {
     segmentCounter = offset;
   }
@@ -482,7 +727,9 @@ export class TokenProcessor {
     this.sessions = [];
     this.segmentFinalTokens = [];
     this.segmentNonFinalTokens = [];
+    this.recentTranslationSegments = [];
     this.pendingTranslationTargets = [];
+    this.pendingTranslationTokens = [];
     this.clearCurrentPreviewTranslation();
     this.currentSessionIndex = 0;
     segmentCounter = 0;

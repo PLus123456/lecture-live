@@ -121,6 +121,7 @@ export interface SessionConfig {
   sourceLang: string;
   targetLang: string;
   languageHints: string[];
+  languageHintsStrict?: boolean;
   enableSpeakerDiarization: boolean;
   enableLanguageIdentification: boolean;
   enableEndpointDetection: boolean;
@@ -130,6 +131,7 @@ export interface SessionConfig {
   topic: string;
   terms: string[];
   sonioxRegionPreference: SonioxRegionPreference;
+  clientReferenceId?: string;
   /** 启用 Soniox two_way 双向翻译（来回翻译模式） */
   twoWayTranslation?: boolean;
 }

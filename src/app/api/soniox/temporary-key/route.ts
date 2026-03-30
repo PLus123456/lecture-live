@@ -30,8 +30,15 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Quota exceeded' }, { status: 403 });
   }
 
-  const body = await req.json().catch(() => ({})) as { region?: string };
+  const body = await req.json().catch(() => ({})) as {
+    region?: string;
+    clientReferenceId?: string;
+  };
   const requestedRegion = parseSonioxRegionPreference(body.region) ?? 'auto';
+  const clientReferenceId =
+    typeof body.clientReferenceId === 'string'
+      ? body.clientReferenceId.trim().slice(0, 256)
+      : undefined;
   const resolvedRegion = await resolveRequestedRegionAsync(requestedRegion, req.headers);
   const sonioxConfig = await resolveSonioxRuntimeConfigAsync({
     requestedRegion,
@@ -56,6 +63,7 @@ export async function POST(req: Request) {
         body: JSON.stringify({
           usage_type: 'transcribe_websocket',
           expires_in_seconds: 60,
+          client_reference_id: clientReferenceId || undefined,
         }),
       }
     );

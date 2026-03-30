@@ -65,7 +65,7 @@ export default function ExportModal({
     try {
       const endpoint = sessionId ? `/api/sessions/${sessionId}/export` : '/api/export';
       const payload = sessionId
-        ? { format: selectedFormat }
+        ? { format: selectedFormat, sourceLang, targetLang }
         : {
             format: selectedFormat,
             title: sessionTitle || t('session.defaultTitle'),

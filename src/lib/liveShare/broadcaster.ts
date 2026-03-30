@@ -4,6 +4,10 @@
 import { io, Socket } from 'socket.io-client';
 import type { TranscriptSegment } from '@/types/transcript';
 import type { SummaryBlock } from '@/types/summary';
+import type {
+  StreamingPreviewText,
+  StreamingPreviewTranslation,
+} from '@/types/transcript';
 
 interface BroadcasterCallbacks {
   onViewerCount?: (count: number) => void;
@@ -15,6 +19,8 @@ interface SnapshotPayload {
   translations: Record<string, string>;
   summaryBlocks: SummaryBlock[];
   status: string;
+  previewText: StreamingPreviewText;
+  previewTranslation: StreamingPreviewTranslation;
 }
 
 export class LiveBroadcaster {
@@ -86,12 +92,15 @@ export class LiveBroadcaster {
   }
 
   /** 广播实时预览文本（正在说的内容，尚未确认为完整段落） */
-  broadcastPreviewUpdate(preview: string, previewTranslation: string) {
+  broadcastPreviewUpdate(payload: {
+    previewText: StreamingPreviewText;
+    previewTranslation: StreamingPreviewTranslation;
+  }) {
     this.socket.emit('broadcast', {
       sessionId: this.sessionId,
       event: {
         type: 'preview_update',
-        payload: { preview, previewTranslation },
+        payload,
         timestamp: Date.now(),
       },
     });

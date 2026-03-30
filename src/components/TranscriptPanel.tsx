@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { hasPreviewContent } from '@/lib/transcriptPreview';
 import { useTranscriptStore } from '@/stores/transcriptStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -30,10 +31,13 @@ export default function TranscriptPanel({
 }) {
   const { t } = useI18n();
   const segments = useTranscriptStore((s) => s.segments);
-  const currentPreview = useTranscriptStore((s) => s.currentPreview);
-  const currentPreviewTranslation = useTranscriptStore((s) => s.currentPreviewTranslation);
+  const currentPreviewText = useTranscriptStore((s) => s.currentPreviewText);
+  const currentPreviewTranslationText = useTranscriptStore(
+    (s) => s.currentPreviewTranslationText
+  );
   const recordingState = useTranscriptStore((s) => s.recordingState);
   const translations = useTranslationStore((s) => s.translations);
+  const translationEntries = useTranslationStore((s) => s.translationEntries);
   const targetLang = useSettingsStore((s) => s.targetLang);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -68,7 +72,7 @@ export default function TranscriptPanel({
     requestAnimationFrame(() => {
       isAutoScrollingRef.current = false;
     });
-  }, [segments, currentPreview, currentPreviewTranslation, autoScroll]);
+  }, [segments, currentPreviewText, currentPreviewTranslationText, autoScroll]);
 
   const scrollToBottom = useCallback(() => {
     setAutoScroll(true);
@@ -80,6 +84,13 @@ export default function TranscriptPanel({
   }, []);
 
   const hasTranslation = !!targetLang;
+  const hasPreview = hasPreviewContent(currentPreviewText);
+  const hasPreviewTranslation = hasPreviewContent(currentPreviewTranslationText);
+  const showPreviewTranslationWaiting =
+    hasTranslation &&
+    hasPreview &&
+    currentPreviewTranslationText.state === 'waiting' &&
+    !hasPreviewTranslation;
 
   return (
     <div className={`panel-card relative flex h-full flex-col ${className}`.trim()}>
@@ -104,7 +115,7 @@ export default function TranscriptPanel({
         onScroll={handleScroll}
         className={`min-h-0 flex-1 overflow-y-auto px-5 py-4 ${contentClassName}`.trim()}
       >
-        {segments.length === 0 && recordingState === 'idle' && !currentPreview && (
+        {segments.length === 0 && recordingState === 'idle' && !hasPreview && (
           <div className="flex flex-col items-center justify-center h-full text-charcoal-300">
             <MessageSquare className="w-10 h-10 mb-3 opacity-50" />
             <p className="text-sm">{t('transcriptPanel.empty')}</p>
@@ -114,7 +125,12 @@ export default function TranscriptPanel({
         <div className={compact ? 'space-y-2' : 'space-y-4'}>
           {/* 已确认的 segments — 不显示说话人，只有时间戳 + 文本 + 翻译 */}
           {segments.map((seg) => {
-            const translation = hasTranslation ? translations[seg.id] : null;
+            const translationEntry = hasTranslation
+              ? translationEntries[seg.id]
+              : null;
+            const translation = hasTranslation
+              ? translationEntry?.text ?? translations[seg.id] ?? ''
+              : '';
             return (
               <div key={seg.id} className="segment-enter">
                 <div className="flex items-center gap-2 mb-1">
@@ -148,16 +164,42 @@ export default function TranscriptPanel({
           })}
 
           {/* 实时 preview */}
-          {currentPreview && (
+          {hasPreview && (
             <div>
-              <p className={`text-charcoal-400 leading-relaxed ${compact ? 'text-[13px]' : 'text-sm'}`}>
-                {currentPreview}
+              <p className={`leading-relaxed ${compact ? 'text-[13px]' : 'text-sm'}`}>
+                {currentPreviewText.finalText ? (
+                  <span className="text-charcoal-600">
+                    {currentPreviewText.finalText}
+                  </span>
+                ) : null}
+                {currentPreviewText.nonFinalText ? (
+                  <span className="text-charcoal-400">
+                    {currentPreviewText.nonFinalText}
+                  </span>
+                ) : null}
               </p>
 
-              {hasTranslation && currentPreviewTranslation && (
+              {hasTranslation && hasPreviewTranslation && (
                 <div className="mt-0.5">
-                  <p className={`font-medium text-rust-500 leading-relaxed opacity-80 ${compact ? 'text-[15px]' : 'text-base'}`}>
-                    {currentPreviewTranslation}
+                  <p className={`font-medium leading-relaxed ${compact ? 'text-[15px]' : 'text-base'}`}>
+                    {currentPreviewTranslationText.finalText ? (
+                      <span className="text-rust-700">
+                        {currentPreviewTranslationText.finalText}
+                      </span>
+                    ) : null}
+                    {currentPreviewTranslationText.nonFinalText ? (
+                      <span className="text-rust-500">
+                        {currentPreviewTranslationText.nonFinalText}
+                      </span>
+                    ) : null}
+                  </p>
+                </div>
+              )}
+
+              {showPreviewTranslationWaiting && (
+                <div className="mt-0.5">
+                  <p className={`text-charcoal-300 italic leading-relaxed ${compact ? 'text-[15px]' : 'text-base'}`}>
+                    {t('transcriptPanel.translating')}
                   </p>
                 </div>
               )}
@@ -165,7 +207,7 @@ export default function TranscriptPanel({
           )}
 
           {/* 打字指示器 */}
-          {recordingState === 'recording' && !currentPreview && segments.length > 0 && (
+          {recordingState === 'recording' && !hasPreview && segments.length > 0 && (
             <TypingIndicator />
           )}
         </div>

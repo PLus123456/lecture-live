@@ -2,6 +2,10 @@
 // 观看者端：连接到分享 session
 
 import { io, Socket } from 'socket.io-client';
+import type {
+  StreamingPreviewText,
+  StreamingPreviewTranslation,
+} from '@/types/transcript';
 
 export interface ViewerCallbacks {
   onInitialState: (snapshot: {
@@ -9,14 +13,17 @@ export interface ViewerCallbacks {
     translations: Record<string, string>;
     summaryBlocks: unknown[];
     status?: string | null;
-    preview?: string;
-    previewTranslation?: string;
+    previewText?: StreamingPreviewText;
+    previewTranslation?: StreamingPreviewTranslation;
   }) => void;
   onTranscriptDelta: (delta: unknown) => void;
   onTranslationDelta: (data: { segmentId: string; translation: string }) => void;
   onSummaryUpdate: (block: unknown) => void;
   onStatusUpdate: (data: { status: string }) => void;
-  onPreviewUpdate: (data: { preview: string; previewTranslation: string }) => void;
+  onPreviewUpdate: (data: {
+    previewText: StreamingPreviewText;
+    previewTranslation: StreamingPreviewTranslation;
+  }) => void;
   onError: (error: { message: string }) => void;
 }
 

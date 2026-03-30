@@ -8,10 +8,20 @@ import { prisma } from '@/lib/prisma';
 import { assertWithinRoot, sanitizePath, sanitizeToken } from '@/lib/security';
 import { logger, serializeError } from '@/lib/logger';
 import {
+  EMPTY_STREAMING_PREVIEW_TEXT,
+  EMPTY_STREAMING_PREVIEW_TRANSLATION,
+  normalizePreviewText,
+  normalizePreviewTranslation,
+} from '@/lib/transcriptPreview';
+import {
   CLIENT_SESSION_TOKEN,
   extractTokenFromCookieHeader,
   verifyAuthToken,
 } from '@/lib/auth';
+import type {
+  StreamingPreviewText,
+  StreamingPreviewTranslation,
+} from '@/types/transcript';
 
 const TRANSCRIPT_DIR = path.join(process.cwd(), 'data', 'transcripts');
 const liveShareLogger = logger.child({ component: 'live-share' });
@@ -34,8 +44,8 @@ interface LiveSnapshot {
   summaryBlocks: unknown[];
   status: string | null;
   /** 当前正在说的流式预览文本（临时，不持久化） */
-  preview: string;
-  previewTranslation: string;
+  previewText: StreamingPreviewText;
+  previewTranslation: StreamingPreviewTranslation;
   updatedAt: number;
 }
 
@@ -68,8 +78,8 @@ function buildEmptySnapshot(): LiveSnapshot {
     translations: {},
     summaryBlocks: [],
     status: null,
-    preview: '',
-    previewTranslation: '',
+    previewText: EMPTY_STREAMING_PREVIEW_TEXT,
+    previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
     updatedAt: Date.now(),
   };
 }
@@ -100,8 +110,8 @@ async function loadPersistedSnapshot(sessionId: string): Promise<LiveSnapshot> {
           : {},
       summaryBlocks: Array.isArray(parsed.summaries) ? parsed.summaries : [],
       status: typeof parsed.status === 'string' ? parsed.status : null,
-      preview: '',
-      previewTranslation: '',
+      previewText: EMPTY_STREAMING_PREVIEW_TEXT,
+      previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
       updatedAt: Date.now(),
     };
   } catch {
@@ -207,9 +217,16 @@ function mergeEventIntoSnapshot(
     }
     case 'preview_update': {
       if (event.payload && typeof event.payload === 'object') {
-        const p = event.payload as { preview?: string; previewTranslation?: string };
-        snapshot.preview = typeof p.preview === 'string' ? p.preview : '';
-        snapshot.previewTranslation = typeof p.previewTranslation === 'string' ? p.previewTranslation : '';
+        const p = event.payload as {
+          previewText?: StreamingPreviewText | string;
+          previewTranslation?: StreamingPreviewTranslation | string;
+        };
+        snapshot.previewText = p.previewText
+          ? normalizePreviewText(p.previewText)
+          : EMPTY_STREAMING_PREVIEW_TEXT;
+        snapshot.previewTranslation = p.previewTranslation
+          ? normalizePreviewTranslation(p.previewTranslation)
+          : EMPTY_STREAMING_PREVIEW_TRANSLATION;
       }
       break;
     }
@@ -392,10 +409,22 @@ export function setupLiveShare(io: SocketIO) {
           ? payload.summaryBlocks
           : [],
         status: typeof payload.status === 'string' ? payload.status : null,
-        preview: typeof (payload as Record<string, unknown>).preview === 'string'
-          ? (payload as Record<string, unknown>).preview as string : '',
-        previewTranslation: typeof (payload as Record<string, unknown>).previewTranslation === 'string'
-          ? (payload as Record<string, unknown>).previewTranslation as string : '',
+        previewText:
+          (payload as { previewText?: StreamingPreviewText | string }).previewText
+            ? normalizePreviewText(
+                (payload as { previewText?: StreamingPreviewText | string }).previewText!
+              )
+            : EMPTY_STREAMING_PREVIEW_TEXT,
+        previewTranslation:
+          (payload as { previewTranslation?: StreamingPreviewTranslation | string }).previewTranslation
+            ? normalizePreviewTranslation(
+                (
+                  payload as {
+                    previewTranslation?: StreamingPreviewTranslation | string;
+                  }
+                ).previewTranslation!
+              )
+            : EMPTY_STREAMING_PREVIEW_TRANSLATION,
         updatedAt: Date.now(),
       };
 

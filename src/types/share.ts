@@ -12,7 +12,8 @@ export interface LiveEvent {
     | 'transcript_delta'
     | 'translation_delta'
     | 'summary_update'
-    | 'status_update';
+    | 'status_update'
+    | 'preview_update';
   sessionId: string;
   payload: unknown;
   timestamp: number;
@@ -24,7 +25,8 @@ export interface LiveBroadcast {
     | 'transcript_delta'
     | 'translation_delta'
     | 'summary_update'
-    | 'status_update';
+    | 'status_update'
+    | 'preview_update';
   payload: unknown;
   timestamp: number;
 }

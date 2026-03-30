@@ -14,6 +14,25 @@ export interface TranscriptSegment {
   timestamp: string; // formatted HH:MM:SS
 }
 
+export type PreviewTranslationState = 'idle' | 'waiting' | 'streaming' | 'final';
+export type SegmentTranslationState = 'pending' | 'streaming' | 'final';
+
+export interface StreamingPreviewText {
+  finalText: string;
+  nonFinalText: string;
+}
+
+export interface StreamingPreviewTranslation extends StreamingPreviewText {
+  state: PreviewTranslationState;
+  sourceLanguage: string | null;
+}
+
+export interface SegmentTranslationEntry {
+  text: string;
+  state: SegmentTranslationState;
+  sourceLanguage: string | null;
+}
+
 export type SonioxRegion = 'us' | 'eu' | 'jp';
 export type SonioxRegionPreference = 'auto' | SonioxRegion;
 export type AudioSourceType = 'mic' | 'system';

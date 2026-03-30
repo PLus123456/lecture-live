@@ -2,9 +2,18 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Mic, MicOff, ArrowLeftRight, Circle, AudioLines } from 'lucide-react';
+import {
+  EMPTY_STREAMING_PREVIEW_TEXT,
+  EMPTY_STREAMING_PREVIEW_TRANSLATION,
+  hasPreviewContent,
+} from '@/lib/transcriptPreview';
 import { useInterpret, type InterpretLine } from '@/hooks/useInterpret';
 import { useI18n } from '@/lib/i18n';
 import { useAuthStore } from '@/stores/authStore';
+import type {
+  StreamingPreviewText,
+  StreamingPreviewTranslation,
+} from '@/types/transcript';
 
 /** 支持的语言对列表（带 emoji 国旗） */
 const LANG_OPTIONS = [
@@ -47,8 +56,8 @@ function LangPanel({
 }: {
   langCode: string;
   lines: InterpretLine[];
-  previewText: string;
-  previewTranslation: string;
+  previewText: StreamingPreviewText;
+  previewTranslation: StreamingPreviewTranslation;
   isPreviewSide: boolean;
   label: string;
   direction: 'top' | 'bottom';
@@ -60,10 +69,14 @@ function LangPanel({
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [lines, previewText]);
+  }, [lines, previewText, previewTranslation]);
 
   const borderClass =
     direction === 'top' ? 'border-b border-cream-200' : '';
+  const hasPreview = hasPreviewContent(previewText);
+  const hasPreviewTranslation = hasPreviewContent(previewTranslation);
+  const showPreviewTranslationWaiting =
+    previewTranslation.state === 'waiting' && !hasPreviewTranslation;
 
   return (
     <div className={`flex flex-1 flex-col min-h-0 ${borderClass}`}>
@@ -99,14 +112,37 @@ function LangPanel({
         ))}
 
         {/* 实时预览 */}
-        {isPreviewSide && previewText && (
+        {isPreviewSide && hasPreview && (
           <div className="text-sm leading-relaxed">
-            <p className="text-charcoal-500 italic">{previewText}</p>
+            <p>
+              {previewText.finalText ? (
+                <span className="text-charcoal-800">{previewText.finalText}</span>
+              ) : null}
+              {previewText.nonFinalText ? (
+                <span className="text-charcoal-500">{previewText.nonFinalText}</span>
+              ) : null}
+            </p>
           </div>
         )}
-        {!isPreviewSide && previewTranslation && (
+        {!isPreviewSide && hasPreviewTranslation && (
           <div className="text-sm leading-relaxed">
-            <p className="text-rust-400 italic text-[13px]">{previewTranslation}</p>
+            <p className="text-[13px]">
+              {previewTranslation.finalText ? (
+                <span className="text-rust-500">
+                  {previewTranslation.finalText}
+                </span>
+              ) : null}
+              {previewTranslation.nonFinalText ? (
+                <span className="text-rust-400">
+                  {previewTranslation.nonFinalText}
+                </span>
+              ) : null}
+            </p>
+          </div>
+        )}
+        {!isPreviewSide && showPreviewTranslationWaiting && (
+          <div className="text-sm leading-relaxed">
+            <p className="text-rust-300 italic text-[13px]">翻译中…</p>
           </div>
         )}
       </div>
@@ -205,6 +241,8 @@ export default function InterpretPage() {
   }, [micTesting, selectedMic]);
 
   const previewIsA = previewLang === langA;
+  const previewTranslationSourceIsA =
+    (previewTranslation.sourceLanguage ?? previewLang) === langA;
   const hasContent = linesA.length > 0 || linesB.length > 0;
 
   /* ── 空闲状态：居中布局 ── */
@@ -404,8 +442,12 @@ export default function InterpretPage() {
         <LangPanel
           langCode={langA}
           lines={linesA}
-          previewText={previewIsA ? previewText : ''}
-          previewTranslation={!previewIsA ? previewTranslation : ''}
+          previewText={previewIsA ? previewText : EMPTY_STREAMING_PREVIEW_TEXT}
+          previewTranslation={
+            previewTranslationSourceIsA
+              ? EMPTY_STREAMING_PREVIEW_TRANSLATION
+              : previewTranslation
+          }
           isPreviewSide={previewIsA}
           label={t('interpret.langA')}
           direction="top"
@@ -413,8 +455,12 @@ export default function InterpretPage() {
         <LangPanel
           langCode={langB}
           lines={linesB}
-          previewText={!previewIsA ? previewText : ''}
-          previewTranslation={previewIsA ? previewTranslation : ''}
+          previewText={!previewIsA ? previewText : EMPTY_STREAMING_PREVIEW_TEXT}
+          previewTranslation={
+            previewTranslationSourceIsA
+              ? previewTranslation
+              : EMPTY_STREAMING_PREVIEW_TRANSLATION
+          }
           isPreviewSide={!previewIsA}
           label={t('interpret.langB')}
           direction="bottom"

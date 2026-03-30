@@ -100,24 +100,24 @@
     30% { transform: translateY(-4px); opacity: 1; }
   }
 
-  /* Segment fade-in animation */
+  /* 段落入场只做位移，避免视觉上发淡 */
   .segment-enter {
-    animation: segmentFadeIn 0.3s ease-out;
+    animation: segmentSlideIn 0.22s ease-out;
   }
 
-  @keyframes segmentFadeIn {
-    from { opacity: 0; transform: translateY(6px); }
-    to { opacity: 1; transform: translateY(0); }
+  @keyframes segmentSlideIn {
+    from { transform: translateY(4px); }
+    to { transform: translateY(0); }
   }
 
-  /* Translation fade-in */
+  /* 翻译入场也避免透明度渐入 */
   .translation-enter {
-    animation: translationFadeIn 0.25s ease-out;
+    animation: translationSlideIn 0.2s ease-out;
   }
 
-  @keyframes translationFadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
+  @keyframes translationSlideIn {
+    from { transform: translateY(3px); }
+    to { transform: translateY(0); }
   }
 
   /* ─── 交错动画延迟工具类 ─── */

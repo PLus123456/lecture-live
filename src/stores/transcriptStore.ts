@@ -2,10 +2,19 @@
 
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
+import {
+  EMPTY_STREAMING_PREVIEW_TEXT,
+  EMPTY_STREAMING_PREVIEW_TRANSLATION,
+  combinePreviewText,
+  normalizePreviewText,
+  normalizePreviewTranslation,
+} from '@/lib/transcriptPreview';
 import type {
   TranscriptSegment,
   ConnectionState,
   RecordingState,
+  StreamingPreviewText,
+  StreamingPreviewTranslation,
 } from '@/types/transcript';
 
 export interface ConnectionMeta {
@@ -28,6 +37,8 @@ interface TranscriptStore {
   segments: TranscriptSegment[];
   currentPreview: string;
   currentPreviewTranslation: string;
+  currentPreviewText: StreamingPreviewText;
+  currentPreviewTranslationText: StreamingPreviewTranslation;
   connectionState: ConnectionState;
   connectionMeta: ConnectionMeta;
   backupMeta: BackupMeta;
@@ -41,8 +52,8 @@ interface TranscriptStore {
   availableMics: MediaDeviceInfo[];
 
   addFinalSegment: (segment: TranscriptSegment) => void;
-  updatePreview: (text: string) => void;
-  updatePreviewTranslation: (text: string) => void;
+  updatePreview: (preview: string | StreamingPreviewText) => void;
+  updatePreviewTranslation: (preview: string | StreamingPreviewTranslation) => void;
   setConnectionState: (state: ConnectionState) => void;
   setConnectionMeta: (meta: Partial<ConnectionMeta>) => void;
   setBackupMeta: (meta: Partial<BackupMeta>) => void;
@@ -75,6 +86,8 @@ export const useTranscriptStore = create<TranscriptStore>()(
       segments: [],
       currentPreview: '',
       currentPreviewTranslation: '',
+      currentPreviewText: EMPTY_STREAMING_PREVIEW_TEXT,
+      currentPreviewTranslationText: EMPTY_STREAMING_PREVIEW_TRANSLATION,
       connectionState: 'disconnected',
       connectionMeta: { region: null, wsUrl: null, latencyMs: null, connectedAt: null, transcriptionLatencyMs: null },
       backupMeta: {
@@ -96,9 +109,21 @@ export const useTranscriptStore = create<TranscriptStore>()(
       addFinalSegment: (segment) =>
         set((state) => ({ segments: [...state.segments, segment] })),
 
-      updatePreview: (text) => set({ currentPreview: text }),
+      updatePreview: (preview) => {
+        const normalized = normalizePreviewText(preview);
+        set({
+          currentPreviewText: normalized,
+          currentPreview: combinePreviewText(normalized),
+        });
+      },
 
-      updatePreviewTranslation: (text) => set({ currentPreviewTranslation: text }),
+      updatePreviewTranslation: (preview) => {
+        const normalized = normalizePreviewTranslation(preview);
+        set({
+          currentPreviewTranslationText: normalized,
+          currentPreviewTranslation: combinePreviewText(normalized),
+        });
+      },
 
       setConnectionState: (connectionState) => set({ connectionState }),
 
@@ -151,6 +176,8 @@ export const useTranscriptStore = create<TranscriptStore>()(
           segments: [],
           currentPreview: '',
           currentPreviewTranslation: '',
+          currentPreviewText: EMPTY_STREAMING_PREVIEW_TEXT,
+          currentPreviewTranslationText: EMPTY_STREAMING_PREVIEW_TRANSLATION,
           connectionState: 'disconnected',
           connectionMeta: { region: null, wsUrl: null, latencyMs: null, connectedAt: null, transcriptionLatencyMs: null },
           backupMeta: {
@@ -178,6 +205,8 @@ export const useTranscriptStore = create<TranscriptStore>()(
         segments: state.segments,
         currentPreview: state.currentPreview,
         currentPreviewTranslation: state.currentPreviewTranslation,
+        currentPreviewText: state.currentPreviewText,
+        currentPreviewTranslationText: state.currentPreviewTranslationText,
         recordingState: state.recordingState,
         recordingStartTime: state.recordingStartTime,
         pausedAt: state.pausedAt,

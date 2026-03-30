@@ -7,6 +7,12 @@ import type {
   StreamingPreviewTranslation,
 } from '@/types/transcript';
 
+export interface LiveShareTranslationMeta {
+  sourceLang?: string | null;
+  targetLang?: string | null;
+  translationMode?: string | null;
+}
+
 export interface ViewerCallbacks {
   onInitialState: (snapshot: {
     segments: unknown[];
@@ -15,9 +21,18 @@ export interface ViewerCallbacks {
     status?: string | null;
     previewText?: StreamingPreviewText;
     previewTranslation?: StreamingPreviewTranslation;
+    sourceLang?: string | null;
+    targetLang?: string | null;
+    translationMode?: string | null;
   }) => void;
   onTranscriptDelta: (delta: unknown) => void;
-  onTranslationDelta: (data: { segmentId: string; translation: string }) => void;
+  onTranslationDelta: (data: {
+    segmentId: string;
+    translation: string;
+    sourceLang?: string;
+    targetLang?: string;
+    translationMode?: string;
+  }) => void;
   onSummaryUpdate: (block: unknown) => void;
   onStatusUpdate: (data: { status: string }) => void;
   onPreviewUpdate: (data: {

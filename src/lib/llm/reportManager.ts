@@ -20,6 +20,15 @@ import {
 /** 意义评估阈值 — 低于此分数的录音不生成报告 */
 const SIGNIFICANCE_THRESHOLD = 0.4;
 
+/** 根据语言格式化时长字符串 */
+function formatReportDuration(hours: number, mins: number, language: string): string {
+  const lang = language.toLowerCase().slice(0, 2);
+  if (lang === 'zh') return hours > 0 ? `${hours}小时${mins}分钟` : `${mins}分钟`;
+  if (lang === 'ja') return hours > 0 ? `${hours}時間${mins}分` : `${mins}分`;
+  if (lang === 'ko') return hours > 0 ? `${hours}시간 ${mins}분` : `${mins}분`;
+  return hours > 0 ? `${hours}h ${mins}min` : `${mins} min`;
+}
+
 /** 最短有效转录文本长度（字符数）— 过短的直接跳过 */
 const MIN_TRANSCRIPT_LENGTH = 50;
 
@@ -89,7 +98,7 @@ export async function generateSessionReport(
     .map((block) => {
       const parts = [block.summary];
       if (block.keyPoints.length > 0) {
-        parts.push('要点: ' + block.keyPoints.join('; '));
+        parts.push('Key points: ' + block.keyPoints.join('; '));
       }
       return parts.join(' | ');
     })
@@ -165,7 +174,7 @@ async function generateReport(
     const durationMinutes = Math.round(durationMs / 60000);
     const hours = Math.floor(durationMinutes / 60);
     const mins = durationMinutes % 60;
-    const durationStr = hours > 0 ? `${hours}小时${mins}分钟` : `${mins}分钟`;
+    const durationStr = formatReportDuration(hours, mins, language);
 
     return parseSessionReportResult(result, {
       sessionTitle,

@@ -310,6 +310,8 @@ export default {
       'Local processing uses browser-based models for maximum data privacy.',
     bothDesc: 'Run both engines simultaneously and compare results.',
     cloudDesc: 'Cloud processing via Soniox for lowest latency.',
+    localUnsupportedPair:
+      'Local translation does not support this language pair. It will fall back to cloud translation.',
     domainContext: 'Domain Context',
     domain: 'Domain',
     domainPlaceholder: 'e.g., University Lecture',

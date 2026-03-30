@@ -299,6 +299,7 @@ export default {
     localDesc: '本地处理使用浏览器模型，提供更高的数据隐私保护。',
     bothDesc: '同时运行两套引擎，方便对比结果。',
     cloudDesc: '通过 Soniox 云端处理，获得更低延迟。',
+    localUnsupportedPair: '本地翻译不支持当前语言对，将自动回退到云端翻译。',
     domainContext: '领域上下文',
     domain: '领域',
     domainPlaceholder: '例如：大学讲座',

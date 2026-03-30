@@ -77,7 +77,7 @@ export function useInterpret() {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${authToken}`,
           },
-          body: JSON.stringify({ durationMs }),
+          body: JSON.stringify({ durationMs, translationMode: 'soniox' }),
         });
         if (res.ok) {
           const data = (await res.json()) as { quotas?: Record<string, unknown> };

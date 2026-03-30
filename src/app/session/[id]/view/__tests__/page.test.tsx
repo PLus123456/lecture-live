@@ -24,7 +24,7 @@ vi.mock('@/lib/i18n', () => ({
   }),
 }));
 
-import { ViewerTranscriptPanel } from '@/app/session/[id]/view/page';
+import { ViewerTranscriptPanel } from '@/app/session/[id]/view/ViewerTranscriptPanel';
 
 describe('ViewerTranscriptPanel', () => {
   beforeEach(() => {

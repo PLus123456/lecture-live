@@ -64,7 +64,7 @@ export async function POST(req: Request) {
 
       case 'json':
         content = exportToJson(
-          title, body.date, body.segments, body.translations, body.summaries
+          title, body.date, body.segments, body.translations, body.summaries, body.sourceLang, body.targetLang
         );
         filename = `${safeFilenameBase}.json`;
         mimeType = 'application/json';

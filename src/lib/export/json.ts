@@ -6,9 +6,11 @@ export function exportJson(
   title: string,
   segments: ExportTranscriptSegment[],
   translations: Record<string, string>,
-  summaries: unknown[]
+  summaries: unknown[],
+  sourceLang?: string,
+  targetLang?: string
 ): string {
-  return exportToJson(title, new Date().toISOString(), segments, translations, summaries as SummarizeResponse[]);
+  return exportToJson(title, new Date().toISOString(), segments, translations, summaries as SummarizeResponse[], sourceLang, targetLang);
 }
 
 export function exportToJson(
@@ -16,12 +18,16 @@ export function exportToJson(
   date: string,
   segments: ExportTranscriptSegment[],
   translations: Record<string, string>,
-  summaries: SummarizeResponse[]
+  summaries: SummarizeResponse[],
+  sourceLang?: string,
+  targetLang?: string
 ): string {
   return JSON.stringify(
     {
       title,
       date,
+      ...(sourceLang ? { sourceLang } : {}),
+      ...(targetLang ? { targetLang } : {}),
       exportedAt: new Date().toISOString(),
       segments: segments.map((seg) => ({
         ...seg,

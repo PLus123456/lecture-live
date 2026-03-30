@@ -1,5 +1,6 @@
 import type { StorageCategory } from '@/lib/storage/cloudreve';
 import type { PersistedTranscriptBundle } from '@/lib/sessionPersistence';
+import { LANGUAGES } from '@/lib/languages';
 
 const SESSION_AUDIO_SOURCES = ['microphone', 'system_audio'] as const;
 const SESSION_REGIONS = ['auto', 'us', 'eu', 'jp'] as const;
@@ -51,6 +52,8 @@ export function normalizeOptionalString(
   return normalized.slice(0, maxLength);
 }
 
+const VALID_LANGUAGE_CODES = new Set(LANGUAGES.map((l) => l.code));
+
 export function normalizeLanguageCode(
   value: unknown,
   fallback: string
@@ -59,8 +62,24 @@ export function normalizeLanguageCode(
     return fallback;
   }
 
-  const normalized = value.trim().toLowerCase();
-  return normalized ? normalized.slice(0, 16) : fallback;
+  const normalized = value.trim().toLowerCase().slice(0, 16);
+  if (!normalized || !VALID_LANGUAGE_CODES.has(normalized)) {
+    return fallback;
+  }
+
+  return normalized;
+}
+
+const VALID_TRANSLATION_MODES = ['soniox', 'local', 'both'] as const;
+
+export function normalizeTranslationMode(value: unknown): string {
+  if (
+    typeof value === 'string' &&
+    VALID_TRANSLATION_MODES.includes(value as 'soniox' | 'local' | 'both')
+  ) {
+    return value;
+  }
+  return 'soniox';
 }
 
 export function isStorageCategoryValue(value: unknown): value is StorageCategory {

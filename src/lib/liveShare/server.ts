@@ -46,6 +46,10 @@ interface LiveSnapshot {
   /** 当前正在说的流式预览文本（临时，不持久化） */
   previewText: StreamingPreviewText;
   previewTranslation: StreamingPreviewTranslation;
+  /** 翻译元数据 */
+  sourceLang: string | null;
+  targetLang: string | null;
+  translationMode: string | null;
   updatedAt: number;
 }
 
@@ -80,6 +84,9 @@ function buildEmptySnapshot(): LiveSnapshot {
     status: null,
     previewText: EMPTY_STREAMING_PREVIEW_TEXT,
     previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
+    sourceLang: null,
+    targetLang: null,
+    translationMode: null,
     updatedAt: Date.now(),
   };
 }
@@ -112,6 +119,9 @@ async function loadPersistedSnapshot(sessionId: string): Promise<LiveSnapshot> {
       status: typeof parsed.status === 'string' ? parsed.status : null,
       previewText: EMPTY_STREAMING_PREVIEW_TEXT,
       previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
+      sourceLang: null,
+      targetLang: null,
+      translationMode: null,
       updatedAt: Date.now(),
     };
   } catch {
@@ -197,8 +207,22 @@ function mergeEventIntoSnapshot(
         typeof (event.payload as { segmentId?: string }).segmentId === 'string' &&
         typeof (event.payload as { translation?: string }).translation === 'string'
       ) {
-        const payload = event.payload as { segmentId: string; translation: string };
-        snapshot.translations[payload.segmentId] = payload.translation;
+        const MAX_TRANSLATION_LENGTH = 10_000;
+        const payload = event.payload as {
+          segmentId: string;
+          translation: string;
+          sourceLang?: string;
+          targetLang?: string;
+          translationMode?: string;
+        };
+        snapshot.translations[payload.segmentId] =
+          payload.translation.length > MAX_TRANSLATION_LENGTH
+            ? payload.translation.slice(0, MAX_TRANSLATION_LENGTH)
+            : payload.translation;
+        // 更新翻译元数据（如果 delta 中携带）
+        if (typeof payload.sourceLang === 'string') snapshot.sourceLang = payload.sourceLang;
+        if (typeof payload.targetLang === 'string') snapshot.targetLang = payload.targetLang;
+        if (typeof payload.translationMode === 'string') snapshot.translationMode = payload.translationMode;
       }
       break;
     }
@@ -399,6 +423,14 @@ export function setupLiveShare(io: SocketIO) {
       }
 
       const sessionId = socket.data.sessionId as string;
+      const ext = payload as {
+        previewText?: StreamingPreviewText | string;
+        previewTranslation?: StreamingPreviewTranslation | string;
+        sourceLang?: string;
+        targetLang?: string;
+        translationMode?: string;
+      };
+
       const nextSnapshot: LiveSnapshot = {
         segments: Array.isArray(payload.segments) ? payload.segments : [],
         translations:
@@ -409,22 +441,15 @@ export function setupLiveShare(io: SocketIO) {
           ? payload.summaryBlocks
           : [],
         status: typeof payload.status === 'string' ? payload.status : null,
-        previewText:
-          (payload as { previewText?: StreamingPreviewText | string }).previewText
-            ? normalizePreviewText(
-                (payload as { previewText?: StreamingPreviewText | string }).previewText!
-              )
-            : EMPTY_STREAMING_PREVIEW_TEXT,
-        previewTranslation:
-          (payload as { previewTranslation?: StreamingPreviewTranslation | string }).previewTranslation
-            ? normalizePreviewTranslation(
-                (
-                  payload as {
-                    previewTranslation?: StreamingPreviewTranslation | string;
-                  }
-                ).previewTranslation!
-              )
-            : EMPTY_STREAMING_PREVIEW_TRANSLATION,
+        previewText: ext.previewText
+          ? normalizePreviewText(ext.previewText)
+          : EMPTY_STREAMING_PREVIEW_TEXT,
+        previewTranslation: ext.previewTranslation
+          ? normalizePreviewTranslation(ext.previewTranslation)
+          : EMPTY_STREAMING_PREVIEW_TRANSLATION,
+        sourceLang: typeof ext.sourceLang === 'string' ? ext.sourceLang : null,
+        targetLang: typeof ext.targetLang === 'string' ? ext.targetLang : null,
+        translationMode: typeof ext.translationMode === 'string' ? ext.translationMode : null,
         updatedAt: Date.now(),
       };
 

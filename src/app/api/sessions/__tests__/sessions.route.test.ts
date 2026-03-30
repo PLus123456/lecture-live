@@ -162,7 +162,7 @@ describe('sessions route', () => {
         status: 'CREATED',
         courseName: 'Organic',
         sourceLang: 'en',
-        targetLang: 'zh-cn',
+        targetLang: 'zh',
         llmProvider: 'openai',
         audioSource: 'system_audio',
         sonioxRegion: 'eu',

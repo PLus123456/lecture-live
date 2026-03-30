@@ -14,7 +14,10 @@ describe('session api helpers', () => {
     expect(normalizeSessionAudioSource('mic')).toBe('microphone');
     expect(normalizeSessionAudioSource('system_audio')).toBe('system_audio');
     expect(normalizeSessionRegion('EU')).toBe('eu');
-    expect(normalizeLanguageCode('  ZH-CN  ', 'en')).toBe('zh-cn');
+    // 'zh-cn' 不在有效语言列表中（列表使用 ISO 639-1: 'zh'），回退到 fallback
+    expect(normalizeLanguageCode('  ZH-CN  ', 'en')).toBe('en');
+    expect(normalizeLanguageCode('  ZH  ', 'en')).toBe('zh');
+    expect(normalizeLanguageCode('invalid-lang', 'en')).toBe('en');
     expect(normalizeSessionAudioSource({})).toBeNull();
     expect(normalizeSessionRegion(123)).toBeNull();
   });

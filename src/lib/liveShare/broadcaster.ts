@@ -21,6 +21,9 @@ interface SnapshotPayload {
   status: string;
   previewText: StreamingPreviewText;
   previewTranslation: StreamingPreviewTranslation;
+  sourceLang?: string;
+  targetLang?: string;
+  translationMode?: string;
 }
 
 export class LiveBroadcaster {
@@ -69,12 +72,21 @@ export class LiveBroadcaster {
     });
   }
 
-  broadcastTranslationDelta(segmentId: string, translation: string) {
+  broadcastTranslationDelta(
+    segmentId: string,
+    translation: string,
+    meta?: { sourceLang?: string; targetLang?: string; translationMode?: string }
+  ) {
+    const MAX_TRANSLATION_LENGTH = 10_000;
+    const safeTrans = translation.length > MAX_TRANSLATION_LENGTH
+      ? translation.slice(0, MAX_TRANSLATION_LENGTH)
+      : translation;
+
     this.socket.emit('broadcast', {
       sessionId: this.sessionId,
       event: {
         type: 'translation_delta',
-        payload: { segmentId, translation },
+        payload: { segmentId, translation: safeTrans, ...meta },
         timestamp: Date.now(),
       },
     });

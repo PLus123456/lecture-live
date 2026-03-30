@@ -8,8 +8,9 @@ import { useSettingsStore } from '@/stores/settingsStore';
 import { useTranscriptStore } from '@/stores/transcriptStore';
 import LanguageSelect from '@/components/LanguageSelect';
 import { useI18n } from '@/lib/i18n';
-import { X, Globe, Cpu, Sparkles, Sliders, Mic } from 'lucide-react';
+import { X, Globe, Cpu, Sparkles, Sliders, Mic, AlertTriangle } from 'lucide-react';
 import type { TranslationMode } from '@/types/transcript';
+import { LocalTranslator } from '@/lib/translation/localTranslator';
 
 export default function SettingsDrawer({
   isOpen,
@@ -209,6 +210,16 @@ export default function SettingsDrawer({
                 ? t('settingsDrawer.bothDesc')
                 : t('settingsDrawer.cloudDesc')}
           </p>
+          {(draft.translationMode === 'local' || draft.translationMode === 'both') &&
+            draft.targetLang &&
+            !LocalTranslator.isSupported(draft.sourceLang, draft.targetLang) && (
+              <div className="flex items-start gap-1.5 mt-2 p-2 rounded-lg bg-amber-50 border border-amber-200">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0 mt-0.5" />
+                <p className="text-[11px] text-amber-700">
+                  {t('settingsDrawer.localUnsupportedPair')}
+                </p>
+              </div>
+            )}
         </section>
 
         {/* Domain Context */}

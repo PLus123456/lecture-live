@@ -75,6 +75,9 @@ model Session {
   summaryPath     String?   // e.g., "/{userId}/summaries/{sessionId}.json"
   reportPath      String?   // e.g., "/{userId}/reports/{sessionId}.json"
 
+  // 翻译模式
+  translationMode String    @default("soniox")     // "soniox" | "local" | "both"
+
   // 元数据
   courseName      String?
   sourceLang      String    @default("en")

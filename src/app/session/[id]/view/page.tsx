@@ -74,7 +74,7 @@ function ViewerTypingIndicator({ theme }: { theme: 'light' | 'dark' }) {
   );
 }
 
-function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
+export function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
   const { t } = useI18n();
   const segments = useTranscriptStore((s) => s.segments);
   const currentPreviewText = useTranscriptStore((s) => s.currentPreviewText);
@@ -82,6 +82,7 @@ function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
     (s) => s.currentPreviewTranslationText
   );
   const translations = useTranslationStore((s) => s.translations);
+  const translationEntries = useTranslationStore((s) => s.translationEntries);
   const fontSize = useViewerSettingsStore((s) => s.fontSize);
   const autoScrollSetting = useViewerSettingsStore((s) => s.autoScroll);
   const compact = useViewerSettingsStore((s) => s.compact);
@@ -178,7 +179,7 @@ function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
 
         <div className={compact ? 'space-y-2' : 'space-y-4'}>
           {segments.map((seg) => {
-            const translation = translations[seg.id];
+            const translation = translationEntries[seg.id]?.text ?? translations[seg.id] ?? '';
             return (
               <div key={seg.id}>
                 <div className="flex items-center gap-2 mb-1">
@@ -229,9 +230,7 @@ function ViewerTranscriptPanel({ isLive }: { isLive: boolean }) {
                 ) : null}
               </p>
               {hasPreviewTranslation && (
-                <p className={`${fs.translation} font-medium leading-relaxed mt-0.5 opacity-70 ${
-                  theme === 'dark' ? 'text-rust-400' : 'text-rust-600'
-                }`}>
+                <p className={`${fs.translation} font-medium leading-relaxed mt-0.5`}>
                   {currentPreviewTranslationText.finalText ? (
                     <span className={theme === 'dark' ? 'text-rust-300' : 'text-rust-700'}>
                       {sanitizeDisplayText(currentPreviewTranslationText.finalText)}

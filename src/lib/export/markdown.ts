@@ -8,13 +8,15 @@ export function exportMarkdown(
   segments: ExportTranscriptSegment[],
   translations: Record<string, string>,
   summaries: unknown[],
-  report?: SessionReportData | null
+  report?: SessionReportData | null,
+  sourceLang = 'en',
+  targetLang = 'zh'
 ): string {
   return exportToMarkdown(
     title,
     new Date().toISOString(),
-    'en',
-    'zh',
+    sourceLang,
+    targetLang,
     segments,
     translations,
     summaries as SummarizeResponse[],
@@ -46,22 +48,26 @@ export function exportToMarkdown(
     lines.push('');
     lines.push('## Session Report');
     lines.push('');
-    lines.push(`**Topic**: ${r.topic}`);
-    lines.push(`**Participants**: ${r.participants.join(', ')}`);
-    lines.push(`**Duration**: ${r.duration}`);
+    if (r.topic) lines.push(`**Topic**: ${r.topic}`);
+    if (Array.isArray(r.participants) && r.participants.length > 0) {
+      lines.push(`**Participants**: ${r.participants.join(', ')}`);
+    }
+    if (r.duration) lines.push(`**Duration**: ${r.duration}`);
     lines.push('');
-    lines.push(`> ${r.overview}`);
+    if (r.overview) lines.push(`> ${r.overview}`);
     lines.push('');
 
-    for (const section of r.sections) {
-      lines.push(`### ${section.title}`);
-      for (const point of section.points) {
-        lines.push(`- ${point}`);
+    if (Array.isArray(r.sections)) {
+      for (const section of r.sections) {
+        lines.push(`### ${section.title}`);
+        for (const point of section.points ?? []) {
+          lines.push(`- ${point}`);
+        }
+        lines.push('');
       }
-      lines.push('');
     }
 
-    if (r.conclusions.length > 0) {
+    if (Array.isArray(r.conclusions) && r.conclusions.length > 0) {
       lines.push('### Conclusions');
       for (const c of r.conclusions) {
         lines.push(`- ✓ ${c}`);
@@ -69,7 +75,7 @@ export function exportToMarkdown(
       lines.push('');
     }
 
-    if (r.actionItems.length > 0) {
+    if (Array.isArray(r.actionItems) && r.actionItems.length > 0) {
       lines.push('### Action Items');
       for (const item of r.actionItems) {
         lines.push(`- [ ] ${item}`);
@@ -77,12 +83,14 @@ export function exportToMarkdown(
       lines.push('');
     }
 
-    if (Object.keys(r.keyTerms).length > 0) {
+    if (r.keyTerms && Object.keys(r.keyTerms).length > 0) {
       lines.push('### Key Terms');
       lines.push('| Term | Definition |');
       lines.push('|------|-----------|');
       for (const [term, def] of Object.entries(r.keyTerms)) {
-        lines.push(`| ${term} | ${def} |`);
+        const safeTerm = String(term).replace(/\|/g, '\\|');
+        const safeDef = String(def).replace(/\|/g, '\\|');
+        lines.push(`| ${safeTerm} | ${safeDef} |`);
       }
       lines.push('');
     }
@@ -126,7 +134,9 @@ export function exportToMarkdown(
         lines.push('| Term | Definition |');
         lines.push('|------|-----------|');
         for (const [term, def] of Object.entries(summary.definitions)) {
-          lines.push(`| ${term} | ${def} |`);
+          const safeTerm = String(term).replace(/\|/g, '\\|');
+          const safeDef = String(def).replace(/\|/g, '\\|');
+          lines.push(`| ${safeTerm} | ${safeDef} |`);
         }
         lines.push('');
       }

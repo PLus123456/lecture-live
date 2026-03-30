@@ -2,16 +2,18 @@ import { LocalTranslator } from './localTranslator';
 
 export class TranslationScheduler {
   private localTranslator: LocalTranslator | null = null;
-  private pendingSentences: Array<{ id: string; text: string }> = [];
+  private pendingSentences: Array<{ id: string; text: string; retries?: number }> = [];
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private batchDelayMs: number;
   private targetLang = '';
+  private static readonly MAX_RETRIES = 3;
 
   private onLocalTranslationResult?: (
     results: Array<{ segmentId: string; translation: string }>
   ) => void;
   private onModelProgress?: (progress: number, status: string) => void;
   private onModelLoaded?: () => void;
+  private onError?: (error: unknown) => void;
 
   constructor(options: {
     batchDelayMs?: number;
@@ -20,11 +22,13 @@ export class TranslationScheduler {
     ) => void;
     onModelProgress?: (progress: number, status: string) => void;
     onModelLoaded?: () => void;
+    onError?: (error: unknown) => void;
   }) {
     this.batchDelayMs = options.batchDelayMs ?? 1000;
     this.onLocalTranslationResult = options.onLocalTranslationResult;
     this.onModelProgress = options.onModelProgress;
     this.onModelLoaded = options.onModelLoaded;
+    this.onError = options.onError;
   }
 
   async initLocalTranslator(sourceLang: string, targetLang: string): Promise<void> {
@@ -71,13 +75,28 @@ export class TranslationScheduler {
       const translations = await this.localTranslator.translateBatch(
         batch.map((b) => b.text)
       );
-      const results = batch.map((b, i) => ({
-        segmentId: b.id,
-        translation: translations[i],
-      }));
-      this.onLocalTranslationResult?.(results);
+      const results = batch
+        .map((b, i) => ({
+          segmentId: b.id,
+          translation: translations[i],
+        }))
+        .filter((r) => r.translation !== undefined);
+      if (results.length > 0) {
+        this.onLocalTranslationResult?.(results);
+      }
     } catch (error) {
       console.error('Local translation batch failed:', error);
+      this.onError?.(error);
+      // 未超过最大重试次数的句子重新入队
+      const retriable = batch.filter((b) => (b.retries ?? 0) < TranslationScheduler.MAX_RETRIES);
+      if (retriable.length > 0) {
+        this.pendingSentences.push(
+          ...retriable.map((b) => ({ ...b, retries: (b.retries ?? 0) + 1 }))
+        );
+        if (!this.batchTimer) {
+          this.batchTimer = setTimeout(() => this.flushBatch(), this.batchDelayMs * 2);
+        }
+      }
     }
   }
 

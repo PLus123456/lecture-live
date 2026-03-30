@@ -89,6 +89,9 @@ export class LocalTranslator {
   async translate(text: string): Promise<string> {
     if (!this.translator) throw new Error('Translator not initialized');
     const result = await this.translator(text, { max_length: 512 });
+    if (!result || result.length === 0) {
+      throw new Error('Translation returned empty result');
+    }
     return result[0].translation_text;
   }
 

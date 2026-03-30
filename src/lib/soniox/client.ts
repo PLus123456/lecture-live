@@ -16,14 +16,67 @@ import type { TemporaryApiKeyResponse } from '@/types/soniox';
 import { BrowserAudioInputSource } from '@/lib/audio/browserAudioInputSource';
 import { resolveAutoRegion } from '@/lib/soniox/clientPing';
 
+const SONIOX_MIN_ENDPOINT_DELAY_MS = 500;
+const SONIOX_MAX_ENDPOINT_DELAY_MS = 3000;
+const SONIOX_DEFAULT_ENDPOINT_DELAY_MS = 2000;
+
+function clampEndpointDelayMs(value?: number): number | undefined {
+  if (!Number.isFinite(value)) {
+    return undefined;
+  }
+
+  return Math.min(
+    SONIOX_MAX_ENDPOINT_DELAY_MS,
+    Math.max(SONIOX_MIN_ENDPOINT_DELAY_MS, Math.round(value as number))
+  );
+}
+
+function deriveLanguageHints(config: SessionConfig): {
+  hints: string[] | undefined;
+  strict: boolean | undefined;
+} {
+  const normalized = Array.from(
+    new Set(
+      (
+        config.twoWayTranslation
+          ? [config.sourceLang, config.targetLang]
+          : [config.sourceLang]
+      )
+        .map((lang) => lang?.trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+
+  if (normalized.length > 0) {
+    return {
+      hints: normalized,
+      strict:
+        config.languageHintsStrict ??
+        (normalized.length === 1 && !config.twoWayTranslation ? true : undefined),
+    };
+  }
+
+  return {
+    hints: config.languageHints.length > 0 ? config.languageHints : undefined,
+    strict: config.languageHintsStrict,
+  };
+}
+
 export function buildSonioxConfig(config: SessionConfig): SonioxSessionConfig {
+  const endpointDelayMs =
+    clampEndpointDelayMs(config.endpointDetectionMs) ?? SONIOX_DEFAULT_ENDPOINT_DELAY_MS;
+  const { hints: languageHints, strict: languageHintsStrict } =
+    deriveLanguageHints(config);
+
   const sonioxConfig: SonioxSessionConfig = {
     model: config.model,
-    language_hints: config.languageHints,
+    language_hints: languageHints,
+    language_hints_strict: languageHintsStrict,
     enable_speaker_diarization: config.enableSpeakerDiarization,
     enable_language_identification: config.enableLanguageIdentification,
     enable_endpoint_detection: config.enableEndpointDetection,
-    max_endpoint_delay_ms: config.endpointDetectionMs,
+    max_endpoint_delay_ms: endpointDelayMs,
+    client_reference_id: config.clientReferenceId,
   };
 
   // Add domain context if provided
@@ -43,6 +96,16 @@ export function buildSonioxConfig(config: SessionConfig): SonioxSessionConfig {
 
   // Add translation config if target language is specified
   if (config.targetLang && config.translationMode !== 'local') {
+    if (config.terms.length > 0) {
+      sonioxConfig.context = {
+        ...sonioxConfig.context,
+        translation_terms: config.terms.map((term) => ({
+          source: term,
+          target: term,
+        })),
+      };
+    }
+
     if (config.twoWayTranslation) {
       // 来回翻译模式：双向翻译
       sonioxConfig.translation = {
@@ -63,7 +126,8 @@ export function buildSonioxConfig(config: SessionConfig): SonioxSessionConfig {
 
 export async function fetchTemporaryApiKey(
   authToken: string,
-  regionPreference?: SonioxRegionPreference
+  regionPreference?: SonioxRegionPreference,
+  clientReferenceId?: string
 ): Promise<TemporaryApiKeyResponse> {
   // auto 模式下，用客户端 ping 选延迟最低的区域
   let resolvedRegion: string | undefined;
@@ -84,6 +148,7 @@ export async function fetchTemporaryApiKey(
     },
     body: JSON.stringify({
       region: resolvedRegion,
+      clientReferenceId,
     }),
   });
   if (!res.ok) {
@@ -115,6 +180,7 @@ export async function startSonioxRecording(
     preAcquiredStream?: MediaStream | null;
     managedStream?: MediaStream | null;
     regionPreference?: SonioxRegionPreference;
+    clientReferenceId?: string;
     onAudioLevel?: (level: number) => void;
   }
 ) {
@@ -124,7 +190,8 @@ export async function startSonioxRecording(
   callbacks.onConnectionChange('connecting');
   const temporaryKey = await fetchTemporaryApiKey(
     authToken,
-    options?.regionPreference
+    options?.regionPreference,
+    options?.clientReferenceId
   );
   const wsBaseUrl = temporaryKey.ws_url ?? temporaryKey.ws_base_url;
   if (!wsBaseUrl) {

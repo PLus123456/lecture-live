@@ -16,6 +16,20 @@ export interface InterpretLine {
   timestamp: string;
 }
 
+function upsertInterpretLine(
+  lines: InterpretLine[],
+  nextLine: InterpretLine
+): InterpretLine[] {
+  const existingIndex = lines.findIndex((line) => line.id === nextLine.id);
+  if (existingIndex === -1) {
+    return [...lines, nextLine];
+  }
+
+  const next = [...lines];
+  next[existingIndex] = { ...next[existingIndex], ...nextLine };
+  return next;
+}
+
 type RecordingHandle = {
   stop?: () => Promise<void> | void;
 };
@@ -91,6 +105,7 @@ export function useInterpret() {
         topic: '',
         terms: [],
         sonioxRegionPreference: settings.sonioxRegionPreference,
+        clientReferenceId: `interpret:${langA}:${langB}`,
         twoWayTranslation: true,
       };
 
@@ -121,7 +136,11 @@ export function useInterpret() {
         onPreviewUpdate: (text: string) => {
           setPreviewText(text);
         },
-        onTranslationToken: (text: string, segmentId: string) => {
+        onTranslationToken: (
+          text: string,
+          segmentId: string,
+          meta?: { sourceLanguage: string }
+        ) => {
           // 翻译完成后绑定到对应 segment
           const translatedLine: InterpretLine = {
             id: `${segmentId}-tr`,
@@ -131,30 +150,26 @@ export function useInterpret() {
           };
 
           // 翻译内容放到另一个面板
-          const spokenLang = currentSpokenLangRef.current;
-          const isLangA = spokenLang === langARef.current;
+          const sourceLanguage = meta?.sourceLanguage ?? currentSpokenLangRef.current;
+          const isLangA = sourceLanguage === langARef.current;
           if (isLangA) {
             // 说的是 A，翻译放到 B 面板
-            setLinesB((prev) => [...prev, translatedLine]);
+            setLinesB((prev) => upsertInterpretLine(prev, translatedLine));
             // 同时更新 A 面板最后一个 line 的 translatedText
             setLinesA((prev) => {
               if (prev.length === 0) return prev;
-              const last = prev[prev.length - 1];
-              if (last.id === segmentId) {
-                return [...prev.slice(0, -1), { ...last, translatedText: text }];
-              }
-              return prev;
+              return prev.map((line) =>
+                line.id === segmentId ? { ...line, translatedText: text } : line
+              );
             });
           } else {
             // 说的是 B，翻译放到 A 面板
-            setLinesA((prev) => [...prev, translatedLine]);
+            setLinesA((prev) => upsertInterpretLine(prev, translatedLine));
             setLinesB((prev) => {
               if (prev.length === 0) return prev;
-              const last = prev[prev.length - 1];
-              if (last.id === segmentId) {
-                return [...prev.slice(0, -1), { ...last, translatedText: text }];
-              }
-              return prev;
+              return prev.map((line) =>
+                line.id === segmentId ? { ...line, translatedText: text } : line
+              );
             });
           }
         },
@@ -212,6 +227,7 @@ export function useInterpret() {
                 ? settings.preferredMicDeviceId
                 : undefined,
             regionPreference: settings.sonioxRegionPreference,
+            clientReferenceId: `interpret:${langA}:${langB}`,
           }
         );
 

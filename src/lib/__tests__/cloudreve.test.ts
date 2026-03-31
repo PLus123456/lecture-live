@@ -122,7 +122,7 @@ describe('Cloudreve OAuth 配置', () => {
     expect(url.searchParams.get('redirect_uri')).toBe(
       'http://localhost:3000/api/admin/cloudreve/callback'
     );
-    expect(url.searchParams.get('scope')).toBe('offline_access Files.Read Files.Write');
+    expect(url.searchParams.get('scope')).toBe('openid offline_access Files.Read Files.Write');
     expect(url.searchParams.get('code_challenge_method')).toBe('S256');
     expect(url.searchParams.get('code_challenge')).toMatch(/^[A-Za-z0-9_-]+$/);
   });

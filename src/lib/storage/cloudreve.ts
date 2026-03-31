@@ -635,26 +635,33 @@ export class CloudreveStorage {
   }
 
   /**
-   * 确保目录存在
+   * 确保目录存在（V4: POST /api/v4/file/create）
    */
   private async ensureDirectory(dirPath: string): Promise<void> {
     const uri = this.toFileUri(dirPath);
     try {
-      const response = await this.authedFetch('/api/v4/directory', {
-        method: 'PUT',
+      const response = await this.authedFetch('/api/v4/file/create', {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uri }),
+        body: JSON.stringify({
+          uri,
+          type: 'folder',
+          err_on_conflict: false,
+        }),
       });
-      // 目录已存在也是正常的
-      if (!response.ok && response.status !== 409) {
-        console.warn(`[Cloudreve] 创建目录 ${dirPath} 返回: ${response.status}`);
+      // V4 统一返回 200，通过 code 判断
+      if (!response.ok) {
+        console.warn(`[Cloudreve] 创建目录 ${dirPath} HTTP ${response.status}`);
       }
     } catch {
-      // 忽略目录创建错误，后续上传时 V4 也会自动创建
+      // 忽略目录创建错误，上传时会自动创建父目录
     }
   }
 
-  /** 上传文件（V4 分片上传流程） */
+  /**
+   * 上传文件：小文件使用 PUT /api/v4/file/content 直传，
+   * 大文件使用 V4 三步分片上传流程。
+   */
   async upload(
     userId: string,
     category: StorageCategory,
@@ -672,7 +679,61 @@ export class CloudreveStorage {
         ? new TextEncoder().encode(data)
         : new Uint8Array(data);
 
-    // 步骤 1：创建上传会话
+    // 小文件（< 20MB）使用 PUT /api/v4/file/content 直接写入
+    const DIRECT_UPLOAD_THRESHOLD = 20 * 1024 * 1024;
+    if (bodyBytes.byteLength < DIRECT_UPLOAD_THRESHOLD) {
+      return this.uploadDirect(fileUri, bodyBytes, remotePath);
+    }
+
+    // 大文件走分片上传
+    return this.uploadChunked(fileUri, bodyBytes, fileName, remotePath);
+  }
+
+  /**
+   * 小文件直传：PUT /api/v4/file/content?uri=...
+   */
+  private async uploadDirect(
+    fileUri: string,
+    bodyBytes: Uint8Array,
+    remotePath: string
+  ): Promise<string> {
+    const response = await this.authedFetch(
+      `/api/v4/file/content?uri=${encodeURIComponent(fileUri)}`,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(bodyBytes.byteLength),
+        },
+        body: Buffer.from(bodyBytes),
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => response.statusText);
+      throw new Error(
+        `Cloudreve 文件直传失败 (${response.status}): ${errorText}`
+      );
+    }
+
+    const result = await response.json();
+    if (result.code !== 0) {
+      throw new Error(`Cloudreve 文件直传失败: [${result.code}] ${result.msg}`);
+    }
+
+    return remotePath;
+  }
+
+  /**
+   * 大文件分片上传（V4 三步流程）
+   */
+  private async uploadChunked(
+    fileUri: string,
+    bodyBytes: Uint8Array,
+    fileName: string,
+    remotePath: string
+  ): Promise<string> {
+    // 步骤 1：创建上传会话 PUT /api/v4/file/upload
     const sessionResponse = await this.authedFetch('/api/v4/file/upload', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -693,40 +754,56 @@ export class CloudreveStorage {
     const sessionResult: CloudreveApiResponse<{
       session_id: string;
       chunk_size: number;
-      upload_urls: string[];
+      upload_urls: string[] | null;
       credential?: string;
     }> = await sessionResponse.json();
 
     const session = assertApiSuccess(sessionResult, '上传会话创建');
-
-    if (session.upload_urls.length === 0) {
-      throw new Error('Cloudreve 未返回上传地址');
-    }
-
-    // 步骤 2：上传分片
     const chunkSize = session.chunk_size || bodyBytes.byteLength;
     const totalChunks = Math.ceil(bodyBytes.byteLength / chunkSize);
+
+    // 步骤 2：上传分片
+    // 本地存储：upload_urls 为空，使用 POST /api/v4/file/upload/{sessionId}/{index}
+    // S3 等：upload_urls 包含预签名 URL
+    const hasUploadUrls = session.upload_urls && session.upload_urls.length > 0;
 
     for (let i = 0; i < totalChunks; i++) {
       const start = i * chunkSize;
       const end = Math.min(start + chunkSize, bodyBytes.byteLength);
       const chunk = bodyBytes.slice(start, end);
-      const uploadUrl = session.upload_urls[i] ?? session.upload_urls[0];
-      const config = await this.getConfig();
 
-      // upload_url 可能是相对路径或绝对 URL
-      const fullUrl = uploadUrl.startsWith('http')
-        ? uploadUrl
-        : `${config.baseUrl}${uploadUrl}`;
+      let fullUrl: string;
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(chunk.byteLength),
+      };
 
-      const token = await this.getAccessToken();
+      if (hasUploadUrls) {
+        // S3/OSS 等外部存储：使用预签名 URL
+        const uploadUrl = session.upload_urls![i] ?? session.upload_urls![0];
+        const config = await this.getConfig();
+        fullUrl = uploadUrl.startsWith('http')
+          ? uploadUrl
+          : `${config.baseUrl}${uploadUrl}`;
+      } else {
+        // 本地存储：POST /api/v4/file/upload/{sessionId}/{index}
+        const config = await this.getConfig();
+        fullUrl = `${config.baseUrl}/api/v4/file/upload/${session.session_id}/${i}`;
+        const token = await this.getAccessToken();
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+
+      // 使用 credential 作为认证（远程存储节点）
+      if (session.credential && hasUploadUrls) {
+        headers['Authorization'] = `Bearer ${session.credential}`;
+      } else if (!headers['Authorization']) {
+        const token = await this.getAccessToken();
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+
       const chunkResponse = await fetch(fullUrl, {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': String(chunk.byteLength),
-        },
+        headers,
         body: chunk,
       });
 
@@ -758,37 +835,41 @@ export class CloudreveStorage {
     const safeRemotePath = validateRemotePath(remotePath, expectedUserId);
     const fileUri = this.toFileUri(safeRemotePath);
 
-    // V4: 获取文件内容
-    const response = await this.authedFetch(
-      `/api/v4/file/content?uri=${encodeURIComponent(fileUri)}`
-    );
+    // V4: POST /api/v4/file/url 获取签名下载链接
+    const response = await this.authedFetch('/api/v4/file/url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        uris: [fileUri],
+        download: true,
+      }),
+    });
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => response.statusText);
       throw new Error(
-        `Cloudreve 下载失败 (${response.status}): ${errorText}`
+        `Cloudreve 获取下载链接失败 (${response.status}): ${errorText}`
       );
     }
 
-    const contentType = response.headers.get('content-type') ?? '';
+    const result: CloudreveApiResponse<{
+      urls: Array<{ url: string; stream_saver_display_name?: string }>;
+      expires?: string;
+    }> = await response.json();
 
-    // V4 可能返回 JSON（包含下载链接）或直接返回文件内容
-    if (contentType.includes('application/json')) {
-      const result: CloudreveApiResponse<{ url?: string }> = await response.json();
-      const downloadData = assertApiSuccess(result, '获取下载链接');
+    const downloadData = assertApiSuccess(result, '获取下载链接');
 
-      if (downloadData.url) {
-        const fileResponse = await fetch(downloadData.url);
-        if (!fileResponse.ok) {
-          throw new Error(`Cloudreve 文件下载失败 (${fileResponse.status})`);
-        }
-        return Buffer.from(await fileResponse.arrayBuffer());
-      }
-
+    if (!downloadData.urls || downloadData.urls.length === 0 || !downloadData.urls[0].url) {
       throw new Error('Cloudreve 未返回下载链接');
     }
 
-    return Buffer.from(await response.arrayBuffer());
+    const downloadUrl = downloadData.urls[0].url;
+    const fileResponse = await fetch(downloadUrl);
+    if (!fileResponse.ok) {
+      throw new Error(`Cloudreve 文件下载失败 (${fileResponse.status})`);
+    }
+
+    return Buffer.from(await fileResponse.arrayBuffer());
   }
 }
 

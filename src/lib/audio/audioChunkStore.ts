@@ -260,6 +260,34 @@ export async function clearAudioChunks(sessionId: string): Promise<void> {
   clearAudioArchiveSnapshot(sessionId);
 }
 
+/**
+ * 获取指定 session 在 IndexedDB 中实际存储的最大 chunk seq 值。
+ * 返回 -1 表示没有任何 chunk。
+ */
+export async function getMaxAudioChunkSeq(sessionId: string): Promise<number> {
+  const db = await openDB();
+  if (!db.objectStoreNames.contains(CHUNK_STORE)) {
+    return -1;
+  }
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CHUNK_STORE, 'readonly');
+    const store = tx.objectStore(CHUNK_STORE);
+    const index = store.index('bySessionId');
+    const request = index.getAll(IDBKeyRange.only(sessionId));
+    request.onsuccess = () => {
+      const records = request.result as AudioChunkRecord[];
+      if (records.length === 0) {
+        resolve(-1);
+        return;
+      }
+      const maxSeq = records.reduce((max, r) => Math.max(max, r.seq), -1);
+      resolve(maxSeq);
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
 export async function hasAudioChunks(sessionId: string): Promise<boolean> {
   const db = await openDB();
   const count = await new Promise<number>((resolve, reject) => {

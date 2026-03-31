@@ -1065,7 +1065,10 @@ export function useSoniox(
     const handleBeforeUnload = () => {
       archiveManagerRef.current?.flushForPageUnload();
       void syncRemoteDraft();
-      sendFinalizeBeacon();
+      // 不在 unload 时 finalize：刷新页面也会触发 beforeunload，
+      // 此时 finalize 会导致会话变为 COMPLETED，刷新后无法恢复录制。
+      // 用户主动停止走 handleStopWithFinalization；
+      // 真正关闭标签页的孤儿会话由 billingMaintenance 的 reclaimStaleSessions 兜底。
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);

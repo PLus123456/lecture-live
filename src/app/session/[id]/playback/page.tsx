@@ -172,13 +172,14 @@ function loadBlobDurationMs(url: string): Promise<number> {
       audio.removeAttribute('src');
       audio.load();
     };
+    // 大文件可能需要更长时间探测时长，从 2s 提升到 8s
     const timeoutId = window.setTimeout(() => {
       const durationMs =
         Number.isFinite(audio.duration) && audio.duration > 0
           ? audio.duration * 1000
           : 0;
       finish(durationMs);
-    }, 2000);
+    }, 8000);
 
     audio.onloadedmetadata = reportDuration;
     audio.ondurationchange = reportDuration;
@@ -233,6 +234,7 @@ export default function PlaybackPage() {
   const playbackClockStateRef = useRef<PlaybackClockState | null>(null);
   const shouldResumePlaybackRef = useRef(false);
   const pendingSeekMsRef = useRef<number | null>(null);
+  const sessionDurationMsRef = useRef<number>(0);
 
   // Auth guard — 和 session page 一样防止水合竞态
   useEffect(() => {
@@ -350,14 +352,51 @@ export default function PlaybackPage() {
 
         if (disposed) return;
 
+        // 降级处理：如果有段的时长检测失败 (=0)，用字节比例 + session.durationMs 估算
+        const totalBytes = blobs.reduce((sum, b) => sum + b.size, 0);
+        const detectedTotalMs = durations.reduce((sum, d) => sum + d, 0);
+        const fallbackTotalMs = sessionDurationMsRef.current;
+        const hasZeroDuration = durations.some((d) => d <= 0);
+
+        const resolvedDurations = durations.map((detected, idx) => {
+          if (detected > 0) return detected;
+          // 用字节比例 × 已知总时长来估算
+          const referenceTotalMs =
+            detectedTotalMs > 0
+              ? detectedTotalMs
+              : fallbackTotalMs > 0
+                ? fallbackTotalMs
+                : 0;
+          if (referenceTotalMs <= 0 || totalBytes <= 0) return detected;
+          const byteProportion = blobs[idx].size / totalBytes;
+          return Math.max(1, Math.round(byteProportion * referenceTotalMs));
+        });
+
+        // 如果所有段的 detected duration 之和远超 session.durationMs，
+        // 说明 fixWebmDuration 写入了不正确的总时长；改用字节比例重新分配
+        if (
+          !hasZeroDuration &&
+          blobs.length > 1 &&
+          fallbackTotalMs > 0 &&
+          detectedTotalMs > fallbackTotalMs * 1.5
+        ) {
+          for (let i = 0; i < resolvedDurations.length; i++) {
+            const byteProportion = blobs[i].size / totalBytes;
+            resolvedDurations[i] = Math.max(
+              1,
+              Math.round(byteProportion * fallbackTotalMs)
+            );
+          }
+        }
+
         let nextOffsetMs = 0;
         const nextSegments = segmentsWithUrls.map(({ url }, index) => {
           const segment: PlaybackAudioSegment = {
             url,
-            durationMs: durations[index],
+            durationMs: resolvedDurations[index],
             startOffsetMs: nextOffsetMs,
           };
-          nextOffsetMs += durations[index];
+          nextOffsetMs += resolvedDurations[index];
           return segment;
         });
 
@@ -409,6 +448,10 @@ export default function PlaybackPage() {
   ]);
 
   const activeAudioSegment = audioSegments[activeAudioIndex] ?? null;
+
+  useEffect(() => {
+    sessionDurationMsRef.current = session?.durationMs ?? 0;
+  }, [session?.durationMs]);
 
   useEffect(() => {
     audioSegmentsRef.current = audioSegments;

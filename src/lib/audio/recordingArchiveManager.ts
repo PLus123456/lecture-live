@@ -8,6 +8,7 @@ import {
   getArchiveMimeType,
   getAudioArchiveSnapshot,
   getAudioSession,
+  getMaxAudioChunkSeq,
   hasAudioChunks,
   patchAudioSession,
   persistAudioArchiveSnapshot,
@@ -66,10 +67,15 @@ export class RecordingArchiveManager {
     } else {
       const session = await getAudioSession(this.sessionId);
       const snapshot = getAudioArchiveSnapshot(this.sessionId);
-      this.nextSeq = Math.max(
+      // 从 IDB 中查询实际存在的最大 chunk seq，避免因 chunkCount 元数据
+      // 落后（浏览器被强制关闭时最后几次写入可能未提交）而导致新 chunk
+      // 覆盖旧 chunk。
+      const maxSeqInDb = await getMaxAudioChunkSeq(this.sessionId);
+      const metadataCount = Math.max(
         session?.chunkCount ?? 0,
         snapshot?.chunkCount ?? 0
       );
+      this.nextSeq = Math.max(metadataCount, maxSeqInDb + 1);
       this.mimeType = session?.mimeType || snapshot?.mimeType || this.mimeType;
       this.startedAt =
         session?.startedAt ??

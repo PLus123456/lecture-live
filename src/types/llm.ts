@@ -13,6 +13,8 @@ export interface ChatMessage {
   model?: string;
   /** Thinking depth used for this reply (assistant only) */
   thinkingDepth?: ThinkingDepth;
+  /** LLM 的思考过程（extended thinking 或 /keyword 步骤） */
+  thinking?: string;
 }
 
 export interface KeywordEntry {

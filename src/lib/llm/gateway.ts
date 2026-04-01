@@ -243,7 +243,14 @@ interface LLMCallUsage {
 
 interface LLMCallResult {
   text: string;
+  thinking?: string;
   usage?: LLMCallUsage;
+}
+
+/** callLLMWithHistory 的详细返回类型（包含 thinking） */
+export interface LLMDetailedResult {
+  text: string;
+  thinking?: string;
 }
 
 async function executeLoggedCall(
@@ -255,8 +262,33 @@ async function executeLoggedCall(
     messageCount: number;
     purpose?: LlmPurpose;
   },
-  executor: () => Promise<LLMCallResult>
-): Promise<string> {
+  executor: () => Promise<LLMCallResult>,
+  detailed?: false
+): Promise<string>;
+async function executeLoggedCall(
+  provider: LLMProviderConfig,
+  context: {
+    kind: 'single' | 'history';
+    thinkingDepth?: ThinkingDepth;
+    promptChars: number;
+    messageCount: number;
+    purpose?: LlmPurpose;
+  },
+  executor: () => Promise<LLMCallResult>,
+  detailed: true
+): Promise<LLMDetailedResult>;
+async function executeLoggedCall(
+  provider: LLMProviderConfig,
+  context: {
+    kind: 'single' | 'history';
+    thinkingDepth?: ThinkingDepth;
+    promptChars: number;
+    messageCount: number;
+    purpose?: LlmPurpose;
+  },
+  executor: () => Promise<LLMCallResult>,
+  detailed?: boolean
+): Promise<string | LLMDetailedResult> {
   const startedAt = Date.now();
 
   try {
@@ -275,6 +307,9 @@ async function executeLoggedCall(
       },
       'LLM request completed'
     );
+    if (detailed) {
+      return { text: result.text, thinking: result.thinking };
+    }
     return result.text;
   } catch (error) {
     llmLogger.error(
@@ -353,6 +388,17 @@ export async function callLLM(
 export async function callLLMWithHistory(
   systemPrompt: string,
   messages: Array<{ role: 'user' | 'assistant'; content: string }>,
+  options: {
+    providerOverride?: string;
+    thinkingDepth?: ThinkingDepth;
+    purpose?: LlmPurpose;
+    modelId?: string;
+    detailed: true;
+  }
+): Promise<LLMDetailedResult>;
+export async function callLLMWithHistory(
+  systemPrompt: string,
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>,
   options?: {
     providerOverride?: string;
     thinkingDepth?: ThinkingDepth;
@@ -360,8 +406,21 @@ export async function callLLMWithHistory(
     purpose?: LlmPurpose;
     /** 按数据库模型 ID 查找 */
     modelId?: string;
+    /** 返回详细结果（包含 thinking） */
+    detailed?: false;
   }
-): Promise<string> {
+): Promise<string>;
+export async function callLLMWithHistory(
+  systemPrompt: string,
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>,
+  options?: {
+    providerOverride?: string;
+    thinkingDepth?: ThinkingDepth;
+    purpose?: LlmPurpose;
+    modelId?: string;
+    detailed?: boolean;
+  }
+): Promise<string | LLMDetailedResult> {
   let provider: LLMProviderConfig;
 
   if (options?.modelId) {
@@ -376,28 +435,29 @@ export async function callLLMWithHistory(
   }
 
   const budget = resolveThinkingBudget(provider, options?.thinkingDepth);
+  const ctx = {
+    kind: 'history' as const,
+    thinkingDepth: options?.thinkingDepth,
+    promptChars:
+      systemPrompt.length +
+      messages.reduce((total, message) => total + message.content.length, 0),
+    messageCount: messages.length,
+    purpose: options?.purpose,
+  };
+  const executor = () =>
+    provider.isAnthropic
+      ? callAnthropicWithHistory(provider, systemPrompt, messages, budget)
+      : callOpenAICompatibleWithHistory(
+          provider,
+          systemPrompt,
+          messages,
+          options?.thinkingDepth
+        );
 
-  return executeLoggedCall(
-    provider,
-    {
-      kind: 'history',
-      thinkingDepth: options?.thinkingDepth,
-      promptChars:
-        systemPrompt.length +
-        messages.reduce((total, message) => total + message.content.length, 0),
-      messageCount: messages.length,
-      purpose: options?.purpose,
-    },
-    () =>
-      provider.isAnthropic
-        ? callAnthropicWithHistory(provider, systemPrompt, messages, budget)
-        : callOpenAICompatibleWithHistory(
-            provider,
-            systemPrompt,
-            messages,
-            options?.thinkingDepth
-          )
-  );
+  if (options?.detailed) {
+    return executeLoggedCall(provider, ctx, executor, true);
+  }
+  return executeLoggedCall(provider, ctx, executor);
 }
 
 /* ------------------------------------------------------------------ */
@@ -443,22 +503,26 @@ async function callAnthropic(
   }
 
   const data = await res.json() as {
-    content?: Array<{ type?: string; text?: string }>;
+    content?: Array<{ type?: string; text?: string; thinking?: string }>;
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
     };
   };
 
-  const text = (data.content ?? []).reduce((result, block) => {
+  let text = '';
+  let thinking = '';
+  for (const block of data.content ?? []) {
     if (block.type === 'text' && typeof block.text === 'string') {
-      return result + block.text;
+      text += block.text;
+    } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+      thinking += block.thinking;
     }
-    return result;
-  }, '');
+  }
 
   return {
     text,
+    thinking: thinking || undefined,
     usage: {
       inputTokens: data.usage?.input_tokens,
       outputTokens: data.usage?.output_tokens,
@@ -507,22 +571,26 @@ async function callAnthropicWithHistory(
   }
 
   const data = await res.json() as {
-    content?: Array<{ type?: string; text?: string }>;
+    content?: Array<{ type?: string; text?: string; thinking?: string }>;
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
     };
   };
 
-  const text = (data.content ?? []).reduce((result, block) => {
+  let text = '';
+  let thinking = '';
+  for (const block of data.content ?? []) {
     if (block.type === 'text' && typeof block.text === 'string') {
-      return result + block.text;
+      text += block.text;
+    } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+      thinking += block.thinking;
     }
-    return result;
-  }, '');
+  }
 
   return {
     text,
+    thinking: thinking || undefined,
     usage: {
       inputTokens: data.usage?.input_tokens,
       outputTokens: data.usage?.output_tokens,
@@ -535,6 +603,22 @@ async function callAnthropicWithHistory(
 /* ------------------------------------------------------------------ */
 /*  OpenAI-compatible API                                              */
 /* ------------------------------------------------------------------ */
+
+/**
+ * 从 OpenAI 兼容 API 的 message 对象中提取 thinking / reasoning 内容。
+ * 兼容多种格式：
+ *   - OpenAI o1/o3: message.reasoning_content
+ *   - DeepSeek R1:   message.reasoning_content
+ *   - 其他兼容 API:  message.reasoning / message.thinking
+ */
+function extractOpenAIThinking(
+  message: Record<string, unknown> | undefined
+): string | undefined {
+  if (!message) return undefined;
+  const raw =
+    message.reasoning_content ?? message.reasoning ?? message.thinking;
+  return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
+}
 
 async function callOpenAICompatible(
   provider: LLMProviderConfig,
@@ -567,7 +651,7 @@ async function callOpenAICompatible(
   }
 
   const data = await res.json() as {
-    choices?: Array<{ message?: { content?: string } }>;
+    choices?: Array<{ message?: Record<string, unknown> }>;
     usage?: {
       prompt_tokens?: number;
       completion_tokens?: number;
@@ -575,8 +659,11 @@ async function callOpenAICompatible(
     };
   };
 
+  const msg = data.choices?.[0]?.message;
+
   return {
-    text: data.choices?.[0]?.message?.content ?? '',
+    text: (typeof msg?.content === 'string' ? msg.content : '') as string,
+    thinking: extractOpenAIThinking(msg),
     usage: {
       inputTokens: data.usage?.prompt_tokens,
       outputTokens: data.usage?.completion_tokens,
@@ -613,7 +700,7 @@ async function callOpenAICompatibleWithHistory(
   }
 
   const data = await res.json() as {
-    choices?: Array<{ message?: { content?: string } }>;
+    choices?: Array<{ message?: Record<string, unknown> }>;
     usage?: {
       prompt_tokens?: number;
       completion_tokens?: number;
@@ -621,8 +708,11 @@ async function callOpenAICompatibleWithHistory(
     };
   };
 
+  const msg = data.choices?.[0]?.message;
+
   return {
-    text: data.choices?.[0]?.message?.content ?? '',
+    text: (typeof msg?.content === 'string' ? msg.content : '') as string,
+    thinking: extractOpenAIThinking(msg),
     usage: {
       inputTokens: data.usage?.prompt_tokens,
       outputTokens: data.usage?.completion_tokens,

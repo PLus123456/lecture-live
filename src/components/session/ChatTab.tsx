@@ -12,11 +12,15 @@ import {
   User,
   Bot,
   ChevronDown,
+  ChevronRight,
   Zap,
   Brain,
   Sparkles,
+  CheckCircle2,
+  XCircle,
 } from 'lucide-react';
-import type { ThinkingDepth } from '@/types/llm';
+import ReactMarkdown from 'react-markdown';
+import type { ChatMessage, ThinkingDepth } from '@/types/llm';
 
 interface ChatContextSegment {
   text: string;
@@ -52,6 +56,225 @@ const DEPTH_OPTIONS: {
   },
 ];
 
+/* ------------------------------------------------------------------ */
+/*  Markdown 渲染（统一样式）                                             */
+/* ------------------------------------------------------------------ */
+
+/** 聊天气泡 & thinking 块共用的 Markdown 渲染器 */
+function Md({ children }: { children: string }) {
+  return (
+    <ReactMarkdown
+      components={{
+        p: ({ children: c }) => <p className="mb-1.5 last:mb-0">{c}</p>,
+        strong: ({ children: c }) => (
+          <strong className="font-semibold">{c}</strong>
+        ),
+        em: ({ children: c }) => <em className="italic">{c}</em>,
+        ul: ({ children: c }) => (
+          <ul className="list-disc list-inside mb-1.5 space-y-0.5">{c}</ul>
+        ),
+        ol: ({ children: c }) => (
+          <ol className="list-decimal list-inside mb-1.5 space-y-0.5">{c}</ol>
+        ),
+        li: ({ children: c }) => <li>{c}</li>,
+        code: ({ children: c, className: codeClass }) => {
+          // 行内 code vs 块级 code — react-markdown 在块级时会包在 <pre> 里
+          const isInline = !codeClass;
+          return isInline ? (
+            <code className="px-1 py-0.5 rounded bg-charcoal-100 text-rust-600 text-[10px] font-mono">
+              {c}
+            </code>
+          ) : (
+            <code className={codeClass}>{c}</code>
+          );
+        },
+        pre: ({ children: c }) => (
+          <pre className="my-1.5 p-2 rounded-md bg-charcoal-800 text-cream-100 text-[10px] font-mono overflow-x-auto">
+            {c}
+          </pre>
+        ),
+        blockquote: ({ children: c }) => (
+          <blockquote className="border-l-2 border-rust-300 pl-2 my-1.5 text-charcoal-500 italic">
+            {c}
+          </blockquote>
+        ),
+        h1: ({ children: c }) => (
+          <h1 className="font-bold text-sm mb-1">{c}</h1>
+        ),
+        h2: ({ children: c }) => (
+          <h2 className="font-bold text-xs mb-1">{c}</h2>
+        ),
+        h3: ({ children: c }) => (
+          <h3 className="font-semibold text-xs mb-0.5">{c}</h3>
+        ),
+        a: ({ href, children: c }) => (
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-rust-500 underline hover:text-rust-700"
+          >
+            {c}
+          </a>
+        ),
+        hr: () => <hr className="my-2 border-charcoal-200" />,
+      }}
+    >
+      {children}
+    </ReactMarkdown>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  思考过程折叠组件                                                     */
+/* ------------------------------------------------------------------ */
+
+function ThinkingBlock({ thinking }: { thinking: string }) {
+  const [expanded, setExpanded] = useState(false);
+  // 截断显示前 120 字符作为预览
+  const preview =
+    thinking.length > 120 ? thinking.slice(0, 120) + '…' : thinking;
+
+  return (
+    <div className="mt-1.5 mb-1">
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="flex items-center gap-1 text-[11px] text-purple-500 hover:text-purple-700
+                   transition-colors group"
+      >
+        {expanded ? (
+          <ChevronDown className="w-3 h-3" />
+        ) : (
+          <ChevronRight className="w-3 h-3" />
+        )}
+        <Sparkles className="w-3 h-3" />
+        <span className="font-medium">思考过程</span>
+        {!expanded && (
+          <span className="text-charcoal-400 font-normal ml-1 truncate max-w-[200px]">
+            {preview}
+          </span>
+        )}
+      </button>
+      {expanded && (
+        <div
+          className="mt-1 ml-4 px-2.5 py-2 rounded-md text-[11px] leading-relaxed
+                      bg-purple-50/60 text-purple-800 border border-purple-100
+                      max-h-[240px] overflow-y-auto"
+        >
+          <Md>{thinking}</Md>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  /keyword 步骤指示器                                                  */
+/* ------------------------------------------------------------------ */
+
+interface KeywordStep {
+  label: string;
+  status: 'pending' | 'active' | 'done' | 'error';
+}
+
+function KeywordSteps({ steps }: { steps: KeywordStep[] }) {
+  return (
+    <div className="flex items-center gap-2 my-1.5 ml-8">
+      {steps.map((step, i) => (
+        <div key={i} className="flex items-center gap-1">
+          {step.status === 'active' && (
+            <Loader2 className="w-3 h-3 text-rust-500 animate-spin" />
+          )}
+          {step.status === 'done' && (
+            <CheckCircle2 className="w-3 h-3 text-green-500" />
+          )}
+          {step.status === 'error' && (
+            <XCircle className="w-3 h-3 text-red-500" />
+          )}
+          {step.status === 'pending' && (
+            <div className="w-3 h-3 rounded-full border border-charcoal-300" />
+          )}
+          <span
+            className={`text-[11px] ${
+              step.status === 'active'
+                ? 'text-rust-600 font-medium'
+                : step.status === 'done'
+                  ? 'text-green-600'
+                  : step.status === 'error'
+                    ? 'text-red-600'
+                    : 'text-charcoal-400'
+            }`}
+          >
+            {step.label}
+          </span>
+          {i < steps.length - 1 && (
+            <div className="w-4 h-px bg-charcoal-200 mx-0.5" />
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  消息气泡（含 thinking 折叠）                                         */
+/* ------------------------------------------------------------------ */
+
+function MessageBubble({ msg }: { msg: ChatMessage }) {
+  if (msg.role === 'user') {
+    return (
+      <div className="flex gap-2 justify-end animate-chat-bubble-right">
+        <div className="max-w-[80%]">
+          <div className="px-3 py-2 rounded-lg text-xs leading-relaxed bg-charcoal-800 text-white">
+            {msg.content}
+          </div>
+        </div>
+        <div className="w-6 h-6 rounded-full bg-charcoal-200 flex items-center justify-center flex-shrink-0">
+          <User className="w-3.5 h-3.5 text-charcoal-600" />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex gap-2 animate-chat-bubble-left">
+      <div className="w-6 h-6 rounded-full bg-rust-100 flex items-center justify-center flex-shrink-0">
+        <Bot className="w-3.5 h-3.5 text-rust-600" />
+      </div>
+      <div className="max-w-[80%]">
+        {/* Thinking 折叠块（放在正文前面） */}
+        {msg.thinking && <ThinkingBlock thinking={msg.thinking} />}
+        {/* 正文内容（Markdown 渲染） */}
+        <div className="px-3 py-2 rounded-lg text-xs leading-relaxed bg-cream-100 text-charcoal-700">
+          <Md>{msg.content}</Md>
+        </div>
+        {/* 模型 & depth 标签 */}
+        {msg.model && (
+          <div className="flex items-center gap-1.5 mt-0.5 pl-1">
+            <span className="text-[10px] text-charcoal-300">{msg.model}</span>
+            {msg.thinkingDepth && msg.thinkingDepth !== 'medium' && (
+              <span
+                className={`text-[10px] px-1 py-0.5 rounded ${
+                  msg.thinkingDepth === 'high'
+                    ? 'bg-purple-50 text-purple-500'
+                    : 'bg-cream-100 text-charcoal-400'
+                }`}
+              >
+                {msg.thinkingDepth}
+              </span>
+            )}
+            {msg.thinking && (
+              <span className="text-[10px] px-1 py-0.5 rounded bg-purple-50 text-purple-400">
+                含思考
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function ChatTab({
   onInjectKeywords,
   transcriptSegments,
@@ -78,6 +301,7 @@ export default function ChatTab({
 
   const [input, setInput] = useState('');
   const [showModelMenu, setShowModelMenu] = useState(false);
+  const [keywordSteps, setKeywordSteps] = useState<KeywordStep[] | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
 
@@ -118,45 +342,77 @@ export default function ChatTab({
       });
 
       const manualKeywordInput = value.slice('/keyword'.length).trim();
+
+      /* ── 手动添加：/keyword term1, term2 ── */
       if (manualKeywordInput) {
+        const steps: KeywordStep[] = [
+          { label: '解析关键词', status: 'active' },
+          { label: '注入 ASR', status: 'pending' },
+        ];
+        setKeywordSteps([...steps]);
+
         const manualKeywords = manualKeywordInput
           .split(',')
           .map((item) => item.trim())
           .filter(Boolean);
 
         if (manualKeywords.length === 0) {
+          steps[0].status = 'error';
+          setKeywordSteps([...steps]);
           addMessage({
             id: crypto.randomUUID(),
             role: 'assistant',
-            content: 'No valid keywords found. Try `/keyword term1, term2`.',
+            content: '未找到有效关键词。请尝试 `/keyword term1, term2`。',
+            thinking: `解析输入: "${manualKeywordInput}"\n结果: 空（逗号分隔后无有效项）`,
             timestamp: Date.now(),
           });
+          setKeywordSteps(null);
           return;
         }
+
+        steps[0].status = 'done';
+        steps[1].status = 'active';
+        setKeywordSteps([...steps]);
 
         try {
           manualKeywords.forEach(addManualKeyword);
           if (onInjectKeywords) {
             await onInjectKeywords(manualKeywords);
           }
+          steps[1].status = 'done';
+          setKeywordSteps([...steps]);
         } catch (error) {
+          steps[1].status = 'error';
+          setKeywordSteps([...steps]);
           addMessage({
             id: crypto.randomUUID(),
             role: 'assistant',
-            content: `Failed to inject manual keywords: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            content: `注入关键词失败: ${error instanceof Error ? error.message : '未知错误'}`,
+            thinking: `手动关键词: ${manualKeywords.join(', ')}\n注入阶段出错: ${error instanceof Error ? error.message : String(error)}`,
             timestamp: Date.now(),
           });
+          setKeywordSteps(null);
           return;
         }
 
         addMessage({
           id: crypto.randomUUID(),
           role: 'assistant',
-          content: `Added ${manualKeywords.length} keyword(s) to the ASR context: ${manualKeywords.join(', ')}`,
+          content: `已将 ${manualKeywords.length} 个关键词添加到 ASR 上下文: ${manualKeywords.join(', ')}`,
+          thinking: `解析输入: "${manualKeywordInput}"\n识别到 ${manualKeywords.length} 个关键词: [${manualKeywords.join(', ')}]\n已添加到关键词库并注入 ASR 引擎`,
           timestamp: Date.now(),
         });
+        setKeywordSteps(null);
         return;
       }
+
+      /* ── 自动提取：/keyword（无参数） ── */
+      const steps: KeywordStep[] = [
+        { label: '收集转录稿', status: 'active' },
+        { label: 'LLM 提取', status: 'pending' },
+        { label: '完成', status: 'pending' },
+      ];
+      setKeywordSteps([...steps]);
 
       const recentTranscriptForKeywords = effectiveSegments
         .slice(-60)
@@ -164,35 +420,64 @@ export default function ChatTab({
         .join(' ');
 
       if (!recentTranscriptForKeywords.trim()) {
+        steps[0].status = 'error';
+        setKeywordSteps([...steps]);
         addMessage({
           id: crypto.randomUUID(),
           role: 'assistant',
-          content: 'There is not enough transcript yet to extract keywords.',
+          content: '转录稿内容不足，无法提取关键词。',
+          thinking: `尝试收集最近 60 个片段\n结果: 转录稿为空，跳过 LLM 调用`,
           timestamp: Date.now(),
         });
+        setKeywordSteps(null);
         return;
       }
 
+      steps[0].status = 'done';
+      steps[1].status = 'active';
+      setKeywordSteps([...steps]);
+
       try {
         const extractedKeywords = await extractFromText(recentTranscriptForKeywords);
+
+        steps[1].status = 'done';
+        steps[2].status = 'done';
+        setKeywordSteps([...steps]);
+
+        const segmentCount = Math.min(effectiveSegments.length, 60);
+        const charCount = recentTranscriptForKeywords.length;
+
         addMessage({
           id: crypto.randomUUID(),
           role: 'assistant',
           content:
             extractedKeywords.length > 0
-              ? `Extracted ${extractedKeywords.length} keyword(s). Review them in the Keywords tab and click Inject to rebuild the ASR context.`
-              : 'No new keywords were extracted from the current transcript.',
+              ? `提取到 ${extractedKeywords.length} 个关键词。请在关键词标签页审核，点击 Inject 注入 ASR 上下文。`
+              : '当前转录稿中未提取到新关键词。',
+          thinking: [
+            `收集最近 ${segmentCount} 个转录片段（共 ${charCount} 字符）`,
+            `发送至 /api/llm/extract-keywords（截断至 8000 字符）`,
+            `LLM 返回 ${extractedKeywords.length} 个关键词`,
+            extractedKeywords.length > 0
+              ? `结果: [${extractedKeywords.join(', ')}]`
+              : '结果: 无新关键词（可能与现有关键词重复）',
+          ].join('\n'),
           timestamp: Date.now(),
         });
       } catch (error) {
+        steps[1].status = 'error';
+        setKeywordSteps([...steps]);
+
         addMessage({
           id: crypto.randomUUID(),
           role: 'assistant',
-          content: `Keyword extraction failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          content: `关键词提取失败: ${error instanceof Error ? error.message : '未知错误'}`,
+          thinking: `收集转录稿: ${recentTranscriptForKeywords.length} 字符\nLLM 调用失败: ${error instanceof Error ? error.message : String(error)}`,
           timestamp: Date.now(),
         });
       }
 
+      setKeywordSteps(null);
       return;
     }
 
@@ -300,59 +585,29 @@ export default function ChatTab({
         )}
 
         {messages.map((msg) => (
-          <div
-            key={msg.id}
-            className={`flex gap-2 ${msg.role === 'user' ? 'justify-end animate-chat-bubble-right' : 'animate-chat-bubble-left'}`}
-          >
-            {msg.role === 'assistant' && (
-              <div className="w-6 h-6 rounded-full bg-rust-100 flex items-center justify-center flex-shrink-0">
-                <Bot className="w-3.5 h-3.5 text-rust-600" />
-              </div>
-            )}
-            <div className="max-w-[80%]">
-              <div
-                className={`px-3 py-2 rounded-lg text-xs leading-relaxed ${
-                  msg.role === 'user'
-                    ? 'bg-charcoal-800 text-white'
-                    : 'bg-cream-100 text-charcoal-700'
-                }`}
-              >
-                {msg.content}
-              </div>
-              {/* Model/depth indicator for assistant messages */}
-              {msg.role === 'assistant' && msg.model && (
-                <div className="flex items-center gap-1.5 mt-0.5 pl-1">
-                  <span className="text-[10px] text-charcoal-300">
-                    {msg.model}
-                  </span>
-                  {msg.thinkingDepth && msg.thinkingDepth !== 'medium' && (
-                    <span className={`text-[10px] px-1 py-0.5 rounded ${
-                      msg.thinkingDepth === 'high'
-                        ? 'bg-purple-50 text-purple-500'
-                        : 'bg-cream-100 text-charcoal-400'
-                    }`}>
-                      {msg.thinkingDepth}
-                    </span>
-                  )}
-                </div>
-              )}
-            </div>
-            {msg.role === 'user' && (
-              <div className="w-6 h-6 rounded-full bg-charcoal-200 flex items-center justify-center flex-shrink-0">
-                <User className="w-3.5 h-3.5 text-charcoal-600" />
-              </div>
-            )}
-          </div>
+          <MessageBubble key={msg.id} msg={msg} />
         ))}
 
-        {isLoading && (
-          <div className="flex items-center gap-2">
+        {/* /keyword 步骤指示器 */}
+        {keywordSteps && <KeywordSteps steps={keywordSteps} />}
+
+        {/* 普通对话 loading 状态 */}
+        {isLoading && !keywordSteps && (
+          <div className="flex items-center gap-2 animate-chat-bubble-left">
             <div className="w-6 h-6 rounded-full bg-rust-100 flex items-center justify-center">
               <Loader2 className="w-3.5 h-3.5 text-rust-600 animate-spin" />
             </div>
-            <span className="text-xs text-charcoal-400">
-              {selectedDepth === 'high' ? 'Thinking deeply...' : 'Thinking...'}
-            </span>
+            <div className="flex flex-col gap-0.5">
+              <span className="text-xs text-charcoal-400">
+                {selectedDepth === 'high' ? '深度思考中…' : '思考中…'}
+              </span>
+              {selectedDepth === 'high' && (
+                <span className="text-[10px] text-purple-400 flex items-center gap-1">
+                  <Sparkles className="w-2.5 h-2.5" />
+                  Extended Thinking 已启用
+                </span>
+              )}
+            </div>
           </div>
         )}
 

@@ -90,6 +90,7 @@ export function useChat() {
           timestamp: Date.now(),
           model: data.model,
           thinkingDepth: data.thinkingDepth,
+          thinking: data.thinking ?? undefined,
         };
         addMessage(assistantMsg);
       } catch (error) {

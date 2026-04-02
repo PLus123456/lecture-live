@@ -220,12 +220,14 @@ LectureLive 接入 Cloudreve 存储时，使用的是 Cloudreve v4 的 OAuth 授
 - `Redirect URI` 必须与 LectureLive 的回调地址完全一致。
 - 本地开发：`http://localhost:3000/api/admin/cloudreve/callback`
 - 生产环境：`https://你的域名/api/admin/cloudreve/callback`
-- 推荐 scopes：`offline_access Files.Read Files.Write`
+- 推荐 scopes：`openid offline_access Files.Write`
 
 #### 关键说明
 
 - 发送给 Cloudreve 的 `redirect_uri` 必须与 Cloudreve 管理后台登记的地址完全一致，协议、域名、端口、路径都不能有差异。
+- Cloudreve OAuth 授权时必须显式包含 `openid`。
 - 如果希望 Cloudreve 返回 `refresh_token`，scope 里必须包含 `offline_access`。
+- Cloudreve 用 `Files.Write` 表示文件读写权限；除非你的 Cloudreve 实例明确支持，否则不要同时请求 `Files.Read Files.Write`。
 - 现在点击管理后台的 `Cloudreve 授权` 按钮前，LectureLive 会先保存当前填写的 Cloudreve 地址、Client ID 和 Client Secret，再跳转到 Cloudreve。
 - OAuth 配置读取优先级为：环境变量优先，其次才是管理后台里保存的设置。
 

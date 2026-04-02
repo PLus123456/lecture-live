@@ -220,12 +220,14 @@ LectureLive uses the Cloudreve v4 OAuth authorization code flow with PKCE for st
 - `Redirect URI` must exactly match LectureLive's callback URL.
 - Local development: `http://localhost:3000/api/admin/cloudreve/callback`
 - Production: `https://your-domain/api/admin/cloudreve/callback`
-- Recommended scopes: `offline_access Files.Read Files.Write`
+- Recommended scopes: `openid offline_access Files.Write`
 
 #### Important notes
 
 - The `redirect_uri` sent to Cloudreve must be identical to the URI registered in the Cloudreve admin panel, including protocol, host, port, and path.
+- `openid` is required by Cloudreve OAuth consent.
 - `offline_access` is required if you want Cloudreve to return a `refresh_token`.
+- Cloudreve uses `Files.Write` to represent read-write file access, so do not request `Files.Read Files.Write` together unless your Cloudreve instance explicitly allows that combination.
 - When you click `Cloudreve Authorize` in the admin panel, LectureLive now saves the current Cloudreve URL, Client ID, and Client Secret before redirecting to Cloudreve.
 - OAuth configuration resolution order is: environment variables first, then saved admin settings.
 

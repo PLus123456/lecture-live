@@ -925,6 +925,8 @@ export default function PlaybackPage() {
             sessionId={session.id}
             sourceLang={session.sourceLang}
             targetLang={session.targetLang}
+            report={reportData}
+            hasRecording={audioSegments.length > 0}
           />
         )}
       </>
@@ -1466,6 +1468,8 @@ export default function PlaybackPage() {
           sessionId={session.id}
           sourceLang={session.sourceLang}
           targetLang={session.targetLang}
+          report={reportData}
+          hasRecording={audioSegments.length > 0}
         />
       )}
     </div>

@@ -286,6 +286,9 @@ export function buildSummaryParagraphs(
   const overallSummaries = summaries.filter((s) => !s.timeRange);
   if (overallSummaries.length > 0) {
     for (const summary of overallSummaries) {
+      if (summary.summary) {
+        paragraphs.push(bodyText(summary.summary));
+      }
       if (summary.keyPoints?.length) {
         paragraphs.push(heading3('要点'));
         for (const point of summary.keyPoints) {
@@ -295,6 +298,12 @@ export function buildSummaryParagraphs(
       if (summary.definitions && Object.keys(summary.definitions).length > 0) {
         paragraphs.push(heading3('术语'));
         paragraphs.push(createDefinitionTable(summary.definitions) as FileChild);
+      }
+      if (summary.suggestedQuestions?.length) {
+        paragraphs.push(heading3('复习问题'));
+        summary.suggestedQuestions.forEach((q, i) => {
+          paragraphs.push(bodyText(`${i + 1}. ${q}`));
+        });
       }
     }
   }

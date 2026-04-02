@@ -1,4 +1,5 @@
 import path from 'path';
+import { sanitizeFileNamePart } from '@/lib/fileNames';
 
 export const STORAGE_CATEGORIES = [
   'recordings',
@@ -23,29 +24,7 @@ export function sanitizePath(input: string): string {
     throw new Error('Invalid path input');
   }
 
-  // 1. 移除 null bytes
-  let safe = input.replace(/\0/g, '');
-
-  // 2. 只取 basename（移除任何目录穿越）
-  safe = path.basename(safe);
-
-  // 3. 移除 .. 和 其他路径分隔符残留
-  safe = safe.replace(/\.\./g, '').replace(/[/\\]/g, '');
-
-  // 4. 移除不安全字符（允许字母数字、连字符、下划线、点、Unicode 字母/数字）
-  safe = safe.replace(/[^\w._-]/g, '_');
-
-  // 5. 防止空结果
-  if (!safe || safe === '.' || safe === '..') {
-    throw new Error('Invalid path after sanitization');
-  }
-
-  // 6. 长度限制
-  if (safe.length > 255) {
-    safe = safe.slice(0, 255);
-  }
-
-  return safe;
+  return sanitizeFileNamePart(path.basename(input));
 }
 
 export function sanitizeToken(input: string): string {

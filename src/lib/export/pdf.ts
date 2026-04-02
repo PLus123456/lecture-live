@@ -5,6 +5,7 @@
  */
 import type { SummarizeResponse } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
+import { sanitizeDownloadFilenameBase } from '@/lib/fileNames';
 import type { ExportTranscriptSegment } from './types';
 
 function escapeHtml(text: string): string {
@@ -177,6 +178,9 @@ function buildSummaryHtml(
 
   const overallSummaries = summaries.filter((s) => !s.timeRange);
   for (const summary of overallSummaries) {
+    if (summary.summary) {
+      html += `<p>${escapeHtml(summary.summary)}</p>`;
+    }
     if (summary.keyPoints?.length) {
       html += '<h3>要点</h3><ul>';
       for (const p of summary.keyPoints) html += `<li>${escapeHtml(p)}</li>`;
@@ -188,6 +192,11 @@ function buildSummaryHtml(
         html += `<tr><td><strong>${escapeHtml(term)}</strong></td><td>${escapeHtml(def)}</td></tr>`;
       }
       html += '</table>';
+    }
+    if (summary.suggestedQuestions?.length) {
+      html += '<h3>复习问题</h3><ol class="question-list">';
+      for (const q of summary.suggestedQuestions) html += `<li>${escapeHtml(q)}</li>`;
+      html += '</ol>';
     }
   }
 
@@ -297,7 +306,7 @@ export function exportPdf(options: PdfExportOptions): void {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${title || 'lecture'}.html`;
+    a.download = `${sanitizeDownloadFilenameBase(title, 'lecture')}.html`;
     a.click();
     URL.revokeObjectURL(url);
     return;

@@ -12,6 +12,7 @@ import ChatTab from '@/components/session/ChatTab';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useI18n } from '@/lib/i18n';
+import { summaryBlocksToResponses } from '@/lib/summary';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useAuthStore } from '@/stores/authStore';
 import { useTranscriptStore } from '@/stores/transcriptStore';
@@ -207,6 +208,7 @@ export default function PlaybackPage() {
   const addSummaryBlock = useSummaryStore((s) => s.addBlock);
   const clearSummaries = useSummaryStore((s) => s.clearAll);
   const setTranslation = useTranslationStore((s) => s.setTranslation);
+  const translations = useTranslationStore((s) => s.translations);
   const clearTranslations = useTranslationStore((s) => s.clearAll);
   const restoreAttemptedRef = useRef(false);
 
@@ -925,6 +927,9 @@ export default function PlaybackPage() {
             sessionId={session.id}
             sourceLang={session.sourceLang}
             targetLang={session.targetLang}
+            segments={segments}
+            translations={translations}
+            summaries={summaryBlocksToResponses(summaries)}
             report={reportData}
             hasRecording={audioSegments.length > 0}
           />
@@ -1468,6 +1473,9 @@ export default function PlaybackPage() {
           sessionId={session.id}
           sourceLang={session.sourceLang}
           targetLang={session.targetLang}
+          segments={segments}
+          translations={translations}
+          summaries={summaryBlocksToResponses(summaries)}
           report={reportData}
           hasRecording={audioSegments.length > 0}
         />

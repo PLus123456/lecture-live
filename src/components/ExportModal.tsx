@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import BottomSheet from '@/components/mobile/BottomSheet';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import {
@@ -17,16 +17,13 @@ import {
   Check,
   AlertCircle,
 } from 'lucide-react';
-import { useTranscriptStore } from '@/stores/transcriptStore';
-import { useTranslationStore } from '@/stores/translationStore';
 import { useAuthStore } from '@/stores/authStore';
-import { useSummaryStore } from '@/stores/summaryStore';
-import { summaryBlocksToResponses } from '@/lib/summary';
 import { useI18n } from '@/lib/i18n';
 import type { ExportTranscriptSegment } from '@/lib/export/types';
 import type { SummarizeResponse } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
 import {
+  buildExportPlan,
   executeExport,
   isFormatAvailable,
   textContentCount,
@@ -86,66 +83,170 @@ const FORMAT_OPTIONS: FormatOption[] = [
   { id: 'json', label: 'JSON', desc: '.json', ext: 'json', color: 'bg-amber-600' },
 ];
 
+interface SessionExportDataResponse {
+  title?: string;
+  sourceLang?: string;
+  targetLang?: string;
+  segments?: ExportTranscriptSegment[];
+  translations?: Record<string, string>;
+  summaries?: SummarizeResponse[];
+  report?: SessionReportData | null;
+  hasRecording?: boolean;
+}
+
+function getAvailableContents(options: {
+  hasTranscript: boolean;
+  hasSummary: boolean;
+  hasTimedSummary: boolean;
+  hasRecording: boolean;
+}): ContentType[] {
+  const contents: ContentType[] = [];
+
+  if (options.hasTranscript) contents.push('transcript');
+  if (options.hasSummary) contents.push('summary');
+  if (options.hasTimedSummary) contents.push('timedSummary');
+  if (options.hasRecording) contents.push('recording');
+
+  return contents;
+}
+
+function getDefaultSelectedContents(availableContents: ContentType[]): ContentType[] {
+  const defaults = ['transcript', 'summary'].filter((content) =>
+    availableContents.includes(content as ContentType)
+  ) as ContentType[];
+
+  if (defaults.length > 0) {
+    return defaults;
+  }
+
+  if (availableContents.includes('timedSummary')) {
+    return ['timedSummary'];
+  }
+
+  if (availableContents.includes('recording')) {
+    return ['recording'];
+  }
+
+  return [];
+}
+
 export default function ExportModal({
   isOpen,
   onClose,
   sessionTitle,
   sessionId,
-  sourceLang = 'en',
-  targetLang = 'zh',
+  sourceLang,
+  targetLang,
   segments: segmentsOverride,
   translations: translationsOverride,
   summaries: summariesOverride,
   report,
-  hasRecording = false,
+  hasRecording,
 }: ExportModalProps) {
   const isMobile = useIsMobile();
   const { t } = useI18n();
   const token = useAuthStore((s) => s.token);
 
-  // Store 数据
-  const storeSegments = useTranscriptStore((s) => s.segments);
-  const storeTranslations = useTranslationStore((s) => s.translations);
-  const summaryBlocks = useSummaryStore((s) => s.blocks);
-  const exportSegments = segmentsOverride ?? storeSegments;
-  const exportTranslations = translationsOverride ?? storeTranslations;
-  const exportSummaries = summariesOverride ?? summaryBlocksToResponses(summaryBlocks);
+  const [sessionData, setSessionData] = useState<SessionExportDataResponse | null>(null);
+  const [isLoadingSessionData, setIsLoadingSessionData] = useState(false);
+
+  const hasProvidedContentData =
+    segmentsOverride !== undefined ||
+    translationsOverride !== undefined ||
+    summariesOverride !== undefined ||
+    report !== undefined;
+
+  const fetchSessionData = useCallback(async (): Promise<SessionExportDataResponse | null> => {
+    if (!sessionId || !token) return null;
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/export-data`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return null;
+      return await res.json() as SessionExportDataResponse;
+    } catch {
+      return null;
+    }
+  }, [sessionId, token]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setError(null);
+      return;
+    }
+
+    if (!sessionId || !token) {
+      return;
+    }
+
+    let cancelled = false;
+    setIsLoadingSessionData(true);
+
+    void fetchSessionData()
+      .then((data) => {
+        if (!cancelled && data) {
+          setSessionData(data);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsLoadingSessionData(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, sessionId, token, fetchSessionData]);
+
+  const exportSegments = segmentsOverride ?? sessionData?.segments ?? [];
+  const exportSummaries = summariesOverride ?? sessionData?.summaries ?? [];
+  const exportReport = report ?? sessionData?.report ?? null;
+  const exportHasRecording = Boolean((hasRecording ?? sessionData?.hasRecording ?? false) && sessionId);
 
   // 可用性判断
   const hasTranscript = exportSegments.length > 0;
-  const hasSummary = exportSummaries.some((s) => !s.timeRange) || Boolean(report?.significance?.isWorthSummarizing);
+  const hasSummary =
+    exportSummaries.some((s) => !s.timeRange) ||
+    Boolean(exportReport?.significance?.isWorthSummarizing && exportReport.report);
   const hasTimedSummary = exportSummaries.some((s) => s.timeRange);
 
   // 状态
-  const [selectedContents, setSelectedContents] = useState<ContentType[]>(
-    ['transcript', 'summary'].filter((c) => {
-      if (c === 'transcript') return hasTranscript;
-      if (c === 'summary') return hasSummary;
-      return false;
-    }) as ContentType[],
-  );
+  const [selectedContents, setSelectedContents] = useState<ContentType[]>([]);
   const [selectedFormat, setSelectedFormat] = useState<ExportFileFormat>('docx');
   const [documentMode, setDocumentMode] = useState<DocumentMode>('single');
   const [isExporting, setIsExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const availableContents = useMemo(
+    () =>
+      getAvailableContents({
+        hasTranscript,
+        hasSummary,
+        hasTimedSummary,
+        hasRecording: exportHasRecording,
+      }),
+    [hasTranscript, hasSummary, hasTimedSummary, exportHasRecording],
+  );
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    setSelectedContents((prev) => {
+      const filtered = prev.filter((content) => availableContents.includes(content));
+      if (filtered.length > 0) {
+        return filtered;
+      }
+      return getDefaultSelectedContents(availableContents);
+    });
+  }, [isOpen, availableContents]);
+
   // 当前选择的文本内容数量
   const currentTextCount = textContentCount(selectedContents);
   const hasAnyTextContent = hasTextContent(selectedContents);
-  const showDocumentMode = currentTextCount >= 2;
   const onlyRecording = selectedContents.length === 1 && selectedContents[0] === 'recording';
-
-  // 将产生多少个文件
-  const estimatedFileCount = useMemo(() => {
-    let count = 0;
-    if (hasAnyTextContent) {
-      count += documentMode === 'separate' ? currentTextCount : 1;
-    }
-    if (selectedContents.includes('recording')) count += 1;
-    return count;
-  }, [selectedContents, documentMode, hasAnyTextContent, currentTextCount]);
-
-  const willZip = estimatedFileCount >= 2;
+  const showSessionDataLoadingState =
+    isLoadingSessionData && !hasProvidedContentData && !sessionData;
 
   // 内容复选框切换
   const toggleContent = useCallback((id: ContentType) => {
@@ -173,9 +274,17 @@ export default function ExportModal({
     }
     return selectedFormat;
   }, [selectedFormat, isFormatDisabled, onlyRecording]);
+  const showDocumentMode = currentTextCount >= 2 && effectiveFormat !== 'pdf';
+  const exportPlan = useMemo(
+    () => buildExportPlan(selectedContents, effectiveFormat, documentMode),
+    [selectedContents, effectiveFormat, documentMode],
+  );
 
   // 是否可导出
-  const canExport = selectedContents.length > 0 && (onlyRecording || hasAnyTextContent);
+  const canExport =
+    !showSessionDataLoadingState &&
+    selectedContents.length > 0 &&
+    (onlyRecording || hasAnyTextContent);
 
   // 下载录音的回调
   const fetchRecording = useCallback(async (): Promise<Blob | null> => {
@@ -191,20 +300,6 @@ export default function ExportModal({
     }
   }, [sessionId, token]);
 
-  // 从服务端获取完整会话数据
-  const fetchSessionData = useCallback(async () => {
-    if (!sessionId || !token) return null;
-    try {
-      const res = await fetch(`/api/sessions/${sessionId}/export-data`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) return null;
-      return await res.json();
-    } catch {
-      return null;
-    }
-  }, [sessionId, token]);
-
   // 执行导出
   const handleExport = async () => {
     if (!canExport) return;
@@ -212,31 +307,37 @@ export default function ExportModal({
     setError(null);
 
     try {
-      // 尝试从服务端获取完整数据（如果有 sessionId 且本地数据为空）
-      let segments = exportSegments;
-      let translations = exportTranslations;
-      let summaries = exportSummaries;
-      let sessionReport = report ?? null;
-
-      if (sessionId && segments.length === 0) {
-        const data = await fetchSessionData();
-        if (data) {
-          segments = data.segments ?? [];
-          translations = data.translations ?? {};
-          summaries = data.summaries ?? [];
-          sessionReport = data.report ?? null;
+      let latestSessionData = sessionData;
+      if (sessionId && !latestSessionData) {
+        latestSessionData = await fetchSessionData();
+        if (latestSessionData) {
+          setSessionData(latestSessionData);
         }
+      }
+
+      const segments = segmentsOverride ?? latestSessionData?.segments ?? [];
+      const translations = translationsOverride ?? latestSessionData?.translations ?? {};
+      const summaries = summariesOverride ?? latestSessionData?.summaries ?? [];
+      const sessionReport = report ?? latestSessionData?.report ?? null;
+      const sessionSourceLang = sourceLang ?? latestSessionData?.sourceLang ?? 'en';
+      const sessionTargetLang = targetLang ?? latestSessionData?.targetLang ?? 'zh';
+
+      if (sessionId && !hasProvidedContentData && !latestSessionData) {
+        throw new Error('Failed to load session export data');
       }
 
       await executeExport({
         contents: selectedContents,
-        format: onlyRecording ? 'md' : effectiveFormat,
+        format: effectiveFormat,
         documentMode,
         payload: {
-          title: sessionTitle || t('session.defaultTitle'),
+          title:
+            sessionTitle ||
+            latestSessionData?.title ||
+            t('session.defaultTitle'),
           date: new Date().toISOString(),
-          sourceLang,
-          targetLang,
+          sourceLang: sessionSourceLang,
+          targetLang: sessionTargetLang,
           segments,
           translations,
           summaries,
@@ -258,6 +359,15 @@ export default function ExportModal({
 
   const content = (
     <div className="flex flex-col max-h-[70vh] md:max-h-none">
+      {showSessionDataLoadingState && (
+        <div className="px-5 pt-4">
+          <div className="flex items-center gap-2 rounded-xl border border-cream-200 bg-cream-50 px-3 py-2 text-xs text-charcoal-500">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            {t('exportModal.loadingData')}
+          </div>
+        </div>
+      )}
+
       {/* 步骤1：选择导出内容 */}
       <div className="px-5 pt-4 pb-3">
         <div className="flex items-center gap-2 mb-3">
@@ -267,10 +377,11 @@ export default function ExportModal({
         <div className="grid grid-cols-2 gap-2">
           {CONTENT_OPTIONS.map((opt) => {
             const disabled =
+              showSessionDataLoadingState ||
               (opt.id === 'transcript' && !hasTranscript) ||
               (opt.id === 'summary' && !hasSummary) ||
               (opt.id === 'timedSummary' && !hasTimedSummary) ||
-              (opt.id === 'recording' && !hasRecording);
+              (opt.id === 'recording' && !exportHasRecording);
             const selected = selectedContents.includes(opt.id);
             const Icon = opt.icon;
 
@@ -418,12 +529,19 @@ export default function ExportModal({
       <div className="px-5 py-4 border-t border-cream-200 flex items-center justify-between bg-cream-50/50 safe-bottom">
         {/* 文件数量提示 */}
         <div className="text-[10px] text-charcoal-400">
-          {willZip ? (
+          {exportPlan.usesPrintDialog ? (
+            <span className="flex items-center gap-1">
+              <AlertCircle className="w-3 h-3" />
+              {exportPlan.downloadFileCount > 0
+                ? t('exportModal.printAndDownload', { count: String(exportPlan.downloadFileCount) })
+                : t('exportModal.printOnly')}
+            </span>
+          ) : exportPlan.willZip ? (
             <span className="flex items-center gap-1">
               <Package className="w-3 h-3" />
-              {t('exportModal.willZip', { count: String(estimatedFileCount) })}
+              {t('exportModal.willZip', { count: String(exportPlan.downloadFileCount) })}
             </span>
-          ) : selectedContents.length > 0 ? (
+          ) : exportPlan.downloadFileCount === 1 ? (
             <span className="flex items-center gap-1">
               <FileType className="w-3 h-3" />
               {t('exportModal.singleFile')}

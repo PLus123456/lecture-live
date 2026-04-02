@@ -1,4 +1,5 @@
 import type { SummarizeResponse } from '@/types/summary';
+import type { SessionReportData } from '@/types/report';
 import type { ExportTranscriptSegment } from './types';
 
 /** v2 simplified export interface */
@@ -8,9 +9,19 @@ export function exportJson(
   translations: Record<string, string>,
   summaries: unknown[],
   sourceLang?: string,
-  targetLang?: string
+  targetLang?: string,
+  report?: SessionReportData | null
 ): string {
-  return exportToJson(title, new Date().toISOString(), segments, translations, summaries as SummarizeResponse[], sourceLang, targetLang);
+  return exportToJson(
+    title,
+    new Date().toISOString(),
+    segments,
+    translations,
+    summaries as SummarizeResponse[],
+    sourceLang,
+    targetLang,
+    report
+  );
 }
 
 export function exportToJson(
@@ -20,7 +31,8 @@ export function exportToJson(
   translations: Record<string, string>,
   summaries: SummarizeResponse[],
   sourceLang?: string,
-  targetLang?: string
+  targetLang?: string,
+  report?: SessionReportData | null
 ): string {
   return JSON.stringify(
     {
@@ -34,6 +46,7 @@ export function exportToJson(
         translation: translations[seg.id] ?? null,
       })),
       summaries,
+      ...(report ? { report } : {}),
     },
     null,
     2

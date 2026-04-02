@@ -5,6 +5,7 @@
 import JSZip from 'jszip';
 import type { SummarizeResponse } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
+import { sanitizeDownloadFilenameBase } from '@/lib/fileNames';
 import type { ExportTranscriptSegment } from './types';
 import { exportMarkdown } from './markdown';
 import { exportToSrt } from './srt';
@@ -14,6 +15,7 @@ import { exportPdf } from './pdf';
 
 /** 用户可选择的内容类型 */
 export type ContentType = 'transcript' | 'summary' | 'timedSummary' | 'recording';
+type TextContentType = Exclude<ContentType, 'recording'>;
 
 /** 支持的导出格式 */
 export type ExportFileFormat = 'docx' | 'pdf' | 'md' | 'txt' | 'srt' | 'json';
@@ -46,6 +48,15 @@ interface GeneratedFile {
   blob: Blob;
 }
 
+export interface ExportPlan {
+  textContents: TextContentType[];
+  includeRecording: boolean;
+  textDownloadFileCount: number;
+  downloadFileCount: number;
+  usesPrintDialog: boolean;
+  willZip: boolean;
+}
+
 /** 判断所选内容是否需要文本内容（排除纯录音场景） */
 export function hasTextContent(contents: ContentType[]): boolean {
   return contents.some((c) => c !== 'recording');
@@ -63,6 +74,45 @@ export function isFormatAvailable(format: ExportFileFormat, contents: ContentTyp
 /** 文本内容数量（用于判断是否需要 single/separate 选择） */
 export function textContentCount(contents: ContentType[]): number {
   return contents.filter((c) => c !== 'recording').length;
+}
+
+function getTextContents(contents: ContentType[]): TextContentType[] {
+  return contents.filter((content): content is TextContentType => content !== 'recording');
+}
+
+export function buildExportPlan(
+  contents: ContentType[],
+  format: ExportFileFormat,
+  documentMode: DocumentMode,
+): ExportPlan {
+  const textContents = getTextContents(contents);
+  const includeRecording = contents.includes('recording');
+
+  let textDownloadFileCount = 0;
+  let usesPrintDialog = false;
+
+  if (textContents.length > 0) {
+    if (format === 'pdf') {
+      usesPrintDialog = true;
+    } else if (documentMode === 'single' || textContents.length === 1) {
+      textDownloadFileCount = 1;
+    } else if (format === 'srt') {
+      textDownloadFileCount = textContents.includes('transcript') ? 1 : 0;
+    } else {
+      textDownloadFileCount = textContents.length;
+    }
+  }
+
+  const downloadFileCount = textDownloadFileCount + (includeRecording ? 1 : 0);
+
+  return {
+    textContents,
+    includeRecording,
+    textDownloadFileCount,
+    downloadFileCount,
+    usesPrintDialog,
+    willZip: !usesPrintDialog && downloadFileCount >= 2,
+  };
 }
 
 // ─── Markdown 生成 ───
@@ -114,9 +164,29 @@ function generateSummaryMd(payload: ExportPayload): string {
 
   const overallSummaries = payload.summaries.filter((s) => !s.timeRange);
   for (const summary of overallSummaries) {
+    if (summary.summary) {
+      lines.push(summary.summary);
+      lines.push('');
+    }
     if (summary.keyPoints?.length) {
       lines.push('## 要点');
       for (const p of summary.keyPoints) lines.push(`- ${p}`);
+      lines.push('');
+    }
+    if (summary.definitions && Object.keys(summary.definitions).length > 0) {
+      lines.push('## 术语');
+      lines.push('| 术语 | 定义 |');
+      lines.push('|------|------|');
+      for (const [term, definition] of Object.entries(summary.definitions)) {
+        lines.push(`| ${term.replace(/\|/g, '\\|')} | ${definition.replace(/\|/g, '\\|')} |`);
+      }
+      lines.push('');
+    }
+    if (summary.suggestedQuestions?.length) {
+      lines.push('## 复习问题');
+      summary.suggestedQuestions.forEach((question, index) => {
+        lines.push(`${index + 1}. ${question}`);
+      });
       lines.push('');
     }
   }
@@ -171,9 +241,26 @@ function generateSummaryTxt(payload: ExportPayload): string {
 
   const overallSummaries = payload.summaries.filter((s) => !s.timeRange);
   for (const summary of overallSummaries) {
+    if (summary.summary) {
+      lines.push(summary.summary, '');
+    }
     if (summary.keyPoints?.length) {
       lines.push('要点：');
       for (const p of summary.keyPoints) lines.push(`• ${p}`);
+      lines.push('');
+    }
+    if (summary.definitions && Object.keys(summary.definitions).length > 0) {
+      lines.push('术语：');
+      for (const [term, definition] of Object.entries(summary.definitions)) {
+        lines.push(`${term}: ${definition}`);
+      }
+      lines.push('');
+    }
+    if (summary.suggestedQuestions?.length) {
+      lines.push('复习问题：');
+      summary.suggestedQuestions.forEach((question, index) => {
+        lines.push(`${index + 1}. ${question}`);
+      });
       lines.push('');
     }
   }
@@ -204,7 +291,7 @@ async function generateSingleFile(
   contents: ContentType[],
   payload: ExportPayload,
 ): Promise<GeneratedFile> {
-  const baseName = payload.title || 'lecture';
+  const baseName = sanitizeDownloadFilenameBase(payload.title, 'lecture');
   const includeTranscript = contents.includes('transcript');
   const includeSummary = contents.includes('summary');
   const includeTimedSummary = contents.includes('timedSummary');
@@ -275,6 +362,7 @@ async function generateSingleFile(
         includeSummary || includeTimedSummary ? payload.summaries : [],
         payload.sourceLang,
         payload.targetLang,
+        includeSummary ? payload.report : null,
       );
       return {
         name: `${baseName}.json`,
@@ -292,7 +380,7 @@ async function generateSeparateFiles(
   payload: ExportPayload,
 ): Promise<GeneratedFile[]> {
   const files: GeneratedFile[] = [];
-  const baseName = payload.title || 'lecture';
+  const baseName = sanitizeDownloadFilenameBase(payload.title, 'lecture');
   const includeTranscript = contents.includes('transcript');
   const includeSummary = contents.includes('summary');
   const includeTimedSummary = contents.includes('timedSummary');
@@ -406,20 +494,47 @@ async function generateSeparateFiles(
 
     case 'json': {
       if (includeTranscript) {
-        const json = exportJson(payload.title + ' - 转录', payload.segments, payload.translations, [], payload.sourceLang, payload.targetLang);
+        const json = exportJson(
+          `${payload.title} - 转录`,
+          payload.segments,
+          payload.translations,
+          [],
+          payload.sourceLang,
+          payload.targetLang,
+        );
         files.push({
           name: `${baseName}_转录.json`,
           blob: new Blob([json], { type: 'application/json; charset=utf-8' }),
         });
       }
-      if (includeSummary || includeTimedSummary) {
-        const summariesToExport = [
-          ...(includeSummary ? payload.summaries.filter((s) => !s.timeRange) : []),
-          ...(includeTimedSummary ? payload.summaries.filter((s) => s.timeRange) : []),
-        ];
-        const json = exportJson(payload.title + ' - 总结', [], {}, summariesToExport, payload.sourceLang, payload.targetLang);
+      if (includeSummary) {
+        const overallSummaries = payload.summaries.filter((s) => !s.timeRange);
+        const json = exportJson(
+          `${payload.title} - 总结`,
+          [],
+          {},
+          overallSummaries,
+          payload.sourceLang,
+          payload.targetLang,
+          payload.report,
+        );
         files.push({
           name: `${baseName}_总结.json`,
+          blob: new Blob([json], { type: 'application/json; charset=utf-8' }),
+        });
+      }
+      if (includeTimedSummary) {
+        const timedSummaries = payload.summaries.filter((s) => s.timeRange);
+        const json = exportJson(
+          `${payload.title} - 分时总结`,
+          [],
+          {},
+          timedSummaries,
+          payload.sourceLang,
+          payload.targetLang,
+        );
+        files.push({
+          name: `${baseName}_分时总结.json`,
           blob: new Blob([json], { type: 'application/json; charset=utf-8' }),
         });
       }
@@ -450,58 +565,79 @@ async function bundleAsZip(files: GeneratedFile[], zipName: string): Promise<voi
   triggerDownload(zipBlob, zipName);
 }
 
+async function resolveRecordingBlob(
+  includeRecording: boolean,
+  fetchRecording?: () => Promise<Blob | null>,
+): Promise<Blob | null> {
+  if (!includeRecording) {
+    return null;
+  }
+
+  if (!fetchRecording) {
+    throw new Error('Missing recording fetcher');
+  }
+
+  const recordingBlob = await fetchRecording();
+  if (!recordingBlob || recordingBlob.size === 0) {
+    throw new Error('Recording download failed');
+  }
+
+  return recordingBlob;
+}
+
 // ─── 主导出函数 ───
 
 export async function executeExport(options: ExportOptions): Promise<void> {
   const { contents, format, documentMode, payload, fetchRecording } = options;
-
-  const textContents = contents.filter((c) => c !== 'recording');
-  const includeRecording = contents.includes('recording');
+  const plan = buildExportPlan(contents, format, documentMode);
   const allFiles: GeneratedFile[] = [];
+  const safeBaseName = sanitizeDownloadFilenameBase(payload.title, 'lecture');
+  const recordingBlob = await resolveRecordingBlob(plan.includeRecording, fetchRecording);
 
   // 1. 生成文本文件
-  if (textContents.length > 0) {
-    if (format === 'pdf') {
+  if (plan.textContents.length > 0) {
+    if (plan.usesPrintDialog) {
       // PDF 通过打印窗口处理，不生成 blob 文件
-      if (documentMode === 'single' || textContents.length === 1) {
-        await generateSingleFile(format, textContents, payload);
+      if (documentMode === 'single' || plan.textContents.length === 1) {
+        await generateSingleFile(format, plan.textContents, payload);
       } else {
-        await generateSeparateFiles(format, textContents, payload);
+        await generateSeparateFiles(format, plan.textContents, payload);
       }
-      // 如果只有文本（无录音），PDF 已处理完成
-      if (!includeRecording) return;
     } else {
-      if (documentMode === 'single' || textContents.length === 1) {
-        const file = await generateSingleFile(format, textContents, payload);
+      if (documentMode === 'single' || plan.textContents.length === 1) {
+        const file = await generateSingleFile(format, plan.textContents, payload);
         if (file.name) allFiles.push(file);
       } else {
-        const files = await generateSeparateFiles(format, textContents, payload);
+        const files = await generateSeparateFiles(format, plan.textContents, payload);
         allFiles.push(...files);
       }
     }
   }
 
   // 2. 获取录音文件
-  if (includeRecording && fetchRecording) {
-    const recordingBlob = await fetchRecording();
-    if (recordingBlob) {
-      const ext = recordingBlob.type.includes('webm') ? 'webm'
-        : recordingBlob.type.includes('mp4') ? 'mp4'
-        : recordingBlob.type.includes('ogg') ? 'ogg'
-        : 'webm';
-      allFiles.push({
-        name: `${payload.title || 'lecture'}_录音.${ext}`,
-        blob: recordingBlob,
-      });
-    }
+  if (recordingBlob) {
+    const ext = recordingBlob.type.includes('webm') ? 'webm'
+      : recordingBlob.type.includes('mp4') ? 'mp4'
+      : recordingBlob.type.includes('ogg') ? 'ogg'
+      : 'webm';
+    allFiles.push({
+      name: `${safeBaseName}_录音.${ext}`,
+      blob: recordingBlob,
+    });
   }
 
   // 3. 下载
-  if (allFiles.length === 0) return;
+  if (plan.usesPrintDialog && allFiles.length === 0) {
+    return;
+  }
 
-  if (allFiles.length === 1) {
+  if (allFiles.length === 0) {
+    throw new Error('No export files generated');
+  }
+
+  if (!plan.willZip && allFiles.length === 1) {
     triggerDownload(allFiles[0].blob, allFiles[0].name);
   } else {
-    await bundleAsZip(allFiles, `${payload.title || 'lecture'}_导出.zip`);
+    await bundleAsZip(allFiles, `${safeBaseName}_导出.zip`);
   }
 }

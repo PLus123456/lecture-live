@@ -6,7 +6,7 @@ import { getSiteSettings } from '@/lib/siteSettings';
 import { sanitizePath } from '@/lib/security';
 
 const STORAGE_CATEGORIES = ['recordings', 'transcripts', 'summaries', 'reports'] as const;
-const DEFAULT_CLOUDREVE_OAUTH_SCOPE = 'offline_access Files.Read Files.Write';
+const DEFAULT_CLOUDREVE_OAUTH_SCOPE = 'openid offline_access Files.Read Files.Write';
 
 export type StorageCategory = (typeof STORAGE_CATEGORIES)[number];
 

@@ -94,10 +94,12 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
           ? { providerOverride: selection.providerName }
           : {}),
       thinkingDepth: finalDepth,
+      detailed: true,
     });
 
     return NextResponse.json({
-      reply: result,
+      reply: result.text,
+      thinking: result.thinking ?? null,
       model:
         selection.providerConfig?.displayName ||
         selection.providerName ||

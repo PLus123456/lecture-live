@@ -54,6 +54,9 @@ export async function GET(
   }
 
   return NextResponse.json({
+    title: session.title,
+    sourceLang: session.sourceLang,
+    targetLang: session.targetLang,
     segments,
     translations,
     summaries,

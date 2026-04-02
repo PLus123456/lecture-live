@@ -89,7 +89,15 @@ export async function POST(
       contentType = 'text/srt; charset=utf-8';
       break;
     case 'json':
-      content = exportJson(session.title, segments, translations, summaries, sourceLang, targetLang);
+      content = exportJson(
+        session.title,
+        segments,
+        translations,
+        summaries,
+        sourceLang,
+        targetLang,
+        report
+      );
       contentType = 'application/json; charset=utf-8';
       break;
     case 'txt':

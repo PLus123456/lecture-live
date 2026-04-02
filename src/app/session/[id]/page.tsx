@@ -11,6 +11,7 @@ import MobileSessionLayout from '@/components/mobile/MobileSessionLayout';
 import LiveShareBadge from '@/components/session/LiveShareBadge';
 import { useI18n } from '@/lib/i18n';
 import { mergeSessionTerms } from '@/lib/keywords/sessionTerms';
+import { summaryBlocksToResponses } from '@/lib/summary';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useAuthStore } from '@/stores/authStore';
@@ -396,6 +397,8 @@ export default function ActiveSessionPage() {
   const [exportOpen, setExportOpen] = useState(false);
   const pip = usePipReferenceTool();
   const [sessionTitle, setSessionTitle] = useState('New Lecture Session');
+  const [sessionSourceLang, setSessionSourceLang] = useState('en');
+  const [sessionTargetLang, setSessionTargetLang] = useState('zh');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editingTitle, setEditingTitle] = useState('');
   const titleInputRef = useRef<HTMLInputElement>(null);
@@ -522,6 +525,12 @@ export default function ActiveSessionPage() {
           return;
         }
         if (data.title) setSessionTitle(data.title);
+        if (typeof data.sourceLang === 'string' && data.sourceLang) {
+          setSessionSourceLang(data.sourceLang);
+        }
+        if (typeof data.targetLang === 'string' && data.targetLang) {
+          setSessionTargetLang(data.targetLang);
+        }
         setBackendStatus(data.status ?? null);
         setSessionChecked(true);
       })
@@ -1403,6 +1412,12 @@ export default function ActiveSessionPage() {
           isOpen={exportOpen}
           onClose={() => setExportOpen(false)}
           sessionTitle={sessionTitle}
+          sessionId={sessionId}
+          sourceLang={sessionSourceLang}
+          targetLang={sessionTargetLang}
+          segments={segments}
+          translations={translations}
+          summaries={summaryBlocksToResponses(summaryBlocks)}
         />
         <SessionFinalizingOverlay steps={finalizingSteps} visible={isFinalizing} />
 
@@ -1853,7 +1868,17 @@ export default function ActiveSessionPage() {
       </main>
 
       <SettingsDrawer isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} onSwitchMic={switchMicrophone} />
-      <ExportModal isOpen={exportOpen} onClose={() => setExportOpen(false)} sessionTitle={sessionTitle} />
+      <ExportModal
+        isOpen={exportOpen}
+        onClose={() => setExportOpen(false)}
+        sessionTitle={sessionTitle}
+        sessionId={sessionId}
+        sourceLang={sessionSourceLang}
+        targetLang={sessionTargetLang}
+        segments={segments}
+        translations={translations}
+        summaries={summaryBlocksToResponses(summaryBlocks)}
+      />
 
       {/* v2.1: Finalization overlay */}
       <SessionFinalizingOverlay steps={finalizingSteps} visible={isFinalizing} />

@@ -35,6 +35,7 @@
     "@prisma/client": "^5.22.0",
     "@soniox/client": "^1.0.2",
     "bcryptjs": "^2.4.3",
+    "docx": "^9.6.1",
     "dompurify": "^3.3.3",
     "fix-webm-duration": "^1.0.6",
     "ioredis": "^5.10.1",

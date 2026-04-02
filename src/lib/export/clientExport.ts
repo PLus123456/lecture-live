@@ -6,7 +6,7 @@ import JSZip from 'jszip';
 import type { SummarizeResponse } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
 import type { ExportTranscriptSegment } from './types';
-import { exportMarkdown, exportToMarkdown } from './markdown';
+import { exportMarkdown } from './markdown';
 import { exportToSrt } from './srt';
 import { exportJson } from './json';
 import { generateDocx } from './docx';

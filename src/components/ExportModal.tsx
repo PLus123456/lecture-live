@@ -9,7 +9,6 @@ import {
   Download,
   Loader2,
   FileType,
-  FileAudio,
   Clock,
   BookOpen,
   Mic,

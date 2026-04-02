@@ -12,11 +12,8 @@ import {
   TableCell,
   WidthType,
   BorderStyle,
-  AlignmentType,
   ShadingType,
   convertInchesToTwip,
-  ExternalHyperlink,
-  PageBreak,
   Packer,
 } from 'docx';
 import type { SummarizeResponse } from '@/types/summary';
@@ -426,7 +423,7 @@ export async function generateDocx(options: DocxExportOptions): Promise<Blob> {
         },
       },
     },
-    sections: [{ children: children as any[] }],
+    sections: [{ children: children as unknown[] }],
   });
 
   return await Packer.toBlob(doc);

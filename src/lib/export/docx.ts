@@ -4,6 +4,7 @@
  */
 import {
   Document,
+  FileChild,
   Paragraph,
   TextRun,
   HeadingLevel,
@@ -180,8 +181,8 @@ function createDefinitionTable(definitions: Record<string, string>): Table {
 export function buildTranscriptParagraphs(
   segments: ExportTranscriptSegment[],
   translations: Record<string, string>,
-): Paragraph[] {
-  const paragraphs: Paragraph[] = [heading2('转录文本')];
+): FileChild[] {
+  const paragraphs: FileChild[] = [heading2('转录文本')];
 
   for (const seg of segments) {
     // 说话人 + 时间戳
@@ -237,8 +238,8 @@ export function buildTranscriptParagraphs(
 export function buildSummaryParagraphs(
   summaries: SummarizeResponse[],
   report?: SessionReportData | null,
-): Paragraph[] {
-  const paragraphs: Paragraph[] = [heading2('内容总结')];
+): FileChild[] {
+  const paragraphs: FileChild[] = [heading2('内容总结')];
 
   // 会话报告
   if (report?.significance?.isWorthSummarizing && report.report) {
@@ -277,7 +278,7 @@ export function buildSummaryParagraphs(
 
     if (r.keyTerms && Object.keys(r.keyTerms).length > 0) {
       paragraphs.push(heading3('关键术语'));
-      paragraphs.push(createDefinitionTable(r.keyTerms) as unknown as Paragraph);
+      paragraphs.push(createDefinitionTable(r.keyTerms) as FileChild);
     }
   }
 
@@ -293,7 +294,7 @@ export function buildSummaryParagraphs(
       }
       if (summary.definitions && Object.keys(summary.definitions).length > 0) {
         paragraphs.push(heading3('术语'));
-        paragraphs.push(createDefinitionTable(summary.definitions) as unknown as Paragraph);
+        paragraphs.push(createDefinitionTable(summary.definitions) as FileChild);
       }
     }
   }
@@ -304,11 +305,11 @@ export function buildSummaryParagraphs(
 /** 生成分时总结的 docx 段落 */
 export function buildTimedSummaryParagraphs(
   summaries: SummarizeResponse[],
-): Paragraph[] {
+): FileChild[] {
   const timed = summaries.filter((s) => s.timeRange);
   if (timed.length === 0) return [];
 
-  const paragraphs: Paragraph[] = [heading2('分时总结')];
+  const paragraphs: FileChild[] = [heading2('分时总结')];
 
   for (const summary of timed) {
     paragraphs.push(new Paragraph({
@@ -335,7 +336,7 @@ export function buildTimedSummaryParagraphs(
     }
 
     if (summary.definitions && Object.keys(summary.definitions).length > 0) {
-      paragraphs.push(createDefinitionTable(summary.definitions) as unknown as Paragraph);
+      paragraphs.push(createDefinitionTable(summary.definitions) as FileChild);
     }
 
     if (summary.suggestedQuestions?.length) {
@@ -355,7 +356,7 @@ function buildTitleSection(
   date: string,
   sourceLang: string,
   targetLang: string,
-): Paragraph[] {
+): FileChild[] {
   return [
     heading1(title),
     metadataLine('日期', new Date(date).toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' })),
@@ -387,7 +388,7 @@ export async function generateDocx(options: DocxExportOptions): Promise<Blob> {
     report, includeTranscript = true, includeSummary = true, includeTimedSummary = true,
   } = options;
 
-  const children: Paragraph[] = [
+  const children: FileChild[] = [
     ...buildTitleSection(title, date, sourceLang, targetLang),
   ];
 
@@ -423,7 +424,7 @@ export async function generateDocx(options: DocxExportOptions): Promise<Blob> {
         },
       },
     },
-    sections: [{ children: children as unknown[] }],
+    sections: [{ children }],
   });
 
   return await Packer.toBlob(doc);

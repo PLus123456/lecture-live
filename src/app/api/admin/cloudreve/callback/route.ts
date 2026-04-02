@@ -69,6 +69,14 @@ export async function GET(req: Request) {
     const redirectUri =
       storedRedirectUri ?? `${fallbackOrigin}/api/admin/cloudreve/callback`;
 
+    console.log('[Cloudreve OAuth] callback 参数:', {
+      code_prefix: code.slice(0, 8) + '***',
+      redirectUri,
+      storedRedirectUri,
+      fallbackOrigin,
+      codeVerifier_len: codeVerifier.length,
+    });
+
     // 用 code 换取 token
     const tokens = await exchangeAuthorizationCode(code, redirectUri, codeVerifier);
 

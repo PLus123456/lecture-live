@@ -320,11 +320,15 @@ async function generateSingleFile(
     }
 
     case 'md': {
+      const filteredSummaries = payload.summaries.filter((s) => {
+        if (s.timeRange) return includeTimedSummary;
+        return includeSummary;
+      });
       const md = exportMarkdown(
         payload.title,
         includeTranscript ? payload.segments : [],
         includeTranscript ? payload.translations : {},
-        includeSummary || includeTimedSummary ? payload.summaries : [],
+        filteredSummaries,
         includeSummary ? payload.report : null,
         payload.sourceLang,
         payload.targetLang,
@@ -355,11 +359,15 @@ async function generateSingleFile(
     }
 
     case 'json': {
+      const filteredSummaries = payload.summaries.filter((s) => {
+        if (s.timeRange) return includeTimedSummary;
+        return includeSummary;
+      });
       const json = exportJson(
         payload.title,
         includeTranscript ? payload.segments : [],
         includeTranscript ? payload.translations : {},
-        includeSummary || includeTimedSummary ? payload.summaries : [],
+        filteredSummaries,
         payload.sourceLang,
         payload.targetLang,
         includeSummary ? payload.report : null,

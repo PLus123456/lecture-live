@@ -4,6 +4,7 @@ import { prisma } from '@/lib/prisma';
 import { assertOwnership } from '@/lib/security';
 import { loadSessionTranscriptBundle, loadSessionReport } from '@/lib/sessionPersistence';
 import { summaryBlockToResponse } from '@/lib/summary';
+import { toExportSegments } from '@/lib/export/types';
 import type { SummaryBlock, SummarizeResponse } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
 
@@ -34,7 +35,8 @@ export async function GET(
   }
 
   const persisted = await loadSessionTranscriptBundle(session);
-  const segments = Array.isArray(persisted?.segments) ? persisted.segments : [];
+  const rawSegments = Array.isArray(persisted?.segments) ? persisted.segments : [];
+  const segments = toExportSegments(rawSegments);
   const translations = (persisted?.translations ?? {}) as Record<string, string>;
   const rawSummaries = Array.isArray(persisted?.summaries) ? persisted.summaries : [];
 

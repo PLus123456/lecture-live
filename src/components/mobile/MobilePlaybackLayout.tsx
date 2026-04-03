@@ -23,6 +23,8 @@ import {
   CheckSquare,
   BookOpen,
   AlertCircle,
+  Loader2,
+  RefreshCw,
 } from 'lucide-react';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
 import ChatTab from '@/components/session/ChatTab';
@@ -65,6 +67,9 @@ interface MobilePlaybackLayoutProps {
   activeSegmentId?: string;
   // 导出
   onOpenExport: () => void;
+  // 标题重新生成
+  onRegenerateTitle?: () => void;
+  regeneratingTitle?: boolean;
 }
 
 const TAB_KEYS: MobilePlaybackTab[] = ['report', 'transcript', 'summary', 'chat', 'info'];
@@ -270,6 +275,8 @@ export default function MobilePlaybackLayout({
   onSegmentClick,
   activeSegmentId,
   onOpenExport,
+  onRegenerateTitle,
+  regeneratingTitle,
 }: MobilePlaybackLayoutProps) {
   const router = useRouter();
   const { t } = useI18n();
@@ -469,6 +476,20 @@ export default function MobilePlaybackLayout({
           {/* Info */}
           {activeTab === 'info' && (
             <div className="space-y-3">
+              {onRegenerateTitle && (
+                <button
+                  onClick={onRegenerateTitle}
+                  disabled={regeneratingTitle}
+                  className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg
+                             bg-rust-50 text-rust-600 text-xs font-medium
+                             active:bg-rust-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {regeneratingTitle
+                    ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    : <RefreshCw className="w-3.5 h-3.5" />}
+                  {t('playback.regenerateTitle')}
+                </button>
+              )}
               {[
                 { label: t('playback.infoSessionId'), value: session.id },
                 { label: t('playback.infoStatus'), value: session.status },

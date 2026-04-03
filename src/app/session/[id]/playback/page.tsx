@@ -330,9 +330,11 @@ export default function PlaybackPage() {
     if (!token || !sessionId) return;
     let disposed = false;
     const createdUrls: string[] = [];
+    const abortController = new AbortController();
 
     fetch(`/api/sessions/${sessionId}/audio`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: abortController.signal,
     })
       .then(async (res) => {
         if (!res.ok) throw new Error('Audio load failed');
@@ -417,6 +419,7 @@ export default function PlaybackPage() {
 
     return () => {
       disposed = true;
+      abortController.abort();
       createdUrls.forEach((url) => URL.revokeObjectURL(url));
       recordingBlobRef.current = null;
       setAudioSegments([]);

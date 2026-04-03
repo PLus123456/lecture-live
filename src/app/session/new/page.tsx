@@ -282,7 +282,7 @@ export default function NewSessionPage() {
   /* ---- Loading guard ---- */
   if (!user || !token) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-cream-50">
+      <div className="min-h-[100dvh] flex items-center justify-center bg-cream-50">
         <div className="text-charcoal-400 text-sm">{t('playback.redirectingToLogin')}</div>
       </div>
     );

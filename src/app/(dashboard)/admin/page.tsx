@@ -127,7 +127,7 @@ export default function AdminPage() {
 
   if (isMobile) {
     return (
-      <div className="min-h-screen bg-cream-50 pb-28">
+      <div className="min-h-[100dvh] bg-cream-50 pb-28">
         <header className="sticky top-0 z-20 border-b border-cream-200 bg-white/95 px-4 py-4 backdrop-blur-md">
           <div className="flex items-center gap-3">
             <button

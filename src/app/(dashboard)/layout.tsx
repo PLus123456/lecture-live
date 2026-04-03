@@ -23,7 +23,7 @@ export default function DashboardLayout({
 
   return (
     <AuthGuard>
-      <div className="min-h-screen bg-cream-50 dark:bg-charcoal-900">
+      <div className="min-h-[100dvh] bg-cream-50 dark:bg-charcoal-900">
         {!isMobile && !isAdmin && <Sidebar />}
         {isMobile && <MobileDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} />}
         <UserSettingsModal />

@@ -218,7 +218,7 @@ export default function HomePage() {
 
   return (
     <>
-      <div className="flex min-h-screen flex-col overflow-hidden">
+      <div className="flex min-h-[100dvh] flex-col overflow-hidden">
         {/* 顶部区域：问候 + 搜索 */}
         <div className={`flex-shrink-0 ${isMobile ? 'px-4 pt-5 pb-2' : 'px-8 lg:px-12 pt-8 lg:pt-10 pb-2'}`}>
           {/* 问候语 + New Session 按钮 */}

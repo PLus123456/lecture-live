@@ -133,6 +133,16 @@ export async function GET(
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  const rateLimited = await enforceRateLimit(req, {
+    scope: 'sessions:audio-download',
+    limit: 60,
+    windowMs: 10 * 60_000,
+    key: `user:${user.id}`,
+  });
+  if (rateLimited) {
+    return rateLimited;
+  }
+
   const session = await prisma.session.findUnique({
     where: { id: id },
   });

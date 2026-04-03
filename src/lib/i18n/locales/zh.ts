@@ -548,6 +548,7 @@ export default {
     exporting: '导出中…',
     loadingData: '正在加载当前会话的导出数据…',
     exportError: '导出失败，请重试',
+    recordingDownloadError: '录音下载失败，请稍后重试',
     popupBlocked: '浏览器拦截了弹窗，请允许本站弹窗后重试',
     pdfHint: 'PDF 将通过浏览器打印对话框生成，请选择「另存为 PDF」',
     srtHint: 'SRT 仅支持导出转录文本，可与录音一起下载',

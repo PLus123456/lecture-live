@@ -362,7 +362,7 @@ export default function SetupPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-cream-50">
+      <div className="min-h-[100dvh] flex items-center justify-center bg-cream-50">
         <div className="flex items-center gap-2 text-charcoal-400">
           <Loader2 className="w-5 h-5 animate-spin" />
           <span className="text-sm">正在检查设置状态…</span>
@@ -375,7 +375,7 @@ export default function SetupPage() {
     status?.steps?.[stepId as keyof SetupStatus['steps']] ?? false;
 
   return (
-    <div className="min-h-screen bg-cream-50 py-8 px-4">
+    <div className="min-h-[100dvh] bg-cream-50 py-8 px-4">
       <div className="max-w-2xl mx-auto">
         {/* Header */}
         <div className="text-center mb-8">

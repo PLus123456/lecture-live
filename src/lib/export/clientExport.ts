@@ -101,12 +101,9 @@ export function buildExportPlan(
   const includeRecording = normalizedContents.includes('recording');
 
   let textDownloadFileCount = 0;
-  let usesPrintDialog = false;
 
   if (textContents.length > 0) {
-    if (format === 'pdf') {
-      usesPrintDialog = true;
-    } else if (documentMode === 'single' || textContents.length === 1) {
+    if (documentMode === 'single' || textContents.length === 1) {
       textDownloadFileCount = 1;
     } else if (format === 'srt') {
       textDownloadFileCount = textContents.includes('transcript') ? 1 : 0;
@@ -122,8 +119,8 @@ export function buildExportPlan(
     includeRecording,
     textDownloadFileCount,
     downloadFileCount,
-    usesPrintDialog,
-    willZip: !usesPrintDialog && downloadFileCount >= 2,
+    usesPrintDialog: false,
+    willZip: downloadFileCount >= 2,
   };
 }
 
@@ -392,15 +389,13 @@ async function generateSingleFile(
     }
 
     case 'pdf': {
-      // PDF 使用打印方式，不返回 blob —— 特殊处理
-      exportPdf({
+      const blob = await exportPdf({
         ...singleFilePayload,
         includeTranscript,
         includeSummary,
         includeTimedSummary,
       });
-      // 返回空 blob 表示已通过打印处理
-      return { name: '', blob: new Blob() };
+      return { name: `${baseName}.pdf`, blob };
     }
 
     case 'md': {
@@ -514,14 +509,40 @@ async function generateSeparateFiles(
     }
 
     case 'pdf': {
-      // PDF 打印模式不支持多文件，回退到合并模式
-      exportPdf({
-        ...payload,
-        includeTranscript,
-        includeSummary,
-        includeTimedSummary,
-      });
-      return []; // 空数组表示已通过打印处理
+      if (includeTranscript) {
+        const blob = await exportPdf({
+          ...payload,
+          includeTranscript: true,
+          includeSummary: false,
+          includeTimedSummary: false,
+        });
+        files.push({ name: `${baseName}_转录.pdf`, blob });
+      }
+      if (includeSummary) {
+        const overallSummaries = payload.summaries.filter((s) => !s.timeRange);
+        const blob = await exportPdf({
+          ...payload,
+          segments: [],
+          summaries: overallSummaries,
+          includeTranscript: false,
+          includeSummary: true,
+          includeTimedSummary: false,
+        });
+        files.push({ name: `${baseName}_总结.pdf`, blob });
+      }
+      if (includeTimedSummary) {
+        const timedSummaries = payload.summaries.filter((s) => s.timeRange);
+        const blob = await exportPdf({
+          ...payload,
+          segments: [],
+          summaries: timedSummaries,
+          includeTranscript: false,
+          includeSummary: false,
+          includeTimedSummary: true,
+        });
+        files.push({ name: `${baseName}_分时总结.pdf`, blob });
+      }
+      break;
     }
 
     case 'md': {
@@ -699,21 +720,12 @@ export async function executeExport(options: ExportOptions): Promise<void> {
   // 并行执行：文本文件生成 + 录音下载
   const textFilesPromise = (async () => {
     if (plan.textContents.length === 0) return;
-    if (plan.usesPrintDialog) {
-      // PDF 通过打印窗口处理，不生成 blob 文件
-      if (documentMode === 'single' || plan.textContents.length === 1) {
-        await generateSingleFile(format, plan.textContents, payload);
-      } else {
-        await generateSeparateFiles(format, plan.textContents, payload);
-      }
+    if (documentMode === 'single' || plan.textContents.length === 1) {
+      const file = await generateSingleFile(format, plan.textContents, payload);
+      if (file.name) allFiles.push(file);
     } else {
-      if (documentMode === 'single' || plan.textContents.length === 1) {
-        const file = await generateSingleFile(format, plan.textContents, payload);
-        if (file.name) allFiles.push(file);
-      } else {
-        const files = await generateSeparateFiles(format, plan.textContents, payload);
-        allFiles.push(...files);
-      }
+      const files = await generateSeparateFiles(format, plan.textContents, payload);
+      allFiles.push(...files);
     }
   })();
 
@@ -735,10 +747,6 @@ export async function executeExport(options: ExportOptions): Promise<void> {
   }
 
   // 3. 下载
-  if (plan.usesPrintDialog && allFiles.length === 0) {
-    return;
-  }
-
   if (allFiles.length === 0) {
     throw new Error('No export files generated');
   }

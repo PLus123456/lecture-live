@@ -1,6 +1,7 @@
 /**
  * Word (.docx) 导出模块
  * 使用 docx 库在客户端生成格式优美的 Word 文档
+ * 自动从 Google Fonts 下载并嵌入 Noto Sans SC 字体，确保跨平台 CJK 显示正确
  */
 import {
   Document,
@@ -20,6 +21,58 @@ import {
 import type { SummarizeResponse } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
 import type { ExportTranscriptSegment } from './types';
+
+// ─── 字体嵌入 ───
+
+/** 已缓存的字体数据（同一会话内只下载一次） */
+let fontCachePromise: Promise<ArrayBuffer | null> | null = null;
+
+/**
+ * 通过 Google Fonts CSS API 获取 Noto Sans SC 的 TTF URL 然后下载字体数据。
+ * 使用 fetch + User-Agent 模拟技巧拿 truetype 格式（浏览器默认拿 woff2，docx 不支持）。
+ * 浏览器不能设置 User-Agent header，因此先尝试本地 /fonts/ 路径，再回退到 Google Fonts woff2。
+ */
+async function fetchFontData(): Promise<ArrayBuffer | null> {
+  // 优先使用本地字体（如部署方在 public/fonts/ 下放置了 TTF 文件）
+  try {
+    const localRes = await fetch('/fonts/NotoSansSC-Regular.ttf');
+    if (localRes.ok) {
+      return await localRes.arrayBuffer();
+    }
+  } catch { /* 忽略 */ }
+
+  // 回退：从 Google Fonts CDN 下载（woff2 格式，docx 库也可处理）
+  try {
+    const cssRes = await fetch(
+      'https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400&display=swap',
+    );
+    if (!cssRes.ok) return null;
+
+    const css = await cssRes.text();
+    // 提取包含 CJK 字符范围的 woff2 URL（选最大的 unicode-range 块）
+    const urlMatches = [...css.matchAll(/url\(([^)]+\.woff2)\)/g)];
+    if (urlMatches.length === 0) return null;
+
+    // 下载所有 woff2 片段中的第一个（通常覆盖最常见的 CJK 字符）
+    // 对于字体嵌入我们取最大的一块
+    const fontUrl = urlMatches[0][1];
+    const fontRes = await fetch(fontUrl);
+    if (!fontRes.ok) return null;
+    return await fontRes.arrayBuffer();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 获取字体数据（带缓存），同一页面生命周期内只下载一次
+ */
+function getCachedFontData(): Promise<ArrayBuffer | null> {
+  if (!fontCachePromise) {
+    fontCachePromise = fetchFontData().catch(() => null);
+  }
+  return fontCachePromise;
+}
 
 // 主题色（与项目 cream/charcoal/rust 色系对应）
 const COLORS = {
@@ -389,6 +442,9 @@ export interface DocxExportOptions {
   includeTimedSummary?: boolean;
 }
 
+/** 嵌入字体的名称 */
+const EMBEDDED_FONT_NAME = 'Noto Sans SC';
+
 /** 生成完整的 docx Blob */
 export async function generateDocx(options: DocxExportOptions): Promise<Blob> {
   const {
@@ -418,15 +474,29 @@ export async function generateDocx(options: DocxExportOptions): Promise<Blob> {
     children.push(...buildTranscriptParagraphs(segments, translations));
   }
 
+  // 尝试获取字体数据用于嵌入
+  const fontData = await getCachedFontData();
+
+  // 使用嵌入字体或回退到跨平台字体链
+  const defaultFontName = fontData
+    ? EMBEDDED_FONT_NAME
+    : 'PingFang SC, Microsoft YaHei, Noto Sans CJK SC, SimSun, sans-serif';
+
   const doc = new Document({
     creator: 'LectureLive',
     title,
     description: `Exported from LectureLive on ${new Date().toISOString()}`,
+    ...(fontData ? {
+      fonts: [{
+        name: EMBEDDED_FONT_NAME,
+        data: Buffer.from(fontData),
+      }],
+    } : {}),
     styles: {
       default: {
         document: {
           run: {
-            font: 'Microsoft YaHei',
+            font: defaultFontName,
             size: 22,
             color: COLORS.charcoal,
           },

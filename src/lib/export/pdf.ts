@@ -301,15 +301,7 @@ export function exportPdf(options: PdfExportOptions): void {
 
   const printWindow = window.open('', '_blank');
   if (!printWindow) {
-    // 弹窗被阻止，回退到 blob 下载 HTML
-    const blob = new Blob([fullHtml], { type: 'text/html; charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${sanitizeDownloadFilenameBase(title, 'lecture')}.html`;
-    a.click();
-    URL.revokeObjectURL(url);
-    return;
+    throw new Error('POPUP_BLOCKED');
   }
 
   printWindow.document.write(fullHtml);

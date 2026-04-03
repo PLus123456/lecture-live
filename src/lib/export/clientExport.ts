@@ -397,9 +397,11 @@ async function generateSeparateFiles(
         files.push({ name: `${baseName}_转录.docx`, blob });
       }
       if (includeSummary) {
+        const overallSummaries = payload.summaries.filter((s) => !s.timeRange);
         const blob = await generateDocx({
           ...payload,
           segments: [],
+          summaries: overallSummaries,
           includeTranscript: false,
           includeSummary: true,
           includeTimedSummary: false,
@@ -407,9 +409,11 @@ async function generateSeparateFiles(
         files.push({ name: `${baseName}_总结.docx`, blob });
       }
       if (includeTimedSummary) {
+        const timedSummaries = payload.summaries.filter((s) => s.timeRange);
         const blob = await generateDocx({
           ...payload,
           segments: [],
+          summaries: timedSummaries,
           includeTranscript: false,
           includeSummary: false,
           includeTimedSummary: true,
@@ -553,7 +557,7 @@ function triggerDownload(blob: Blob, filename: string): void {
   a.href = url;
   a.download = filename;
   a.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 async function bundleAsZip(files: GeneratedFile[], zipName: string): Promise<void> {

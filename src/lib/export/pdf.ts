@@ -308,10 +308,11 @@ export function exportPdf(options: PdfExportOptions): void {
   printWindow.document.write(fullHtml);
   printWindow.document.close();
 
-  // 等待渲染完成后自动打印
-  printWindow.onload = () => {
-    setTimeout(() => {
-      printWindow.print();
-    }, 300);
-  };
+  // 兜底：无论 onload 是否已触发，都尝试打印
+  const tryPrint = () => setTimeout(() => printWindow.print(), 300);
+  if (printWindow.document.readyState === 'complete') {
+    tryPrint();
+  } else {
+    printWindow.onload = tryPrint;
+  }
 }

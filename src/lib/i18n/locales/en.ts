@@ -495,6 +495,9 @@ export default {
     sessionNotFound: 'Session not found',
     loadFailed: 'Failed to load session',
     export: 'Export',
+    regenerateTitle: 'Regenerate Title',
+    regenerateTitleConfirm: 'AI will regenerate the title based on transcript. Proceed?',
+    regenerateTitleFail: 'Title generation failed, please try again later',
     transcript: 'Transcript',
     transcriptSegments: '{count} segments',
     transcriptEmpty: 'Transcript data will appear here once loaded from storage.',
@@ -872,6 +875,7 @@ export default {
     // Job types
     typeKeywordExtraction: 'Keyword Extraction',
     typeReportGeneration: 'Report Generation',
+    typeTitleGeneration: 'Title Generation',
     typeQuotaReset: 'Quota Reset',
     typeStaleSessionReclaim: 'Session Reclaim',
     typeReconciliation: 'Reconciliation',

@@ -482,6 +482,9 @@ export default {
     sessionNotFound: '未找到会话',
     loadFailed: '加载会话失败',
     export: '导出',
+    regenerateTitle: '重新生成标题',
+    regenerateTitleConfirm: 'AI 将根据转录内容重新生成标题，确定？',
+    regenerateTitleFail: '标题生成失败，请稍后重试',
     transcript: '转录',
     transcriptSegments: '{count} 段',
     transcriptEmpty: '转录内容会在从存储加载完成后显示在这里。',
@@ -859,6 +862,7 @@ export default {
     // 任务类型
     typeKeywordExtraction: '关键词提取',
     typeReportGeneration: '报告生成',
+    typeTitleGeneration: '标题生成',
     typeQuotaReset: '配额重置',
     typeStaleSessionReclaim: '会话回收',
     typeReconciliation: '对账',

@@ -4,6 +4,7 @@ import { enforceRateLimit } from '@/lib/rateLimit';
 import { exportToMarkdown } from '@/lib/export/markdown';
 import { exportToSrt } from '@/lib/export/srt';
 import { exportToJson } from '@/lib/export/json';
+import { exportToTxt } from '@/lib/export/txt';
 import { toExportSegments } from '@/lib/export/types';
 import {
   parseExportFormat,
@@ -91,10 +92,7 @@ export async function POST(req: Request) {
         break;
 
       case 'txt':
-        content = segments.map((seg) => {
-          const translation = body.translations[seg.id];
-          return `[${seg.speaker}] ${seg.timestamp}\n${seg.text}${translation ? `\n${translation}` : ''}`;
-        }).join('\n\n');
+        content = exportToTxt(title, segments, body.translations, body.summaries);
         filename = `${safeFilenameBase}.txt`;
         mimeType = 'text/plain';
         break;

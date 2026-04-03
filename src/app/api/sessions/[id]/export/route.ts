@@ -6,6 +6,7 @@ import { assertOwnership, sanitizeHeaderFilename } from '@/lib/security';
 import { exportMarkdown } from '@/lib/export/markdown';
 import { exportToSrt } from '@/lib/export/srt';
 import { exportJson } from '@/lib/export/json';
+import { exportToTxt } from '@/lib/export/txt';
 import { normalizeExportFormat } from '@/lib/sessionApi';
 import { loadSessionTranscriptBundle, loadSessionReport } from '@/lib/sessionPersistence';
 import { summaryBlockToResponse } from '@/lib/summary';
@@ -84,7 +85,7 @@ export async function POST(
 
   switch (format) {
     case 'markdown':
-      content = exportMarkdown(session.title, segments, translations, summaries, report, sourceLang, targetLang);
+      content = exportMarkdown(session.title, segments, translations, summaries, report, sourceLang, targetLang, undefined, session.createdAt.toISOString());
       contentType = 'text/markdown; charset=utf-8';
       break;
     case 'srt':
@@ -99,19 +100,13 @@ export async function POST(
         summaries,
         sourceLang,
         targetLang,
-        report
+        report,
+        session.createdAt.toISOString(),
       );
       contentType = 'application/json; charset=utf-8';
       break;
     case 'txt':
-      content = segments
-        .map((segment) => {
-          const translation = translations[segment.id];
-          return `[${segment.speaker}] ${segment.timestamp}\n${segment.text}${
-            translation ? `\n${translation}` : ''
-          }`;
-        })
-        .join('\n\n');
+      content = exportToTxt(session.title, segments, translations, summaries, report);
       contentType = 'text/plain; charset=utf-8';
       break;
     default:

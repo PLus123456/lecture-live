@@ -57,6 +57,7 @@ export async function GET(
 
   return NextResponse.json({
     title: session.title,
+    date: session.createdAt.toISOString(),
     sourceLang: session.sourceLang,
     targetLang: session.targetLang,
     segments,

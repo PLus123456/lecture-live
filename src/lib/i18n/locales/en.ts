@@ -563,6 +563,7 @@ export default {
     exportError: 'Export failed, please try again',
     popupBlocked: 'Browser blocked the popup. Please allow popups for this site and try again.',
     pdfHint: 'PDF will be generated via browser print dialog — select "Save as PDF"',
+    srtHint: 'SRT only exports transcript text, and can still be downloaded with the recording',
   },
 
   // 管理面板

@@ -14,7 +14,7 @@ export function sanitizeFileNamePart(input: string): string {
   safe = parts[parts.length - 1] ?? '';
 
   safe = safe.replace(/\.\./g, '').replace(/[/\\]/g, '');
-  safe = safe.replace(/[^\w._-]/g, '_');
+  safe = safe.replace(/[^\p{L}\p{N}\p{M}._-]/gu, '_');
 
   if (!safe || safe === '.' || safe === '..') {
     throw new Error('Invalid path after sanitization');

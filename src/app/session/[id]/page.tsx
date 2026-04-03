@@ -399,6 +399,7 @@ export default function ActiveSessionPage() {
   const [sessionTitle, setSessionTitle] = useState('New Lecture Session');
   const [sessionSourceLang, setSessionSourceLang] = useState('en');
   const [sessionTargetLang, setSessionTargetLang] = useState('zh');
+  const [sessionMetaReady, setSessionMetaReady] = useState(false);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editingTitle, setEditingTitle] = useState('');
   const titleInputRef = useRef<HTMLInputElement>(null);
@@ -515,6 +516,7 @@ export default function ActiveSessionPage() {
 
   useEffect(() => {
     if (!token || !sessionId) return;
+    setSessionMetaReady(false);
     fetch(`/api/sessions/${sessionId}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
@@ -531,6 +533,7 @@ export default function ActiveSessionPage() {
         if (typeof data.targetLang === 'string' && data.targetLang) {
           setSessionTargetLang(data.targetLang);
         }
+        setSessionMetaReady(true);
         setBackendStatus(data.status ?? null);
         setSessionChecked(true);
       })
@@ -1411,10 +1414,10 @@ export default function ActiveSessionPage() {
         <ExportModal
           isOpen={exportOpen}
           onClose={() => setExportOpen(false)}
-          sessionTitle={sessionTitle}
+          sessionTitle={sessionMetaReady ? sessionTitle : ''}
           sessionId={sessionId}
-          sourceLang={sessionSourceLang}
-          targetLang={sessionTargetLang}
+          sourceLang={sessionMetaReady ? sessionSourceLang : undefined}
+          targetLang={sessionMetaReady ? sessionTargetLang : undefined}
           segments={segments}
           translations={translations}
           summaries={summaryBlocksToResponses(summaryBlocks)}
@@ -1871,10 +1874,10 @@ export default function ActiveSessionPage() {
       <ExportModal
         isOpen={exportOpen}
         onClose={() => setExportOpen(false)}
-        sessionTitle={sessionTitle}
+        sessionTitle={sessionMetaReady ? sessionTitle : ''}
         sessionId={sessionId}
-        sourceLang={sessionSourceLang}
-        targetLang={sessionTargetLang}
+        sourceLang={sessionMetaReady ? sessionSourceLang : undefined}
+        targetLang={sessionMetaReady ? sessionTargetLang : undefined}
         segments={segments}
         translations={translations}
         summaries={summaryBlocksToResponses(summaryBlocks)}

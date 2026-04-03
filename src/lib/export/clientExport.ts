@@ -76,6 +76,17 @@ export function textContentCount(contents: ContentType[]): number {
   return contents.filter((c) => c !== 'recording').length;
 }
 
+export function normalizeContentsForFormat(
+  contents: ContentType[],
+  format: ExportFileFormat,
+): ContentType[] {
+  if (format !== 'srt') {
+    return contents;
+  }
+
+  return contents.filter((content) => content === 'transcript' || content === 'recording');
+}
+
 function getTextContents(contents: ContentType[]): TextContentType[] {
   return contents.filter((content): content is TextContentType => content !== 'recording');
 }
@@ -85,8 +96,9 @@ export function buildExportPlan(
   format: ExportFileFormat,
   documentMode: DocumentMode,
 ): ExportPlan {
-  const textContents = getTextContents(contents);
-  const includeRecording = contents.includes('recording');
+  const normalizedContents = normalizeContentsForFormat(contents, format);
+  const textContents = getTextContents(normalizedContents);
+  const includeRecording = normalizedContents.includes('recording');
 
   let textDownloadFileCount = 0;
   let usesPrintDialog = false;
@@ -206,6 +218,15 @@ function generateTimedSummaryMd(payload: ExportPayload): string {
       for (const p of summary.keyPoints) lines.push(`- ${p}`);
       lines.push('');
     }
+    if (summary.definitions && Object.keys(summary.definitions).length > 0) {
+      lines.push('### 术语');
+      lines.push('| 术语 | 定义 |');
+      lines.push('|------|------|');
+      for (const [term, definition] of Object.entries(summary.definitions)) {
+        lines.push(`| ${term.replace(/\|/g, '\\|')} | ${definition.replace(/\|/g, '\\|')} |`);
+      }
+      lines.push('');
+    }
     if (summary.suggestedQuestions?.length) {
       lines.push('### 复习问题');
       summary.suggestedQuestions.forEach((q, i) => lines.push(`${i + 1}. ${q}`));
@@ -235,6 +256,23 @@ function generateSummaryTxt(payload: ExportPayload): string {
     for (const section of r.sections ?? []) {
       lines.push(section.title, '-'.repeat(20));
       for (const p of section.points ?? []) lines.push(`• ${p}`);
+      lines.push('');
+    }
+    if (r.conclusions?.length) {
+      lines.push('结论：');
+      for (const conclusion of r.conclusions) lines.push(`• ${conclusion}`);
+      lines.push('');
+    }
+    if (r.actionItems?.length) {
+      lines.push('待办事项：');
+      for (const actionItem of r.actionItems) lines.push(`□ ${actionItem}`);
+      lines.push('');
+    }
+    if (r.keyTerms && Object.keys(r.keyTerms).length > 0) {
+      lines.push('关键术语：');
+      for (const [term, definition] of Object.entries(r.keyTerms)) {
+        lines.push(`${term}: ${definition}`);
+      }
       lines.push('');
     }
   }
@@ -279,12 +317,52 @@ function generateTimedSummaryTxt(payload: ExportPayload): string {
     if (summary.keyPoints?.length) {
       for (const p of summary.keyPoints) lines.push(`• ${p}`);
     }
+    if (summary.definitions && Object.keys(summary.definitions).length > 0) {
+      lines.push('术语：');
+      for (const [term, definition] of Object.entries(summary.definitions)) {
+        lines.push(`${term}: ${definition}`);
+      }
+    }
+    if (summary.suggestedQuestions?.length) {
+      lines.push('复习问题：');
+      summary.suggestedQuestions.forEach((question, index) => {
+        lines.push(`${index + 1}. ${question}`);
+      });
+    }
     lines.push('');
   }
   return lines.join('\n');
 }
 
 // ─── 单一文件格式生成（合并模式） ───
+
+function splitSummariesByType(summaries: ExportPayload['summaries']) {
+  return {
+    overallSummaries: summaries.filter((summary) => !summary.timeRange),
+    timedSummaries: summaries.filter((summary) => summary.timeRange),
+  };
+}
+
+function buildSingleFilePayload(
+  payload: ExportPayload,
+  includeTranscript: boolean,
+  includeSummary: boolean,
+  includeTimedSummary: boolean,
+): ExportPayload {
+  const { overallSummaries, timedSummaries } = splitSummariesByType(payload.summaries);
+  const selectedSummaries = [
+    ...(includeSummary ? overallSummaries : []),
+    ...(includeTimedSummary ? timedSummaries : []),
+  ];
+
+  return {
+    ...payload,
+    segments: includeTranscript ? payload.segments : [],
+    translations: includeTranscript ? payload.translations : {},
+    summaries: selectedSummaries,
+    report: includeSummary ? payload.report : null,
+  };
+}
 
 async function generateSingleFile(
   format: ExportFileFormat,
@@ -295,11 +373,17 @@ async function generateSingleFile(
   const includeTranscript = contents.includes('transcript');
   const includeSummary = contents.includes('summary');
   const includeTimedSummary = contents.includes('timedSummary');
+  const singleFilePayload = buildSingleFilePayload(
+    payload,
+    includeTranscript,
+    includeSummary,
+    includeTimedSummary,
+  );
 
   switch (format) {
     case 'docx': {
       const blob = await generateDocx({
-        ...payload,
+        ...singleFilePayload,
         includeTranscript,
         includeSummary,
         includeTimedSummary,
@@ -310,7 +394,7 @@ async function generateSingleFile(
     case 'pdf': {
       // PDF 使用打印方式，不返回 blob —— 特殊处理
       exportPdf({
-        ...payload,
+        ...singleFilePayload,
         includeTranscript,
         includeSummary,
         includeTimedSummary,
@@ -320,18 +404,18 @@ async function generateSingleFile(
     }
 
     case 'md': {
-      const filteredSummaries = payload.summaries.filter((s) => {
-        if (s.timeRange) return includeTimedSummary;
-        return includeSummary;
-      });
       const md = exportMarkdown(
-        payload.title,
-        includeTranscript ? payload.segments : [],
-        includeTranscript ? payload.translations : {},
-        filteredSummaries,
-        includeSummary ? payload.report : null,
-        payload.sourceLang,
-        payload.targetLang,
+        singleFilePayload.title,
+        singleFilePayload.segments,
+        singleFilePayload.translations,
+        singleFilePayload.summaries,
+        singleFilePayload.report,
+        singleFilePayload.sourceLang,
+        singleFilePayload.targetLang,
+        {
+          includeTranscriptSection: includeTranscript,
+          includeSummarySection: singleFilePayload.summaries.length > 0,
+        },
       );
       return {
         name: `${baseName}.md`,
@@ -341,9 +425,9 @@ async function generateSingleFile(
 
     case 'txt': {
       const parts: string[] = [];
-      if (includeSummary) parts.push(generateSummaryTxt(payload));
-      if (includeTimedSummary) parts.push(generateTimedSummaryTxt(payload));
-      if (includeTranscript) parts.push(generateTranscriptTxt(payload));
+      if (includeSummary) parts.push(generateSummaryTxt(singleFilePayload));
+      if (includeTimedSummary) parts.push(generateTimedSummaryTxt(singleFilePayload));
+      if (includeTranscript) parts.push(generateTranscriptTxt(singleFilePayload));
       return {
         name: `${baseName}.txt`,
         blob: new Blob([parts.filter(Boolean).join('\n\n')], { type: 'text/plain; charset=utf-8' }),
@@ -351,7 +435,7 @@ async function generateSingleFile(
     }
 
     case 'srt': {
-      const srt = exportToSrt(payload.segments, payload.translations);
+      const srt = exportToSrt(singleFilePayload.segments, singleFilePayload.translations);
       return {
         name: `${baseName}.srt`,
         blob: new Blob([srt], { type: 'text/srt; charset=utf-8' }),
@@ -359,18 +443,14 @@ async function generateSingleFile(
     }
 
     case 'json': {
-      const filteredSummaries = payload.summaries.filter((s) => {
-        if (s.timeRange) return includeTimedSummary;
-        return includeSummary;
-      });
       const json = exportJson(
-        payload.title,
-        includeTranscript ? payload.segments : [],
-        includeTranscript ? payload.translations : {},
-        filteredSummaries,
-        payload.sourceLang,
-        payload.targetLang,
-        includeSummary ? payload.report : null,
+        singleFilePayload.title,
+        singleFilePayload.segments,
+        singleFilePayload.translations,
+        singleFilePayload.summaries,
+        singleFilePayload.sourceLang,
+        singleFilePayload.targetLang,
+        singleFilePayload.report,
       );
       return {
         name: `${baseName}.json`,
@@ -601,7 +681,8 @@ async function resolveRecordingBlob(
 
 export async function executeExport(options: ExportOptions): Promise<void> {
   const { contents, format, documentMode, payload, fetchRecording } = options;
-  const plan = buildExportPlan(contents, format, documentMode);
+  const normalizedContents = normalizeContentsForFormat(contents, format);
+  const plan = buildExportPlan(normalizedContents, format, documentMode);
   const allFiles: GeneratedFile[] = [];
   const safeBaseName = sanitizeDownloadFilenameBase(payload.title, 'lecture');
   const recordingBlob = await resolveRecordingBlob(plan.includeRecording, fetchRecording);

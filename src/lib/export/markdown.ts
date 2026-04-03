@@ -2,6 +2,11 @@ import type { SummarizeResponse } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
 import type { ExportTranscriptSegment } from './types';
 
+export interface MarkdownSectionOptions {
+  includeTranscriptSection?: boolean;
+  includeSummarySection?: boolean;
+}
+
 /** v2 simplified export interface */
 export function exportMarkdown(
   title: string,
@@ -10,7 +15,8 @@ export function exportMarkdown(
   summaries: unknown[],
   report?: SessionReportData | null,
   sourceLang = 'en',
-  targetLang = 'zh'
+  targetLang = 'zh',
+  options?: MarkdownSectionOptions,
 ): string {
   return exportToMarkdown(
     title,
@@ -20,7 +26,8 @@ export function exportMarkdown(
     segments,
     translations,
     summaries as SummarizeResponse[],
-    report
+    report,
+    options,
   );
 }
 
@@ -32,9 +39,14 @@ export function exportToMarkdown(
   segments: ExportTranscriptSegment[],
   translations: Record<string, string>,
   summaries: SummarizeResponse[],
-  report?: SessionReportData | null
+  report?: SessionReportData | null,
+  options?: MarkdownSectionOptions,
 ): string {
   const lines: string[] = [];
+  const {
+    includeTranscriptSection = segments.length > 0,
+    includeSummarySection = summaries.length > 0,
+  } = options ?? {};
 
   lines.push(`# ${title}`);
   lines.push(`**Date**: ${date}`);
@@ -96,21 +108,23 @@ export function exportToMarkdown(
     }
   }
 
-  lines.push('---');
-  lines.push('');
-  lines.push('## Transcript');
-  lines.push('');
-
-  for (const seg of segments) {
-    lines.push(`**[${seg.speaker}] ${seg.timestamp}**`);
-    lines.push(seg.text);
-    if (translations[seg.id]) {
-      lines.push(`> ${translations[seg.id]}`);
-    }
+  if (includeTranscriptSection) {
+    lines.push('---');
     lines.push('');
+    lines.push('## Transcript');
+    lines.push('');
+
+    for (const seg of segments) {
+      lines.push(`**[${seg.speaker}] ${seg.timestamp}**`);
+      lines.push(seg.text);
+      if (translations[seg.id]) {
+        lines.push(`> ${translations[seg.id]}`);
+      }
+      lines.push('');
+    }
   }
 
-  if (summaries.length > 0) {
+  if (includeSummarySection && summaries.length > 0) {
     lines.push('---');
     lines.push('');
     lines.push('## AI Summary');
@@ -119,6 +133,12 @@ export function exportToMarkdown(
     for (const summary of summaries) {
       if (summary.timeRange) {
         lines.push(`### ${summary.timeRange}`);
+        lines.push('');
+      }
+
+      if (summary.summary) {
+        lines.push(summary.summary);
+        lines.push('');
       }
 
       if (summary.keyPoints && summary.keyPoints.length > 0) {

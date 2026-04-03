@@ -931,7 +931,6 @@ export default function PlaybackPage() {
             translations={translations}
             summaries={summaryBlocksToResponses(summaries)}
             report={reportData}
-            hasRecording={audioSegments.length > 0}
           />
         )}
       </>
@@ -1477,7 +1476,6 @@ export default function PlaybackPage() {
           translations={translations}
           summaries={summaryBlocksToResponses(summaries)}
           report={reportData}
-          hasRecording={audioSegments.length > 0}
         />
       )}
     </div>

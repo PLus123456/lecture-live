@@ -10,11 +10,12 @@ export function exportJson(
   summaries: unknown[],
   sourceLang?: string,
   targetLang?: string,
-  report?: SessionReportData | null
+  report?: SessionReportData | null,
+  date?: string,
 ): string {
   return exportToJson(
     title,
-    new Date().toISOString(),
+    date || new Date().toISOString(),
     segments,
     translations,
     summaries as SummarizeResponse[],

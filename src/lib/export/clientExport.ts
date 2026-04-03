@@ -416,6 +416,7 @@ async function generateSingleFile(
           includeTranscriptSection: includeTranscript,
           includeSummarySection: singleFilePayload.summaries.length > 0,
         },
+        singleFilePayload.date,
       );
       return {
         name: `${baseName}.md`,
@@ -451,6 +452,7 @@ async function generateSingleFile(
         singleFilePayload.sourceLang,
         singleFilePayload.targetLang,
         singleFilePayload.report,
+        singleFilePayload.date,
       );
       return {
         name: `${baseName}.json`,
@@ -593,6 +595,8 @@ async function generateSeparateFiles(
           [],
           payload.sourceLang,
           payload.targetLang,
+          undefined,
+          payload.date,
         );
         files.push({
           name: `${baseName}_转录.json`,
@@ -609,6 +613,7 @@ async function generateSeparateFiles(
           payload.sourceLang,
           payload.targetLang,
           payload.report,
+          payload.date,
         );
         files.push({
           name: `${baseName}_总结.json`,
@@ -624,6 +629,8 @@ async function generateSeparateFiles(
           timedSummaries,
           payload.sourceLang,
           payload.targetLang,
+          undefined,
+          payload.date,
         );
         files.push({
           name: `${baseName}_分时总结.json`,
@@ -644,7 +651,10 @@ function triggerDownload(blob: Blob, filename: string): void {
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
   a.click();
+  document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
@@ -685,10 +695,10 @@ export async function executeExport(options: ExportOptions): Promise<void> {
   const plan = buildExportPlan(normalizedContents, format, documentMode);
   const allFiles: GeneratedFile[] = [];
   const safeBaseName = sanitizeDownloadFilenameBase(payload.title, 'lecture');
-  const recordingBlob = await resolveRecordingBlob(plan.includeRecording, fetchRecording);
 
-  // 1. 生成文本文件
-  if (plan.textContents.length > 0) {
+  // 并行执行：文本文件生成 + 录音下载
+  const textFilesPromise = (async () => {
+    if (plan.textContents.length === 0) return;
     if (plan.usesPrintDialog) {
       // PDF 通过打印窗口处理，不生成 blob 文件
       if (documentMode === 'single' || plan.textContents.length === 1) {
@@ -705,9 +715,14 @@ export async function executeExport(options: ExportOptions): Promise<void> {
         allFiles.push(...files);
       }
     }
-  }
+  })();
 
-  // 2. 获取录音文件
+  const [recordingBlob] = await Promise.all([
+    resolveRecordingBlob(plan.includeRecording, fetchRecording),
+    textFilesPromise,
+  ]);
+
+  // 获取录音文件
   if (recordingBlob) {
     const ext = recordingBlob.type.includes('webm') ? 'webm'
       : recordingBlob.type.includes('mp4') ? 'mp4'

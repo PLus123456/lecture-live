@@ -38,6 +38,8 @@ import {
   CheckSquare,
   BookOpen,
   AlertCircle,
+  Loader2,
+  RefreshCw,
 } from 'lucide-react';
 import type { TranscriptSegment } from '@/types/transcript';
 import type { SummaryBlock } from '@/types/summary';
@@ -46,6 +48,7 @@ import type { SessionReportData } from '@/types/report';
 interface SessionData {
   id: string;
   title: string;
+  titleEn?: string;
   createdAt: string;
   durationMs: number;
   sourceLang: string;
@@ -221,6 +224,7 @@ export default function PlaybackPage() {
   const [exportOpen, setExportOpen] = useState(false);
   const [reportData, setReportData] = useState<SessionReportData | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
+  const [regeneratingTitle, setRegeneratingTitle] = useState(false);
 
   // Audio player state
   const [isPlaying, setIsPlaying] = useState(false);
@@ -801,6 +805,31 @@ export default function PlaybackPage() {
   }, [handleSegmentClick]);
 
   // 导出录音回调：复用已加载的 blob，避免重复下载
+  const handleRegenerateTitle = useCallback(async () => {
+    if (!sessionId || !token || regeneratingTitle) return;
+    if (!confirm(t('playback.regenerateTitleConfirm'))) return;
+    setRegeneratingTitle(true);
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/regenerate-title`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || t('playback.regenerateTitleFail'));
+        return;
+      }
+      const data = await res.json();
+      if (data.success && session) {
+        setSession({ ...session, title: data.title, titleEn: data.titleEn });
+      }
+    } catch {
+      alert(t('playback.regenerateTitleFail'));
+    } finally {
+      setRegeneratingTitle(false);
+    }
+  }, [sessionId, token, regeneratingTitle, session, t]);
+
   const fetchRecordingForExport = useCallback(async (): Promise<Blob | null> => {
     if (recordingBlobRef.current) {
       return recordingBlobRef.current;
@@ -894,6 +923,8 @@ export default function PlaybackPage() {
           onSegmentClick={handleSegmentClickWithScroll}
           activeSegmentId={activeSegmentId}
           onOpenExport={() => setExportOpen(true)}
+          onRegenerateTitle={handleRegenerateTitle}
+          regeneratingTitle={regeneratingTitle}
         />
 
         {/* 音频元素 — 移动端也需要 */}
@@ -1010,13 +1041,26 @@ export default function PlaybackPage() {
               </div>
             </div>
 
-            <button
-              className="btn-ghost text-xs flex items-center gap-1.5"
-              onClick={() => setExportOpen(true)}
-            >
-              <Download className="w-3.5 h-3.5" />
-              {t('playback.export')}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                className="btn-ghost text-xs flex items-center gap-1.5"
+                onClick={handleRegenerateTitle}
+                disabled={regeneratingTitle}
+                title={t('playback.regenerateTitle')}
+              >
+                {regeneratingTitle
+                  ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  : <RefreshCw className="w-3.5 h-3.5" />}
+                {t('playback.regenerateTitle')}
+              </button>
+              <button
+                className="btn-ghost text-xs flex items-center gap-1.5"
+                onClick={() => setExportOpen(true)}
+              >
+                <Download className="w-3.5 h-3.5" />
+                {t('playback.export')}
+              </button>
+            </div>
           </div>
         </header>
 

@@ -44,6 +44,7 @@ interface Pagination {
 const JOB_TYPES = [
   'keyword_extraction',
   'report_generation',
+  'title_generation',
   'quota_reset',
   'stale_session_reclaim',
   'reconciliation',
@@ -57,6 +58,7 @@ const JOB_STATUSES = ['SUBMITTED', 'PENDING', 'PROCESSING', 'SUCCESS', 'FAILED']
 const TYPE_I18N_MAP: Record<string, string> = {
   keyword_extraction: 'jobQueue.typeKeywordExtraction',
   report_generation: 'jobQueue.typeReportGeneration',
+  title_generation: 'jobQueue.typeTitleGeneration',
   quota_reset: 'jobQueue.typeQuotaReset',
   stale_session_reclaim: 'jobQueue.typeStaleSessionReclaim',
   reconciliation: 'jobQueue.typeReconciliation',

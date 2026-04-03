@@ -26,7 +26,7 @@ import {
 import { clampSessionDurationMs, getBillableMinutes } from '@/lib/billing';
 import { callLLM } from '@/lib/llm/gateway';
 import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
-import { generateSessionReport } from '@/lib/llm/reportManager';
+import { generateSessionReport, generateSessionTitle } from '@/lib/llm/reportManager';
 import { logSystemEvent } from '@/lib/auditLog';
 import { trackJob, JOB_TYPE } from '@/lib/jobQueue';
 import {
@@ -561,41 +561,82 @@ async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
       })
     );
 
-    const reportPromise = trackJob(
-      {
-        type: JOB_TYPE.REPORT_GENERATION,
-        sessionId: params.sessionId,
-        userId: params.userId,
-        triggeredBy: 'system',
-        params: { title: params.title, courseName: params.courseName },
-      },
-      async () => {
-        const summaryBlocks = (bundle.summaries ?? []) as SummaryBlock[];
-        const reportData = await generateSessionReport({
-          sessionId: params.sessionId,
-          transcript: fullTranscript,
-          sessionTitle: params.title,
-          courseName: params.courseName,
-          durationMs: params.durationMs ?? 0,
-          date: params.createdAt.toISOString().split('T')[0],
-          summaryBlocks,
-          language: params.targetLang,
-          callLLM: (system: string, userMessage: string) =>
-            callLLM(system, userMessage, { purpose: 'FINAL_SUMMARY' }),
-        });
+    const summaryBlocks = (bundle.summaries ?? []) as SummaryBlock[];
 
-        const stored = await persistSessionReport(sessionForLoad, reportData);
-        await prisma.session.update({
-          where: { id: params.sessionId },
-          data: { reportPath: stored.path },
-        });
-        return { reportPath: stored.path };
+    const reportAndTitlePromise = (async () => {
+      // 步骤 1: 报告生成
+      await trackJob(
+        {
+          type: JOB_TYPE.REPORT_GENERATION,
+          sessionId: params.sessionId,
+          userId: params.userId,
+          triggeredBy: 'system',
+          params: { title: params.title, courseName: params.courseName },
+        },
+        async () => {
+          const reportData = await generateSessionReport({
+            sessionId: params.sessionId,
+            transcript: fullTranscript,
+            sessionTitle: params.title,
+            courseName: params.courseName,
+            durationMs: params.durationMs ?? 0,
+            date: params.createdAt.toISOString().split('T')[0],
+            summaryBlocks,
+            language: params.targetLang,
+            callLLM: (system: string, userMessage: string) =>
+              callLLM(system, userMessage, { purpose: 'FINAL_SUMMARY' }),
+          });
+
+          const stored = await persistSessionReport(sessionForLoad, reportData);
+          await prisma.session.update({
+            where: { id: params.sessionId },
+            data: { reportPath: stored.path },
+          });
+          return { reportPath: stored.path };
+        }
+      );
+
+      // 步骤 2: 标题生成（仅覆盖默认标题）
+      const DEFAULT_TITLES = ['新建讲座会话', 'New Lecture Session'];
+      if (!DEFAULT_TITLES.includes(params.title)) {
+        console.log(`[finalize-bg] ${params.sessionId}: custom title, skip title generation`);
+        return;
       }
-    ).catch((error) => {
-      console.error('[finalize-bg] report generation failed:', error);
+
+      await trackJob(
+        {
+          type: JOB_TYPE.TITLE_GENERATION,
+          sessionId: params.sessionId,
+          userId: params.userId,
+          triggeredBy: 'system',
+          params: { originalTitle: params.title },
+        },
+        async () => {
+          const generated = await generateSessionTitle({
+            transcript: fullTranscript,
+            summaryBlocks,
+            courseName: params.courseName,
+            language: params.targetLang,
+            callLLM: (system: string, userMessage: string) =>
+              callLLM(system, userMessage, { purpose: 'FINAL_SUMMARY' }),
+          });
+
+          if (!generated) {
+            return { skipped: true, reason: 'generation_failed' };
+          }
+
+          await prisma.session.update({
+            where: { id: params.sessionId },
+            data: { title: generated.zh, titleEn: generated.en },
+          });
+          return { zh: generated.zh, en: generated.en };
+        }
+      );
+    })().catch((error) => {
+      console.error('[finalize-bg] report/title generation failed:', error);
     });
 
-    await Promise.allSettled([keywordPromise, reportPromise]);
+    await Promise.allSettled([keywordPromise, reportAndTitlePromise]);
     await Promise.all([
       invalidateSessionsApiCache(params.userId),
       invalidateFoldersApiCache(params.userId),

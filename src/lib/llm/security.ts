@@ -307,6 +307,48 @@ export function parseSignificanceEvaluationResult(
   };
 }
 
+/** 统计标题词数 — 中文按字符数（去除标点），英文按空格拆分单词数 */
+export function countTitleWords(text: string, lang: 'zh' | 'en'): number {
+  const trimmed = text.trim();
+  if (!trimmed) return 0;
+
+  if (lang === 'zh') {
+    // 去除标点和空格，只保留 CJK 字符和字母/数字
+    const chars = trimmed.replace(/[\s\p{P}\p{S}]/gu, '');
+    return chars.length;
+  }
+  // 英文：按空格拆分
+  return trimmed.split(/\s+/).filter(Boolean).length;
+}
+
+export interface TitleGenerationResult {
+  zh: string;
+  en: string;
+}
+
+/** 解析标题生成 LLM 响应 — 保留内容标点，不截断 */
+export function parseTitleGenerationResult(raw: string): TitleGenerationResult {
+  const parsed = parseJsonObject(raw, 'title generation response');
+
+  const zh = ensureString(parsed.zh, 'zh')
+    .replace(PROMPT_CONTROL_CHARS, ' ')
+    .replace(/\n/g, ' ')
+    .trim();
+
+  const en = ensureString(parsed.en, 'en')
+    .replace(PROMPT_CONTROL_CHARS, ' ')
+    .replace(/\n/g, ' ')
+    .trim();
+
+  if (!zh || !en) {
+    throw new LLMResponseError(
+      'Invalid title generation response: both zh and en titles are required'
+    );
+  }
+
+  return { zh, en };
+}
+
 export function parseSessionReportResult(
   raw: string,
   fallback: { sessionTitle: string; date: string; duration: string }

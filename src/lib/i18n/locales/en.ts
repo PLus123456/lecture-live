@@ -80,6 +80,7 @@ export default {
     users: 'Users',
     logs: 'Logs',
     reconciliation: 'Reconciliation',
+    jobQueue: 'Job Queue',
     backToHome: 'Back to Home',
     interpret: 'Interpret',
     appName: 'LectureLive',
@@ -855,6 +856,57 @@ export default {
     overCharged: 'Over',
     underCharged: 'Under',
     total: '{n} records total',
+  },
+
+  // Job Queue
+  jobQueue: {
+    title: 'Job Queue',
+    noJobs: 'No background jobs',
+    noJobsDesc: 'Jobs will appear here when triggered by session finalization, system maintenance, etc.',
+    // Status
+    statusSubmitted: 'Submitted',
+    statusPending: 'Pending',
+    statusProcessing: 'Processing',
+    statusSuccess: 'Success',
+    statusFailed: 'Failed',
+    // Job types
+    typeKeywordExtraction: 'Keyword Extraction',
+    typeReportGeneration: 'Report Generation',
+    typeQuotaReset: 'Quota Reset',
+    typeStaleSessionReclaim: 'Session Reclaim',
+    typeReconciliation: 'Reconciliation',
+    typeStorageCleanup: 'Storage Cleanup',
+    typeStorageMigration: 'Storage Migration',
+    typeBillingMaintenance: 'Billing Maintenance',
+    // Table headers
+    colTime: 'Time',
+    colType: 'Type',
+    colStatus: 'Status',
+    colDuration: 'Duration',
+    colRelated: 'Related',
+    colActions: 'Actions',
+    // Filters
+    allTypes: 'All Types',
+    allStatuses: 'All Statuses',
+    // Detail
+    viewDetail: 'View',
+    backToList: 'Back to List',
+    params: 'Parameters',
+    result: 'Result',
+    error: 'Error',
+    attempt: 'Attempt',
+    maxAttempts: 'Max Attempts',
+    triggeredBy: 'Triggered By',
+    startedAt: 'Started At',
+    completedAt: 'Completed At',
+    noParams: 'No parameters',
+    noResult: 'No result',
+    // Actions
+    retry: 'Retry',
+    retrySuccess: 'Job has been reset to submitted',
+    retryFailed: 'Retry failed',
+    // Pagination
+    total: '{n} total',
   },
 
   // Interpret

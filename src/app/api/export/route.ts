@@ -1,14 +1,17 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
+import { enforceRateLimit } from '@/lib/rateLimit';
 import { exportToMarkdown } from '@/lib/export/markdown';
 import { exportToSrt } from '@/lib/export/srt';
 import { exportToJson } from '@/lib/export/json';
-import type { ExportTranscriptSegment } from '@/lib/export/types';
+import { toExportSegments } from '@/lib/export/types';
 import {
   parseExportFormat,
   sanitizeHeaderFilename,
   sanitizeTextInput,
 } from '@/lib/security';
+
+const MAX_SEGMENTS = 50_000;
 
 interface ExportRequestBody {
   format: 'markdown' | 'srt' | 'json' | 'txt';
@@ -16,7 +19,7 @@ interface ExportRequestBody {
   date: string;
   sourceLang: string;
   targetLang: string;
-  segments: ExportTranscriptSegment[];
+  segments: unknown[];
   translations: Record<string, string>;
   summaries: Array<{
     keyPoints: string[];
@@ -34,14 +37,31 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  const rateLimited = await enforceRateLimit(req, {
+    scope: 'export',
+    limit: 30,
+    windowMs: 10 * 60_000,
+    key: `user:${user.id}`,
+  });
+  if (rateLimited) {
+    return rateLimited;
+  }
+
   try {
     const body: ExportRequestBody = await req.json();
+    if (Array.isArray(body.segments) && body.segments.length > MAX_SEGMENTS) {
+      return NextResponse.json(
+        { error: `Too many segments (max ${MAX_SEGMENTS})` },
+        { status: 400 },
+      );
+    }
     const format = parseExportFormat(body.format);
     const title = sanitizeTextInput(body.title, {
       maxLength: 120,
       fallback: 'Lecture Recording',
     });
     const safeFilenameBase = sanitizeHeaderFilename(title, 'lecture-recording');
+    const segments = toExportSegments(Array.isArray(body.segments) ? body.segments : []);
     let content: string;
     let filename: string;
     let mimeType: string;
@@ -50,28 +70,28 @@ export async function POST(req: Request) {
       case 'markdown':
         content = exportToMarkdown(
           title, body.date, body.sourceLang, body.targetLang,
-          body.segments, body.translations, body.summaries
+          segments, body.translations, body.summaries
         );
         filename = `${safeFilenameBase}.md`;
         mimeType = 'text/markdown';
         break;
 
       case 'srt':
-        content = exportToSrt(body.segments, body.translations);
+        content = exportToSrt(segments, body.translations);
         filename = `${safeFilenameBase}.srt`;
         mimeType = 'text/plain';
         break;
 
       case 'json':
         content = exportToJson(
-          title, body.date, body.segments, body.translations, body.summaries, body.sourceLang, body.targetLang
+          title, body.date, segments, body.translations, body.summaries, body.sourceLang, body.targetLang
         );
         filename = `${safeFilenameBase}.json`;
         mimeType = 'application/json';
         break;
 
       case 'txt':
-        content = body.segments.map((seg) => {
+        content = segments.map((seg) => {
           const translation = body.translations[seg.id];
           return `[${seg.speaker}] ${seg.timestamp}\n${seg.text}${translation ? `\n${translation}` : ''}`;
         }).join('\n\n');

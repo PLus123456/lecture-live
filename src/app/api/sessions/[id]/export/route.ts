@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { enforceRateLimit } from '@/lib/rateLimit';
 import { assertOwnership, sanitizeHeaderFilename } from '@/lib/security';
 import { exportMarkdown } from '@/lib/export/markdown';
 import { exportToSrt } from '@/lib/export/srt';
@@ -8,7 +9,7 @@ import { exportJson } from '@/lib/export/json';
 import { normalizeExportFormat } from '@/lib/sessionApi';
 import { loadSessionTranscriptBundle, loadSessionReport } from '@/lib/sessionPersistence';
 import { summaryBlockToResponse } from '@/lib/summary';
-import type { ExportTranscriptSegment } from '@/lib/export/types';
+import { toExportSegments } from '@/lib/export/types';
 import type { SummaryBlock, SummarizeResponse } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
 
@@ -36,6 +37,16 @@ export async function POST(
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
+  const rateLimited = await enforceRateLimit(req, {
+    scope: 'export',
+    limit: 30,
+    windowMs: 10 * 60_000,
+    key: `user:${user.id}`,
+  });
+  if (rateLimited) {
+    return rateLimited;
+  }
+
   const body = await req.json().catch(() => ({}));
   const format = normalizeExportFormat(body.format);
   const sourceLang = typeof body.sourceLang === 'string' ? body.sourceLang : (session.sourceLang ?? 'en');
@@ -48,17 +59,9 @@ export async function POST(
   }
 
   const persisted = await loadSessionTranscriptBundle(session);
-  const segments = toExportSegments(
-    Array.isArray(body.segments) ? body.segments : persisted?.segments ?? []
-  );
-  const translations = toStringRecord(
-    isPlainObject(body.translations)
-      ? body.translations
-      : persisted?.translations ?? {}
-  );
-  const summaries = normalizeSummaries(
-    Array.isArray(body.summaries) ? body.summaries : persisted?.summaries ?? []
-  );
+  const segments = toExportSegments(persisted?.segments ?? []);
+  const translations = toStringRecord(persisted?.translations ?? {});
+  const summaries = normalizeSummaries(persisted?.summaries ?? []);
 
   // 加载会话报告（用于 Markdown 导出）
   let report: SessionReportData | null = null;
@@ -125,41 +128,6 @@ export async function POST(
       'Content-Disposition': `attachment; filename="${encodeURIComponent(`${safeBase}.${ext}`)}"`,
     },
   });
-}
-
-function toExportSegments(input: unknown[]): ExportTranscriptSegment[] {
-  return input
-    .filter(isPlainObject)
-    .map((segment) => ({
-      id: typeof segment.id === 'string' ? segment.id : crypto.randomUUID(),
-      speaker:
-        typeof segment.speaker === 'string' && segment.speaker.trim()
-          ? segment.speaker
-          : 'Speaker',
-      language:
-        typeof segment.language === 'string' && segment.language.trim()
-          ? segment.language
-          : 'en',
-      text: typeof segment.text === 'string' ? segment.text : '',
-      startMs:
-        typeof segment.startMs === 'number'
-          ? segment.startMs
-          : typeof segment.globalStartMs === 'number'
-            ? segment.globalStartMs
-            : 0,
-      endMs:
-        typeof segment.endMs === 'number'
-          ? segment.endMs
-          : typeof segment.globalEndMs === 'number'
-            ? segment.globalEndMs
-            : 0,
-      isFinal: segment.isFinal !== false,
-      confidence:
-        typeof segment.confidence === 'number' ? segment.confidence : 1,
-      timestamp:
-        typeof segment.timestamp === 'string' ? segment.timestamp : '00:00:00',
-    }))
-    .filter((segment) => segment.text.trim().length > 0);
 }
 
 function normalizeSummaries(input: unknown[]): SummarizeResponse[] {

@@ -10,11 +10,15 @@ import type { SummaryBlock } from '@/types/summary';
 import {
   buildSignificanceEvaluationPrompt,
   buildSessionReportPrompt,
+  buildTitleGenerationPrompt,
 } from './prompts';
 import {
   LLM_LIMITS,
   parseSessionReportResult,
   parseSignificanceEvaluationResult,
+  parseTitleGenerationResult,
+  countTitleWords,
+  type TitleGenerationResult,
 } from './security';
 
 /** 意义评估阈值 — 低于此分数的录音不生成报告 */
@@ -185,4 +189,105 @@ async function generateReport(
     console.error('报告生成失败:', error);
     return null;
   }
+}
+
+// ─── 标题生成 ───
+
+/** 常规词数上限 */
+const TITLE_LIMIT_ZH = 25;
+const TITLE_LIMIT_EN = 15;
+/** 严格词数上限 */
+const TITLE_STRICT_ZH = 12;
+const TITLE_STRICT_EN = 8;
+/** 容忍超出的词数 */
+const TITLE_TOLERANCE = 3;
+
+interface GenerateTitleOptions {
+  transcript: string;
+  summaryBlocks: SummaryBlock[];
+  courseName: string;
+  language: string;
+  callLLM: (system: string, user: string) => Promise<string>;
+}
+
+function isTitleWithinLimit(
+  result: TitleGenerationResult,
+  zhLimit: number,
+  enLimit: number,
+  tolerance: number
+): boolean {
+  const zhCount = countTitleWords(result.zh, 'zh');
+  const enCount = countTitleWords(result.en, 'en');
+  return zhCount <= zhLimit + tolerance && enCount <= enLimit + tolerance;
+}
+
+/**
+ * 生成会话标题（中英文），含分阶段重试逻辑：
+ * 1. 常规 prompt → 最多 2 次 → 容忍 +3 词
+ * 2. 严格 prompt → 1 次 → 容忍 +3 词
+ * 3. 兜底：接受最后一次结果
+ */
+export async function generateSessionTitle(
+  options: GenerateTitleOptions
+): Promise<TitleGenerationResult | null> {
+  const { transcript, summaryBlocks, courseName, language, callLLM } = options;
+
+  const summaryContext = summaryBlocks
+    .map((block) => {
+      const parts = [block.summary];
+      if (block.keyPoints.length > 0) {
+        parts.push('Key points: ' + block.keyPoints.join('; '));
+      }
+      return parts.join(' | ');
+    })
+    .join('\n')
+    .slice(0, LLM_LIMITS.reportSummaryContext);
+
+  let lastResult: TitleGenerationResult | null = null;
+
+  // 阶段 1: 常规 prompt，最多 2 次
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const { system, user } = buildTitleGenerationPrompt(
+        transcript, summaryContext, courseName, language, false
+      );
+      const raw = await callLLM(system, user);
+      lastResult = parseTitleGenerationResult(raw);
+
+      if (isTitleWithinLimit(lastResult, TITLE_LIMIT_ZH, TITLE_LIMIT_EN, TITLE_TOLERANCE)) {
+        return lastResult;
+      }
+      console.warn(
+        `[title-gen] attempt ${attempt + 1} too long: zh=${countTitleWords(lastResult.zh, 'zh')} en=${countTitleWords(lastResult.en, 'en')}`
+      );
+    } catch (error) {
+      console.error(`[title-gen] attempt ${attempt + 1} failed:`, error);
+    }
+  }
+
+  // 阶段 2: 严格 prompt，1 次
+  try {
+    const { system, user } = buildTitleGenerationPrompt(
+      transcript, summaryContext, courseName, language, true
+    );
+    const raw = await callLLM(system, user);
+    lastResult = parseTitleGenerationResult(raw);
+
+    if (isTitleWithinLimit(lastResult, TITLE_STRICT_ZH, TITLE_STRICT_EN, TITLE_TOLERANCE)) {
+      return lastResult;
+    }
+    console.warn(
+      `[title-gen] strict attempt too long: zh=${countTitleWords(lastResult.zh, 'zh')} en=${countTitleWords(lastResult.en, 'en')}`
+    );
+  } catch (error) {
+    console.error('[title-gen] strict attempt failed:', error);
+  }
+
+  // 阶段 3: 兜底 — 接受最后一次结果
+  if (lastResult) {
+    console.warn('[title-gen] accepting last result as fallback');
+    return lastResult;
+  }
+
+  return null;
 }

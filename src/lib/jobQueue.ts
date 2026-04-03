@@ -10,6 +10,7 @@ export const JOB_TYPE = {
   STORAGE_CLEANUP: 'storage_cleanup',
   STORAGE_MIGRATION: 'storage_migration',
   BILLING_MAINTENANCE: 'billing_maintenance',
+  TITLE_GENERATION: 'title_generation',
 } as const;
 
 export type JobType = (typeof JOB_TYPE)[keyof typeof JOB_TYPE];

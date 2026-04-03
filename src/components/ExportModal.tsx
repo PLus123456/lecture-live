@@ -26,6 +26,7 @@ import {
   buildExportPlan,
   executeExport,
   isFormatAvailable,
+  normalizeContentsForFormat,
   textContentCount,
   hasTextContent,
   type ContentType,
@@ -130,6 +131,60 @@ function getDefaultSelectedContents(availableContents: ContentType[]): ContentTy
   return [];
 }
 
+function hasItems<T>(value?: T[]): value is T[] {
+  return Array.isArray(value) && value.length > 0;
+}
+
+function hasEntries(value?: Record<string, string>): value is Record<string, string> {
+  return Boolean(value && Object.keys(value).length > 0);
+}
+
+function resolveArrayOverride<T>(override: T[] | undefined, fallback: T[] | undefined): T[] {
+  if (hasItems(override)) {
+    return override;
+  }
+
+  if (Array.isArray(fallback)) {
+    return fallback;
+  }
+
+  return override ?? [];
+}
+
+function resolveRecordOverride(
+  override: Record<string, string> | undefined,
+  fallback: Record<string, string> | undefined,
+): Record<string, string> {
+  if (hasEntries(override)) {
+    return override;
+  }
+
+  if (fallback) {
+    return fallback;
+  }
+
+  return override ?? {};
+}
+
+function resolveHasRecording(
+  override: boolean | undefined,
+  fallback: boolean | undefined,
+): boolean {
+  if (override === true) {
+    return true;
+  }
+
+  return Boolean(fallback);
+}
+
+function isSameContents(left: ContentType[], right: ContentType[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((content, index) => content === right[index]);
+}
+
 export default function ExportModal({
   isOpen,
   onClose,
@@ -151,10 +206,10 @@ export default function ExportModal({
   const [isLoadingSessionData, setIsLoadingSessionData] = useState(false);
 
   const hasProvidedContentData =
-    segmentsOverride !== undefined ||
-    translationsOverride !== undefined ||
-    summariesOverride !== undefined ||
-    report !== undefined;
+    hasItems(segmentsOverride) ||
+    hasEntries(translationsOverride) ||
+    hasItems(summariesOverride) ||
+    report != null;
 
   const fetchSessionData = useCallback(async (): Promise<SessionExportDataResponse | null> => {
     if (!sessionId || !token) return null;
@@ -172,8 +227,11 @@ export default function ExportModal({
   useEffect(() => {
     if (!isOpen) {
       setError(null);
+      setSessionData(null);
       return;
     }
+
+    setSessionData(null);
 
     if (!sessionId || !token) {
       return;
@@ -199,10 +257,15 @@ export default function ExportModal({
     };
   }, [isOpen, sessionId, token, fetchSessionData]);
 
-  const exportSegments = segmentsOverride ?? sessionData?.segments ?? [];
-  const exportSummaries = summariesOverride ?? sessionData?.summaries ?? [];
+  const exportSegments = resolveArrayOverride(segmentsOverride, sessionData?.segments);
+  const exportTranslations = resolveRecordOverride(translationsOverride, sessionData?.translations);
+  const exportSummaries = resolveArrayOverride(summariesOverride, sessionData?.summaries);
   const exportReport = report ?? sessionData?.report ?? null;
-  const exportHasRecording = Boolean((hasRecording ?? sessionData?.hasRecording ?? false) && sessionId);
+  const exportHasRecording = Boolean(resolveHasRecording(hasRecording, sessionData?.hasRecording) && sessionId);
+  const displayTitle =
+    (typeof sessionTitle === 'string' && sessionTitle.trim()) ||
+    sessionData?.title ||
+    t('session.defaultTitle');
 
   // 可用性判断
   const hasTranscript = exportSegments.length > 0;
@@ -234,19 +297,19 @@ export default function ExportModal({
 
     setSelectedContents((prev) => {
       const filtered = prev.filter((content) => availableContents.includes(content));
+      const normalized = normalizeContentsForFormat(filtered, selectedFormat);
       if (filtered.length > 0) {
-        return filtered;
+        return normalized;
       }
-      return getDefaultSelectedContents(availableContents);
+      return normalizeContentsForFormat(getDefaultSelectedContents(availableContents), selectedFormat);
     });
-  }, [isOpen, availableContents]);
+  }, [isOpen, availableContents, selectedFormat]);
 
   // 当前选择的文本内容数量
-  const currentTextCount = textContentCount(selectedContents);
-  const hasAnyTextContent = hasTextContent(selectedContents);
-  const onlyRecording = selectedContents.length === 1 && selectedContents[0] === 'recording';
   const showSessionDataLoadingState =
     isLoadingSessionData && !hasProvidedContentData && !sessionData;
+  const onlyRecordingSelected =
+    selectedContents.length === 1 && selectedContents[0] === 'recording';
 
   // 内容复选框切换
   const toggleContent = useCallback((id: ContentType) => {
@@ -261,29 +324,47 @@ export default function ExportModal({
 
   // 格式是否可选
   const isFormatDisabled = useCallback((format: ExportFileFormat) => {
-    if (onlyRecording) return true;
+    if (onlyRecordingSelected) return true;
     return !isFormatAvailable(format, selectedContents);
-  }, [selectedContents, onlyRecording]);
+  }, [selectedContents, onlyRecordingSelected]);
 
   // 确保选中的格式仍然可用
   const effectiveFormat = useMemo(() => {
-    if (onlyRecording) return selectedFormat;
+    if (onlyRecordingSelected) return selectedFormat;
     if (isFormatDisabled(selectedFormat)) {
       const available = FORMAT_OPTIONS.find((f) => !isFormatDisabled(f.id));
       return available?.id ?? 'md';
     }
     return selectedFormat;
-  }, [selectedFormat, isFormatDisabled, onlyRecording]);
+  }, [selectedFormat, isFormatDisabled, onlyRecordingSelected]);
+
+  useEffect(() => {
+    if (!isOpen || effectiveFormat !== 'srt') return;
+
+    setSelectedContents((prev) => {
+      const normalized = normalizeContentsForFormat(prev, 'srt');
+      return isSameContents(prev, normalized) ? prev : normalized;
+    });
+  }, [isOpen, effectiveFormat]);
+
+  const effectiveSelectedContents = useMemo(
+    () => normalizeContentsForFormat(selectedContents, effectiveFormat),
+    [selectedContents, effectiveFormat],
+  );
+  const currentTextCount = textContentCount(effectiveSelectedContents);
+  const hasAnyTextContent = hasTextContent(effectiveSelectedContents);
+  const onlyRecording =
+    effectiveSelectedContents.length === 1 && effectiveSelectedContents[0] === 'recording';
   const showDocumentMode = currentTextCount >= 2 && effectiveFormat !== 'pdf';
   const exportPlan = useMemo(
-    () => buildExportPlan(selectedContents, effectiveFormat, documentMode),
-    [selectedContents, effectiveFormat, documentMode],
+    () => buildExportPlan(effectiveSelectedContents, effectiveFormat, documentMode),
+    [effectiveSelectedContents, effectiveFormat, documentMode],
   );
 
   // 是否可导出
   const canExport =
     !showSessionDataLoadingState &&
-    selectedContents.length > 0 &&
+    effectiveSelectedContents.length > 0 &&
     (onlyRecording || hasAnyTextContent);
 
   // 下载录音的回调
@@ -315,26 +396,27 @@ export default function ExportModal({
         }
       }
 
-      const segments = segmentsOverride ?? latestSessionData?.segments ?? [];
-      const translations = translationsOverride ?? latestSessionData?.translations ?? {};
-      const summaries = summariesOverride ?? latestSessionData?.summaries ?? [];
+      const segments = resolveArrayOverride(segmentsOverride, latestSessionData?.segments);
+      const translations = resolveRecordOverride(translationsOverride, latestSessionData?.translations);
+      const summaries = resolveArrayOverride(summariesOverride, latestSessionData?.summaries);
       const sessionReport = report ?? latestSessionData?.report ?? null;
       const sessionSourceLang = sourceLang ?? latestSessionData?.sourceLang ?? 'en';
       const sessionTargetLang = targetLang ?? latestSessionData?.targetLang ?? 'zh';
+      const resolvedTitle =
+        (typeof sessionTitle === 'string' && sessionTitle.trim()) ||
+        latestSessionData?.title ||
+        t('session.defaultTitle');
 
       if (sessionId && !hasProvidedContentData && !latestSessionData) {
         throw new Error('Failed to load session export data');
       }
 
       await executeExport({
-        contents: selectedContents,
+        contents: effectiveSelectedContents,
         format: effectiveFormat,
         documentMode,
         payload: {
-          title:
-            sessionTitle ||
-            latestSessionData?.title ||
-            t('session.defaultTitle'),
+          title: resolvedTitle,
           date: new Date().toISOString(),
           sourceLang: sessionSourceLang,
           targetLang: sessionTargetLang,
@@ -343,7 +425,7 @@ export default function ExportModal({
           summaries,
           report: sessionReport,
         },
-        fetchRecording: selectedContents.includes('recording') ? fetchRecording : undefined,
+        fetchRecording: effectiveSelectedContents.includes('recording') ? fetchRecording : undefined,
       });
 
       onClose();
@@ -385,8 +467,9 @@ export default function ExportModal({
               (opt.id === 'transcript' && !hasTranscript) ||
               (opt.id === 'summary' && !hasSummary) ||
               (opt.id === 'timedSummary' && !hasTimedSummary) ||
-              (opt.id === 'recording' && !exportHasRecording);
-            const selected = selectedContents.includes(opt.id);
+              (opt.id === 'recording' && !exportHasRecording) ||
+              (effectiveFormat === 'srt' && (opt.id === 'summary' || opt.id === 'timedSummary'));
+            const selected = effectiveSelectedContents.includes(opt.id);
             const Icon = opt.icon;
 
             return (
@@ -468,6 +551,12 @@ export default function ExportModal({
             <p className="mt-2 text-[10px] text-charcoal-400 flex items-center gap-1">
               <AlertCircle className="w-3 h-3" />
               {t('exportModal.pdfHint')}
+            </p>
+          )}
+          {effectiveFormat === 'srt' && (
+            <p className="mt-2 text-[10px] text-charcoal-400 flex items-center gap-1">
+              <AlertCircle className="w-3 h-3" />
+              {t('exportModal.srtHint')}
             </p>
           )}
         </div>
@@ -595,7 +684,7 @@ export default function ExportModal({
               </div>
               <div>
                 <h2 className="font-serif font-bold text-charcoal-800 text-sm">{t('exportModal.title')}</h2>
-                <p className="text-[10px] text-charcoal-400">{sessionTitle}</p>
+                <p className="text-[10px] text-charcoal-400">{displayTitle}</p>
               </div>
             </div>
             <button onClick={onClose} className="btn-ghost p-1.5 rounded-lg hover:bg-cream-100">

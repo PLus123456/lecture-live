@@ -4,12 +4,15 @@
 
 @layer base {
   html {
+    height: 100%;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
 
   body {
     @apply bg-cream-50 text-charcoal-800 font-sans dark:bg-charcoal-900 dark:text-cream-100;
+    min-height: 100vh;
+    min-height: 100dvh;
   }
 
   ::selection {

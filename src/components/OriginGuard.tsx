@@ -101,7 +101,7 @@ export default function OriginGuard({
 
   if (state === 'blocked') {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-cream-50">
+      <div className="min-h-[100dvh] flex items-center justify-center bg-cream-50">
         <div className="text-center max-w-md px-6">
           <div className="text-6xl font-bold text-charcoal-300 mb-4">403</div>
           <h1 className="text-xl font-semibold text-charcoal-700 mb-2">

@@ -78,7 +78,7 @@ export default function RegisterPage() {
   };
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-cream-50 px-4">
+    <div className="min-h-[100dvh] flex flex-col items-center justify-center bg-cream-50 px-4">
       <div className="w-full max-w-sm flex-1 flex flex-col justify-center">
         <div className="text-center mb-8 animate-fade-in-up">
           <div className="mx-auto mb-3 animate-pop-in">

@@ -1,11 +1,10 @@
 /**
  * PDF 导出模块
- * 通过生成样式化 HTML 并使用浏览器原生打印功能生成 PDF
- * 这种方式完美支持 CJK 字符，无需额外字体文件
+ * 通过生成样式化 HTML，使用 html2canvas 渲染后写入 jsPDF，直接生成可下载的 PDF 文件
+ * 完美支持 CJK 字符，无需额外字体文件
  */
 import type { SummarizeResponse } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
-import { sanitizeDownloadFilenameBase } from '@/lib/fileNames';
 import type { ExportTranscriptSegment } from './types';
 
 function escapeHtml(text: string): string {
@@ -17,18 +16,29 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
+/** A4 尺寸（mm） */
+const A4_WIDTH_MM = 210;
+const A4_HEIGHT_MM = 297;
+const PAGE_MARGIN_MM = 20;
+const CONTENT_WIDTH_MM = A4_WIDTH_MM - PAGE_MARGIN_MM * 2;
+
+/** 渲染 DPI 倍率，2x 保证清晰度 */
+const SCALE = 2;
+
+/** 容器宽度（px），对应 A4 内容区域 */
+const CONTAINER_WIDTH_PX = Math.round(CONTENT_WIDTH_MM * 3.78); // ~643px
+
 const CSS = `
-  @page {
-    size: A4;
-    margin: 2cm;
-  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: "Noto Serif SC", "Source Han Serif SC", Georgia, "Times New Roman", serif;
+    font-family: "Noto Serif SC", "Source Han Serif SC", "PingFang SC", "Hiragino Sans GB",
+                 "Microsoft YaHei", Georgia, "Times New Roman", serif;
     color: #2D2D2D;
     line-height: 1.7;
     font-size: 11pt;
     background: #fff;
+    width: ${CONTAINER_WIDTH_PX}px;
+    padding: 0;
   }
   .page-title {
     font-size: 22pt;
@@ -85,7 +95,6 @@ const CSS = `
   tr:nth-child(even) td { background: #F5E6E0; }
   .segment {
     margin-bottom: 12px;
-    page-break-inside: avoid;
   }
   .seg-header {
     font-size: 10pt;
@@ -115,9 +124,6 @@ const CSS = `
     font-size: 11pt;
   }
   .question-list { list-style-type: decimal; }
-  @media print {
-    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-  }
 `;
 
 function buildTranscriptHtml(
@@ -250,10 +256,9 @@ export interface PdfExportOptions {
 }
 
 /**
- * 生成 PDF：打开新窗口显示样式化 HTML 并自动触发打印
- * 用户在打印对话框中选择"另存为 PDF"即可
+ * 构建 HTML 内容字符串（供内部渲染使用）
  */
-export function exportPdf(options: PdfExportOptions): void {
+function buildHtmlBody(options: PdfExportOptions): string {
   const {
     title, date, sourceLang, targetLang,
     segments = [], translations = {}, summaries = [],
@@ -290,29 +295,87 @@ export function exportPdf(options: PdfExportOptions): void {
     bodyHtml += buildTranscriptHtml(segments, translations);
   }
 
-  const fullHtml = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <title>${escapeHtml(title)} - LectureLive</title>
-  <style>${CSS}</style>
-</head>
-<body>${bodyHtml}</body>
-</html>`;
+  return bodyHtml;
+}
 
-  const printWindow = window.open('', '_blank');
-  if (!printWindow) {
-    throw new Error('POPUP_BLOCKED');
-  }
+/**
+ * 生成 PDF Blob：使用 html2canvas 渲染 HTML → jsPDF 分页输出
+ * 直接返回可下载的 Blob，无需弹出打印对话框
+ */
+export async function exportPdf(options: PdfExportOptions): Promise<Blob> {
+  // 动态导入以减少首屏加载体积
+  const [{ default: jsPDF }, { default: html2canvas }] = await Promise.all([
+    import('jspdf'),
+    import('html2canvas'),
+  ]);
 
-  printWindow.document.write(fullHtml);
-  printWindow.document.close();
+  const bodyHtml = buildHtmlBody(options);
 
-  // 兜底：无论 onload 是否已触发，都尝试打印
-  const tryPrint = () => setTimeout(() => printWindow.print(), 300);
-  if (printWindow.document.readyState === 'complete') {
-    tryPrint();
-  } else {
-    printWindow.onload = tryPrint;
+  // 创建离屏容器
+  const container = document.createElement('div');
+  container.style.cssText = `
+    position: fixed; left: -10000px; top: 0;
+    width: ${CONTAINER_WIDTH_PX}px;
+    background: #fff;
+    z-index: -9999;
+  `;
+  container.innerHTML = `<style>${CSS}</style>${bodyHtml}`;
+  document.body.appendChild(container);
+
+  try {
+    // 等待字体和图片加载
+    await document.fonts.ready;
+
+    const canvas = await html2canvas(container, {
+      scale: SCALE,
+      useCORS: true,
+      backgroundColor: '#ffffff',
+      logging: false,
+      width: CONTAINER_WIDTH_PX,
+      windowWidth: CONTAINER_WIDTH_PX,
+    });
+
+    // 计算分页
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    const pageContentHeight = A4_HEIGHT_MM - PAGE_MARGIN_MM * 2;
+
+    // canvas 像素到 mm 的转换
+    const pxPerMm = (canvas.width / SCALE) / CONTENT_WIDTH_MM;
+    const pageHeightPx = Math.floor(pageContentHeight * pxPerMm * SCALE);
+    const totalPages = Math.ceil(canvas.height / pageHeightPx);
+
+    for (let page = 0; page < totalPages; page++) {
+      if (page > 0) pdf.addPage();
+
+      // 切割当前页的 canvas 区域
+      const sliceY = page * pageHeightPx;
+      const sliceHeight = Math.min(pageHeightPx, canvas.height - sliceY);
+
+      const pageCanvas = document.createElement('canvas');
+      pageCanvas.width = canvas.width;
+      pageCanvas.height = sliceHeight;
+
+      const ctx = pageCanvas.getContext('2d')!;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+      ctx.drawImage(
+        canvas,
+        0, sliceY, canvas.width, sliceHeight,
+        0, 0, canvas.width, sliceHeight,
+      );
+
+      const imgData = pageCanvas.toDataURL('image/jpeg', 0.92);
+      const imgHeightMm = (sliceHeight / SCALE) / pxPerMm;
+
+      pdf.addImage(
+        imgData, 'JPEG',
+        PAGE_MARGIN_MM, PAGE_MARGIN_MM,
+        CONTENT_WIDTH_MM, imgHeightMm,
+      );
+    }
+
+    return pdf.output('blob');
+  } finally {
+    document.body.removeChild(container);
   }
 }

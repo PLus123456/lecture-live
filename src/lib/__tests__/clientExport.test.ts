@@ -34,10 +34,10 @@ describe('client export helpers', () => {
     ).toEqual({
       textContents: ['summary', 'timedSummary'],
       includeRecording: false,
-      textDownloadFileCount: 0,
-      downloadFileCount: 0,
-      usesPrintDialog: true,
-      willZip: false,
+      textDownloadFileCount: 2,
+      downloadFileCount: 2,
+      usesPrintDialog: false,
+      willZip: true,
     });
 
     expect(
@@ -45,10 +45,10 @@ describe('client export helpers', () => {
     ).toEqual({
       textContents: ['summary', 'timedSummary'],
       includeRecording: true,
-      textDownloadFileCount: 0,
-      downloadFileCount: 1,
-      usesPrintDialog: true,
-      willZip: false,
+      textDownloadFileCount: 2,
+      downloadFileCount: 3,
+      usesPrintDialog: false,
+      willZip: true,
     });
   });
 

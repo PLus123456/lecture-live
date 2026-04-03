@@ -80,6 +80,7 @@ export default {
     users: '用户',
     logs: '日志',
     reconciliation: '对账',
+    jobQueue: '任务队列',
     backToHome: '返回首页',
     interpret: '来回翻译',
     appName: 'LectureLive',
@@ -842,6 +843,57 @@ export default {
     overCharged: '多记',
     underCharged: '少记',
     total: '共 {n} 条记录',
+  },
+
+  // 任务队列
+  jobQueue: {
+    title: '任务队列',
+    noJobs: '暂无后台任务',
+    noJobsDesc: '当录音结束、系统维护等操作触发时，任务会自动出现在这里',
+    // 状态
+    statusSubmitted: '已提交',
+    statusPending: '挂起',
+    statusProcessing: '处理中',
+    statusSuccess: '成功',
+    statusFailed: '失败',
+    // 任务类型
+    typeKeywordExtraction: '关键词提取',
+    typeReportGeneration: '报告生成',
+    typeQuotaReset: '配额重置',
+    typeStaleSessionReclaim: '会话回收',
+    typeReconciliation: '对账',
+    typeStorageCleanup: '存储清理',
+    typeStorageMigration: '存储迁移',
+    typeBillingMaintenance: '账单维护',
+    // 表头
+    colTime: '时间',
+    colType: '类型',
+    colStatus: '状态',
+    colDuration: '耗时',
+    colRelated: '关联',
+    colActions: '操作',
+    // 筛选
+    allTypes: '所有类型',
+    allStatuses: '所有状态',
+    // 详情
+    viewDetail: '查看',
+    backToList: '返回列表',
+    params: '任务参数',
+    result: '执行结果',
+    error: '错误信息',
+    attempt: '当前次数',
+    maxAttempts: '最大次数',
+    triggeredBy: '触发方',
+    startedAt: '开始时间',
+    completedAt: '完成时间',
+    noParams: '无参数',
+    noResult: '无结果',
+    // 操作
+    retry: '重试',
+    retrySuccess: '已重置为待执行状态',
+    retryFailed: '重试失败',
+    // 分页
+    total: '共 {n} 条',
   },
 
   // 来回翻译

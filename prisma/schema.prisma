@@ -241,3 +241,26 @@ model LlmModel {
   @@index([providerId])
   @@index([purpose])
 }
+
+// ─── 后台任务队列 ───
+model JobQueue {
+  id            String    @id @default(cuid())
+  type          String                            // keyword_extraction, report_generation, quota_reset, stale_session_reclaim, reconciliation, storage_cleanup, storage_migration, billing_maintenance
+  status        String    @default("SUBMITTED")   // SUBMITTED | PENDING | PROCESSING | SUCCESS | FAILED
+  params        String?   @db.Text                // JSON 格式的任务参数
+  result        String?   @db.Text                // JSON 格式的结果摘要
+  error         String?   @db.Text                // 失败时的错误信息
+  sessionId     String?                           // 关联的会话 ID
+  userId        String?                           // 关联的用户 ID
+  triggeredBy   String?                           // "system" | "admin:{userId}"
+  attempt       Int       @default(1)             // 当前尝试次数
+  maxAttempts   Int       @default(1)             // 最大重试次数
+  createdAt     DateTime  @default(now())
+  startedAt     DateTime?                         // 开始处理时间
+  completedAt   DateTime?                         // 处理完成时间
+
+  @@index([type])
+  @@index([status])
+  @@index([sessionId])
+  @@index([createdAt])
+}

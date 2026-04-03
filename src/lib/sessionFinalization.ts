@@ -28,6 +28,7 @@ import { callLLM } from '@/lib/llm/gateway';
 import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
 import { generateSessionReport } from '@/lib/llm/reportManager';
 import { logSystemEvent } from '@/lib/auditLog';
+import { trackJob, JOB_TYPE } from '@/lib/jobQueue';
 import {
   invalidateFoldersApiCache,
   invalidateSessionsApiCache,
@@ -534,24 +535,41 @@ async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
 
     const keywordPromise = Promise.all(
       params.folderIds.map(async (folderId) => {
-        try {
-          await extractAndAccumulateKeywords(
-            params.sessionId,
-            folderId,
-            fullTranscript,
-            callLLM
-          );
-        } catch (error) {
+        await trackJob(
+          {
+            type: JOB_TYPE.KEYWORD_EXTRACTION,
+            sessionId: params.sessionId,
+            userId: params.userId,
+            triggeredBy: 'system',
+            params: { folderId },
+          },
+          async () => {
+            await extractAndAccumulateKeywords(
+              params.sessionId,
+              folderId,
+              fullTranscript,
+              callLLM
+            );
+            return { folderId };
+          }
+        ).catch((error) => {
           console.error(
             `[finalize-bg] keyword extraction failed folder=${folderId}:`,
             error
           );
-        }
+        });
       })
     );
 
-    const reportPromise = (async () => {
-      try {
+    const reportPromise = trackJob(
+      {
+        type: JOB_TYPE.REPORT_GENERATION,
+        sessionId: params.sessionId,
+        userId: params.userId,
+        triggeredBy: 'system',
+        params: { title: params.title, courseName: params.courseName },
+      },
+      async () => {
         const summaryBlocks = (bundle.summaries ?? []) as SummaryBlock[];
         const reportData = await generateSessionReport({
           sessionId: params.sessionId,
@@ -571,10 +589,11 @@ async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
           where: { id: params.sessionId },
           data: { reportPath: stored.path },
         });
-      } catch (error) {
-        console.error('[finalize-bg] report generation failed:', error);
+        return { reportPath: stored.path };
       }
-    })();
+    ).catch((error) => {
+      console.error('[finalize-bg] report generation failed:', error);
+    });
 
     await Promise.allSettled([keywordPromise, reportPromise]);
     await Promise.all([

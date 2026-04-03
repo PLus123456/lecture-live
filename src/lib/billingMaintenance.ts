@@ -1,6 +1,7 @@
 import { prisma } from '@/lib/prisma';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
+import { trackJob, createJob, markJobProcessing, markJobSuccess, markJobFailed, JOB_TYPE } from '@/lib/jobQueue';
 import {
   loadRecordingDraftManifest,
 } from '@/lib/recordingDraftPersistence';
@@ -45,7 +46,14 @@ export function startBillingMaintenanceLoop(
       return;
     }
 
-    const runPromise = runBillingMaintenance({ source: 'scheduler' })
+    const runPromise = trackJob(
+      {
+        type: JOB_TYPE.BILLING_MAINTENANCE,
+        triggeredBy: 'system',
+        params: { source: 'scheduler' },
+      },
+      () => runBillingMaintenance({ source: 'scheduler' }),
+    )
       .catch((error) => {
         billingLogger.error(
           { err: serializeError(error) },
@@ -91,8 +99,37 @@ export async function runBillingMaintenance(options?: {
   source?: 'scheduler' | 'manual';
 }): Promise<BillingMaintenanceSummary> {
   const now = options?.now ?? new Date();
-  const resetUsers = await resetExpiredTranscriptionQuotas(now);
-  const reclaimedSessions = await reclaimStaleSessions(now);
+  const source = options?.source ?? 'manual';
+
+  // 配额重置
+  let resetUsers = 0;
+  {
+    const jobId = await createJob({ type: JOB_TYPE.QUOTA_RESET, triggeredBy: 'system', params: { source } });
+    if (jobId) markJobProcessing(jobId);
+    try {
+      resetUsers = await resetExpiredTranscriptionQuotas(now);
+      if (jobId) markJobSuccess(jobId, { resetUsers });
+    } catch (err) {
+      if (jobId) markJobFailed(jobId, err);
+      throw err;
+    }
+  }
+
+  // 过期会话回收
+  let reclaimedSessions = 0;
+  {
+    const jobId = await createJob({ type: JOB_TYPE.STALE_SESSION_RECLAIM, triggeredBy: 'system', params: { source } });
+    if (jobId) markJobProcessing(jobId);
+    try {
+      reclaimedSessions = await reclaimStaleSessions(now);
+      if (jobId) markJobSuccess(jobId, { reclaimedSessions });
+    } catch (err) {
+      if (jobId) markJobFailed(jobId, err);
+      throw err;
+    }
+  }
+
+  // 每日对账
   const reconciliationRunId = await maybeRunDailyReconciliation(now);
 
   if (resetUsers > 0 || reclaimedSessions > 0 || reconciliationRunId) {
@@ -207,17 +244,26 @@ async function maybeRunDailyReconciliation(now: Date): Promise<string | null> {
     return null;
   }
 
-  const run = await runTranscriptionUsageReconciliation({
-    triggeredBy: 'system',
-    triggeredByName: 'Billing Maintenance',
-    source: 'scheduler',
-  });
+  const jobId = await createJob({ type: JOB_TYPE.RECONCILIATION, triggeredBy: 'system', params: { date: todayUtc } });
+  if (jobId) markJobProcessing(jobId);
 
-  await prisma.siteSetting.upsert({
-    where: { key: RECONCILIATION_LAST_RUN_KEY },
-    create: { key: RECONCILIATION_LAST_RUN_KEY, value: todayUtc },
-    update: { value: todayUtc },
-  });
+  try {
+    const run = await runTranscriptionUsageReconciliation({
+      triggeredBy: 'system',
+      triggeredByName: 'Billing Maintenance',
+      source: 'scheduler',
+    });
 
-  return run.id;
+    await prisma.siteSetting.upsert({
+      where: { key: RECONCILIATION_LAST_RUN_KEY },
+      create: { key: RECONCILIATION_LAST_RUN_KEY, value: todayUtc },
+      update: { value: todayUtc },
+    });
+
+    if (jobId) markJobSuccess(jobId, { reconciliationRunId: run.id });
+    return run.id;
+  } catch (err) {
+    if (jobId) markJobFailed(jobId, err);
+    throw err;
+  }
 }

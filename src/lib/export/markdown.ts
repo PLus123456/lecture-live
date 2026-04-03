@@ -17,10 +17,11 @@ export function exportMarkdown(
   sourceLang = 'en',
   targetLang = 'zh',
   options?: MarkdownSectionOptions,
+  date?: string,
 ): string {
   return exportToMarkdown(
     title,
-    new Date().toISOString(),
+    date || new Date().toISOString(),
     sourceLang,
     targetLang,
     segments,

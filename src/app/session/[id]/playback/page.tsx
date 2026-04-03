@@ -230,6 +230,8 @@ export default function PlaybackPage() {
   const [activeAudioIndex, setActiveAudioIndex] = useState(0);
   const audioRef = useRef<HTMLAudioElement>(null);
   const audioSegmentsRef = useRef<PlaybackAudioSegment[]>([]);
+  /** 缓存完整音频 blob，供导出复用，避免重复下载 */
+  const recordingBlobRef = useRef<Blob | null>(null);
   const activeAudioIndexRef = useRef(0);
   const isPlayingRef = useRef(false);
   const playbackClockRef = useRef<number | null>(null);
@@ -336,6 +338,8 @@ export default function PlaybackPage() {
         if (!res.ok) throw new Error('Audio load failed');
         const mimeType = res.headers.get('content-type') || 'audio/webm';
         const buffer = await res.arrayBuffer();
+        // 缓存完整音频 blob，供导出时复用
+        recordingBlobRef.current = new Blob([buffer], { type: mimeType });
         return { mimeType, buffer };
       })
       .then(async ({ mimeType, buffer }) => {
@@ -414,6 +418,7 @@ export default function PlaybackPage() {
     return () => {
       disposed = true;
       createdUrls.forEach((url) => URL.revokeObjectURL(url));
+      recordingBlobRef.current = null;
       setAudioSegments([]);
       setActiveAudioIndex(0);
     };
@@ -792,6 +797,26 @@ export default function PlaybackPage() {
     userScrolledRef.current = false;
   }, [handleSegmentClick]);
 
+  // 导出录音回调：复用已加载的 blob，避免重复下载
+  const fetchRecordingForExport = useCallback(async (): Promise<Blob | null> => {
+    if (recordingBlobRef.current) {
+      return recordingBlobRef.current;
+    }
+    // 回退：blob 尚未加载或已被清理时，重新 fetch
+    if (!sessionId || !token) return null;
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/audio`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return null;
+      const blob = await res.blob();
+      recordingBlobRef.current = blob;
+      return blob;
+    } catch {
+      return null;
+    }
+  }, [sessionId, token]);
+
   if (!user || !token) {
     return (
         <div className="h-screen flex items-center justify-center bg-cream-50">
@@ -931,6 +956,8 @@ export default function PlaybackPage() {
             translations={translations}
             summaries={summaryBlocksToResponses(summaries)}
             report={reportData}
+            hasRecording={audioSegments.length > 0}
+            fetchRecording={fetchRecordingForExport}
           />
         )}
       </>
@@ -1476,6 +1503,8 @@ export default function PlaybackPage() {
           translations={translations}
           summaries={summaryBlocksToResponses(summaries)}
           report={reportData}
+          hasRecording={audioSegments.length > 0}
+          fetchRecording={fetchRecordingForExport}
         />
       )}
     </div>

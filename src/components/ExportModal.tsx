@@ -47,6 +47,8 @@ interface ExportModalProps {
   report?: SessionReportData | null;
   /** 是否有可用录音 */
   hasRecording?: boolean;
+  /** 外部提供的录音获取回调（优先于内部 fetch，避免重复下载） */
+  fetchRecording?: () => Promise<Blob | null>;
 }
 
 // ─── 内容选项定义 ───
@@ -197,6 +199,7 @@ export default function ExportModal({
   summaries: summariesOverride,
   report,
   hasRecording,
+  fetchRecording: fetchRecordingProp,
 }: ExportModalProps) {
   const isMobile = useIsMobile();
   const { t } = useI18n();
@@ -367,8 +370,8 @@ export default function ExportModal({
     effectiveSelectedContents.length > 0 &&
     (onlyRecording || hasAnyTextContent);
 
-  // 下载录音的回调
-  const fetchRecording = useCallback(async (): Promise<Blob | null> => {
+  // 下载录音的回调：优先使用外部传入的（复用已加载 blob），否则自行 fetch
+  const internalFetchRecording = useCallback(async (): Promise<Blob | null> => {
     if (!sessionId || !token) return null;
     try {
       const res = await fetch(`/api/sessions/${sessionId}/audio`, {
@@ -380,6 +383,8 @@ export default function ExportModal({
       return null;
     }
   }, [sessionId, token]);
+
+  const fetchRecording = fetchRecordingProp ?? internalFetchRecording;
 
   // 执行导出
   const handleExport = async () => {
@@ -431,8 +436,17 @@ export default function ExportModal({
       onClose();
     } catch (err) {
       console.error('Export error:', err);
-      if (err instanceof Error && err.message === 'POPUP_BLOCKED') {
-        setError(t('exportModal.popupBlocked'));
+      if (err instanceof Error) {
+        if (err.message === 'POPUP_BLOCKED') {
+          setError(t('exportModal.popupBlocked'));
+        } else if (
+          err.message === 'Recording download failed' ||
+          err.message === 'Missing recording fetcher'
+        ) {
+          setError(t('exportModal.recordingDownloadError'));
+        } else {
+          setError(t('exportModal.exportError'));
+        }
       } else {
         setError(t('exportModal.exportError'));
       }

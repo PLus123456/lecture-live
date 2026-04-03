@@ -173,7 +173,8 @@ export async function GET(
       const match = range.match(/bytes=(\d+)-(\d*)/);
       if (match) {
         const start = parseInt(match[1], 10);
-        const end = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+        const rawEnd = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+        const end = Math.min(rawEnd, totalSize - 1);
         if (
           Number.isNaN(start) ||
           Number.isNaN(end) ||

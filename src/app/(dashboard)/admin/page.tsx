@@ -16,6 +16,7 @@ import {
   ChevronRight,
   ScrollText,
   Scale,
+  Layers,
 } from 'lucide-react';
 import SiteLogo from '@/components/SiteLogo';
 
@@ -25,8 +26,9 @@ import UserGroupsPanel from '@/components/admin/UserGroupsPanel';
 import UserManagementPanel from '@/components/admin/UserManagementPanel';
 import AuditLogPanel from '@/components/admin/AuditLogPanel';
 import ReconciliationPanel from '@/components/admin/ReconciliationPanel';
+import JobQueuePanel from '@/components/admin/JobQueuePanel';
 
-type AdminTab = 'dashboard' | 'settings' | 'groups' | 'users' | 'logs' | 'reconciliation';
+type AdminTab = 'dashboard' | 'settings' | 'groups' | 'users' | 'logs' | 'reconciliation' | 'jobs';
 
 export default function AdminPage() {
   const { user } = useAuth();
@@ -41,6 +43,7 @@ export default function AdminPage() {
     { id: 'users', label: t('nav.users'), icon: Users },
     { id: 'logs', label: t('nav.logs'), icon: ScrollText },
     { id: 'reconciliation', label: t('nav.reconciliation'), icon: Scale },
+    { id: 'jobs', label: t('nav.jobQueue'), icon: Layers },
   ];
   const [activeTab, setActiveTab] = useState<AdminTab>('dashboard');
 
@@ -179,6 +182,7 @@ export default function AdminPage() {
           {activeTab === 'users' && <UserManagementPanel />}
           {activeTab === 'logs' && <AuditLogPanel />}
           {activeTab === 'reconciliation' && <ReconciliationPanel />}
+          {activeTab === 'jobs' && <JobQueuePanel />}
         </div>
       </div>
     );
@@ -257,6 +261,7 @@ export default function AdminPage() {
         {activeTab === 'users' && <UserManagementPanel />}
         {activeTab === 'logs' && <AuditLogPanel />}
         {activeTab === 'reconciliation' && <ReconciliationPanel />}
+        {activeTab === 'jobs' && <JobQueuePanel />}
       </div>
     </div>
   );

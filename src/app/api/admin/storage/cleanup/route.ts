@@ -3,6 +3,7 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { logAction } from '@/lib/auditLog';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { cleanupExpiredLocalFiles } from '@/lib/storage/migration';
+import { trackJob, JOB_TYPE } from '@/lib/jobQueue';
 
 // 手动触发本地过期文件清理
 export async function POST(req: Request) {
@@ -29,7 +30,14 @@ export async function POST(req: Request) {
   });
 
   try {
-    const result = await cleanupExpiredLocalFiles(settings.local_retention_days);
+    const result = await trackJob(
+      {
+        type: JOB_TYPE.STORAGE_CLEANUP,
+        triggeredBy: `admin:${admin!.id}`,
+        params: { retentionDays: settings.local_retention_days },
+      },
+      () => cleanupExpiredLocalFiles(settings.local_retention_days),
+    );
     return NextResponse.json(result);
   } catch (err) {
     console.error('本地文件清理失败:', err);

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import BottomSheet from '@/components/mobile/BottomSheet';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import {
@@ -314,8 +314,13 @@ export default function ExportModal({
   const onlyRecordingSelected =
     selectedContents.length === 1 && selectedContents[0] === 'recording';
 
-  // 内容复选框切换
+  // 内容复选框切换（节流防止移动端快速连点导致崩溃）
+  const lastToggleRef = useRef(0);
   const toggleContent = useCallback((id: ContentType) => {
+    const now = Date.now();
+    if (now - lastToggleRef.current < 120) return;
+    lastToggleRef.current = now;
+
     setSelectedContents((prev) => {
       const next = prev.includes(id)
         ? prev.filter((c) => c !== id)
@@ -358,7 +363,7 @@ export default function ExportModal({
   const hasAnyTextContent = hasTextContent(effectiveSelectedContents);
   const onlyRecording =
     effectiveSelectedContents.length === 1 && effectiveSelectedContents[0] === 'recording';
-  const showDocumentMode = currentTextCount >= 2 && effectiveFormat !== 'pdf';
+  const showDocumentMode = currentTextCount >= 2;
   const exportPlan = useMemo(
     () => buildExportPlan(effectiveSelectedContents, effectiveFormat, documentMode),
     [effectiveSelectedContents, effectiveFormat, documentMode],
@@ -437,9 +442,7 @@ export default function ExportModal({
     } catch (err) {
       console.error('Export error:', err);
       if (err instanceof Error) {
-        if (err.message === 'POPUP_BLOCKED') {
-          setError(t('exportModal.popupBlocked'));
-        } else if (
+        if (
           err.message === 'Recording download failed' ||
           err.message === 'Missing recording fetcher'
         ) {
@@ -460,7 +463,7 @@ export default function ExportModal({
   const content = (
     <div className="flex flex-col max-h-[70vh] md:max-h-none">
       {showSessionDataLoadingState && (
-        <div className="px-5 pt-4">
+        <div className="px-5 pt-4 animate-fade-slide-in">
           <div className="flex items-center gap-2 rounded-xl border border-cream-200 bg-cream-50 px-3 py-2 text-xs text-charcoal-500">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
             {t('exportModal.loadingData')}
@@ -525,7 +528,7 @@ export default function ExportModal({
 
       {/* 步骤2：选择格式 */}
       {!onlyRecording && (
-        <div className="px-5 pt-2 pb-3 border-t border-cream-100">
+        <div className="px-5 pt-2 pb-3 border-t border-cream-100 animate-fade-slide-in">
           <div className="flex items-center gap-2 mb-3">
             <span className="flex items-center justify-center w-5 h-5 rounded-full bg-rust-500 text-white text-xs font-bold">2</span>
             <span className="text-sm font-semibold text-charcoal-700">{t('exportModal.stepFormat')}</span>
@@ -561,12 +564,6 @@ export default function ExportModal({
             })}
           </div>
 
-          {effectiveFormat === 'pdf' && (
-            <p className="mt-2 text-[10px] text-charcoal-400 flex items-center gap-1">
-              <AlertCircle className="w-3 h-3" />
-              {t('exportModal.pdfHint')}
-            </p>
-          )}
           {effectiveFormat === 'srt' && (
             <p className="mt-2 text-[10px] text-charcoal-400 flex items-center gap-1">
               <AlertCircle className="w-3 h-3" />
@@ -578,7 +575,7 @@ export default function ExportModal({
 
       {/* 步骤3：合并/分开选择 */}
       {showDocumentMode && !onlyRecording && (
-        <div className="px-5 pt-2 pb-3 border-t border-cream-100">
+        <div className="px-5 pt-2 pb-3 border-t border-cream-100 animate-fade-slide-in">
           <div className="flex items-center gap-2 mb-3">
             <span className="flex items-center justify-center w-5 h-5 rounded-full bg-rust-500 text-white text-xs font-bold">3</span>
             <span className="text-sm font-semibold text-charcoal-700">{t('exportModal.stepMode')}</span>
@@ -626,44 +623,37 @@ export default function ExportModal({
 
       {/* 错误提示 */}
       {error && (
-        <div className="mx-5 mb-2 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-xs text-red-600 flex items-center gap-2">
+        <div className="mx-5 mb-2 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-xs text-red-600 flex items-center gap-2 animate-fade-slide-in">
           <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
           {error}
         </div>
       )}
 
       {/* 底栏 */}
-      <div className="px-5 py-4 border-t border-cream-200 flex items-center justify-between bg-cream-50/50 safe-bottom">
+      <div className="px-5 py-4 border-t border-cream-200 bg-cream-50/50 safe-bottom">
         {/* 文件数量提示 */}
-        <div className="text-[10px] text-charcoal-400">
-          {exportPlan.usesPrintDialog ? (
-            <span className="flex items-center gap-1">
-              <AlertCircle className="w-3 h-3" />
-              {exportPlan.downloadFileCount > 0
-                ? t('exportModal.printAndDownload', { count: String(exportPlan.downloadFileCount) })
-                : t('exportModal.printOnly')}
-            </span>
-          ) : exportPlan.willZip ? (
-            <span className="flex items-center gap-1">
+        <div className="text-[10px] text-charcoal-400 text-center mb-3">
+          {exportPlan.willZip ? (
+            <span className="inline-flex items-center gap-1">
               <Package className="w-3 h-3" />
               {t('exportModal.willZip', { count: String(exportPlan.downloadFileCount) })}
             </span>
           ) : exportPlan.downloadFileCount === 1 ? (
-            <span className="flex items-center gap-1">
+            <span className="inline-flex items-center gap-1">
               <FileType className="w-3 h-3" />
               {t('exportModal.singleFile')}
             </span>
           ) : null}
         </div>
 
-        <div className="flex items-center gap-2">
-          <button onClick={onClose} className="btn-secondary text-xs px-3 py-1.5">
+        <div className="flex items-center justify-center gap-3">
+          <button onClick={onClose} className="btn-secondary text-xs px-4 py-1.5">
             {t('common.cancel')}
           </button>
           <button
             onClick={handleExport}
             disabled={isExporting || !canExport}
-            className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5"
+            className="btn-primary text-xs px-5 py-1.5 flex items-center gap-1.5"
           >
             {isExporting ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />

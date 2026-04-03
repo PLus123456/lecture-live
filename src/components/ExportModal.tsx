@@ -349,7 +349,11 @@ export default function ExportModal({
       onClose();
     } catch (err) {
       console.error('Export error:', err);
-      setError(t('exportModal.exportError'));
+      if (err instanceof Error && err.message === 'POPUP_BLOCKED') {
+        setError(t('exportModal.popupBlocked'));
+      } else {
+        setError(t('exportModal.exportError'));
+      }
     } finally {
       setIsExporting(false);
     }

@@ -60,7 +60,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
 
   // 水合中 或 正在从 cookie 恢复 → 显示骨架屏
   return (
-    <div className="min-h-screen bg-cream-50">
+    <div className="min-h-[100dvh] bg-cream-50">
       <div className="animate-pulse">
         {/* 侧边栏骨架 */}
         <div className="fixed left-0 top-0 h-full w-56 bg-white border-r border-cream-200">

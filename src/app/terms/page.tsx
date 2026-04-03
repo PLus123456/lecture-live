@@ -9,7 +9,7 @@ export default function TermsPage() {
   const [lang, setLang] = useState<Lang>('en');
 
   return (
-    <div className="min-h-screen bg-cream-50 dark:bg-charcoal-900">
+    <div className="min-h-[100dvh] bg-cream-50 dark:bg-charcoal-900">
       {/* 顶部导航栏 */}
       <header className="sticky top-0 z-10 bg-cream-50/80 dark:bg-charcoal-900/80 backdrop-blur-sm border-b border-cream-300 dark:border-charcoal-700">
         <div className="max-w-4xl mx-auto px-6 py-4 flex items-center justify-between">

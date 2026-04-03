@@ -664,7 +664,7 @@ export default function ViewerPage() {
   // 错误页面
   if (error) {
     return (
-      <div className={`min-h-screen flex items-center justify-center ${
+      <div className={`min-h-[100dvh] flex items-center justify-center ${
         theme === 'dark' ? 'bg-charcoal-900' : 'bg-cream-50'
       }`}>
         <div className="text-center max-w-sm px-6">
@@ -692,7 +692,7 @@ export default function ViewerPage() {
   // 加载中
   if (loading) {
     return (
-      <div className={`min-h-screen flex items-center justify-center ${
+      <div className={`min-h-[100dvh] flex items-center justify-center ${
         theme === 'dark' ? 'bg-charcoal-900' : 'bg-cream-50'
       }`}>
         <div className="text-center">

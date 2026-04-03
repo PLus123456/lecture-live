@@ -19,8 +19,9 @@ export function exportToSrt(
   translations?: Record<string, string>
 ): string {
   const lines: string[] = [];
+  const valid = segments.filter((seg) => seg.endMs > seg.startMs);
 
-  segments.forEach((seg, index) => {
+  valid.forEach((seg, index) => {
     lines.push(`${index + 1}`);
     lines.push(`${formatSrtTime(seg.startMs)} --> ${formatSrtTime(seg.endMs)}`);
     lines.push(seg.text);

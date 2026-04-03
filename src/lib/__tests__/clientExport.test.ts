@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   buildExportPlan,
   executeExport,
+  normalizeContentsForFormat,
   type ExportOptions,
 } from '@/lib/export/clientExport';
 
@@ -61,6 +62,23 @@ describe('client export helpers', () => {
       downloadFileCount: 2,
       usesPrintDialog: false,
       willZip: true,
+    });
+  });
+
+  it('SRT 会把文本内容收敛为仅 transcript', () => {
+    expect(
+      normalizeContentsForFormat(['transcript', 'summary', 'timedSummary', 'recording'], 'srt')
+    ).toEqual(['transcript', 'recording']);
+
+    expect(
+      buildExportPlan(['transcript', 'summary', 'timedSummary'], 'srt', 'separate')
+    ).toEqual({
+      textContents: ['transcript'],
+      includeRecording: false,
+      textDownloadFileCount: 1,
+      downloadFileCount: 1,
+      usesPrintDialog: false,
+      willZip: false,
     });
   });
 

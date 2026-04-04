@@ -304,7 +304,7 @@ export default function SettingsDrawer({
     <>
       {/* Backdrop */}
       <div
-        className="fixed inset-0 bg-charcoal-900/30 backdrop-blur-sm z-50 animate-backdrop-enter"
+        className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 animate-backdrop-enter"
         onClick={onClose}
       />
 

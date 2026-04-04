@@ -386,7 +386,7 @@ function GroupModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
       <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">
           <h3 className="text-base font-semibold text-charcoal-800">
@@ -501,7 +501,7 @@ function CreateGroupModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
       <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">
           <h3 className="text-base font-semibold text-charcoal-800">{t('admin.createGroup')}</h3>
@@ -800,7 +800,7 @@ export default function UserGroupsPanel() {
       )}
 
       {deleteConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
           <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-sm mx-4 p-6">
             <p className="text-sm text-charcoal-700 mb-4">
               {t('admin.deleteGroupConfirm', { name: deleteConfirm.name })}

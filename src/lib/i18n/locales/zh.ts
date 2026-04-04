@@ -598,6 +598,15 @@ export default {
     freeDesc: '免费版，提供基础转录功能',
     proDesc: '专业版，提供扩展配额和模型访问',
     adminDesc: '管理员，拥有无限制访问权限',
+    selectAllProviders: '全选所有供应商',
+    noProvidersHint: '尚未配置 LLM 供应商，请在 设置 > LLM 中配置。',
+    createGroup: '新建用户组',
+    deleteGroup: '删除',
+    deleteGroupConfirm: '确定删除用户组「{name}」？该组中的用户将恢复为其角色的默认配额。',
+    customGroup: '自定义用户组',
+    noCustomGroup: '无（使用角色默认值）',
+    groupColor: '颜色',
+    custom: '自定义',
   },
 
   // 管理员设置面板

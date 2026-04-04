@@ -46,6 +46,7 @@ model User {
   storageHoursUsed            Float   @default(0)
   storageHoursLimit           Float   @default(10)     // FREE=10h录音, PRO=100h, ADMIN=unlimited
   allowedModels               String  @default("local") // 逗号分隔: "local,gpt,claude,deepseek"
+  customGroupId               String?                      // 自定义用户组 ID，指向 SiteSetting 中存储的自定义组
 
   sessions    Session[]
   shareLinks  ShareLink[]

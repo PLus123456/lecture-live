@@ -611,6 +611,15 @@ export default {
     freeDesc: 'Free tier with basic transcription features',
     proDesc: 'Professional tier with extended quotas and model access',
     adminDesc: 'Administrator with unlimited access',
+    selectAllProviders: 'Select All Providers',
+    noProvidersHint: 'No LLM providers configured. Set them up in Settings > LLM.',
+    createGroup: 'New Group',
+    deleteGroup: 'Delete',
+    deleteGroupConfirm: 'Delete group "{name}"? Users in this group will revert to their role defaults.',
+    customGroup: 'Custom Group',
+    noCustomGroup: 'None (use role defaults)',
+    groupColor: 'Color',
+    custom: 'Custom',
   },
 
   // 管理员设置面板

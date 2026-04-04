@@ -24,6 +24,7 @@ const USER_SELECT = {
   storageHoursUsed: true,
   storageHoursLimit: true,
   allowedModels: true,
+  customGroupId: true,
 } as const;
 
 // 管理员用户列表 API
@@ -54,9 +55,13 @@ export async function GET(req: Request) {
       ];
     }
 
-    // 用户组过滤
-    if (groupFilter && ['ADMIN', 'PRO', 'FREE'].includes(groupFilter)) {
-      where.role = groupFilter;
+    // 用户组过滤（系统角色或自定义组）
+    if (groupFilter) {
+      if (['ADMIN', 'PRO', 'FREE'].includes(groupFilter)) {
+        where.role = groupFilter;
+      } else {
+        where.customGroupId = groupFilter;
+      }
     }
 
     const users = await prisma.user.findMany({
@@ -218,6 +223,7 @@ export async function PATCH(req: Request) {
       points?: number;
       originalRole?: string | null;
       roleExpiresAt?: string | null;
+      customGroupId?: string | null;
     };
 
     if (!userId) {
@@ -290,6 +296,37 @@ export async function PATCH(req: Request) {
           return NextResponse.json({ error: '无效的日期格式' }, { status: 400 });
         }
         data.roleExpiresAt = d;
+      }
+    }
+
+    // 自定义用户组分配
+    if (fields.customGroupId !== undefined) {
+      if (fields.customGroupId === null || fields.customGroupId === '') {
+        // 清除自定义组，恢复角色默认配额
+        data.customGroupId = null;
+        const role = (data.role as string) || existing.role;
+        const defaults = getDefaultQuotasForRole(role as 'ADMIN' | 'PRO' | 'FREE');
+        data.allowedModels = defaults.allowedModels;
+        data.transcriptionMinutesLimit = defaults.transcriptionMinutesLimit;
+        data.storageHoursLimit = defaults.storageHoursLimit;
+      } else {
+        // 分配到自定义组，从组配置同步配额
+        data.customGroupId = fields.customGroupId;
+        // 读取组配置
+        const groupRow = await prisma.siteSetting.findUnique({ where: { key: 'custom_groups' } });
+        if (groupRow) {
+          try {
+            const groups = JSON.parse(groupRow.value);
+            const group = Array.isArray(groups) ? groups.find((g: { id: string }) => g.id === fields.customGroupId) : null;
+            if (group?.permissions) {
+              data.allowedModels = group.permissions.allowedModels;
+              data.transcriptionMinutesLimit = group.permissions.transcriptionMinutesLimit;
+              data.storageHoursLimit = group.permissions.storageHoursLimit;
+            }
+          } catch {
+            // 解析失败，忽略配额同步
+          }
+        }
       }
     }
 

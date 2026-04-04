@@ -31,6 +31,12 @@ interface UserItem {
   storageHoursUsed: number;
   storageHoursLimit: number;
   allowedModels: string;
+  customGroupId: string | null;
+}
+
+interface CustomGroupOption {
+  id: string;
+  name: string;
 }
 
 function RoleBadge({ role }: { role: string }) {
@@ -87,16 +93,17 @@ function UserDetailModal({
   token,
   onClose,
   onUpdated,
+  customGroups,
 }: {
   user: UserItem;
   token: string | null;
   onClose: () => void;
   onUpdated: () => void;
+  customGroups: CustomGroupOption[];
 }) {
   const { t } = useI18n();
   const [email, setEmail] = useState(user.email);
   const [displayName, setDisplayName] = useState(user.displayName);
-  const [role, setRole] = useState(user.role);
   const [status, setStatus] = useState(user.status);
   const [points, setPoints] = useState(String(user.points));
   const [password, setPassword] = useState('');
@@ -107,6 +114,12 @@ function UserDetailModal({
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
+  // 统一用户组选择：内置组用 "FREE"/"PRO"/"ADMIN"，自定义组用组 ID
+  const initGroupValue = user.customGroupId || user.role;
+  const [groupValue, setGroupValue] = useState(initGroupValue);
+
+  const isCustomGroup = (v: string) => !['FREE', 'PRO', 'ADMIN'].includes(v);
+
   const handleSave = async () => {
     setSubmitting(true);
     setError('');
@@ -115,10 +128,21 @@ function UserDetailModal({
 
       if (email !== user.email) body.email = email;
       if (displayName !== user.displayName) body.displayName = displayName;
-      if (role !== user.role) body.role = role;
       if (status !== user.status) body.status = status;
       if (Number(points) !== user.points) body.points = Number(points);
       if (password.length > 0) body.password = password;
+
+      // 处理用户组变更
+      if (groupValue !== initGroupValue) {
+        if (isCustomGroup(groupValue)) {
+          // 选了自定义组
+          body.customGroupId = groupValue;
+        } else {
+          // 选了内置组
+          if (groupValue !== user.role) body.role = groupValue;
+          if (user.customGroupId) body.customGroupId = null; // 清除自定义组
+        }
+      }
 
       const newOriginalRole = originalRole || null;
       if (newOriginalRole !== (user.originalRole ?? null)) {
@@ -207,7 +231,13 @@ function UserDetailModal({
               )}
               <div className="md:text-center">
                 <div className="text-sm font-semibold text-charcoal-800">{user.displayName}</div>
-                <RoleBadge role={user.role} />
+                {user.customGroupId ? (
+                  <span className="inline-block text-[10px] px-2 py-0.5 rounded border font-medium bg-purple-50 text-purple-500 border-purple-200">
+                    {customGroups.find((g) => g.id === user.customGroupId)?.name || user.customGroupId}
+                  </span>
+                ) : (
+                  <RoleBadge role={user.role} />
+                )}
               </div>
             </div>
 
@@ -265,13 +295,19 @@ function UserDetailModal({
                   <option value={0}>禁用</option>
                 </select>
               </div>
-              {/* 用户组 */}
+              {/* 用户组（内置 + 自定义统一选择） */}
               <div>
                 <label className="text-xs font-medium text-charcoal-600 mb-1 block">用户组</label>
-                <select value={role} onChange={(e) => setRole(e.target.value as UserItem['role'])} className={inputClass}>
+                <select value={groupValue} onChange={(e) => setGroupValue(e.target.value)} className={inputClass}>
                   <option value="FREE">Free</option>
                   <option value="PRO">Pro</option>
                   <option value="ADMIN">Admin</option>
+                  {customGroups.length > 0 && (
+                    <option disabled>──────────</option>
+                  )}
+                  {customGroups.map((g) => (
+                    <option key={g.id} value={g.id}>{g.name}</option>
+                  ))}
                 </select>
               </div>
             </div>
@@ -520,6 +556,25 @@ export default function UserManagementPanel() {
   const [showFilter, setShowFilter] = useState(false);
   const [filterText, setFilterText] = useState('');
   const [filterGroup, setFilterGroup] = useState('');
+  const [customGroups, setCustomGroups] = useState<CustomGroupOption[]>([]);
+
+  // 加载自定义用户组列表
+  const fetchCustomGroups = useCallback(async () => {
+    try {
+      const res = await fetch('/api/admin/groups', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const custom = (data.groups ?? [])
+          .filter((g: { isSystem: boolean }) => !g.isSystem)
+          .map((g: { id: string; name: string }) => ({ id: g.id, name: g.name }));
+        setCustomGroups(custom);
+      }
+    } catch (err) {
+      console.error('Failed to fetch custom groups:', err);
+    }
+  }, [token]);
 
   const fetchUsers = useCallback(async () => {
     setLoading(true);
@@ -544,7 +599,8 @@ export default function UserManagementPanel() {
 
   useEffect(() => {
     fetchUsers();
-  }, [fetchUsers]);
+    fetchCustomGroups();
+  }, [fetchUsers, fetchCustomGroups]);
 
   const toggleSelectAll = () => {
     if (selectedIds.size === users.length) {
@@ -665,6 +721,9 @@ export default function UserManagementPanel() {
             <option value="ADMIN">Admin</option>
             <option value="PRO">Pro</option>
             <option value="FREE">Free</option>
+            {customGroups.map((g) => (
+              <option key={g.id} value={g.id}>{g.name}</option>
+            ))}
           </select>
           <button
             onClick={() => { setFilterText(''); setFilterGroup(''); }}
@@ -760,7 +819,13 @@ export default function UserManagementPanel() {
                       {user.email}
                     </td>
                     <td className="px-4 py-3">
-                      <RoleBadge role={user.role} />
+                      {user.customGroupId ? (
+                        <span className="inline-block text-[10px] px-2 py-0.5 rounded border font-medium bg-purple-50 text-purple-500 border-purple-200">
+                          {customGroups.find((g) => g.id === user.customGroupId)?.name || user.customGroupId}
+                        </span>
+                      ) : (
+                        <RoleBadge role={user.role} />
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       {!isSelf && (
@@ -796,6 +861,7 @@ export default function UserManagementPanel() {
           token={token}
           onClose={() => setDetailUser(null)}
           onUpdated={() => fetchUsers()}
+          customGroups={customGroups}
         />
       )}
     </div>

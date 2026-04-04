@@ -864,7 +864,7 @@ export default function FoldersPage() {
 
         {propertiesFolder && (
           <div
-            className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm"
+            className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter"
             onClick={() => setPropertiesFolder(null)}
           >
             <div
@@ -913,7 +913,7 @@ export default function FoldersPage() {
 
         {showCreateModal && (
           <div
-            className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm"
+            className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter"
             onClick={() => setShowCreateModal(false)}
           >
             <div
@@ -1135,7 +1135,7 @@ export default function FoldersPage() {
       {/* ── Properties Modal ── */}
       {propertiesFolder && (
         <div
-          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm"
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter"
           onClick={() => setPropertiesFolder(null)}
         >
           <div
@@ -1195,7 +1195,7 @@ export default function FoldersPage() {
       {/* ── New Folder Modal ── */}
       {showCreateModal && (
         <div
-          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm"
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter"
           onClick={() => setShowCreateModal(false)}
         >
           <div

@@ -195,7 +195,7 @@ function UserDetailModal({
     'w-full px-3 py-1.5 text-sm border border-cream-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
       <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-3xl mx-4 max-h-[90vh] overflow-y-auto">
         {/* 标题栏 */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200">
@@ -458,7 +458,7 @@ function CreateUserModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
       <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-md mx-4">
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200">
           <h3 className="text-base font-semibold text-charcoal-800">{t('admin.newUser')}</h3>

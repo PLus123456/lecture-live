@@ -55,7 +55,7 @@ export default function BottomSheet({
     <div className="fixed inset-0 z-[70]">
       <button
         aria-label="Close sheet"
-        className="absolute inset-0 bg-black/40 backdrop-blur-[1px]"
+        className="absolute inset-0 bg-black/30 backdrop-blur-sm animate-backdrop-enter"
         onClick={onClose}
       />
       <div className="absolute inset-x-0 bottom-0 flex justify-center">

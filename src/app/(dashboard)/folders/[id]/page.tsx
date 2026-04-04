@@ -1021,7 +1021,7 @@ function ExpandBtn({ icon, label, onClick, disabled, variant = 'default', title,
 /* ═══ Modal overlay ═══ */
 function ModalOverlay({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={onClose}>
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter" onClick={onClose}>
       <div className="w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         {children}
       </div>

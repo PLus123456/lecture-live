@@ -89,7 +89,7 @@ function SettingsDrawer() {
   return (
     <>
       {/* 半透明遮罩 */}
-      <div className="fixed inset-0 bg-black/20 z-40" aria-hidden="true" />
+      <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-40 animate-backdrop-enter" aria-hidden="true" />
 
       {/* 设置面板 */}
       <div

@@ -282,7 +282,7 @@ export default function NewSessionModal({ onClose, defaultFolderId }: NewSession
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop with blur */}
       <div
-        className="absolute inset-0 bg-charcoal-900/30 backdrop-blur-xl animate-backdrop-enter"
+        className="absolute inset-0 bg-black/30 backdrop-blur-sm animate-backdrop-enter"
         onClick={() => { if (!isStarting) onClose(); }}
       />
 

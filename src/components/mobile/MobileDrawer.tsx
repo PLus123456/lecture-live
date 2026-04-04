@@ -99,7 +99,7 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
     <div className="fixed inset-0 z-[60]">
       <button
         aria-label="Close profile drawer"
-        className="absolute inset-0 bg-black/40"
+        className="absolute inset-0 bg-black/30 backdrop-blur-sm animate-backdrop-enter"
         onClick={onClose}
       />
       <div

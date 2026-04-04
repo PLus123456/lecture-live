@@ -147,7 +147,7 @@ export default function UserSettingsModal() {
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* 背景遮罩 */}
       <div
-        className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-backdrop-enter"
+        className="absolute inset-0 bg-black/30 backdrop-blur-sm animate-backdrop-enter"
         onClick={() => setOpen(false)}
       />
 

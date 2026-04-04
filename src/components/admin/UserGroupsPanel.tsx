@@ -320,6 +320,13 @@ function usePermissionsForm(
     return new Set(initPermissions.allowedModels.split(',').map((s) => s.trim()).filter(Boolean));
   });
 
+  // Bug 8: providers 异步加载完成时，若处于全选模式则更新 selected
+  useEffect(() => {
+    if (selectAll && providers.length > 0) {
+      setSelected(new Set(providers.map((p) => p.name)));
+    }
+  }, [providers, selectAll]);
+
   const handleToggle = (name: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -584,6 +591,7 @@ export default function UserGroupsPanel() {
   const [groups, setGroups] = useState<UserGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [editingGroup, setEditingGroup] = useState<UserGroup | undefined>(undefined);
@@ -669,6 +677,7 @@ export default function UserGroupsPanel() {
         }),
       });
       if (res.ok) {
+        setError('');
         setGroups((prev) =>
           prev.map((g) =>
             g.id === editingGroup.id
@@ -683,9 +692,13 @@ export default function UserGroupsPanel() {
           ),
         );
         setShowModal(false);
+      } else {
+        const body = await res.json().catch(() => ({}));
+        setError(body.error || '保存失败');
       }
     } catch (err) {
       console.error('保存用户组失败:', err);
+      setError('保存失败');
     } finally {
       setSaving(false);
     }
@@ -704,14 +717,19 @@ export default function UserGroupsPanel() {
         body: JSON.stringify(data),
       });
       if (res.ok) {
+        setError('');
         const result = await res.json();
         if (result.group) {
           setGroups((prev) => [...prev, { ...result.group, description: data.description, color: data.color }]);
         }
         setShowCreateModal(false);
+      } else {
+        const body = await res.json().catch(() => ({}));
+        setError(body.error || '创建失败');
       }
     } catch (err) {
       console.error('创建用户组失败:', err);
+      setError('创建失败');
     } finally {
       setSaving(false);
     }
@@ -726,11 +744,16 @@ export default function UserGroupsPanel() {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (res.ok) {
+        setError('');
         setGroups((prev) => prev.filter((g) => g.id !== group.id));
         setDeleteConfirm(null);
+      } else {
+        const body = await res.json().catch(() => ({}));
+        setError(body.error || '删除失败');
       }
     } catch (err) {
       console.error('删除用户组失败:', err);
+      setError('删除失败');
     } finally {
       setSaving(false);
     }
@@ -760,6 +783,15 @@ export default function UserGroupsPanel() {
           </button>
         </div>
       </div>
+
+      {error && (
+        <div className="flex items-center justify-between text-sm text-red-600 bg-red-50 px-4 py-2.5 rounded-lg border border-red-100">
+          <span>{error}</span>
+          <button onClick={() => setError('')} className="ml-3 text-red-400 hover:text-red-600">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {loading ? (
         <div className="flex items-center justify-center py-12 text-charcoal-400 text-sm">

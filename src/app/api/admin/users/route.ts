@@ -310,23 +310,24 @@ export async function PATCH(req: Request) {
         data.transcriptionMinutesLimit = defaults.transcriptionMinutesLimit;
         data.storageHoursLimit = defaults.storageHoursLimit;
       } else {
-        // 分配到自定义组，从组配置同步配额
-        data.customGroupId = fields.customGroupId;
-        // 读取组配置
+        // Bug 5: 先验证自定义组是否存在，再分配
         const groupRow = await prisma.siteSetting.findUnique({ where: { key: 'custom_groups' } });
+        let group: { permissions: { allowedModels: string; transcriptionMinutesLimit: number; storageHoursLimit: number } } | null = null;
         if (groupRow) {
           try {
             const groups = JSON.parse(groupRow.value);
-            const group = Array.isArray(groups) ? groups.find((g: { id: string }) => g.id === fields.customGroupId) : null;
-            if (group?.permissions) {
-              data.allowedModels = group.permissions.allowedModels;
-              data.transcriptionMinutesLimit = group.permissions.transcriptionMinutesLimit;
-              data.storageHoursLimit = group.permissions.storageHoursLimit;
-            }
+            group = Array.isArray(groups) ? groups.find((g: { id: string }) => g.id === fields.customGroupId) : null;
           } catch {
-            // 解析失败，忽略配额同步
+            // 解析失败
           }
         }
+        if (!group) {
+          return NextResponse.json({ error: '指定的用户组不存在' }, { status: 400 });
+        }
+        data.customGroupId = fields.customGroupId;
+        data.allowedModels = group.permissions.allowedModels;
+        data.transcriptionMinutesLimit = group.permissions.transcriptionMinutesLimit;
+        data.storageHoursLimit = group.permissions.storageHoursLimit;
       }
     }
 

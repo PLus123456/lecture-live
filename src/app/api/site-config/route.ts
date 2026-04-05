@@ -22,7 +22,7 @@ export async function GET(req: Request) {
         logo_path: '',
         favicon_path: '',
         site_url: '',
-        site_url_alt: '',
+        site_url_backups: [],
         allow_registration: true,
         password_min_length: 8,
         theme: 'cream',

@@ -6,7 +6,7 @@ export interface SiteSettings {
   site_name: string;
   site_description: string;
   site_url: string;
-  site_url_alt: string;
+  site_url_backups: string[];
   footer_code: string;
   site_announcement: string;
   terms_url: string;
@@ -47,11 +47,13 @@ export interface SiteSettings {
 
 const SITE_SETTINGS_CACHE_TTL_MS = 60_000;
 
+export const MAX_BACKUP_URLS = 10;
+
 const DEFAULT_SITE_SETTINGS: SiteSettings = {
   site_name: 'LectureLive',
   site_description: '',
   site_url: 'http://localhost:3000',
-  site_url_alt: '',
+  site_url_backups: [],
   footer_code: '',
   site_announcement: '',
   terms_url: '/terms',
@@ -120,6 +122,34 @@ function parseInteger(
   return parsed;
 }
 
+function parseUrlBackups(raw: Record<string, string>): string[] {
+  const rawValue = raw.site_url_backups;
+  if (rawValue) {
+    try {
+      const parsed = JSON.parse(rawValue);
+      if (Array.isArray(parsed)) {
+        const cleaned = parsed
+          .filter((item): item is string => typeof item === 'string')
+          .map((item) => item.trim())
+          .filter(Boolean);
+        if (cleaned.length > 0) {
+          return cleaned.slice(0, MAX_BACKUP_URLS);
+        }
+      }
+    } catch {
+      // Fall through to legacy migration
+    }
+  }
+
+  // Legacy migration from site_url_alt
+  const legacy = raw.site_url_alt?.trim();
+  if (legacy) {
+    return [legacy];
+  }
+
+  return [];
+}
+
 function parseEnum<T extends string>(
   value: string | null | undefined,
   allowed: readonly T[],
@@ -130,9 +160,15 @@ function parseEnum<T extends string>(
 }
 
 function normalizeSiteSettings(raw: Record<string, string>): SiteSettings {
+  // Avoid spreading legacy site_url_alt onto the result object — the canonical
+  // field is now site_url_backups (populated via parseUrlBackups below).
+  const { site_url_alt: _legacyAlt, site_url_backups: _rawBackups, ...rest } = raw;
+  void _legacyAlt;
+  void _rawBackups;
   return {
     ...DEFAULT_SITE_SETTINGS,
-    ...raw,
+    ...rest,
+    site_url_backups: parseUrlBackups(raw),
     allow_registration: parseBoolean(
       raw.allow_registration,
       DEFAULT_SITE_SETTINGS.allow_registration
@@ -273,7 +309,7 @@ export function toPublicSiteConfig(settings: SiteSettings) {
     logo_path: settings.logo_path,
     favicon_path: settings.favicon_path,
     site_url: settings.site_url,
-    site_url_alt: settings.site_url_alt,
+    site_url_backups: settings.site_url_backups,
     allow_registration: settings.allow_registration,
     password_min_length: settings.password_min_length,
     theme: settings.theme,

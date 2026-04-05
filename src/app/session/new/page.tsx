@@ -38,6 +38,7 @@ export default function NewSessionPage() {
   const { user, token, restoreSession } = useAuth();
   const { t } = useI18n();
   const restoreAttempted = useRef(false);
+  const restoreInFlight = useRef(false);
   const sidebarCollapsed = useSettingsStore((s) => s.sidebarCollapsed);
   const audioSource = useSettingsStore((s) => s.audioSource);
   const preferredMicDeviceId = useSettingsStore((s) => s.preferredMicDeviceId);
@@ -94,9 +95,15 @@ export default function NewSessionPage() {
   /* ---- Auth restore ---- */
   useEffect(() => {
     if (user && token) return;
+    // restoreSession 正在进行中：StrictMode 双调用或快速重渲染时，不能误跳 /login
+    if (restoreInFlight.current) return;
     if (!restoreAttempted.current) {
       restoreAttempted.current = true;
-      restoreSession().then((ok) => { if (!ok) router.replace('/login'); });
+      restoreInFlight.current = true;
+      restoreSession().then((ok) => {
+        restoreInFlight.current = false;
+        if (!ok) router.replace('/login');
+      });
       return;
     }
     if (!user || !token) router.replace('/login');

@@ -287,12 +287,15 @@ export function usePipReferenceTool() {
     else open();
   }, [isOpen, open, close]);
 
+  // 仅在 pipWindow 变更或组件卸载时清理 Document PiP
+  // Video PiP 的清理由 useVideoPip 内部 useEffect 管理
+  // 注意：不能将 videoPip 放入 deps，否则因每次渲染 videoPip 对象引用变化
+  //       导致 cleanup 反复执行 pipWindow?.close()，Document PiP 会立即关闭
   useEffect(() => {
     return () => {
       try { pipWindow?.close(); } catch { /* ignore */ }
-      videoPip.close();
     };
-  }, [pipWindow, videoPip]);
+  }, [pipWindow]);
 
   return { pipWindow, isOpen, pinned, setPinned, mode, open, close, toggle, videoPipUpdate: videoPip.updateData };
 }
@@ -586,11 +589,18 @@ function renderPipCanvas(
 
 /**
  * Safari Video PiP Hook — 管理 Canvas → Video → PiP 生命周期
+ *
+ * 关键设计：挂载时「预热」video 元素
+ * iOS Safari 要求 requestPictureInPicture() 在用户手势上下文内同步调用，
+ * 但如果 video 还没有可用帧（readyState < HAVE_CURRENT_FRAME）则会被拒绝。
+ * 预热方案：挂载时即创建 canvas → captureStream → video.play()，
+ * 这样用户点击 PiP 按钮时 video 已有数据，可直接进入画中画。
  */
 function useVideoPip(onClosed: () => void) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const rafRef = useRef<number>(0);
+  const warmedUpRef = useRef(false);
   const dataRef = useRef<Parameters<typeof renderPipCanvas>[1]>({
     srcName: '', tgtName: '', recentSourceText: '', recentTargetText: '', hasTranslation: false,
   });
@@ -611,7 +621,7 @@ function useVideoPip(onClosed: () => void) {
       const video = document.createElement('video');
       video.setAttribute('playsinline', '');
       video.setAttribute('webkit-playsinline', '');
-      video.setAttribute('autopictureinpicture', '');
+      // 注意：不设置 autopictureinpicture，避免页面切后台时自动进入 PiP
       video.muted = true;
       video.autoplay = true;
       video.style.position = 'fixed';
@@ -628,8 +638,24 @@ function useVideoPip(onClosed: () => void) {
     return { canvas: canvasRef.current, video: videoRef.current };
   }, []);
 
-  // 启动渲染循环
+  // ── 预热：挂载时创建元素、渲染一帧、启动流并播放 ──
+  // 使 video.readyState >= HAVE_CURRENT_FRAME，确保后续 PiP 请求不会因缺数据被拒
+  useEffect(() => {
+    if (!supportsVideoPip() || warmedUpRef.current) return;
+    warmedUpRef.current = true;
+    const { canvas, video } = ensureElements();
+    renderPipCanvas(canvas, dataRef.current);
+    const stream = getCaptureStream(canvas, 5); // 低帧率预热，节省资源
+    if (stream) {
+      video.srcObject = stream;
+      video.play().catch(() => { /* 静音自动播放一般不会被阻止 */ });
+    }
+  }, [ensureElements]);
+
+  // 启动渲染循环（PiP 打开后全速渲染）
   const startRenderLoop = useCallback(() => {
+    // 先取消已有循环，防止重复
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
     const render = () => {
       if (canvasRef.current) {
         renderPipCanvas(canvasRef.current, dataRef.current);
@@ -647,39 +673,43 @@ function useVideoPip(onClosed: () => void) {
   }, []);
 
   // 打开 Video PiP
-  // 关键：Safari 要求 requestPictureInPicture() 在用户手势栈内同步调用，
-  // 不能在 await 之后调用，否则用户手势上下文过期会被拒绝。
   const open = useCallback(async (): Promise<boolean> => {
     try {
       const { canvas, video } = ensureElements();
 
-      // 先渲染一帧，确保 canvas 有内容且尺寸正确
+      // 渲染最新一帧
       renderPipCanvas(canvas, dataRef.current);
 
-      // captureStream — 兼容 webkit 前缀
-      const stream = getCaptureStream(canvas, 30);
-      if (!stream) {
-        console.error('[PiP] captureStream not available');
-        return false;
+      // 如果流已断开（首次打开或 close 后仍保留），重新连接
+      if (!video.srcObject) {
+        const stream = getCaptureStream(canvas, 30);
+        if (!stream) {
+          console.error('[PiP] captureStream not available');
+          return false;
+        }
+        video.srcObject = stream;
       }
-      video.srcObject = stream;
 
-      // 同步发起 play()，但不 await —— 保持用户手势上下文存活
-      const playPromise = video.play();
+      // 确保 video 正在播放（预热阶段可能已在播放）
+      if (video.paused) {
+        // 不 await —— 保持用户手势上下文存活
+        video.play().catch(() => {});
+      }
 
-      // 在用户手势栈内立即请求 PiP（不能放在 await 之后）
+      // 在用户手势栈内立即请求 PiP
       try {
         await requestVideoPip(video);
       } catch (pipErr) {
-        // 部分 Safari / iOS 版本要求 video 已在播放状态才能进入 PiP，
-        // 先等 play 完成再重试一次
-        console.warn('[PiP] First PiP attempt failed, waiting for play then retry:', pipErr);
-        await playPromise;
+        // 部分 Safari / iOS 版本要求 video 处于播放且有可用帧，
+        // 等 play 完成 + 一帧渲染后再重试
+        console.warn('[PiP] First PiP attempt failed, retrying:', pipErr);
+        if (video.paused) {
+          await video.play();
+        }
+        // 等待一帧，让 canvas 数据通过 stream 到达 video
+        await new Promise<void>(r => requestAnimationFrame(() => r()));
         await requestVideoPip(video);
       }
-
-      // 确保 play 完成（如果尚未完成）
-      await playPromise;
 
       // 监听 PiP 退出（标准事件 + webkit 事件）
       video.addEventListener('leavepictureinpicture', onClosed, { once: true });
@@ -693,7 +723,7 @@ function useVideoPip(onClosed: () => void) {
       });
 
       startRenderLoop();
-      console.info('[PiP] Safari Video PiP opened successfully');
+      console.info('[PiP] Video PiP opened successfully');
       return true;
     } catch (err) {
       console.error('[PiP] Video PiP failed:', err);
@@ -713,23 +743,20 @@ function useVideoPip(onClosed: () => void) {
         (videoRef.current as any).webkitSetPresentationMode('inline');
       }
     } catch { /* ignore */ }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
+    // 保留 video.srcObject 不销毁 —— 下次 open 时可快速重用，
+    // 避免重新创建流和等待 video 加载数据
   }, [stopRenderLoop]);
 
-  // 更新渲染数据（由外部 hook 调用）
+  // 更新渲染数据（由外部 bridge 组件调用）
   const updateData = useCallback((data: Parameters<typeof renderPipCanvas>[1]) => {
     dataRef.current = data;
   }, []);
 
-  // 清理
+  // 组件卸载时完全清理
   useEffect(() => {
     return () => {
-      stopRenderLoop();
-      try {
-        exitVideoPip();
-      } catch { /* ignore */ }
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      try { exitVideoPip(); } catch { /* ignore */ }
       if (canvasRef.current) {
         canvasRef.current.remove();
         canvasRef.current = null;
@@ -740,9 +767,9 @@ function useVideoPip(onClosed: () => void) {
         videoRef.current = null;
       }
     };
-  }, [stopRenderLoop]);
+  }, []);
 
-  return { open, close, updateData };
+  return useMemo(() => ({ open, close, updateData }), [open, close, updateData]);
 }
 
 /**

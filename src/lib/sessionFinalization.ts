@@ -438,16 +438,18 @@ function buildFinalizePromotionData(session: {
   status: SessionStatus;
   serverPausedAt: Date | null;
 }): Prisma.SessionUpdateManyMutationInput {
+  const now = new Date();
   const data: Prisma.SessionUpdateManyMutationInput = {
     status: 'FINALIZING',
+    // 用 serverPausedAt 记录"录音实际结束时间"，避免 finalize 延迟造成 duration 被高估。
+    serverPausedAt: now,
   };
 
   if (session.status === 'PAUSED' && session.serverPausedAt) {
     const pendingPausedMs = Math.max(
       0,
-      Date.now() - session.serverPausedAt.getTime()
+      now.getTime() - session.serverPausedAt.getTime()
     );
-    data.serverPausedAt = null;
     if (pendingPausedMs > 0) {
       data.serverPausedMs = { increment: pendingPausedMs };
     }

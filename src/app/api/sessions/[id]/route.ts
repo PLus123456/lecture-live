@@ -275,11 +275,15 @@ function buildSessionUpdateData(options: {
     data.serverPausedAt = options.session.serverPausedAt ?? now;
   }
 
-  if (options.nextStatus === 'FINALIZING' && sessionWasPaused) {
-    data.serverPausedAt = null;
-    if (pendingPausedMs > 0) {
+  if (options.nextStatus === 'FINALIZING') {
+    // 从 PAUSED 转入时，先把挂起的暂停时长并入 serverPausedMs
+    if (sessionWasPaused && pendingPausedMs > 0) {
       data.serverPausedMs = { increment: pendingPausedMs };
     }
+    // 用 serverPausedAt 记录"录音实际结束时间"，这样 resolveServerRecordingDurationMs
+    // 的 pendingPausedMs 会把 FINALIZING 之后经过的时间从 duration 中扣除，
+    // 避免 finalize 延迟（如请求失败后恢复）时 duration 被严重高估。
+    data.serverPausedAt = now;
   }
 
   return data;

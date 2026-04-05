@@ -214,6 +214,7 @@ export default function PlaybackPage() {
   const translations = useTranslationStore((s) => s.translations);
   const clearTranslations = useTranslationStore((s) => s.clearAll);
   const restoreAttemptedRef = useRef(false);
+  const restoreInFlightRef = useRef(false);
 
   const [session, setSession] = useState<SessionData | null>(null);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
@@ -247,9 +248,13 @@ export default function PlaybackPage() {
   // Auth guard — 和 session page 一样防止水合竞态
   useEffect(() => {
     if (user && token) return;
+    // restoreSession 正在进行中：StrictMode 双调用或快速重渲染时，不能误跳 /login
+    if (restoreInFlightRef.current) return;
     if (!restoreAttemptedRef.current) {
       restoreAttemptedRef.current = true;
+      restoreInFlightRef.current = true;
       restoreSession().then((ok) => {
+        restoreInFlightRef.current = false;
         if (!ok) {
           const { user: u, token: t } = useAuthStore.getState();
           if (!u || !t) {

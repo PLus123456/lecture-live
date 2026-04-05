@@ -3,7 +3,7 @@
 /**
  * OriginGuard — 前端域名二进制校验组件
  *
- * 从 /api/site-config 获取 site_url 和 site_url_alt，
+ * 从 /api/site-config 获取 site_url 和 site_url_backups，
  * 将允许的 origin 和当前 window.location.origin 编码为 UTF-8 字节序列，
  * 逐字节比较（"二进制体操"），不匹配则显示 403 拒绝页面。
  */
@@ -59,10 +59,15 @@ export default function OriginGuard({
         const data = await res.json();
 
         const siteUrl: string = data.site_url ?? '';
-        const siteUrlAlt: string = data.site_url_alt ?? '';
+        const siteUrlBackups: string[] = Array.isArray(data.site_url_backups)
+          ? data.site_url_backups.filter(
+              (item: unknown): item is string =>
+                typeof item === 'string' && item.trim().length > 0
+            )
+          : [];
 
         // 如果管理员没有配置任何 URL，放行
-        if (!siteUrl.trim() && !siteUrlAlt.trim()) {
+        if (!siteUrl.trim() && siteUrlBackups.length === 0) {
           if (!cancelled) setState('pass');
           return;
         }
@@ -71,7 +76,9 @@ export default function OriginGuard({
 
         const allowedOrigins: string[] = [];
         if (siteUrl.trim()) allowedOrigins.push(extractOrigin(siteUrl));
-        if (siteUrlAlt.trim()) allowedOrigins.push(extractOrigin(siteUrlAlt));
+        for (const backup of siteUrlBackups) {
+          allowedOrigins.push(extractOrigin(backup));
+        }
 
         const matched = allowedOrigins.some((origin) => {
           if (!origin) return false;

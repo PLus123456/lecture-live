@@ -41,7 +41,7 @@ interface SiteSettingsData {
   site_name: string;
   site_description: string;
   site_url: string;
-  site_url_alt: string;
+  site_url_backups: string[];
   footer_code: string;
   site_announcement: string;
   terms_url: string;
@@ -83,8 +83,10 @@ interface SiteSettingsData {
   rate_limit_api: string;
   jwt_expiry: string;
   bcrypt_rounds: string;
-  [key: string]: string | boolean;
+  [key: string]: string | boolean | string[];
 }
+
+const MAX_BACKUP_URLS = 10;
 
 /** LLM 模型用途 */
 type ModelPurpose = 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION';
@@ -248,7 +250,7 @@ const defaultSettings: SiteSettingsData = {
   site_name: 'LectureLive',
   site_description: '',
   site_url: 'http://localhost:3000',
-  site_url_alt: '',
+  site_url_backups: [],
   footer_code: '',
   site_announcement: '',
   terms_url: '/terms',
@@ -528,6 +530,56 @@ function IconUpload({
           <span className="text-xs text-charcoal-400 truncate max-w-[200px]">{currentPath}</span>
         )}
       </div>
+    </div>
+  );
+}
+
+/** 备用 URL 动态列表 */
+function BackupUrlList({
+  urls,
+  onChange,
+  onAdd,
+  onRemove,
+}: {
+  urls: string[];
+  onChange: (index: number, value: string) => void;
+  onAdd: () => void;
+  onRemove: (index: number) => void;
+}) {
+  const { t } = useI18n();
+  const atLimit = urls.length >= MAX_BACKUP_URLS;
+  return (
+    <div className="space-y-2">
+      {urls.map((url, index) => (
+        <div key={index} className="flex items-center gap-2">
+          <div className="flex-1">
+            <TextInput
+              value={url}
+              onChange={(v) => onChange(index, v)}
+              placeholder="https://backup.example.com"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={() => onRemove(index)}
+            className="flex-shrink-0 p-2 text-charcoal-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+            aria-label={t('common.delete')}
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={onAdd}
+        disabled={atLimit}
+        className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-rust-600 dark:text-rust-400 hover:bg-rust-50 dark:hover:bg-charcoal-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent dark:disabled:hover:bg-transparent"
+      >
+        <Plus className="w-3.5 h-3.5" />
+        {atLimit
+          ? t('adminSettings.backupUrlLimitReached')
+          : t('adminSettings.addBackupUrl')}
+      </button>
     </div>
   );
 }
@@ -910,9 +962,15 @@ function ProviderCard({
 function SiteInfoPanel({
   settings,
   onChange,
+  onBackupChange,
+  onBackupAdd,
+  onBackupRemove,
 }: {
   settings: SiteSettingsData;
   onChange: (key: string, value: string) => void;
+  onBackupChange: (index: number, value: string) => void;
+  onBackupAdd: () => void;
+  onBackupRemove: (index: number) => void;
 }) {
   const { t } = useI18n();
   return (
@@ -929,8 +987,13 @@ function SiteInfoPanel({
         <TextInput value={settings.site_url} onChange={(v) => onChange('site_url', v)} placeholder="https://example.com" />
       </SettingField>
 
-      <SettingField label={t('adminSettings.altUrl')} description={t('adminSettings.altUrlDesc')}>
-        <TextInput value={settings.site_url_alt} onChange={(v) => onChange('site_url_alt', v)} placeholder="https://alt.example.com" />
+      <SettingField label={t('adminSettings.backupUrls')} description={t('adminSettings.backupUrlsDesc')}>
+        <BackupUrlList
+          urls={settings.site_url_backups}
+          onChange={onBackupChange}
+          onAdd={onBackupAdd}
+          onRemove={onBackupRemove}
+        />
       </SettingField>
 
       <SettingField label={t('adminSettings.footerCode')} description={t('adminSettings.footerCodeDesc')}>
@@ -1876,6 +1939,29 @@ export default function SettingsPanel() {
     setSettings((prev) => ({ ...prev, [key]: value }));
   }, []);
 
+  // 备用 URL 列表操作
+  const handleBackupChange = useCallback((index: number, value: string) => {
+    setSettings((prev) => {
+      const next = [...prev.site_url_backups];
+      next[index] = value;
+      return { ...prev, site_url_backups: next };
+    });
+  }, []);
+
+  const handleBackupAdd = useCallback(() => {
+    setSettings((prev) => {
+      if (prev.site_url_backups.length >= MAX_BACKUP_URLS) return prev;
+      return { ...prev, site_url_backups: [...prev.site_url_backups, ''] };
+    });
+  }, []);
+
+  const handleBackupRemove = useCallback((index: number) => {
+    setSettings((prev) => ({
+      ...prev,
+      site_url_backups: prev.site_url_backups.filter((_, i) => i !== index),
+    }));
+  }, []);
+
   // 重置设置为上次保存的状态
   const handleReset = () => {
     setSettings(originalSettings);
@@ -1883,15 +1969,40 @@ export default function SettingsPanel() {
 
   // 保存站点设置到后端
   const handleSave = async () => {
+    // 前端校验：清洗备用 URL 列表
+    const cleanedBackups = settings.site_url_backups
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    for (const url of cleanedBackups) {
+      try {
+        new URL(url);
+      } catch {
+        alert(t('adminSettings.invalidBackupUrl'));
+        return;
+      }
+    }
+
+    if (cleanedBackups.length > MAX_BACKUP_URLS) {
+      alert(t('adminSettings.backupUrlLimitReached'));
+      return;
+    }
+
+    const payload = { ...settings, site_url_backups: cleanedBackups };
+
     setSaving(true);
     try {
       const res = await fetch('/api/admin/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(settings),
+        body: JSON.stringify(payload),
       });
       if (res.ok) {
-        setOriginalSettings(settings);
+        setSettings(payload);
+        setOriginalSettings(payload);
+      } else {
+        const err = await res.json().catch(() => null);
+        if (err?.error) alert(err.error);
       }
     } catch (err) {
       console.error('保存设置失败:', err);
@@ -1912,7 +2023,15 @@ export default function SettingsPanel() {
 
     switch (activeTab) {
       case 'site':
-        return <SiteInfoPanel settings={settings} onChange={handleChange} />;
+        return (
+          <SiteInfoPanel
+            settings={settings}
+            onChange={handleChange}
+            onBackupChange={handleBackupChange}
+            onBackupAdd={handleBackupAdd}
+            onBackupRemove={handleBackupRemove}
+          />
+        );
       case 'registration':
         return <RegistrationPanel settings={settings} onChange={handleChange} onToggle={handleToggle} />;
       case 'email':

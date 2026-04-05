@@ -6,6 +6,7 @@ import {
   getSiteSettings,
   invalidateSiteSettingsCache,
   serializeSiteSettingsForAdmin,
+  MAX_BACKUP_URLS,
 } from '@/lib/siteSettings';
 import { invalidateSonioxDbConfigCache } from '@/lib/soniox/env';
 import { invalidateTrustedProxyCache } from '@/lib/clientIp';
@@ -55,7 +56,7 @@ export async function PUT(req: Request) {
       'site_name',
       'site_description',
       'site_url',
-      'site_url_alt',
+      'site_url_backups',
       'footer_code',
       'site_announcement',
       'terms_url',
@@ -109,6 +110,47 @@ export async function PUT(req: Request) {
       return NextResponse.json({ error: '没有有效的设置项' }, { status: 400 });
     }
 
+    // 预处理 site_url_backups：必须是数组，清洗 + 合法性校验
+    const backupsIdx = entries.findIndex(([key]) => key === 'site_url_backups');
+    if (backupsIdx >= 0) {
+      const rawBackups = entries[backupsIdx][1];
+      if (!Array.isArray(rawBackups)) {
+        return NextResponse.json(
+          { error: '备用 URL 必须是数组' },
+          { status: 400 }
+        );
+      }
+
+      const seen = new Set<string>();
+      const cleaned: string[] = [];
+      for (const item of rawBackups) {
+        if (typeof item !== 'string') continue;
+        const trimmed = item.trim();
+        if (!trimmed) continue;
+        try {
+          new URL(trimmed);
+        } catch {
+          return NextResponse.json(
+            { error: `备用 URL 格式不正确: ${trimmed}` },
+            { status: 400 }
+          );
+        }
+        if (seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        cleaned.push(trimmed);
+      }
+
+      if (cleaned.length > MAX_BACKUP_URLS) {
+        return NextResponse.json(
+          { error: `备用 URL 最多 ${MAX_BACKUP_URLS} 个` },
+          { status: 400 }
+        );
+      }
+
+      // 替换 entries 中的原值，后续 flatMap 统一处理
+      entries[backupsIdx] = ['site_url_backups', JSON.stringify(cleaned)];
+    }
+
     // 记录切换前的存储模式，用于检测是否需要迁移
     const previousSettings = await getSiteSettings({ fresh: true });
 
@@ -128,6 +170,11 @@ export async function PUT(req: Request) {
 
       if (key === 'language') {
         mirroredEntries.push(['default_language', normalizedValue]);
+      }
+
+      // 保存新 backups 时同步清空老字段 site_url_alt
+      if (key === 'site_url_backups') {
+        mirroredEntries.push(['site_url_alt', '']);
       }
 
       return mirroredEntries;

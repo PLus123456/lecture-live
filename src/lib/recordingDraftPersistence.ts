@@ -13,7 +13,19 @@ export interface RecordingDraftManifest {
   receivedSeqs: number[];
 }
 
+// manifest.json 只存元数据——receivedSeqs 始终从 chunks/ 目录扫描得到，
+// 这样并发写入 chunk 时不会因为 manifest 的 read-modify-write 竞态丢失 seq。
+interface StoredManifestMetadata {
+  sessionId: string;
+  userId: string;
+  mimeType: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 type DraftSessionSource = Pick<Session, 'id' | 'userId'>;
+
+const CHUNK_FILENAME_RE = /^(\d+)\.chunk$/;
 
 function normalizeSessionId(sessionId: string): string {
   return sessionId.replace(/[^a-zA-Z0-9_-]/g, '');
@@ -51,25 +63,31 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-function uniqueSortedSeqs(seqs: number[]): number[] {
-  return Array.from(new Set(seqs)).sort((a, b) => a - b);
-}
-
-async function writeManifest(
-  session: DraftSessionSource,
-  manifest: RecordingDraftManifest
-) {
-  await ensureDraftDir(session);
-  await fs.writeFile(
-    getDraftManifestPath(session),
-    JSON.stringify(manifest, null, 2),
-    'utf-8'
-  );
-}
-
-export async function loadRecordingDraftManifest(
+/** 扫描 chunks/ 目录得到当前实际已保存的 seq 列表（source of truth） */
+async function scanChunkSeqsOnDisk(
   session: DraftSessionSource
-): Promise<RecordingDraftManifest | null> {
+): Promise<number[]> {
+  try {
+    const files = await fs.readdir(getDraftChunksDir(session));
+    const seqs: number[] = [];
+    for (const file of files) {
+      const match = CHUNK_FILENAME_RE.exec(file);
+      if (!match) continue;
+      const seq = Number.parseInt(match[1], 10);
+      if (Number.isInteger(seq) && seq >= 0) {
+        seqs.push(seq);
+      }
+    }
+    seqs.sort((a, b) => a - b);
+    return seqs;
+  } catch {
+    return [];
+  }
+}
+
+async function readStoredManifestMetadata(
+  session: DraftSessionSource
+): Promise<StoredManifestMetadata | null> {
   const manifestPath = getDraftManifestPath(session);
   if (!(await fileExists(manifestPath))) {
     return null;
@@ -77,38 +95,55 @@ export async function loadRecordingDraftManifest(
 
   try {
     const raw = await fs.readFile(manifestPath, 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<RecordingDraftManifest>;
+    const parsed = JSON.parse(raw) as Partial<StoredManifestMetadata>;
     if (
       parsed.sessionId !== session.id ||
       parsed.userId !== session.userId ||
       typeof parsed.mimeType !== 'string' ||
       typeof parsed.createdAt !== 'number' ||
-      typeof parsed.updatedAt !== 'number' ||
-      !Array.isArray(parsed.receivedSeqs)
+      typeof parsed.updatedAt !== 'number'
     ) {
       return null;
     }
-
     return {
       sessionId: parsed.sessionId,
       userId: parsed.userId,
       mimeType: parsed.mimeType,
       createdAt: parsed.createdAt,
       updatedAt: parsed.updatedAt,
-      receivedSeqs: uniqueSortedSeqs(
-        parsed.receivedSeqs.filter((seq): seq is number => Number.isInteger(seq) && seq >= 0)
-      ),
     };
   } catch {
     return null;
   }
 }
 
+async function writeStoredManifestMetadata(
+  session: DraftSessionSource,
+  metadata: StoredManifestMetadata
+) {
+  await ensureDraftDir(session);
+  await fs.writeFile(
+    getDraftManifestPath(session),
+    JSON.stringify(metadata, null, 2),
+    'utf-8'
+  );
+}
+
+export async function loadRecordingDraftManifest(
+  session: DraftSessionSource
+): Promise<RecordingDraftManifest | null> {
+  const metadata = await readStoredManifestMetadata(session);
+  if (!metadata) {
+    return null;
+  }
+  const receivedSeqs = await scanChunkSeqsOnDisk(session);
+  return { ...metadata, receivedSeqs };
+}
+
 export async function listRecordingDraftSeqs(
   session: DraftSessionSource
 ): Promise<number[]> {
-  const manifest = await loadRecordingDraftManifest(session);
-  return manifest?.receivedSeqs ?? [];
+  return scanChunkSeqsOnDisk(session);
 }
 
 export async function persistRecordingDraftChunk(
@@ -119,18 +154,19 @@ export async function persistRecordingDraftChunk(
   await fs.writeFile(getChunkFilePath(session, options.seq), options.data);
 
   const now = Date.now();
-  const existing = await loadRecordingDraftManifest(session);
-  const manifest: RecordingDraftManifest = {
+  const existing = await readStoredManifestMetadata(session);
+  const metadata: StoredManifestMetadata = {
     sessionId: session.id,
     userId: session.userId,
     mimeType: options.mimeType || existing?.mimeType || 'audio/webm',
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
-    receivedSeqs: uniqueSortedSeqs([...(existing?.receivedSeqs ?? []), options.seq]),
   };
 
-  await writeManifest(session, manifest);
-  return manifest;
+  await writeStoredManifestMetadata(session, metadata);
+
+  const receivedSeqs = await scanChunkSeqsOnDisk(session);
+  return { ...metadata, receivedSeqs };
 }
 
 export async function mergeRecordingDraftChunks(

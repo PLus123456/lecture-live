@@ -132,6 +132,79 @@ describe('session detail route', () => {
     });
   });
 
+  it('PATCH status=FINALIZING 时记录录音结束时间到 serverPausedAt', async () => {
+    const startedAt = new Date('2026-03-27T10:00:00.000Z');
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 'session-1',
+      userId: 'user-1',
+      title: 'Lecture',
+      status: 'RECORDING',
+      serverStartedAt: startedAt,
+      serverPausedAt: null,
+      serverPausedMs: 0,
+    });
+    sessionUpdateMock.mockResolvedValue({
+      id: 'session-1',
+      userId: 'user-1',
+      status: 'FINALIZING',
+      serverStartedAt: startedAt,
+      serverPausedAt: new Date(),
+    });
+
+    const before = Date.now();
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { status: 'FINALIZING' },
+      }),
+      { params }
+    );
+    const after = Date.now();
+
+    expect(response.status).toBe(200);
+    expect(sessionUpdateMock).toHaveBeenCalledTimes(1);
+    const data = sessionUpdateMock.mock.calls[0][0].data;
+    expect(data.status).toBe('FINALIZING');
+    expect(data.serverPausedAt).toBeInstanceOf(Date);
+    const pausedAtMs = (data.serverPausedAt as Date).getTime();
+    expect(pausedAtMs).toBeGreaterThanOrEqual(before);
+    expect(pausedAtMs).toBeLessThanOrEqual(after);
+  });
+
+  it('PATCH status=FINALIZING 从 PAUSED 转入时会累加挂起的暂停时长', async () => {
+    const startedAt = new Date('2026-03-27T10:00:00.000Z');
+    const pausedAt = new Date(Date.now() - 30_000); // 30s ago
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 'session-1',
+      userId: 'user-1',
+      title: 'Lecture',
+      status: 'PAUSED',
+      serverStartedAt: startedAt,
+      serverPausedAt: pausedAt,
+      serverPausedMs: 0,
+    });
+    sessionUpdateMock.mockResolvedValue({ id: 'session-1' });
+
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { status: 'FINALIZING' },
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(200);
+    const data = sessionUpdateMock.mock.calls[0][0].data;
+    expect(data.status).toBe('FINALIZING');
+    expect(data.serverPausedAt).toBeInstanceOf(Date);
+    // 挂起的 ~30s 暂停时长应被累加到 serverPausedMs
+    expect(data.serverPausedMs).toEqual(
+      expect.objectContaining({ increment: expect.any(Number) })
+    );
+    expect(data.serverPausedMs.increment).toBeGreaterThanOrEqual(29_000);
+    expect(data.serverPausedMs.increment).toBeLessThanOrEqual(31_000);
+  });
+
   it('删除会话时会清理关联表记录', async () => {
     const response = await DELETE(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {

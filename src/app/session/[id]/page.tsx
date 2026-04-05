@@ -488,15 +488,20 @@ export default function ActiveSessionPage() {
   const quotaLimitReachedRef = useRef(false);
   const maxDurationReachedRef = useRef(false);
   const restoreAttemptedRef = useRef(false);
+  const restoreInFlightRef = useRef(false);
 
   // v2.1: Route guard — redirect COMPLETED/ARCHIVED sessions to playback view
   const [sessionChecked, setSessionChecked] = useState(false);
   const [backendStatus, setBackendStatus] = useState<string | null>(null);
   useEffect(() => {
     if (user && token) return;
+    // restoreSession 正在进行中：StrictMode 双调用或快速重渲染时，不能误跳 /login
+    if (restoreInFlightRef.current) return;
     if (!restoreAttemptedRef.current) {
       restoreAttemptedRef.current = true;
+      restoreInFlightRef.current = true;
       restoreSession().then((ok) => {
+        restoreInFlightRef.current = false;
         if (!ok) {
           // zustand persist 可能已经水合了 token，再次检查
           const { user: u, token: t } = useAuthStore.getState();

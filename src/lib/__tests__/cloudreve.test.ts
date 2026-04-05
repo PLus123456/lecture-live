@@ -20,7 +20,7 @@ function createSiteSettings(overrides: Partial<SiteSettings> = {}): SiteSettings
     site_name: 'LectureLive',
     site_description: '',
     site_url: 'http://localhost:3000',
-    site_url_alt: '',
+    site_url_backups: [],
     footer_code: '',
     site_announcement: '',
     terms_url: '/terms',

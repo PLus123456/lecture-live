@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/hooks/useAuth';
@@ -110,6 +110,9 @@ export default function HomePage() {
   const [showNewSession, setShowNewSession] = useState(false);
   const [loading, setLoading] = useState(true);
 
+  const listContainerRef = useRef<HTMLDivElement>(null);
+  const [listLayout, setListLayout] = useState({ visibleCount: 100, paddingY: 14 });
+
   const greeting = useMemo(() => getGreeting(), []);
 
   useEffect(() => {
@@ -196,6 +199,61 @@ export default function HomePage() {
     s.title.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
+  /* ───────── 动态列表布局：填满可用高度，智能挤压 ───────── */
+  const recalcLayout = useCallback(() => {
+    const el = listContainerRef.current;
+    if (!el) return;
+    const H = el.clientHeight;
+    const N = filteredSessions.length;
+    if (H <= 0 || N === 0) return;
+
+    const CONTENT_H = isMobile ? 46 : 42;   // 每项内容区估算高度
+    const DEFAULT_PY = isMobile ? 16 : 14;  // 默认纵向 padding
+    const MIN_PY = isMobile ? 6 : 4;        // 最小挤压 padding
+    const MAX_PY = isMobile ? 24 : 22;      // 最大拉伸 padding
+    const SQUEEZE_RATIO = 0.35;              // 剩余 ≥ 35% 就尝试多塞一项
+
+    const itemH = CONTENT_H + 2 * DEFAULT_PY;
+    const fitCount = Math.floor(H / itemH);
+
+    if (N <= fitCount) {
+      // 条目全放得下，均分空间（cap 上限）
+      const py = Math.min((H / N - CONTENT_H) / 2, MAX_PY);
+      setListLayout({ visibleCount: N, paddingY: Math.max(py, MIN_PY) });
+      return;
+    }
+
+    const leftover = H - fitCount * itemH;
+    const ratio = leftover / itemH;
+
+    if (ratio >= SQUEEZE_RATIO && fitCount > 0) {
+      // 挤一挤多放一个
+      const target = fitCount + 1;
+      const py = (H / target - CONTENT_H) / 2;
+      if (py >= MIN_PY) {
+        setListLayout({ visibleCount: target, paddingY: py });
+        return;
+      }
+    }
+
+    // 均分给 fitCount 个
+    if (fitCount > 0) {
+      const py = Math.min((H / fitCount - CONTENT_H) / 2, MAX_PY);
+      setListLayout({ visibleCount: fitCount, paddingY: Math.max(py, MIN_PY) });
+    } else {
+      setListLayout({ visibleCount: 1, paddingY: MIN_PY });
+    }
+  }, [filteredSessions.length, isMobile]);
+
+  useEffect(() => {
+    const el = listContainerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => recalcLayout());
+    ro.observe(el);
+    recalcLayout();
+    return () => ro.disconnect();
+  }, [recalcLayout]);
+
   const getSessionHref = (session: SessionItem) =>
     ['COMPLETED', 'ARCHIVED'].includes(session.status)
       ? `/session/${session.id}/playback`
@@ -218,7 +276,7 @@ export default function HomePage() {
 
   return (
     <>
-      <div className="flex min-h-[100dvh] flex-col overflow-hidden">
+      <div className={`flex flex-col overflow-hidden ${isMobile ? 'h-[calc(100dvh-6rem)]' : 'h-[100dvh]'}`}>
         {/* 顶部区域：问候 + 搜索 */}
         <div className={`flex-shrink-0 ${isMobile ? 'px-4 pt-5 pb-2' : 'px-8 lg:px-12 pt-8 lg:pt-10 pb-2'}`}>
           {/* 问候语 + New Session 按钮 */}
@@ -286,7 +344,7 @@ export default function HomePage() {
             <h2 className="text-xs font-semibold text-charcoal-400 tracking-wider uppercase">
               Recent Sessions
             </h2>
-            {sessions.length > 3 && (
+            {filteredSessions.length > listLayout.visibleCount && (
               <Link
                 href="/folders"
                 className="text-xs font-medium text-rust-400 hover:text-rust-600 transition-colors"
@@ -299,7 +357,7 @@ export default function HomePage() {
         </div>
 
         {/* 中间可滚动的 Session 列表 */}
-        <div className={`flex-1 min-h-0 overflow-y-auto scrollbar-thin ${isMobile ? 'px-4 pb-28' : 'px-8 lg:px-12'}`}>
+        <div ref={listContainerRef} className={`flex-1 min-h-0 overflow-hidden ${isMobile ? 'px-4' : 'px-8 lg:px-12'}`}>
           {loading ? (
             /* 加载骨架屏 */
             <div className="py-1 animate-pulse space-y-2">
@@ -324,8 +382,8 @@ export default function HomePage() {
               </p>
             </div>
           ) : (
-            <div className="py-1">
-              {filteredSessions.map((s, index) => (
+            <div>
+              {filteredSessions.slice(0, listLayout.visibleCount).map((s, index) => (
                 <Link
                   key={s.id}
                   href={getSessionHref(s)}
@@ -334,9 +392,13 @@ export default function HomePage() {
                              transition-all duration-200 ease-out
                              border border-transparent hover:border-cream-200
                              animate-list-item-in ${
-                               isMobile ? 'min-h-[72px] px-4 py-4' : 'py-3.5 px-3 -mx-3'
+                               isMobile ? 'px-4' : 'px-3 -mx-3'
                              }`}
-                  style={{ animationDelay: `${Math.min(index * 0.05, 0.5)}s` }}
+                  style={{
+                    paddingTop: `${listLayout.paddingY}px`,
+                    paddingBottom: `${listLayout.paddingY}px`,
+                    animationDelay: `${Math.min(index * 0.05, 0.5)}s`,
+                  }}
                 >
                   {/* 状态指示点 */}
                   <div className="flex-shrink-0 flex flex-col items-center gap-1">

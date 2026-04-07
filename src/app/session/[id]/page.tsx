@@ -477,6 +477,7 @@ export default function ActiveSessionPage() {
 
   // v2.1: Finalization state
   const [isFinalizing, setIsFinalizing] = useState(false);
+  const isFinalizingRef = useRef(false);
   const [finalizingSteps, setFinalizingSteps] = useState<FinalizingStep[]>([]);
   const [finalizingError, setFinalizingError] = useState<string | null>(null);
   const [quotaSnapshot, setQuotaSnapshot] = useState<UserQuotas | null>(cachedQuotas);
@@ -685,9 +686,12 @@ export default function ActiveSessionPage() {
       const storeState = useTranscriptStore.getState();
       const isResumable = storeState.recordingState === 'recording' ||
                           storeState.recordingState === 'paused';
+      // 如果 recordingState 是 'stopped' 且还有数据，说明是 FINALIZING 期间刷新的，不能清除
+      const hasDataAfterStop = storeState.recordingState === 'stopped' &&
+                               storeState.segments.length > 0;
       wasRecordingRef.current = isResumable;
 
-      if (!isResumable) {
+      if (!isResumable && !hasDataAfterStop) {
         clearTranscript();
         clearTranslations();
         clearSummaries();
@@ -699,8 +703,9 @@ export default function ActiveSessionPage() {
       cancelled = true;
       resetSummary();
       // 只在非录音状态时清除（避免刷新时丢数据）
+      // FINALIZING 期间也不能清除 — 否则刷新会丢失所有数据
       const currentState = useTranscriptStore.getState().recordingState;
-      if (currentState === 'idle' || currentState === 'stopped') {
+      if ((currentState === 'idle' || currentState === 'stopped') && !isFinalizingRef.current) {
         clearTranscript();
         clearTranslations();
         clearSummaries();
@@ -713,8 +718,9 @@ export default function ActiveSessionPage() {
   useEffect(() => {
     if (draftRestorationDoneRef.current) return;
     if (!sessionChecked || !token || !sessionId) return;
-    // 只在会话状态为 PAUSED 或 RECORDING 时尝试恢复
-    if (backendStatus !== 'PAUSED' && backendStatus !== 'RECORDING') return;
+    // 在会话状态为 PAUSED、RECORDING 或 FINALIZING 时尝试恢复
+    // FINALIZING：用户可能在结束录制后刷新了页面，需要从后端 draft 恢复数据
+    if (backendStatus !== 'PAUSED' && backendStatus !== 'RECORDING' && backendStatus !== 'FINALIZING') return;
     // 如果 store 已经有数据（从 sessionStorage 恢复的页面刷新场景），无需从后端拉取
     if (useTranscriptStore.getState().segments.length > 0) return;
 
@@ -778,6 +784,60 @@ export default function ActiveSessionPage() {
         console.error('从后端恢复草稿失败:', err);
       }
     })();
+  }, [sessionChecked, token, sessionId, backendStatus]);
+
+  // FINALIZING 恢复：刷新后检测到 FINALIZING 状态时，轮询等待完成并跳转回放
+  useEffect(() => {
+    if (!sessionChecked || !token || !sessionId) return;
+    if (backendStatus !== 'FINALIZING') return;
+    // 如果是当前录制触发的 finalize，不重复处理（handleStopWithFinalization 会自行跳转）
+    if (isFinalizingRef.current) return;
+
+    // 说明是刷新后检测到的 FINALIZING — 显示 finalize 遮罩并轮询
+    isFinalizingRef.current = true;
+    setIsFinalizing(true);
+    setFinalizingSteps([
+      { label: t('session.finalizing.stepStop'), status: 'done' },
+      { label: t('session.finalizing.stepSync'), status: 'done' },
+      { label: t('session.finalizing.stepFinalize'), status: 'active' },
+    ]);
+
+    let retried = false;
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.status === 'COMPLETED' || data.status === 'ARCHIVED') {
+          clearInterval(poll);
+          setFinalizingSteps([
+            { label: t('session.finalizing.stepStop'), status: 'done' },
+            { label: t('session.finalizing.stepSync'), status: 'done' },
+            { label: t('session.finalizing.stepFinalize'), status: 'done' },
+          ]);
+          // 清除本地缓存
+          try {
+            sessionStorage.removeItem('lecture-live-transcript');
+            sessionStorage.removeItem('lecture-live-translations');
+            sessionStorage.removeItem('lecture-live-summary');
+          } catch { /* silent */ }
+          setTimeout(() => router.push(`/session/${sessionId}/playback`), 600);
+        } else if (data.status === 'FINALIZING' && !retried) {
+          // 可能 finalize 请求被刷新中断 — 超时后自动重试一次
+          retried = true;
+          fetch(`/api/sessions/${sessionId}/finalize`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({}),
+          }).catch(() => { /* server-side draft 是主要数据源，空 body 即可 */ });
+        }
+      } catch { /* 网络错误 — 继续轮询 */ }
+    }, 3000);
+
+    return () => clearInterval(poll);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionChecked, token, sessionId, backendStatus]);
 
   useEffect(() => {
@@ -1012,6 +1072,7 @@ export default function ActiveSessionPage() {
   // v2.2: 服务端 finalize — 客户端只负责停止录音 + 发信号，服务端从 draft 完成所有持久化
   const handleStopWithFinalization = useCallback(async () => {
     setIsFinalizing(true);
+    isFinalizingRef.current = true;
     setFinalizingError(null);
     const steps: FinalizingStep[] = [
       { label: t('session.finalizing.stepStop'), status: 'active' },
@@ -1114,6 +1175,7 @@ export default function ActiveSessionPage() {
         steps.findIndex((step) => step.status === 'active'),
         error instanceof Error ? error.message : t('session.finalizing.failed')
       );
+      isFinalizingRef.current = false;
       const store = useTranscriptStore.getState();
       store.setConnectionState('error');
       store.setRecordingState('paused');

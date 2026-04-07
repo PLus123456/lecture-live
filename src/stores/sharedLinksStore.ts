@@ -17,6 +17,7 @@ export interface ViewedShareLink {
 interface SharedLinksStore {
   viewedLinks: ViewedShareLink[];
   rememberViewedLink: (link: ViewedShareLink) => void;
+  removeViewedLink: (token: string) => void;
 }
 
 export const useSharedLinksStore = create<SharedLinksStore>()(
@@ -30,6 +31,10 @@ export const useSharedLinksStore = create<SharedLinksStore>()(
             viewedLinks: [link, ...deduped].slice(0, 20),
           };
         }),
+      removeViewedLink: (token) =>
+        set((state) => ({
+          viewedLinks: state.viewedLinks.filter((entry) => entry.token !== token),
+        })),
     }),
     {
       name: 'lecture-live-viewed-share-links',

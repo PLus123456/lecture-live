@@ -219,7 +219,7 @@ export default function SharedPage() {
               {playbackLinks.length > 0 && (
                 <div>
                   <div className="mb-2 text-[11px] uppercase tracking-[0.16em] text-charcoal-400">
-                    Recording
+                    Playback
                   </div>
                   <div className="space-y-3">
                     {playbackLinks.map((link, index) => (
@@ -239,7 +239,7 @@ export default function SharedPage() {
                           </div>
                           <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-emerald-700">
                             <Play className="inline h-2.5 w-2.5 mr-0.5 -mt-px" />
-                            Recording
+                            Playback
                           </span>
                         </div>
 
@@ -337,11 +337,16 @@ export default function SharedPage() {
 
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button
-                      onClick={() => void navigator.clipboard.writeText(link.url)}
+                      onClick={() => {
+                        navigator.clipboard.writeText(link.url).then(
+                          () => { setCopiedId(link.token); window.setTimeout(() => setCopiedId(null), 1600); },
+                          () => { /* silent */ }
+                        );
+                      }}
                       className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-cream-300 bg-white px-3 py-2 text-xs text-charcoal-600 transition-colors hover:bg-cream-50"
                     >
                       <Link2 className="h-3.5 w-3.5" />
-                      Copy Link
+                      {copiedId === link.token ? 'Copied' : 'Copy Link'}
                     </button>
                     <a
                       href={link.url}

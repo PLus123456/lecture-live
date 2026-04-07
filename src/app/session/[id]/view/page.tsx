@@ -718,7 +718,11 @@ export default function ViewerPage() {
             </div>
           </header>
 
-          <div className="border-b border-cream-200 bg-white/95 px-2 backdrop-blur-md">
+          <div className={`border-b px-2 backdrop-blur-md ${
+              theme === 'dark'
+                ? 'border-charcoal-600 bg-charcoal-800/95'
+                : 'border-cream-200 bg-white/95'
+            }`}>
             <div className="flex">
               {[
                 ['transcript', t('viewer.tabsTranscript')],
@@ -731,7 +735,9 @@ export default function ViewerPage() {
                   className={`flex-1 border-b-2 px-3 py-2 text-xs font-medium ${
                     mobileTab === key
                       ? 'border-rust-500 text-rust-600'
-                      : 'border-transparent text-charcoal-400'
+                      : theme === 'dark'
+                        ? 'border-transparent text-cream-500'
+                        : 'border-transparent text-charcoal-400'
                   }`}
                 >
                   {label}

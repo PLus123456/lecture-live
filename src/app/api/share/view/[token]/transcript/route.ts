@@ -55,7 +55,7 @@ export async function GET(
     },
   });
 
-  if (!link) {
+  if (!link || (link.expiresAt && link.expiresAt < new Date())) {
     return secureResponse(
       { error: 'Share link not found or expired' },
       { status: 404 }
@@ -66,18 +66,11 @@ export async function GET(
   const isPlaybackReady =
     link.session.status === 'COMPLETED' || link.session.status === 'ARCHIVED';
   if (!isPlaybackReady) {
-    // 未完成的会话仍需检查 isLive 和过期时间
+    // 未完成的会话仍需检查 isLive
     if (!link.isLive) {
       return secureResponse(
         { error: 'Share link not found or expired' },
-        { status: 410 }
-      );
-    }
-
-    if (link.expiresAt && link.expiresAt < new Date()) {
-      return secureResponse(
-        { error: 'Share link not found or expired' },
-        { status: 410 }
+        { status: 404 }
       );
     }
 

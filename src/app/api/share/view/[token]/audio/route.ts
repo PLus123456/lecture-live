@@ -56,7 +56,7 @@ export async function GET(
     },
   });
 
-  if (!link) {
+  if (!link || (link.expiresAt && link.expiresAt < new Date())) {
     return Response.json(
       { error: 'Share link not found or expired' },
       { status: 404, headers: secureHeaders() }

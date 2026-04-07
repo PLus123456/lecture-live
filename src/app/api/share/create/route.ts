@@ -223,6 +223,7 @@ export async function DELETE(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const sessionId = sanitizeTextInput(body.sessionId, { maxLength: 64 });
+    const keepForPlayback = body.keepForPlayback === true;
     if (!sessionId) {
       return NextResponse.json(
         { error: 'sessionId is required' },
@@ -244,20 +245,21 @@ export async function DELETE(req: Request) {
       );
     }
 
+    // keepForPlayback: 录制结束后保留链接供回放，只关闭 live 状态
+    // 完全撤销：同时设置 expiresAt 使链接失效
     await prisma.shareLink.updateMany({
       where: {
         sessionId,
         createdBy: user.id,
         isLive: true,
       },
-      data: {
-        isLive: false,
-        expiresAt: new Date(),
-      },
+      data: keepForPlayback
+        ? { isLive: false }
+        : { isLive: false, expiresAt: new Date() },
     });
     await invalidateShareLinksApiCache(user.id);
 
-    logAction(req, 'share.revoke', {
+    logAction(req, keepForPlayback ? 'share.transition_playback' : 'share.revoke', {
       user,
       detail: `${session!.title} (${sessionId})`,
     });

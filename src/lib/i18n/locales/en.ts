@@ -530,6 +530,13 @@ export default {
     autoRegion: 'Auto',
     backTenSeconds: 'Back 10s',
     forwardTenSeconds: 'Forward 10s',
+    share: 'Share',
+    shareTitle: 'Share Playback',
+    shareDescription: 'Generate a link so others can view this playback.',
+    shareCreate: 'Create Share Link',
+    shareRevoke: 'Revoke Share Link',
+    shareCopied: 'Link Copied',
+    shareCopyLink: 'Copy link',
   },
 
   exportModal: {

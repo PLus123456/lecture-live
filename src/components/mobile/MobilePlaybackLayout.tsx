@@ -27,6 +27,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
+import PlaybackSharePopover from '@/components/session/PlaybackSharePopover';
 import ChatTab from '@/components/session/ChatTab';
 import { useI18n } from '@/lib/i18n';
 import type { TranscriptSegment } from '@/types/transcript';
@@ -348,6 +349,9 @@ export default function MobilePlaybackLayout({
             </div>
           </div>
 
+          {!isShareMode && (
+            <PlaybackSharePopover sessionId={session.id} iconOnly />
+          )}
           <button
             onClick={onOpenExport}
             className="flex h-9 w-9 items-center justify-center rounded-full bg-cream-100 text-charcoal-600"

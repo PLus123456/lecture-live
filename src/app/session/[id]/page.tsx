@@ -1477,6 +1477,7 @@ export default function ActiveSessionPage() {
           isOpen={settingsOpen}
           onClose={() => setSettingsOpen(false)}
           onSwitchMic={switchMicrophone}
+          onSettingsApplied={rebuildSession}
         />
         <ExportModal
           isOpen={exportOpen}
@@ -1937,7 +1938,7 @@ export default function ActiveSessionPage() {
         </div>
       </main>
 
-      <SettingsDrawer isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} onSwitchMic={switchMicrophone} />
+      <SettingsDrawer isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} onSwitchMic={switchMicrophone} onSettingsApplied={rebuildSession} />
       <ExportModal
         isOpen={exportOpen}
         onClose={() => setExportOpen(false)}

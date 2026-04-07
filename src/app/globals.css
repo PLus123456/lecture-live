@@ -123,6 +123,11 @@
     to { transform: translateY(0); }
   }
 
+  @keyframes popoverIn {
+    from { opacity: 0; transform: scale(0.95) translateY(-4px); }
+    to   { opacity: 1; transform: scale(1) translateY(0); }
+  }
+
   /* ─── 交错动画延迟工具类 ─── */
   .stagger-1 { animation-delay: 0.05s; }
   .stagger-2 { animation-delay: 0.1s; }

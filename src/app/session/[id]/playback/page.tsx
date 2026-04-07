@@ -8,6 +8,7 @@ import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import Sidebar from '@/components/Sidebar';
 import ExportModal from '@/components/ExportModal';
 import MobilePlaybackLayout from '@/components/mobile/MobilePlaybackLayout';
+import PlaybackSharePopover from '@/components/session/PlaybackSharePopover';
 import ChatTab from '@/components/session/ChatTab';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -1104,6 +1105,7 @@ export default function PlaybackPage() {
                   {t('playback.regenerateTitle')}
                 </button>
               )}
+              {!isShareMode && <PlaybackSharePopover sessionId={sessionId} />}
               <button
                 className="btn-ghost text-xs flex items-center gap-1.5"
                 onClick={() => setExportOpen(true)}

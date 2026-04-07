@@ -163,7 +163,6 @@ describe('/api/share/create route', () => {
       where: {
         sessionId: 'session-1',
         createdBy: 'user-1',
-        isLive: true,
       },
       data: {
         isLive: false,

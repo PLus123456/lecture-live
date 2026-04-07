@@ -3,8 +3,8 @@
 // v2.1 §C.4: Independent playback view for COMPLETED/ARCHIVED sessions
 // Completely separate from the recording view — focused on review & audio playback
 
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams, useRouter } from 'next/navigation';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import Sidebar from '@/components/Sidebar';
 import ExportModal from '@/components/ExportModal';
 import MobilePlaybackLayout from '@/components/mobile/MobilePlaybackLayout';
@@ -199,7 +199,10 @@ function loadBlobDurationMs(url: string): Promise<number> {
 export default function PlaybackPage() {
   const params = useParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const sessionId = params.id as string;
+  const shareToken = searchParams.get('token');
+  const isShareMode = Boolean(shareToken);
   const { restoreSession } = useAuth();
   const { t } = useI18n();
   const token = useAuthStore((s) => s.token);
@@ -245,8 +248,9 @@ export default function PlaybackPage() {
   const pendingSeekMsRef = useRef<number | null>(null);
   const sessionDurationMsRef = useRef<number>(0);
 
-  // Auth guard — 和 session page 一样防止水合竞态
+  // Auth guard — 分享模式下跳过认证
   useEffect(() => {
+    if (isShareMode) return;
     if (user && token) return;
     // restoreSession 正在进行中：StrictMode 双调用或快速重渲染时，不能误跳 /login
     if (restoreInFlightRef.current) return;
@@ -268,36 +272,56 @@ export default function PlaybackPage() {
     if (!u || !t) {
       router.replace('/login');
     }
-  }, [user, token, router, restoreSession]);
+  }, [user, token, router, restoreSession, isShareMode]);
 
-  // Fetch session data + transcript
+  // Fetch session data + transcript（支持认证模式和分享模式）
   useEffect(() => {
-    if (!token) return;
+    if (!isShareMode && !token) return;
     setLoading(true);
 
-    const headers = { Authorization: `Bearer ${token}` };
+    const authHeaders: Record<string, string> = token
+      ? { Authorization: `Bearer ${token}` }
+      : {};
 
-    fetch(`/api/sessions/${sessionId}`, { headers })
+    // 根据模式选择 API
+    const sessionUrl = isShareMode
+      ? `/api/share/view/${encodeURIComponent(shareToken!)}`
+      : `/api/sessions/${sessionId}`;
+    const transcriptUrl = isShareMode
+      ? `/api/share/view/${encodeURIComponent(shareToken!)}/transcript`
+      : `/api/sessions/${sessionId}/transcript`;
+    const reportUrl = isShareMode
+      ? `/api/share/view/${encodeURIComponent(shareToken!)}/report`
+      : `/api/llm/report?sessionId=${sessionId}`;
+
+    fetch(sessionUrl, isShareMode ? undefined : { headers: authHeaders })
       .then((r) => r.json())
       .then(async (data) => {
         if (data.error) {
           setError(data.error);
           return;
         }
-        // If session is still recording, redirect to live page
-        if (['CREATED', 'RECORDING', 'PAUSED', 'FINALIZING'].includes(data.status)) {
+
+        // 分享模式：从 data.session 取出会话信息
+        const sessionData = isShareMode ? data.session : data;
+        if (!sessionData) {
+          setError(t('playback.sessionNotFound'));
+          return;
+        }
+
+        // If session is still recording, redirect to live page (仅认证模式)
+        if (!isShareMode && ['CREATED', 'RECORDING', 'PAUSED', 'FINALIZING'].includes(sessionData.status)) {
           router.replace(`/session/${sessionId}`);
           return;
         }
-        setSession(data);
+        setSession(sessionData);
 
         // Load transcript and summary data
         try {
-          const tRes = await fetch(`/api/sessions/${sessionId}/transcript`, { headers });
+          const tRes = await fetch(transcriptUrl, isShareMode ? undefined : { headers: authHeaders });
           if (tRes.ok) {
             const tData = await tRes.json();
             if (Array.isArray(tData.segments)) {
-              // Merge translations into segments
               const translations: Record<string, string> = tData.translations || {};
               setSegments(
                 tData.segments.map((seg: TranscriptSegment) => ({
@@ -317,7 +341,7 @@ export default function PlaybackPage() {
         // 加载会话报告
         try {
           setReportLoading(true);
-          const rRes = await fetch(`/api/llm/report?sessionId=${sessionId}`, { headers });
+          const rRes = await fetch(reportUrl, isShareMode ? undefined : { headers: authHeaders });
           if (rRes.ok) {
             const rData = await rRes.json();
             if (rData.report) {
@@ -332,17 +356,22 @@ export default function PlaybackPage() {
       })
       .catch(() => setError(t('playback.loadFailed')))
       .finally(() => setLoading(false));
-  }, [sessionId, token, router, t]);
+  }, [sessionId, token, router, t, isShareMode, shareToken]);
 
-  // 带 auth header 加载音频，必要时拆成多个连续 WebM 段
+  // 加载音频（认证模式用 auth header，分享模式用 share API），必要时拆成多个连续 WebM 段
   useEffect(() => {
-    if (!token || !sessionId) return;
+    if (!isShareMode && (!token || !sessionId)) return;
+    if (isShareMode && !shareToken) return;
     let disposed = false;
     const createdUrls: string[] = [];
     const abortController = new AbortController();
 
-    fetch(`/api/sessions/${sessionId}/audio`, {
-      headers: { Authorization: `Bearer ${token}` },
+    const audioUrl = isShareMode
+      ? `/api/share/view/${encodeURIComponent(shareToken!)}/audio`
+      : `/api/sessions/${sessionId}/audio`;
+
+    fetch(audioUrl, {
+      ...(token && !isShareMode ? { headers: { Authorization: `Bearer ${token}` } } : {}),
       signal: abortController.signal,
     })
       .then(async (res) => {
@@ -434,7 +463,7 @@ export default function PlaybackPage() {
       setAudioSegments([]);
       setActiveAudioIndex(0);
     };
-  }, [token, sessionId]);
+  }, [token, sessionId, isShareMode, shareToken]);
 
   // Sync to stores (for ChatTab / ExportModal)
   useEffect(() => {
@@ -840,6 +869,18 @@ export default function PlaybackPage() {
       return recordingBlobRef.current;
     }
     // 回退：blob 尚未加载或已被清理时，重新 fetch
+    // 分享模式使用 share audio API
+    if (isShareMode && shareToken) {
+      try {
+        const res = await fetch(`/api/share/view/${encodeURIComponent(shareToken)}/audio`);
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        recordingBlobRef.current = blob;
+        return blob;
+      } catch {
+        return null;
+      }
+    }
     if (!sessionId || !token) return null;
     try {
       const res = await fetch(`/api/sessions/${sessionId}/audio`, {
@@ -852,9 +893,9 @@ export default function PlaybackPage() {
     } catch {
       return null;
     }
-  }, [sessionId, token]);
+  }, [sessionId, token, isShareMode, shareToken]);
 
-  if (!user || !token) {
+  if (!isShareMode && (!user || !token)) {
     return (
         <div className="h-screen flex items-center justify-center bg-cream-50">
         <div className="text-charcoal-400 text-sm">{t('playback.redirectingToLogin')}</div>
@@ -930,6 +971,7 @@ export default function PlaybackPage() {
           onOpenExport={() => setExportOpen(true)}
           onRegenerateTitle={handleRegenerateTitle}
           regeneratingTitle={regeneratingTitle}
+          isShareMode={isShareMode}
         />
 
         {/* 音频元素 — 移动端也需要 */}
@@ -1006,24 +1048,26 @@ export default function PlaybackPage() {
   /* ─── 桌面端布局 ─── */
   return (
     <div className="flex h-screen overflow-hidden">
-      <Sidebar />
+      {!isShareMode && <Sidebar />}
 
       <main
         className={`flex-1 flex flex-col overflow-hidden transition-all duration-300 ${
-          sidebarCollapsed ? 'ml-16' : 'ml-56'
+          isShareMode ? '' : sidebarCollapsed ? 'ml-16' : 'ml-56'
         }`}
       >
         {/* Header */}
         <header className="flex-shrink-0 bg-white/95 backdrop-blur-md border-b border-cream-200 z-30">
           <div className="flex items-center justify-between px-5 py-3">
             <div className="flex items-center gap-3 min-w-0">
-              <button
-                onClick={() => router.push('/home')}
-                className="w-8 h-8 flex items-center justify-center rounded-lg
-                           hover:bg-cream-100 text-charcoal-400 transition-colors"
-              >
-                <ChevronLeft className="w-4 h-4" />
-              </button>
+              {!isShareMode && (
+                <button
+                  onClick={() => router.push('/home')}
+                  className="w-8 h-8 flex items-center justify-center rounded-lg
+                             hover:bg-cream-100 text-charcoal-400 transition-colors"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+              )}
 
               <div className="min-w-0">
                 <h1 className="font-serif font-bold text-charcoal-800 text-base leading-tight truncate">
@@ -1047,17 +1091,19 @@ export default function PlaybackPage() {
             </div>
 
             <div className="flex items-center gap-2">
-              <button
-                className="btn-ghost text-xs flex items-center gap-1.5"
-                onClick={handleRegenerateTitle}
-                disabled={regeneratingTitle}
-                title={t('playback.regenerateTitle')}
-              >
-                {regeneratingTitle
-                  ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  : <RefreshCw className="w-3.5 h-3.5" />}
-                {t('playback.regenerateTitle')}
-              </button>
+              {!isShareMode && (
+                <button
+                  className="btn-ghost text-xs flex items-center gap-1.5"
+                  onClick={handleRegenerateTitle}
+                  disabled={regeneratingTitle}
+                  title={t('playback.regenerateTitle')}
+                >
+                  {regeneratingTitle
+                    ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    : <RefreshCw className="w-3.5 h-3.5" />}
+                  {t('playback.regenerateTitle')}
+                </button>
+              )}
               <button
                 className="btn-ghost text-xs flex items-center gap-1.5"
                 onClick={() => setExportOpen(true)}
@@ -1149,12 +1195,12 @@ export default function PlaybackPage() {
           {/* Right: AI Panel */}
           <div className="w-[380px] flex-shrink-0 bg-white rounded-xl border border-cream-200 flex flex-col">
             <div className="flex border-b border-cream-100 flex-shrink-0">
-              {[
+              {([
                 { key: 'report' as const, icon: ClipboardList, label: t('playback.tabReport') },
                 { key: 'summary' as const, icon: Sparkles, label: t('playback.tabSummary') },
-                { key: 'chat' as const, icon: MessageSquare, label: t('playback.tabChat') },
+                ...(!isShareMode ? [{ key: 'chat' as const, icon: MessageSquare, label: t('playback.tabChat') }] : []),
                 { key: 'info' as const, icon: FileText, label: t('playback.tabInfo') },
-              ].map(({ key, icon: Icon, label }) => (
+              ] as { key: PlaybackTab; icon: typeof ClipboardList; label: string }[]).map(({ key, icon: Icon, label }) => (
                 <button
                   key={key}
                   onClick={() => setActiveTab(key)}
@@ -1344,7 +1390,7 @@ export default function PlaybackPage() {
                 </div>
               )}
 
-              {activeTab === 'chat' && (
+              {activeTab === 'chat' && !isShareMode && (
                 <ChatTab />
               )}
 

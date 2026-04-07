@@ -539,34 +539,11 @@ export default function ViewerPage() {
           viewedAt: new Date().toISOString(),
         });
 
-        // 已完成的会话：直接加载最终转录数据，不连接 WebSocket
-        if (status === 'COMPLETED') {
-          setIsCompleted(true);
-          fetch(`/api/share/view/${encodeURIComponent(shareToken)}/transcript`)
-            .then((r) => r.json())
-            .then((transcriptData) => {
-              if (transcriptData.error) {
-                setError(transcriptData.error);
-                setLoading(false);
-                return;
-              }
-              if (transcriptData.segments) {
-                (transcriptData.segments as TranscriptSegment[]).forEach(addFinalSegment);
-              }
-              if (transcriptData.translations) {
-                Object.entries(transcriptData.translations).forEach(([segmentId, translation]) => {
-                  setTranslation(segmentId, translation as string);
-                });
-              }
-              if (transcriptData.summaries) {
-                (transcriptData.summaries as SummaryBlock[]).forEach(addBlock);
-              }
-              setLoading(false);
-            })
-            .catch(() => {
-              setError(t('viewer.loadTranscriptFailed'));
-              setLoading(false);
-            });
+        // 已完成/已归档的会话：重定向到 playback 页面（完整回放体验）
+        if (status === 'COMPLETED' || status === 'ARCHIVED') {
+          window.location.replace(
+            `/session/${data.sessionId}/playback?token=${encodeURIComponent(shareToken)}`
+          );
           return;
         }
 

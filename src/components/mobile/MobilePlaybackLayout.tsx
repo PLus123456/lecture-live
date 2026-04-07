@@ -70,6 +70,8 @@ interface MobilePlaybackLayoutProps {
   // 标题重新生成
   onRegenerateTitle?: () => void;
   regeneratingTitle?: boolean;
+  /** 分享模式：隐藏 Chat tab 和重新生成标题 */
+  isShareMode?: boolean;
 }
 
 const TAB_KEYS: MobilePlaybackTab[] = ['report', 'transcript', 'summary', 'chat', 'info'];
@@ -277,6 +279,7 @@ export default function MobilePlaybackLayout({
   onOpenExport,
   onRegenerateTitle,
   regeneratingTitle,
+  isShareMode,
 }: MobilePlaybackLayoutProps) {
   const router = useRouter();
   const { t } = useI18n();
@@ -287,19 +290,21 @@ export default function MobilePlaybackLayout({
     { key: 'report', label: t('playback.tabReport'), icon: <ClipboardList className="h-4 w-4" /> },
     { key: 'transcript', label: t('playback.transcript'), icon: <FileText className="h-4 w-4" /> },
     { key: 'summary', label: t('playback.tabSummary'), icon: <Sparkles className="h-4 w-4" /> },
-    { key: 'chat', label: t('playback.tabMobileChat'), icon: <MessageSquare className="h-4 w-4" /> },
+    ...(!isShareMode ? [{ key: 'chat' as const, label: t('playback.tabMobileChat'), icon: <MessageSquare className="h-4 w-4" /> }] : []),
     { key: 'info', label: t('playback.tabInfo'), icon: <Info className="h-4 w-4" /> },
   ];
+
+  const effectiveTabKeys = tabs.map((tab) => tab.key);
 
   // 滑动切换 Tab
   useSwipeGesture(contentRef, {
     onSwipeLeft: () => {
-      const idx = TAB_KEYS.indexOf(activeTab);
-      if (idx < TAB_KEYS.length - 1) setActiveTab(TAB_KEYS[idx + 1]);
+      const idx = effectiveTabKeys.indexOf(activeTab);
+      if (idx < effectiveTabKeys.length - 1) setActiveTab(effectiveTabKeys[idx + 1]);
     },
     onSwipeRight: () => {
-      const idx = TAB_KEYS.indexOf(activeTab);
-      if (idx > 0) setActiveTab(TAB_KEYS[idx - 1]);
+      const idx = effectiveTabKeys.indexOf(activeTab);
+      if (idx > 0) setActiveTab(effectiveTabKeys[idx - 1]);
     },
     threshold: 60,
   });
@@ -466,8 +471,8 @@ export default function MobilePlaybackLayout({
             </div>
           )}
 
-          {/* Chat */}
-          {activeTab === 'chat' && (
+          {/* Chat — 分享模式下隐藏 */}
+          {activeTab === 'chat' && !isShareMode && (
             <div className="-mx-4 -my-4 h-[calc(100dvh-theme(spacing.48))]">
               <ChatTab inputSticky />
             </div>
@@ -476,7 +481,7 @@ export default function MobilePlaybackLayout({
           {/* Info */}
           {activeTab === 'info' && (
             <div className="space-y-3">
-              {onRegenerateTitle && (
+              {onRegenerateTitle && !isShareMode && (
                 <button
                   onClick={onRegenerateTitle}
                   disabled={regeneratingTitle}

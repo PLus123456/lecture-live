@@ -1085,9 +1085,9 @@ export default function ActiveSessionPage() {
         );
       }
 
-      // 录制完成后自动停止分享
+      // 录制完成后自动停止分享，但保留链接供回放访问
       if (isSharing) {
-        await stopSharing(sessionId);
+        await stopSharing(sessionId, { keepForPlayback: true });
       }
 
       steps[2].status = 'done';

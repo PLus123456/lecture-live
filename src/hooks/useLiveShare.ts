@@ -60,8 +60,13 @@ export function useLiveShare() {
     [token, setViewerCount, reset, setSharing]
   );
 
-  /** 录制者：停止分享 */
-  const stopSharing = useCallback(async (sessionId?: string) => {
+  /** 录制者：停止分享
+   *  @param options.keepForPlayback 保留链接供回放（录制结束时使用），默认完全撤销
+   */
+  const stopSharing = useCallback(async (
+    sessionId?: string,
+    options?: { keepForPlayback?: boolean },
+  ) => {
     const activeSessionId = sessionId;
     if (token && activeSessionId) {
       await fetch('/api/share/create', {
@@ -70,7 +75,10 @@ export function useLiveShare() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ sessionId: activeSessionId }),
+        body: JSON.stringify({
+          sessionId: activeSessionId,
+          ...(options?.keepForPlayback && { keepForPlayback: true }),
+        }),
       }).catch(() => undefined);
     }
     broadcasterInstance?.broadcastStatusUpdate('SHARE_OFFLINE');

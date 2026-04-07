@@ -84,8 +84,9 @@ export async function GET(
     );
   }
 
-  // 已完成的会话：即使分享链接已标记为非活跃（录音结束自动关闭），仍允许访问
-  const isCompletedSession = link.session.status === 'COMPLETED';
+  // 已完成/已归档的会话：即使分享链接已标记为非活跃（录音结束自动关闭），仍允许访问
+  const isCompletedSession =
+    link.session.status === 'COMPLETED' || link.session.status === 'ARCHIVED';
 
   if (!isCompletedSession) {
     // 安全：对不存在、已禁用、已过期的 token 统一返回 404，防止状态枚举

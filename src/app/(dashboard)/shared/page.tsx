@@ -6,6 +6,7 @@ import {
   ExternalLink,
   Link2,
   Loader2,
+  Play,
   Radio,
   Share2,
 } from 'lucide-react';
@@ -85,11 +86,31 @@ export default function SharedPage() {
     [links]
   );
 
+  // 回放链接：非 live、未过期、会话已完成/已归档
+  const playbackLinks = useMemo(
+    () =>
+      links.filter((link) => {
+        if (link.isLive) return false;
+        // 有 expiresAt 且已过期 → 不是回放链接，是被撤销的
+        if (link.expiresAt && new Date(link.expiresAt) <= new Date()) return false;
+        return link.session.status === 'COMPLETED' || link.session.status === 'ARCHIVED';
+      }),
+    [links]
+  );
+
   const expiredLinks = useMemo(
     () =>
-      links.filter(
-        (link) => !link.isLive || (link.expiresAt ? new Date(link.expiresAt) <= new Date() : false)
-      ),
+      links.filter((link) => {
+        // 已在 active 中
+        if (link.isLive && (!link.expiresAt || new Date(link.expiresAt) > new Date())) return false;
+        // 已在 playback 中
+        if (
+          !link.isLive &&
+          !(link.expiresAt && new Date(link.expiresAt) <= new Date()) &&
+          (link.session.status === 'COMPLETED' || link.session.status === 'ARCHIVED')
+        ) return false;
+        return true;
+      }),
     [links]
   );
 
@@ -130,7 +151,7 @@ export default function SharedPage() {
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               Loading share links...
             </div>
-          ) : activeLinks.length === 0 && expiredLinks.length === 0 ? (
+          ) : activeLinks.length === 0 && playbackLinks.length === 0 && expiredLinks.length === 0 ? (
             <div className="rounded-xl border border-dashed border-cream-300 bg-cream-50/70 px-4 py-10 text-center animate-fade-in">
               <Share2 className="mx-auto mb-3 h-8 w-8 text-charcoal-200 animate-breathe" />
               <p className="text-sm text-charcoal-500">No shared links yet</p>
@@ -187,6 +208,61 @@ export default function SharedPage() {
                           >
                             <ExternalLink className="h-3.5 w-3.5" />
                             Open Viewer
+                          </a>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {playbackLinks.length > 0 && (
+                <div>
+                  <div className="mb-2 text-[11px] uppercase tracking-[0.16em] text-charcoal-400">
+                    Recording
+                  </div>
+                  <div className="space-y-3">
+                    {playbackLinks.map((link, index) => (
+                      <article
+                        key={link.id}
+                        className="rounded-xl border border-cream-200 bg-cream-50/50 p-4 animate-list-item-in card-hover-lift"
+                        style={{ animationDelay: `${index * 0.08}s` }}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <h2 className="text-sm font-semibold text-charcoal-800">
+                              {link.session.title}
+                            </h2>
+                            <p className="mt-1 text-[11px] text-charcoal-400">
+                              {link.session.sourceLang.toUpperCase()} → {link.session.targetLang.toUpperCase()} · {link.session.status}
+                            </p>
+                          </div>
+                          <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-emerald-700">
+                            <Play className="inline h-2.5 w-2.5 mr-0.5 -mt-px" />
+                            Recording
+                          </span>
+                        </div>
+
+                        <div className="mt-3 text-[11px] text-charcoal-400">
+                          Created {formatDate(link.createdAt)}
+                        </div>
+
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button
+                            onClick={() => void copyLink(link)}
+                            className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-cream-300 bg-white px-3 py-2 text-xs text-charcoal-600 transition-colors hover:bg-cream-50"
+                          >
+                            <Link2 className="h-3.5 w-3.5" />
+                            {copiedId === link.id ? 'Copied' : 'Copy Link'}
+                          </button>
+                          <a
+                            href={link.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700 transition-colors hover:bg-emerald-100"
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" />
+                            Open Playback
                           </a>
                         </div>
                       </article>

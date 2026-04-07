@@ -16,10 +16,12 @@ export default function SettingsDrawer({
   isOpen,
   onClose,
   onSwitchMic,
+  onSettingsApplied,
 }: {
   isOpen: boolean;
   onClose: () => void;
   onSwitchMic?: (deviceId: string) => void;
+  onSettingsApplied?: () => void;
 }) {
   const isMobile = useIsMobile();
   const { t } = useI18n();
@@ -75,6 +77,14 @@ export default function SettingsDrawer({
   }, [currentMicDeviceId, isOpen]);
 
   const handleApply = () => {
+    const sonioxConfigChanged =
+      draft.sourceLang !== settings.sourceLang ||
+      draft.targetLang !== settings.targetLang ||
+      draft.translationMode !== settings.translationMode ||
+      draft.domain !== settings.domain ||
+      draft.topic !== settings.topic ||
+      JSON.stringify(draft.terms) !== JSON.stringify(settings.terms);
+
     settings.setSourceLang(draft.sourceLang);
     settings.setTargetLang(draft.targetLang);
     settings.setTranslationMode(draft.translationMode);
@@ -82,6 +92,10 @@ export default function SettingsDrawer({
     settings.setTopic(draft.topic);
     settings.setTerms(draft.terms);
     onClose();
+
+    if (sonioxConfigChanged && isActive) {
+      onSettingsApplied?.();
+    }
   };
 
   if (!isOpen) return null;

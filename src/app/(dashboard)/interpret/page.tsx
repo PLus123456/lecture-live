@@ -240,6 +240,16 @@ export default function InterpretPage() {
     }
   }, [micTesting, selectedMic]);
 
+  // 录制中离开页面时提示数据丢失
+  useEffect(() => {
+    if (!isRunning) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [isRunning]);
+
   const previewIsA = previewLang === langA;
   const previewTranslationSourceIsA =
     (previewTranslation.sourceLanguage ?? previewLang) === langA;

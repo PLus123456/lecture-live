@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Eye,
   ExternalLink,
@@ -9,6 +9,8 @@ import {
   Play,
   Radio,
   Share2,
+  Trash2,
+  X,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -49,6 +51,40 @@ export default function SharedPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState<string | null>(null);
+  const [confirmRevoke, setConfirmRevoke] = useState<string | null>(null);
+  const removeViewedLink = useSharedLinksStore((s) => s.removeViewedLink);
+
+  const revokeLink = useCallback(async (link: SharedSessionLink) => {
+    if (!token) return;
+    setRevoking(link.id);
+    try {
+      const res = await fetch('/api/share/create', {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ sessionId: link.session.id }),
+      });
+      if (res.ok) {
+        // 从列表中移除（设置 expiresAt 使其变为 expired）
+        setLinks((prev) =>
+          prev.map((l) =>
+            l.session.id === link.session.id
+              ? { ...l, isLive: false, expiresAt: new Date().toISOString() }
+              : l
+          )
+        );
+        // 清理 localStorage 中该 token 对应的 viewed 记录
+        removeViewedLink(link.token);
+      }
+    } catch {
+      // silent
+    }
+    setRevoking(null);
+    setConfirmRevoke(null);
+  }, [token, removeViewedLink]);
 
   useEffect(() => {
     if (!token) {
@@ -209,6 +245,36 @@ export default function SharedPage() {
                             <ExternalLink className="h-3.5 w-3.5" />
                             Open Viewer
                           </a>
+                          {confirmRevoke === link.id ? (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                onClick={() => void revokeLink(link)}
+                                disabled={revoking === link.id}
+                                className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-600 font-medium transition-colors hover:bg-red-100 disabled:opacity-50"
+                              >
+                                {revoking === link.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                )}
+                                Confirm
+                              </button>
+                              <button
+                                onClick={() => setConfirmRevoke(null)}
+                                className="inline-flex min-h-[44px] items-center rounded-lg border border-cream-300 bg-white px-2 py-2 text-xs text-charcoal-500 transition-colors hover:bg-cream-50"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => setConfirmRevoke(link.id)}
+                              className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-red-200 bg-white px-3 py-2 text-xs text-red-500 transition-colors hover:bg-red-50"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                              Revoke
+                            </button>
+                          )}
                         </div>
                       </article>
                     ))}
@@ -264,6 +330,36 @@ export default function SharedPage() {
                             <ExternalLink className="h-3.5 w-3.5" />
                             Open Playback
                           </a>
+                          {confirmRevoke === link.id ? (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                onClick={() => void revokeLink(link)}
+                                disabled={revoking === link.id}
+                                className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-600 font-medium transition-colors hover:bg-red-100 disabled:opacity-50"
+                              >
+                                {revoking === link.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                )}
+                                Confirm
+                              </button>
+                              <button
+                                onClick={() => setConfirmRevoke(null)}
+                                className="inline-flex min-h-[44px] items-center rounded-lg border border-cream-300 bg-white px-2 py-2 text-xs text-charcoal-500 transition-colors hover:bg-cream-50"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => setConfirmRevoke(link.id)}
+                              className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-red-200 bg-white px-3 py-2 text-xs text-red-500 transition-colors hover:bg-red-50"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                              Revoke
+                            </button>
+                          )}
                         </div>
                       </article>
                     ))}

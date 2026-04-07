@@ -10,6 +10,8 @@ function secureResponse(body: unknown, init?: ResponseInit) {
   res.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.headers.set('Pragma', 'no-cache');
   res.headers.set('X-Content-Type-Options', 'nosniff');
+  // 安全：防止 share token 通过 Referer header 泄露
+  res.headers.set('Referrer-Policy', 'no-referrer');
   return res;
 }
 

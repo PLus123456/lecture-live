@@ -517,6 +517,13 @@ export default {
     autoRegion: '自动',
     backTenSeconds: '后退 10 秒',
     forwardTenSeconds: '前进 10 秒',
+    share: '分享',
+    shareTitle: '分享回放',
+    shareDescription: '生成链接，其他人可通过链接查看本次回放内容。',
+    shareCreate: '创建分享链接',
+    shareRevoke: '撤销分享链接',
+    shareCopied: '链接已复制',
+    shareCopyLink: '复制链接',
   },
 
   exportModal: {

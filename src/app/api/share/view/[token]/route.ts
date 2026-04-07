@@ -84,6 +84,14 @@ export async function GET(
     );
   }
 
+  // 安全：被主动撤销的链接（expiresAt <= now）一律拒绝，无论会话状态
+  if (link.expiresAt && link.expiresAt < new Date()) {
+    return secureResponse(
+      { error: 'Share link not found or expired' },
+      { status: 404 }
+    );
+  }
+
   // 已完成/已归档的会话：即使分享链接已标记为非活跃（录音结束自动关闭），仍允许访问
   const isCompletedSession =
     link.session.status === 'COMPLETED' || link.session.status === 'ARCHIVED';
@@ -91,13 +99,6 @@ export async function GET(
   if (!isCompletedSession) {
     // 安全：对不存在、已禁用、已过期的 token 统一返回 404，防止状态枚举
     if (!link.isLive) {
-      return secureResponse(
-        { error: 'Share link not found or expired' },
-        { status: 404 }
-      );
-    }
-
-    if (link.expiresAt && link.expiresAt < new Date()) {
       return secureResponse(
         { error: 'Share link not found or expired' },
         { status: 404 }

@@ -461,7 +461,8 @@ export default function ExportModal({
   if (!isOpen) return null;
 
   const content = (
-    <div className="flex flex-col max-h-[70vh] md:max-h-none">
+    <div className="flex flex-col flex-1 min-h-0">
+      <div className="flex-1 min-h-0 overflow-y-auto">
       {showSessionDataLoadingState && (
         <div className="px-5 pt-4 animate-fade-slide-in">
           <div className="flex items-center gap-2 rounded-xl border border-cream-200 bg-cream-50 px-3 py-2 text-xs text-charcoal-500">
@@ -533,7 +534,7 @@ export default function ExportModal({
             <span className="flex items-center justify-center w-5 h-5 rounded-full bg-rust-500 text-white text-xs font-bold">2</span>
             <span className="text-sm font-semibold text-charcoal-700">{t('exportModal.stepFormat')}</span>
           </div>
-          <div className="flex flex-wrap gap-1.5">
+          <div className="grid grid-cols-3 gap-2">
             {FORMAT_OPTIONS.map((fmt) => {
               const disabled = isFormatDisabled(fmt.id);
               const selected = effectiveFormat === fmt.id;
@@ -544,21 +545,30 @@ export default function ExportModal({
                   onClick={() => !disabled && setSelectedFormat(fmt.id)}
                   disabled={disabled}
                   className={`
-                    flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium
+                    relative flex flex-col items-start gap-1 p-3 rounded-xl border-2 text-left
                     transition-all duration-150
                     ${disabled
-                      ? 'border-cream-200 text-charcoal-300 cursor-not-allowed'
+                      ? 'border-cream-200 bg-cream-50 opacity-40 cursor-not-allowed'
                       : selected
-                        ? 'border-rust-400 bg-rust-500 text-white shadow-sm'
-                        : 'border-cream-200 text-charcoal-600 hover:border-cream-400 hover:bg-cream-50'
+                        ? 'border-rust-400 bg-rust-50 shadow-sm'
+                        : 'border-cream-200 bg-white hover:border-cream-400 hover:shadow-sm'
                     }
                   `}
                 >
-                  <span className={`w-1.5 h-1.5 rounded-full ${disabled ? 'bg-cream-300' : selected ? 'bg-white' : fmt.color}`} />
-                  {fmt.label}
-                  <span className={`text-[10px] ${selected ? 'text-rust-100' : 'text-charcoal-300'}`}>
-                    {fmt.desc}
-                  </span>
+                  {selected && (
+                    <div className="absolute top-2 right-2 w-4 h-4 rounded-full bg-rust-500 flex items-center justify-center">
+                      <Check className="w-2.5 h-2.5 text-white" strokeWidth={3} />
+                    </div>
+                  )}
+                  <span className={`w-3 h-3 rounded-full ${disabled ? 'bg-cream-300' : fmt.color}`} />
+                  <div>
+                    <p className={`text-xs font-medium ${selected ? 'text-rust-700' : 'text-charcoal-600'}`}>
+                      {fmt.label}
+                    </p>
+                    <p className="text-[10px] text-charcoal-400 leading-tight mt-0.5">
+                      {fmt.desc}
+                    </p>
+                  </div>
                 </button>
               );
             })}
@@ -629,40 +639,39 @@ export default function ExportModal({
         </div>
       )}
 
-      {/* 底栏 */}
-      <div className="px-5 py-4 border-t border-cream-200 bg-cream-50/50 safe-bottom">
-        {/* 文件数量提示 */}
-        <div className="text-[10px] text-charcoal-400 text-center mb-3">
-          {exportPlan.willZip ? (
-            <span className="inline-flex items-center gap-1">
-              <Package className="w-3 h-3" />
-              {t('exportModal.willZip', { count: String(exportPlan.downloadFileCount) })}
-            </span>
-          ) : exportPlan.downloadFileCount === 1 ? (
-            <span className="inline-flex items-center gap-1">
-              <FileType className="w-3 h-3" />
-              {t('exportModal.singleFile')}
-            </span>
-          ) : null}
-        </div>
+      {/* 文件数量提示（分割线上方） */}
+      <div className="text-[10px] text-charcoal-400 text-center px-5 pb-3">
+        {exportPlan.willZip ? (
+          <span className="inline-flex items-center gap-1">
+            <Package className="w-3 h-3" />
+            {t('exportModal.willZip', { count: String(exportPlan.downloadFileCount) })}
+          </span>
+        ) : exportPlan.downloadFileCount === 1 ? (
+          <span className="inline-flex items-center gap-1">
+            <FileType className="w-3 h-3" />
+            {t('exportModal.singleFile')}
+          </span>
+        ) : null}
+      </div>
+      </div>
 
-        <div className="flex items-center justify-center gap-3">
-          <button onClick={onClose} className="btn-secondary text-xs px-4 py-1.5">
-            {t('common.cancel')}
-          </button>
-          <button
-            onClick={handleExport}
-            disabled={isExporting || !canExport}
-            className="btn-primary text-xs px-5 py-1.5 flex items-center gap-1.5"
-          >
-            {isExporting ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <Download className="w-3.5 h-3.5" />
-            )}
-            {isExporting ? t('exportModal.exporting') : t('common.download')}
-          </button>
-        </div>
+      {/* 底栏 */}
+      <div className="px-5 min-h-[60px] border-t border-cream-200 bg-cream-50/50 safe-bottom flex-shrink-0 flex items-center justify-center gap-3">
+        <button onClick={onClose} className="btn-secondary text-xs px-4 py-1.5">
+          {t('common.cancel')}
+        </button>
+        <button
+          onClick={handleExport}
+          disabled={isExporting || !canExport}
+          className="btn-primary text-xs px-5 py-1.5 flex items-center gap-1.5"
+        >
+          {isExporting ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          ) : (
+            <Download className="w-3.5 h-3.5" />
+          )}
+          {isExporting ? t('exportModal.exporting') : t('common.download')}
+        </button>
       </div>
     </div>
   );
@@ -679,7 +688,7 @@ export default function ExportModal({
     <>
       <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 animate-backdrop-enter" onClick={onClose} />
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-2xl w-[480px] max-w-full animate-modal-enter overflow-hidden">
+        <div className="bg-white rounded-2xl shadow-2xl w-[480px] max-w-full max-h-[calc(100vh-2rem)] flex flex-col animate-modal-enter overflow-hidden">
           {/* Header */}
           <div className="flex items-center justify-between px-5 py-3.5 border-b border-cream-200 bg-gradient-to-r from-rust-50 to-cream-50">
             <div className="flex items-center gap-2">

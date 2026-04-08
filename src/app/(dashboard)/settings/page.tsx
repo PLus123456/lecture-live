@@ -5,7 +5,9 @@ import { useSettingsStore } from '@/stores/settingsStore';
 import { useAuth } from '@/hooks/useAuth';
 import { SONIOX_REGION_OPTIONS } from '@/types/transcript';
 import LanguageSelect from '@/components/LanguageSelect';
-import { Settings, Globe, Cpu, Mic, Lock, Tags, Scissors } from 'lucide-react';
+import { useI18n } from '@/lib/i18n';
+import { UI_LOCALE_OPTIONS, type Locale } from '@/lib/i18n';
+import { Settings, Globe, Cpu, Mic, Lock, Tags, Scissors, Languages } from 'lucide-react';
 import type { ChatModelOption, ChatModelsResponse } from '@/types/llm';
 
 function clampNumber(value: string, fallback: number, min: number, max: number) {
@@ -26,6 +28,7 @@ function parseTerms(value: string) {
 export default function SettingsPage() {
   const settings = useSettingsStore();
   const { user, token } = useAuth();
+  const { locale, setLocale, t } = useI18n();
 
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -166,6 +169,29 @@ export default function SettingsPage() {
         </section>
 
         <section className="bg-white rounded-xl border border-cream-200 p-5 animate-fade-in-up stagger-2">
+          <h2 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
+            <Languages className="w-4 h-4" />
+            {t('settings.interfaceLanguage')}
+          </h2>
+          <div>
+            <select
+              value={locale}
+              onChange={(e) => setLocale(e.target.value as Locale)}
+              className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm"
+            >
+              {UI_LOCALE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-[11px] text-charcoal-400">
+              {t('settings.interfaceLanguageDesc')}
+            </p>
+          </div>
+        </section>
+
+        <section className="bg-white rounded-xl border border-cream-200 p-5 animate-fade-in-up">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
             <Lock className="w-4 h-4" />
             Change Password

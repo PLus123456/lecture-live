@@ -131,6 +131,8 @@ export default {
     standardReasoning: '该服务商使用标准推理。',
     autoRegionDesc: '自动模式根据部署平台的地理位置信息，自动选择最近的 Soniox 区域。',
     quota: '配额',
+    interfaceLanguage: '界面语言',
+    interfaceLanguageDesc: '选择应用界面的显示语言。',
   },
 
   // 侧边栏

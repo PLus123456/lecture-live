@@ -1,16 +1,23 @@
 'use client';
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { I18nContext, getTranslation, type Locale } from '@/lib/i18n';
+import { I18nContext, getTranslation, detectBrowserLocale, SUPPORTED_LOCALES, type Locale } from '@/lib/i18n';
 
 const STORAGE_KEY = 'lecture-live-locale';
 
+function isValidLocale(v: string | null): v is Locale {
+  return !!v && (SUPPORTED_LOCALES as readonly string[]).includes(v);
+}
+
 function getStoredLocale(defaultLocale: Locale): Locale {
-  if (typeof window === 'undefined') return 'en';
+  if (typeof window === 'undefined') return defaultLocale;
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored === 'en' || stored === 'zh') return stored;
+    if (isValidLocale(stored)) return stored;
   } catch {}
-  return defaultLocale;
+  // 首次访问：根据浏览器语言自动检测，并写入 localStorage 避免重复检测
+  const detected = detectBrowserLocale(defaultLocale);
+  try { localStorage.setItem(STORAGE_KEY, detected); } catch {}
+  return detected;
 }
 
 export default function I18nProvider({

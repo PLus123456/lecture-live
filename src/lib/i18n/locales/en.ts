@@ -131,6 +131,8 @@ export default {
     standardReasoning: 'This provider uses standard reasoning depth.',
     autoRegionDesc: 'Auto uses geo headers from your deployment platform to choose the nearest available Soniox region.',
     quota: 'Quota',
+    interfaceLanguage: 'Interface Language',
+    interfaceLanguageDesc: 'Choose the display language for the application interface.',
   },
 
   // 侧边栏

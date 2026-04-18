@@ -6,6 +6,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import Sidebar from '@/components/Sidebar';
+import UserSettingsModal from '@/components/UserSettingsModal';
 import ExportModal from '@/components/ExportModal';
 import MobilePlaybackLayout from '@/components/mobile/MobilePlaybackLayout';
 import PlaybackSharePopover from '@/components/session/PlaybackSharePopover';
@@ -1050,6 +1051,7 @@ export default function PlaybackPage() {
   return (
     <div className="flex h-screen overflow-hidden">
       {!isShareMode && <Sidebar />}
+      {!isShareMode && <UserSettingsModal />}
 
       <main
         className={`flex-1 flex flex-col overflow-hidden transition-all duration-300 ${

@@ -245,6 +245,8 @@ export default function InterpretPage() {
     if (!isRunning) return;
     const handler = (e: BeforeUnloadEvent) => {
       e.preventDefault();
+      // Safari / 老版 Firefox 需要显式 returnValue 才会弹出确认框
+      e.returnValue = '';
     };
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);

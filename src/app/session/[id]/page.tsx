@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Sidebar from '@/components/Sidebar';
+import UserSettingsModal from '@/components/UserSettingsModal';
 import TranscriptPanel from '@/components/TranscriptPanel';
 import AiPanel from '@/components/session/AiPanel';
 import SettingsDrawer from '@/components/SettingsDrawer';
@@ -1517,6 +1518,7 @@ export default function ActiveSessionPage() {
   return (
     <div className="flex h-screen overflow-hidden">
       <Sidebar />
+      <UserSettingsModal />
 
       <main
         className={`flex-1 flex flex-col overflow-hidden transition-all duration-300 ${

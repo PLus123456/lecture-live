@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import Sidebar from '@/components/Sidebar';
+import UserSettingsModal from '@/components/UserSettingsModal';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useMicrophoneMonitor } from '@/hooks/useMicrophoneMonitor';
 import { useAuth } from '@/hooks/useAuth';
@@ -298,6 +299,7 @@ export default function NewSessionPage() {
   return (
     <div className="flex h-screen bg-cream-50 overflow-hidden">
       {!isMobile ? <Sidebar /> : null}
+      {!isMobile ? <UserSettingsModal /> : null}
       <main
         className={`flex-1 flex flex-col transition-all duration-300 ${
           isMobile ? 'ml-0 overflow-y-auto' : sidebarCollapsed ? 'ml-16' : 'ml-56'

@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import Sidebar from '@/components/Sidebar';
+import UserSettingsModal from '@/components/UserSettingsModal';
 import { useI18n } from '@/lib/i18n';
 import { useSettingsStore } from '@/stores/settingsStore';
 import {
@@ -68,6 +69,7 @@ export default function LibraryPage() {
   return (
     <div className="flex min-h-[100dvh]">
       <Sidebar />
+      <UserSettingsModal />
       <main
         className={`flex-1 transition-all duration-300 ${
           sidebarCollapsed ? 'ml-16' : 'ml-56'

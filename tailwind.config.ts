@@ -47,9 +47,17 @@ const config: Config = {
           '0%': { opacity: '0', transform: 'scale(0.95) translateY(10px)' },
           '100%': { opacity: '1', transform: 'scale(1) translateY(0)' },
         },
+        'modal-leave': {
+          '0%': { opacity: '1', transform: 'scale(1) translateY(0)' },
+          '100%': { opacity: '0', transform: 'scale(0.95) translateY(10px)' },
+        },
         'backdrop-enter': {
           '0%': { opacity: '0' },
           '100%': { opacity: '1' },
+        },
+        'backdrop-leave': {
+          '0%': { opacity: '1' },
+          '100%': { opacity: '0' },
         },
         'toolbar-in': {
           '0%': { opacity: '0', transform: 'translateY(4px) scale(0.95)' },
@@ -141,7 +149,9 @@ const config: Config = {
       },
       animation: {
         'modal-enter': 'modal-enter 0.2s ease-out',
+        'modal-leave': 'modal-leave 0.18s ease-in forwards',
         'backdrop-enter': 'backdrop-enter 0.15s ease-out',
+        'backdrop-leave': 'backdrop-leave 0.18s ease-in forwards',
         'toolbar-in': 'toolbar-in 0.18s ease-out forwards',
         'toolbar-out': 'toolbar-out 0.12s ease-in forwards',
         'ctx-menu-in': 'ctx-menu-in 0.12s ease-out forwards',

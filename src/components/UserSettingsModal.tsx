@@ -25,9 +25,28 @@ function parseTerms(value: string) {
     .filter(Boolean);
 }
 
+const MODAL_LEAVE_MS = 180;
+
 export default function UserSettingsModal() {
   const open = useSettingsStore((s) => s.userSettingsOpen);
   const setOpen = useSettingsStore((s) => s.setUserSettingsOpen);
+  const [mounted, setMounted] = useState(false);
+  const [leaving, setLeaving] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setMounted(true);
+      setLeaving(false);
+      return;
+    }
+    if (!mounted) return;
+    setLeaving(true);
+    const timer = setTimeout(() => {
+      setMounted(false);
+      setLeaving(false);
+    }, MODAL_LEAVE_MS);
+    return () => clearTimeout(timer);
+  }, [open, mounted]);
   const settings = useSettingsStore();
   const { user, token } = useAuth();
 
@@ -145,18 +164,18 @@ export default function UserSettingsModal() {
     }
   };
 
-  if (!open) return null;
+  if (!mounted) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* 背景遮罩 */}
       <div
-        className="absolute inset-0 bg-black/30 backdrop-blur-sm animate-backdrop-enter"
+        className={`absolute inset-0 bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
         onClick={() => setOpen(false)}
       />
 
       {/* 弹窗主体 */}
-      <div className="relative bg-cream-50 rounded-2xl shadow-2xl border border-cream-200 w-full max-w-2xl max-h-[85vh] overflow-hidden flex flex-col mx-4 animate-modal-enter">
+      <div className={`relative bg-cream-50 rounded-2xl shadow-2xl border border-cream-200 w-full max-w-2xl max-h-[85vh] overflow-hidden flex flex-col mx-4 ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
         {/* 标题栏 */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 bg-white flex-shrink-0">
           <h2 className="font-serif text-lg font-bold text-charcoal-800">Settings</h2>

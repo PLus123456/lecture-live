@@ -19,6 +19,7 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
   const [loading, setLoading] = useState(false);
   const [revoking, setRevoking] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [initialChecked, setInitialChecked] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -68,11 +69,15 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
     if (open && !initialChecked) {
       checkExisting();
     }
+    if (!open) {
+      setError(null);
+    }
   }, [open, initialChecked, checkExisting]);
 
   const handleCreate = async () => {
     if (!token) return;
     setLoading(true);
+    setError(null);
     try {
       const res = await fetch('/api/share/create', {
         method: 'POST',
@@ -86,9 +91,12 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
         const data = await res.json();
         const url = `${window.location.origin}/session/${sessionId}/playback?token=${data.token}`;
         setShareUrl(url);
+      } else {
+        const body = await res.json().catch(() => null);
+        setError(body?.error || t('playback.shareCreateFailed'));
       }
     } catch {
-      // silent
+      setError(t('playback.shareCreateFailed'));
     }
     setLoading(false);
   };
@@ -96,6 +104,7 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
   const handleRevoke = async () => {
     if (!token) return;
     setRevoking(true);
+    setError(null);
     try {
       const res = await fetch('/api/share/create', {
         method: 'DELETE',
@@ -107,18 +116,27 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
       });
       if (res.ok) {
         setShareUrl(null);
+      } else {
+        const body = await res.json().catch(() => null);
+        setError(body?.error || t('playback.shareRevokeFailed'));
       }
     } catch {
-      // silent
+      setError(t('playback.shareRevokeFailed'));
     }
     setRevoking(false);
   };
+
+  // 复制成功提示 2s 后自动消失；unmount 或再次点击会取消定时器避免在已卸载组件上 setState
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(timer);
+  }, [copied]);
 
   const handleCopy = async () => {
     if (!shareUrl) return;
     await navigator.clipboard.writeText(shareUrl);
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
   };
 
   return (
@@ -185,6 +203,9 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
                 )}
                 {t('playback.shareCreate')}
               </button>
+              {error && (
+                <p className="text-[11px] text-red-600 mt-2">{error}</p>
+              )}
             </div>
           ) : (
             <div>
@@ -230,6 +251,9 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
                 )}
                 {t('playback.shareRevoke')}
               </button>
+              {error && (
+                <p className="text-[11px] text-red-600 mt-2">{error}</p>
+              )}
             </div>
           )}
         </div>

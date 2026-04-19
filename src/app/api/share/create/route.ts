@@ -136,7 +136,8 @@ export async function POST(req: Request) {
     }
 
     let expiresAt: Date | null = null;
-    if (body.expiresInHours != null) {
+    const expiresInHoursProvided = body.expiresInHours != null;
+    if (expiresInHoursProvided) {
       try {
         const expiresInHours = parsePositiveInteger(body.expiresInHours, {
           min: 1,
@@ -164,7 +165,8 @@ export async function POST(req: Request) {
     const shareLink = existingLiveLink
       ? await prisma.shareLink.update({
           where: { id: existingLiveLink.id },
-          data: { expiresAt },
+          // 只有调用方显式提供 expiresInHours 时才覆盖，否则保留原有过期时间
+          data: expiresInHoursProvided ? { expiresAt } : {},
         })
       : await prisma.shareLink.create({
           data: {

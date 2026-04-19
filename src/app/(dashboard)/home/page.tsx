@@ -105,6 +105,7 @@ export default function HomePage() {
   const isMobile = useIsMobile();
   const { token, fetchQuotas } = useAuth();
   const [sessions, setSessions] = useState<SessionItem[]>([]);
+  const [stats, setStats] = useState<{ totalCount: number; totalDurationMs: number } | null>(null);
   const [folders, setFolders] = useState<FolderItem[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewSession, setShowNewSession] = useState(false);
@@ -131,10 +132,16 @@ export default function HomePage() {
       fetchQuotas(),
     ]).then(([sessionsResult, foldersResult]) => {
       if (sessionsResult.status === 'fulfilled') {
-        // 兼容分页响应格式 { items, nextCursor } 和旧格式 []
+        // 兼容分页响应格式 { items, nextCursor, totalCount, totalDurationMs } 和旧格式 []
         const data = sessionsResult.value;
         const items = Array.isArray(data) ? data : (data?.items ?? []);
         setSessions(items);
+        if (!Array.isArray(data) && typeof data?.totalCount === 'number') {
+          setStats({
+            totalCount: data.totalCount,
+            totalDurationMs: data.totalDurationMs ?? 0,
+          });
+        }
       }
       if (foldersResult.status === 'fulfilled' && Array.isArray(foldersResult.value)) {
         setFolders(foldersResult.value);
@@ -189,7 +196,11 @@ export default function HomePage() {
     return formatDate(dateStr);
   };
 
-  const totalRecordingMs = sessions.reduce((sum, s) => sum + getEffectiveDurationMs(s), 0);
+  // stats 已有则用服务端返回的总量，否则回退到已加载列表（首次加载时的空壳）
+  const totalRecordingMs = stats
+    ? stats.totalDurationMs
+    : sessions.reduce((sum, s) => sum + getEffectiveDurationMs(s), 0);
+  const totalSessionsCount = stats ? stats.totalCount : sessions.length;
   const totalRecordingMin = Math.floor(totalRecordingMs / 60000);
   const recordingTimeStr = totalRecordingMin < 60
     ? `${totalRecordingMin}m`
@@ -447,7 +458,7 @@ export default function HomePage() {
                   Sessions
                 </div>
                 <div className="text-lg font-bold text-charcoal-800 leading-tight">
-                  {sessions.length}
+                  {totalSessionsCount}
                 </div>
               </div>
             </div>

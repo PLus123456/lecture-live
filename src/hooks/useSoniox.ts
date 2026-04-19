@@ -560,6 +560,12 @@ export function useSoniox(
   // 内部重连函数 — 断网后自动尝试重新建立 Soniox 连接
   const attemptReconnect = useCallback(
     async () => {
+      // 清掉任何还未触发的上一次重连定时器，避免 onError + catch 同时触发时堆叠多个 WS 尝试
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+
       if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
         console.error('Max reconnect attempts reached, giving up');
         shouldReconnectRef.current = false;
@@ -1053,6 +1059,16 @@ export function useSoniox(
       finalizeOnUnloadSentRef.current = false;
     }
   }, [recordingState]);
+
+  // 组件卸载时清掉 pending 重连定时器，避免在已卸载后仍尝试新建 WS
+  useEffect(() => {
+    return () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const handleVisibilityChange = () => {

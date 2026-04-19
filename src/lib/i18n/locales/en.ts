@@ -539,6 +539,8 @@ export default {
     shareRevoke: 'Revoke Share Link',
     shareCopied: 'Link Copied',
     shareCopyLink: 'Copy link',
+    shareCreateFailed: 'Failed to create share link. Please try again.',
+    shareRevokeFailed: 'Failed to revoke share link. Please try again.',
   },
 
   exportModal: {

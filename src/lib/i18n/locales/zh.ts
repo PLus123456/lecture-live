@@ -526,6 +526,8 @@ export default {
     shareRevoke: '撤销分享链接',
     shareCopied: '链接已复制',
     shareCopyLink: '复制链接',
+    shareCreateFailed: '创建分享链接失败，请稍后再试。',
+    shareRevokeFailed: '撤销分享链接失败，请稍后再试。',
   },
 
   exportModal: {

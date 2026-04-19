@@ -79,7 +79,40 @@ export const GET = withRequestLogging('sessions:list', async (req: Request) => {
       const hasMore = sessions.length > limit;
       const items = hasMore ? sessions.slice(0, limit) : sessions;
       const nextCursor = hasMore ? items[items.length - 1].id : null;
-      return { items, nextCursor };
+
+      // 统计数据独立于分页列表，避免底部数字被 limit 截断
+      const [totalCount, durationAgg, liveSessions] = await Promise.all([
+        prisma.session.count({ where: { userId: user.id } }),
+        prisma.session.aggregate({
+          where: { userId: user.id },
+          _sum: { durationMs: true },
+        }),
+        prisma.session.findMany({
+          where: {
+            userId: user.id,
+            status: { in: ['RECORDING', 'PAUSED'] },
+            durationMs: 0,
+          },
+          select: {
+            serverStartedAt: true,
+            serverPausedMs: true,
+            serverPausedAt: true,
+          },
+        }),
+      ]);
+
+      const now = Date.now();
+      const liveDurationMs = liveSessions.reduce((sum, s) => {
+        if (!s.serverStartedAt) return sum;
+        const started = s.serverStartedAt.getTime();
+        const pending = s.serverPausedAt
+          ? Math.max(0, now - s.serverPausedAt.getTime())
+          : 0;
+        return sum + Math.max(0, now - started - s.serverPausedMs - pending);
+      }, 0);
+      const totalDurationMs = (durationAgg._sum.durationMs ?? 0) + liveDurationMs;
+
+      return { items, nextCursor, totalCount, totalDurationMs };
     }
   );
 

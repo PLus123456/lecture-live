@@ -6,12 +6,16 @@ const {
   enforceApiRateLimitMock,
   sessionFindManyMock,
   sessionCreateMock,
+  sessionCountMock,
+  sessionAggregateMock,
   folderFindUniqueMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   enforceApiRateLimitMock: vi.fn(),
   sessionFindManyMock: vi.fn(),
   sessionCreateMock: vi.fn(),
+  sessionCountMock: vi.fn(),
+  sessionAggregateMock: vi.fn(),
   folderFindUniqueMock: vi.fn(),
 }));
 
@@ -39,6 +43,8 @@ vi.mock('@/lib/prisma', () => ({
     session: {
       findMany: sessionFindManyMock,
       create: sessionCreateMock,
+      count: sessionCountMock,
+      aggregate: sessionAggregateMock,
     },
     folder: {
       findUnique: folderFindUniqueMock,
@@ -59,11 +65,20 @@ describe('sessions route', () => {
   });
 
   it('支持分页获取当前用户会话列表', async () => {
-    sessionFindManyMock.mockResolvedValue([
-      { id: 'session-3', title: 'Third' },
-      { id: 'session-2', title: 'Second' },
-      { id: 'session-1', title: 'First' },
-    ]);
+    sessionFindManyMock.mockImplementation((args: { where?: { status?: unknown } } = {}) => {
+      // liveSessions 查询：status in [RECORDING, PAUSED]
+      if (args.where?.status) {
+        return Promise.resolve([]);
+      }
+      // 主列表查询
+      return Promise.resolve([
+        { id: 'session-3', title: 'Third' },
+        { id: 'session-2', title: 'Second' },
+        { id: 'session-1', title: 'First' },
+      ]);
+    });
+    sessionCountMock.mockResolvedValue(12);
+    sessionAggregateMock.mockResolvedValue({ _sum: { durationMs: 360000 } });
 
     const response = await GET(
       createJsonRequest('http://localhost:3000/api/sessions?limit=2'),
@@ -79,6 +94,8 @@ describe('sessions route', () => {
       readJson<{
         items: Array<{ id: string; title: string }>;
         nextCursor: string | null;
+        totalCount: number;
+        totalDurationMs: number;
       }>(response)
     ).resolves.toEqual({
       items: [
@@ -86,6 +103,8 @@ describe('sessions route', () => {
         { id: 'session-2', title: 'Second' },
       ],
       nextCursor: 'session-2',
+      totalCount: 12,
+      totalDurationMs: 360000,
     });
     expect(sessionFindManyMock).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -93,6 +112,13 @@ describe('sessions route', () => {
         take: 3,
       })
     );
+    expect(sessionCountMock).toHaveBeenCalledWith({
+      where: { userId: 'user-1' },
+    });
+    expect(sessionAggregateMock).toHaveBeenCalledWith({
+      where: { userId: 'user-1' },
+      _sum: { durationMs: true },
+    });
   });
 
   it('命中 ETag 时返回 304', async () => {

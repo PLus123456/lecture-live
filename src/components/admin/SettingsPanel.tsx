@@ -1137,6 +1137,41 @@ function StoragePanel({
   const [cleanResult, setCleanResult] = useState<string | null>(null);
   const [authorizing, setAuthorizing] = useState(false);
   const [authResult, setAuthResult] = useState<string | null>(null);
+  const [authStatus, setAuthStatus] = useState<{
+    authorized: boolean;
+    expiresAt: number | null;
+  } | null>(null);
+  const [revoking, setRevoking] = useState(false);
+
+  const refreshAuthStatus = useCallback(async () => {
+    if (settings.storage_mode !== 'cloudreve') {
+      setAuthStatus(null);
+      return;
+    }
+    try {
+      const res = await fetch('/api/admin/cloudreve/status', {
+        cache: 'no-store',
+      });
+      if (!res.ok) {
+        setAuthStatus({ authorized: false, expiresAt: null });
+        return;
+      }
+      const data = await res.json();
+      setAuthStatus({
+        authorized: Boolean(data.authorized),
+        expiresAt:
+          typeof data.expires_at === 'number' && Number.isFinite(data.expires_at)
+            ? data.expires_at
+            : null,
+      });
+    } catch {
+      setAuthStatus({ authorized: false, expiresAt: null });
+    }
+  }, [settings.storage_mode]);
+
+  useEffect(() => {
+    void refreshAuthStatus();
+  }, [refreshAuthStatus]);
 
   const handleMigrate = async () => {
     setMigrating(true);
@@ -1227,6 +1262,38 @@ function StoragePanel({
     }
   };
 
+  const handleRevoke = async () => {
+    if (!window.confirm(t('adminSettings.cloudreveRevokeConfirm'))) {
+      return;
+    }
+    setRevoking(true);
+    setAuthResult(null);
+    try {
+      const res = await fetch('/api/admin/cloudreve/revoke', { method: 'POST' });
+      if (res.ok) {
+        setAuthResult(t('adminSettings.cloudreveRevokeSuccess'));
+        await refreshAuthStatus();
+      } else {
+        const data = await res.json().catch(() => null);
+        setAuthResult(
+          data?.error || t('adminSettings.cloudreveRevokeFailed')
+        );
+      }
+    } catch {
+      setAuthResult(t('adminSettings.cloudreveRevokeFailed'));
+    } finally {
+      setRevoking(false);
+    }
+  };
+
+  const isAuthorized = Boolean(authStatus?.authorized);
+  const isExpired =
+    isAuthorized &&
+    authStatus?.expiresAt !== null &&
+    authStatus?.expiresAt !== undefined &&
+    authStatus.expiresAt > 0 &&
+    authStatus.expiresAt <= Date.now();
+
   return (
     <div>
       <SettingField label={t('adminSettings.storageMode')} description={t('adminSettings.storageModeDesc')}>
@@ -1256,22 +1323,69 @@ function StoragePanel({
             <TextInput value={settings.cloudreve_client_secret} onChange={(v) => onChange('cloudreve_client_secret', v)} type="password" />
           </SettingField>
 
-          {/* OAuth 授权按钮 */}
-          <div className="mt-2">
-            <button
-              type="button"
-              onClick={handleAuthorize}
-              disabled={
-                authorizing ||
-                !settings.cloudreve_url.trim() ||
-                !settings.cloudreve_client_id.trim() ||
-                !settings.cloudreve_client_secret.trim()
-              }
-              className="inline-flex items-center gap-1.5 rounded-md bg-rust-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-rust-600 disabled:opacity-50"
-            >
-              <Globe size={14} />
-              {authorizing ? t('adminSettings.cloudreveAuthorizing') : t('adminSettings.cloudreveAuthorize')}
-            </button>
+          {/* OAuth 授权状态 + 操作按钮 */}
+          <div className="mt-2 space-y-2">
+            {authStatus && (
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <span
+                  className={
+                    isAuthorized && !isExpired
+                      ? 'inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+                      : isExpired
+                      ? 'inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300'
+                      : 'inline-flex items-center gap-1 rounded-full bg-charcoal-200 px-2 py-0.5 text-xs font-medium text-charcoal-600 dark:bg-charcoal-700 dark:text-charcoal-300'
+                  }
+                >
+                  {isExpired
+                    ? t('adminSettings.cloudreveStatusExpired')
+                    : isAuthorized
+                    ? t('adminSettings.cloudreveStatusAuthorized')
+                    : t('adminSettings.cloudreveStatusUnauthorized')}
+                </span>
+                {isAuthorized && !isExpired && authStatus.expiresAt && (
+                  <span className="text-xs text-charcoal-500 dark:text-charcoal-400">
+                    {t('adminSettings.cloudreveTokenExpiresAt').replace(
+                      '{time}',
+                      new Date(authStatus.expiresAt).toLocaleString()
+                    )}
+                  </span>
+                )}
+              </div>
+            )}
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleAuthorize}
+                disabled={
+                  authorizing ||
+                  revoking ||
+                  !settings.cloudreve_url.trim() ||
+                  !settings.cloudreve_client_id.trim() ||
+                  !settings.cloudreve_client_secret.trim()
+                }
+                className="inline-flex items-center gap-1.5 rounded-md bg-rust-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-rust-600 disabled:opacity-50"
+              >
+                <Globe size={14} />
+                {authorizing
+                  ? t('adminSettings.cloudreveAuthorizing')
+                  : isAuthorized
+                  ? t('adminSettings.cloudreveReauthorize')
+                  : t('adminSettings.cloudreveAuthorize')}
+              </button>
+              {isAuthorized && (
+                <button
+                  type="button"
+                  onClick={handleRevoke}
+                  disabled={revoking || authorizing}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-charcoal-300 bg-white px-3 py-1.5 text-sm font-medium text-charcoal-700 transition-colors hover:bg-charcoal-50 disabled:opacity-50 dark:border-charcoal-600 dark:bg-charcoal-800 dark:text-charcoal-200 dark:hover:bg-charcoal-700"
+                >
+                  <Trash2 size={14} />
+                  {revoking
+                    ? t('adminSettings.cloudreveRevoking')
+                    : t('adminSettings.cloudreveRevoke')}
+                </button>
+              )}
+            </div>
             {authResult && (
               <p className="mt-1 text-sm text-charcoal-600 dark:text-charcoal-400">{authResult}</p>
             )}

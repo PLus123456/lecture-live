@@ -4,13 +4,30 @@ import { getSiteSettings } from '@/lib/siteSettings';
 import {
   buildAuthorizeUrl,
   clearCachedTokens,
+  clearPersistedTokens,
   exchangeAuthorizationCode,
+  getCloudreveAuthStatus,
   invalidateCloudreveConfigCache,
+  isCloudreveAuthorizedAsync,
   isCloudreveConfiguredAsync,
 } from '@/lib/storage/cloudreve';
 
 vi.mock('@/lib/siteSettings', () => ({
   getSiteSettings: vi.fn(),
+}));
+
+const siteSettingDeleteManyMock = vi.fn();
+const siteSettingFindUniqueMock = vi.fn();
+const siteSettingFindManyMock = vi.fn();
+
+vi.mock('@/lib/prisma', () => ({
+  prisma: {
+    siteSetting: {
+      deleteMany: (...args: unknown[]) => siteSettingDeleteManyMock(...args),
+      findUnique: (...args: unknown[]) => siteSettingFindUniqueMock(...args),
+      findMany: (...args: unknown[]) => siteSettingFindManyMock(...args),
+    },
+  },
 }));
 
 const mockedGetSiteSettings = vi.mocked(getSiteSettings);
@@ -73,6 +90,12 @@ describe('Cloudreve OAuth 配置', () => {
     delete process.env.CLOUDREVE_CLIENT_ID;
     delete process.env.CLOUDREVE_CLIENT_SECRET;
     mockedGetSiteSettings.mockReset();
+    siteSettingDeleteManyMock.mockReset();
+    siteSettingFindUniqueMock.mockReset();
+    siteSettingFindManyMock.mockReset();
+    siteSettingDeleteManyMock.mockResolvedValue({ count: 0 });
+    siteSettingFindUniqueMock.mockResolvedValue(null);
+    siteSettingFindManyMock.mockResolvedValue([]);
     clearCachedTokens();
     invalidateCloudreveConfigCache();
   });
@@ -122,7 +145,9 @@ describe('Cloudreve OAuth 配置', () => {
     expect(url.searchParams.get('redirect_uri')).toBe(
       'http://localhost:3000/api/admin/cloudreve/callback'
     );
-    expect(url.searchParams.get('scope')).toBe('openid offline_access Files.Read Files.Write');
+    // scope 仅请求 Files.Write —— Cloudreve V4 用 Files.Write 表示读写权限，
+    // 同时请求 Files.Read + Files.Write 在部分实例会被同意页拒绝。
+    expect(url.searchParams.get('scope')).toBe('openid offline_access Files.Write');
     expect(url.searchParams.get('code_challenge_method')).toBe('S256');
     expect(url.searchParams.get('code_challenge')).toMatch(/^[A-Za-z0-9_-]+$/);
   });
@@ -176,5 +201,95 @@ describe('Cloudreve OAuth 配置', () => {
     });
     expect(tokens.expiresAt).toBeGreaterThanOrEqual(startedAt + 7190 * 1000);
     expect(tokens.expiresAt).toBeLessThanOrEqual(startedAt + 7210 * 1000);
+  });
+
+  it('Cloudreve V4 返回 code !== 0 时拒绝写入 token，避免把 undefined 缓存', async () => {
+    mockedGetSiteSettings.mockResolvedValue(createSiteSettings());
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          code: 40001,
+          msg: 'invalid grant',
+          data: {},
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+
+    await expect(
+      exchangeAuthorizationCode(
+        'auth-code',
+        'http://localhost:3000/api/admin/cloudreve/callback',
+        'verifier-verifier-verifier-verifier-verifier-verifier'
+      )
+    ).rejects.toThrow(/40001|invalid grant/);
+  });
+
+  it('响应缺少 access_token 时也要拒绝，绝不能写入空字符串', async () => {
+    mockedGetSiteSettings.mockResolvedValue(createSiteSettings());
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          // 没有 access_token
+          refresh_token: 'rt',
+          expires_in: 7200,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+
+    await expect(
+      exchangeAuthorizationCode(
+        'auth-code',
+        'http://localhost:3000/api/admin/cloudreve/callback',
+        'verifier-verifier-verifier-verifier-verifier-verifier'
+      )
+    ).rejects.toThrow(/access_token|refresh_token/);
+  });
+
+  it('clearPersistedTokens 同时清除内存缓存与数据库三行', async () => {
+    siteSettingDeleteManyMock.mockResolvedValue({ count: 3 });
+
+    await clearPersistedTokens();
+
+    expect(siteSettingDeleteManyMock).toHaveBeenCalledWith({
+      where: {
+        key: {
+          in: [
+            'cloudreve_access_token',
+            'cloudreve_refresh_token',
+            'cloudreve_token_expires_at',
+          ],
+        },
+      },
+    });
+  });
+
+  it('isCloudreveAuthorizedAsync 在数据库存有 refresh_token 时返回 true', async () => {
+    siteSettingFindUniqueMock.mockResolvedValue({
+      key: 'cloudreve_refresh_token',
+      value: 'enc:v2:abc:def:ghi',
+    });
+
+    await expect(isCloudreveAuthorizedAsync()).resolves.toBe(true);
+  });
+
+  it('isCloudreveAuthorizedAsync 在没有 refresh_token 时返回 false', async () => {
+    siteSettingFindUniqueMock.mockResolvedValue(null);
+
+    await expect(isCloudreveAuthorizedAsync()).resolves.toBe(false);
+  });
+
+  it('getCloudreveAuthStatus 返回授权状态与过期时间', async () => {
+    siteSettingFindManyMock.mockResolvedValue([
+      { key: 'cloudreve_refresh_token', value: 'enc:v2:abc:def:ghi' },
+      { key: 'cloudreve_token_expires_at', value: '1800000000000' },
+    ]);
+
+    const status = await getCloudreveAuthStatus();
+    expect(status.authorized).toBe(true);
+    expect(status.expiresAt).toBe(1800000000000);
   });
 });

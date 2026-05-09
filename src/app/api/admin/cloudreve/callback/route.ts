@@ -6,6 +6,7 @@ import {
 } from '@/lib/storage/cloudreve';
 import { invalidateSiteSettingsCache } from '@/lib/siteSettings';
 import { resolvePublicAppOrigin } from '@/lib/requestOrigin';
+import { encrypt } from '@/lib/crypto';
 
 function normalizeStoredRedirectUri(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
@@ -80,17 +81,19 @@ export async function GET(req: Request) {
     // 用 code 换取 token
     const tokens = await exchangeAuthorizationCode(code, redirectUri, codeVerifier);
 
-    // 持久化 token 到数据库
+    // 持久化 token 到数据库（加密存储，与 LlmProvider.apiKey 同一加密体系）
+    const encryptedAccess = encrypt(tokens.accessToken);
+    const encryptedRefresh = encrypt(tokens.refreshToken);
     await prisma.$transaction([
       prisma.siteSetting.upsert({
         where: { key: 'cloudreve_access_token' },
-        update: { value: tokens.accessToken },
-        create: { key: 'cloudreve_access_token', value: tokens.accessToken },
+        update: { value: encryptedAccess },
+        create: { key: 'cloudreve_access_token', value: encryptedAccess },
       }),
       prisma.siteSetting.upsert({
         where: { key: 'cloudreve_refresh_token' },
-        update: { value: tokens.refreshToken },
-        create: { key: 'cloudreve_refresh_token', value: tokens.refreshToken },
+        update: { value: encryptedRefresh },
+        create: { key: 'cloudreve_refresh_token', value: encryptedRefresh },
       }),
       prisma.siteSetting.upsert({
         where: { key: 'cloudreve_token_expires_at' },

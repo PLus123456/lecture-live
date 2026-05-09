@@ -11,7 +11,10 @@ import {
 import { invalidateSonioxDbConfigCache } from '@/lib/soniox/env';
 import { invalidateTrustedProxyCache } from '@/lib/clientIp';
 import { migrateLocalToCloudreve } from '@/lib/storage/migration';
-import { invalidateCloudreveConfigCache } from '@/lib/storage/cloudreve';
+import {
+  clearPersistedTokens as clearCloudreveTokens,
+  invalidateCloudreveConfigCache,
+} from '@/lib/storage/cloudreve';
 
 // 获取所有站点设置
 export async function GET(req: Request) {
@@ -196,6 +199,19 @@ export async function PUT(req: Request) {
     invalidateTrustedProxyCache();
     invalidateCloudreveConfigCache();
     const settings = await getSiteSettings({ fresh: true });
+
+    // Cloudreve URL/Client 任一变更后，旧 token 不再匹配新 server/app —
+    // 用旧 token 调新 client 必然 401，必须清空让管理员重新走 OAuth。
+    const cloudreveCredentialsChanged =
+      previousSettings.cloudreve_url !== settings.cloudreve_url ||
+      previousSettings.cloudreve_client_id !== settings.cloudreve_client_id ||
+      previousSettings.cloudreve_client_secret !== settings.cloudreve_client_secret;
+
+    if (cloudreveCredentialsChanged) {
+      await clearCloudreveTokens().catch((err) =>
+        console.error('[admin.settings] 清除 Cloudreve token 失败:', err)
+      );
+    }
 
     // 如果存储模式从 local 切换到 cloudreve，后台触发迁移
     const switchedToCloudreve =

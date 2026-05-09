@@ -1,12 +1,24 @@
 // src/lib/storage/cloudreve.ts
 // Cloudreve V4 OAuth 应用集成
 
+import 'server-only';
+
 import path from 'path';
+import { prisma } from '@/lib/prisma';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { sanitizePath } from '@/lib/security';
+import { decrypt, encrypt, isEncrypted } from '@/lib/crypto';
 
 const STORAGE_CATEGORIES = ['recordings', 'transcripts', 'summaries', 'reports'] as const;
-const DEFAULT_CLOUDREVE_OAUTH_SCOPE = 'openid offline_access Files.Read Files.Write';
+// Cloudreve V4 用 Files.Write 表示读写权限，请求 Files.Read + Files.Write 组合
+// 在部分 Cloudreve 实例上会被同意页拒绝。
+const DEFAULT_CLOUDREVE_OAUTH_SCOPE = 'openid offline_access Files.Write';
+
+const TOKEN_DB_KEYS = [
+  'cloudreve_access_token',
+  'cloudreve_refresh_token',
+  'cloudreve_token_expires_at',
+] as const;
 
 export type StorageCategory = (typeof STORAGE_CATEGORIES)[number];
 
@@ -352,14 +364,10 @@ export async function exchangeAuthorizationCode(
   }
 
   const data = await response.json();
-  const payload = data.data ?? data;
-
-  const tokenSet: CloudreveTokenSet = {
-    accessToken: payload.access_token,
-    refreshToken: payload.refresh_token,
-    expiresAt: resolveExpiresAt(payload, ['expires_in', 'access_expires']),
-  };
-
+  const tokenSet = parseTokenResponse(data, 'OAuth token 交换', [
+    'expires_in',
+    'access_expires',
+  ]);
   tokenCache = tokenSet;
   return tokenSet;
 }
@@ -383,16 +391,55 @@ async function refreshAccessToken(
   }
 
   const data = await response.json();
-  const payload = data.data ?? data;
-
-  const tokenSet: CloudreveTokenSet = {
-    accessToken: payload.access_token,
-    refreshToken: payload.refresh_token ?? currentRefreshToken,
-    expiresAt: resolveExpiresAt(payload, ['access_expires', 'expires_in']),
-  };
-
+  const tokenSet = parseTokenResponse(
+    data,
+    'token 刷新',
+    ['access_expires', 'expires_in'],
+    currentRefreshToken
+  );
   tokenCache = tokenSet;
   return tokenSet;
+}
+
+/**
+ * 解析 Cloudreve V4 OAuth token 响应。
+ * V4 习惯返回 200 + `{ code, msg, data }`，其中 code != 0 即业务失败 —
+ * 必须先校验 code 再取字段，否则会把 undefined access_token 写进缓存。
+ */
+function parseTokenResponse(
+  data: unknown,
+  action: string,
+  expiryKeys: string[],
+  fallbackRefreshToken?: string
+): CloudreveTokenSet {
+  if (!data || typeof data !== 'object') {
+    throw new Error(`Cloudreve ${action} 失败：响应不是 JSON 对象`);
+  }
+
+  const envelope = data as Record<string, unknown>;
+  if (typeof envelope.code === 'number' && envelope.code !== 0) {
+    const msg = typeof envelope.msg === 'string' ? envelope.msg : 'unknown';
+    throw new Error(`Cloudreve ${action} 失败：[${envelope.code}] ${msg}`);
+  }
+
+  const payload = (envelope.data ?? envelope) as Record<string, unknown>;
+  const accessToken =
+    typeof payload.access_token === 'string' ? payload.access_token : '';
+  const refreshTokenRaw =
+    typeof payload.refresh_token === 'string' ? payload.refresh_token : '';
+  const refreshToken = refreshTokenRaw || fallbackRefreshToken || '';
+
+  if (!accessToken || !refreshToken) {
+    throw new Error(
+      `Cloudreve ${action} 失败：响应缺少 access_token 或 refresh_token`
+    );
+  }
+
+  return {
+    accessToken,
+    refreshToken,
+    expiresAt: resolveExpiresAt(payload, expiryKeys),
+  };
 }
 
 /**
@@ -414,10 +461,78 @@ export function getCachedTokens(): CloudreveTokenSet | null {
 }
 
 /**
- * 清除缓存的 token
+ * 清除内存中的 token 缓存（不动数据库）
  */
 export function clearCachedTokens() {
   tokenCache = null;
+}
+
+/**
+ * 清除内存缓存 + 数据库中持久化的所有 token 记录。
+ * 用于：refresh_token 失效、配置变更、管理员主动撤销授权。
+ */
+export async function clearPersistedTokens(): Promise<void> {
+  tokenCache = null;
+  try {
+    await prisma.siteSetting.deleteMany({
+      where: { key: { in: [...TOKEN_DB_KEYS] } },
+    });
+  } catch (err) {
+    console.error('[Cloudreve] 清除持久化 token 失败:', err);
+    throw err;
+  }
+}
+
+/**
+ * 异步检查 Cloudreve 是否完成 OAuth 授权（数据库中存在 refresh_token）。
+ * 用于 admin 面板"授权状态"显示，而 isCloudreveAuthorized() 仅看内存。
+ */
+export async function isCloudreveAuthorizedAsync(): Promise<boolean> {
+  if (tokenCache?.refreshToken) {
+    return true;
+  }
+
+  try {
+    const row = await prisma.siteSetting.findUnique({
+      where: { key: 'cloudreve_refresh_token' },
+    });
+    return Boolean(row?.value && row.value.trim());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 获取 Cloudreve 当前授权状态（含 access_token 过期时间），用于 admin UI。
+ */
+export async function getCloudreveAuthStatus(): Promise<{
+  authorized: boolean;
+  expiresAt: number | null;
+}> {
+  if (tokenCache?.refreshToken) {
+    return {
+      authorized: true,
+      expiresAt: tokenCache.expiresAt || null,
+    };
+  }
+
+  try {
+    const rows = await prisma.siteSetting.findMany({
+      where: { key: { in: [...TOKEN_DB_KEYS] } },
+    });
+    const map = new Map(rows.map((r) => [r.key, r.value] as const));
+    const refreshTokenCipher = map.get('cloudreve_refresh_token');
+    const expiresAtRaw = map.get('cloudreve_token_expires_at');
+
+    const authorized = Boolean(refreshTokenCipher && refreshTokenCipher.trim());
+    const expiresAt = expiresAtRaw ? Number(expiresAtRaw) : null;
+    return {
+      authorized,
+      expiresAt: expiresAt && Number.isFinite(expiresAt) ? expiresAt : null,
+    };
+  } catch {
+    return { authorized: false, expiresAt: null };
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -502,7 +617,9 @@ export class CloudreveStorage {
   }
 
   /**
-   * 获取有效的 access_token，必要时自动从数据库恢复或刷新
+   * 获取有效的 access_token，必要时自动从数据库恢复或刷新。
+   * refresh_token 被 Cloudreve 拒绝时会清空内存缓存与数据库中的 token 行，
+   * 避免下次请求又撞同一份失效 token —— 这是历史"过期不删"bug 的根因。
    */
   private async getAccessToken(): Promise<string> {
     // 缓存中有且未过期（预留 60s 缓冲）
@@ -510,20 +627,10 @@ export class CloudreveStorage {
       return tokenCache.accessToken;
     }
 
-    // 有 refresh_token 则刷新
-    if (tokenCache?.refreshToken) {
-      const config = await this.getConfig();
-      const refreshed = await refreshAccessToken(
-        config.baseUrl,
-        tokenCache.refreshToken
-      );
-      // 触发异步持久化（不阻塞当前请求）
-      this.persistTokensAsync(refreshed);
-      return refreshed.accessToken;
+    // 内存缓存里没有可用 token，先尝试从数据库恢复
+    if (!tokenCache?.refreshToken) {
+      await this.loadTokensFromDb();
     }
-
-    // 尝试从数据库恢复 token
-    await this.loadTokensFromDb();
 
     if (tokenCache && tokenCache.expiresAt > Date.now() + 60_000) {
       return tokenCache.accessToken;
@@ -531,12 +638,25 @@ export class CloudreveStorage {
 
     if (tokenCache?.refreshToken) {
       const config = await this.getConfig();
-      const refreshed = await refreshAccessToken(
-        config.baseUrl,
-        tokenCache.refreshToken
-      );
-      this.persistTokensAsync(refreshed);
-      return refreshed.accessToken;
+      try {
+        const refreshed = await refreshAccessToken(
+          config.baseUrl,
+          tokenCache.refreshToken
+        );
+        // 触发异步持久化（不阻塞当前请求）
+        this.persistTokensAsync(refreshed);
+        return refreshed.accessToken;
+      } catch (err) {
+        // refresh_token 失效 / 被吊销 / 配置变更 —— 清干净后让用户重新授权，
+        // 否则下一次请求会读到同一份失效 token，永远走不通。
+        console.error('[Cloudreve] refresh_token 失效，清除持久化 token:', err);
+        await clearPersistedTokens().catch((cleanupErr) => {
+          console.error('[Cloudreve] 清除失效 token 失败:', cleanupErr);
+        });
+        throw new Error(
+          'Cloudreve 授权已失效，请在管理面板重新授权'
+        );
+      }
     }
 
     throw new Error(
@@ -545,17 +665,19 @@ export class CloudreveStorage {
   }
 
   /**
-   * 异步将刷新后的 token 持久化到数据库
+   * 异步将刷新后的 token 持久化到数据库（加密存储）。
+   * access_token / refresh_token 走 ENCRYPTION_KEY AES-GCM，
+   * 与 LlmProvider.apiKey 同一加密体系，DB dump 也无法直接读出。
    */
   private persistTokensAsync(tokens: CloudreveTokenSet) {
-    // 动态导入避免循环依赖
-    import('@/lib/prisma').then(({ prisma }) => {
-      const entries = [
-        { key: 'cloudreve_access_token', value: tokens.accessToken },
-        { key: 'cloudreve_refresh_token', value: tokens.refreshToken },
-        { key: 'cloudreve_token_expires_at', value: String(tokens.expiresAt) },
-      ];
-      return prisma.$transaction(
+    const entries = [
+      { key: 'cloudreve_access_token', value: encrypt(tokens.accessToken) },
+      { key: 'cloudreve_refresh_token', value: encrypt(tokens.refreshToken) },
+      { key: 'cloudreve_token_expires_at', value: String(tokens.expiresAt) },
+    ];
+
+    prisma
+      .$transaction(
         entries.map((entry) =>
           prisma.siteSetting.upsert({
             where: { key: entry.key },
@@ -563,34 +685,58 @@ export class CloudreveStorage {
             create: entry,
           })
         )
-      );
-    }).catch((err) => {
-      console.error('[Cloudreve] token 持久化失败:', err);
-    });
+      )
+      .catch((err) => {
+        console.error('[Cloudreve] token 持久化失败:', err);
+      });
   }
 
   /**
-   * 从数据库加载 token 到内存缓存
+   * 从数据库加载 token 到内存缓存。
+   * 自动处理向后兼容：旧版本写入的是明文 token（无 enc: 前缀），
+   * 此处用 decrypt() 兼容读取，下次刷新时会以加密形式重写回去。
    */
   private async loadTokensFromDb(): Promise<void> {
     try {
-      const { prisma } = await import('@/lib/prisma');
-      const keys = ['cloudreve_access_token', 'cloudreve_refresh_token', 'cloudreve_token_expires_at'];
       const rows = await prisma.siteSetting.findMany({
-        where: { key: { in: keys } },
+        where: { key: { in: [...TOKEN_DB_KEYS] } },
       });
 
-      const map = new Map(rows.map((r: { key: string; value: string }) => [r.key, r.value]));
-      const accessToken = map.get('cloudreve_access_token');
-      const refreshToken = map.get('cloudreve_refresh_token');
-      const expiresAt = map.get('cloudreve_token_expires_at');
+      const map = new Map(rows.map((r) => [r.key, r.value] as const));
+      const accessTokenRaw = map.get('cloudreve_access_token');
+      const refreshTokenRaw = map.get('cloudreve_refresh_token');
+      const expiresAtRaw = map.get('cloudreve_token_expires_at');
 
-      if (refreshToken) {
-        tokenCache = {
-          accessToken: accessToken ?? '',
-          refreshToken,
-          expiresAt: expiresAt ? Number(expiresAt) : 0,
-        };
+      if (!refreshTokenRaw) {
+        return;
+      }
+
+      let accessToken = '';
+      let refreshToken = '';
+      try {
+        accessToken = accessTokenRaw ? decrypt(accessTokenRaw) : '';
+        refreshToken = decrypt(refreshTokenRaw);
+      } catch (err) {
+        console.error('[Cloudreve] token 解密失败，可能 ENCRYPTION_KEY 不匹配:', err);
+        // 解密失败：把无效记录清掉，让管理员重新授权，避免持续报错
+        await clearPersistedTokens().catch(() => {});
+        return;
+      }
+
+      const expiresAt = expiresAtRaw ? Number(expiresAtRaw) : 0;
+      tokenCache = {
+        accessToken,
+        refreshToken,
+        expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
+      };
+
+      // 兼容老数据：如果 DB 里存的是明文（没有 enc: 前缀），
+      // 主动加密重写一次，无需用户重新授权。
+      const needsRewrite =
+        (accessTokenRaw && !isEncrypted(accessTokenRaw)) ||
+        (refreshTokenRaw && !isEncrypted(refreshTokenRaw));
+      if (needsRewrite) {
+        this.persistTokensAsync(tokenCache);
       }
     } catch (err) {
       console.error('[Cloudreve] 从数据库恢复 token 失败:', err);

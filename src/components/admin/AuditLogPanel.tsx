@@ -223,10 +223,11 @@ export default function AuditLogPanel() {
           disabled={loading}
           className="p-2 rounded-lg border border-cream-200 dark:border-charcoal-600
                      bg-white dark:bg-charcoal-800 text-charcoal-500 hover:text-charcoal-700
-                     hover:bg-cream-50 dark:hover:bg-charcoal-700 transition-colors disabled:opacity-50"
+                     hover:bg-cream-50 dark:hover:bg-charcoal-700 transition-all duration-150
+                     disabled:opacity-50 hover:scale-105 active:scale-95"
           title={t('common.refresh')}
         >
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`w-4 h-4 transition-transform duration-300 ${loading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
@@ -259,18 +260,23 @@ export default function AuditLogPanel() {
           </div>
         ) : (
           <div className="divide-y divide-cream-100 dark:divide-charcoal-700">
-            {logs.map((log) => {
+            {logs.map((log, idx) => {
               const meta = getActionMeta(log.action);
               const Icon = meta.icon;
               return (
                 <div
                   key={log.id}
-                  className="grid grid-cols-[200px_1fr_160px_120px] gap-4 px-5 py-3.5 hover:bg-cream-50/50 dark:hover:bg-charcoal-750/50 transition-colors min-w-[700px]"
+                  style={{ animationDelay: `${Math.min(idx * 25, 250)}ms` }}
+                  className="grid grid-cols-[200px_1fr_160px_120px] gap-4 px-5 py-3.5
+                             hover:bg-cream-50/60 dark:hover:bg-charcoal-750/60
+                             transition-all duration-200 min-w-[700px]
+                             animate-fade-in-up"
                 >
                   {/* 操作 + 用户 */}
                   <div className="flex items-center gap-3 min-w-0">
                     <div
-                      className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
+                      className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0
+                                 transition-transform duration-200 group-hover:scale-110"
                       style={{ backgroundColor: meta.bg }}
                     >
                       <Icon className="w-4 h-4" style={{ color: meta.color }} />
@@ -321,7 +327,7 @@ export default function AuditLogPanel() {
               <button
                 onClick={() => fetchLogs(pagination.page - 1)}
                 disabled={pagination.page <= 1}
-                className="p-1.5 rounded-md text-charcoal-500 hover:bg-cream-100 dark:hover:bg-charcoal-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                className="p-1.5 rounded-md text-charcoal-500 hover:bg-cream-100 dark:hover:bg-charcoal-700 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 hover:scale-110 active:scale-95"
               >
                 <ChevronLeft className="w-4 h-4" />
               </button>
@@ -331,7 +337,7 @@ export default function AuditLogPanel() {
               <button
                 onClick={() => fetchLogs(pagination.page + 1)}
                 disabled={pagination.page >= pagination.totalPages}
-                className="p-1.5 rounded-md text-charcoal-500 hover:bg-cream-100 dark:hover:bg-charcoal-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                className="p-1.5 rounded-md text-charcoal-500 hover:bg-cream-100 dark:hover:bg-charcoal-700 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 hover:scale-110 active:scale-95"
               >
                 <ChevronRight className="w-4 h-4" />
               </button>

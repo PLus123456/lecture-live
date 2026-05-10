@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Share2, Copy, CheckCheck, X, Link2, Trash2, Loader2 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/stores/toastStore';
 
 interface PlaybackSharePopoverProps {
   sessionId: string;
@@ -91,12 +92,15 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
         const data = await res.json();
         const url = `${window.location.origin}/session/${sessionId}/playback?token=${data.token}`;
         setShareUrl(url);
+        toast.success(t('common.createSuccess'));
       } else {
         const body = await res.json().catch(() => null);
         setError(body?.error || t('playback.shareCreateFailed'));
+        toast.error(t('playback.shareCreateFailed'), body?.error);
       }
     } catch {
       setError(t('playback.shareCreateFailed'));
+      toast.error(t('playback.shareCreateFailed'), t('common.networkError'));
     }
     setLoading(false);
   };
@@ -116,12 +120,15 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
       });
       if (res.ok) {
         setShareUrl(null);
+        toast.success(t('common.deleteSuccess'));
       } else {
         const body = await res.json().catch(() => null);
         setError(body?.error || t('playback.shareRevokeFailed'));
+        toast.error(t('playback.shareRevokeFailed'), body?.error);
       }
     } catch {
       setError(t('playback.shareRevokeFailed'));
+      toast.error(t('playback.shareRevokeFailed'), t('common.networkError'));
     }
     setRevoking(false);
   };

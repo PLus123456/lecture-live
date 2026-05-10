@@ -22,6 +22,7 @@ import {
 import { useAuth } from '@/hooks/useAuth';
 import ActionSheet, { type ActionSheetItem } from '@/components/mobile/ActionSheet';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { toast } from '@/stores/toastStore';
 
 /* ─── Types ─── */
 interface FolderListItem {
@@ -264,9 +265,12 @@ export default function FoldersPage() {
       setNewFolderName('');
       setShowCreateModal(false);
       setSuccess('Folder created');
+      toast.success('Folder created');
       await loadFolders();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to create folder');
+      const msg = e instanceof Error ? e.message : 'Failed to create folder';
+      setError(msg);
+      toast.error('Failed to create folder', e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -300,9 +304,11 @@ export default function FoldersPage() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'Rename failed');
       setSuccess('Renamed successfully');
+      toast.success('Renamed successfully');
       await loadFolders();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Rename failed');
+      toast.error('Rename failed', e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
       setRenamingId(null);
@@ -334,10 +340,12 @@ export default function FoldersPage() {
         ? `Deleted ${data.deleted}, ${data.blocked.length} non-empty folder(s) skipped: ${data.blocked.join(', ')}`
         : `Deleted ${data.deleted} folder${data.deleted > 1 ? 's' : ''}`;
       setSuccess(msg);
+      toast.success(msg);
       clearSelection();
       await loadFolders();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Delete failed');
+      toast.error('Delete failed', e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -361,10 +369,12 @@ export default function FoldersPage() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'Delete failed');
       setSuccess('Folder deleted');
+      toast.success('Folder deleted');
       clearSelection();
       await loadFolders();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Delete failed');
+      toast.error('Delete failed', e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -390,9 +400,11 @@ export default function FoldersPage() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'Rename failed');
       setSuccess('Renamed successfully');
+      toast.success('Renamed successfully');
       await loadFolders();
     } catch (error) {
       setError(error instanceof Error ? error.message : 'Rename failed');
+      toast.error('Rename failed', error instanceof Error ? error.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -428,11 +440,14 @@ export default function FoldersPage() {
           throw new Error(data.error || `Failed to move ${id}`);
         }
       }
-      setSuccess(`Moved ${clipboard.ids.length} folder${clipboard.ids.length > 1 ? 's' : ''}`);
+      const msg = `Moved ${clipboard.ids.length} folder${clipboard.ids.length > 1 ? 's' : ''}`;
+      setSuccess(msg);
+      toast.success(msg);
       if (clipboard.mode === 'cut') setClipboard(null);
       await loadFolders();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Paste failed');
+      toast.error('Paste failed', e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -443,7 +458,10 @@ export default function FoldersPage() {
     const id = singleDeletableId;
     if (!id) return;
     const url = `${window.location.origin}/folders/${id}`;
-    navigator.clipboard.writeText(url).then(() => setSuccess('Folder link copied!'));
+    navigator.clipboard.writeText(url).then(() => {
+      setSuccess('Folder link copied!');
+      toast.success('Folder link copied!');
+    });
   };
 
   /* ─── "..." 按钮触发右键菜单 ─── */

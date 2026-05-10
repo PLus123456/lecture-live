@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/stores/toastStore';
 
 interface UserGroup {
   id: string;
@@ -692,13 +693,16 @@ export default function UserGroupsPanel() {
           ),
         );
         setShowModal(false);
+        toast.success(t('common.saveSuccess'));
       } else {
         const body = await res.json().catch(() => ({}));
-        setError(body.error || '保存失败');
+        setError(body.error || t('common.saveFailed'));
+        toast.error(t('common.saveFailed'), body.error);
       }
     } catch (err) {
       console.error('保存用户组失败:', err);
-      setError('保存失败');
+      setError(t('common.saveFailed'));
+      toast.error(t('common.saveFailed'), t('common.networkError'));
     } finally {
       setSaving(false);
     }
@@ -723,13 +727,16 @@ export default function UserGroupsPanel() {
           setGroups((prev) => [...prev, { ...result.group, description: data.description, color: data.color }]);
         }
         setShowCreateModal(false);
+        toast.success(t('common.createSuccess'));
       } else {
         const body = await res.json().catch(() => ({}));
-        setError(body.error || '创建失败');
+        setError(body.error || t('common.createFailed'));
+        toast.error(t('common.createFailed'), body.error);
       }
     } catch (err) {
       console.error('创建用户组失败:', err);
-      setError('创建失败');
+      setError(t('common.createFailed'));
+      toast.error(t('common.createFailed'), t('common.networkError'));
     } finally {
       setSaving(false);
     }
@@ -747,13 +754,16 @@ export default function UserGroupsPanel() {
         setError('');
         setGroups((prev) => prev.filter((g) => g.id !== group.id));
         setDeleteConfirm(null);
+        toast.success(t('common.deleteSuccess'));
       } else {
         const body = await res.json().catch(() => ({}));
-        setError(body.error || '删除失败');
+        setError(body.error || t('common.deleteFailed'));
+        toast.error(t('common.deleteFailed'), body.error);
       }
     } catch (err) {
       console.error('删除用户组失败:', err);
-      setError('删除失败');
+      setError(t('common.deleteFailed'));
+      toast.error(t('common.deleteFailed'), t('common.networkError'));
     } finally {
       setSaving(false);
     }

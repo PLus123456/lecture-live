@@ -33,6 +33,7 @@ import ActionSheet, { type ActionSheetItem } from '@/components/mobile/ActionShe
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/stores/toastStore';
 
 interface FolderDetail {
   id: string;
@@ -228,9 +229,15 @@ export default function FolderDetailPage() {
     try {
       let c = 0;
       for (const id of ids) { const r = await fetch(`/api/sessions/${id}`, { method: 'DELETE', headers: authHeaders }); if (r.ok) c++; }
-      setSuccess(t('foldersPage.deletedCount', { count: c }));
+      const msg = t('foldersPage.deletedCount', { count: c });
+      setSuccess(msg);
+      toast.success(msg);
       clearSessionSelection(); await loadData();
-    } catch (e) { setError(e instanceof Error ? e.message : t('foldersPage.deleteFailed')); }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : t('foldersPage.deleteFailed');
+      setError(msg);
+      toast.error(t('foldersPage.deleteFailed'), e instanceof Error ? e.message : undefined);
+    }
     finally { setSaving(false); }
   };
 
@@ -242,8 +249,13 @@ export default function FolderDetailPage() {
     try {
       const r = await fetch(`/api/sessions/${id}`, { method: 'DELETE', headers: authHeaders });
       if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || t('foldersPage.deleteFailed')); }
-      setSuccess(t('foldersPage.recordingDeleted')); clearSessionSelection(); await loadData();
-    } catch (e) { setError(e instanceof Error ? e.message : t('foldersPage.deleteFailed')); }
+      setSuccess(t('foldersPage.recordingDeleted'));
+      toast.success(t('foldersPage.recordingDeleted'));
+      clearSessionSelection(); await loadData();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('foldersPage.deleteFailed'));
+      toast.error(t('foldersPage.deleteFailed'), e instanceof Error ? e.message : undefined);
+    }
     finally { setSaving(false); }
   };
 
@@ -265,8 +277,13 @@ export default function FolderDetailPage() {
         body: JSON.stringify({ title: renameValue.trim() }),
       });
       if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || t('foldersPage.renameFailed')); }
-      setSuccess(t('foldersPage.renamed')); setShowRenameModal(false); await loadData();
-    } catch (e) { setError(e instanceof Error ? e.message : t('foldersPage.renameFailed')); }
+      setSuccess(t('foldersPage.renamed'));
+      toast.success(t('foldersPage.renamed'));
+      setShowRenameModal(false); await loadData();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('foldersPage.renameFailed'));
+      toast.error(t('foldersPage.renameFailed'), e instanceof Error ? e.message : undefined);
+    }
     finally { setSaving(false); }
   };
 
@@ -293,9 +310,14 @@ export default function FolderDetailPage() {
         });
         if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || t('foldersPage.moveFailed')); }
       }
-      setSuccess(t('foldersPage.movedCount', { count: selectedSessionIds.size }));
+      const msg = t('foldersPage.movedCount', { count: selectedSessionIds.size });
+      setSuccess(msg);
+      toast.success(msg);
       setShowMoveModal(false); clearSessionSelection(); await loadData();
-    } catch (e) { setError(e instanceof Error ? e.message : t('foldersPage.moveFailed')); }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('foldersPage.moveFailed'));
+      toast.error(t('foldersPage.moveFailed'), e instanceof Error ? e.message : undefined);
+    }
     finally { setSaving(false); }
   };
 
@@ -315,7 +337,11 @@ export default function FolderDetailPage() {
       const url = `${window.location.origin}/session/${id}/view/${data.token}`;
       await navigator.clipboard.writeText(url);
       setSuccess(t('foldersPage.shareCopied'));
-    } catch (e) { setError(e instanceof Error ? e.message : t('foldersPage.shareFailed')); }
+      toast.success(t('foldersPage.shareCopied'));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('foldersPage.shareFailed'));
+      toast.error(t('foldersPage.shareFailed'), e instanceof Error ? e.message : undefined);
+    }
     finally { setSaving(false); }
   };
 

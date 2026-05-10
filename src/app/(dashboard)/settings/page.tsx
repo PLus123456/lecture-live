@@ -8,6 +8,7 @@ import LanguageSelect from '@/components/LanguageSelect';
 import { useI18n } from '@/lib/i18n';
 import { UI_LOCALE_OPTIONS, type Locale } from '@/lib/i18n';
 import { Settings, Globe, Cpu, Mic, Lock, Tags, Scissors, Languages } from 'lucide-react';
+import { toast } from '@/stores/toastStore';
 import type { ChatModelOption, ChatModelsResponse } from '@/types/llm';
 
 function clampNumber(value: string, fallback: number, min: number, max: number) {
@@ -100,15 +101,21 @@ export default function SettingsPage() {
   const handleChangePassword = async () => {
     setPwMsg(null);
     if (!currentPassword || !newPassword || !confirmPassword) {
-      setPwMsg({ type: 'error', text: '请填写所有密码字段' });
+      const msg = t('auth.fillAllFields');
+      setPwMsg({ type: 'error', text: msg });
+      toast.error(msg);
       return;
     }
     if (newPassword.length < 8) {
-      setPwMsg({ type: 'error', text: '新密码至少需要 8 个字符' });
+      const msg = t('auth.passwordTooShort');
+      setPwMsg({ type: 'error', text: msg });
+      toast.error(msg);
       return;
     }
     if (newPassword !== confirmPassword) {
-      setPwMsg({ type: 'error', text: '两次输入的新密码不一致' });
+      const msg = t('auth.passwordMismatch');
+      setPwMsg({ type: 'error', text: msg });
+      toast.error(msg);
       return;
     }
     setPwLoading(true);
@@ -124,15 +131,21 @@ export default function SettingsPage() {
       });
       const data = await res.json();
       if (!res.ok) {
-        setPwMsg({ type: 'error', text: data.error || '修改失败' });
+        const msg = data.error || t('auth.changeFailed');
+        setPwMsg({ type: 'error', text: msg });
+        toast.error(t('auth.changeFailed'), data.error);
       } else {
-        setPwMsg({ type: 'success', text: '密码修改成功' });
+        const msg = t('auth.passwordChanged');
+        setPwMsg({ type: 'success', text: msg });
+        toast.success(msg);
         setCurrentPassword('');
         setNewPassword('');
         setConfirmPassword('');
       }
     } catch {
-      setPwMsg({ type: 'error', text: '网络错误，请重试' });
+      const msg = t('auth.networkError');
+      setPwMsg({ type: 'error', text: msg });
+      toast.error(t('auth.changeFailed'), t('common.networkError'));
     } finally {
       setPwLoading(false);
     }

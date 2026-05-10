@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/stores/toastStore';
 
 interface UserItem {
   id: string;
@@ -171,13 +172,16 @@ function UserDetailModal({
       });
       if (!res.ok) {
         const data = await res.json();
-        setError(data.error || '保存失败');
+        setError(data.error || t('common.saveFailed'));
+        toast.error(t('common.saveFailed'), data.error);
         return;
       }
+      toast.success(t('common.saveSuccess'));
       onUpdated();
       onClose();
     } catch {
-      setError('网络错误');
+      setError(t('common.networkError'));
+      toast.error(t('common.saveFailed'), t('common.networkError'));
     } finally {
       setSubmitting(false);
     }
@@ -429,7 +433,9 @@ function CreateUserModal({
 
   const handleSubmit = async () => {
     if (!email || !displayName || !password) {
-      setError('Please fill in all required fields');
+      const msg = 'Please fill in all required fields';
+      setError(msg);
+      toast.error(msg);
       return;
     }
     setSubmitting(true);
@@ -445,13 +451,16 @@ function CreateUserModal({
       });
       if (!res.ok) {
         const data = await res.json();
-        setError(data.error || 'Failed to create user');
+        setError(data.error || t('common.createFailed'));
+        toast.error(t('common.createFailed'), data.error);
         return;
       }
+      toast.success(t('common.createSuccess'));
       onCreated();
       onClose();
     } catch {
-      setError('Network error');
+      setError(t('common.networkError'));
+      toast.error(t('common.createFailed'), t('common.networkError'));
     } finally {
       setSubmitting(false);
     }
@@ -636,11 +645,16 @@ export default function UserManagementPanel() {
         body: JSON.stringify({ userIds: filtered }),
       });
       if (res.ok) {
+        toast.success(t('common.deleteSuccess'));
         setSelectedIds(new Set());
         fetchUsers();
+      } else {
+        const data = await res.json().catch(() => null);
+        toast.error(t('common.deleteFailed'), data?.error);
       }
     } catch (err) {
       console.error('Failed to delete users:', err);
+      toast.error(t('common.deleteFailed'), t('common.networkError'));
     }
   };
 

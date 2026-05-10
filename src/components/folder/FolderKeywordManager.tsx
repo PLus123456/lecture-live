@@ -7,6 +7,7 @@ import {
   Tag,
   Trash2,
 } from 'lucide-react';
+import { toast } from '@/stores/toastStore';
 
 interface FolderKeyword {
   id: string;
@@ -118,13 +119,13 @@ export default function FolderKeywordManager({
 
       setNewKeyword('');
       setInlineMessage('success', 'Keyword added to this folder pool.');
+      toast.success('Keyword added');
       await loadKeywords();
       await onMutated?.();
     } catch (error) {
-      setInlineMessage(
-        'error',
-        error instanceof Error ? error.message : 'Failed to add keyword'
-      );
+      const msg = error instanceof Error ? error.message : 'Failed to add keyword';
+      setInlineMessage('error', msg);
+      toast.error('Failed to add keyword', error instanceof Error ? error.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -151,6 +152,7 @@ export default function FolderKeywordManager({
       }
 
       setInlineMessage('success', 'Keyword removed from this folder pool.');
+      toast.success('Keyword removed');
       await loadKeywords();
       await onMutated?.();
     } catch (error) {
@@ -158,6 +160,7 @@ export default function FolderKeywordManager({
         'error',
         error instanceof Error ? error.message : 'Failed to remove keyword'
       );
+      toast.error('Failed to remove keyword', error instanceof Error ? error.message : undefined);
     } finally {
       setSaving(false);
     }

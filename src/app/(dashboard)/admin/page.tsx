@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useI18n } from '@/lib/i18n';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import {
   LayoutDashboard,
@@ -30,11 +30,18 @@ import JobQueuePanel from '@/components/admin/JobQueuePanel';
 
 type AdminTab = 'dashboard' | 'settings' | 'groups' | 'users' | 'logs' | 'reconciliation' | 'jobs';
 
+const ADMIN_TABS: AdminTab[] = ['dashboard', 'settings', 'groups', 'users', 'logs', 'reconciliation', 'jobs'];
+
+const isAdminTab = (v: string | null): v is AdminTab =>
+  v !== null && (ADMIN_TABS as string[]).includes(v);
+
 export default function AdminPage() {
   const { user } = useAuth();
   const isMobile = useIsMobile();
   const { t } = useI18n();
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
 
   const tabs: { id: AdminTab; label: string; icon: typeof Users }[] = [
     { id: 'dashboard', label: t('nav.dashboard'), icon: LayoutDashboard },
@@ -45,7 +52,26 @@ export default function AdminPage() {
     { id: 'reconciliation', label: t('nav.reconciliation'), icon: Scale },
     { id: 'jobs', label: t('nav.jobQueue'), icon: Layers },
   ];
-  const [activeTab, setActiveTab] = useState<AdminTab>('dashboard');
+
+  // tab 状态由 URL `?tab=` 驱动，刷新后保留
+  const tabFromUrl = searchParams.get('tab');
+  const activeTab: AdminTab = isAdminTab(tabFromUrl) ? tabFromUrl : 'dashboard';
+
+  const setActiveTab = useCallback(
+    (next: AdminTab) => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (next === 'dashboard') {
+        params.delete('tab');
+      } else {
+        params.set('tab', next);
+      }
+      // 切换主 tab 时清掉子 tab，避免无效组合
+      params.delete('subtab');
+      const qs = params.toString();
+      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+    },
+    [pathname, router, searchParams],
+  );
 
   // ─── 左右滑动切换 tab（移动端） ───
   const touchRef = useRef<{ startX: number; startY: number; startTime: number } | null>(null);

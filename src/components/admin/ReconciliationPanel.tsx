@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/stores/toastStore';
 
 interface Mismatch {
   id: string;
@@ -105,14 +106,19 @@ export default function ReconciliationPanel() {
       });
       if (res.ok) {
         const newRun = await res.json();
+        toast.success(t('common.operationSuccess'));
         // 如果当前在列表页，刷新；如果有差异直接展示详情
         if (newRun.mismatchCount > 0) {
           setSelectedRun(newRun);
         }
         fetchRuns(1);
+      } else {
+        const data = await res.json().catch(() => null);
+        toast.error(t('common.operationFailed'), data?.error);
       }
     } catch (err) {
       console.error('对账运行失败:', err);
+      toast.error(t('common.operationFailed'), t('common.networkError'));
     } finally {
       setRunning(false);
     }
@@ -154,9 +160,14 @@ export default function ReconciliationPanel() {
           ),
         });
         fetchRuns(pagination.page);
+        toast.success(t('common.operationSuccess'));
+      } else if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        toast.error(t('common.operationFailed'), data?.error);
       }
     } catch (err) {
       console.error('修复失败:', err);
+      toast.error(t('common.operationFailed'), t('common.networkError'));
     } finally {
       setFixing(null);
     }
@@ -176,9 +187,14 @@ export default function ReconciliationPanel() {
         // 刷新详情
         handleViewDetail(selectedRun.id);
         fetchRuns(pagination.page);
+        toast.success(t('common.operationSuccess'));
+      } else {
+        const data = await res.json().catch(() => null);
+        toast.error(t('common.operationFailed'), data?.error);
       }
     } catch (err) {
       console.error('批量修复失败:', err);
+      toast.error(t('common.operationFailed'), t('common.networkError'));
     } finally {
       setFixing(null);
     }

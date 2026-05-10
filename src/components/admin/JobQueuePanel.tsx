@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/stores/toastStore';
 
 interface Job {
   id: string;
@@ -152,11 +153,13 @@ export default function JobQueuePanel() {
         if (selectedJob?.id === jobId) {
           setSelectedJob((prev) => (prev ? update(prev) : null));
         }
+        toast.success(t('common.operationSuccess'));
       } else {
-        alert(t('jobQueue.retryFailed'));
+        const data = await res.json().catch(() => null);
+        toast.error(t('jobQueue.retryFailed'), data?.error);
       }
     } catch {
-      alert(t('jobQueue.retryFailed'));
+      toast.error(t('jobQueue.retryFailed'), t('common.networkError'));
     } finally {
       setRetrying(null);
     }

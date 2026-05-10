@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useRouter, usePathname, useSearchParams } from 'next/navigation';
 import {
   Globe,
   UserPlus,
@@ -23,6 +24,7 @@ import {
 } from 'lucide-react';
 import { useTheme } from '@/components/ThemeProvider';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/stores/toastStore';
 
 // ──── 类型定义 ────
 
@@ -244,6 +246,10 @@ const settingsTabs: { id: SettingsTab; label: string; icon: typeof Globe }[] = [
   { id: 'llm', label: 'LLM', icon: Server },
   { id: 'security', label: 'Security', icon: Shield },
 ];
+
+const SETTINGS_TAB_IDS: SettingsTab[] = settingsTabs.map((t) => t.id);
+const isSettingsTab = (v: string | null): v is SettingsTab =>
+  v !== null && (SETTINGS_TAB_IDS as string[]).includes(v);
 
 // 站点设置默认值
 const defaultSettings: SiteSettingsData = {
@@ -475,22 +481,32 @@ function IconUpload({
         method: 'POST',
         body: formData,
       });
-      if (res.ok) {
-        const data = await res.json();
-        const newPath = data.path || '';
-        onUploaded(newPath);
-        // 上传成功后立即将路径保存到数据库，无需手动点保存
-        const settingKey = ICON_TYPE_TO_SETTING_KEY[uploadType];
-        if (settingKey && newPath) {
-          await fetch('/api/admin/settings', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ [settingKey]: newPath }),
-          });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        toast.error(t('common.saveFailed'), err?.error);
+        return;
+      }
+      const data = await res.json();
+      const newPath = data.path || '';
+      onUploaded(newPath);
+      // 上传成功后立即将路径保存到数据库，无需手动点保存
+      const settingKey = ICON_TYPE_TO_SETTING_KEY[uploadType];
+      if (settingKey && newPath) {
+        const persistRes = await fetch('/api/admin/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ [settingKey]: newPath }),
+        });
+        if (!persistRes.ok) {
+          const err = await persistRes.json().catch(() => null);
+          toast.error(t('common.saveFailed'), err?.error);
+          return;
         }
       }
+      toast.success(t('common.saveSuccess'));
     } catch (err) {
       console.error('图标上传失败:', err);
+      toast.error(t('common.saveFailed'), t('common.networkError'));
     } finally {
       setUploading(false);
       // 重置 file input 以便重复选择同一文件
@@ -1180,17 +1196,20 @@ function StoragePanel({
       const res = await fetch('/api/admin/storage/migrate', { method: 'POST' });
       const data = await res.json();
       if (res.ok) {
-        setMigrateResult(
-          t('adminSettings.migrateSuccess')
-            .replace('{migrated}', String(data.migratedCount))
-            .replace('{skipped}', String(data.skippedCount))
-            .replace('{errors}', String(data.errorCount))
-        );
+        const msg = t('adminSettings.migrateSuccess')
+          .replace('{migrated}', String(data.migratedCount))
+          .replace('{skipped}', String(data.skippedCount))
+          .replace('{errors}', String(data.errorCount));
+        setMigrateResult(msg);
+        toast.success(msg);
       } else {
-        setMigrateResult(data.error || t('adminSettings.migrateFailed'));
+        const errMsg = data.error || t('adminSettings.migrateFailed');
+        setMigrateResult(errMsg);
+        toast.error(t('adminSettings.migrateFailed'), data.error);
       }
     } catch {
       setMigrateResult(t('adminSettings.migrateFailed'));
+      toast.error(t('adminSettings.migrateFailed'), t('common.networkError'));
     } finally {
       setMigrating(false);
     }
@@ -1203,16 +1222,19 @@ function StoragePanel({
       const res = await fetch('/api/admin/storage/cleanup', { method: 'POST' });
       const data = await res.json();
       if (res.ok) {
-        setCleanResult(
-          t('adminSettings.cleanupSuccess')
-            .replace('{deleted}', String(data.deletedCount))
-            .replace('{errors}', String(data.errorCount))
-        );
+        const msg = t('adminSettings.cleanupSuccess')
+          .replace('{deleted}', String(data.deletedCount))
+          .replace('{errors}', String(data.errorCount));
+        setCleanResult(msg);
+        toast.success(msg);
       } else {
-        setCleanResult(data.error || t('adminSettings.cleanupFailed'));
+        const errMsg = data.error || t('adminSettings.cleanupFailed');
+        setCleanResult(errMsg);
+        toast.error(t('adminSettings.cleanupFailed'), data.error);
       }
     } catch {
       setCleanResult(t('adminSettings.cleanupFailed'));
+      toast.error(t('adminSettings.cleanupFailed'), t('common.networkError'));
     } finally {
       setCleaning(false);
     }
@@ -1228,6 +1250,7 @@ function StoragePanel({
         !settings.cloudreve_client_secret.trim()
       ) {
         setAuthResult(t('adminSettings.cloudreveAuthFailed'));
+        toast.error(t('adminSettings.cloudreveAuthFailed'));
         return;
       }
 
@@ -1245,6 +1268,7 @@ function StoragePanel({
       if (!saveRes.ok) {
         const saveData = await saveRes.json().catch(() => null);
         setAuthResult(saveData?.error || t('adminSettings.cloudreveAuthFailed'));
+        toast.error(t('adminSettings.cloudreveAuthFailed'), saveData?.error);
         return;
       }
 
@@ -1254,9 +1278,11 @@ function StoragePanel({
         window.location.href = data.authorize_url;
       } else {
         setAuthResult(data.error || t('adminSettings.cloudreveAuthFailed'));
+        toast.error(t('adminSettings.cloudreveAuthFailed'), data.error);
       }
     } catch {
       setAuthResult(t('adminSettings.cloudreveAuthFailed'));
+      toast.error(t('adminSettings.cloudreveAuthFailed'), t('common.networkError'));
     } finally {
       setAuthorizing(false);
     }
@@ -1272,15 +1298,18 @@ function StoragePanel({
       const res = await fetch('/api/admin/cloudreve/revoke', { method: 'POST' });
       if (res.ok) {
         setAuthResult(t('adminSettings.cloudreveRevokeSuccess'));
+        toast.success(t('adminSettings.cloudreveRevokeSuccess'));
         await refreshAuthStatus();
       } else {
         const data = await res.json().catch(() => null);
         setAuthResult(
           data?.error || t('adminSettings.cloudreveRevokeFailed')
         );
+        toast.error(t('adminSettings.cloudreveRevokeFailed'), data?.error);
       }
     } catch {
       setAuthResult(t('adminSettings.cloudreveRevokeFailed'));
+      toast.error(t('adminSettings.cloudreveRevokeFailed'), t('common.networkError'));
     } finally {
       setRevoking(false);
     }
@@ -1564,7 +1593,9 @@ function AsrPanel({
       }
 
       if (Object.keys(regionsPayload).length === 0) {
-        setSonioxError('请至少输入一个区域的 API Key');
+        const msg = '请至少输入一个区域的 API Key';
+        setSonioxError(msg);
+        toast.error(msg);
         setSonioxSaving(false);
         return;
       }
@@ -1577,11 +1608,15 @@ function AsrPanel({
 
       if (!res.ok) {
         const data = await res.json();
-        setSonioxError(data.error || '保存失败');
+        const msg = data.error || t('common.saveFailed');
+        setSonioxError(msg);
+        toast.error(t('common.saveFailed'), data.error);
         return;
       }
 
-      setSonioxSuccess('Soniox API Key 已更新');
+      const msg = 'Soniox API Key 已更新';
+      setSonioxSuccess(msg);
+      toast.success(msg);
       setNewKeys({ us: '', eu: '', jp: '' });
 
       // 重新加载配置状态
@@ -1592,7 +1627,9 @@ function AsrPanel({
 
       setTimeout(() => setSonioxSuccess(''), 3000);
     } catch {
-      setSonioxError('保存失败，请检查网络连接');
+      const msg = '保存失败，请检查网络连接';
+      setSonioxError(msg);
+      toast.error(t('common.saveFailed'), t('common.networkError'));
     } finally {
       setSonioxSaving(false);
     }
@@ -1616,11 +1653,17 @@ function AsrPanel({
         if (refreshRes.ok) {
           setSonioxConfig(await refreshRes.json());
         }
-        setSonioxSuccess(`${SONIOX_REGION_LABELS[region]} API Key 已删除`);
+        const msg = `${SONIOX_REGION_LABELS[region]} API Key 已删除`;
+        setSonioxSuccess(msg);
+        toast.success(msg);
         setTimeout(() => setSonioxSuccess(''), 3000);
+      } else {
+        const data = await res.json().catch(() => null);
+        toast.error(t('common.deleteFailed'), data?.error);
       }
     } catch {
       setSonioxError('删除失败');
+      toast.error(t('common.deleteFailed'), t('common.networkError'));
     } finally {
       setSonioxSaving(false);
     }
@@ -1866,9 +1909,14 @@ function LlmPanel({
         setProviders((prev) =>
           prev.map((p) => (p.id === provider.id ? mapped : p))
         );
+        toast.success(isNew ? t('common.createSuccess') : t('common.saveSuccess'));
+      } else {
+        const data = await res.json().catch(() => null);
+        toast.error(isNew ? t('common.createFailed') : t('common.saveFailed'), data?.error);
       }
     } catch (err) {
       console.error('保存供应商失败:', err);
+      toast.error(t('common.saveFailed'), t('common.networkError'));
     } finally {
       setSaving(false);
     }
@@ -1879,9 +1927,16 @@ function LlmPanel({
     const isNew = provider.id.startsWith('temp-');
     if (!isNew) {
       try {
-        await fetch(`/api/admin/llm-providers/${provider.id}`, { method: 'DELETE' });
+        const res = await fetch(`/api/admin/llm-providers/${provider.id}`, { method: 'DELETE' });
+        if (!res.ok) {
+          const data = await res.json().catch(() => null);
+          toast.error(t('common.deleteFailed'), data?.error);
+          return;
+        }
+        toast.success(t('common.deleteSuccess'));
       } catch (err) {
         console.error('删除供应商失败:', err);
+        toast.error(t('common.deleteFailed'), t('common.networkError'));
         return;
       }
     }
@@ -1982,7 +2037,28 @@ function SecurityPanel({
 // ──── 主组件 ────
 
 export default function SettingsPanel() {
-  const [activeTab, setActiveTab] = useState<SettingsTab>('site');
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  // sub-tab 状态由 URL `?subtab=` 驱动
+  const subtabFromUrl = searchParams.get('subtab');
+  const activeTab: SettingsTab = isSettingsTab(subtabFromUrl) ? subtabFromUrl : 'site';
+
+  const setActiveTab = useCallback(
+    (next: SettingsTab) => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (next === 'site') {
+        params.delete('subtab');
+      } else {
+        params.set('subtab', next);
+      }
+      const qs = params.toString();
+      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+    },
+    [pathname, router, searchParams],
+  );
+
   const [settings, setSettings] = useState<SiteSettingsData>(defaultSettings);
   const [originalSettings, setOriginalSettings] = useState<SiteSettingsData>(defaultSettings);
   const [providers, setProviders] = useState<LlmProvider[]>([]);
@@ -2092,13 +2168,13 @@ export default function SettingsPanel() {
       try {
         new URL(url);
       } catch {
-        alert(t('adminSettings.invalidBackupUrl'));
+        toast.error(t('adminSettings.invalidBackupUrl'));
         return;
       }
     }
 
     if (cleanedBackups.length > MAX_BACKUP_URLS) {
-      alert(t('adminSettings.backupUrlLimitReached'));
+      toast.error(t('adminSettings.backupUrlLimitReached'));
       return;
     }
 
@@ -2114,12 +2190,14 @@ export default function SettingsPanel() {
       if (res.ok) {
         setSettings(payload);
         setOriginalSettings(payload);
+        toast.success(t('common.saveSuccess'));
       } else {
         const err = await res.json().catch(() => null);
-        if (err?.error) alert(err.error);
+        toast.error(t('common.saveFailed'), err?.error);
       }
     } catch (err) {
       console.error('保存设置失败:', err);
+      toast.error(t('common.saveFailed'), t('common.networkError'));
     } finally {
       setSaving(false);
     }

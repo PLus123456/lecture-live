@@ -12,6 +12,7 @@ import {
   toSessionAudioSource,
 } from '@/types/transcript';
 import LanguageSelect from '@/components/LanguageSelect';
+import { toast } from '@/stores/toastStore';
 import {
   Mic,
   Monitor,
@@ -187,10 +188,16 @@ export default function NewSessionModal({ onClose, defaultFolderId }: NewSession
         setFolderId(folder.id);
         setNewFolderName('');
         setIsCreatingFolder(false);
+        toast.success('Folder created');
+      } else {
+        const data = await res.json().catch(() => null);
+        toast.error('Failed to create folder', data?.error);
       }
-    } catch { /* silent */ }
+    } catch {
+      toast.error('Failed to create folder', t('common.networkError'));
+    }
     setFolderCreating(false);
-  }, [newFolderName, token]);
+  }, [newFolderName, token, t]);
 
   // Start session
   const handleStart = useCallback(async () => {
@@ -218,10 +225,9 @@ export default function NewSessionModal({ onClose, defaultFolderId }: NewSession
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        setErrorMsg(
-          data.error ||
-            t('session.newSession.failedToCreateSession', { status: res.status })
-        );
+        const msg = data.error || t('session.newSession.failedToCreateSession', { status: res.status });
+        setErrorMsg(msg);
+        toast.error(t('session.newSession.failedToCreateSession', { status: res.status }), data.error);
         setIsStarting(false);
         return;
       }

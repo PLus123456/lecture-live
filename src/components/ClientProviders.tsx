@@ -8,6 +8,7 @@ import SiteDefaultsBootstrap from '@/components/SiteDefaultsBootstrap';
 import OriginGuard from '@/components/OriginGuard';
 import AuthSessionMonitor from '@/components/AuthSessionMonitor';
 import ViewportAdapter from '@/components/ViewportAdapter';
+import Toaster from '@/components/Toaster';
 import type { Locale } from '@/lib/i18n';
 import type { TranslationMode, SonioxRegionPreference } from '@/types/transcript';
 
@@ -36,6 +37,7 @@ export default function ClientProviders({
         <OriginGuard>
           {children}
         </OriginGuard>
+        <Toaster />
       </ThemeProvider>
     </I18nProvider>
   );

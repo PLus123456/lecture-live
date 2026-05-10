@@ -18,6 +18,8 @@ import {
   SkipBack,
   SkipForward,
   Volume2,
+  VolumeX,
+  Volume1,
   Users,
   Target,
   CheckSquare,
@@ -60,6 +62,10 @@ interface MobilePlaybackLayoutProps {
   currentTimeMs: number;
   effectiveDurationMs: number;
   playbackRate: number;
+  volume: number;
+  muted: boolean;
+  onVolumeChange: (v: number) => void;
+  onToggleMuted: () => void;
   hasAudio: boolean;
   onTogglePlayback: () => void;
   onSeekToMs: (ms: number, options?: { resumePlayback?: boolean }) => void;
@@ -271,6 +277,10 @@ export default function MobilePlaybackLayout({
   currentTimeMs,
   effectiveDurationMs,
   playbackRate,
+  volume,
+  muted,
+  onVolumeChange,
+  onToggleMuted,
   hasAudio,
   onTogglePlayback,
   onSeekToMs,
@@ -607,9 +617,38 @@ export default function MobilePlaybackLayout({
               </button>
             </div>
 
-            {/* 音量图标占位 */}
-            <div className="flex h-9 min-w-[44px] items-center justify-center">
-              <Volume2 className="h-4 w-4 text-charcoal-400" />
+            {/* 音量控制 */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onToggleMuted}
+                className="flex h-9 w-9 items-center justify-center rounded-full text-charcoal-500 active:bg-cream-100 transition-colors"
+                aria-label={muted ? t('common.unmute') : t('common.mute')}
+              >
+                {muted || volume === 0 ? (
+                  <VolumeX className="h-4 w-4" />
+                ) : volume < 0.5 ? (
+                  <Volume1 className="h-4 w-4" />
+                ) : (
+                  <Volume2 className="h-4 w-4" />
+                )}
+              </button>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={muted ? 0 : volume}
+                onChange={(e) => {
+                  const next = parseFloat(e.target.value);
+                  onVolumeChange(next);
+                  if (next > 0 && muted) onToggleMuted();
+                }}
+                className="playback-volume-slider w-20"
+                style={{
+                  background: `linear-gradient(to right, #C44B20 0%, #C44B20 ${(muted ? 0 : volume) * 100}%, #E8DFD0 ${(muted ? 0 : volume) * 100}%, #E8DFD0 100%)`,
+                }}
+                aria-label={t('common.volume')}
+              />
             </div>
           </div>
         </div>

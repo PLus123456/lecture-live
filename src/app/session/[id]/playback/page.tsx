@@ -34,6 +34,8 @@ import {
   Sparkles,
   ChevronLeft,
   Volume2,
+  VolumeX,
+  Volume1,
   ClipboardList,
   Users,
   Target,
@@ -236,6 +238,8 @@ export default function PlaybackPage() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTimeMs, setCurrentTimeMs] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [volume, setVolume] = useState(1);
+  const [muted, setMuted] = useState(false);
   const [audioSegments, setAudioSegments] = useState<PlaybackAudioSegment[]>([]);
   const [activeAudioIndex, setActiveAudioIndex] = useState(0);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -514,6 +518,46 @@ export default function PlaybackPage() {
   useEffect(() => {
     isPlayingRef.current = isPlaying;
   }, [isPlaying]);
+
+  // 从 localStorage 恢复音量（仅初始化时执行一次，先于持久化）
+  const volumeRestoredRef = useRef(false);
+  if (!volumeRestoredRef.current && typeof window !== 'undefined') {
+    volumeRestoredRef.current = true;
+    try {
+      const savedVol = window.localStorage.getItem('playback.volume');
+      const savedMuted = window.localStorage.getItem('playback.muted');
+      if (savedVol !== null) {
+        const v = parseFloat(savedVol);
+        if (!Number.isNaN(v)) {
+          const clamped = Math.max(0, Math.min(1, v));
+          if (clamped !== volume) setVolume(clamped);
+        }
+      }
+      if (savedMuted !== null) {
+        const m = savedMuted === 'true';
+        if (m !== muted) setMuted(m);
+      }
+    } catch {
+      /* localStorage may be unavailable */
+    }
+  }
+
+  // 同步音量到 audio 元素 + 持久化
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (audio) {
+      audio.volume = volume;
+      audio.muted = muted;
+    }
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem('playback.volume', String(volume));
+        window.localStorage.setItem('playback.muted', String(muted));
+      } catch {
+        /* localStorage may be unavailable */
+      }
+    }
+  }, [volume, muted, activeAudioIndex]);
 
   const getTranscriptTimelineDurationMs = useCallback(() => {
     return segments.reduce((maxDuration, segment) => {
@@ -964,6 +1008,10 @@ export default function PlaybackPage() {
           currentTimeMs={currentTimeMs}
           effectiveDurationMs={effectiveDurationMs}
           playbackRate={playbackRate}
+          volume={volume}
+          muted={muted}
+          onVolumeChange={setVolume}
+          onToggleMuted={() => setMuted((m) => !m)}
           hasAudio={!!activeAudioSegment}
           onTogglePlayback={togglePlayback}
           onSeekToMs={seekToMs}
@@ -987,6 +1035,8 @@ export default function PlaybackPage() {
               const audio = audioRef.current;
               if (!audio) return;
               audio.playbackRate = playbackRate;
+              audio.volume = volume;
+              audio.muted = muted;
               if (pendingSeekMsRef.current !== null) {
                 audio.currentTime = pendingSeekMsRef.current / 1000;
                 pendingSeekMsRef.current = null;
@@ -1500,7 +1550,39 @@ export default function PlaybackPage() {
               >
                 {playbackRate}x
               </button>
-              <Volume2 className="w-4 h-4 text-charcoal-400" />
+              <div className="group/vol flex items-center gap-1.5 px-1.5 py-1 rounded-md hover:bg-cream-50 transition-colors">
+                <button
+                  onClick={() => setMuted((m) => !m)}
+                  className="text-charcoal-500 hover:text-charcoal-700 transition-colors"
+                  aria-label={muted ? t('common.unmute') : t('common.mute')}
+                  title={muted ? t('common.unmute') : t('common.mute')}
+                >
+                  {muted || volume === 0 ? (
+                    <VolumeX className="w-4 h-4" />
+                  ) : volume < 0.5 ? (
+                    <Volume1 className="w-4 h-4" />
+                  ) : (
+                    <Volume2 className="w-4 h-4" />
+                  )}
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={muted ? 0 : volume}
+                  onChange={(e) => {
+                    const next = parseFloat(e.target.value);
+                    setVolume(next);
+                    if (next > 0 && muted) setMuted(false);
+                  }}
+                  className="playback-volume-slider w-20"
+                  style={{
+                    background: `linear-gradient(to right, #C44B20 0%, #C44B20 ${(muted ? 0 : volume) * 100}%, #E8DFD0 ${(muted ? 0 : volume) * 100}%, #E8DFD0 100%)`,
+                  }}
+                  aria-label={t('common.volume')}
+                />
+              </div>
             </div>
           </div>
 
@@ -1518,6 +1600,8 @@ export default function PlaybackPage() {
                 }
 
                 audio.playbackRate = playbackRate;
+                audio.volume = volume;
+                audio.muted = muted;
                 if (pendingSeekMsRef.current !== null) {
                   audio.currentTime = pendingSeekMsRef.current / 1000;
                   pendingSeekMsRef.current = null;

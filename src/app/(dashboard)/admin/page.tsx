@@ -17,6 +17,7 @@ import {
   ScrollText,
   Scale,
   Layers,
+  Share2,
 } from 'lucide-react';
 import SiteLogo from '@/components/SiteLogo';
 
@@ -27,10 +28,11 @@ import UserManagementPanel from '@/components/admin/UserManagementPanel';
 import AuditLogPanel from '@/components/admin/AuditLogPanel';
 import ReconciliationPanel from '@/components/admin/ReconciliationPanel';
 import JobQueuePanel from '@/components/admin/JobQueuePanel';
+import ShareLinksPanel from '@/components/admin/ShareLinksPanel';
 
-type AdminTab = 'dashboard' | 'settings' | 'groups' | 'users' | 'logs' | 'reconciliation' | 'jobs';
+type AdminTab = 'dashboard' | 'settings' | 'groups' | 'users' | 'shareLinks' | 'logs' | 'reconciliation' | 'jobs';
 
-const ADMIN_TABS: AdminTab[] = ['dashboard', 'settings', 'groups', 'users', 'logs', 'reconciliation', 'jobs'];
+const ADMIN_TABS: AdminTab[] = ['dashboard', 'settings', 'groups', 'users', 'shareLinks', 'logs', 'reconciliation', 'jobs'];
 
 const isAdminTab = (v: string | null): v is AdminTab =>
   v !== null && (ADMIN_TABS as string[]).includes(v);
@@ -48,6 +50,7 @@ export default function AdminPage() {
     { id: 'settings', label: t('nav.settings'), icon: Settings },
     { id: 'groups', label: t('nav.userGroups'), icon: UserCog },
     { id: 'users', label: t('nav.users'), icon: Users },
+    { id: 'shareLinks', label: t('nav.shareLinks'), icon: Share2 },
     { id: 'logs', label: t('nav.logs'), icon: ScrollText },
     { id: 'reconciliation', label: t('nav.reconciliation'), icon: Scale },
     { id: 'jobs', label: t('nav.jobQueue'), icon: Layers },
@@ -174,7 +177,7 @@ export default function AdminPage() {
             </div>
           </div>
           <div ref={tabBarRef} className="mobile-scroll mt-4 flex gap-2 overflow-x-auto pb-1">
-            {tabs.map((tab) => {
+            {tabs.map((tab, idx) => {
               const Icon = tab.icon;
               const active = activeTab === tab.id;
               return (
@@ -182,13 +185,15 @@ export default function AdminPage() {
                   key={tab.id}
                   data-active={active}
                   onClick={() => setActiveTab(tab.id)}
-                  className={`inline-flex min-w-max items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium transition-colors ${
+                  style={{ animationDelay: `${idx * 20}ms` }}
+                  className={`inline-flex min-w-max items-center gap-2 rounded-full border px-4 py-2 text-sm font-medium
+                              transition-all duration-200 ease-out animate-fade-in-up active:scale-95 ${
                     active
-                      ? 'border-rust-200 bg-rust-50 text-rust-700'
-                      : 'border-cream-200 bg-white text-charcoal-500'
+                      ? 'border-rust-200 bg-rust-50 text-rust-700 shadow-sm scale-[1.02]'
+                      : 'border-cream-200 bg-white text-charcoal-500 hover:border-cream-300 hover:bg-cream-50'
                   }`}
                 >
-                  <Icon className="h-4 w-4" />
+                  <Icon className={`h-4 w-4 transition-transform duration-200 ${active ? 'scale-110' : ''}`} />
                   {tab.label}
                 </button>
               );
@@ -202,13 +207,16 @@ export default function AdminPage() {
           onTouchStart={handleTouchStart}
           onTouchEnd={handleTouchEnd}
         >
-          {activeTab === 'dashboard' && <DashboardPanel />}
-          {activeTab === 'settings' && <SettingsPanel />}
-          {activeTab === 'groups' && <UserGroupsPanel />}
-          {activeTab === 'users' && <UserManagementPanel />}
-          {activeTab === 'logs' && <AuditLogPanel />}
-          {activeTab === 'reconciliation' && <ReconciliationPanel />}
-          {activeTab === 'jobs' && <JobQueuePanel />}
+          <div key={activeTab} className="animate-fade-in-up">
+            {activeTab === 'dashboard' && <DashboardPanel />}
+            {activeTab === 'settings' && <SettingsPanel />}
+            {activeTab === 'groups' && <UserGroupsPanel />}
+            {activeTab === 'users' && <UserManagementPanel />}
+            {activeTab === 'shareLinks' && <ShareLinksPanel />}
+            {activeTab === 'logs' && <AuditLogPanel />}
+            {activeTab === 'reconciliation' && <ReconciliationPanel />}
+            {activeTab === 'jobs' && <JobQueuePanel />}
+          </div>
         </div>
       </div>
     );
@@ -239,25 +247,32 @@ export default function AdminPage() {
 
         {/* 导航项 */}
         <nav className="flex-1 py-4 px-2 space-y-0.5">
-          {tabs.map((tab) => {
+          {tabs.map((tab, idx) => {
             const Icon = tab.icon;
             const isActive = activeTab === tab.id;
             return (
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
+                style={{ animationDelay: `${idx * 30}ms` }}
                 className={`
-                  w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium
-                  transition-all duration-150
+                  group relative w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium
+                  transition-all duration-200 ease-out animate-fade-in-up
                   ${isActive
-                    ? 'bg-rust-50 dark:bg-rust-900/30 text-rust-600 dark:text-rust-400 border border-rust-200 dark:border-rust-800 shadow-sm'
-                    : 'text-charcoal-500 dark:text-charcoal-400 hover:bg-cream-100 dark:hover:bg-charcoal-700 hover:text-charcoal-700 dark:hover:text-cream-200'
+                    ? 'bg-rust-50 dark:bg-rust-900/30 text-rust-600 dark:text-rust-400 border border-rust-200 dark:border-rust-800 shadow-sm scale-[1.01]'
+                    : 'text-charcoal-500 dark:text-charcoal-400 hover:bg-cream-100 dark:hover:bg-charcoal-700 hover:text-charcoal-700 dark:hover:text-cream-200 hover:translate-x-0.5 border border-transparent'
                   }
                 `}
               >
-                <Icon className="w-4 h-4 flex-shrink-0" />
+                <Icon className={`w-4 h-4 flex-shrink-0 transition-transform duration-200 ${isActive ? 'scale-110' : 'group-hover:scale-110'}`} />
                 <span>{tab.label}</span>
-                {isActive && <ChevronRight className="w-3.5 h-3.5 ml-auto" />}
+                <ChevronRight
+                  className={`w-3.5 h-3.5 ml-auto transition-all duration-200 ${
+                    isActive
+                      ? 'opacity-100 translate-x-0'
+                      : 'opacity-0 -translate-x-1 group-hover:opacity-50 group-hover:translate-x-0'
+                  }`}
+                />
               </button>
             );
           })}
@@ -281,13 +296,16 @@ export default function AdminPage() {
 
       {/* 右侧内容 */}
       <div className="flex-1 overflow-y-auto p-8 bg-cream-50 dark:bg-charcoal-900">
-        {activeTab === 'dashboard' && <DashboardPanel />}
-        {activeTab === 'settings' && <SettingsPanel />}
-        {activeTab === 'groups' && <UserGroupsPanel />}
-        {activeTab === 'users' && <UserManagementPanel />}
-        {activeTab === 'logs' && <AuditLogPanel />}
-        {activeTab === 'reconciliation' && <ReconciliationPanel />}
-        {activeTab === 'jobs' && <JobQueuePanel />}
+        <div key={activeTab} className="animate-fade-in-up">
+          {activeTab === 'dashboard' && <DashboardPanel />}
+          {activeTab === 'settings' && <SettingsPanel />}
+          {activeTab === 'groups' && <UserGroupsPanel />}
+          {activeTab === 'users' && <UserManagementPanel />}
+          {activeTab === 'shareLinks' && <ShareLinksPanel />}
+          {activeTab === 'logs' && <AuditLogPanel />}
+          {activeTab === 'reconciliation' && <ReconciliationPanel />}
+          {activeTab === 'jobs' && <JobQueuePanel />}
+        </div>
       </div>
     </div>
   );

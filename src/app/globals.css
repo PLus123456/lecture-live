@@ -183,6 +183,50 @@
     }
   }
 
+  /* ─── 音量滑块（播放页） ─── */
+  .playback-volume-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 9999px;
+    outline: none;
+    cursor: pointer;
+    transition: opacity 0.15s ease;
+  }
+
+  .playback-volume-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 9999px;
+    background: #C44B20;
+    border: 2px solid white;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+    cursor: pointer;
+    transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  .playback-volume-slider::-webkit-slider-thumb:hover,
+  .playback-volume-slider:focus::-webkit-slider-thumb {
+    transform: scale(1.2);
+  }
+
+  .playback-volume-slider::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border-radius: 9999px;
+    background: #C44B20;
+    border: 2px solid white;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+    cursor: pointer;
+    transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  .playback-volume-slider::-moz-range-thumb:hover {
+    transform: scale(1.2);
+  }
+
   /* Expandable button */
   .expand-btn .expand-label {
     max-width: 0;

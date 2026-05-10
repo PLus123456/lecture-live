@@ -264,9 +264,9 @@ export default function JobQueuePanel() {
         <div className="flex items-center justify-between mb-5">
           <button
             onClick={() => setSelectedJob(null)}
-            className="inline-flex items-center gap-2 text-sm text-charcoal-500 hover:text-charcoal-700 dark:text-charcoal-400 dark:hover:text-cream-200 transition-colors"
+            className="inline-flex items-center gap-2 text-sm text-charcoal-500 hover:text-charcoal-700 dark:text-charcoal-400 dark:hover:text-cream-200 transition-all duration-150 hover:-translate-x-0.5 group"
           >
-            <ArrowLeft className="w-4 h-4" />
+            <ArrowLeft className="w-4 h-4 transition-transform duration-150 group-hover:-translate-x-0.5" />
             {t('jobQueue.backToList')}
           </button>
           {selectedJob.status === 'FAILED' && (
@@ -274,7 +274,9 @@ export default function JobQueuePanel() {
               onClick={() => handleRetry(selectedJob.id)}
               disabled={retrying === selectedJob.id}
               className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
-                         bg-rust-500 text-white hover:bg-rust-600 disabled:opacity-50 transition-colors"
+                         bg-rust-500 text-white hover:bg-rust-600 disabled:opacity-50
+                         transition-all duration-150 hover:scale-[1.02] active:scale-95
+                         shadow-sm hover:shadow"
             >
               {retrying === selectedJob.id ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
@@ -400,10 +402,11 @@ export default function JobQueuePanel() {
           disabled={loading}
           className="p-2 rounded-lg border border-cream-200 dark:border-charcoal-600
                      bg-white dark:bg-charcoal-800 text-charcoal-500 hover:text-charcoal-700
-                     hover:bg-cream-50 dark:hover:bg-charcoal-700 transition-colors disabled:opacity-50"
+                     hover:bg-cream-50 dark:hover:bg-charcoal-700 transition-all duration-150
+                     disabled:opacity-50 hover:scale-105 active:scale-95"
           title={t('common.refresh')}
         >
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`w-4 h-4 transition-transform duration-300 ${loading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
@@ -412,7 +415,8 @@ export default function JobQueuePanel() {
         <select
           value={filterType}
           onChange={(e) => setFilterType(e.target.value)}
-          className="px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600 bg-white dark:bg-charcoal-800 text-sm text-charcoal-700 dark:text-cream-200"
+          className="px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600 bg-white dark:bg-charcoal-800 text-sm text-charcoal-700 dark:text-cream-200
+                     focus:outline-none focus:ring-2 focus:ring-rust-300 transition-all duration-150 cursor-pointer"
         >
           <option value="">{t('jobQueue.allTypes')}</option>
           {JOB_TYPES.map((type) => (
@@ -424,7 +428,8 @@ export default function JobQueuePanel() {
         <select
           value={filterStatus}
           onChange={(e) => setFilterStatus(e.target.value)}
-          className="px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600 bg-white dark:bg-charcoal-800 text-sm text-charcoal-700 dark:text-cream-200"
+          className="px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600 bg-white dark:bg-charcoal-800 text-sm text-charcoal-700 dark:text-cream-200
+                     focus:outline-none focus:ring-2 focus:ring-rust-300 transition-all duration-150 cursor-pointer"
         >
           <option value="">{t('jobQueue.allStatuses')}</option>
           {JOB_STATUSES.map((s) => (
@@ -460,10 +465,14 @@ export default function JobQueuePanel() {
           </div>
         ) : (
           <div className="divide-y divide-cream-100 dark:divide-charcoal-700">
-            {jobs.map((job) => (
+            {jobs.map((job, idx) => (
               <div
                 key={job.id}
-                className="grid grid-cols-[140px_140px_100px_80px_120px_60px] gap-4 px-5 py-3.5 hover:bg-cream-50/50 dark:hover:bg-charcoal-750/50 transition-colors min-w-[700px]"
+                style={{ animationDelay: `${Math.min(idx * 25, 250)}ms` }}
+                className="grid grid-cols-[140px_140px_100px_80px_120px_60px] gap-4 px-5 py-3.5
+                           hover:bg-cream-50/60 dark:hover:bg-charcoal-750/60
+                           transition-all duration-200 min-w-[700px]
+                           animate-fade-in-up"
               >
                 <div className="text-sm text-charcoal-500 dark:text-charcoal-400 whitespace-nowrap">
                   {formatTime(job.createdAt)}
@@ -483,7 +492,7 @@ export default function JobQueuePanel() {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => setSelectedJob(job)}
-                    className="text-sm text-rust-500 hover:text-rust-600 dark:text-rust-400 dark:hover:text-rust-300 font-medium transition-colors"
+                    className="text-sm text-rust-500 hover:text-rust-600 dark:text-rust-400 dark:hover:text-rust-300 font-medium transition-all duration-150 hover:translate-x-0.5"
                   >
                     {t('jobQueue.viewDetail')}
                   </button>
@@ -503,7 +512,7 @@ export default function JobQueuePanel() {
               <button
                 onClick={() => fetchJobs(pagination.page - 1)}
                 disabled={pagination.page <= 1}
-                className="p-1.5 rounded-md text-charcoal-500 hover:bg-cream-100 dark:hover:bg-charcoal-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                className="p-1.5 rounded-md text-charcoal-500 hover:bg-cream-100 dark:hover:bg-charcoal-700 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 hover:scale-110 active:scale-95"
               >
                 <ChevronLeft className="w-4 h-4" />
               </button>
@@ -513,7 +522,7 @@ export default function JobQueuePanel() {
               <button
                 onClick={() => fetchJobs(pagination.page + 1)}
                 disabled={pagination.page >= pagination.totalPages}
-                className="p-1.5 rounded-md text-charcoal-500 hover:bg-cream-100 dark:hover:bg-charcoal-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                className="p-1.5 rounded-md text-charcoal-500 hover:bg-cream-100 dark:hover:bg-charcoal-700 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 hover:scale-110 active:scale-95"
               >
                 <ChevronRight className="w-4 h-4" />
               </button>

@@ -8,7 +8,6 @@ import {
   HardDrive,
   Cpu,
   ChevronDown,
-  ChevronUp,
   X,
   RefreshCw,
   Plus,
@@ -91,15 +90,21 @@ function GroupCard({
         </div>
         <div className="flex items-center gap-2">
           <span className="text-xs text-charcoal-400">{t('admin.nUsers', { n: group.userCount })}</span>
-          {expanded ? (
-            <ChevronUp className="w-4 h-4 text-charcoal-400" />
-          ) : (
-            <ChevronDown className="w-4 h-4 text-charcoal-400" />
-          )}
+          <ChevronDown
+            className={`w-4 h-4 text-charcoal-400 transition-transform duration-300 ease-out ${
+              expanded ? 'rotate-180' : 'rotate-0'
+            }`}
+          />
         </div>
       </div>
 
-      {expanded && (
+      {/* 用 CSS grid 行 0fr → 1fr 做高度过渡，避免 JS 计算高度 */}
+      <div
+        className={`grid transition-[grid-template-rows,opacity] duration-300 ease-out
+                    ${expanded ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'}`}
+        aria-hidden={!expanded}
+      >
+        <div className="overflow-hidden">
         <div className="px-5 pb-4 border-t border-cream-100">
           <div className="grid grid-cols-2 gap-3 pt-4">
             <div className="flex items-center gap-2 text-sm text-charcoal-600">
@@ -161,7 +166,8 @@ function GroupCard({
             )}
           </div>
         </div>
-      )}
+        </div>
+      </div>
     </div>
   );
 }

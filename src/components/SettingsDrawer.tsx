@@ -8,6 +8,7 @@ import { useSettingsStore } from '@/stores/settingsStore';
 import { useTranscriptStore } from '@/stores/transcriptStore';
 import LanguageSelect from '@/components/LanguageSelect';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/stores/toastStore';
 import { X, Globe, Cpu, Sparkles, Sliders, Mic, AlertTriangle } from 'lucide-react';
 import type { TranslationMode } from '@/types/transcript';
 import { LocalTranslator } from '@/lib/translation/localTranslator';
@@ -92,6 +93,7 @@ export default function SettingsDrawer({
     settings.setTopic(draft.topic);
     settings.setTerms(draft.terms);
     onClose();
+    toast.success(t('common.saveSuccess'));
 
     if (sonioxConfigChanged && isActive) {
       onSettingsApplied?.();

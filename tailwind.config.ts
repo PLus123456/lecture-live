@@ -146,6 +146,15 @@ const config: Config = {
           '0%': { opacity: '0', transform: 'translateY(-6px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
+        /* ─── Toast 通知 ─── */
+        'toast-in': {
+          '0%': { opacity: '0', transform: 'translateY(12px) scale(0.96)' },
+          '100%': { opacity: '1', transform: 'translateY(0) scale(1)' },
+        },
+        'toast-out': {
+          '0%': { opacity: '1', transform: 'translateY(0) scale(1)' },
+          '100%': { opacity: '0', transform: 'translateY(-6px) scale(0.96)' },
+        },
       },
       animation: {
         'modal-enter': 'modal-enter 0.2s ease-out',
@@ -170,6 +179,8 @@ const config: Config = {
         'tag-pop': 'tag-pop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) both',
         'count-up': 'count-up 0.5s ease-out both',
         'fade-slide-in': 'fade-slide-in 0.25s ease-out both',
+        'toast-in': 'toast-in 0.28s cubic-bezier(0.16, 1, 0.3, 1) both',
+        'toast-out': 'toast-out 0.18s ease-in forwards',
       },
       fontFamily: {
         serif: ['Georgia', 'Cambria', '"Times New Roman"', 'Times', 'serif'],

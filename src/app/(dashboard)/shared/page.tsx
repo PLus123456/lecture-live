@@ -15,6 +15,8 @@ import {
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSharedLinksStore } from '@/stores/sharedLinksStore';
+import { toast } from '@/stores/toastStore';
+import { useI18n } from '@/lib/i18n';
 
 interface SharedSessionLink {
   id: string;
@@ -46,6 +48,7 @@ function formatDate(value: string) {
 export default function SharedPage() {
   const isMobile = useIsMobile();
   const { token } = useAuth();
+  const { t } = useI18n();
   const viewedLinks = useSharedLinksStore((s) => s.viewedLinks);
   const [links, setLinks] = useState<SharedSessionLink[]>([]);
   const [loading, setLoading] = useState(true);
@@ -78,13 +81,17 @@ export default function SharedPage() {
         );
         // 清理 localStorage 中该 token 对应的 viewed 记录
         removeViewedLink(link.token);
+        toast.success(t('common.deleteSuccess'));
+      } else {
+        const data = await res.json().catch(() => null);
+        toast.error(t('common.deleteFailed'), data?.error);
       }
     } catch {
-      // silent
+      toast.error(t('common.deleteFailed'), t('common.networkError'));
     }
     setRevoking(null);
     setConfirmRevoke(null);
-  }, [token, removeViewedLink]);
+  }, [token, removeViewedLink, t]);
 
   useEffect(() => {
     if (!token) {

@@ -15,6 +15,8 @@ import {
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
+import ModalPortal from '@/components/ModalPortal';
+import ConfirmDialog from '@/components/ConfirmDialog';
 
 interface UserItem {
   id: string;
@@ -199,8 +201,9 @@ function UserDetailModal({
     'w-full px-3 py-1.5 text-sm border border-cream-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
-      <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-3xl mx-4 max-h-[90vh] overflow-y-auto">
+    <ModalPortal>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter px-4">
+      <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto animate-modal-enter">
         {/* 标题栏 */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200">
           <h3 className="text-base font-semibold text-charcoal-800">用户详情</h3>
@@ -410,6 +413,7 @@ function UserDetailModal({
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }
 
@@ -467,8 +471,9 @@ function CreateUserModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
-      <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-md mx-4">
+    <ModalPortal>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter px-4">
+      <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-md animate-modal-enter">
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200">
           <h3 className="text-base font-semibold text-charcoal-800">{t('admin.newUser')}</h3>
           <button
@@ -549,6 +554,7 @@ function CreateUserModal({
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }
 
@@ -629,12 +635,19 @@ export default function UserManagementPanel() {
     setSelectedIds(next);
   };
 
-  const handleDelete = async (userIds: string[]) => {
+  const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  const handleDelete = (userIds: string[]) => {
     const filtered = userIds.filter((id) => id !== currentUser?.id);
     if (filtered.length === 0) return;
+    setPendingDelete(filtered);
+  };
 
-    if (!confirm(t('admin.deleteConfirm', { n: filtered.length }))) return;
-
+  const confirmDeleteUsers = async () => {
+    const filtered = pendingDelete;
+    if (!filtered || filtered.length === 0) return;
+    setDeleting(true);
     try {
       const res = await fetch('/api/admin/users', {
         method: 'DELETE',
@@ -655,6 +668,9 @@ export default function UserManagementPanel() {
     } catch (err) {
       console.error('Failed to delete users:', err);
       toast.error(t('common.deleteFailed'), t('common.networkError'));
+    } finally {
+      setDeleting(false);
+      setPendingDelete(null);
     }
   };
 
@@ -878,6 +894,17 @@ export default function UserManagementPanel() {
           customGroups={customGroups}
         />
       )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        loading={deleting}
+        title={t('admin.deleteUser')}
+        message={pendingDelete ? t('admin.deleteConfirm', { n: pendingDelete.length }) : ''}
+        confirmText={t('common.delete')}
+        onConfirm={confirmDeleteUsers}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   );
 }

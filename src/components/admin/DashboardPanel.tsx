@@ -242,10 +242,12 @@ function ActivityRow({
 // ──── Trend chart ────
 function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typeof useI18n>['t'] }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
   const [animKey, setAnimKey] = useState(0);
   const [animDone, setAnimDone] = useState(false);
-  const [tooltip, setTooltip] = useState<{ visible: boolean; x: number; index: number }>({
-    visible: false, x: 0, index: 0,
+  // 注意：x 为 viewBox 坐标（用于 SVG 内部绘制），leftPx 为相对于 containerRef 的像素值（用于 HTML tooltip 定位）
+  const [tooltip, setTooltip] = useState<{ visible: boolean; x: number; index: number; leftPx: number }>({
+    visible: false, x: 0, index: 0, leftPx: 0,
   });
 
   useEffect(() => {
@@ -301,19 +303,39 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
   });
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const svgX = ((e.clientX - rect.left) / rect.width) * W;
+    // SVG 用 preserveAspectRatio="xMidYMid meet"，视口宽高比 ≠ 800:280 时会出现 letterbox，
+    // 直接用 (clientX - rect.left) / rect.width 推 SVG x 会偏移；用 SVG 自身 CTM 反变换才能精确。
+    const svg = svgRef.current;
+    const container = containerRef.current;
+    if (!svg || !container) return;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return;
+
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX;
+    pt.y = e.clientY;
+    const svgPt = pt.matrixTransform(ctm.inverse());
+
     let closest = 0;
     let minDist = Infinity;
     for (let i = 0; i < data.length; i++) {
-      const dist = Math.abs(toX(i) - svgX);
+      const dist = Math.abs(toX(i) - svgPt.x);
       if (dist < minDist) {
         minDist = dist;
         closest = i;
       }
     }
-    setTooltip({ visible: true, x: toX(closest), index: closest });
+
+    const closestSvgX = toX(closest);
+    // 将选中点的 SVG x 正向变换回屏幕坐标，再减去 container 左边距，得到 tooltip 的容器内像素位置
+    const fwdPt = svg.createSVGPoint();
+    fwdPt.x = closestSvgX;
+    fwdPt.y = 0;
+    const screenPt = fwdPt.matrixTransform(ctm);
+    const containerRect = container.getBoundingClientRect();
+    const leftPx = screenPt.x - containerRect.left;
+
+    setTooltip({ visible: true, x: closestSvgX, index: closest, leftPx });
   };
 
   const handleMouseLeave = () => setTooltip((prev) => ({ ...prev, visible: false }));
@@ -323,6 +345,7 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
   return (
     <div ref={containerRef} className="relative">
       <svg
+        ref={svgRef}
         viewBox={`0 0 ${W} ${H}`}
         className="w-full"
         style={{ height: 280 }}
@@ -449,7 +472,7 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
         <div
           className="absolute pointer-events-none bg-white/95 dark:bg-charcoal-800/95 backdrop-blur-sm border border-cream-200 dark:border-charcoal-700 rounded-lg shadow-lg px-3 py-2.5 z-10 min-w-[140px]"
           style={{
-            left: `${(tooltip.x / W) * 100}%`,
+            left: tooltip.leftPx,
             top: 8,
             transform: tooltip.x > W * 0.7 ? 'translateX(-110%)' : 'translateX(10px)',
           }}

@@ -2247,7 +2247,7 @@ export default function SettingsPanel() {
 
       {/* 水平标签栏 */}
       <div className="bg-white rounded-xl border border-cream-200 dark:bg-charcoal-800 dark:border-charcoal-700 overflow-hidden">
-        <div className="flex overflow-x-auto border-b border-cream-200 dark:border-charcoal-700 px-2 pt-2 gap-1 scrollbar-thin">
+        <div className="relative flex overflow-x-auto border-b border-cream-200 dark:border-charcoal-700 px-2 pt-2 gap-1 scrollbar-thin">
           {settingsTabs.map((tab) => {
             const Icon = tab.icon;
             const isActive = activeTab === tab.id;
@@ -2256,24 +2256,38 @@ export default function SettingsPanel() {
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
                 className={`
-                  flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-t-lg
-                  whitespace-nowrap transition-colors flex-shrink-0
+                  relative flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-t-lg
+                  whitespace-nowrap flex-shrink-0
+                  transition-all duration-200 ease-out
                   ${isActive
-                    ? 'bg-cream-50 dark:bg-charcoal-700 text-rust-600 dark:text-rust-400 border-b-2 border-rust-500'
-                    : 'text-charcoal-400 hover:text-charcoal-600 dark:hover:text-cream-300 hover:bg-cream-50 dark:hover:bg-charcoal-750'
+                    ? 'bg-cream-50 dark:bg-charcoal-700 text-rust-600 dark:text-rust-400'
+                    : 'text-charcoal-400 hover:text-charcoal-600 dark:hover:text-cream-300 hover:bg-cream-50/70 dark:hover:bg-charcoal-750'
                   }
                 `}
               >
-                <Icon className="w-3.5 h-3.5" />
+                <Icon
+                  className={`w-3.5 h-3.5 transition-transform duration-200 ease-out ${
+                    isActive ? 'scale-110' : 'group-hover:scale-105'
+                  }`}
+                />
                 <span>{t(tabLabelKeys[tab.id])}</span>
+                {/* 用 absolute span 做 active 下划线，动画过渡更自然 */}
+                <span
+                  className={`absolute left-2 right-2 bottom-0 h-0.5 rounded-full bg-rust-500 origin-center
+                              transition-transform duration-300 ease-out ${
+                                isActive ? 'scale-x-100 opacity-100' : 'scale-x-0 opacity-0'
+                              }`}
+                />
               </button>
             );
           })}
         </div>
 
-        {/* 设置内容区域 */}
+        {/* 设置内容区域 — key 切换触发 fade-in，使切 tab 时内容有过渡 */}
         <div className="p-6">
-          {renderContent()}
+          <div key={activeTab} className="animate-fade-in">
+            {renderContent()}
+          </div>
         </div>
 
         {/* 底部操作栏 — LLM 标签页不显示全局保存按钮（LLM 有独立保存逻辑） */}

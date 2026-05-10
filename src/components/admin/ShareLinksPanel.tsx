@@ -19,6 +19,7 @@ import {
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
+import ConfirmDialog from '@/components/ConfirmDialog';
 
 interface ShareLinkRow {
   id: string;
@@ -102,6 +103,8 @@ export default function ShareLinksPanel() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // 自定义删除确认弹窗的待办状态
+  const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
 
   const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
 
@@ -155,13 +158,20 @@ export default function ShareLinksPanel() {
     }
   };
 
-  const handleDelete = async (ids: string[]) => {
+  // 触发删除：先把目标 ids 推到 pendingDelete 让 ConfirmDialog 显示
+  const handleDelete = (ids: string[]) => {
     if (ids.length === 0) return;
-    const confirmMsg =
-      ids.length === 1
-        ? t('shareLinks.deleteConfirm')
-        : t('shareLinks.deleteSelectedConfirm', { n: ids.length });
-    if (!window.confirm(confirmMsg)) return;
+    setPendingDelete(ids);
+  };
+
+  // 用户确认删除后实际执行
+  const confirmDelete = async () => {
+    const ids = pendingDelete;
+    if (!ids || ids.length === 0) {
+      setPendingDelete(null);
+      return;
+    }
+    setPendingDelete(null);
 
     setDeletingIds((prev) => {
       const next = new Set(prev);
@@ -533,6 +543,21 @@ export default function ShareLinksPanel() {
             })}
           </div>
         )}
+
+        {/* 删除确认弹窗（自定义，替代浏览器原生 confirm） */}
+        <ConfirmDialog
+          open={pendingDelete !== null}
+          danger
+          title={t('shareLinks.deleteLink')}
+          message={
+            pendingDelete && pendingDelete.length === 1
+              ? t('shareLinks.deleteConfirm')
+              : t('shareLinks.deleteSelectedConfirm', { n: pendingDelete?.length ?? 0 })
+          }
+          confirmText={t('common.delete')}
+          onConfirm={confirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
 
         {/* 分页 */}
         {pagination.totalPages > 1 && (

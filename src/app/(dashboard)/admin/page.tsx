@@ -19,8 +19,10 @@ import {
   Layers,
   Share2,
   FolderOpen,
+  LogOut,
 } from 'lucide-react';
 import SiteLogo from '@/components/SiteLogo';
+import { useSettingsStore } from '@/stores/settingsStore';
 
 import DashboardPanel from '@/components/admin/DashboardPanel';
 import SettingsPanel from '@/components/admin/SettingsPanel';
@@ -40,12 +42,13 @@ const isAdminTab = (v: string | null): v is AdminTab =>
   v !== null && (ADMIN_TABS as string[]).includes(v);
 
 export default function AdminPage() {
-  const { user } = useAuth();
+  const { user, logout } = useAuth();
   const isMobile = useIsMobile();
   const { t } = useI18n();
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  const setUserSettingsOpen = useSettingsStore((s) => s.setUserSettingsOpen);
 
   const tabs: { id: AdminTab; label: string; icon: typeof Users }[] = [
     { id: 'dashboard', label: t('nav.dashboard'), icon: LayoutDashboard },
@@ -282,18 +285,37 @@ export default function AdminPage() {
           })}
         </nav>
 
-        {/* 底部用户信息 */}
-        <div className="p-3 border-t border-cream-200 dark:border-charcoal-700">
+        {/* 底部用户信息 + 设置 / 退出 */}
+        <div className="p-3 border-t border-cream-200 dark:border-charcoal-700 space-y-2">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-full bg-gradient-to-br from-rust-400 to-rust-600 flex items-center justify-center flex-shrink-0">
               <span className="text-white text-xs font-bold">
                 {user.displayName.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2)}
               </span>
             </div>
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <div className="text-sm font-medium text-charcoal-800 dark:text-cream-100 truncate">{user.displayName}</div>
               <div className="text-[10px] text-charcoal-400 truncate">{user.email}</div>
             </div>
+            <button
+              onClick={() => setUserSettingsOpen(true)}
+              className="w-7 h-7 rounded-md flex items-center justify-center
+                         text-charcoal-400 hover:bg-cream-100 dark:hover:bg-charcoal-700 hover:text-charcoal-600 transition-colors"
+              title={t('nav.settings')}
+            >
+              <Settings className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={async () => {
+                await logout();
+                router.replace('/login');
+              }}
+              className="w-7 h-7 rounded-md flex items-center justify-center
+                         text-charcoal-400 hover:bg-red-50 hover:text-red-500 transition-colors"
+              title={t('auth.signOut')}
+            >
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
           </div>
         </div>
       </aside>

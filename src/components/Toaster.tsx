@@ -39,6 +39,11 @@ function ToastItem({ toast }: { toast: Toast }) {
     setTimeout(() => dismiss(toast.id), 180);
   };
 
+  const handleAction = () => {
+    toast.action?.onClick();
+    handleClose();
+  };
+
   return (
     <div
       role="status"
@@ -64,6 +69,15 @@ function ToastItem({ toast }: { toast: Toast }) {
           <div className="mt-0.5 text-xs text-charcoal-500 dark:text-charcoal-400 break-words">
             {toast.description}
           </div>
+        )}
+        {toast.action && (
+          <button
+            type="button"
+            onClick={handleAction}
+            className="mt-1.5 inline-flex items-center text-xs font-semibold text-rust-600 dark:text-rust-400 hover:text-rust-700 dark:hover:text-rust-300 transition-colors"
+          >
+            {toast.action.label} →
+          </button>
         )}
       </div>
       <button

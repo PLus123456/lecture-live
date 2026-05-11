@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo, useId } from 'react';
 import {
   Users, Mic, Share2, FolderOpen,
   TrendingUp, TrendingDown, Minus,
@@ -243,19 +243,49 @@ function ActivityRow({
 function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typeof useI18n>['t'] }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
-  const [animKey, setAnimKey] = useState(0);
+  // useId 给 clipPath / gradient 一个稳定且组件内唯一的 id 前缀（剥离冒号以兼容 url(#...) 引用）
+  const idBase = useId().replace(/:/g, '');
+  const W = 800;
+  const H = 280;
+  const padL = 36;
+  const padR = 16;
+  const padT = 16;
+  const padB = 28;
+  const [revealW, setRevealW] = useState(0);
   const [animDone, setAnimDone] = useState(false);
   // 注意：x 为 viewBox 坐标（用于 SVG 内部绘制），leftPx 为相对于 containerRef 的像素值（用于 HTML tooltip 定位）
   const [tooltip, setTooltip] = useState<{ visible: boolean; x: number; index: number; leftPx: number }>({
     visible: false, x: 0, index: 0, leftPx: 0,
   });
 
+  // RAF 驱动的揭示动画。
+  // 不用 SMIL <animate>，因为它的 begin="0s" 是相对父 SVG 时钟，
+  // 切 tab 回来时 SVG 没重建 → 新挂的 <animate> 会被认为"已结束"，瞬移到 freeze 终态。
   useEffect(() => {
-    if (!data.length) return;
+    if (!data.length) {
+      setRevealW(0);
+      setAnimDone(false);
+      return;
+    }
     setAnimDone(false);
-    setAnimKey((k) => k + 1);
-    const timer = setTimeout(() => setAnimDone(true), 1500);
-    return () => clearTimeout(timer);
+    setRevealW(0);
+    let raf = 0;
+    let start = 0;
+    const DUR = 1400;
+    const tick = (now: number) => {
+      if (!start) start = now;
+      const t = Math.min(1, (now - start) / DUR);
+      // ease-out cubic ≈ cubic-bezier(0.25, 0.1, 0.25, 1)
+      const eased = 1 - Math.pow(1 - t, 3);
+      setRevealW(eased * W);
+      if (t < 1) {
+        raf = requestAnimationFrame(tick);
+      } else {
+        setAnimDone(true);
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
   }, [data]);
 
   if (!data.length) {
@@ -265,13 +295,6 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
       </div>
     );
   }
-
-  const W = 800;
-  const H = 280;
-  const padL = 36;
-  const padR = 16;
-  const padT = 16;
-  const padB = 28;
 
   const chartW = W - padL - padR;
   const chartH = H - padT - padB;
@@ -355,25 +378,13 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
       >
         <defs>
           {SERIES.map((s) => (
-            <linearGradient key={s.key} id={`grad-${s.key}-${animKey}`} x1="0" y1="0" x2="0" y2="1">
+            <linearGradient key={s.key} id={`grad-${s.key}-${idBase}`} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor={s.color} stopOpacity={0.18} />
               <stop offset="100%" stopColor={s.color} stopOpacity={0} />
             </linearGradient>
           ))}
-          <clipPath id={`reveal-${animKey}`}>
-            <rect x={0} y={0} width={W} height={H}>
-              <animate
-                attributeName="width"
-                from="0"
-                to={W}
-                dur="1.4s"
-                fill="freeze"
-                calcMode="spline"
-                keySplines="0.25 0.1 0.25 1"
-                keyTimes="0;1"
-                begin="0s"
-              />
-            </rect>
+          <clipPath id={`reveal-${idBase}`}>
+            <rect x={0} y={0} width={revealW} height={H} />
           </clipPath>
         </defs>
 
@@ -396,9 +407,9 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
         ))}
 
         {/* 区域填充 + 折线（按动画 clip 揭示） */}
-        <g key={animKey} clipPath={`url(#reveal-${animKey})`}>
+        <g clipPath={`url(#reveal-${idBase})`}>
           {SERIES.map((s, si) => (
-            <path key={`area-${s.key}`} d={seriesAreas[si]} fill={`url(#grad-${s.key}-${animKey})`} />
+            <path key={`area-${s.key}`} d={seriesAreas[si]} fill={`url(#grad-${s.key}-${idBase})`} />
           ))}
           {SERIES.map((s, si) => (
             <path
@@ -526,7 +537,8 @@ function Distribution3DBars({
   const H = 220;
   const padL = 24;
   const padR = 24;
-  const padT = 16;
+  // padT 需同时容纳 3D 顶面(depth=14) + 数字标签(11px) + 与柱顶间距(6px) + hover 抬升(6px)
+  const padT = 32;
   const padB = 36;
   const chartW = W - padL - padR;
   const chartH = H - padT - padB;

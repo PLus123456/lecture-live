@@ -5,8 +5,9 @@ import {
   invalidateFoldersApiCache,
   invalidateSessionsApiCache,
 } from '@/lib/apiResponseCache';
-import { assertOwnership } from '@/lib/security';
+import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { enforceRateLimit } from '@/lib/rateLimit';
+import { logAction } from '@/lib/auditLog';
 import { callLLM } from '@/lib/llm/gateway';
 import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
 import { validatePersistedTranscriptBundle } from '@/lib/sessionApi';
@@ -164,7 +165,13 @@ export async function GET(
   }
 
   try {
-    assertOwnership(user.id, session.userId);
+    const { isCrossUserAdmin } = assertSessionReadAccess(user, session.userId);
+    if (isCrossUserAdmin) {
+      logAction(req, 'admin.session.transcript.read', {
+        user,
+        detail: `读取他人转录 (sessionId=${id}, owner=${session.userId})`,
+      });
+    }
   } catch {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }

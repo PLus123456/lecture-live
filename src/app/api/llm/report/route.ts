@@ -5,7 +5,8 @@ import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
-import { assertOwnership } from '@/lib/security';
+import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
+import { logAction } from '@/lib/auditLog';
 import { callLLM } from '@/lib/llm/gateway';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { generateSessionReport } from '@/lib/llm/reportManager';
@@ -119,7 +120,13 @@ export async function GET(req: Request) {
   }
 
   try {
-    assertOwnership(user.id, session.userId);
+    const { isCrossUserAdmin } = assertSessionReadAccess(user, session.userId);
+    if (isCrossUserAdmin) {
+      logAction(req, 'admin.session.report.read', {
+        user,
+        detail: `读取他人会议报告 (sessionId=${sessionId}, owner=${session.userId})`,
+      });
+    }
   } catch {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }

@@ -62,6 +62,11 @@ export const POST = withRequestLogging(
         finalizeSource,
       });
 
+      logAction(req, 'session.finalize', {
+        user,
+        detail: `${clientTitle || id} (${finalizeSource})`,
+      });
+
       await invalidateSessionsApiCache(user.id);
       return NextResponse.json(result);
     } catch (error) {

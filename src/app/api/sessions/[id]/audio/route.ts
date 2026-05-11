@@ -2,8 +2,9 @@ import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
-import { assertOwnership } from '@/lib/security';
+import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { enforceRateLimit } from '@/lib/rateLimit';
+import { logAction } from '@/lib/auditLog';
 import {
   isAllowedAudioMimeType,
   matchesAudioSignature,
@@ -151,7 +152,13 @@ export async function GET(
   }
 
   try {
-    assertOwnership(user.id, session.userId);
+    const { isCrossUserAdmin } = assertSessionReadAccess(user, session.userId);
+    if (isCrossUserAdmin) {
+      logAction(req, 'admin.session.audio.read', {
+        user,
+        detail: `读取他人录音音频 (sessionId=${id}, owner=${session.userId})`,
+      });
+    }
   } catch {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }

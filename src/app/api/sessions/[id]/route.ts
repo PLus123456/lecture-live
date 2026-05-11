@@ -8,7 +8,8 @@ import {
   invalidateShareLinksApiCache,
 } from '@/lib/apiResponseCache';
 import { jsonWithCache } from '@/lib/httpCache';
-import { assertOwnership } from '@/lib/security';
+import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
+import { logAction } from '@/lib/auditLog';
 import {
   normalizeOptionalString,
   normalizeSessionAudioSource,
@@ -38,7 +39,13 @@ export async function GET(
   }
 
   try {
-    assertOwnership(user.id, session.userId);
+    const { isCrossUserAdmin } = assertSessionReadAccess(user, session.userId);
+    if (isCrossUserAdmin) {
+      logAction(req, 'admin.session.read', {
+        user,
+        detail: `读取他人会话元数据 (sessionId=${id}, owner=${session.userId})`,
+      });
+    }
   } catch {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }

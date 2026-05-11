@@ -5,11 +5,15 @@ import {
   Search,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   RefreshCw,
   Filter,
   LogIn,
   LogOut,
   UserPlus,
+  UserMinus,
+  UserCog,
+  Users,
   KeyRound,
   Settings,
   Trash2,
@@ -20,6 +24,15 @@ import {
   MicOff,
   Share2,
   Eye,
+  Headphones,
+  FileText,
+  ClipboardList,
+  FileX2,
+  Cloud,
+  HardDrive,
+  ArrowRightLeft,
+  Coins,
+  RotateCw,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
@@ -41,46 +54,121 @@ interface Pagination {
   totalPages: number;
 }
 
-// 操作类型 → 图标 & 颜色映射
-function getActionMeta(action: string): {
+// 颜色板：使用统一的 token 简化映射
+const PALETTE = {
+  green:  { color: '#059669', bg: '#d1fae5' },
+  amber:  { color: '#d97706', bg: '#fef3c7' },
+  blue:   { color: '#2563eb', bg: '#dbeafe' },
+  violet: { color: '#7c3aed', bg: '#ede9fe' },
+  purple: { color: '#8b5cf6', bg: '#f3e8ff' },
+  red:    { color: '#dc2626', bg: '#fee2e2' },
+  gray:   { color: '#6b7280', bg: '#f3f4f6' },
+  cyan:   { color: '#0891b2', bg: '#cffafe' },
+  indigo: { color: '#4f46e5', bg: '#e0e7ff' },
+  teal:   { color: '#0d9488', bg: '#ccfbf1' },
+  orange: { color: '#ea580c', bg: '#ffedd5' },
+  slate:  { color: '#475569', bg: '#f1f5f9' },
+} as const;
+
+type Tone = keyof typeof PALETTE;
+
+interface ActionDef {
   icon: typeof LogIn;
-  color: string;
-  bg: string;
-} {
-  if (action === 'session.create') return { icon: Mic, color: '#059669', bg: '#d1fae5' };
-  if (action === 'session.finalize') return { icon: MicOff, color: '#d97706', bg: '#fef3c7' };
-  if (action === 'share.create') return { icon: Share2, color: '#2563eb', bg: '#dbeafe' };
-  if (action === 'share.revoke') return { icon: Share2, color: '#dc2626', bg: '#fee2e2' };
-  if (action === 'share.view') return { icon: Eye, color: '#8b5cf6', bg: '#f3e8ff' };
-  if (action.startsWith('user.login')) {
-    return action.includes('failed')
-      ? { icon: LogIn, color: '#d97706', bg: '#fef3c7' }
-      : { icon: LogIn, color: '#059669', bg: '#d1fae5' };
-  }
-  if (action === 'user.logout') return { icon: LogOut, color: '#6b7280', bg: '#f3f4f6' };
-  if (action === 'user.register') return { icon: UserPlus, color: '#2563eb', bg: '#dbeafe' };
-  if (action === 'user.password.change') return { icon: KeyRound, color: '#7c3aed', bg: '#ede9fe' };
-  if (action.startsWith('admin.settings')) return { icon: Settings, color: '#0891b2', bg: '#cffafe' };
-  if (action.includes('delete')) return { icon: Trash2, color: '#dc2626', bg: '#fee2e2' };
-  if (action.includes('user')) return { icon: UserPlus, color: '#2563eb', bg: '#dbeafe' };
-  if (action.includes('llm')) return { icon: Bot, color: '#8b5cf6', bg: '#f3e8ff' };
-  if (action.startsWith('system')) return { icon: Server, color: '#475569', bg: '#f1f5f9' };
-  return { icon: Activity, color: '#64748b', bg: '#f8fafc' };
+  tone: Tone;
+  labelKey: string;
 }
 
-// 操作类型筛选选项
+// 单一数据源：每种 action → icon / 颜色 / i18n key
+const ACTION_DEFS: Record<string, ActionDef> = {
+  // 会话生命周期（保留即使尚未写入，作为历史/未来兼容）
+  'session.create':                  { icon: Mic,            tone: 'green',  labelKey: 'auditLog.sessionCreate' },
+  'session.finalize':                { icon: MicOff,         tone: 'amber',  labelKey: 'auditLog.sessionFinalize' },
+
+  // 分享
+  'share.create':                    { icon: Share2,         tone: 'blue',   labelKey: 'auditLog.shareCreate' },
+  'share.revoke':                    { icon: Share2,         tone: 'red',    labelKey: 'auditLog.shareRevoke' },
+  'share.view':                      { icon: Eye,            tone: 'purple', labelKey: 'auditLog.shareView' },
+  'share.transition_playback':       { icon: Share2,         tone: 'cyan',   labelKey: 'auditLog.shareTransitionPlayback' },
+
+  // 用户账号
+  'user.login':                      { icon: LogIn,          tone: 'green',  labelKey: 'auditLog.login' },
+  'user.login.failed':               { icon: LogIn,          tone: 'amber',  labelKey: 'auditLog.loginFailed' },
+  'user.logout':                     { icon: LogOut,         tone: 'gray',   labelKey: 'auditLog.logout' },
+  'user.register':                   { icon: UserPlus,       tone: 'blue',   labelKey: 'auditLog.register' },
+  'user.password.change':            { icon: KeyRound,       tone: 'violet', labelKey: 'auditLog.passwordChange' },
+
+  // Admin 跨用户读取（敏感操作 — 全部用 amber 警示色）
+  'admin.session.read':              { icon: Eye,            tone: 'amber',  labelKey: 'auditLog.adminSessionRead' },
+  'admin.session.audio.read':        { icon: Headphones,     tone: 'amber',  labelKey: 'auditLog.adminSessionAudioRead' },
+  'admin.session.transcript.read':   { icon: FileText,       tone: 'amber',  labelKey: 'auditLog.adminSessionTranscriptRead' },
+  'admin.session.report.read':       { icon: ClipboardList,  tone: 'amber',  labelKey: 'auditLog.adminSessionReportRead' },
+
+  // 用户管理
+  'admin.user.create':               { icon: UserPlus,       tone: 'blue',   labelKey: 'auditLog.userCreate' },
+  'admin.user.update':               { icon: UserCog,        tone: 'blue',   labelKey: 'auditLog.userUpdate' },
+  'admin.user.delete':               { icon: UserMinus,      tone: 'red',    labelKey: 'auditLog.userDelete' },
+
+  // 用户组管理
+  'admin.group.create':              { icon: Users,          tone: 'indigo', labelKey: 'auditLog.groupCreate' },
+  'admin.group.update':              { icon: Users,          tone: 'indigo', labelKey: 'auditLog.groupUpdate' },
+  'admin.group.delete':              { icon: Users,          tone: 'red',    labelKey: 'auditLog.groupDelete' },
+
+  // 设置
+  'admin.settings.update':           { icon: Settings,       tone: 'cyan',   labelKey: 'auditLog.settingsChange' },
+
+  // LLM 供应商
+  'admin.llm.provider.create':       { icon: Bot,            tone: 'violet', labelKey: 'auditLog.llmProviderCreate' },
+  'admin.llm.provider.update':       { icon: Bot,            tone: 'violet', labelKey: 'auditLog.llmProviderUpdate' },
+  'admin.llm.provider.delete':       { icon: Bot,            tone: 'red',    labelKey: 'auditLog.llmProviderDelete' },
+
+  // 文件 / 分享 / 存储
+  'admin.files.delete':              { icon: FileX2,         tone: 'red',    labelKey: 'auditLog.filesDelete' },
+  'admin.share.delete':              { icon: Share2,         tone: 'red',    labelKey: 'auditLog.shareDelete' },
+  'admin.cloudreve.revoke':          { icon: Cloud,          tone: 'red',    labelKey: 'auditLog.cloudreveRevoke' },
+  'admin.storage.cleanup':           { icon: HardDrive,      tone: 'gray',   labelKey: 'auditLog.storageCleanup' },
+  'admin.storage.migrate':           { icon: ArrowRightLeft, tone: 'cyan',   labelKey: 'auditLog.storageMigrate' },
+
+  // 对账
+  'admin.reconciliation.run':        { icon: Coins,          tone: 'teal',   labelKey: 'auditLog.reconciliationRun' },
+  'admin.reconciliation.fix':        { icon: Coins,          tone: 'teal',   labelKey: 'auditLog.reconciliationFix' },
+  'admin.reconciliation.fixAll':     { icon: Coins,          tone: 'teal',   labelKey: 'auditLog.reconciliationFixAll' },
+
+  // 任务队列
+  'admin.job.retry':                 { icon: RotateCw,       tone: 'orange', labelKey: 'auditLog.jobRetry' },
+
+  // 系统
+  'system.start':                    { icon: Server,         tone: 'slate',  labelKey: 'auditLog.systemStart' },
+};
+
+const FALLBACK_DEF: ActionDef = {
+  icon: Activity,
+  tone: 'slate',
+  labelKey: '',
+};
+
+function getActionDef(action: string): ActionDef {
+  return ACTION_DEFS[action] ?? FALLBACK_DEF;
+}
+
+// 操作类型筛选选项（按前缀分组，便于一次过滤同类操作）
 const ACTION_FILTERS = [
   { value: '', label: 'auditLog.allActions' },
-  { value: 'session.create', label: 'auditLog.sessionCreate' },
-  { value: 'session.finalize', label: 'auditLog.sessionFinalize' },
-  { value: 'share', label: 'auditLog.share' },
   { value: 'user.login', label: 'auditLog.login' },
   { value: 'user.logout', label: 'auditLog.logout' },
   { value: 'user.register', label: 'auditLog.register' },
   { value: 'user.password', label: 'auditLog.passwordChange' },
-  { value: 'admin.settings', label: 'auditLog.settingsChange' },
+  { value: 'share', label: 'auditLog.share' },
+  { value: 'admin.session', label: 'auditLog.adminSessionAccess' },
   { value: 'admin.user', label: 'auditLog.userManage' },
+  { value: 'admin.group', label: 'auditLog.groupManage' },
+  { value: 'admin.settings', label: 'auditLog.settingsChange' },
   { value: 'admin.llm', label: 'auditLog.llmManage' },
+  { value: 'admin.files', label: 'auditLog.filesDelete' },
+  { value: 'admin.share', label: 'auditLog.shareDelete' },
+  { value: 'admin.cloudreve', label: 'auditLog.cloudreveRevoke' },
+  { value: 'admin.storage', label: 'auditLog.storageManage' },
+  { value: 'admin.reconciliation', label: 'auditLog.reconciliationManage' },
+  { value: 'admin.job', label: 'auditLog.jobRetry' },
   { value: 'system', label: 'auditLog.system' },
 ];
 
@@ -158,26 +246,8 @@ export default function AuditLogPanel() {
 
   // 获取操作的可读名称
   const getActionLabel = (action: string) => {
-    const map: Record<string, string> = {
-      'session.create': t('auditLog.sessionCreate'),
-      'session.finalize': t('auditLog.sessionFinalize'),
-      'share.create': t('auditLog.shareCreate'),
-      'share.revoke': t('auditLog.shareRevoke'),
-      'share.view': t('auditLog.shareView'),
-      'user.login': t('auditLog.login'),
-      'user.login.failed': t('auditLog.loginFailed'),
-      'user.logout': t('auditLog.logout'),
-      'user.register': t('auditLog.register'),
-      'user.password.change': t('auditLog.passwordChange'),
-      'admin.settings.update': t('auditLog.settingsChange'),
-      'admin.user.create': t('auditLog.userCreate'),
-      'admin.user.delete': t('auditLog.userDelete'),
-      'admin.llm.provider.create': t('auditLog.llmProviderCreate'),
-      'admin.llm.provider.update': t('auditLog.llmProviderUpdate'),
-      'admin.llm.provider.delete': t('auditLog.llmProviderDelete'),
-      'system.start': t('auditLog.systemStart'),
-    };
-    return map[action] || action;
+    const def = ACTION_DEFS[action];
+    return def ? t(def.labelKey) : action;
   };
 
   return (
@@ -219,6 +289,7 @@ export default function AuditLogPanel() {
               </option>
             ))}
           </select>
+          <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-charcoal-400 pointer-events-none" />
         </div>
 
         {/* 刷新按钮 */}
@@ -265,8 +336,9 @@ export default function AuditLogPanel() {
         ) : (
           <div className="divide-y divide-cream-100 dark:divide-charcoal-700">
             {logs.map((log, idx) => {
-              const meta = getActionMeta(log.action);
-              const Icon = meta.icon;
+              const def = getActionDef(log.action);
+              const meta = PALETTE[def.tone];
+              const Icon = def.icon;
               return (
                 <div
                   key={log.id}

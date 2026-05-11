@@ -129,3 +129,20 @@ export function assertOwnership(requestUserId: string, resourceUserId: string): 
     throw new Error('Access denied: resource does not belong to current user');
   }
 }
+
+/**
+ * 读类访问控制：拥有者通过；ADMIN 跨用户读取也通过，但返回标记供调用方写入审计日志。
+ * 仅用于 GET / 只读操作，不能用于修改类操作。
+ */
+export function assertSessionReadAccess(
+  user: { id: string; role: string },
+  resourceUserId: string
+): { isCrossUserAdmin: boolean } {
+  if (user.id === resourceUserId) {
+    return { isCrossUserAdmin: false };
+  }
+  if (user.role === 'ADMIN') {
+    return { isCrossUserAdmin: true };
+  }
+  throw new Error('Access denied: resource does not belong to current user');
+}

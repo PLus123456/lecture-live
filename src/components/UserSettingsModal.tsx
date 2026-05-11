@@ -5,6 +5,7 @@ import { useSettingsStore } from '@/stores/settingsStore';
 import { useAuth } from '@/hooks/useAuth';
 import { SONIOX_REGION_OPTIONS } from '@/types/transcript';
 import LanguageSelect from '@/components/LanguageSelect';
+import ModalPortal from '@/components/ModalPortal';
 import { useI18n } from '@/lib/i18n';
 import { UI_LOCALE_OPTIONS, type Locale } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
@@ -180,7 +181,8 @@ export default function UserSettingsModal() {
   if (!mounted) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
+    <ModalPortal>
+    <div className="fixed inset-0 z-[1100] flex items-center justify-center">
       {/* 背景遮罩 */}
       <div
         className={`absolute inset-0 bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
@@ -534,5 +536,6 @@ export default function UserSettingsModal() {
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }

@@ -4,6 +4,11 @@ import { create } from 'zustand';
 
 export type ToastType = 'success' | 'error' | 'info';
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 export interface Toast {
   id: number;
   type: ToastType;
@@ -11,6 +16,8 @@ export interface Toast {
   description?: string;
   /** 自动关闭延迟（毫秒）。0 表示需要手动关闭 */
   duration: number;
+  /** 可选的操作按钮。点击后会先调用 onClick，再关闭 toast。 */
+  action?: ToastAction;
 }
 
 interface ToastStore {
@@ -35,12 +42,12 @@ const ERROR_DURATION = 5000;
 export const useToastStore = create<ToastStore>((set, get) => ({
   toasts: [],
 
-  show: ({ type, message, description, duration }) => {
+  show: ({ type, message, description, duration, action }) => {
     const id = nextId();
     const finalDuration =
       duration ?? (type === 'error' ? ERROR_DURATION : DEFAULT_DURATION);
     set((state) => ({
-      toasts: [...state.toasts, { id, type, message, description, duration: finalDuration }],
+      toasts: [...state.toasts, { id, type, message, description, duration: finalDuration, action }],
     }));
     if (finalDuration > 0) {
       setTimeout(() => get().dismiss(id), finalDuration);

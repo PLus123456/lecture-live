@@ -7,6 +7,7 @@
     "db:ensure": "node scripts/ensure-database.mjs",
     "dev": "next dev",
     "dev:ws": "ts-node server/websocket.ts",
+    "prebuild": "prisma generate",
     "build": "next build",
     "build:ws": "esbuild server/websocket.ts --bundle --platform=node --target=node20 --outfile=dist/websocket.js --external:@prisma/client --external:socket.io --external:ioredis --external:jsonwebtoken --external:bcryptjs --alias:server-only=./deploy/shims/server-only.js",
     "prestart": "node scripts/ensure-database.mjs",

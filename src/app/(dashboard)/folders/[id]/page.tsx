@@ -30,6 +30,7 @@ import FolderKeywordManager from '@/components/folder/FolderKeywordManager';
 import NewSessionModal from '@/components/NewSessionModal';
 import ExportModal from '@/components/ExportModal';
 import ActionSheet, { type ActionSheetItem } from '@/components/mobile/ActionSheet';
+import ConfirmDialog from '@/components/ConfirmDialog';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useI18n } from '@/lib/i18n';
@@ -132,6 +133,11 @@ export default function FolderDetailPage() {
   const [renameValue, setRenameValue] = useState('');
   const [showProperties, setShowProperties] = useState(false);
   const [propertiesSession, setPropertiesSession] = useState<SessionItem | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<
+    | { kind: 'batch'; ids: string[] }
+    | { kind: 'single'; id: string; title: string }
+    | null
+  >(null);
 
   /* ─── Session selection ─── */
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
@@ -220,11 +226,24 @@ export default function FolderDetailPage() {
 
   useEffect(() => { void loadData(); }, [loadData]);
 
-  /* ─── Delete ─── */
-  const handleDeleteSessions = async () => {
+  /* ─── Delete (open confirm) ─── */
+  const handleDeleteSessions = () => {
     if (selectedSessionIds.size === 0 || !token) return;
     const ids = Array.from(selectedSessionIds);
-    if (!window.confirm(t('foldersPage.deleteConfirmMany', { count: ids.length }))) return;
+    setPendingDelete({ kind: 'batch', ids });
+  };
+
+  const handleDeleteSingle = (id: string) => {
+    if (!token) return;
+    const s = sessions.find((s) => s.id === id);
+    setPendingDelete({
+      kind: 'single',
+      id,
+      title: s?.title || t('foldersPage.untitledSession'),
+    });
+  };
+
+  const executeBatchDelete = async (ids: string[]) => {
     resetMessages(); setSaving(true);
     try {
       let c = 0;
@@ -241,10 +260,7 @@ export default function FolderDetailPage() {
     finally { setSaving(false); }
   };
 
-  const handleDeleteSingle = async (id: string) => {
-    if (!token) return;
-    const s = sessions.find((s) => s.id === id);
-    if (!window.confirm(t('foldersPage.deleteConfirmSingle', { title: s?.title || t('foldersPage.untitledSession') }))) return;
+  const executeSingleDelete = async (id: string) => {
     resetMessages(); setSaving(true);
     try {
       const r = await fetch(`/api/sessions/${id}`, { method: 'DELETE', headers: authHeaders });
@@ -257,6 +273,14 @@ export default function FolderDetailPage() {
       toast.error(t('foldersPage.deleteFailed'), e instanceof Error ? e.message : undefined);
     }
     finally { setSaving(false); }
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!pendingDelete) return;
+    const target = pendingDelete;
+    setPendingDelete(null);
+    if (target.kind === 'batch') await executeBatchDelete(target.ids);
+    else await executeSingleDelete(target.id);
   };
 
   /* ─── Rename session ─── */
@@ -1021,6 +1045,23 @@ export default function FolderDetailPage() {
           </div>
         </ModalOverlay>
       )}
+
+      <ConfirmDialog
+        open={!!pendingDelete}
+        title={t('common.delete')}
+        message={
+          pendingDelete?.kind === 'batch'
+            ? t('foldersPage.deleteConfirmMany', { count: pendingDelete.ids.length })
+            : pendingDelete?.kind === 'single'
+              ? t('foldersPage.deleteConfirmSingle', { title: pendingDelete.title })
+              : undefined
+        }
+        confirmText={t('common.delete')}
+        danger
+        loading={saving}
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   );
 }

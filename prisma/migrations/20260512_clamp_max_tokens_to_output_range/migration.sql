@@ -1,0 +1,13 @@
+-- 把存量 LlmModel.maxTokens 夹到合理输出范围 (≤ 8192)。
+--
+-- 背景：上一个 migration (20260511_llm_context_management) 加了
+-- contextWindow 字段并把 maxTokens 的值复制过去 —— 但 maxTokens 本身
+-- 没动。如果用户之前把 maxTokens 填成了"上下文窗口大小"（如 256000），
+-- 这条数据现在两边都是 256000：contextWindow 是对的，但 maxTokens 也
+-- 跟着错。
+--
+-- 即使 lib/llm/tokenBudget.ts 的 computeContextBudget() 已经在运行时
+-- clamp，这里仍然把存量数据物理修正，让 admin 面板里 maxTokens 字段
+-- 显示的是真实的输出上限（≤ 8192），而不是一个被运行时悄悄改过的
+-- "虚假大数"。
+UPDATE `LlmModel` SET `maxTokens` = 8192 WHERE `maxTokens` > 8192;

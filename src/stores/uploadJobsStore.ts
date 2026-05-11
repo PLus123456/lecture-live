@@ -89,6 +89,12 @@ export const useUploadJobsStore = create<UploadJobsStore>((set, get) => ({
 }));
 
 /**
+ * 取消 handle 的注册表 — handle 是函数，不放 zustand state 里。
+ * 用 module-level Map 让 modal 卸载后仍能从后台 widget 取消任务。
+ */
+const cancelHandles = new Map<string, () => void>();
+
+/**
  * 全局便捷调用，无需在组件中订阅 store。
  */
 export const uploadJobs = {
@@ -98,4 +104,18 @@ export const uploadJobs = {
     useUploadJobsStore.getState().update(id, patch),
   get: (id: string) => useUploadJobsStore.getState().get(id),
   remove: (id: string) => useUploadJobsStore.getState().remove(id),
+  registerCancel: (id: string, cancel: () => void) => {
+    cancelHandles.set(id, cancel);
+  },
+  unregisterCancel: (id: string) => {
+    cancelHandles.delete(id);
+  },
+  cancel: (id: string) => {
+    const fn = cancelHandles.get(id);
+    if (fn) {
+      try { fn(); } catch { /* ignore — handle 已失效 */ }
+    }
+    cancelHandles.delete(id);
+    useUploadJobsStore.getState().update(id, { status: 'canceled' });
+  },
 };

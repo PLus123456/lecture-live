@@ -23,6 +23,7 @@ import {
   Image as ImageIcon,
 } from 'lucide-react';
 import { useTheme } from '@/components/ThemeProvider';
+import ConfirmDialog from '@/components/ConfirmDialog';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
 
@@ -1158,6 +1159,7 @@ function StoragePanel({
     expiresAt: number | null;
   } | null>(null);
   const [revoking, setRevoking] = useState(false);
+  const [revokeConfirmOpen, setRevokeConfirmOpen] = useState(false);
 
   const refreshAuthStatus = useCallback(async () => {
     if (settings.storage_mode !== 'cloudreve') {
@@ -1288,10 +1290,12 @@ function StoragePanel({
     }
   };
 
-  const handleRevoke = async () => {
-    if (!window.confirm(t('adminSettings.cloudreveRevokeConfirm'))) {
-      return;
-    }
+  const handleRevoke = () => {
+    setRevokeConfirmOpen(true);
+  };
+
+  const handleRevokeConfirm = async () => {
+    setRevokeConfirmOpen(false);
     setRevoking(true);
     setAuthResult(null);
     try {
@@ -1460,6 +1464,16 @@ function StoragePanel({
       <SettingField label={t('adminSettings.maxUploadSize')} description={t('adminSettings.maxUploadSizeDesc')}>
         <TextInput value={settings.max_file_size} onChange={(v) => onChange('max_file_size', v)} type="number" />
       </SettingField>
+      <ConfirmDialog
+        open={revokeConfirmOpen}
+        title={t('adminSettings.cloudreveRevoke')}
+        message={t('adminSettings.cloudreveRevokeConfirm')}
+        confirmText={t('adminSettings.cloudreveRevoke')}
+        danger
+        loading={revoking}
+        onConfirm={handleRevokeConfirm}
+        onCancel={() => setRevokeConfirmOpen(false)}
+      />
     </div>
   );
 }

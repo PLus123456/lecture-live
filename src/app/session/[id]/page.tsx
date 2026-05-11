@@ -24,6 +24,7 @@ import {
 } from '@/stores/transcriptStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import { useSummaryStore } from '@/stores/summaryStore';
+import { toast } from '@/stores/toastStore';
 import { useSoniox } from '@/hooks/useSoniox';
 import { useLiveShare } from '@/hooks/useLiveShare';
 import { useLocalTranslation } from '@/hooks/useTranslation';
@@ -453,9 +454,8 @@ export default function ActiveSessionPage() {
     if (reason === 'idle') {
       const message = t('session.notices.idleAutoPause');
       setBillingNotice({ tone: 'warning', message });
-      if (typeof window !== 'undefined') {
-        window.alert(message);
-      }
+      // 长时间静音自动暂停 — 用 toast 提示（错误级别保证 5s 停留）
+      toast.error(message);
       return;
     }
 

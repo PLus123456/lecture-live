@@ -24,7 +24,7 @@ import {
   normalizeRecordedAudioDuration,
 } from '@/lib/audio/recordingDuration';
 import { clampSessionDurationMs, getBillableMinutes } from '@/lib/billing';
-import { callLLM } from '@/lib/llm/gateway';
+import { callLLM, getProviderForPurpose } from '@/lib/llm/gateway';
 import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
 import { generateSessionReport, generateSessionTitle } from '@/lib/llm/reportManager';
 import { logSystemEvent } from '@/lib/auditLog';
@@ -576,6 +576,11 @@ async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
           params: { title: params.title, courseName: params.courseName },
         },
         async () => {
+          // 拿 FINAL_SUMMARY 模型的 contextWindow 喂给 reportManager 决定 map-reduce 阈值
+          const finalSummaryProvider = await getProviderForPurpose('FINAL_SUMMARY').catch(
+            () => null
+          );
+
           const reportData = await generateSessionReport({
             sessionId: params.sessionId,
             transcript: fullTranscript,
@@ -587,6 +592,7 @@ async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
             language: params.targetLang,
             callLLM: (system: string, userMessage: string) =>
               callLLM(system, userMessage, { purpose: 'FINAL_SUMMARY' }),
+            contextWindow: finalSummaryProvider?.contextWindow,
           });
 
           const stored = await persistSessionReport(sessionForLoad, reportData);

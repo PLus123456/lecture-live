@@ -24,6 +24,12 @@ export interface LLMProviderConfig {
   thinkingBudget: number; // 0 = 关闭 extended thinking
   thinkingDepth: ThinkingDepth; // 数据库中的 thinkingDepth 字段
   maxTokens: number;
+  /**
+   * 模型输入上下文窗口（token）。从数据库 LlmModel.contextWindow 取，
+   * 环境变量 fallback 模式下默认 8192。reportManager / chatContextBuilder
+   * 根据这个值计算 token 预算和 map-reduce 阈值。
+   */
+  contextWindow: number;
   temperature: number;
   isAnthropic: boolean; // Anthropic 原生 API 需要特殊处理
   /** 数据库模型 ID（从数据库加载时有值） */
@@ -73,6 +79,8 @@ export function parseProviders(): Record<string, LLMProviderConfig> {
       thinkingBudget: parseInt(get('THINKING_BUDGET') || '0'),
       thinkingDepth: 'medium',
       maxTokens: parseInt(get('MAX_TOKENS') || '4096'),
+      // 环境变量 fallback：未配置时默认 8192（保守值，与 Prisma schema 默认一致）
+      contextWindow: parseInt(get('CONTEXT_WINDOW') || '8192'),
       temperature: parseFloat(get('TEMPERATURE') || '0.3'),
       isAnthropic: get('IS_ANTHROPIC') === 'true',
     };
@@ -92,6 +100,7 @@ function dbModelToConfig(
     displayName: string;
     thinkingDepth: string;
     maxTokens: number;
+    contextWindow: number;
     temperature: number;
     purpose: string;
     isDefault: boolean;
@@ -114,6 +123,7 @@ function dbModelToConfig(
     thinkingBudget: THINKING_BUDGET_MAP[depth] ?? 0,
     thinkingDepth: depth,
     maxTokens: model.maxTokens,
+    contextWindow: model.contextWindow,
     temperature: model.temperature,
     isAnthropic: model.provider.isAnthropic,
     dbModelId: model.id,
@@ -719,4 +729,86 @@ async function callOpenAICompatibleWithHistory(
       totalTokens: data.usage?.total_tokens,
     },
   };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Embedding API（OpenAI 兼容 /v1/embeddings 端点）                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 调用 EMBEDDING 用途的模型把文本批量转向量。复用 OpenAI 兼容 embeddings 端点。
+ *
+ * 国内模型支持情况（截至 2026-05）：
+ *  - 豆包 / GLM / DeepSeek / Kimi / Minimax：通过 OpenAI 兼容协议都暴露 /embeddings
+ *  - Anthropic Claude：不提供原生 embedding，需要切到 Voyage 等第三方
+ *
+ * 调用者应在 admin 后台为 LlmPurpose.EMBEDDING 配置一个合适的 OpenAI 兼容模型。
+ */
+export async function callEmbedding(texts: string[]): Promise<number[][]> {
+  if (texts.length === 0) return [];
+
+  const provider = await getProviderForPurpose('EMBEDDING');
+
+  if (provider.isAnthropic) {
+    throw new Error(
+      'Anthropic 不支持 embeddings 端点，请在 admin 面板把 EMBEDDING 用途配置到 OpenAI 兼容模型上'
+    );
+  }
+
+  const startedAt = Date.now();
+  const res = await fetch(`${provider.apiBase}/embeddings`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${provider.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: provider.model,
+      input: texts,
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(
+      `Embedding API error (${res.status}): ${sanitizeApiError(errText)}`
+    );
+  }
+
+  const data = (await res.json()) as {
+    data?: Array<{ embedding?: number[]; index?: number }>;
+    usage?: { prompt_tokens?: number; total_tokens?: number };
+  };
+
+  if (!Array.isArray(data.data) || data.data.length !== texts.length) {
+    throw new Error(
+      `Embedding API returned mismatched array (expected ${texts.length}, got ${data.data?.length ?? 0})`
+    );
+  }
+
+  // 按 index 重排（OpenAI 协议保证按输入顺序，但保险起见排序）
+  const sorted = [...data.data].sort(
+    (a, b) => (a.index ?? 0) - (b.index ?? 0)
+  );
+  const vectors = sorted.map((item) => {
+    if (!Array.isArray(item.embedding)) {
+      throw new Error('Embedding API response missing embedding array');
+    }
+    return item.embedding;
+  });
+
+  llmLogger.info(
+    {
+      provider: provider.name,
+      model: provider.model,
+      purpose: 'EMBEDDING',
+      batchSize: texts.length,
+      dim: vectors[0]?.length ?? 0,
+      durationMs: Date.now() - startedAt,
+      usage: data.usage,
+    },
+    'Embedding request completed'
+  );
+
+  return vectors;
 }

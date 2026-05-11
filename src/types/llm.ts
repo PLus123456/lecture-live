@@ -32,7 +32,12 @@ export interface KeywordEntry {
 export type ThinkingDepth = 'low' | 'medium' | 'high';
 
 /** LLM 用途枚举（与 Prisma LlmPurpose 对应） */
-export type LlmPurpose = 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION';
+export type LlmPurpose =
+  | 'CHAT'
+  | 'REALTIME_SUMMARY'
+  | 'FINAL_SUMMARY'
+  | 'KEYWORD_EXTRACTION'
+  | 'EMBEDDING';
 
 /** What the /api/llm/models endpoint returns per model */
 export interface ChatModelOption {

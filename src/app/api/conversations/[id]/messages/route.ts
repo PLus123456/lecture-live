@@ -8,15 +8,17 @@ import { prisma } from '@/lib/prisma';
 
 export async function GET(
   req: Request,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   const user = await verifyAuth(req);
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  const { id } = await params;
+
   const conversation = await prisma.conversation.findUnique({
-    where: { id: params.id },
+    where: { id },
     include: {
       session: { select: { userId: true } },
       messages: {

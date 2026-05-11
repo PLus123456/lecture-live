@@ -277,7 +277,7 @@ export default function ShareLinksPanel() {
     <div className="animate-fade-in">
       {/* 标题区 */}
       <div className="mb-5 animate-fade-in-up">
-        <h2 className="text-xl font-serif font-bold text-charcoal-800 dark:text-cream-100">
+        <h2 className="text-xl md:text-2xl font-serif font-bold text-charcoal-800 dark:text-cream-100">
           {t('shareLinks.title')}
         </h2>
         <p className="text-sm text-charcoal-500 dark:text-charcoal-400 mt-1">

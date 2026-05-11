@@ -403,7 +403,7 @@ function GroupModal({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
       <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">
-          <h3 className="text-base font-semibold text-charcoal-800">
+          <h3 className="text-base font-semibold text-charcoal-800 dark:text-cream-100">
             {t('admin.editGroup')} — {group.name}
           </h3>
           <button
@@ -518,7 +518,7 @@ function CreateGroupModal({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
       <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">
-          <h3 className="text-base font-semibold text-charcoal-800">{t('admin.createGroup')}</h3>
+          <h3 className="text-base font-semibold text-charcoal-800 dark:text-cream-100">{t('admin.createGroup')}</h3>
           <button
             onClick={onClose}
             className="w-7 h-7 rounded-md flex items-center justify-center
@@ -778,7 +778,7 @@ export default function UserGroupsPanel() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h2 className="text-xl font-bold text-charcoal-800">{t('nav.userGroups')}</h2>
+        <h2 className="text-xl md:text-2xl font-serif font-bold text-charcoal-800 dark:text-cream-100">{t('nav.userGroups')}</h2>
         <div className="flex items-center gap-2">
           <button
             onClick={() => setShowCreateModal(true)}

@@ -866,10 +866,10 @@ export default function DashboardPanel() {
       {/* ── 顶部 Hero：标题 + 刷新 ── */}
       <div className="flex items-end justify-between gap-3 animate-fade-in-up">
         <div className="min-w-0">
-          <h2 className="text-xl md:text-2xl font-bold text-charcoal-800 dark:text-cream-100">
+          <h2 className="text-xl md:text-2xl font-serif font-bold text-charcoal-800 dark:text-cream-100">
             {t('admin.overview')}
           </h2>
-          <p className="text-xs md:text-sm text-charcoal-400 dark:text-charcoal-500 mt-0.5">
+          <p className="text-sm text-charcoal-500 dark:text-charcoal-400 mt-1">
             {t('admin.overviewSubtitle')}
             {agoText && (
               <span className="ml-2 text-charcoal-400 dark:text-charcoal-500">

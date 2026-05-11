@@ -2243,7 +2243,7 @@ export default function SettingsPanel() {
 
   return (
     <div className="space-y-6">
-      <h2 className="text-xl font-bold text-charcoal-800 dark:text-cream-100">{t('adminSettings.title')}</h2>
+      <h2 className="text-xl md:text-2xl font-serif font-bold text-charcoal-800 dark:text-cream-100">{t('adminSettings.title')}</h2>
 
       {/* 水平标签栏 */}
       <div className="bg-white rounded-xl border border-cream-200 dark:bg-charcoal-800 dark:border-charcoal-700 overflow-hidden">

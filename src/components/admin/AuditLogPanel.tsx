@@ -182,6 +182,10 @@ export default function AuditLogPanel() {
 
   return (
     <div>
+      <h2 className="text-xl md:text-2xl font-serif font-bold text-charcoal-800 dark:text-cream-100 mb-5">
+        {t('nav.logs')}
+      </h2>
+
       {/* 顶部筛选栏 */}
       <div className="flex flex-wrap items-center gap-3 mb-5">
         {/* 搜索框 */}

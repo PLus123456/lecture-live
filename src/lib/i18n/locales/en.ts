@@ -647,6 +647,7 @@ export default {
 
     // 用户管理
     newUser: 'New User',
+    userDetails: 'User Details',
     deleteUser: 'Delete user',
     deleteSelected: 'Delete Selected',
     nSelected: '{n} selected',

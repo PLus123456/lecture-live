@@ -92,7 +92,7 @@ interface SiteSettingsData {
 const MAX_BACKUP_URLS = 10;
 
 /** LLM 模型用途 */
-type ModelPurpose = 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION';
+type ModelPurpose = 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING';
 
 /** LLM 思考深度 */
 type ThinkingBudget = 'low' | 'medium' | 'high';
@@ -104,6 +104,7 @@ interface LlmModel {
   display_name: string;
   thinking_budget: ThinkingBudget;
   max_tokens: number;
+  context_window: number;
   temperature: number;
   purposes: ModelPurpose[];
   default_purposes: ModelPurpose[];
@@ -127,6 +128,7 @@ const MODEL_PURPOSES: ModelPurpose[] = [
   'REALTIME_SUMMARY',
   'FINAL_SUMMARY',
   'KEYWORD_EXTRACTION',
+  'EMBEDDING',
 ];
 
 function getPurposeLabel(t: (key: string) => string, purpose: ModelPurpose) {
@@ -139,6 +141,8 @@ function getPurposeLabel(t: (key: string) => string, purpose: ModelPurpose) {
       return t('adminSettings.purposeFinalSummary');
     case 'KEYWORD_EXTRACTION':
       return t('adminSettings.purposeKeywordExtraction');
+    case 'EMBEDDING':
+      return t('adminSettings.purposeEmbedding');
     default:
       return purpose;
   }
@@ -160,9 +164,10 @@ function buildModelGroupKey(model: Record<string, unknown>) {
   const displayName = (model.displayName ?? model.display_name ?? '') as string;
   const thinkingDepth = (model.thinkingDepth ?? model.thinking_budget ?? 'medium') as string;
   const maxTokens = toFiniteNumber(model.maxTokens ?? model.max_tokens, 4096);
+  const contextWindow = toFiniteNumber(model.contextWindow ?? model.context_window, 8192);
   const temperature = toFiniteNumber(model.temperature, 0.3);
 
-  return [modelId, displayName, thinkingDepth, maxTokens, temperature].join('::');
+  return [modelId, displayName, thinkingDepth, maxTokens, contextWindow, temperature].join('::');
 }
 
 function groupProviderModels(models: Record<string, unknown>[]): LlmModel[] {
@@ -181,6 +186,7 @@ function groupProviderModels(models: Record<string, unknown>[]): LlmModel[] {
         display_name: (model.displayName ?? model.display_name ?? '') as string,
         thinking_budget: (model.thinkingDepth ?? model.thinking_budget ?? 'medium') as ThinkingBudget,
         max_tokens: toFiniteNumber(model.maxTokens ?? model.max_tokens, 4096),
+        context_window: toFiniteNumber(model.contextWindow ?? model.context_window, 8192),
         temperature: toFiniteNumber(model.temperature, 0.3),
         purposes: [],
         default_purposes: [],
@@ -228,6 +234,7 @@ function expandProviderModelsForSave(models: LlmModel[]) {
       displayName: model.display_name,
       thinkingDepth: model.thinking_budget,
       maxTokens: model.max_tokens,
+      contextWindow: model.context_window,
       temperature: model.temperature,
       purpose,
       isDefault: model.default_purposes.includes(purpose),
@@ -649,8 +656,10 @@ function ModelRow({
     });
   };
 
+  const contextWindowTooLow = model.context_window < model.max_tokens;
+
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-7 gap-2 items-end p-3 bg-cream-50 dark:bg-charcoal-750 rounded-lg border border-cream-100 dark:border-charcoal-600">
+    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-9 gap-2 items-end p-3 bg-cream-50 dark:bg-charcoal-750 rounded-lg border border-cream-100 dark:border-charcoal-600">
       {/* 模型 ID */}
       <div className="md:col-span-1">
         <label className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block">{t('adminSettings.modelId')}</label>
@@ -695,9 +704,14 @@ function ModelRow({
         </select>
       </div>
 
-      {/* 最大 Token 数 */}
+      {/* 最大 Token 数（单次输出上限，一般 4096-8192） */}
       <div>
-        <label className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block">{t('adminSettings.maxTokens')}</label>
+        <label
+          className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block"
+          title={t('adminSettings.maxTokensDesc')}
+        >
+          {t('adminSettings.maxTokens')}
+        </label>
         <input
           type="number"
           value={model.max_tokens}
@@ -706,6 +720,33 @@ function ModelRow({
                      dark:bg-charcoal-700 dark:border-charcoal-600 dark:text-cream-100
                      focus:outline-none focus:ring-1 focus:ring-rust-200"
         />
+      </div>
+
+      {/* 上下文窗口（模型可接受的最大输入 token 数） */}
+      <div>
+        <label
+          className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block"
+          title={t('adminSettings.contextWindowDesc')}
+        >
+          {t('adminSettings.contextWindow')}
+        </label>
+        <input
+          type="number"
+          value={model.context_window}
+          onChange={(e) => onUpdate({ ...model, context_window: Number(e.target.value) })}
+          className={`w-full px-2 py-1.5 text-xs border rounded bg-white text-charcoal-800
+                     dark:bg-charcoal-700 dark:text-cream-100
+                     focus:outline-none focus:ring-1 ${
+                       contextWindowTooLow
+                         ? 'border-red-300 dark:border-red-500 focus:ring-red-200'
+                         : 'border-cream-200 dark:border-charcoal-600 focus:ring-rust-200'
+                     }`}
+        />
+        {contextWindowTooLow && (
+          <p className="text-[10px] text-red-500 mt-0.5">
+            {t('adminSettings.contextWindowTooLow')}
+          </p>
+        )}
       </div>
 
       {/* 温度 */}
@@ -816,6 +857,7 @@ function ProviderCard({
       display_name: '',
       thinking_budget: 'medium',
       max_tokens: 4096,
+      context_window: 8192,
       temperature: 0.7,
       purposes: ['CHAT'],
       default_purposes: [],
@@ -1977,11 +2019,12 @@ function LlmPanel({
       {/* 用途说明 */}
       <div className="bg-cream-50 dark:bg-charcoal-750 rounded-lg p-4 border border-cream-100 dark:border-charcoal-700">
         <div className="text-xs font-medium text-charcoal-600 dark:text-cream-300 mb-2">{t('adminSettings.purposeDesc')}</div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs text-charcoal-500 dark:text-charcoal-400">
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-2 text-xs text-charcoal-500 dark:text-charcoal-400">
           <div><span className="font-medium text-charcoal-700 dark:text-cream-200">{t('adminSettings.purposeChat')}</span> — {t('adminSettings.purposeChatDesc')}</div>
           <div><span className="font-medium text-charcoal-700 dark:text-cream-200">{t('adminSettings.purposeRealtimeSummary')}</span> — {t('adminSettings.purposeRealtimeSummaryDesc')}</div>
           <div><span className="font-medium text-charcoal-700 dark:text-cream-200">{t('adminSettings.purposeFinalSummary')}</span> — {t('adminSettings.purposeFinalSummaryDesc')}</div>
           <div><span className="font-medium text-charcoal-700 dark:text-cream-200">{t('adminSettings.purposeKeywordExtraction')}</span> — {t('adminSettings.purposeKeywordExtractionDesc')}</div>
+          <div><span className="font-medium text-charcoal-700 dark:text-cream-200">{t('adminSettings.purposeEmbedding')}</span> — {t('adminSettings.purposeEmbeddingDesc')}</div>
         </div>
       </div>
 

@@ -3,7 +3,7 @@ import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
 
 // 有效的 LLM 用途枚举值
-const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION'];
+const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING'];
 
 // 添加模型到指定供应商
 export async function POST(
@@ -34,6 +34,7 @@ export async function POST(
       displayName,
       thinkingDepth,
       maxTokens,
+      contextWindow,
       temperature,
       purpose,
       isDefault,
@@ -63,6 +64,16 @@ export async function POST(
       );
     }
 
+    // 验证 contextWindow >= maxTokens（否则可输入预算 <= 0，所有 chat 都会立刻 EOL）
+    const effectiveMaxTokens = maxTokens ?? 4096;
+    const effectiveContextWindow = contextWindow ?? 8192;
+    if (effectiveContextWindow < effectiveMaxTokens) {
+      return NextResponse.json(
+        { error: 'contextWindow 必须 ≥ maxTokens（上下文窗口必须大于等于单次输出 token 数）' },
+        { status: 400 }
+      );
+    }
+
     // 如果设置为默认模型，先取消同用途下其他默认模型
     const effectivePurpose = purpose || 'CHAT';
     if (isDefault) {
@@ -78,7 +89,8 @@ export async function POST(
         modelId,
         displayName,
         thinkingDepth: thinkingDepth ?? 'medium',
-        maxTokens: maxTokens ?? 4096,
+        maxTokens: effectiveMaxTokens,
+        contextWindow: effectiveContextWindow,
         temperature: temperature ?? 0.3,
         purpose: effectivePurpose,
         isDefault: isDefault ?? false,

@@ -70,8 +70,9 @@ export async function POST(req: Request) {
           displayName: (m.displayName ?? m.display_name ?? '') as string,
           thinkingDepth: (m.thinkingDepth ?? m.thinking_budget ?? 'medium') as string,
           maxTokens: Number(m.maxTokens ?? m.max_tokens ?? 4096),
+          contextWindow: Number(m.contextWindow ?? m.context_window ?? 8192),
           temperature: Number(m.temperature ?? 0.3),
-          purpose: (m.purpose ?? 'CHAT') as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION',
+          purpose: (m.purpose ?? 'CHAT') as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING',
           isDefault: Boolean(m.isDefault ?? m.is_default ?? false),
           sortOrder: Number(m.sortOrder ?? m.sort_order ?? idx),
         }))

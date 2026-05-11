@@ -78,13 +78,24 @@ export async function PATCH(
 
       // 创建或更新模型
       for (const m of incomingModels) {
+        const maxTokens = Number(m.maxTokens ?? m.max_tokens ?? 4096);
+        const contextWindow = Number(m.contextWindow ?? m.context_window ?? 8192);
+        if (contextWindow < maxTokens) {
+          return NextResponse.json(
+            {
+              error: `模型 ${(m.modelId ?? m.model_id ?? '') as string}: contextWindow 必须 ≥ maxTokens（上下文窗口必须大于等于单次输出 token 数）`,
+            },
+            { status: 400 }
+          );
+        }
         const modelData = {
           modelId: (m.modelId ?? m.model_id ?? '') as string,
           displayName: (m.displayName ?? m.display_name ?? '') as string,
           thinkingDepth: (m.thinkingDepth ?? m.thinking_budget ?? 'medium') as string,
-          maxTokens: Number(m.maxTokens ?? m.max_tokens ?? 4096),
+          maxTokens,
+          contextWindow,
           temperature: Number(m.temperature ?? 0.3),
-          purpose: (m.purpose ?? 'CHAT') as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION',
+          purpose: (m.purpose ?? 'CHAT') as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING',
           isDefault: Boolean(m.isDefault ?? m.is_default ?? false),
           sortOrder: Number(m.sortOrder ?? m.sort_order ?? 0),
         };

@@ -253,6 +253,9 @@ export function useChat(sessionId: string | null) {
         if (res.status === 413) {
           // 上下文已满：提示用户新建对话
           setContextFull(true);
+          // 把 level 提到 L7（EOL），让小圈紫色 + L7 与红色横幅语义一致 —
+          // 否则 preEstimate 留下的 L1 会让用户看到"L1 但上下文炸了"的困惑。
+          setTokenUsage({ ...preEstimate, level: 7 });
           const data = await res.json().catch(() => ({} as Record<string, unknown>));
           const assistantMsg: ChatMessage = {
             id: crypto.randomUUID(),

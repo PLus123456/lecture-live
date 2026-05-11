@@ -35,18 +35,32 @@ export interface ContextBudget {
 }
 
 /**
+ * 单次输出最多允许 contextWindow 的 1/4 —— 防止 admin 误把 maxTokens 当成
+ * "上下文窗口"填了一个跟 contextWindow 一样大的数（如 256000），导致
+ * usable = 0 → inputBudget = 0 → 所有请求立即 EOL。
+ */
+const OUTPUT_BUDGET_RATIO = 0.25;
+/** 现代模型的合理输出上限。再大也不会让 LLM 输出更长，只会吃掉输入预算。 */
+const OUTPUT_TOKENS_CAP = 8192;
+
+/**
  * 根据 LLM provider 配置计算可用 token 预算。
  *
  * inputBudget = (contextWindow - outputMaxTokens) × SAFETY_RATIO
  *
  * 注意：参数里 contextWindow 必须从数据库 LlmModel.contextWindow 取，
- * LLMProviderConfig.maxTokens 仅是 API 调用的输出上限。
+ * LLMProviderConfig.maxTokens 仅是 API 调用的输出上限。即使该字段被误配
+ * 成一个很大的值，这里也会 clamp 回合理范围 —— 保证 inputBudget > 0。
  */
 export function computeContextBudget(
   provider: LLMProviderConfig,
   contextWindow: number
 ): ContextBudget {
-  const outputMaxTokens = Math.max(1, provider.maxTokens || 4096);
+  const rawMaxTokens = provider.maxTokens || 4096;
+  const outputMaxTokens = Math.max(
+    1,
+    Math.min(rawMaxTokens, Math.floor(contextWindow * OUTPUT_BUDGET_RATIO), OUTPUT_TOKENS_CAP)
+  );
   const usable = Math.max(0, contextWindow - outputMaxTokens);
   const inputBudget = Math.floor(usable * SAFETY_RATIO);
   return {

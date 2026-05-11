@@ -3,7 +3,7 @@ import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
 
 // 有效的 LLM 用途枚举值
-const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION'];
+const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING'];
 
 // 更新模型
 export async function PATCH(
@@ -48,12 +48,25 @@ export async function PATCH(
       );
     }
 
+    // 验证 contextWindow >= maxTokens 组合（用 patch 中提供的值；未提供则用现有值）
+    const nextMaxTokens =
+      body.maxTokens !== undefined ? Number(body.maxTokens) : existing.maxTokens;
+    const nextContextWindow =
+      body.contextWindow !== undefined ? Number(body.contextWindow) : existing.contextWindow;
+    if (nextContextWindow < nextMaxTokens) {
+      return NextResponse.json(
+        { error: 'contextWindow 必须 ≥ maxTokens（上下文窗口必须大于等于单次输出 token 数）' },
+        { status: 400 }
+      );
+    }
+
     // 只更新提供的字段
     const updateData: Record<string, unknown> = {};
     if (body.modelId !== undefined) updateData.modelId = body.modelId;
     if (body.displayName !== undefined) updateData.displayName = body.displayName;
     if (body.thinkingDepth !== undefined) updateData.thinkingDepth = body.thinkingDepth;
     if (body.maxTokens !== undefined) updateData.maxTokens = body.maxTokens;
+    if (body.contextWindow !== undefined) updateData.contextWindow = body.contextWindow;
     if (body.temperature !== undefined) updateData.temperature = body.temperature;
     if (body.purpose !== undefined) updateData.purpose = body.purpose;
     if (body.sortOrder !== undefined) updateData.sortOrder = body.sortOrder;

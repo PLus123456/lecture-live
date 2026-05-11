@@ -9,6 +9,10 @@ import {
   startBillingMaintenanceLoop,
   stopBillingMaintenanceLoop,
 } from '../src/lib/billingMaintenance';
+import {
+  startCloudreveTokenRefreshLoop,
+  stopCloudreveTokenRefreshLoop,
+} from '../src/lib/storage/cloudreveTokenRefresh';
 import { logger, serializeError } from '../src/lib/logger';
 
 const PORT = parseInt(process.env.WS_PORT || '3001', 10);
@@ -137,6 +141,7 @@ io.on('connection', (socket) => {
 
 setupLiveShare(io);
 startBillingMaintenanceLoop();
+startCloudreveTokenRefreshLoop();
 
 httpServer.listen(PORT, () => {
   wsLogger.info({ port: PORT }, 'WebSocket server listening');
@@ -150,6 +155,7 @@ async function shutdown(signal: string) {
   isShuttingDown = true;
   wsLogger.info({ signal }, 'Starting websocket server shutdown');
   stopBillingMaintenanceLoop();
+  stopCloudreveTokenRefreshLoop();
 
   io.emit('status_update', { status: 'SERVER_SHUTDOWN' });
 

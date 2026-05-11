@@ -497,8 +497,9 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
   );
 }
 
-// ──── Distribution donut ────
-function DistributionDonut({
+// ──── Distribution 3D bar chart ────
+// 用 SVG 绘制等距投影 (isometric) 的 3D 柱状图：每根柱由前面 / 顶面 / 右侧面 三个多边形组成。
+function Distribution3DBars({
   totals,
   t,
 }: {
@@ -512,70 +513,205 @@ function DistributionDonut({
     { key: 'folders', label: t('admin.filesFolders'), value: totals.folders, color: '#9a7a64' },
   ];
   const total = items.reduce((acc, i) => acc + i.value, 0);
+  const maxVal = Math.max(...items.map((i) => i.value), 1);
 
-  // 环形参数
-  const size = 140;
-  const stroke = 16;
-  const radius = (size - stroke) / 2;
-  const circ = 2 * Math.PI * radius;
+  const [hover, setHover] = useState<number | null>(null);
+  const [animKey, setAnimKey] = useState(0);
+  useEffect(() => {
+    setAnimKey((k) => k + 1);
+  }, [totals.users, totals.sessions, totals.shares, totals.folders]);
 
-  let offset = 0;
+  // 画布参数
+  const W = 320;
+  const H = 220;
+  const padL = 24;
+  const padR = 24;
+  const padT = 16;
+  const padB = 36;
+  const chartW = W - padL - padR;
+  const chartH = H - padT - padB;
+  const slot = chartW / items.length;
+  const barW = slot * 0.5;
+  const depth = 14; // 3D 透视深度
+
+  // 颜色亮/暗变体（用 HSL 偏移做顶面/右面的高光与阴影）
+  const shade = (hex: string, dl: number) => {
+    const h = hex.replace('#', '');
+    const r = parseInt(h.substring(0, 2), 16);
+    const g = parseInt(h.substring(2, 4), 16);
+    const b = parseInt(h.substring(4, 6), 16);
+    const adjust = (c: number) => Math.max(0, Math.min(255, Math.round(c + dl)));
+    const hex2 = (n: number) => n.toString(16).padStart(2, '0');
+    return `#${hex2(adjust(r))}${hex2(adjust(g))}${hex2(adjust(b))}`;
+  };
 
   return (
-    <div className="flex items-center gap-5">
-      <div className="relative flex-shrink-0" style={{ width: size, height: size }}>
-        <svg width={size} height={size} className="-rotate-90">
-          <circle
-            cx={size / 2}
-            cy={size / 2}
-            r={radius}
-            fill="none"
-            stroke="#f3ede3"
-            strokeWidth={stroke}
-          />
-          {total > 0 &&
-            items.map((it) => {
-              const frac = it.value / total;
-              const len = circ * frac;
-              const seg = (
-                <circle
-                  key={it.key}
-                  cx={size / 2}
-                  cy={size / 2}
-                  r={radius}
-                  fill="none"
-                  stroke={it.color}
-                  strokeWidth={stroke}
-                  strokeDasharray={`${len} ${circ - len}`}
-                  strokeDashoffset={-offset}
-                  strokeLinecap="butt"
+    <div className="flex flex-col gap-3">
+      <div className="relative flex-shrink-0 w-full" style={{ height: H }}>
+        <svg
+          viewBox={`0 0 ${W} ${H}`}
+          className="w-full h-full"
+          preserveAspectRatio="xMidYMid meet"
+          key={animKey}
+        >
+          <defs>
+            {items.map((it) => (
+              <linearGradient key={it.key} id={`bar-front-${it.key}-${animKey}`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={shade(it.color, 12)} />
+                <stop offset="100%" stopColor={shade(it.color, -18)} />
+              </linearGradient>
+            ))}
+            {/* 地板阴影 */}
+            <radialGradient id={`floor-shadow-${animKey}`} cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stopColor="#000" stopOpacity="0.18" />
+              <stop offset="100%" stopColor="#000" stopOpacity="0" />
+            </radialGradient>
+          </defs>
+
+          {/* 等距网格地板 — 给一种"立体平面"的暗示 */}
+          <g opacity="0.35">
+            {[0, 1, 2, 3].map((i) => {
+              const y = padT + chartH - (i / 3) * chartH;
+              return (
+                <line
+                  key={`grid-${i}`}
+                  x1={padL}
+                  y1={y}
+                  x2={padL + chartW + depth}
+                  y2={y - depth}
+                  stroke="#e2dac9"
+                  strokeWidth={1}
+                  strokeDasharray="2 3"
                 />
               );
-              offset += len;
-              return seg;
             })}
+          </g>
+
+          {items.map((it, i) => {
+            const frac = it.value / maxVal;
+            const h = Math.max(2, frac * (chartH - 8));
+            const xLeft = padL + slot * i + (slot - barW) / 2;
+            const yTop = padT + chartH - h;
+            const yBottom = padT + chartH;
+            const isHover = hover === i;
+            const lift = isHover ? 6 : 0;
+
+            // 三个面的多边形
+            const front = `${xLeft},${yTop - lift} ${xLeft + barW},${yTop - lift} ${xLeft + barW},${yBottom - lift} ${xLeft},${yBottom - lift}`;
+            const top = `${xLeft},${yTop - lift} ${xLeft + depth},${yTop - depth - lift} ${xLeft + barW + depth},${yTop - depth - lift} ${xLeft + barW},${yTop - lift}`;
+            const side = `${xLeft + barW},${yTop - lift} ${xLeft + barW + depth},${yTop - depth - lift} ${xLeft + barW + depth},${yBottom - depth - lift} ${xLeft + barW},${yBottom - lift}`;
+
+            return (
+              <g
+                key={it.key}
+                style={{
+                  transition: 'transform 200ms ease-out, filter 200ms',
+                  transformOrigin: `${xLeft + barW / 2}px ${yBottom}px`,
+                  filter: isHover ? 'drop-shadow(0 6px 8px rgba(0,0,0,0.18))' : 'none',
+                  cursor: 'pointer',
+                }}
+                onMouseEnter={() => setHover(i)}
+                onMouseLeave={() => setHover(null)}
+              >
+                {/* 地板阴影椭圆 */}
+                <ellipse
+                  cx={xLeft + barW / 2 + depth / 2}
+                  cy={yBottom + 4}
+                  rx={barW * 0.7}
+                  ry={4}
+                  fill={`url(#floor-shadow-${animKey})`}
+                />
+                {/* 入场动画 — 从底部生长 */}
+                <g style={{ transformOrigin: `${xLeft + barW / 2}px ${yBottom}px` }}>
+                  <polygon
+                    points={side}
+                    fill={shade(it.color, -32)}
+                    style={{
+                      transformOrigin: `${xLeft + barW / 2}px ${yBottom}px`,
+                      animation: `barRise 700ms cubic-bezier(0.25, 1, 0.4, 1) ${i * 100}ms backwards`,
+                    }}
+                  />
+                  <polygon
+                    points={top}
+                    fill={shade(it.color, 22)}
+                    style={{
+                      transformOrigin: `${xLeft + barW / 2}px ${yBottom}px`,
+                      animation: `barRise 700ms cubic-bezier(0.25, 1, 0.4, 1) ${i * 100}ms backwards`,
+                    }}
+                  />
+                  <polygon
+                    points={front}
+                    fill={`url(#bar-front-${it.key}-${animKey})`}
+                    style={{
+                      transformOrigin: `${xLeft + barW / 2}px ${yBottom}px`,
+                      animation: `barRise 700ms cubic-bezier(0.25, 1, 0.4, 1) ${i * 100}ms backwards`,
+                    }}
+                  />
+
+                  {/* 顶部数值 */}
+                  <text
+                    x={xLeft + barW / 2 + depth / 2}
+                    y={yTop - depth - 6 - lift}
+                    textAnchor="middle"
+                    fontSize={11}
+                    fontWeight={600}
+                    fill="#5a4f43"
+                    style={{ animation: `barRise 700ms cubic-bezier(0.25, 1, 0.4, 1) ${i * 100 + 200}ms backwards` }}
+                  >
+                    {it.value.toLocaleString()}
+                  </text>
+                </g>
+
+                {/* X 轴文字 */}
+                <text
+                  x={xLeft + barW / 2 + depth / 2}
+                  y={H - 14}
+                  textAnchor="middle"
+                  fontSize={10}
+                  fill="#9c8e7d"
+                >
+                  {it.label.length > 6 ? it.label.slice(0, 5) + '…' : it.label}
+                </text>
+              </g>
+            );
+          })}
+          <style>{`
+            @keyframes barRise {
+              0% { transform: scaleY(0.02); opacity: 0; }
+              60% { opacity: 1; }
+              100% { transform: scaleY(1); opacity: 1; }
+            }
+          `}</style>
         </svg>
-        <div className="absolute inset-0 flex flex-col items-center justify-center">
-          <div className="text-xs text-charcoal-400 dark:text-charcoal-500">{t('admin.totals')}</div>
-          <div className="text-xl font-bold text-charcoal-800 dark:text-cream-100 tabular-nums">
-            {total.toLocaleString()}
-          </div>
-        </div>
       </div>
-      <div className="flex-1 min-w-0 space-y-2">
-        {items.map((it) => {
+
+      {/* 底部图例 + 数值表 */}
+      <div className="flex-1 min-w-0 space-y-1.5 pt-1 border-t border-cream-100 dark:border-charcoal-700">
+        <div className="flex items-center justify-between text-[11px] text-charcoal-400 dark:text-charcoal-500 pt-1.5">
+          <span>{t('admin.totals')}</span>
+          <span className="font-semibold tabular-nums text-charcoal-700 dark:text-cream-200">
+            {total.toLocaleString()}
+          </span>
+        </div>
+        {items.map((it, i) => {
           const pct = total > 0 ? Math.round((it.value / total) * 100) : 0;
+          const isHover = hover === i;
           return (
-            <div key={it.key} className="flex items-center gap-2 text-sm">
+            <div
+              key={it.key}
+              className={`flex items-center gap-2 text-xs rounded px-1 py-0.5 transition-colors ${isHover ? 'bg-cream-100 dark:bg-charcoal-700' : ''}`}
+              onMouseEnter={() => setHover(i)}
+              onMouseLeave={() => setHover(null)}
+            >
               <span
-                className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                className="w-2 h-2 rounded-sm flex-shrink-0"
                 style={{ backgroundColor: it.color }}
               />
               <span className="flex-1 text-charcoal-600 dark:text-cream-200 truncate">{it.label}</span>
               <span className="font-semibold tabular-nums text-charcoal-700 dark:text-cream-200">
                 {it.value.toLocaleString()}
               </span>
-              <span className="w-9 text-right text-xs text-charcoal-400 dark:text-charcoal-500 tabular-nums">
+              <span className="w-7 text-right text-charcoal-400 dark:text-charcoal-500 tabular-nums">
                 {pct}%
               </span>
             </div>
@@ -845,7 +981,7 @@ export default function DashboardPanel() {
               <div className="animate-pulse text-charcoal-400 text-sm">{t('common.loading')}</div>
             </div>
           ) : (
-            <DistributionDonut totals={totals} t={t} />
+            <Distribution3DBars totals={totals} t={t} />
           )}
         </div>
       </div>

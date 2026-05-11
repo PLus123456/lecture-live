@@ -9,6 +9,7 @@ import OriginGuard from '@/components/OriginGuard';
 import AuthSessionMonitor from '@/components/AuthSessionMonitor';
 import ViewportAdapter from '@/components/ViewportAdapter';
 import Toaster from '@/components/Toaster';
+import GlobalUploadDropzone from '@/components/global/GlobalUploadDropzone';
 import type { Locale } from '@/lib/i18n';
 import type { TranslationMode, SonioxRegionPreference } from '@/types/transcript';
 
@@ -37,6 +38,7 @@ export default function ClientProviders({
         <OriginGuard>
           {children}
         </OriginGuard>
+        <GlobalUploadDropzone />
         <Toaster />
       </ThemeProvider>
     </I18nProvider>

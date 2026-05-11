@@ -394,7 +394,7 @@ export default function JobQueuePanel() {
     <div>
       {/* 顶部操作栏 */}
       <div className="flex items-center justify-between mb-5">
-        <h2 className="text-lg font-serif font-bold text-charcoal-800 dark:text-cream-100">
+        <h2 className="text-xl md:text-2xl font-serif font-bold text-charcoal-800 dark:text-cream-100">
           {t('jobQueue.title')}
         </h2>
         <button

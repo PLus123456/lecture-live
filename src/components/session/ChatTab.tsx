@@ -1,10 +1,10 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
+import { useParams } from 'next/navigation';
 import { useChat } from '@/hooks/useChat';
 import { useKeywords } from '@/hooks/useKeywords';
 import { useTranscriptStore } from '@/stores/transcriptStore';
-import { useChatStore } from '@/stores/chatStore';
 import { useSummaryStore } from '@/stores/summaryStore';
 import {
   Send,
@@ -13,11 +13,14 @@ import {
   Bot,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Zap,
   Brain,
   Sparkles,
   CheckCircle2,
   XCircle,
+  MessageSquarePlus,
+  Check,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import type { ChatMessage, ThinkingDepth } from '@/types/llm';
@@ -220,6 +223,234 @@ function KeywordSteps({ steps }: { steps: KeywordStep[] }) {
 /*  消息气泡（含 thinking 折叠）                                         */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/*  上下文小圈 + 详情卡                                                  */
+/* ------------------------------------------------------------------ */
+
+function getRingColor(percent: number, contextFull: boolean): { stroke: string; bg: string; text: string } {
+  if (contextFull) return { stroke: '#7c3aed', bg: '#ede9fe', text: 'text-purple-600' }; // 紫：RAG/EOL
+  if (percent < 0.6) return { stroke: '#059669', bg: '#d1fae5', text: 'text-green-600' };
+  if (percent < 0.85) return { stroke: '#d97706', bg: '#fef3c7', text: 'text-amber-600' };
+  return { stroke: '#dc2626', bg: '#fee2e2', text: 'text-red-600' };
+}
+
+function ContextRingButton({
+  percent,
+  level,
+  contextFull,
+  onClick,
+}: {
+  percent: number;
+  level: number;
+  contextFull: boolean;
+  onClick: () => void;
+}) {
+  const safePercent = Math.min(1, Math.max(0, percent));
+  const radius = 9;
+  const circumference = 2 * Math.PI * radius;
+  const dashOffset = circumference * (1 - safePercent);
+  const palette = getRingColor(safePercent, contextFull);
+  const displayPercent = Math.round(safePercent * 100);
+  const showLevel = level > 1;
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={`上下文 ${displayPercent}% · 降级级别 L${level}`}
+      className="relative w-7 h-7 rounded-full flex items-center justify-center
+                 hover:bg-cream-100 transition-colors flex-shrink-0"
+    >
+      <svg viewBox="0 0 24 24" className="w-7 h-7 -rotate-90">
+        <circle
+          cx="12"
+          cy="12"
+          r={radius}
+          fill="none"
+          stroke="#e5e7eb"
+          strokeWidth="2.5"
+        />
+        <circle
+          cx="12"
+          cy="12"
+          r={radius}
+          fill="none"
+          stroke={palette.stroke}
+          strokeWidth="2.5"
+          strokeDasharray={circumference}
+          strokeDashoffset={dashOffset}
+          strokeLinecap="round"
+        />
+      </svg>
+      <span
+        className={`absolute text-[8px] font-semibold ${palette.text}`}
+      >
+        {showLevel ? `L${level}` : `${displayPercent}`}
+      </span>
+    </button>
+  );
+}
+
+function ContextPopover({
+  tokenUsage,
+  level,
+  conversations,
+  activeConversationId,
+  showConversationList,
+  onToggleConversationList,
+  onNewConversation,
+  onSwitchConversation,
+  onClose,
+}: {
+  tokenUsage: import('@/stores/chatStore').ChatTokenUsage | null;
+  level: number;
+  conversations: import('@/stores/chatStore').ConversationMeta[];
+  activeConversationId: string | null;
+  showConversationList: boolean;
+  onToggleConversationList: () => void;
+  onNewConversation: () => void;
+  onSwitchConversation: (id: string) => void;
+  onClose: () => void;
+}) {
+  const used = tokenUsage?.used ?? 0;
+  const budget = tokenUsage?.budget ?? 0;
+  const percent = budget > 0 ? Math.min(1, used / budget) : 0;
+  const breakdown = tokenUsage?.breakdown;
+
+  const activeConv = conversations.find((c) => c.id === activeConversationId);
+  const activeTitle =
+    activeConv?.title ||
+    (activeConv ? `对话 ${formatHM(activeConv.startedAt)} 起` : '当前对话');
+
+  return (
+    <div className="absolute bottom-full right-0 mb-2 w-72 bg-white border border-cream-300
+                    rounded-lg shadow-lg z-50 p-3 text-xs animate-fade-in-scale">
+      {/* Conversation 选择器（小箭头展开） */}
+      <button
+        type="button"
+        onClick={onToggleConversationList}
+        className="w-full flex items-center justify-between px-2 py-1.5 rounded-md
+                   hover:bg-cream-50 transition-colors"
+      >
+        <span className="flex items-center gap-1.5">
+          <MessageSquarePlus className="w-3 h-3 text-rust-500" />
+          <span className="font-medium text-charcoal-700 truncate">{activeTitle}</span>
+        </span>
+        {showConversationList ? (
+          <ChevronUp className="w-3 h-3 text-charcoal-400" />
+        ) : (
+          <ChevronDown className="w-3 h-3 text-charcoal-400" />
+        )}
+      </button>
+
+      {showConversationList && (
+        <div className="mt-1 mb-2 border border-cream-200 rounded-md max-h-48 overflow-y-auto">
+          {conversations.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => {
+                onSwitchConversation(c.id);
+                onClose();
+              }}
+              className={`w-full flex items-center justify-between px-2 py-1.5 text-left
+                hover:bg-cream-50 transition-colors
+                ${c.id === activeConversationId ? 'bg-rust-50' : ''}`}
+            >
+              <span className="flex flex-col">
+                <span className="text-[11px] font-medium text-charcoal-700">
+                  {c.title || `对话 ${formatHM(c.startedAt)} 起`}
+                  {c.endedAt && (
+                    <span className="ml-1 text-charcoal-400">（已关闭）</span>
+                  )}
+                </span>
+                <span className="text-[10px] text-charcoal-400">
+                  {c.messageCount} 条 · L{c.degradationLevel}
+                </span>
+              </span>
+              {c.id === activeConversationId && (
+                <Check className="w-3 h-3 text-rust-500" />
+              )}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={() => {
+              onNewConversation();
+              onClose();
+            }}
+            className="w-full flex items-center gap-1.5 px-2 py-1.5 text-left
+                       text-rust-600 hover:bg-rust-50 transition-colors border-t border-cream-200"
+          >
+            <MessageSquarePlus className="w-3 h-3" />
+            <span className="text-[11px] font-medium">新建对话</span>
+          </button>
+        </div>
+      )}
+
+      <div className="h-px bg-cream-200 my-2" />
+
+      {/* 上下文用量 */}
+      <div className="mb-1">
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-charcoal-500">上下文用量</span>
+          <span className="font-mono text-charcoal-700">
+            {Math.round(percent * 100)}% · L{level}
+          </span>
+        </div>
+        <div className="h-1.5 bg-cream-200 rounded-full overflow-hidden">
+          <div
+            className="h-full rounded-full transition-all"
+            style={{
+              width: `${percent * 100}%`,
+              backgroundColor: getRingColor(percent, false).stroke,
+            }}
+          />
+        </div>
+        <div className="text-[10px] text-charcoal-400 mt-1 text-right">
+          {(used / 1000).toFixed(1)}K / {(budget / 1000).toFixed(1)}K tokens
+        </div>
+      </div>
+
+      {breakdown && (
+        <div className="space-y-0.5 text-[10px] mt-2">
+          <BreakdownRow label="系统提示" value={breakdown.systemPrompt} />
+          <BreakdownRow label="Transcript" value={breakdown.transcript} />
+          <BreakdownRow label="Summary" value={breakdown.summary} />
+          <BreakdownRow label="历史对话" value={breakdown.history} />
+          <BreakdownRow label="当前输入" value={breakdown.userInput} />
+        </div>
+      )}
+
+      <div className="mt-2 pt-2 border-t border-cream-200 text-[10px] text-charcoal-400">
+        输入 <code className="bg-cream-100 px-1 rounded">/compress</code> 主动压缩历史
+      </div>
+    </div>
+  );
+}
+
+function BreakdownRow({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="flex justify-between text-charcoal-500">
+      <span>{label}</span>
+      <span className="font-mono">{value > 1000 ? `${(value / 1000).toFixed(1)}K` : value}</span>
+    </div>
+  );
+}
+
+function formatHM(iso: string): string {
+  try {
+    const d = new Date(iso);
+    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+  } catch {
+    return iso;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  消息气泡（含 thinking 折叠）                                         */
+/* ------------------------------------------------------------------ */
+
 function MessageBubble({ msg }: { msg: ChatMessage }) {
   if (msg.role === 'user') {
     return (
@@ -286,26 +517,42 @@ export default function ChatTab({
   summaryBlocks?: ChatContextSummary[];
   inputSticky?: boolean;
 }) {
+  const routeParams = useParams<{ id?: string }>();
+  const sessionId = routeParams?.id ?? null;
+
   const {
     messages,
+    archivedMessages,
     isLoading,
     selectedModel,
     selectedDepth,
     availableModels,
+    activeConversationId,
+    conversations,
+    tokenUsage,
+    contextFull,
     sendMessage,
     setSelectedModel,
     setSelectedDepth,
-  } = useChat();
+    createNewConversation,
+    switchConversation,
+    compressActive,
+    addMessage,
+  } = useChat(sessionId);
   const { extractFromText, addManualKeyword } = useKeywords();
-  const addMessage = useChatStore((s) => s.addMessage);
 
   const [input, setInput] = useState('');
   const [showModelMenu, setShowModelMenu] = useState(false);
+  const [showContextPopover, setShowContextPopover] = useState(false);
+  const [showConversationList, setShowConversationList] = useState(false);
   const [keywordSteps, setKeywordSteps] = useState<KeywordStep[] | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
+  const contextPopoverRef = useRef<HTMLDivElement>(null);
 
   const segments = useTranscriptStore((s) => s.segments);
+  const totalDurationMs = useTranscriptStore((s) => s.totalDurationMs);
   const blocks = useSummaryStore((s) => s.blocks);
   const effectiveSegments = transcriptSegments ?? segments;
   const effectiveBlocks = summaryBlocks ?? blocks;
@@ -327,11 +574,53 @@ export default function ChatTab({
     }
   }, [showModelMenu]);
 
+  // Close context popover on outside click
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (
+        contextPopoverRef.current &&
+        !contextPopoverRef.current.contains(e.target as Node)
+      ) {
+        setShowContextPopover(false);
+        setShowConversationList(false);
+      }
+    };
+    if (showContextPopover) {
+      document.addEventListener('mousedown', handleClick);
+      return () => document.removeEventListener('mousedown', handleClick);
+    }
+  }, [showContextPopover]);
+
   const handleSend = async () => {
     const value = input.trim();
     if (!value || isLoading) return;
 
     setInput('');
+
+    // /compress 命令：触发主动压缩，不发给 LLM
+    if (value === '/compress' || value.startsWith('/compress ')) {
+      const argMatch = value.slice('/compress'.length).trim();
+      const keepTurns = /^\d+$/.test(argMatch)
+        ? Math.max(1, Math.min(10, parseInt(argMatch, 10)))
+        : 3;
+
+      addMessage({
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: value,
+        timestamp: Date.now(),
+      });
+      const result = await compressActive(keepTurns);
+      addMessage({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: result.ok
+          ? `已压缩对话历史，保留最近 ${keepTurns} 轮原文。早期消息已折叠（点击"已折叠"展开）。`
+          : `压缩失败：${result.reason ?? '未知原因'}。建议新建对话继续。`,
+        timestamp: Date.now(),
+      });
+      return;
+    }
 
     if (value.startsWith('/keyword')) {
       addMessage({
@@ -481,17 +770,28 @@ export default function ChatTab({
       return;
     }
 
-    const recentTranscript = effectiveSegments
-      .slice(-20)
-      .map((s) => s.text)
-      .join(' ');
+    // 给 chatContextBuilder 传 segments + startMs，让降级链能按"轮窗口"裁剪 transcript。
+    // effectiveSegments 既可能来自 props（ChatContextSegment 只有 text），
+    // 也可能来自 transcriptStore（TranscriptSegment 含 globalStartMs/startMs）。
+    const transcriptSegmentsForApi = effectiveSegments.map((seg) => {
+      const s = seg as { text?: string; globalStartMs?: number; startMs?: number };
+      return {
+        text: s.text ?? '',
+        startMs:
+          typeof s.globalStartMs === 'number'
+            ? s.globalStartMs
+            : typeof s.startMs === 'number'
+              ? s.startMs
+              : 0,
+      };
+    });
 
     const summaryContext = effectiveBlocks
       .map((b) => b.summary)
       .filter(Boolean)
       .join('\n');
 
-    sendMessage(value, recentTranscript, summaryContext);
+    sendMessage(value, transcriptSegmentsForApi, summaryContext, totalDurationMs);
   };
 
   // Current model display info
@@ -574,7 +874,35 @@ export default function ChatTab({
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
-        {messages.length === 0 && (
+        {/* 主动压缩后被折叠的早期消息 —— 用户可展开查看原文 */}
+        {archivedMessages.length > 0 && (
+          <div className="border border-cream-200 rounded-md bg-cream-50/30">
+            <button
+              type="button"
+              onClick={() => setShowArchived((v) => !v)}
+              className="w-full flex items-center justify-between px-2.5 py-1.5
+                         text-[11px] text-charcoal-500 hover:bg-cream-100/50 transition-colors"
+            >
+              <span>
+                {showArchived ? '收起' : '展开'} {archivedMessages.length} 条已折叠消息
+              </span>
+              {showArchived ? (
+                <ChevronUp className="w-3 h-3" />
+              ) : (
+                <ChevronDown className="w-3 h-3" />
+              )}
+            </button>
+            {showArchived && (
+              <div className="border-t border-cream-200 px-2 py-2 space-y-2 opacity-80">
+                {archivedMessages.map((msg) => (
+                  <MessageBubble key={msg.id} msg={msg} />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {messages.length === 0 && archivedMessages.length === 0 && (
           <div className="text-center py-8 text-charcoal-300 animate-fade-in-up">
             <Bot className="w-8 h-8 mx-auto mb-2 opacity-50 animate-breathe" />
             <p className="text-xs">Ask questions about the lecture</p>
@@ -614,8 +942,26 @@ export default function ChatTab({
         <div ref={scrollRef} />
       </div>
 
-      {/* Input */}
+      {/* Input + 小圈 + 详情卡 */}
       <div className={`border-t border-cream-200 p-3 ${inputSticky ? 'sticky bottom-0 bg-white safe-bottom' : ''}`.trim()}>
+        {contextFull && (
+          <div className="mb-2 px-2.5 py-1.5 rounded-md bg-red-50 border border-red-200 text-[11px] text-red-700 flex items-center justify-between">
+            <span>上下文已满，所有降级策略均无法塞下。</span>
+            <button
+              type="button"
+              onClick={() => createNewConversation()}
+              className="ml-2 px-2 py-0.5 rounded bg-red-600 text-white hover:bg-red-700 transition-colors"
+            >
+              新建对话
+            </button>
+          </div>
+        )}
+        {input === '/' && (
+          <div className="mb-1.5 px-2 py-1 rounded-md bg-cream-50 text-[10px] text-charcoal-400 border border-cream-200">
+            <code className="text-rust-500">/compress</code> 压缩对话历史 ·{' '}
+            <code className="text-rust-500">/keyword</code> 提取关键词
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <input
             type="text"
@@ -628,6 +974,36 @@ export default function ChatTab({
                        bg-white text-charcoal-700 placeholder:text-charcoal-300"
             disabled={isLoading}
           />
+          <div ref={contextPopoverRef} className="relative">
+            <ContextRingButton
+              percent={
+                tokenUsage && tokenUsage.budget > 0
+                  ? tokenUsage.used / tokenUsage.budget
+                  : 0
+              }
+              level={tokenUsage?.level ?? 1}
+              contextFull={contextFull}
+              onClick={() => setShowContextPopover((v) => !v)}
+            />
+            {showContextPopover && (
+              <ContextPopover
+                tokenUsage={tokenUsage}
+                level={tokenUsage?.level ?? 1}
+                conversations={conversations}
+                activeConversationId={activeConversationId}
+                showConversationList={showConversationList}
+                onToggleConversationList={() =>
+                  setShowConversationList((v) => !v)
+                }
+                onNewConversation={createNewConversation}
+                onSwitchConversation={switchConversation}
+                onClose={() => {
+                  setShowContextPopover(false);
+                  setShowConversationList(false);
+                }}
+              />
+            )}
+          </div>
           <button
             onClick={handleSend}
             disabled={isLoading || !input.trim()}

@@ -10,6 +10,7 @@ import type { SummaryBlock } from '@/types/summary';
 import {
   buildSignificanceEvaluationPrompt,
   buildSessionReportPrompt,
+  buildChunkSummaryPrompt,
   buildTitleGenerationPrompt,
 } from './prompts';
 import {
@@ -20,6 +21,35 @@ import {
   countTitleWords,
   type TitleGenerationResult,
 } from './security';
+import { estimateTokens } from './tokenizer';
+import { chunkText } from './chunking';
+import { logger, serializeError } from '@/lib/logger';
+
+const reportLogger = logger.child({ component: 'report-manager' });
+
+/** Map-reduce 默认并发数（用户敲定 3） */
+const MAP_REDUCE_CONCURRENCY = 3;
+
+/**
+ * 默认 contextWindow —— 调用方未传时用的保守值。生产环境应该总是从 provider
+ * 配置里读出 contextWindow 传进来。
+ */
+const DEFAULT_CONTEXT_WINDOW = 16384;
+
+/**
+ * 计算 final summary 阶段的"transcript 输入预算"。
+ *
+ * 思路：contextWindow × 0.8（安全冗余）减去 system prompt（~1500）、
+ * summary context（最多 12000 字符 ≈ 9000 token）、输出预留（~4000）。
+ * 剩下的 token 是 transcript 能塞进去的最大量。
+ *
+ * 当 contextWindow=200K 时预算 ~143K（基本随便塞）；
+ * 当 contextWindow=16K 时预算 ~700（必走 map-reduce）。
+ */
+function computeTranscriptInputBudget(contextWindow: number): number {
+  const usable = Math.floor(contextWindow * 0.8) - 1500 - 9000 - 4000;
+  return Math.max(2000, usable);
+}
 
 /** 意义评估阈值 — 低于此分数的录音不生成报告 */
 const SIGNIFICANCE_THRESHOLD = 0.4;
@@ -46,6 +76,12 @@ interface GenerateReportOptions {
   summaryBlocks: SummaryBlock[];
   language: string;
   callLLM: (system: string, user: string) => Promise<string>;
+  /**
+   * 当前 FINAL_SUMMARY 模型的上下文窗口（token）。调用方应从 provider 配置
+   * 读出 contextWindow 传入。未传则用 DEFAULT_CONTEXT_WINDOW 保守估算 ——
+   * 这会导致长 transcript 总是走 map-reduce（更多 LLM 调用，但保证不爆）。
+   */
+  contextWindow?: number;
 }
 
 /**
@@ -66,6 +102,7 @@ export async function generateSessionReport(
     summaryBlocks,
     language,
     callLLM,
+    contextWindow = DEFAULT_CONTEXT_WINDOW,
   } = options;
 
   // 快速检查：转录文本过短直接跳过
@@ -117,7 +154,8 @@ export async function generateSessionReport(
     date,
     summaryContext,
     language,
-    callLLM
+    callLLM,
+    contextWindow
   );
 
   return {
@@ -143,7 +181,10 @@ async function evaluateSignificance(
     const result = await callLLM(system, user);
     return parseSignificanceEvaluationResult(result, SIGNIFICANCE_THRESHOLD);
   } catch (error) {
-    console.error('意义评估失败，默认生成报告:', error);
+    reportLogger.error(
+      { err: serializeError(error) },
+      '意义评估失败，默认生成报告'
+    );
     // 评估失败时默认认为值得生成报告（宁可多生成，不漏掉）
     return {
       score: 0.5,
@@ -153,7 +194,68 @@ async function evaluateSignificance(
   }
 }
 
-/** 生成结构化会议报告 */
+/**
+ * Map 阶段：每段单独跑 LLM 抽取事实清单（JSON）。
+ * 限制并发避免一次性把上游 quota 打爆。
+ */
+async function runMapStage(
+  chunks: ReadonlyArray<{ text: string; index: number }>,
+  totalChunks: number,
+  language: string,
+  callLLM: (system: string, user: string) => Promise<string>
+): Promise<string[]> {
+  const results: (string | null)[] = new Array(chunks.length).fill(null);
+
+  // 简易并发池：每次最多 MAP_REDUCE_CONCURRENCY 个 in-flight
+  let cursor = 0;
+  async function worker(): Promise<void> {
+    while (cursor < chunks.length) {
+      const myIndex = cursor++;
+      const chunk = chunks[myIndex];
+      try {
+        const { system, user } = buildChunkSummaryPrompt(
+          chunk.text,
+          chunk.index,
+          totalChunks,
+          language
+        );
+        const raw = await callLLM(system, user);
+        results[myIndex] = raw.trim();
+      } catch (error) {
+        reportLogger.warn(
+          {
+            chunkIndex: chunk.index,
+            totalChunks,
+            err: serializeError(error),
+          },
+          '段摘要 LLM 调用失败，该段将以空内容继续'
+        );
+        // 不抛 —— 一段失败不该杀掉整个报告生成；返回空 JSON，reduce 阶段自然降级。
+        results[myIndex] = '{"facts":["[此段摘要生成失败]"]}';
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(MAP_REDUCE_CONCURRENCY, chunks.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+
+  return results.map((r) => r ?? '{}');
+}
+
+/**
+ * Reduce 阶段：把所有段摘要 JSON 拼成一段文本，作为"伪 transcript"
+ * 喂给 buildSessionReportPrompt。
+ */
+function buildReducedTranscript(chunkSummariesJson: ReadonlyArray<string>): string {
+  return chunkSummariesJson
+    .map((raw, i) => `[CHUNK ${i + 1}]\n${raw}`)
+    .join('\n\n');
+}
+
+/** 生成结构化会议报告（含 map-reduce 长 transcript 处理） */
 async function generateReport(
   transcript: string,
   sessionTitle: string,
@@ -162,11 +264,64 @@ async function generateReport(
   date: string,
   summaryContext: string,
   language: string,
-  callLLM: (system: string, user: string) => Promise<string>
+  callLLM: (system: string, user: string) => Promise<string>,
+  contextWindow: number
 ): Promise<SessionReport | null> {
   try {
+    const inputBudget = computeTranscriptInputBudget(contextWindow);
+    const transcriptTokens = estimateTokens(transcript);
+
+    let finalTranscript = transcript;
+
+    if (transcriptTokens > inputBudget) {
+      // 走 map-reduce：先按句子 + 800 token 目标切块，map 抽取事实，reduce 拼回
+      const chunks = chunkText(transcript, { chunkTargetTokens: 800 });
+      reportLogger.info(
+        {
+          transcriptTokens,
+          inputBudget,
+          chunkCount: chunks.length,
+          contextWindow,
+        },
+        'transcript 超出输入预算，启动 map-reduce 报告生成'
+      );
+
+      const startedAt = Date.now();
+      const chunkSummaries = await runMapStage(
+        chunks.map((c) => ({ text: c.text, index: c.index })),
+        chunks.length,
+        language,
+        callLLM
+      );
+      reportLogger.info(
+        {
+          chunkCount: chunks.length,
+          mapDurationMs: Date.now() - startedAt,
+        },
+        'map 阶段完成'
+      );
+
+      finalTranscript = buildReducedTranscript(chunkSummaries);
+
+      // 二次保险：reduce 输入若仍超 budget（极端长课程导致段摘要总量爆），
+      // 按 token 从尾部截断，保留最近的段。
+      const reducedTokens = estimateTokens(finalTranscript);
+      if (reducedTokens > inputBudget) {
+        const { truncateToTokensFromEnd } = await import('./tokenizer');
+        finalTranscript = truncateToTokensFromEnd(finalTranscript, inputBudget);
+        reportLogger.warn(
+          {
+            reducedTokens,
+            inputBudget,
+            chunkCount: chunks.length,
+          },
+          'reduce 输入仍超预算，按 token 截尾'
+        );
+      }
+    }
+
     const { system, user } = buildSessionReportPrompt(
-      transcript,
+      finalTranscript,
       sessionTitle,
       courseName,
       durationMs,
@@ -186,7 +341,10 @@ async function generateReport(
       duration: durationStr,
     });
   } catch (error) {
-    console.error('报告生成失败:', error);
+    reportLogger.error(
+      { err: serializeError(error) },
+      '报告生成失败'
+    );
     return null;
   }
 }
@@ -257,11 +415,19 @@ export async function generateSessionTitle(
       if (isTitleWithinLimit(lastResult, TITLE_LIMIT_ZH, TITLE_LIMIT_EN, TITLE_TOLERANCE)) {
         return lastResult;
       }
-      console.warn(
-        `[title-gen] attempt ${attempt + 1} too long: zh=${countTitleWords(lastResult.zh, 'zh')} en=${countTitleWords(lastResult.en, 'en')}`
+      reportLogger.warn(
+        {
+          attempt: attempt + 1,
+          zh: countTitleWords(lastResult.zh, 'zh'),
+          en: countTitleWords(lastResult.en, 'en'),
+        },
+        '[title-gen] 常规尝试超出词数'
       );
     } catch (error) {
-      console.error(`[title-gen] attempt ${attempt + 1} failed:`, error);
+      reportLogger.error(
+        { attempt: attempt + 1, err: serializeError(error) },
+        '[title-gen] 常规尝试失败'
+      );
     }
   }
 
@@ -276,16 +442,23 @@ export async function generateSessionTitle(
     if (isTitleWithinLimit(lastResult, TITLE_STRICT_ZH, TITLE_STRICT_EN, TITLE_TOLERANCE)) {
       return lastResult;
     }
-    console.warn(
-      `[title-gen] strict attempt too long: zh=${countTitleWords(lastResult.zh, 'zh')} en=${countTitleWords(lastResult.en, 'en')}`
+    reportLogger.warn(
+      {
+        zh: countTitleWords(lastResult.zh, 'zh'),
+        en: countTitleWords(lastResult.en, 'en'),
+      },
+      '[title-gen] 严格尝试仍超词数'
     );
   } catch (error) {
-    console.error('[title-gen] strict attempt failed:', error);
+    reportLogger.error(
+      { err: serializeError(error) },
+      '[title-gen] 严格尝试失败'
+    );
   }
 
   // 阶段 3: 兜底 — 接受最后一次结果
   if (lastResult) {
-    console.warn('[title-gen] accepting last result as fallback');
+    reportLogger.warn('[title-gen] 接受最后一次结果作为 fallback');
     return lastResult;
   }
 

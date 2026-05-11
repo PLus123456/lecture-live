@@ -88,6 +88,7 @@ model Session {
 
   shareLinks      ShareLink[]
   folders         FolderSession[]
+  conversations   Conversation[]
 
   @@index([userId])
 }
@@ -223,6 +224,7 @@ enum LlmPurpose {
   REALTIME_SUMMARY    // 实时摘要
   FINAL_SUMMARY       // 最终摘要
   KEYWORD_EXTRACTION  // 关键词提取
+  EMBEDDING           // 嵌入向量（用于 chat L6 RAG 检索）
 }
 
 model LlmModel {
@@ -232,7 +234,8 @@ model LlmModel {
   modelId       String                          // 模型标识，如 "gpt-4o", "claude-sonnet-4-6"
   displayName   String                          // 显示名称
   thinkingDepth String      @default("medium")  // "low" | "medium" | "high"
-  maxTokens     Int         @default(4096)
+  maxTokens     Int         @default(4096)      // 单次输出 max_tokens（传给 API 的 max_tokens 字段）
+  contextWindow Int         @default(8192)      // 模型输入上下文窗口大小（token），用于 LectureLive 内部预算/降级判断
   temperature   Float       @default(0.3)
   purpose       LlmPurpose  @default(CHAT)      // 用途
   isDefault     Boolean     @default(false)      // 该用途下的默认模型
@@ -265,4 +268,37 @@ model JobQueue {
   @@index([status])
   @@index([sessionId])
   @@index([createdAt])
+}
+
+// ─── Chat 对话历史（每次录音可有多个 Conversation，"新建对话"即关闭旧的开新的） ───
+model Conversation {
+  id          String                @id @default(cuid())
+  sessionId   String
+  session     Session               @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  title       String?                                  // AI 生成的对话标题（首条用户消息提取，可为空）
+  startedAt   DateTime              @default(now())
+  endedAt     DateTime?                                // null = 当前活跃；非 null = 已关闭，只读
+  // 单次对话内的降级状态（单调下降，只能 ≥ 上次记录的值）
+  degradationLevel Int              @default(1)        // 1..7，对应 7 级降级链
+  messages    ConversationMessage[]
+
+  @@index([sessionId, startedAt])
+}
+
+model ConversationMessage {
+  id               String        @id @default(cuid())
+  conversationId   String
+  conversation     Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role             String                              // 'user' | 'assistant' | 'system'
+  content          String        @db.Text
+  // 发这条消息时 transcript 已录到的偏移（毫秒），用于"时间锚点 system 消息"对齐
+  transcriptOffsetMs Int?
+  // 本轮命中的降级级别（仅 assistant 消息有意义）
+  degradationLevel Int?
+  // token 用量（仅 assistant 消息）
+  inputTokens      Int?
+  outputTokens     Int?
+  createdAt        DateTime      @default(now())
+
+  @@index([conversationId, createdAt])
 }

@@ -6,6 +6,7 @@ import {
   Search,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   RefreshCw,
   Filter,
   Trash2,
@@ -23,6 +24,7 @@ import {
   ExternalLink,
   Copy,
   Check,
+  Cloud,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
@@ -66,6 +68,51 @@ interface Pagination {
 }
 
 type StatusFilter = '' | 'has-recording' | 'no-recording' | 'completed' | 'archived' | 'recording';
+
+type StorageKind = 'local' | 'cloudreve' | 'missing';
+
+function resolveStorage(path: string | null): StorageKind {
+  if (!path) return 'missing';
+  if (path.startsWith('local:')) return 'local';
+  return 'cloudreve';
+}
+
+function StorageBadge({ kind }: { kind: StorageKind }) {
+  const { t } = useI18n();
+  if (kind === 'missing') {
+    return (
+      <span
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium
+                   bg-cream-100 text-charcoal-400 dark:bg-charcoal-700 dark:text-charcoal-500"
+        title={t('adminFiles.storageMissing')}
+      >
+        —
+      </span>
+    );
+  }
+  if (kind === 'local') {
+    return (
+      <span
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium
+                   bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400"
+        title={t('adminFiles.storageLocalDesc')}
+      >
+        <HardDrive className="w-3 h-3" />
+        {t('adminFiles.storageLocal')}
+      </span>
+    );
+  }
+  return (
+    <span
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium
+                 bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-400"
+      title={t('adminFiles.storageCloudreveDesc')}
+    >
+      <Cloud className="w-3 h-3" />
+      {t('adminFiles.storageCloudreve')}
+    </span>
+  );
+}
 
 function formatDuration(ms: number): string {
   if (!ms || ms <= 0) return '—';
@@ -238,7 +285,10 @@ export default function FilesPanel() {
       });
       if (res.ok) {
         const data = await res.json();
-        toast.success(t('common.deleteSuccess'), `${data.deleted}`);
+        toast.success(
+          t('common.deleteSuccess'),
+          t('adminFiles.deletedCount', { n: data.deleted }),
+        );
         setFiles((prev) => prev.filter((f) => !ids.includes(f.id)));
         setSelected((prev) => {
           const next = new Set(prev);
@@ -350,6 +400,7 @@ export default function FilesPanel() {
             <option value="archived">{t('adminFiles.statusArchived')}</option>
             <option value="recording">{t('adminFiles.statusRecording')}</option>
           </select>
+          <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-charcoal-400 pointer-events-none" />
         </div>
 
         <button
@@ -474,6 +525,7 @@ export default function FilesPanel() {
                       <button
                         onClick={() => setExpandedId(isExpanded ? null : file.id)}
                         className="min-w-0 text-left flex-1"
+                        title={file.title || `Session ${file.id}`}
                       >
                         <div className="text-sm font-medium text-charcoal-800 dark:text-cream-100 truncate hover:text-rust-600 transition-colors">
                           {file.title || `Session ${file.id.slice(0, 8)}`}
@@ -490,13 +542,14 @@ export default function FilesPanel() {
                                 : ''}
                             </span>
                           )}
+                          <StorageBadge kind={resolveStorage(file.recordingPath)} />
                         </div>
                       </button>
                     </div>
 
                     {/* 拥有者 */}
                     <div className="flex items-center min-w-0">
-                      <div className="min-w-0">
+                      <div className="min-w-0" title={file.owner?.email || ''}>
                         <div className="text-sm text-charcoal-700 dark:text-charcoal-200 truncate">
                           {file.owner?.displayName || '—'}
                         </div>
@@ -612,13 +665,17 @@ export default function FilesPanel() {
                         )}
                         <div className="flex items-center gap-3 pt-1 text-xs text-charcoal-400">
                           <span>{t('adminFiles.audioSource')}: {file.audioSource}</span>
-                          <a
-                            href={file.playbackPath}
-                            className="inline-flex items-center gap-1 text-rust-600 hover:text-rust-700 hover:underline"
-                          >
-                            <ExternalLink className="w-3 h-3" />
-                            {t('adminFiles.openInNewTab')}
-                          </a>
+                          {file.canPlayback && (
+                            <a
+                              href={file.playbackPath}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-rust-600 hover:text-rust-700 hover:underline"
+                            >
+                              <ExternalLink className="w-3 h-3" />
+                              {t('adminFiles.openInNewTab')}
+                            </a>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -693,21 +750,28 @@ function PathRow({
   onCopy: (p: string) => void;
   copied: boolean;
 }) {
+  const { t } = useI18n();
+  const storage = resolveStorage(path);
   return (
     <div className="flex items-center gap-2.5 text-xs">
       <span className="flex-shrink-0 w-20 text-charcoal-500 dark:text-charcoal-400 inline-flex items-center gap-1.5">
         {icon}
         {label}
       </span>
+      <StorageBadge kind={storage} />
       {path ? (
         <>
-          <code className="flex-1 px-2 py-1 rounded bg-white dark:bg-charcoal-800 border border-cream-200 dark:border-charcoal-700 text-charcoal-700 dark:text-charcoal-200 font-mono text-[11px] truncate min-w-0">
+          <code
+            className="flex-1 px-2 py-1 rounded bg-white dark:bg-charcoal-800 border border-cream-200 dark:border-charcoal-700 text-charcoal-700 dark:text-charcoal-200 font-mono text-[11px] truncate min-w-0"
+            title={path}
+          >
             {path}
           </code>
           <button
             onClick={() => onCopy(path)}
             className="flex-shrink-0 p-1 rounded text-charcoal-400 hover:text-charcoal-700 hover:bg-cream-100 dark:hover:bg-charcoal-700 transition-colors"
-            title="复制路径"
+            title={t('adminFiles.copyPath')}
+            aria-label={t('adminFiles.copyPath')}
           >
             {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
           </button>

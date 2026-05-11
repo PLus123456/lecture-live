@@ -206,7 +206,7 @@ function UserDetailModal({
       <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto animate-modal-enter">
         {/* 标题栏 */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200">
-          <h3 className="text-base font-semibold text-charcoal-800">用户详情</h3>
+          <h3 className="text-base font-semibold text-charcoal-800 dark:text-cream-100">{t('admin.userDetails')}</h3>
           <button
             onClick={onClose}
             className="w-7 h-7 rounded-md flex items-center justify-center
@@ -475,7 +475,7 @@ function CreateUserModal({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter px-4">
       <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-md animate-modal-enter">
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200">
-          <h3 className="text-base font-semibold text-charcoal-800">{t('admin.newUser')}</h3>
+          <h3 className="text-base font-semibold text-charcoal-800 dark:text-cream-100">{t('admin.newUser')}</h3>
           <button
             onClick={onClose}
             className="w-7 h-7 rounded-md flex items-center justify-center
@@ -679,7 +679,7 @@ export default function UserManagementPanel() {
 
   return (
     <div className="space-y-6">
-      <h2 className="text-xl font-bold text-charcoal-800">{t('nav.users')}</h2>
+      <h2 className="text-xl md:text-2xl font-serif font-bold text-charcoal-800 dark:text-cream-100">{t('nav.users')}</h2>
 
       {/* Action bar: New, Refresh, Filter */}
       <div className="flex items-center gap-3">

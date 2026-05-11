@@ -196,6 +196,11 @@ export const POST = withRequestLogging('sessions:create', async (req: Request) =
       },
     });
 
+    logAction(req, 'session.create', {
+      user,
+      detail: `${title} (${session.id})`,
+    });
+
     await invalidateSessionsApiCache(user.id);
     if (folderId) {
       await invalidateFoldersApiCache(user.id);

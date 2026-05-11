@@ -125,6 +125,9 @@ const ACTION_DEFS: Record<string, ActionDef> = {
   'admin.files.delete':              { icon: FileX2,         tone: 'red',    labelKey: 'auditLog.filesDelete' },
   'admin.share.delete':              { icon: Share2,         tone: 'red',    labelKey: 'auditLog.shareDelete' },
   'admin.cloudreve.revoke':          { icon: Cloud,          tone: 'red',    labelKey: 'auditLog.cloudreveRevoke' },
+  'admin.cloudreve.refresh.success': { icon: Cloud,          tone: 'green',  labelKey: 'auditLog.cloudreveRefreshSuccess' },
+  'admin.cloudreve.refresh.failed':  { icon: Cloud,          tone: 'red',    labelKey: 'auditLog.cloudreveRefreshFailed' },
+  'admin.cloudreve.token.decrypt_failed': { icon: KeyRound,  tone: 'red',    labelKey: 'auditLog.cloudreveTokenDecryptFailed' },
   'admin.storage.cleanup':           { icon: HardDrive,      tone: 'gray',   labelKey: 'auditLog.storageCleanup' },
   'admin.storage.migrate':           { icon: ArrowRightLeft, tone: 'cyan',   labelKey: 'auditLog.storageMigrate' },
 

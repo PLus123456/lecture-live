@@ -21,6 +21,10 @@
 
 [快速开始](#快速开始) | [系统架构](#系统架构) | [仓库结构](#仓库结构) | [常用命令](#常用命令) | [配置与安全](#配置与安全)
 
+<br />
+
+<img src="public/readme/lecturelive-hero.png" alt="LectureLive 课堂 AI 工作流预览图" width="980" />
+
 </div>
 
 ---
@@ -66,6 +70,10 @@ LectureLive 是一个面向直播授课与课堂记录的全栈 Web 应用。它
 
 ## 会话流程
 
+<p align="center">
+  <img src="public/readme/session-flow-zh.png" alt="LectureLive 实时会话流程视觉图" width="920" />
+</p>
+
 ```mermaid
 flowchart LR
     A[教师开启会话] --> B[浏览器采集音频]
@@ -78,6 +86,10 @@ flowchart LR
 ```
 
 ## 系统架构
+
+<p align="center">
+  <img src="public/readme/architecture-zh.png" alt="LectureLive 自托管系统架构视觉图" width="920" />
+</p>
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐

@@ -7,7 +7,7 @@ import { prisma } from '@/lib/prisma';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { logAction } from '@/lib/auditLog';
-import { callLLM } from '@/lib/llm/gateway';
+import { callLLM, getProviderForPurpose } from '@/lib/llm/gateway';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { generateSessionReport } from '@/lib/llm/reportManager';
 import {
@@ -62,6 +62,12 @@ export async function POST(req: Request) {
     const fullTranscript = extractTranscriptText(bundle);
     const summaryBlocks = (bundle.summaries ?? []) as SummaryBlock[];
 
+    // 预解析 FINAL_SUMMARY 模型，拿到 contextWindow 喂给 reportManager 决定是否
+    // 走 map-reduce。即使解析失败也用 DEFAULT_CONTEXT_WINDOW 兜底（reportManager 内部默认）。
+    const finalSummaryProvider = await getProviderForPurpose('FINAL_SUMMARY').catch(
+      () => null
+    );
+
     // 生成报告（包含意义评估）
     const reportData = await generateSessionReport({
       sessionId,
@@ -74,6 +80,7 @@ export async function POST(req: Request) {
       language: session.targetLang || 'zh',
       callLLM: (system: string, userMsg: string) =>
         callLLM(system, userMsg, { purpose: 'FINAL_SUMMARY' }),
+      contextWindow: finalSummaryProvider?.contextWindow,
     });
 
     // 持久化报告

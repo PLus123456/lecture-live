@@ -8,6 +8,10 @@ import { prisma } from '@/lib/prisma';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { sanitizePath } from '@/lib/security';
 import { decrypt, encrypt, isEncrypted } from '@/lib/crypto';
+import { logger, serializeError } from '@/lib/logger';
+import { logSystemEvent } from '@/lib/auditLog';
+
+const cloudreveLogger = logger.child({ component: 'cloudreve-storage' });
 
 const STORAGE_CATEGORIES = ['recordings', 'transcripts', 'summaries', 'reports'] as const;
 // Cloudreve V4 用 Files.Write 表示读写权限，请求 Files.Read + Files.Write 组合
@@ -478,7 +482,10 @@ export async function clearPersistedTokens(): Promise<void> {
       where: { key: { in: [...TOKEN_DB_KEYS] } },
     });
   } catch (err) {
-    console.error('[Cloudreve] 清除持久化 token 失败:', err);
+    cloudreveLogger.error(
+      { err: serializeError(err) },
+      '[Cloudreve] 清除持久化 token 失败'
+    );
     throw err;
   }
 }
@@ -533,6 +540,160 @@ export async function getCloudreveAuthStatus(): Promise<{
   } catch {
     return { authorized: false, expiresAt: null };
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  主动刷新（供 WS 进程内的定时维护循环使用）                          */
+/* ------------------------------------------------------------------ */
+
+export type CloudreveRefreshSource = 'boot' | 'scheduler' | 'manual';
+
+export type CloudreveRefreshOutcome =
+  | { action: 'refreshed'; expiresAt: number }
+  | { action: 'skipped_not_due'; msUntilExpiry: number }
+  | { action: 'skipped_unauthorized' }
+  | { action: 'skipped_unconfigured' };
+
+/**
+ * 主动刷新 Cloudreve token。与 getAccessToken 不同，本函数在"未配置 / 未授权 /
+ * 仍在有效期"情形下返回 skipped_* 状态而非抛错，方便定时循环安静跳过。
+ *
+ * - 解密失败：写 AuditLog 'admin.cloudreve.token.decrypt_failed'，清掉 DB token，抛错
+ * - refresh API 失败：写 AuditLog 'admin.cloudreve.refresh.failed'，清掉 DB token，抛错
+ * - 成功：调用者自行决定是否写 AuditLog（避免每次定时刷成功都污染审计日志）
+ */
+export async function refreshCloudreveTokenProactively(opts: {
+  source: CloudreveRefreshSource;
+  /** token 距离过期还有多少 ms 时才触发刷新。默认 0 = 已过期才刷 */
+  minTimeToExpiryMs?: number;
+}): Promise<CloudreveRefreshOutcome> {
+  const minTimeToExpiry = opts.minTimeToExpiryMs ?? 0;
+
+  const config = await resolveCloudreveConfig();
+  if (!config) {
+    return { action: 'skipped_unconfigured' };
+  }
+
+  let refreshToken = tokenCache?.refreshToken ?? '';
+  let currentExpiresAt = tokenCache?.expiresAt ?? 0;
+
+  if (!refreshToken) {
+    const rows = await prisma.siteSetting.findMany({
+      where: { key: { in: [...TOKEN_DB_KEYS] } },
+    });
+    const map = new Map(rows.map((r) => [r.key, r.value] as const));
+    const refreshTokenRaw = map.get('cloudreve_refresh_token');
+    const expiresAtRaw = map.get('cloudreve_token_expires_at');
+
+    if (!refreshTokenRaw) {
+      return { action: 'skipped_unauthorized' };
+    }
+
+    try {
+      refreshToken = decrypt(refreshTokenRaw);
+    } catch (err) {
+      cloudreveLogger.error(
+        { source: opts.source, err: serializeError(err) },
+        '[Cloudreve] refresh_token 解密失败，可能 ENCRYPTION_KEY 不匹配'
+      );
+      logSystemEvent(
+        'admin.cloudreve.token.decrypt_failed',
+        JSON.stringify({
+          source: opts.source,
+          hint: 'ENCRYPTION_KEY mismatch suspected',
+        })
+      );
+      await clearPersistedTokens().catch((cleanupErr) => {
+        cloudreveLogger.error(
+          { err: serializeError(cleanupErr) },
+          '[Cloudreve] 解密失败后清除 token 失败'
+        );
+      });
+      throw new Error('Cloudreve refresh_token 解密失败');
+    }
+
+    const parsedExpiry = expiresAtRaw ? Number(expiresAtRaw) : 0;
+    currentExpiresAt = Number.isFinite(parsedExpiry) ? parsedExpiry : 0;
+  }
+
+  const msUntilExpiry = currentExpiresAt - Date.now();
+  if (currentExpiresAt > 0 && msUntilExpiry > minTimeToExpiry) {
+    return { action: 'skipped_not_due', msUntilExpiry };
+  }
+
+  const baseUrl = validateCloudreveBaseUrl(config.baseUrl);
+
+  let refreshed: CloudreveTokenSet;
+  try {
+    refreshed = await refreshAccessToken(baseUrl, refreshToken);
+  } catch (err) {
+    cloudreveLogger.error(
+      { source: opts.source, err: serializeError(err) },
+      '[Cloudreve] token 刷新失败，清除持久化 token'
+    );
+    logSystemEvent(
+      'admin.cloudreve.refresh.failed',
+      JSON.stringify({
+        source: opts.source,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    );
+    await clearPersistedTokens().catch((cleanupErr) => {
+      cloudreveLogger.error(
+        { err: serializeError(cleanupErr) },
+        '[Cloudreve] 刷新失败后清除 token 失败'
+      );
+    });
+    throw err;
+  }
+
+  // 同步写回 DB —— 不能 fire-and-forget：refresh_token rotation 后若没存上，
+  // 下次循环还会用旧的，Cloudreve 端可能已经把它废了。
+  try {
+    await prisma.$transaction([
+      prisma.siteSetting.upsert({
+        where: { key: 'cloudreve_access_token' },
+        update: { value: encrypt(refreshed.accessToken) },
+        create: {
+          key: 'cloudreve_access_token',
+          value: encrypt(refreshed.accessToken),
+        },
+      }),
+      prisma.siteSetting.upsert({
+        where: { key: 'cloudreve_refresh_token' },
+        update: { value: encrypt(refreshed.refreshToken) },
+        create: {
+          key: 'cloudreve_refresh_token',
+          value: encrypt(refreshed.refreshToken),
+        },
+      }),
+      prisma.siteSetting.upsert({
+        where: { key: 'cloudreve_token_expires_at' },
+        update: { value: String(refreshed.expiresAt) },
+        create: {
+          key: 'cloudreve_token_expires_at',
+          value: String(refreshed.expiresAt),
+        },
+      }),
+    ]);
+  } catch (err) {
+    cloudreveLogger.error(
+      { source: opts.source, err: serializeError(err) },
+      '[Cloudreve] 刷新后持久化 token 失败 —— 下次循环可能使用已被 rotation 废弃的 refresh_token'
+    );
+    logSystemEvent(
+      'admin.cloudreve.refresh.failed',
+      JSON.stringify({
+        source: opts.source,
+        error:
+          'persist_after_refresh: ' +
+          (err instanceof Error ? err.message : String(err)),
+      })
+    );
+    throw err;
+  }
+
+  return { action: 'refreshed', expiresAt: refreshed.expiresAt };
 }
 
 /* ------------------------------------------------------------------ */
@@ -649,9 +810,22 @@ export class CloudreveStorage {
       } catch (err) {
         // refresh_token 失效 / 被吊销 / 配置变更 —— 清干净后让用户重新授权，
         // 否则下一次请求会读到同一份失效 token，永远走不通。
-        console.error('[Cloudreve] refresh_token 失效，清除持久化 token:', err);
+        cloudreveLogger.error(
+          { source: 'on_demand', err: serializeError(err) },
+          '[Cloudreve] refresh_token 失效，清除持久化 token'
+        );
+        logSystemEvent(
+          'admin.cloudreve.refresh.failed',
+          JSON.stringify({
+            source: 'on_demand',
+            error: err instanceof Error ? err.message : String(err),
+          })
+        );
         await clearPersistedTokens().catch((cleanupErr) => {
-          console.error('[Cloudreve] 清除失效 token 失败:', cleanupErr);
+          cloudreveLogger.error(
+            { err: serializeError(cleanupErr) },
+            '[Cloudreve] 清除失效 token 失败'
+          );
         });
         throw new Error(
           'Cloudreve 授权已失效，请在管理面板重新授权'
@@ -687,7 +861,10 @@ export class CloudreveStorage {
         )
       )
       .catch((err) => {
-        console.error('[Cloudreve] token 持久化失败:', err);
+        cloudreveLogger.error(
+          { err: serializeError(err) },
+          '[Cloudreve] token 持久化失败 —— 下次 refresh 仍会用旧 token，可能因 rotation 而失效'
+        );
       });
   }
 
@@ -717,7 +894,17 @@ export class CloudreveStorage {
         accessToken = accessTokenRaw ? decrypt(accessTokenRaw) : '';
         refreshToken = decrypt(refreshTokenRaw);
       } catch (err) {
-        console.error('[Cloudreve] token 解密失败，可能 ENCRYPTION_KEY 不匹配:', err);
+        cloudreveLogger.error(
+          { err: serializeError(err) },
+          '[Cloudreve] token 解密失败，可能 ENCRYPTION_KEY 不匹配'
+        );
+        logSystemEvent(
+          'admin.cloudreve.token.decrypt_failed',
+          JSON.stringify({
+            source: 'on_demand',
+            hint: 'ENCRYPTION_KEY mismatch suspected',
+          })
+        );
         // 解密失败：把无效记录清掉，让管理员重新授权，避免持续报错
         await clearPersistedTokens().catch(() => {});
         return;
@@ -739,7 +926,10 @@ export class CloudreveStorage {
         this.persistTokensAsync(tokenCache);
       }
     } catch (err) {
-      console.error('[Cloudreve] 从数据库恢复 token 失败:', err);
+      cloudreveLogger.error(
+        { err: serializeError(err) },
+        '[Cloudreve] 从数据库恢复 token 失败'
+      );
     }
   }
 
@@ -797,7 +987,10 @@ export class CloudreveStorage {
       });
       // V4 统一返回 200，通过 code 判断
       if (!response.ok) {
-        console.warn(`[Cloudreve] 创建目录 ${dirPath} HTTP ${response.status}`);
+        cloudreveLogger.warn(
+          { dirPath, status: response.status },
+          '[Cloudreve] 创建目录非 2xx 响应'
+        );
       }
     } catch {
       // 忽略目录创建错误，上传时会自动创建父目录

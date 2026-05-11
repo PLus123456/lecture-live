@@ -15,6 +15,7 @@ import {
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
+import ConfirmDialog from '@/components/ConfirmDialog';
 
 interface Mismatch {
   id: string;
@@ -65,6 +66,12 @@ export default function ReconciliationPanel() {
   const [selectedRun, setSelectedRun] = useState<Run | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [fixing, setFixing] = useState<string | null>(null); // mismatchId 或 'all'
+  const [pendingAction, setPendingAction] = useState<
+    | { kind: 'trigger' }
+    | { kind: 'fix'; mismatchId: string }
+    | { kind: 'fixAll' }
+    | null
+  >(null);
 
   const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
 
@@ -96,8 +103,11 @@ export default function ReconciliationPanel() {
   }, [fetchRuns]);
 
   // 触发对账
-  const handleRunReconciliation = async () => {
-    if (!confirm(t('reconciliation.triggerConfirm'))) return;
+  const handleRunReconciliation = () => {
+    setPendingAction({ kind: 'trigger' });
+  };
+
+  const executeRunReconciliation = async () => {
     setRunning(true);
     try {
       const res = await fetch('/api/admin/reconciliation', {
@@ -141,8 +151,11 @@ export default function ReconciliationPanel() {
   };
 
   // 单条修复
-  const handleFix = async (mismatchId: string) => {
-    if (!confirm(t('reconciliation.fixConfirm'))) return;
+  const handleFix = (mismatchId: string) => {
+    setPendingAction({ kind: 'fix', mismatchId });
+  };
+
+  const executeFix = async (mismatchId: string) => {
     setFixing(mismatchId);
     try {
       const res = await fetch('/api/admin/reconciliation/fix', {
@@ -174,8 +187,13 @@ export default function ReconciliationPanel() {
   };
 
   // 批量修复
-  const handleFixAll = async () => {
-    if (!selectedRun || !confirm(t('reconciliation.fixAllConfirm'))) return;
+  const handleFixAll = () => {
+    if (!selectedRun) return;
+    setPendingAction({ kind: 'fixAll' });
+  };
+
+  const executeFixAll = async () => {
+    if (!selectedRun) return;
     setFixing('all');
     try {
       const res = await fetch('/api/admin/reconciliation/fix', {
@@ -505,6 +523,30 @@ export default function ReconciliationPanel() {
           </div>
         )}
       </div>
+      <ConfirmDialog
+        open={!!pendingAction}
+        title={t('common.confirm')}
+        message={
+          pendingAction?.kind === 'trigger'
+            ? t('reconciliation.triggerConfirm')
+            : pendingAction?.kind === 'fix'
+              ? t('reconciliation.fixConfirm')
+              : pendingAction?.kind === 'fixAll'
+                ? t('reconciliation.fixAllConfirm')
+                : undefined
+        }
+        confirmText={t('common.confirm')}
+        loading={running || fixing !== null}
+        onConfirm={async () => {
+          const action = pendingAction;
+          setPendingAction(null);
+          if (!action) return;
+          if (action.kind === 'trigger') await executeRunReconciliation();
+          else if (action.kind === 'fix') await executeFix(action.mismatchId);
+          else if (action.kind === 'fixAll') await executeFixAll();
+        }}
+        onCancel={() => setPendingAction(null)}
+      />
     </div>
   );
 }

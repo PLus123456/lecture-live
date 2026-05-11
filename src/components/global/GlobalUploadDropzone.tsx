@@ -32,16 +32,17 @@ export default function GlobalUploadDropzone() {
   const user = useAuthStore((s) => s.user);
   const { t } = useI18n();
 
-  // 在登录/分享/setup 等页面禁用全站拖拽（避免在公开页面误触发）
+  // 在登录/公开分享观看/setup 等页面禁用全站拖拽（避免在公开页面误触发，
+  // 也避免已登录用户访问他人分享链接时误触发上传流程）
   const enabled = Boolean(
     user &&
     pathname &&
     !pathname.startsWith('/login') &&
     !pathname.startsWith('/register') &&
-    !pathname.startsWith('/share/') &&
     !pathname.startsWith('/setup') &&
     !pathname.startsWith('/privacy') &&
-    !pathname.startsWith('/terms')
+    !pathname.startsWith('/terms') &&
+    !/^\/session\/[^/]+\/view(\/|$)/.test(pathname)
   );
 
   useEffect(() => {

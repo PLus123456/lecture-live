@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import ActionSheet, { type ActionSheetItem } from '@/components/mobile/ActionSheet';
+import ConfirmDialog from '@/components/ConfirmDialog';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { toast } from '@/stores/toastStore';
 
@@ -106,6 +107,11 @@ export default function FoldersPage() {
   const [success, setSuccess] = useState<string | null>(null);
   const [unarchivedSessions, setUnarchivedSessions] = useState<UnarchivedSession[]>([]);
   const [loadingUnarchived, setLoadingUnarchived] = useState(true);
+  const [pendingDelete, setPendingDelete] = useState<
+    | { kind: 'batch'; ids: string[] }
+    | { kind: 'single'; id: string; name: string }
+    | null
+  >(null);
 
   /* ─── Selection state ─── */
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -315,17 +321,22 @@ export default function FoldersPage() {
     }
   };
 
-  /* ─── Batch delete ─── */
-  const handleDeleteSelected = async () => {
+  /* ─── Batch delete (open confirm) ─── */
+  const handleDeleteSelected = () => {
     if (selectedIds.size === 0 || !token) return;
     const ids = Array.from(selectedIds).filter((id) => id !== UNARCHIVED_ID);
     if (ids.length === 0) return;
+    setPendingDelete({ kind: 'batch', ids });
+  };
 
-    const confirmed = window.confirm(
-      `Delete ${ids.length} folder${ids.length > 1 ? 's' : ''}? (Only empty folders can be deleted)`
-    );
-    if (!confirmed) return;
+  /* ─── Single delete (open confirm) ─── */
+  const handleDeleteSingle = (id: string) => {
+    if (!token) return;
+    const f = folders.find((f) => f.id === id);
+    setPendingDelete({ kind: 'single', id, name: f?.name ?? id });
+  };
 
+  const executeBatchDelete = async (ids: string[]) => {
     resetMessages();
     setSaving(true);
     try {
@@ -351,14 +362,7 @@ export default function FoldersPage() {
     }
   };
 
-  /* ─── Single delete ─── */
-  const handleDeleteSingle = async (id: string) => {
-    if (!token) return;
-    const f = folders.find((f) => f.id === id);
-    const confirmed = window.confirm(
-      `Delete "${f?.name ?? id}"? (Must be empty)`
-    );
-    if (!confirmed) return;
+  const executeSingleDelete = async (id: string) => {
     resetMessages();
     setSaving(true);
     try {
@@ -377,6 +381,17 @@ export default function FoldersPage() {
       toast.error('Delete failed', e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!pendingDelete) return;
+    const target = pendingDelete;
+    setPendingDelete(null);
+    if (target.kind === 'batch') {
+      await executeBatchDelete(target.ids);
+    } else {
+      await executeSingleDelete(target.id);
     }
   };
 
@@ -1258,6 +1273,23 @@ export default function FoldersPage() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={!!pendingDelete}
+        title="Delete folder"
+        message={
+          pendingDelete?.kind === 'batch'
+            ? `Delete ${pendingDelete.ids.length} folder${pendingDelete.ids.length > 1 ? 's' : ''}? Only empty folders can be deleted.`
+            : pendingDelete?.kind === 'single'
+              ? `Delete "${pendingDelete.name}"? (Must be empty)`
+              : undefined
+        }
+        confirmText="Delete"
+        danger
+        loading={saving}
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   );
 }

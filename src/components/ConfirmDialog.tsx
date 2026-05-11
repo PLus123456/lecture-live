@@ -51,7 +51,7 @@ export default function ConfirmDialog({
   if (!mounted || !open) return null;
 
   const confirmBtnClass = danger
-    ? 'bg-rust-500 hover:bg-rust-600 active:bg-rust-700'
+    ? 'bg-red-500 hover:bg-red-600 active:bg-red-700'
     : 'bg-rust-500 hover:bg-rust-600 active:bg-rust-700';
 
   return createPortal(

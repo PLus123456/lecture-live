@@ -11,6 +11,8 @@ import ExportModal from '@/components/ExportModal';
 import MobilePlaybackLayout from '@/components/mobile/MobilePlaybackLayout';
 import PlaybackSharePopover from '@/components/session/PlaybackSharePopover';
 import ChatTab from '@/components/session/ChatTab';
+import ConfirmDialog from '@/components/ConfirmDialog';
+import { toast } from '@/stores/toastStore';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useI18n } from '@/lib/i18n';
@@ -233,6 +235,7 @@ export default function PlaybackPage() {
   const [reportData, setReportData] = useState<SessionReportData | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
   const [regeneratingTitle, setRegeneratingTitle] = useState(false);
+  const [regenerateConfirmOpen, setRegenerateConfirmOpen] = useState(false);
 
   // Audio player state
   const [isPlaying, setIsPlaying] = useState(false);
@@ -885,9 +888,14 @@ export default function PlaybackPage() {
   }, [handleSegmentClick]);
 
   // 导出录音回调：复用已加载的 blob，避免重复下载
-  const handleRegenerateTitle = useCallback(async () => {
+  const handleRegenerateTitle = useCallback(() => {
     if (!sessionId || !token || regeneratingTitle) return;
-    if (!confirm(t('playback.regenerateTitleConfirm'))) return;
+    setRegenerateConfirmOpen(true);
+  }, [sessionId, token, regeneratingTitle]);
+
+  const handleRegenerateTitleConfirm = useCallback(async () => {
+    if (!sessionId || !token) return;
+    setRegenerateConfirmOpen(false);
     setRegeneratingTitle(true);
     try {
       const res = await fetch(`/api/sessions/${sessionId}/regenerate-title`, {
@@ -896,7 +904,7 @@ export default function PlaybackPage() {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        alert(data.error || t('playback.regenerateTitleFail'));
+        toast.error(t('playback.regenerateTitleFail'), data.error || undefined);
         return;
       }
       const data = await res.json();
@@ -904,11 +912,11 @@ export default function PlaybackPage() {
         setSession({ ...session, title: data.title, titleEn: data.titleEn });
       }
     } catch {
-      alert(t('playback.regenerateTitleFail'));
+      toast.error(t('playback.regenerateTitleFail'));
     } finally {
       setRegeneratingTitle(false);
     }
-  }, [sessionId, token, regeneratingTitle, session, t]);
+  }, [sessionId, token, session, t]);
 
   const fetchRecordingForExport = useCallback(async (): Promise<Blob | null> => {
     if (recordingBlobRef.current) {
@@ -1693,6 +1701,15 @@ export default function PlaybackPage() {
           fetchRecording={fetchRecordingForExport}
         />
       )}
+      <ConfirmDialog
+        open={regenerateConfirmOpen}
+        title={t('playback.regenerateTitle')}
+        message={t('playback.regenerateTitleConfirm')}
+        confirmText={t('playback.regenerateTitle')}
+        loading={regeneratingTitle}
+        onConfirm={handleRegenerateTitleConfirm}
+        onCancel={() => setRegenerateConfirmOpen(false)}
+      />
     </div>
   );
 }

@@ -21,6 +21,7 @@ import {
   Archive,
 } from 'lucide-react';
 import ModalPortal from '@/components/ModalPortal';
+import ConfirmDialog from '@/components/ConfirmDialog';
 import LanguageSelect from '@/components/LanguageSelect';
 import { useAuth } from '@/hooks/useAuth';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -77,6 +78,7 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
   const [jobId, setJobId] = useState<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [cancelDialogOpen, setCancelDialogOpen] = useState(false);
 
   // 跟踪当前 job 状态
   const job = useUploadJobsStore((s) => (jobId ? s.jobs[jobId] : undefined));
@@ -206,9 +208,11 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
         onError: (err) => { console.error('Transcribe error:', err); },
       });
       cancelRef.current = handle.cancel;
+      uploadJobs.registerCancel(id, handle.cancel);
 
       const result = await handle.promise;
       cancelRef.current = null;
+      uploadJobs.unregisterCancel(id);
 
       // 5. 写入 transcript
       uploadJobs.update(id, { status: 'finalizing', transcribeProgress: 1 });
@@ -250,6 +254,7 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
     } catch (err) {
       const msg = err instanceof Error ? err.message : '未知错误';
       uploadJobs.update(id, { status: 'failed', errorMessage: msg });
+      uploadJobs.unregisterCancel(id);
       setErrorMsg(msg);
       toast.error(t('upload.failed'), msg);
     }
@@ -259,15 +264,21 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
   ]);
 
   // ── 取消 ──
+  // 运行中：先弹 ConfirmDialog；非运行直接关。
   const handleCancel = useCallback(() => {
     if (phase === 'running' && job && job.status !== 'done' && job.status !== 'failed') {
-      if (!window.confirm(t('upload.confirmCancel'))) return;
-      cancelRef.current?.();
-      cancelRef.current = null;
-      if (jobId) uploadJobs.update(jobId, { status: 'canceled' });
+      setCancelDialogOpen(true);
+      return;
     }
     onClose();
-  }, [phase, job, jobId, onClose, t]);
+  }, [phase, job, onClose]);
+
+  const handleCancelConfirm = useCallback(() => {
+    setCancelDialogOpen(false);
+    if (jobId) uploadJobs.cancel(jobId);
+    cancelRef.current = null;
+    onClose();
+  }, [jobId, onClose]);
 
   const handleMinimize = useCallback(() => {
     // modal 关闭，但 job 继续在后台跑（因为转录 promise + sonioxClient 持有引用）
@@ -501,6 +512,16 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
           </div>
         </div>
       </div>
+      <ConfirmDialog
+        open={cancelDialogOpen}
+        title={t('upload.cancel')}
+        message={t('upload.confirmCancel')}
+        confirmText={t('upload.cancel')}
+        cancelText={t('upload.keepRunning')}
+        danger
+        onConfirm={handleCancelConfirm}
+        onCancel={() => setCancelDialogOpen(false)}
+      />
     </ModalPortal>
   );
 }

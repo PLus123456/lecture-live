@@ -21,6 +21,10 @@ Turn every lecture into a searchable learning session with live subtitles, multi
 
 [Quick Start](#quick-start) | [Architecture](#architecture) | [Repository Map](#repository-map) | [Scripts](#scripts-reference) | [Configuration](#configuration--security)
 
+<br />
+
+<img src="public/readme/lecturelive-hero.png" alt="LectureLive classroom AI workflow preview" width="980" />
+
 </div>
 
 ---
@@ -66,6 +70,10 @@ LectureLive is a full-stack web application for live teaching scenarios. It comb
 
 ## Session Flow
 
+<p align="center">
+  <img src="public/readme/session-flow-en.png" alt="LectureLive live session flow visual" width="920" />
+</p>
+
 ```mermaid
 flowchart LR
     A[Instructor starts a session] --> B[Browser captures audio]
@@ -78,6 +86,10 @@ flowchart LR
 ```
 
 ## Architecture
+
+<p align="center">
+  <img src="public/readme/architecture-en.png" alt="LectureLive self-hosted architecture visual" width="920" />
+</p>
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐

@@ -2,27 +2,45 @@
 
 import { create } from 'zustand';
 
+/**
+ * 文件上传 + Soniox async 转录的状态机。
+ *
+ * 阶段：
+ *   pending          —— 用户在 modal 确认前
+ *   creating         —— 调 /api/sessions 创建 session
+ *   uploading_chunks —— 分片上传（前端按 20MB 切，可并发）
+ *   transcoding      —— 后端 ffmpeg 抽音频 + 压成 MP3
+ *   uploading_to_soniox —— 后端把 MP3 传给 Soniox /v1/files
+ *   transcribing     —— Soniox 排队/转录中
+ *   finalizing       —— 服务端拉 transcript + 写盘 + 删 Soniox 文件
+ *   completed
+ *   failed
+ *   canceled
+ */
 export type UploadJobStatus =
-  | 'pending'        // 已加入队列，等待用户确认
-  | 'creating'       // 正在创建 session
-  | 'uploading'      // 正在上传音频
-  | 'transcribing'   // 正在做转录
-  | 'finalizing'     // 正在写入最终结果
-  | 'done'
+  | 'pending'
+  | 'creating'
+  | 'uploading_chunks'
+  | 'transcoding'
+  | 'uploading_to_soniox'
+  | 'transcribing'
+  | 'finalizing'
+  | 'completed'
   | 'failed'
   | 'canceled';
 
 export interface UploadJob {
-  id: string;                  // local job id
+  id: string;
   fileName: string;
   fileSize: number;
-  durationMs?: number;         // 解码后获得的音频时长
-  estimatedDurationMs?: number;// 预计转录耗时
-  startedAt?: number;          // 转录开始时间戳
+  durationMs?: number;
+  estimatedDurationMs?: number;
+  startedAt?: number;
   status: UploadJobStatus;
-  progress: number;            // 0~1
-  uploadProgress: number;      // 0~1（上传阶段）
-  transcribeProgress: number;  // 0~1（转录阶段，用音频回放进度推算）
+  /** 总体进度 0~1，从 status + uploadProgress 派生 */
+  progress: number;
+  /** 分片上传进度 0~1（已上传分片数 / 总分片数） */
+  uploadProgress: number;
   sessionId?: string;
   errorMessage?: string;
   // 用户配置
@@ -33,8 +51,9 @@ export interface UploadJob {
 
 interface UploadJobsStore {
   jobs: Record<string, UploadJob>;
-  /** 创建任务，返回 jobId */
-  create: (input: Omit<UploadJob, 'id' | 'status' | 'progress' | 'uploadProgress' | 'transcribeProgress'>) => string;
+  create: (
+    input: Omit<UploadJob, 'id' | 'status' | 'progress' | 'uploadProgress'>
+  ) => string;
   update: (id: string, patch: Partial<UploadJob>) => void;
   remove: (id: string) => void;
   get: (id: string) => UploadJob | undefined;
@@ -47,6 +66,32 @@ const nextId = () => {
   return `upload-${Date.now()}-${counter}`;
 };
 
+/**
+ * 各阶段占据的进度区间。区间内根据子进度线性插值。
+ * 数字代表"进入该阶段时显示的进度起点"。下个阶段的起点 = 本阶段的终点。
+ */
+const STAGE_RANGES: Record<UploadJobStatus, [number, number]> = {
+  pending: [0, 0],
+  creating: [0, 0.02],
+  uploading_chunks: [0.02, 0.5],  // 分片上传占大头
+  transcoding: [0.5, 0.65],
+  uploading_to_soniox: [0.65, 0.7],
+  transcribing: [0.7, 0.95],        // Soniox 处理时间不可控，给宽
+  finalizing: [0.95, 0.99],
+  completed: [1, 1],
+  failed: [0, 0],                   // 由 modal 单独处理
+  canceled: [0, 0],
+};
+
+function computeProgress(job: UploadJob): number {
+  const [start, end] = STAGE_RANGES[job.status];
+  if (job.status === 'uploading_chunks') {
+    return start + (end - start) * Math.min(1, Math.max(0, job.uploadProgress));
+  }
+  // 其它阶段没有精细子进度，停在区间起点 + 一点点偏移示意"在跑"
+  return start;
+}
+
 export const useUploadJobsStore = create<UploadJobsStore>((set, get) => ({
   jobs: {},
 
@@ -58,7 +103,6 @@ export const useUploadJobsStore = create<UploadJobsStore>((set, get) => ({
       status: 'pending',
       progress: 0,
       uploadProgress: 0,
-      transcribeProgress: 0,
     };
     set((state) => ({ jobs: { ...state.jobs, [id]: job } }));
     return id;
@@ -68,12 +112,8 @@ export const useUploadJobsStore = create<UploadJobsStore>((set, get) => ({
     set((state) => {
       const existing = state.jobs[id];
       if (!existing) return state;
-      const merged = { ...existing, ...patch };
-      // 派生总进度：上传 30% + 转录 70%
-      merged.progress = Math.min(
-        1,
-        merged.uploadProgress * 0.3 + merged.transcribeProgress * 0.7
-      );
+      const merged: UploadJob = { ...existing, ...patch };
+      merged.progress = computeProgress(merged);
       return { jobs: { ...state.jobs, [id]: merged } };
     }),
 
@@ -89,14 +129,10 @@ export const useUploadJobsStore = create<UploadJobsStore>((set, get) => ({
 }));
 
 /**
- * 取消 handle 的注册表 — handle 是函数，不放 zustand state 里。
- * 用 module-level Map 让 modal 卸载后仍能从后台 widget 取消任务。
+ * 取消 handle 注册表。modal 卸载后后台 widget 仍能取消。
  */
 const cancelHandles = new Map<string, () => void>();
 
-/**
- * 全局便捷调用，无需在组件中订阅 store。
- */
 export const uploadJobs = {
   create: (input: Parameters<UploadJobsStore['create']>[0]) =>
     useUploadJobsStore.getState().create(input),
@@ -113,7 +149,7 @@ export const uploadJobs = {
   cancel: (id: string) => {
     const fn = cancelHandles.get(id);
     if (fn) {
-      try { fn(); } catch { /* ignore — handle 已失效 */ }
+      try { fn(); } catch { /* ignore */ }
     }
     cancelHandles.delete(id);
     useUploadJobsStore.getState().update(id, { status: 'canceled' });

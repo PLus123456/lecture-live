@@ -19,6 +19,10 @@ FROM base AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 
+# ffmpeg：用于文件上传转录（async file API）把视频抽音频 + 压成 mono 128kbps MP3。
+# Alpine 包 ~30MB，包含 libavcodec / libavformat / libavutil。
+RUN apk add --no-cache ffmpeg
+
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
 

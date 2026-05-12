@@ -19,7 +19,9 @@ import { useI18n } from '@/lib/i18n';
 const ACTIVE_STATUSES: UploadJob['status'][] = [
   'pending',
   'creating',
-  'uploading',
+  'uploading_chunks',
+  'transcoding',
+  'uploading_to_soniox',
   'transcribing',
   'finalizing',
 ];
@@ -127,8 +129,12 @@ function statusLabel(
     case 'pending':
     case 'creating':
       return t('upload.creatingSession');
-    case 'uploading':
+    case 'uploading_chunks':
       return t('upload.uploadingAudio');
+    case 'transcoding':
+      return t('upload.transcoding');
+    case 'uploading_to_soniox':
+      return t('upload.uploadingToSoniox');
     case 'transcribing':
       return t('upload.transcribing');
     case 'finalizing':

@@ -6,6 +6,9 @@
  * 两个阶段：
  * - configuring：用户选择语言、folder，然后点"开始转录"
  * - running：modal 显示进度条，可"最小化"到后台或取消
+ *
+ * 转录走 Soniox async file API：分片上传 → 后端 ffmpeg → 后端传 Soniox → 后端 poll
+ * → 前端在 status endpoint 上轮询。视频文件会被后端抽出音频，压成 mono 128kbps MP3。
  */
 
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
@@ -27,12 +30,12 @@ import { useAuth } from '@/hooks/useAuth';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
-import { useUploadJobsStore, uploadJobs } from '@/stores/uploadJobsStore';
+import { useUploadJobsStore, uploadJobs, type UploadJobStatus } from '@/stores/uploadJobsStore';
+import { probeAudioDurationMs } from '@/lib/transcribe/fileTranscriber';
 import {
-  startFileTranscribe,
-  estimateTranscribeDurationMs,
-  probeAudioDurationMs,
-} from '@/lib/transcribe/fileTranscriber';
+  startAsyncUpload,
+  estimateAsyncTranscribeMs,
+} from '@/lib/transcribe/asyncUploadClient';
 
 interface FolderItem {
   id: string;
@@ -49,14 +52,17 @@ interface Props {
 const formatBytes = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 };
 
 const formatDurationCompact = (ms: number) => {
   if (!ms || !Number.isFinite(ms)) return '--';
   const sec = Math.round(ms / 1000);
-  const m = Math.floor(sec / 60);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
+  if (h > 0) return `${h}h ${m}m`;
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 };
 
@@ -69,7 +75,6 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
   const setSourceLang = useSettingsStore((s) => s.setSourceLang);
   const setTargetLang = useSettingsStore((s) => s.setTargetLang);
   const sonioxRegionPreference = useSettingsStore((s) => s.sonioxRegionPreference);
-  const getSessionConfig = useSettingsStore((s) => s.getSessionConfig);
 
   const [folders, setFolders] = useState<FolderItem[]>([]);
   const [folderId, setFolderId] = useState<string>('');
@@ -80,15 +85,14 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [cancelDialogOpen, setCancelDialogOpen] = useState(false);
 
-  // 跟踪当前 job 状态
   const job = useUploadJobsStore((s) => (jobId ? s.jobs[jobId] : undefined));
 
-  // ── 文件元数据 ──
+  // ── 文件元数据（视频文件浏览器可能拿不到时长，忽略即可，后端 ffprobe 是真相） ──
   useEffect(() => {
     let canceled = false;
     probeAudioDurationMs(file)
       .then((ms) => { if (!canceled) setAudioDurationMs(ms); })
-      .catch(() => { /* ignore — 拿不到时长不影响后续流程 */ });
+      .catch(() => { /* ignore */ });
     return () => { canceled = true; };
   }, [file]);
 
@@ -102,10 +106,10 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
   }, [token]);
 
   // ── 估算耗时 ──
-  const estimateMs = useMemo(() => {
-    if (!audioDurationMs) return 0;
-    return estimateTranscribeDurationMs(audioDurationMs, 3);
-  }, [audioDurationMs]);
+  const estimateMs = useMemo(
+    () => estimateAsyncTranscribeMs(file.size, audioDurationMs),
+    [file.size, audioDurationMs]
+  );
 
   const estimateText = useMemo(() => {
     if (!estimateMs) return '--';
@@ -120,7 +124,7 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
     if (phase === 'running' || !token) return;
     setErrorMsg(null);
 
-    // 1. 创建 job
+    // 1. 创建本地 job
     const id = uploadJobs.create({
       fileName: file.name,
       fileSize: file.size,
@@ -153,106 +157,56 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
           folderId: folderId || undefined,
         }),
       });
-      if (!sessionRes.ok) throw new Error('创建会话失败');
-      const session = await sessionRes.json();
+      if (!sessionRes.ok) throw new Error(t('upload.failedCreateSession'));
+      const session = (await sessionRes.json()) as { id: string };
       uploadJobs.update(id, { sessionId: session.id });
 
-      // 3. 上传音频文件（XHR 以获取上传进度）
-      uploadJobs.update(id, { status: 'uploading', uploadProgress: 0 });
-      await new Promise<void>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', `/api/sessions/${session.id}/audio`);
-        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-        xhr.upload.addEventListener('progress', (ev) => {
-          if (ev.lengthComputable) {
-            uploadJobs.update(id, { uploadProgress: ev.loaded / ev.total });
-          }
-        });
-        xhr.addEventListener('load', () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            uploadJobs.update(id, { uploadProgress: 1 });
-            resolve();
-          } else {
-            try {
-              const body = JSON.parse(xhr.responseText) as { error?: string };
-              reject(new Error(body.error || `上传失败 (${xhr.status})`));
-            } catch {
-              reject(new Error(`上传失败 (${xhr.status})`));
-            }
-          }
-        });
-        xhr.addEventListener('error', () => reject(new Error('网络错误')));
-        const formData = new FormData();
-        formData.append('file', file);
-        xhr.send(formData);
-      });
-
-      // 4. 浏览器内 Soniox 实时转录（把文件回放当作音频源）
-      uploadJobs.update(id, { status: 'transcribing', transcribeProgress: 0 });
-
-      const baseConfig = getSessionConfig(session.id);
-      const sessionConfig = {
-        ...baseConfig,
-        sourceLang,
-        targetLang,
-        clientReferenceId: session.id,
-        languageHints: [sourceLang],
-      };
-
-      const handle = startFileTranscribe({
+      // 3. 启动 async upload pipeline（分片上传 + finalize + poll）
+      const handle = startAsyncUpload({
         file,
+        sessionId: session.id,
         authToken: token,
-        config: sessionConfig,
-        playbackRate: 3,
-        onProgress: (p) => uploadJobs.update(id, { transcribeProgress: p }),
-        onError: (err) => { console.error('Transcribe error:', err); },
+        onUploadProgress: (p) => uploadJobs.update(id, { uploadProgress: p }),
+        onStatusChange: (status) => {
+          uploadJobs.update(id, { status: status as UploadJobStatus });
+        },
       });
       cancelRef.current = handle.cancel;
-      uploadJobs.registerCancel(id, handle.cancel);
+      uploadJobs.registerCancel(id, async () => {
+        handle.cancel();
+        // 同时请求服务端取消（后端会清理 chunks + Soniox 文件）
+        await fetch(`/api/sessions/${session.id}/async-upload`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        }).catch(() => undefined);
+      });
 
       const result = await handle.promise;
       cancelRef.current = null;
       uploadJobs.unregisterCancel(id);
 
-      // 5. 写入 transcript
-      uploadJobs.update(id, { status: 'finalizing', transcribeProgress: 1 });
-      await fetch(`/api/sessions/${session.id}/transcript`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          segments: result.segments,
-          summaries: [],
-          translations: {},
-        }),
-      });
-
-      // 6. finalize
-      await fetch(`/api/sessions/${session.id}/finalize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          segments: result.segments,
-          summaries: [],
-          translations: {},
-          durationMs: result.durationMs,
-        }),
-      });
-
-      uploadJobs.update(id, { status: 'done', progress: 1 });
-
-      // 7. toast 通知（带"打开回放"按钮）
-      toast.show({
-        type: 'success',
-        message: `${t('upload.uploadDone')} · ${file.name}`,
-        description: t('upload.uploadDoneDesc'),
-        duration: 0, // 手动关闭
-        action: {
-          label: t('upload.openPlayback'),
-          onClick: () => onNavigate(session.id),
-        },
-      });
+      if (result.finalStatus === 'completed') {
+        uploadJobs.update(id, { status: 'completed' });
+        toast.show({
+          type: 'success',
+          message: `${t('upload.uploadDone')} · ${file.name}`,
+          description: t('upload.uploadDoneDesc'),
+          duration: 0,
+          action: {
+            label: t('upload.openPlayback'),
+            onClick: () => onNavigate(session.id),
+          },
+        });
+      } else if (result.finalStatus === 'failed') {
+        const msg = result.error || t('upload.failed');
+        uploadJobs.update(id, { status: 'failed', errorMessage: msg });
+        setErrorMsg(msg);
+        toast.error(t('upload.failed'), msg);
+      } else if (result.finalStatus === 'canceled') {
+        uploadJobs.update(id, { status: 'canceled' });
+      }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : '未知错误';
+      const msg = err instanceof Error ? err.message : t('upload.failed');
       uploadJobs.update(id, { status: 'failed', errorMessage: msg });
       uploadJobs.unregisterCancel(id);
       setErrorMsg(msg);
@@ -260,13 +214,18 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
     }
   }, [
     phase, token, file, audioDurationMs, estimateMs, sourceLang, targetLang,
-    folderId, sonioxRegionPreference, locale, getSessionConfig, t, onNavigate,
+    folderId, sonioxRegionPreference, locale, t, onNavigate,
   ]);
 
   // ── 取消 ──
-  // 运行中：先弹 ConfirmDialog；非运行直接关。
   const handleCancel = useCallback(() => {
-    if (phase === 'running' && job && job.status !== 'done' && job.status !== 'failed') {
+    if (
+      phase === 'running' &&
+      job &&
+      job.status !== 'completed' &&
+      job.status !== 'failed' &&
+      job.status !== 'canceled'
+    ) {
       setCancelDialogOpen(true);
       return;
     }
@@ -281,7 +240,6 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
   }, [jobId, onClose]);
 
   const handleMinimize = useCallback(() => {
-    // modal 关闭，但 job 继续在后台跑（因为转录 promise + sonioxClient 持有引用）
     onClose();
   }, [onClose]);
 
@@ -299,18 +257,21 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
 
   // ── 渲染 ──
   const isRunning = phase === 'running';
-  const isDone = job?.status === 'done';
+  const isDone = job?.status === 'completed';
   const isFailed = job?.status === 'failed';
 
   const statusLabel = (() => {
     if (!job) return '';
     switch (job.status) {
       case 'creating': return t('upload.creatingSession');
-      case 'uploading': return t('upload.uploadingAudio');
+      case 'uploading_chunks': return t('upload.uploadingAudio');
+      case 'transcoding': return t('upload.transcoding');
+      case 'uploading_to_soniox': return t('upload.uploadingToSoniox');
       case 'transcribing': return t('upload.transcribing');
       case 'finalizing': return t('upload.finalizing');
-      case 'done': return t('upload.uploadDone');
+      case 'completed': return t('upload.uploadDone');
       case 'failed': return t('upload.failed');
+      case 'canceled': return t('upload.cancel');
       default: return '';
     }
   })();
@@ -457,15 +418,11 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
                 )}
 
                 {/* 阶段细节 */}
-                {!isDone && !isFailed && (
-                  <div className="text-[11px] text-charcoal-400 mb-3 space-y-0.5">
+                {!isDone && !isFailed && job.status === 'uploading_chunks' && (
+                  <div className="text-[11px] text-charcoal-400 mb-3">
                     <div className="flex justify-between">
                       <span>{t('upload.uploadingAudio')}</span>
                       <span className="tabular-nums">{Math.round(job.uploadProgress * 100)}%</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span>{t('upload.transcribing')}</span>
-                      <span className="tabular-nums">{Math.round(job.transcribeProgress * 100)}%</span>
                     </div>
                   </div>
                 )}

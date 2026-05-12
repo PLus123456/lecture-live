@@ -20,8 +20,9 @@ import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 
 const ACCEPTED_MEDIA_RE = /^(audio|video)\//i;
-// 兜底：500MB（实际后端限制由 site_settings.max_file_size 控制）
-const MAX_BYTES_FALLBACK = 500 * 1024 * 1024;
+// 5GB —— async file API 走分片上传 + 后端 ffmpeg 抽音频，远高于老路径的 500MB。
+// Soniox 单文件音频时长上限是 5 小时（不是字节）；5GB 足以覆盖一段 5 小时 1080p mp4。
+const MAX_BYTES_FALLBACK = 5 * 1024 * 1024 * 1024;
 
 export default function GlobalUploadDropzone() {
   const [dragActive, setDragActive] = useState(false);

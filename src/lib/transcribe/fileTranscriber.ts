@@ -16,7 +16,6 @@ import type { TranscriptSegment } from '@/types/transcript';
 import type { RealtimeToken } from '@/types/soniox';
 import { TokenProcessor } from '@/lib/soniox/tokenProcessor';
 import { startSonioxRecording, buildSonioxConfig } from '@/lib/soniox/client';
-import { BrowserAudioInputSource } from '@/lib/audio/browserAudioInputSource';
 import type { SessionConfig } from '@/types/transcript';
 
 export interface FileTranscribeOptions {

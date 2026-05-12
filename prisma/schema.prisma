@@ -86,11 +86,21 @@ model Session {
   targetLang      String    @default("zh")
   llmProvider     String    @default("claude")
 
+  // Soniox async file transcription
+  // 文件上传转录的进度跟踪。null = 未走 async 路径（实时录音 or 浏览器 realtime 文件转录）
+  // 状态机：uploading_chunks → transcoding → uploading_to_soniox → transcribing → completed / failed
+  sonioxFileId             String?
+  sonioxTranscriptionId    String?
+  asyncTranscribeStatus    String?
+  asyncTranscribeError     String?   @db.Text
+  asyncTranscribeStartedAt DateTime?
+
   shareLinks      ShareLink[]
   folders         FolderSession[]
   conversations   Conversation[]
 
   @@index([userId])
+  @@index([asyncTranscribeStatus])
 }
 
 model Folder {

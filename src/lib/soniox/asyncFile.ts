@@ -14,6 +14,8 @@
  * - 文件不会自动删，必须手动 DELETE
  */
 import fs from 'fs';
+import path from 'path';
+import { randomUUID } from 'crypto';
 import { logger } from '@/lib/logger';
 import type { SonioxRuntimeConfig } from './env';
 
@@ -96,24 +98,27 @@ export async function uploadSonioxFile(
   options?: { filename?: string; clientReferenceId?: string }
 ): Promise<SonioxFileUploadResponse> {
   const stat = await fs.promises.stat(filePath);
-  const stream = fs.createReadStream(filePath);
-
-  const form = new FormData();
-  // Node 20+ FormData 接受 Blob/ReadableStream，但 fetch 的 body 走流式更稳。
-  // 用 Web Stream 适配：把 fs ReadStream 转 Blob 是会全 buffer 的，所以这里
-  // 直接拼 multipart 字符串太繁琐。改用 Blob + arrayBuffer 但只适合小文件。
-  // 简化方案：把 fs.createReadStream 用 Response 包成 Blob，Node 内部会流式处理。
-  const blob = await streamToBlob(stream);
-  form.append('file', blob, options?.filename || 'upload.bin');
-  if (options?.clientReferenceId) {
-    form.append('client_reference_id', options.clientReferenceId.slice(0, 256));
-  }
+  const filename = path.basename(
+    options?.filename || path.basename(filePath) || 'upload.bin'
+  );
+  const body = createMultipartFileBody(filePath, {
+    filename,
+    fileSize: stat.size,
+    contentType: 'audio/mpeg',
+    clientReferenceId: options?.clientReferenceId,
+  });
 
   const res = await fetch(`${config.restBaseUrl}/v1/files`, {
     method: 'POST',
-    headers: authHeader(config),
-    body: form,
-  });
+    headers: {
+      ...authHeader(config),
+      'Content-Type': `multipart/form-data; boundary=${body.boundary}`,
+      'Content-Length': String(body.contentLength),
+    },
+    body: body.stream as unknown as BodyInit,
+    // Node fetch 在发送流式请求体时需要显式声明 duplex。
+    duplex: 'half',
+  } as RequestInit & { duplex: 'half' });
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
@@ -128,17 +133,68 @@ export async function uploadSonioxFile(
 }
 
 /**
- * 把 Node Readable 转成 Blob（流式，不一次性 buffer 进内存）。
- * 利用 Response.blob() 内部的流处理。
+ * 生成流式 multipart/form-data 请求体，避免把转码后的音频整体读进内存。
+ * Node 的内置 FormData 对文件流支持不稳定，手写边界更可控。
  */
-async function streamToBlob(stream: NodeJS.ReadableStream): Promise<Blob> {
-  // 把 Node Readable 转 Web ReadableStream
-  // Node 18+ 提供 Readable.toWeb
-  const { Readable } = await import('stream');
-  const webStream = (Readable as unknown as { toWeb: (s: NodeJS.ReadableStream) => ReadableStream })
-    .toWeb(stream);
-  const response = new Response(webStream);
-  return await response.blob();
+function createMultipartFileBody(
+  filePath: string,
+  options: {
+    filename: string;
+    fileSize: number;
+    contentType: string;
+    clientReferenceId?: string;
+  }
+): {
+  boundary: string;
+  contentLength: number;
+  stream: AsyncGenerator<Buffer>;
+} {
+  const boundary = `lecturelive-soniox-${randomUUID()}`;
+  const chunks: Buffer[] = [];
+
+  if (options.clientReferenceId) {
+    chunks.push(
+      Buffer.from(
+        `--${boundary}\r\n` +
+          'Content-Disposition: form-data; name="client_reference_id"\r\n\r\n' +
+          `${options.clientReferenceId.slice(0, 256)}\r\n`
+      )
+    );
+  }
+
+  chunks.push(
+    Buffer.from(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="${escapeMultipartValue(
+          options.filename
+        )}"\r\n` +
+        `Content-Type: ${options.contentType}\r\n\r\n`
+    )
+  );
+
+  const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const headerLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const contentLength = headerLength + options.fileSize + footer.length;
+
+  async function* stream(): AsyncGenerator<Buffer> {
+    for (const chunk of chunks) {
+      yield chunk;
+    }
+    for await (const chunk of fs.createReadStream(filePath)) {
+      yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    }
+    yield footer;
+  }
+
+  return {
+    boundary,
+    contentLength,
+    stream: stream(),
+  };
+}
+
+function escapeMultipartValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '%22').replace(/[\r\n]/g, '_');
 }
 
 export async function createSonioxTranscription(

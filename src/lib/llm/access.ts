@@ -114,18 +114,22 @@ export async function resolveAuthorizedLlmSelection(
   return { user };
 }
 
+/**
+ * 决定最终发给 gateway 的 thinkingDepth：
+ *  - FREE 用户禁止 high（成本高）
+ *  - 模型不支持调节深度时，强制使用模型默认深度
+ *  - 否则按用户请求
+ */
 export function resolveEffectiveThinkingDepth(
   role: LLMAccessUser['role'],
   requestedDepth: ThinkingDepth,
   providerConfig?: LLMProviderConfig
 ): ThinkingDepth {
   const clampedDepth =
-    role === 'FREE' && requestedDepth === 'high'
-      ? 'medium'
-      : requestedDepth;
+    role === 'FREE' && requestedDepth === 'high' ? 'medium' : requestedDepth;
 
-  if (clampedDepth === 'high' && providerConfig && !providerConfig.isAnthropic) {
-    return 'medium';
+  if (providerConfig && !providerConfig.supportsThinkingDepth) {
+    return providerConfig.thinkingDepth;
   }
 
   return clampedDepth;

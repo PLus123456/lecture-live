@@ -97,12 +97,23 @@ type ModelPurpose = 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXT
 /** LLM 思考深度 */
 type ThinkingBudget = 'low' | 'medium' | 'high';
 
+/**
+ * 模型的思考能力分类。
+ *  NONE     - 不支持思考（普通 chat 模型）
+ *  OPTIONAL - 用户可开/关思考（Claude Extended Thinking）
+ *  FORCED   - 模型自带思考无法关闭（OpenAI o1/o3、DeepSeek R1）
+ */
+type ThinkingMode = 'NONE' | 'OPTIONAL' | 'FORCED';
+
 /** LLM 模型定义 */
 interface LlmModel {
   id: string;
   model_id: string;
   display_name: string;
   thinking_budget: ThinkingBudget;
+  thinking_mode: ThinkingMode;
+  supports_thinking_depth: boolean;
+  supports_image: boolean;
   max_tokens: number;
   context_window: number;
   temperature: number;
@@ -163,11 +174,24 @@ function buildModelGroupKey(model: Record<string, unknown>) {
   const modelId = (model.modelId ?? model.model_id ?? '') as string;
   const displayName = (model.displayName ?? model.display_name ?? '') as string;
   const thinkingDepth = (model.thinkingDepth ?? model.thinking_budget ?? 'medium') as string;
+  const thinkingMode = (model.thinkingMode ?? model.thinking_mode ?? 'NONE') as string;
+  const supportsDepth = Boolean(model.supportsThinkingDepth ?? model.supports_thinking_depth ?? false);
+  const supportsImage = Boolean(model.supportsImage ?? model.supports_image ?? false);
   const maxTokens = toFiniteNumber(model.maxTokens ?? model.max_tokens, 4096);
   const contextWindow = toFiniteNumber(model.contextWindow ?? model.context_window, 8192);
   const temperature = toFiniteNumber(model.temperature, 0.3);
 
-  return [modelId, displayName, thinkingDepth, maxTokens, contextWindow, temperature].join('::');
+  return [
+    modelId,
+    displayName,
+    thinkingDepth,
+    thinkingMode,
+    supportsDepth ? '1' : '0',
+    supportsImage ? '1' : '0',
+    maxTokens,
+    contextWindow,
+    temperature,
+  ].join('::');
 }
 
 function groupProviderModels(models: Record<string, unknown>[]): LlmModel[] {
@@ -180,11 +204,19 @@ function groupProviderModels(models: Record<string, unknown>[]): LlmModel[] {
       typeof model.id === 'string' && model.id ? model.id : `temp-group-${index}`;
 
     if (!grouped.has(key)) {
+      const rawMode = (model.thinkingMode ?? model.thinking_mode ?? 'NONE') as string;
+      const thinkingMode: ThinkingMode =
+        rawMode === 'OPTIONAL' || rawMode === 'FORCED' ? rawMode : 'NONE';
       grouped.set(key, {
         id: modelRowId,
         model_id: (model.modelId ?? model.model_id ?? '') as string,
         display_name: (model.displayName ?? model.display_name ?? '') as string,
         thinking_budget: (model.thinkingDepth ?? model.thinking_budget ?? 'medium') as ThinkingBudget,
+        thinking_mode: thinkingMode,
+        supports_thinking_depth: Boolean(
+          model.supportsThinkingDepth ?? model.supports_thinking_depth ?? false
+        ),
+        supports_image: Boolean(model.supportsImage ?? model.supports_image ?? false),
         max_tokens: toFiniteNumber(model.maxTokens ?? model.max_tokens, 4096),
         context_window: toFiniteNumber(model.contextWindow ?? model.context_window, 8192),
         temperature: toFiniteNumber(model.temperature, 0.3),
@@ -233,6 +265,10 @@ function expandProviderModelsForSave(models: LlmModel[]) {
       modelId: model.model_id,
       displayName: model.display_name,
       thinkingDepth: model.thinking_budget,
+      thinkingMode: model.thinking_mode,
+      supportsThinkingDepth:
+        model.thinking_mode === 'NONE' ? false : model.supports_thinking_depth,
+      supportsImage: model.supports_image,
       maxTokens: model.max_tokens,
       contextWindow: model.context_window,
       temperature: model.temperature,
@@ -657,9 +693,20 @@ function ModelRow({
   };
 
   const contextWindowTooLow = model.context_window < model.max_tokens;
+  const thinkingModeNone = model.thinking_mode === 'NONE';
+  const showDepthSelect = !thinkingModeNone;
+
+  const setThinkingMode = (next: ThinkingMode) => {
+    onUpdate({
+      ...model,
+      thinking_mode: next,
+      // 切换到 NONE 时自动清掉「可调节深度」标记，避免数据不一致
+      supports_thinking_depth: next === 'NONE' ? false : model.supports_thinking_depth,
+    });
+  };
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-9 gap-2 items-end p-3 bg-cream-50 dark:bg-charcoal-750 rounded-lg border border-cream-100 dark:border-charcoal-600">
+    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-12 gap-2 items-end p-3 bg-cream-50 dark:bg-charcoal-750 rounded-lg border border-cream-100 dark:border-charcoal-600">
       {/* 模型 ID */}
       <div className="md:col-span-1">
         <label className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block">{t('adminSettings.modelId')}</label>
@@ -688,19 +735,87 @@ function ModelRow({
         />
       </div>
 
-      {/* 思考深度 */}
+      {/* 思考模式 */}
       <div>
-        <label className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block">{t('adminSettings.thinkingDepth')}</label>
+        <label
+          className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block"
+          title={t('adminSettings.thinkingModeDesc')}
+        >
+          {t('adminSettings.thinkingMode')}
+        </label>
         <select
-          value={model.thinking_budget}
-          onChange={(e) => onUpdate({ ...model, thinking_budget: e.target.value as ThinkingBudget })}
+          value={model.thinking_mode}
+          onChange={(e) => setThinkingMode(e.target.value as ThinkingMode)}
           className="w-full px-2 py-1.5 text-xs border border-cream-200 rounded bg-white text-charcoal-800
                      dark:bg-charcoal-700 dark:border-charcoal-600 dark:text-cream-100
                      focus:outline-none focus:ring-1 focus:ring-rust-200"
         >
+          <option value="NONE">{t('adminSettings.thinkingModeNone')}</option>
+          <option value="OPTIONAL">{t('adminSettings.thinkingModeOptional')}</option>
+          <option value="FORCED">{t('adminSettings.thinkingModeForced')}</option>
+        </select>
+      </div>
+
+      {/* 默认 / 固定 思考深度 + 是否允许调节 */}
+      <div>
+        <label
+          className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block"
+          title={
+            showDepthSelect && !model.supports_thinking_depth
+              ? t('adminSettings.thinkingDepthFixedDesc')
+              : t('adminSettings.thinkingDepthDesc')
+          }
+        >
+          {t('adminSettings.thinkingDepth')}
+        </label>
+        <select
+          value={model.thinking_budget}
+          disabled={thinkingModeNone}
+          onChange={(e) =>
+            onUpdate({ ...model, thinking_budget: e.target.value as ThinkingBudget })
+          }
+          className="w-full px-2 py-1.5 text-xs border border-cream-200 rounded bg-white text-charcoal-800
+                     dark:bg-charcoal-700 dark:border-charcoal-600 dark:text-cream-100
+                     focus:outline-none focus:ring-1 focus:ring-rust-200
+                     disabled:opacity-50 disabled:cursor-not-allowed"
+        >
           <option value="low">{t('adminSettings.thinkingLow')}</option>
           <option value="medium">{t('adminSettings.thinkingMedium')}</option>
           <option value="high">{t('adminSettings.thinkingHigh')}</option>
+        </select>
+        <label className="mt-1 flex items-center gap-1 text-[11px] text-charcoal-500 dark:text-charcoal-400 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={model.supports_thinking_depth}
+            disabled={thinkingModeNone}
+            onChange={(e) =>
+              onUpdate({ ...model, supports_thinking_depth: e.target.checked })
+            }
+            className="rounded border-cream-300 text-rust-500 focus:ring-rust-200 disabled:opacity-50"
+          />
+          {t('adminSettings.supportsThinkingDepth')}
+        </label>
+      </div>
+
+      {/* 输入模态（文字 / 文字+图片） */}
+      <div>
+        <label
+          className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block"
+          title={t('adminSettings.inputModalityDesc')}
+        >
+          {t('adminSettings.inputModality')}
+        </label>
+        <select
+          value={model.supports_image ? 'TEXT_IMAGE' : 'TEXT'}
+          onChange={(e) =>
+            onUpdate({ ...model, supports_image: e.target.value === 'TEXT_IMAGE' })
+          }
+          className="w-full px-2 py-1.5 text-xs border border-cream-200 rounded bg-white text-charcoal-800
+                     dark:bg-charcoal-700 dark:border-charcoal-600 dark:text-cream-100
+                     focus:outline-none focus:ring-1 focus:ring-rust-200"
+        >
+          <option value="TEXT">{t('adminSettings.inputModalityText')}</option>
+          <option value="TEXT_IMAGE">{t('adminSettings.inputModalityTextImage')}</option>
         </select>
       </div>
 
@@ -856,6 +971,9 @@ function ProviderCard({
       model_id: '',
       display_name: '',
       thinking_budget: 'medium',
+      thinking_mode: 'NONE',
+      supports_thinking_depth: false,
+      supports_image: false,
       max_tokens: 4096,
       context_window: 8192,
       temperature: 0.7,

@@ -88,10 +88,21 @@ export async function PATCH(
             { status: 400 }
           );
         }
+        const thinkingMode = (m.thinkingMode ?? m.thinking_mode ?? 'NONE') as
+          | 'NONE'
+          | 'OPTIONAL'
+          | 'FORCED';
+        const supportsDepth =
+          thinkingMode === 'NONE'
+            ? false
+            : Boolean(m.supportsThinkingDepth ?? m.supports_thinking_depth ?? false);
         const modelData = {
           modelId: (m.modelId ?? m.model_id ?? '') as string,
           displayName: (m.displayName ?? m.display_name ?? '') as string,
           thinkingDepth: (m.thinkingDepth ?? m.thinking_budget ?? 'medium') as string,
+          thinkingMode,
+          supportsThinkingDepth: supportsDepth,
+          supportsImage: Boolean(m.supportsImage ?? m.supports_image ?? false),
           maxTokens,
           contextWindow,
           temperature: Number(m.temperature ?? 0.3),

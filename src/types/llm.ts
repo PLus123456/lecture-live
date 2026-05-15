@@ -39,8 +39,13 @@ export type LlmPurpose =
   | 'KEYWORD_EXTRACTION'
   | 'EMBEDDING';
 
-/** 思考模式（与后端 LlmModel.thinkingMode 一致） */
-export type ThinkingMode = 'NONE' | 'OPTIONAL' | 'FORCED';
+/**
+ * 思考模式（与后端 LlmModel.thinkingMode 一致）
+ * 'OPTIONAL' 为历史值，等价于：supportsThinkingDepth=true → 'DEPTH'，否则 → 'AUTO'。
+ * 当前 gateway 内部仍输出 'OPTIONAL'；admin UI / API 在边界处归一化为 4 值新枚举。
+ * TODO(unit-3): gateway 迁移完成后从联合中移除 'OPTIONAL'。
+ */
+export type ThinkingMode = 'NONE' | 'AUTO' | 'FORCED' | 'DEPTH' | 'OPTIONAL';
 
 /** What the /api/llm/models endpoint returns per model */
 export interface ChatModelOption {
@@ -58,9 +63,10 @@ export interface ChatModelOption {
   supportsThinking: boolean;
   /**
    * 详细思考模式：
-   *  - 'NONE'     : 模型不支持思考，UI 隐藏开关与深度选择器
-   *  - 'OPTIONAL' : 用户可开关，UI 显示开关；开启时按 supportsThinkingDepth 决定是否显示深度
-   *  - 'FORCED'   : 模型自带思考无法关闭，UI 不显示开关，按 supportsThinkingDepth 决定是否显示深度
+   *  - 'NONE'   : 模型不思考，UI 隐藏开关与深度选择器
+   *  - 'AUTO'   : 让模型自行决定是否思考，不发送 thinking 参数
+   *  - 'FORCED' : 模型自带思考无法关闭，UI 不显示开关；按固定深度（thinking_budget）发送
+   *  - 'DEPTH'  : 模型支持思考且允许用户在 chat 端调节深度（低/中/高）
    */
   thinkingMode: ThinkingMode;
   /** 是否允许调节思考深度 */

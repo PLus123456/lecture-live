@@ -7,6 +7,7 @@ import {
   LLMAccessError,
   resolveAuthorizedLlmSelection,
 } from '@/lib/llm/access';
+import { buildLlmRoutingOptions } from '@/lib/llm/llmRoutingOptions';
 import {
   LLM_LIMITS,
   LLMResponseError,
@@ -67,13 +68,11 @@ export async function POST(req: Request) {
 
     const selection = await resolveAuthorizedLlmSelection(user.id, providerOverride);
 
-    const result = await callLLM(system, userMsg, {
-      ...(selection.modelId
-        ? { modelId: selection.modelId }
-        : selection.providerName
-          ? { providerOverride: selection.providerName }
-          : { purpose: 'REALTIME_SUMMARY' as const }),
-    });
+    const result = await callLLM(
+      system,
+      userMsg,
+      buildLlmRoutingOptions(selection, 'REALTIME_SUMMARY')
+    );
 
     const parsed = parseIncrementalSummaryResult(result);
     return NextResponse.json(parsed);

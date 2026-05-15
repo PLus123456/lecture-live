@@ -2,9 +2,9 @@ import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import {
+  callLLM,
   callLLMWithHistory,
   getProviderForPurpose,
-  getModelById,
 } from '@/lib/llm/gateway';
 import { buildChatPrompt } from '@/lib/llm/prompts';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
@@ -33,6 +33,7 @@ import {
 import { computeContextBudget } from '@/lib/llm/tokenBudget';
 import { makeRagRetrieverForSession } from '@/lib/llm/embedding/transcriptRag';
 import { findCompressionBoundary } from '@/lib/llm/chatCompression';
+import { buildLlmRoutingOptions } from '@/lib/llm/llmRoutingOptions';
 import { logger, serializeError } from '@/lib/logger';
 
 const VALID_DEPTHS: ThinkingDepth[] = ['low', 'medium', 'high'];
@@ -179,9 +180,12 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
     );
 
     // 拿到 contextWindow 用于预算
-    const provider = selection.modelId
-      ? await getModelById(selection.modelId)
-      : await getProviderForPurpose('CHAT');
+    // 复用 access.ts 已经解析好的 providerConfig（modelId / providerName 路径都会填充），
+    // 都没指定时落到 DB CHAT 默认 model（再 fallback 到 env var）。这一路必须与
+    // 下方 callLLMWithHistory 的 provider 解析保持完全一致，否则预算和实调会指向
+    // 不同 provider，contextWindow / max_tokens 错位会让降级判定失真。
+    const provider =
+      selection.providerConfig ?? (await getProviderForPurpose('CHAT'));
     const budget = computeContextBudget(provider, provider.contextWindow);
 
     // ── 把 DB 消息转 ConversationTurn[] ──
@@ -231,22 +235,16 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
           minLevel: currentLevel,
           inputBudget: budget.inputBudget,
           buildSystemPrompt,
+          // 压缩历史用 CHAT 用途（其实更适合用 FINAL_SUMMARY 但 CHAT 模型也行）
           callLLM: (s: string, u: string) =>
-            // 压缩历史用 CHAT 用途（其实更适合用 FINAL_SUMMARY 但 CHAT 模型也行）
-            import('@/lib/llm/gateway').then(({ callLLM }) =>
-              callLLM(s, u, { purpose: 'CHAT' })
-            ),
+            callLLM(s, u, { purpose: 'CHAT' }),
           language,
           ragRetrieve: ragRetriever,
         });
         effectiveLevel = ctx.level;
 
         llmResponse = await callLLMWithHistory(ctx.systemPrompt, ctx.messages, {
-          ...(selection.modelId
-            ? { modelId: selection.modelId }
-            : selection.providerName
-              ? { providerOverride: selection.providerName }
-              : {}),
+          ...buildLlmRoutingOptions(selection, 'CHAT'),
           thinkingDepth: finalDepth,
           detailed: true,
         });

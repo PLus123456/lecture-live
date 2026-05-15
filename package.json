@@ -3,13 +3,16 @@
   "version": "0.2.0",
   "private": true,
   "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "db:ensure": "node scripts/ensure-database.mjs",
     "dev": "next dev",
     "dev:ws": "ts-node server/websocket.ts",
     "prebuild": "prisma generate",
     "build": "next build",
-    "build:ws": "esbuild server/websocket.ts --bundle --platform=node --target=node20 --outfile=dist/websocket.js --external:@prisma/client --external:socket.io --external:ioredis --external:jsonwebtoken --external:bcryptjs --alias:server-only=./deploy/shims/server-only.js",
+    "build:ws": "esbuild server/websocket.ts --bundle --platform=node --target=node24 --outfile=dist/websocket.js --external:@prisma/client --external:socket.io --external:ioredis --external:jsonwebtoken --external:bcryptjs --alias:server-only=./deploy/shims/server-only.js",
     "prestart": "node scripts/ensure-database.mjs",
     "start": "next start",
     "prestart:ws": "node scripts/ensure-database.mjs",
@@ -66,7 +69,7 @@
     "@types/dompurify": "^3.0.5",
     "@types/ioredis": "^4.28.10",
     "@types/jsonwebtoken": "^9.0.7",
-    "@types/node": "^20.17.12",
+    "@types/node": "^24",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
     "@vitest/coverage-v8": "^3.2.4",

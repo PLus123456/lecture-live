@@ -90,12 +90,11 @@ export async function PATCH(
         }
         const thinkingMode = (m.thinkingMode ?? m.thinking_mode ?? 'NONE') as
           | 'NONE'
-          | 'OPTIONAL'
-          | 'FORCED';
-        const supportsDepth =
-          thinkingMode === 'NONE'
-            ? false
-            : Boolean(m.supportsThinkingDepth ?? m.supports_thinking_depth ?? false);
+          | 'AUTO'
+          | 'FORCED'
+          | 'DEPTH';
+        // supportsThinkingDepth 由 mode === 'DEPTH' 派生（一致性保护，覆盖 body 值）
+        const supportsDepth = thinkingMode === 'DEPTH';
         const modelData = {
           modelId: (m.modelId ?? m.model_id ?? '') as string,
           displayName: (m.displayName ?? m.display_name ?? '') as string,

@@ -106,9 +106,19 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
   }, [token]);
 
   // ── 估算耗时 ──
+  // 视频文件浏览器经常拿不到 <audio>.duration（容器/codec 不支持），audioDurationMs=0
+  // 会让 estimateAsyncTranscribeMs 漏算 Soniox 处理时间，估算严重偏低。这里按文件大小
+  // 粗估一个 fallback：视频按 ~5MB/min，音频按 ~1MB/min。
+  const effectiveDurationMs = useMemo(() => {
+    if (audioDurationMs > 0) return audioDurationMs;
+    const isVideo = /^video\//i.test(file.type);
+    const mbPerMin = isVideo ? 5 : 1;
+    return Math.round((file.size / (mbPerMin * 1024 * 1024)) * 60_000);
+  }, [audioDurationMs, file.size, file.type]);
+
   const estimateMs = useMemo(
-    () => estimateAsyncTranscribeMs(file.size, audioDurationMs),
-    [file.size, audioDurationMs]
+    () => estimateAsyncTranscribeMs(file.size, effectiveDurationMs),
+    [file.size, effectiveDurationMs]
   );
 
   const estimateText = useMemo(() => {
@@ -167,6 +177,8 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
         sessionId: session.id,
         authToken: token,
         onUploadProgress: (p) => uploadJobs.update(id, { uploadProgress: p }),
+        onProcessingProgress: (p) =>
+          uploadJobs.update(id, { processingProgress: p }),
         onStatusChange: (status) => {
           uploadJobs.update(id, { status: status as UploadJobStatus });
         },
@@ -206,6 +218,17 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
         uploadJobs.update(id, { status: 'canceled' });
       }
     } catch (err) {
+      // 用户点取消时 abort signal 会让 fetch/sleep 抛 AbortError。
+      // asyncUploadClient 顶层 catch 一般会转成 finalStatus='canceled'，但保险起见
+      // 这里也识别一遍，避免把取消当失败弹错 toast。
+      const isAbort =
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError');
+      if (isAbort) {
+        uploadJobs.update(id, { status: 'canceled' });
+        uploadJobs.unregisterCancel(id);
+        return;
+      }
       const msg = err instanceof Error ? err.message : t('upload.failed');
       uploadJobs.update(id, { status: 'failed', errorMessage: msg });
       uploadJobs.unregisterCancel(id);

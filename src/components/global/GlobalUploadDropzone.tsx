@@ -18,6 +18,7 @@ import ModalPortal from '@/components/ModalPortal';
 import UploadTranscribeModal from './UploadTranscribeModal';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
+import { toast } from '@/stores/toastStore';
 
 const ACCEPTED_MEDIA_RE = /^(audio|video)\//i;
 // 5GB —— async file API 走分片上传 + 后端 ffmpeg 抽音频，远高于老路径的 500MB。
@@ -56,6 +57,11 @@ export default function GlobalUploadDropzone() {
       return Array.from(types).some((t) => t === 'Files' || t === 'application/x-moz-file');
     };
 
+    const resetDragState = () => {
+      dragCounterRef.current = 0;
+      setDragActive(false);
+    };
+
     const onDragEnter = (e: DragEvent) => {
       if (!isFileDrag(e)) return;
       e.preventDefault();
@@ -74,21 +80,26 @@ export default function GlobalUploadDropzone() {
     const onDrop = (e: DragEvent) => {
       if (!isFileDrag(e)) return;
       e.preventDefault();
-      dragCounterRef.current = 0;
-      setDragActive(false);
+      resetDragState();
 
       const file = e.dataTransfer?.files?.[0];
       if (!file) return;
 
       if (!ACCEPTED_MEDIA_RE.test(file.type)) {
-        // 非音视频文件忽略，让用户没有打扰感
-        // 也可以选择 toast 提示，但拖入图片这种很常见，提示太烦
+        // 图片/文档拖到页面很常见（用户在拖错位置），静默忽略以免烦扰。
+        // 但对明显意图是媒体文件（type 为空 = 浏览器不识别）的情况，告知用户为什么没反应。
+        const isLikelyAccidentalDrop =
+          /^(image|text|application)\//i.test(file.type);
+        if (!isLikelyAccidentalDrop) {
+          toast.error(t('upload.invalidFileType'));
+        }
         return;
       }
 
       if (file.size > MAX_BYTES_FALLBACK) {
-        // 提示后端限制是动态的；这里只防止特别大的文件
-        // 真正的精确限制在创建 session 后由 upload API 检查
+        toast.error(
+          t('upload.fileTooLarge', { max: Math.floor(MAX_BYTES_FALLBACK / (1024 * 1024)) })
+        );
         return;
       }
 
@@ -99,13 +110,19 @@ export default function GlobalUploadDropzone() {
     window.addEventListener('dragover', onDragOver);
     window.addEventListener('dragleave', onDragLeave);
     window.addEventListener('drop', onDrop);
+    // 拖出窗口边界 / 切换标签页 / 拖拽中点 ESC：dragLeave 可能不成对触发，
+    // 计数器会卡住导致 overlay 不消失或下次拖入失灵。这几个事件做兜底 reset。
+    window.addEventListener('dragend', resetDragState);
+    window.addEventListener('blur', resetDragState);
     return () => {
       window.removeEventListener('dragenter', onDragEnter);
       window.removeEventListener('dragover', onDragOver);
       window.removeEventListener('dragleave', onDragLeave);
       window.removeEventListener('drop', onDrop);
+      window.removeEventListener('dragend', resetDragState);
+      window.removeEventListener('blur', resetDragState);
     };
-  }, [enabled]);
+  }, [enabled, t]);
 
   const handleClose = useCallback(() => {
     setPendingFile(null);

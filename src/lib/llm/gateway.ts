@@ -15,6 +15,14 @@ function sanitizeApiError(text: string, maxLen = 200): string {
 /*  类型定义                                                           */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 思考模式：
+ *  NONE     - 不支持思考
+ *  OPTIONAL - 用户可选（Claude Extended Thinking）
+ *  FORCED   - 模型自带思考无法关闭（OpenAI o1/o3、DeepSeek R1）
+ */
+export type ThinkingMode = 'NONE' | 'OPTIONAL' | 'FORCED';
+
 export interface LLMProviderConfig {
   name: string;
   displayName: string;
@@ -22,7 +30,13 @@ export interface LLMProviderConfig {
   apiKey: string;
   model: string;
   thinkingBudget: number; // 0 = 关闭 extended thinking
-  thinkingDepth: ThinkingDepth; // 数据库中的 thinkingDepth 字段
+  thinkingDepth: ThinkingDepth; // 数据库中的 thinkingDepth 字段（默认深度）
+  /** 模型的思考能力分类，决定 UI 展示和实际请求是否带 thinking 参数 */
+  thinkingMode: ThinkingMode;
+  /** 模型是否支持调节思考深度（low/medium/high）。false 时使用 thinkingDepth 固定值 */
+  supportsThinkingDepth: boolean;
+  /** 模型是否支持图片输入（多模态） */
+  supportsImage: boolean;
   maxTokens: number;
   /**
    * 模型输入上下文窗口（token）。从数据库 LlmModel.contextWindow 取，
@@ -40,10 +54,13 @@ export interface LLMProviderConfig {
   purpose?: LlmPurpose;
 }
 
-/** Thinking depth → thinking budget tokens 映射（仅 high 启用 extended thinking） */
+/**
+ * Thinking depth → Anthropic Extended Thinking 的 budget_tokens 映射。
+ * 仅当模型 thinkingMode != 'NONE' 且实际启用思考（FORCED 或 OPTIONAL+用户开）时使用。
+ */
 const THINKING_BUDGET_MAP: Record<ThinkingDepth, number> = {
-  low: 0,
-  medium: 0,
+  low: 2000,
+  medium: 5000,
   high: 10000,
 };
 const llmLogger = logger.child({ component: 'llm-gateway' });
@@ -70,6 +87,23 @@ export function parseProviders(): Record<string, LLMProviderConfig> {
     const name = get('NAME');
     if (!name) continue;
 
+    const isAnthropic = get('IS_ANTHROPIC') === 'true';
+    // 环境变量 fallback：缺省按 Anthropic = OPTIONAL+depth、其他 = NONE 推断；
+    // 用户可通过 THINKING_MODE / SUPPORTS_THINKING_DEPTH / SUPPORTS_IMAGE 覆盖
+    const envThinkingMode = (get('THINKING_MODE') || '').toUpperCase();
+    const thinkingMode: ThinkingMode =
+      envThinkingMode === 'FORCED' || envThinkingMode === 'OPTIONAL'
+        ? envThinkingMode
+        : isAnthropic
+          ? 'OPTIONAL'
+          : 'NONE';
+    const envSupportsDepth = get('SUPPORTS_THINKING_DEPTH').toLowerCase();
+    const supportsThinkingDepth =
+      envSupportsDepth === 'true' || envSupportsDepth === '1'
+        ? true
+        : envSupportsDepth === 'false' || envSupportsDepth === '0'
+          ? false
+          : isAnthropic;
     providers[name] = {
       name,
       displayName: get('DISPLAY_NAME'),
@@ -78,11 +112,14 @@ export function parseProviders(): Record<string, LLMProviderConfig> {
       model: get('MODEL'),
       thinkingBudget: parseInt(get('THINKING_BUDGET') || '0'),
       thinkingDepth: 'medium',
+      thinkingMode,
+      supportsThinkingDepth,
+      supportsImage: get('SUPPORTS_IMAGE') === 'true',
       maxTokens: parseInt(get('MAX_TOKENS') || '4096'),
       // 环境变量 fallback：未配置时默认 8192（保守值，与 Prisma schema 默认一致）
       contextWindow: parseInt(get('CONTEXT_WINDOW') || '8192'),
       temperature: parseFloat(get('TEMPERATURE') || '0.3'),
-      isAnthropic: get('IS_ANTHROPIC') === 'true',
+      isAnthropic,
     };
   }
   return providers;
@@ -92,6 +129,11 @@ export function parseProviders(): Record<string, LLMProviderConfig> {
 /*  数据库查询函数                                                      */
 /* ------------------------------------------------------------------ */
 
+function normalizeThinkingMode(value: unknown): ThinkingMode {
+  const v = typeof value === 'string' ? value.toUpperCase() : '';
+  return v === 'FORCED' || v === 'OPTIONAL' ? v : 'NONE';
+}
+
 /** 将数据库模型 + 供应商 转为 LLMProviderConfig */
 function dbModelToConfig(
   model: {
@@ -99,6 +141,9 @@ function dbModelToConfig(
     modelId: string;
     displayName: string;
     thinkingDepth: string;
+    thinkingMode: string;
+    supportsThinkingDepth: boolean;
+    supportsImage: boolean;
     maxTokens: number;
     contextWindow: number;
     temperature: number;
@@ -120,8 +165,11 @@ function dbModelToConfig(
     apiBase: model.provider.apiBase,
     apiKey: decrypt(model.provider.apiKey), // 解密存储的 API Key
     model: model.modelId,
-    thinkingBudget: THINKING_BUDGET_MAP[depth] ?? 0,
+    thinkingBudget: THINKING_BUDGET_MAP[depth] ?? THINKING_BUDGET_MAP.medium,
     thinkingDepth: depth,
+    thinkingMode: normalizeThinkingMode(model.thinkingMode),
+    supportsThinkingDepth: Boolean(model.supportsThinkingDepth),
+    supportsImage: Boolean(model.supportsImage),
     maxTokens: model.maxTokens,
     contextWindow: model.contextWindow,
     temperature: model.temperature,
@@ -231,18 +279,49 @@ export function getActiveProvider(): LLMProviderConfig {
 /*  Thinking budget 解析                                               */
 /* ------------------------------------------------------------------ */
 
-/** Resolve effective thinking budget for a request */
+/**
+ * 决定一次请求的有效思考深度：
+ *  - 模型不支持调节（supportsThinkingDepth=false）→ 模型默认值
+ *  - 用户没传 → 模型默认值
+ *  - 用户传了 → 用户值（合法时）
+ */
+function resolveEffectiveDepth(
+  provider: LLMProviderConfig,
+  requestedDepth?: ThinkingDepth
+): ThinkingDepth {
+  if (!provider.supportsThinkingDepth) {
+    return provider.thinkingDepth;
+  }
+  if (
+    requestedDepth === 'low' ||
+    requestedDepth === 'medium' ||
+    requestedDepth === 'high'
+  ) {
+    return requestedDepth;
+  }
+  return provider.thinkingDepth;
+}
+
+/**
+ * 计算实际请求要带的 Anthropic Extended Thinking budget_tokens。
+ *  thinkingMode = NONE                           → 0（不启用）
+ *  thinkingMode = OPTIONAL && enabled !== true   → 0（用户没开）
+ *  thinkingMode = OPTIONAL && enabled === true   → 按深度
+ *  thinkingMode = FORCED                         → 按深度（无视 enabled）
+ *
+ * 仅在 Anthropic 路径生效。OpenAI-compat 模型不发 thinking 参数（即使是 o1/R1），
+ * 服务器端会自然按模型本身的 reasoning 行为返回。
+ */
 function resolveThinkingBudget(
   provider: LLMProviderConfig,
-  depth?: ThinkingDepth
+  depth?: ThinkingDepth,
+  enabled?: boolean
 ): number {
-  // low / medium / 未指定：不启用 extended thinking
-  if (!depth || depth === 'low' || depth === 'medium') {
-    return 0;
-  }
-  // high：仅 Anthropic 支持 extended thinking
+  if (provider.thinkingMode === 'NONE') return 0;
+  if (provider.thinkingMode === 'OPTIONAL' && enabled !== true) return 0;
   if (!provider.isAnthropic) return 0;
-  return THINKING_BUDGET_MAP[depth];
+  const eff = resolveEffectiveDepth(provider, depth);
+  return THINKING_BUDGET_MAP[eff];
 }
 
 interface LLMCallUsage {
@@ -351,6 +430,8 @@ export async function callLLM(
   options?: {
     providerOverride?: string;
     thinkingDepth?: ThinkingDepth;
+    /** 用户是否显式开启思考（仅对 thinkingMode=OPTIONAL 模型生效） */
+    thinkingEnabled?: boolean;
     streamCallback?: (chunk: string) => void;
     /** 按用途查找（优先级高于 providerOverride） */
     purpose?: LlmPurpose;
@@ -371,7 +452,11 @@ export async function callLLM(
     provider = getActiveProvider();
   }
 
-  const budget = resolveThinkingBudget(provider, options?.thinkingDepth);
+  const budget = resolveThinkingBudget(
+    provider,
+    options?.thinkingDepth,
+    options?.thinkingEnabled
+  );
 
   return executeLoggedCall(
     provider,
@@ -401,6 +486,7 @@ export async function callLLMWithHistory(
   options: {
     providerOverride?: string;
     thinkingDepth?: ThinkingDepth;
+    thinkingEnabled?: boolean;
     purpose?: LlmPurpose;
     modelId?: string;
     detailed: true;
@@ -412,6 +498,8 @@ export async function callLLMWithHistory(
   options?: {
     providerOverride?: string;
     thinkingDepth?: ThinkingDepth;
+    /** 用户是否显式开启思考（仅对 thinkingMode=OPTIONAL 模型生效） */
+    thinkingEnabled?: boolean;
     /** 按用途查找 */
     purpose?: LlmPurpose;
     /** 按数据库模型 ID 查找 */
@@ -426,6 +514,7 @@ export async function callLLMWithHistory(
   options?: {
     providerOverride?: string;
     thinkingDepth?: ThinkingDepth;
+    thinkingEnabled?: boolean;
     purpose?: LlmPurpose;
     modelId?: string;
     detailed?: boolean;
@@ -444,7 +533,11 @@ export async function callLLMWithHistory(
     provider = getActiveProvider();
   }
 
-  const budget = resolveThinkingBudget(provider, options?.thinkingDepth);
+  const budget = resolveThinkingBudget(
+    provider,
+    options?.thinkingDepth,
+    options?.thinkingEnabled
+  );
   const ctx = {
     kind: 'history' as const,
     thinkingDepth: options?.thinkingDepth,

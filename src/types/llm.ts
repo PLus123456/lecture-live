@@ -39,6 +39,9 @@ export type LlmPurpose =
   | 'KEYWORD_EXTRACTION'
   | 'EMBEDDING';
 
+/** 思考模式（与后端 LlmModel.thinkingMode 一致） */
+export type ThinkingMode = 'NONE' | 'OPTIONAL' | 'FORCED';
+
 /** What the /api/llm/models endpoint returns per model */
 export interface ChatModelOption {
   /** 兼容标识 — 数据库模式下为 dbModelId，环境变量模式下为 provider name */
@@ -49,10 +52,23 @@ export interface ChatModelOption {
   modelId?: string;
   /** Human-readable label shown in UI */
   displayName: string;
-  /** Whether this model supports thinking depth selection */
+  /**
+   * 是否支持思考。等价于 `thinkingMode !== 'NONE'`。保留字段名兼容旧前端代码。
+   */
   supportsThinking: boolean;
-  /** Allowed thinking depths for this model */
+  /**
+   * 详细思考模式：
+   *  - 'NONE'     : 模型不支持思考，UI 隐藏开关与深度选择器
+   *  - 'OPTIONAL' : 用户可开关，UI 显示开关；开启时按 supportsThinkingDepth 决定是否显示深度
+   *  - 'FORCED'   : 模型自带思考无法关闭，UI 不显示开关，按 supportsThinkingDepth 决定是否显示深度
+   */
+  thinkingMode: ThinkingMode;
+  /** 是否允许调节思考深度 */
+  supportsThinkingDepth: boolean;
+  /** Allowed thinking depths for this model（不支持调节时为该模型的固定深度） */
   allowedDepths: ThinkingDepth[];
+  /** 是否支持图片输入（多模态） */
+  supportsImage: boolean;
   /** 模型用途 */
   purpose?: LlmPurpose;
 }

@@ -128,6 +128,10 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
         ? requestedDepth
         : 'medium';
 
+    // 用户是否显式开启 thinking（仅对 OPTIONAL 模型生效；其他模式由 gateway 自身决定）
+    const requestedThinkingEnabled =
+      typeof body.thinkingEnabled === 'boolean' ? body.thinkingEnabled : false;
+
     // ── 验证 conversation 归属 ──
     const conversation = await prisma.conversation.findUnique({
       where: { id: conversationId },
@@ -246,6 +250,7 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
         llmResponse = await callLLMWithHistory(ctx.systemPrompt, ctx.messages, {
           ...buildLlmRoutingOptions(selection, 'CHAT'),
           thinkingDepth: finalDepth,
+          thinkingEnabled: requestedThinkingEnabled,
           detailed: true,
         });
         break;

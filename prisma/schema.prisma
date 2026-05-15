@@ -245,12 +245,14 @@ model LlmModel {
   displayName   String                          // 显示名称
   // 思考能力控制：
   //  thinkingMode:
-  //    NONE     - 不支持思考（GPT-3.5、文本生成模型）
-  //    OPTIONAL - 用户可以开/关思考（Claude Extended Thinking）
-  //    FORCED   - 模型自带思考无法关闭（OpenAI o1/o3、DeepSeek R1）
-  //  supportsThinkingDepth - 是否支持调节思考深度（low/medium/high）
-  //  thinkingDepth - 默认深度（不支持调节时也作为固定值使用）
-  thinkingMode          String  @default("NONE")     // "NONE" | "OPTIONAL" | "FORCED"
+  //    NONE   - 不支持思考（GPT-3.5、文本生成模型）
+  //    AUTO   - 模型自己决定是否思考，请求不带任何 thinking/reasoning 参数（GLM-4.5/DeepSeek-V3 等）
+  //    FORCED - 模型自带思考无法关闭（OpenAI o-series、DeepSeek R1）；UI 仍允许 auto/forced
+  //    DEPTH  - 支持深度思考（Claude Extended Thinking、OpenAI gpt-5 系列 reasoning_effort）；
+  //             允许用户选 off/low/medium/high
+  //  supportsThinkingDepth - DEPRECATED：被 thinkingMode='DEPTH' 取代，保留字段用于向后兼容
+  //  thinkingDepth - 默认深度（DEPTH 模式下作为 fallback；AUTO/FORCED 模式下作为请求的 effort 默认值）
+  thinkingMode          String  @default("NONE")     // "NONE" | "AUTO" | "FORCED" | "DEPTH"
   supportsThinkingDepth Boolean @default(false)
   thinkingDepth         String  @default("medium")   // "low" | "medium" | "high"
   // 输入能力：是否接受图片输入（多模态）

@@ -5,6 +5,7 @@ import {
   callLLM,
   callLLMWithHistory,
   getProviderForPurpose,
+  type ThinkingPreference,
 } from '@/lib/llm/gateway';
 import { buildChatPrompt } from '@/lib/llm/prompts';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
@@ -128,9 +129,19 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
         ? requestedDepth
         : 'medium';
 
-    // 用户是否显式开启 thinking（仅对 OPTIONAL 模型生效；其他模式由 gateway 自身决定）
-    const requestedThinkingEnabled =
-      typeof body.thinkingEnabled === 'boolean' ? body.thinkingEnabled : false;
+    // 把请求体的 thinkingDepth + thinkingEnabled 三态映射成 gateway 的 ThinkingPreference：
+    //   缺省字段           → auto（让模型/网关自行决定）
+    //   thinkingEnabled=false → off（明确不思考）
+    //   thinkingEnabled=true + depth → depth（DEPTH 模式选档位）
+    //   thinkingEnabled=true 无 depth → forced（强制思考但用模型默认深度）
+    const hasThinkingFlag = typeof body.thinkingEnabled === 'boolean';
+    const thinkingPreference: ThinkingPreference = !hasThinkingFlag
+      ? 'auto'
+      : body.thinkingEnabled === false
+        ? 'off'
+        : requestedDepth && VALID_DEPTHS.includes(requestedDepth)
+          ? requestedDepth
+          : 'forced';
 
     // ── 验证 conversation 归属 ──
     const conversation = await prisma.conversation.findUnique({
@@ -182,6 +193,15 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
       depth,
       selection.providerConfig
     );
+
+    // 把请求里带具体档位的 preference 替换为受 access.ts 钳制后的 finalDepth
+    // （FREE 用户的 high → medium）。auto/off/forced 不带档位，保持原样。
+    const effectivePreference: ThinkingPreference =
+      thinkingPreference === 'low' ||
+      thinkingPreference === 'medium' ||
+      thinkingPreference === 'high'
+        ? finalDepth
+        : thinkingPreference;
 
     // 拿到 contextWindow 用于预算
     // 复用 access.ts 已经解析好的 providerConfig（modelId / providerName 路径都会填充），
@@ -249,8 +269,7 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
 
         llmResponse = await callLLMWithHistory(ctx.systemPrompt, ctx.messages, {
           ...buildLlmRoutingOptions(selection, 'CHAT'),
-          thinkingDepth: finalDepth,
-          thinkingEnabled: requestedThinkingEnabled,
+          thinkingPreference: effectivePreference,
           detailed: true,
         });
         break;

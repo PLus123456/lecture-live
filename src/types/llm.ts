@@ -58,9 +58,11 @@ export interface ChatModelOption {
   /** Human-readable label shown in UI */
   displayName: string;
   /**
-   * 是否支持思考。等价于 `thinkingMode !== 'NONE'`。保留字段名兼容旧前端代码。
+   * @deprecated 用 `thinkingMode !== 'NONE'` 代替。保留输出仅为兼容旧前端代码。
    */
   supportsThinking: boolean;
+  /** 模型思考能力分类，决定底部"思考"按钮 popover 的选项集 */
+  thinkingMode: ThinkingMode;
   /**
    * 详细思考模式：
    *  - 'NONE'   : 模型不思考，UI 隐藏开关与深度选择器
@@ -68,10 +70,8 @@ export interface ChatModelOption {
    *  - 'FORCED' : 模型自带思考无法关闭，UI 不显示开关；按固定深度（thinking_budget）发送
    *  - 'DEPTH'  : 模型支持思考且允许用户在 chat 端调节深度（低/中/高）
    */
-  thinkingMode: ThinkingMode;
-  /** 是否允许调节思考深度 */
   supportsThinkingDepth: boolean;
-  /** Allowed thinking depths for this model（不支持调节时为该模型的固定深度） */
+  /** Allowed thinking depths for this model（仅 mode='DEPTH' 时非空） */
   allowedDepths: ThinkingDepth[];
   /** 是否支持图片输入（多模态） */
   supportsImage: boolean;

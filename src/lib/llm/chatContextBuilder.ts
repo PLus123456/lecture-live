@@ -60,8 +60,11 @@ export interface ChatContextInput {
   minLevel: DegradationLevel;
   /** 输入 token 预算，超过则升级 */
   inputBudget: number;
-  /** 基础 system prompt（如 buildChatPrompt 的输出），降级链会在它之上追加时间锚点 */
-  baseSystemPrompt: string;
+  /** 根据每级降级得到的 transcript/summary 生成最终 chat system prompt */
+  buildSystemPrompt: (
+    transcriptContext: string,
+    summaryContext: string
+  ) => string;
   /** 用于压缩历史的 LLM 调用 */
   callLLM: (system: string, user: string) => Promise<string>;
   /** 输出语言（用于压缩 prompt） */
@@ -252,7 +255,7 @@ export async function compressHistory(input: {
 /* ------------------------------------------------------------------ */
 
 interface BuildState {
-  baseSystemPrompt: string;
+  buildSystemPrompt: ChatContextInput['buildSystemPrompt'];
   timeAnchor: string;
   transcript: ReadonlyArray<TranscriptSegment>;
   summary: string;
@@ -272,7 +275,11 @@ function assembleOutput(
   finalHistory: ReadonlyArray<ConversationTurn>,
   compressedHeader?: string
 ): ChatContextOutput {
-  const segments = [state.baseSystemPrompt];
+  const contextSystemPrompt = state.buildSystemPrompt(
+    transcriptText,
+    summaryText
+  );
+  const segments = [contextSystemPrompt];
   if (state.timeAnchor) segments.push(state.timeAnchor);
   if (compressedHeader) {
     segments.push(
@@ -286,8 +293,11 @@ function assembleOutput(
     { role: 'user' as const, content: state.userInput },
   ];
 
+  const messageTokens =
+    finalHistory.reduce((acc, m) => acc + estimateTokens(m.content), 0) +
+    estimateTokens(state.userInput);
   const breakdown: TokenBreakdown = {
-    systemPrompt: estimateTokens(state.baseSystemPrompt),
+    systemPrompt: estimateTokens(state.buildSystemPrompt('', '')),
     timeAnchor: estimateTokens(state.timeAnchor),
     transcript: estimateTokens(transcriptText),
     summary: estimateTokens(summaryText),
@@ -295,15 +305,8 @@ function assembleOutput(
       (compressedHeader ? estimateTokens(compressedHeader) : 0) +
       finalHistory.reduce((acc, m) => acc + estimateTokens(m.content), 0),
     userInput: estimateTokens(state.userInput),
-    total: 0,
+    total: estimateTokens(systemPrompt) + messageTokens,
   };
-  breakdown.total =
-    breakdown.systemPrompt +
-    breakdown.timeAnchor +
-    breakdown.transcript +
-    breakdown.summary +
-    breakdown.history +
-    breakdown.userInput;
 
   return { systemPrompt, messages, level, breakdown };
 }
@@ -322,7 +325,7 @@ export async function buildChatContext(
   );
 
   const state: BuildState = {
-    baseSystemPrompt: input.baseSystemPrompt,
+    buildSystemPrompt: input.buildSystemPrompt,
     timeAnchor,
     transcript: input.transcript,
     summary: input.summary,

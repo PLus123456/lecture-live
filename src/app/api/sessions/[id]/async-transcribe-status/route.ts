@@ -18,6 +18,7 @@ import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership } from '@/lib/security';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { persistSessionTranscriptArtifacts } from '@/lib/sessionPersistence';
+import { getTranscodingProgress } from '@/lib/audio/asyncUploadProcessor';
 import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
 import {
   deleteSonioxFile,
@@ -73,12 +74,19 @@ export async function GET(
     });
   }
 
-  // 还没到 transcribing（仍在合并/转码/上传），不动 Soniox，直接返回当前状态
+  // 还没到 transcribing（仍在合并/转码/上传），不动 Soniox，直接返回当前状态。
+  // transcoding 阶段额外带上 ffmpeg 实时进度，让前端进度条能动起来。
   if (
     session.asyncTranscribeStatus !== 'transcribing' ||
     !session.sonioxTranscriptionId
   ) {
-    return NextResponse.json({ status: session.asyncTranscribeStatus });
+    const payload: { status: string; processingProgress?: number } = {
+      status: session.asyncTranscribeStatus,
+    };
+    if (session.asyncTranscribeStatus === 'transcoding') {
+      payload.processingProgress = getTranscodingProgress(session.id);
+    }
+    return NextResponse.json(payload);
   }
 
   // ── poll Soniox ──

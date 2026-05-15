@@ -27,6 +27,8 @@ interface StartOptions {
   sessionId: string;
   authToken: string;
   onUploadProgress?: (fraction: number) => void;
+  /** 后端处理阶段（目前仅 transcoding）的子进度 0~1，由 status route 推送 */
+  onProcessingProgress?: (fraction: number) => void;
   onStatusChange?: (status: AsyncUploadStatus) => void;
   signal?: AbortSignal;
 }
@@ -47,6 +49,19 @@ export function startAsyncUpload(opts: StartOptions): {
     : abort.signal;
 
   const promise = (async (): Promise<StartResult> => {
+    try {
+      return await runPipeline();
+    } catch (err) {
+      // cancel 路径：abort signal 触发后，sleep / fetch 会抛 AbortError。
+      // 这里统一转成 canceled 结果，避免被上层当作失败弹错 toast。
+      if (composed.aborted) {
+        return { sessionId: opts.sessionId, finalStatus: 'canceled' };
+      }
+      throw err;
+    }
+  })();
+
+  async function runPipeline(): Promise<StartResult> {
     const totalChunks = Math.max(1, Math.ceil(opts.file.size / CHUNK_SIZE));
 
     // ── 1. init ──
@@ -125,6 +140,7 @@ export function startAsyncUpload(opts: StartOptions): {
       const body = (await res.json()) as {
         status: AsyncUploadStatus | null;
         error?: string;
+        processingProgress?: number;
       };
 
       if (!body.status) {
@@ -135,6 +151,16 @@ export function startAsyncUpload(opts: StartOptions): {
       if (body.status !== lastStatus) {
         lastStatus = body.status;
         opts.onStatusChange?.(lastStatus);
+      }
+
+      // transcoding 阶段把后端 ffmpeg 实时进度透传给上层
+      if (
+        typeof body.processingProgress === 'number' &&
+        Number.isFinite(body.processingProgress)
+      ) {
+        opts.onProcessingProgress?.(
+          Math.min(1, Math.max(0, body.processingProgress))
+        );
       }
 
       if (body.status === 'completed') {
@@ -151,7 +177,7 @@ export function startAsyncUpload(opts: StartOptions): {
         return { sessionId: opts.sessionId, finalStatus: 'canceled' };
       }
     }
-  })();
+  }
 
   return {
     promise,

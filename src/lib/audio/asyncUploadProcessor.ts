@@ -26,6 +26,7 @@ import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
 import {
   createSonioxTranscription,
   deleteSonioxFile,
+  deleteSonioxTranscription,
   uploadSonioxFile,
   type SonioxTranslationConfig,
 } from '@/lib/soniox/asyncFile';
@@ -44,6 +45,23 @@ interface ProcessOptions {
   sessionId: string;
 }
 
+/**
+ * transcoding 阶段的 ffmpeg 实时进度。status route 读取并返回给前端做进度条。
+ * 内存 map 在 dev 和 prod（单 Next 进程）都够用；多进程部署需要换成 Redis。
+ */
+const transcodingProgressMap = new Map<string, number>();
+
+export function getTranscodingProgress(sessionId: string): number {
+  return transcodingProgressMap.get(sessionId) ?? 0;
+}
+
+/**
+ * 更新 session 状态。
+ *
+ * 用 updateMany WHERE asyncTranscribeStatus NOT IN ('canceled', 'failed', 'completed')
+ * 而不是裸 update —— 一旦 session 已经被用户取消（cancelAsyncUpload 设了 canceled）
+ * 或前序步骤标失败，后续 setStatus 不应再把状态打回去。
+ */
 async function setStatus(
   sessionId: string,
   status: AsyncTranscribeStatus,
@@ -54,14 +72,18 @@ async function setStatus(
     durationMs: number;
     asyncTranscribeError: string | null;
   }> = {}
-) {
-  await prisma.session.update({
-    where: { id: sessionId },
+): Promise<boolean> {
+  const result = await prisma.session.updateMany({
+    where: {
+      id: sessionId,
+      asyncTranscribeStatus: { notIn: ['canceled', 'failed', 'completed'] },
+    },
     data: {
       asyncTranscribeStatus: status,
       ...extra,
     },
   });
+  return result.count === 1;
 }
 
 /**
@@ -79,16 +101,24 @@ export function startAsyncUploadProcessing(opts: ProcessOptions): void {
   });
 }
 
+/**
+ * 如果 setStatus 返回 false（被取消/已失败/已完成），抛 PipelineHaltError 让
+ * 外层捕获后**不再覆盖**最终状态，也不当错误上报。
+ */
+class PipelineHaltError extends Error {
+  constructor() {
+    super('Pipeline halted: session no longer in active state');
+    this.name = 'PipelineHaltError';
+  }
+}
+
 async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
   const session = await prisma.session.findUnique({ where: { id: opts.sessionId } });
   if (!session) throw new Error('Session not found');
 
-  let mergedPath: string | null = null;
-  let mp3Path: string | null = null;
-
   try {
     // ── 1. merge chunks ──
-    await setStatus(session.id, 'transcoding');
+    if (!(await setStatus(session.id, 'transcoding'))) throw new PipelineHaltError();
     const manifest = await loadAsyncUploadManifest(session);
     if (!manifest) throw new Error('Upload manifest missing');
     if (manifest.receivedSeqs.length !== manifest.totalChunks) {
@@ -97,7 +127,7 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
       );
     }
     const merged = await mergeAsyncUploadChunks(session);
-    mergedPath = merged.filePath;
+    const mergedPath = merged.filePath;
 
     // ── 2. probe duration ──
     const durationSec = await probeDurationSec(mergedPath);
@@ -112,23 +142,35 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     }
 
     // ── 3. ffmpeg → mp3 ──
-    mp3Path = path.join(path.dirname(mergedPath), 'audio.mp3');
-    await transcodeToMp3({
-      inputPath: mergedPath,
-      outputPath: mp3Path,
-      durationSec,
-      bitrateKbps: 128,
-    });
+    const mp3Path = path.join(path.dirname(mergedPath), 'audio.mp3');
+    transcodingProgressMap.set(session.id, 0);
+    try {
+      await transcodeToMp3({
+        inputPath: mergedPath,
+        outputPath: mp3Path,
+        durationSec,
+        bitrateKbps: 128,
+        onProgress: (fraction) => {
+          transcodingProgressMap.set(session.id, fraction);
+        },
+      });
+    } finally {
+      transcodingProgressMap.delete(session.id);
+    }
 
     // ── 4. persist mp3 → session storage (for playback) ──
     const mp3Buffer = await fs.readFile(mp3Path);
     const stored = await persistSessionAudioArtifact(session, mp3Buffer, 'audio/mpeg');
 
     const durationMs = Math.round(durationSec * 1000);
-    await setStatus(session.id, 'uploading_to_soniox', {
-      recordingPath: stored.path,
-      durationMs,
-    });
+    if (
+      !(await setStatus(session.id, 'uploading_to_soniox', {
+        recordingPath: stored.path,
+        durationMs,
+      }))
+    ) {
+      throw new PipelineHaltError();
+    }
     await invalidateSessionsApiCache(session.userId);
 
     // ── 5. upload to Soniox ──
@@ -140,9 +182,15 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
       clientReferenceId: session.id,
     });
 
-    await setStatus(session.id, 'uploading_to_soniox', {
-      sonioxFileId: sonioxFile.id,
-    });
+    if (
+      !(await setStatus(session.id, 'uploading_to_soniox', {
+        sonioxFileId: sonioxFile.id,
+      }))
+    ) {
+      // 状态已变（取消/失败）—— 把刚上传的 Soniox 文件清掉，避免泄漏配额
+      await deleteSonioxFile(sonioxConfig, sonioxFile.id).catch(() => undefined);
+      throw new PipelineHaltError();
+    }
 
     // ── 6. create transcription ──
     const translation: SonioxTranslationConfig | undefined =
@@ -158,18 +206,31 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
       clientReferenceId: session.id,
     });
 
-    await setStatus(session.id, 'transcribing', {
-      sonioxTranscriptionId: job.id,
-    });
+    if (
+      !(await setStatus(session.id, 'transcribing', {
+        sonioxTranscriptionId: job.id,
+      }))
+    ) {
+      // 取消发生在 createTranscription 之后：清 Soniox 端 transcription + file
+      await deleteSonioxTranscription(sonioxConfig, job.id).catch(() => undefined);
+      await deleteSonioxFile(sonioxConfig, sonioxFile.id).catch(() => undefined);
+      throw new PipelineHaltError();
+    }
 
     // ── 7. cleanup local upload dir（chunks + merged + mp3） ──
     await deleteAsyncUpload(session);
   } catch (error) {
+    // 取消导致的提前退出：状态由 cancelAsyncUpload 维护，这里不覆盖
+    if (error instanceof PipelineHaltError) {
+      await deleteAsyncUpload(session).catch(() => undefined);
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     logger.error(
       { sessionId: session.id, err: error },
       'async upload pipeline failed'
     );
+    // setStatus 自带 notIn guard：如果用户已经取消，这里不会把 canceled 改成 failed
     try {
       await setStatus(session.id, 'failed', { asyncTranscribeError: message });
     } catch (innerErr) {
@@ -187,20 +248,28 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     }
     throw error;
   } finally {
-    // 局部变量本来就是 path 引用，文件由 deleteAsyncUpload 统一删
-    void mergedPath;
-    void mp3Path;
+    transcodingProgressMap.delete(session.id);
   }
 }
 
 /**
- * 取消正在进行的 async 上传。把 session 标为 canceled 并清理本地文件。
- * 已上传到 Soniox 的文件也尽力清理。
+ * 取消正在进行的 async 上传。
+ *
+ * - session.asyncTranscribeStatus → 'canceled'
+ * - sonioxFileId / sonioxTranscriptionId 清空（避免 cron 误删已被回收的资源，
+ *   也避免 status route 在终态后还试图 poll Soniox）
+ * - 本地 chunks/merged/mp3 立刻删
+ * - 内存中的 transcoding progress 立刻清
+ * - Soniox 上的文件也尽力删
  */
 export async function cancelAsyncUpload(
   session: Pick<Session, 'id' | 'sonioxFileId'>
 ): Promise<void> {
-  await setStatus(session.id, 'canceled');
+  await setStatus(session.id, 'canceled', {
+    sonioxFileId: null,
+    sonioxTranscriptionId: null,
+  });
+  transcodingProgressMap.delete(session.id);
   await deleteAsyncUpload({ id: session.id }).catch(() => undefined);
   if (session.sonioxFileId) {
     const config = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);

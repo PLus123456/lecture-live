@@ -37,10 +37,12 @@ export interface UploadJob {
   estimatedDurationMs?: number;
   startedAt?: number;
   status: UploadJobStatus;
-  /** 总体进度 0~1，从 status + uploadProgress 派生 */
+  /** 总体进度 0~1，从 status + uploadProgress / processingProgress 派生 */
   progress: number;
   /** 分片上传进度 0~1（已上传分片数 / 总分片数） */
   uploadProgress: number;
+  /** 后端处理子进度 0~1。目前 transcoding 阶段用 ffmpeg 实时进度填充 */
+  processingProgress: number;
   sessionId?: string;
   errorMessage?: string;
   // 用户配置
@@ -52,7 +54,7 @@ export interface UploadJob {
 interface UploadJobsStore {
   jobs: Record<string, UploadJob>;
   create: (
-    input: Omit<UploadJob, 'id' | 'status' | 'progress' | 'uploadProgress'>
+    input: Omit<UploadJob, 'id' | 'status' | 'progress' | 'uploadProgress' | 'processingProgress'>
   ) => string;
   update: (id: string, patch: Partial<UploadJob>) => void;
   remove: (id: string) => void;
@@ -88,7 +90,10 @@ function computeProgress(job: UploadJob): number {
   if (job.status === 'uploading_chunks') {
     return start + (end - start) * Math.min(1, Math.max(0, job.uploadProgress));
   }
-  // 其它阶段没有精细子进度，停在区间起点 + 一点点偏移示意"在跑"
+  if (job.status === 'transcoding') {
+    return start + (end - start) * Math.min(1, Math.max(0, job.processingProgress));
+  }
+  // 其它阶段没有精细子进度，停在区间起点
   return start;
 }
 
@@ -103,6 +108,7 @@ export const useUploadJobsStore = create<UploadJobsStore>((set, get) => ({
       status: 'pending',
       progress: 0,
       uploadProgress: 0,
+      processingProgress: 0,
     };
     set((state) => ({ jobs: { ...state.jobs, [id]: job } }));
     return id;
@@ -113,6 +119,10 @@ export const useUploadJobsStore = create<UploadJobsStore>((set, get) => ({
       const existing = state.jobs[id];
       if (!existing) return state;
       const merged: UploadJob = { ...existing, ...patch };
+      // 进入新阶段时把上一阶段的子进度清零，避免遗留值污染显示
+      if (patch.status && patch.status !== existing.status && patch.processingProgress === undefined) {
+        merged.processingProgress = 0;
+      }
       merged.progress = computeProgress(merged);
       return { jobs: { ...state.jobs, [id]: merged } };
     }),

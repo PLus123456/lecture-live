@@ -28,17 +28,25 @@ export interface ChatTokenUsage {
   };
 }
 
+/**
+ * 用户对一次请求的思考偏好。前端把 selectedDepth + selectedThinkingEnabled 合成一个单一字段：
+ *  - off            : 不思考
+ *  - low/medium/high: DEPTH 模型上选的档位
+ *  - forced         : 强制思考（DEPTH 模型用模型默认深度；FORCED/AUTO 模型一致）
+ *  - auto           : 让模型/网关自决，请求不带 thinking 参数
+ */
+export type ThinkingPreference =
+  | 'off'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'forced'
+  | 'auto';
+
 interface ChatStore {
   // ── 用户偏好（持久化） ──
   selectedModel: string;
-  selectedDepth: ThinkingDepth;
-  /**
-   * 用户是否显式开启 thinking。
-   *  - 模型 thinkingMode='OPTIONAL' 时，决定是否带 thinking 参数
-   *  - 模型 thinkingMode='FORCED'   时，UI 不展示开关，发送方仍传 true（无效但无副作用）
-   *  - 模型 thinkingMode='NONE'     时，前端忽略此值
-   */
-  selectedThinkingEnabled: boolean;
+  selectedThinkingPreference: ThinkingPreference;
 
   // ── 运行时状态（不持久化） ──
   isLoading: boolean;
@@ -61,8 +69,7 @@ interface ChatStore {
   // ── Setters ──
   setLoading: (loading: boolean) => void;
   setSelectedModel: (model: string) => void;
-  setSelectedDepth: (depth: ThinkingDepth) => void;
-  setSelectedThinkingEnabled: (enabled: boolean) => void;
+  setSelectedThinkingPreference: (pref: ThinkingPreference) => void;
   setAvailableModels: (models: ChatModelOption[], defaultModel: string) => void;
 
   setActiveConversation: (id: string | null) => void;
@@ -91,19 +98,46 @@ const initialRuntimeState = {
   contextFull: false,
 } as const;
 
+const DEFAULT_PREFERENCE: ThinkingPreference = 'auto';
+
+/**
+ * 旧 persist schema 兼容：把 selectedThinkingEnabled + selectedDepth 合并成
+ * 新的 selectedThinkingPreference 字段，向前端保留单一信息源。
+ * 旧字段读到后不再写回（partialize 只持久化新字段）。
+ */
+function migrateLegacyThinking(state: unknown): ThinkingPreference {
+  if (!state || typeof state !== 'object') return DEFAULT_PREFERENCE;
+  const s = state as Record<string, unknown>;
+  if (
+    s.selectedThinkingPreference === 'off' ||
+    s.selectedThinkingPreference === 'low' ||
+    s.selectedThinkingPreference === 'medium' ||
+    s.selectedThinkingPreference === 'high' ||
+    s.selectedThinkingPreference === 'forced' ||
+    s.selectedThinkingPreference === 'auto'
+  ) {
+    return s.selectedThinkingPreference;
+  }
+  if (s.selectedThinkingEnabled === false) return 'off';
+  if (s.selectedThinkingEnabled === true) {
+    const depth = s.selectedDepth;
+    if (depth === 'low' || depth === 'medium' || depth === 'high') return depth;
+    return 'forced';
+  }
+  return DEFAULT_PREFERENCE;
+}
+
 export const useChatStore = create<ChatStore>()(
   persist(
     (set) => ({
       selectedModel: '',
-      selectedDepth: 'medium',
-      selectedThinkingEnabled: false,
+      selectedThinkingPreference: DEFAULT_PREFERENCE,
       ...initialRuntimeState,
 
       setLoading: (isLoading) => set({ isLoading }),
       setSelectedModel: (selectedModel) => set({ selectedModel }),
-      setSelectedDepth: (selectedDepth) => set({ selectedDepth }),
-      setSelectedThinkingEnabled: (selectedThinkingEnabled) =>
-        set({ selectedThinkingEnabled }),
+      setSelectedThinkingPreference: (selectedThinkingPreference) =>
+        set({ selectedThinkingPreference }),
 
       setAvailableModels: (availableModels, defaultModel) =>
         set((state) => ({
@@ -144,13 +178,44 @@ export const useChatStore = create<ChatStore>()(
     }),
     {
       name: 'lecture-live-chat-prefs',
+      version: 2,
       storage: createJSONStorage(() => localStorage),
       // 只持久化用户偏好；conversation 数据每次进入页面从 API 拉
       partialize: (state) => ({
         selectedModel: state.selectedModel,
-        selectedDepth: state.selectedDepth,
-        selectedThinkingEnabled: state.selectedThinkingEnabled,
+        selectedThinkingPreference: state.selectedThinkingPreference,
       }),
+      // v1 → v2: 把 selectedDepth + selectedThinkingEnabled 合并为 selectedThinkingPreference
+      migrate: (persisted, version) => {
+        if (version < 2) {
+          const pref = migrateLegacyThinking(persisted);
+          const selectedModel =
+            typeof (persisted as Record<string, unknown>)?.selectedModel === 'string'
+              ? ((persisted as Record<string, unknown>).selectedModel as string)
+              : '';
+          return { selectedModel, selectedThinkingPreference: pref };
+        }
+        return persisted;
+      },
     }
   )
 );
+
+/** ThinkingDepth × Boolean 解构（给 useChat 用，避免 import 类型链路绕一圈） */
+export function preferenceToFields(pref: ThinkingPreference): {
+  thinkingDepth?: ThinkingDepth;
+  thinkingEnabled?: boolean;
+} {
+  switch (pref) {
+    case 'off':
+      return { thinkingEnabled: false };
+    case 'low':
+    case 'medium':
+    case 'high':
+      return { thinkingEnabled: true, thinkingDepth: pref };
+    case 'forced':
+      return { thinkingEnabled: true };
+    case 'auto':
+      return {};
+  }
+}

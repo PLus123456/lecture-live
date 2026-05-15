@@ -117,7 +117,7 @@ export async function resolveAuthorizedLlmSelection(
 /**
  * 决定最终发给 gateway 的 thinkingDepth：
  *  - FREE 用户禁止 high（成本高）
- *  - 模型不支持调节深度时，强制使用模型默认深度
+ *  - 模型不是 DEPTH 模式时，深度参数无意义，回落到模型默认深度
  *  - 否则按用户请求
  */
 export function resolveEffectiveThinkingDepth(
@@ -128,7 +128,7 @@ export function resolveEffectiveThinkingDepth(
   const clampedDepth =
     role === 'FREE' && requestedDepth === 'high' ? 'medium' : requestedDepth;
 
-  if (providerConfig && !providerConfig.supportsThinkingDepth) {
+  if (providerConfig && providerConfig.thinkingMode !== 'DEPTH') {
     return providerConfig.thinkingDepth;
   }
 

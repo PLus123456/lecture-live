@@ -16,12 +16,27 @@ function sanitizeApiError(text: string, maxLen = 200): string {
 /* ------------------------------------------------------------------ */
 
 /**
- * 思考模式：
- *  NONE     - 不支持思考
- *  OPTIONAL - 用户可选（Claude Extended Thinking）
- *  FORCED   - 模型自带思考无法关闭（OpenAI o1/o3、DeepSeek R1）
+ * 思考模式（4 值）：
+ *  NONE   - 模型不支持思考，请求不带 thinking/reasoning 参数
+ *  AUTO   - 模型自己决定是否思考（GLM-4.5、DeepSeek-V3），请求不带参数
+ *  FORCED - 模型自带思考无法关闭（o1/R1），OpenAI-compat 不发 reasoning_effort
+ *  DEPTH  - 支持深度思考（Claude Extended Thinking、gpt-5），用户可调 off/low/med/high
  */
-export type ThinkingMode = 'NONE' | 'OPTIONAL' | 'FORCED';
+export type ThinkingMode = 'NONE' | 'AUTO' | 'FORCED' | 'DEPTH';
+
+/**
+ * 用户对一次请求的思考偏好（由前端拆出来的 selectedThinkingPreference 直传到 gateway）：
+ *  off / low / medium / high — 用户在 DEPTH 模型上选的具体档位
+ *  forced                    — 强制思考（不指定深度，用模型默认）
+ *  auto                      — 让模型自己决定，不发任何 thinking 参数
+ */
+export type ThinkingPreference =
+  | 'off'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'forced'
+  | 'auto';
 
 export interface LLMProviderConfig {
   name: string;
@@ -29,11 +44,13 @@ export interface LLMProviderConfig {
   apiBase: string;
   apiKey: string;
   model: string;
-  thinkingBudget: number; // 0 = 关闭 extended thinking
   thinkingDepth: ThinkingDepth; // 数据库中的 thinkingDepth 字段（默认深度）
   /** 模型的思考能力分类，决定 UI 展示和实际请求是否带 thinking 参数 */
   thinkingMode: ThinkingMode;
-  /** 模型是否支持调节思考深度（low/medium/high）。false 时使用 thinkingDepth 固定值 */
+  /**
+   * @deprecated 与 thinkingMode='DEPTH' 等价，保留字段是为了不破坏 admin 后台 API。
+   * 新逻辑只看 thinkingMode。
+   */
   supportsThinkingDepth: boolean;
   /** 模型是否支持图片输入（多模态） */
   supportsImage: boolean;
@@ -56,7 +73,7 @@ export interface LLMProviderConfig {
 
 /**
  * Thinking depth → Anthropic Extended Thinking 的 budget_tokens 映射。
- * 仅当模型 thinkingMode != 'NONE' 且实际启用思考（FORCED 或 OPTIONAL+用户开）时使用。
+ * 仅当 thinkingMode='DEPTH' 实际启用思考时使用。
  */
 const THINKING_BUDGET_MAP: Record<ThinkingDepth, number> = {
   low: 2000,
@@ -68,6 +85,19 @@ const llmLogger = logger.child({ component: 'llm-gateway' });
 /* ------------------------------------------------------------------ */
 /*  环境变量 fallback（保留向后兼容）                                      */
 /* ------------------------------------------------------------------ */
+
+/** 把任意字符串规范成 4 值 ThinkingMode；接受旧 'OPTIONAL'，按 isAnthropic 推断 */
+function parseThinkingMode(value: unknown, isAnthropic: boolean): ThinkingMode {
+  const v = typeof value === 'string' ? value.toUpperCase() : '';
+  if (v === 'NONE' || v === 'AUTO' || v === 'FORCED' || v === 'DEPTH') {
+    return v;
+  }
+  // 'OPTIONAL' 是旧 schema 值；按是否能调节深度推断
+  if (v === 'OPTIONAL') {
+    return isAnthropic ? 'DEPTH' : 'AUTO';
+  }
+  return isAnthropic ? 'DEPTH' : 'NONE';
+}
 
 /** 从环境变量解析所有 provider 配置（fallback 用） */
 export function parseProviders(): Record<string, LLMProviderConfig> {
@@ -88,32 +118,17 @@ export function parseProviders(): Record<string, LLMProviderConfig> {
     if (!name) continue;
 
     const isAnthropic = get('IS_ANTHROPIC') === 'true';
-    // 环境变量 fallback：缺省按 Anthropic = OPTIONAL+depth、其他 = NONE 推断；
-    // 用户可通过 THINKING_MODE / SUPPORTS_THINKING_DEPTH / SUPPORTS_IMAGE 覆盖
-    const envThinkingMode = (get('THINKING_MODE') || '').toUpperCase();
-    const thinkingMode: ThinkingMode =
-      envThinkingMode === 'FORCED' || envThinkingMode === 'OPTIONAL'
-        ? envThinkingMode
-        : isAnthropic
-          ? 'OPTIONAL'
-          : 'NONE';
-    const envSupportsDepth = get('SUPPORTS_THINKING_DEPTH').toLowerCase();
-    const supportsThinkingDepth =
-      envSupportsDepth === 'true' || envSupportsDepth === '1'
-        ? true
-        : envSupportsDepth === 'false' || envSupportsDepth === '0'
-          ? false
-          : isAnthropic;
+    const thinkingMode = parseThinkingMode(get('THINKING_MODE'), isAnthropic);
     providers[name] = {
       name,
       displayName: get('DISPLAY_NAME'),
       apiBase: get('API_BASE'),
       apiKey: get('API_KEY'),
       model: get('MODEL'),
-      thinkingBudget: parseInt(get('THINKING_BUDGET') || '0'),
       thinkingDepth: 'medium',
       thinkingMode,
-      supportsThinkingDepth,
+      // 派生字段：保留兼容输出，admin 后台/旧前端继续读
+      supportsThinkingDepth: thinkingMode === 'DEPTH',
       supportsImage: get('SUPPORTS_IMAGE') === 'true',
       maxTokens: parseInt(get('MAX_TOKENS') || '4096'),
       // 环境变量 fallback：未配置时默认 8192（保守值，与 Prisma schema 默认一致）
@@ -128,11 +143,6 @@ export function parseProviders(): Record<string, LLMProviderConfig> {
 /* ------------------------------------------------------------------ */
 /*  数据库查询函数                                                      */
 /* ------------------------------------------------------------------ */
-
-function normalizeThinkingMode(value: unknown): ThinkingMode {
-  const v = typeof value === 'string' ? value.toUpperCase() : '';
-  return v === 'FORCED' || v === 'OPTIONAL' ? v : 'NONE';
-}
 
 /** 将数据库模型 + 供应商 转为 LLMProviderConfig */
 function dbModelToConfig(
@@ -159,16 +169,21 @@ function dbModelToConfig(
   }
 ): LLMProviderConfig {
   const depth = model.thinkingDepth as ThinkingDepth;
+  const thinkingMode = parseThinkingMode(
+    model.thinkingMode,
+    model.provider.isAnthropic
+  );
   return {
     name: model.provider.name,
     displayName: model.displayName,
     apiBase: model.provider.apiBase,
     apiKey: decrypt(model.provider.apiKey), // 解密存储的 API Key
     model: model.modelId,
-    thinkingBudget: THINKING_BUDGET_MAP[depth] ?? THINKING_BUDGET_MAP.medium,
     thinkingDepth: depth,
-    thinkingMode: normalizeThinkingMode(model.thinkingMode),
-    supportsThinkingDepth: Boolean(model.supportsThinkingDepth),
+    thinkingMode,
+    // 派生：admin 后台还在写 supportsThinkingDepth，但 gateway 不再用；
+    // 输出时按 thinkingMode='DEPTH' 推导，保证与新 schema 语义一致。
+    supportsThinkingDepth: thinkingMode === 'DEPTH',
     supportsImage: Boolean(model.supportsImage),
     maxTokens: model.maxTokens,
     contextWindow: model.contextWindow,
@@ -276,52 +291,86 @@ export function getActiveProvider(): LLMProviderConfig {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Thinking budget 解析                                               */
+/*  Thinking 参数构建                                                  */
 /* ------------------------------------------------------------------ */
 
-/**
- * 决定一次请求的有效思考深度：
- *  - 模型不支持调节（supportsThinkingDepth=false）→ 模型默认值
- *  - 用户没传 → 模型默认值
- *  - 用户传了 → 用户值（合法时）
- */
-function resolveEffectiveDepth(
-  provider: LLMProviderConfig,
-  requestedDepth?: ThinkingDepth
-): ThinkingDepth {
-  if (!provider.supportsThinkingDepth) {
-    return provider.thinkingDepth;
+type ThinkingParams = {
+  /** Anthropic Extended Thinking 参数（仅 Anthropic 路径用） */
+  thinking?: { type: 'enabled'; budget_tokens: number };
+  /** OpenAI-compat reasoning_effort 参数 */
+  reasoning_effort?: 'minimal' | 'low' | 'medium' | 'high';
+  /** 最终 temperature —— Anthropic 在 thinking 启用时必须为 1 */
+  temperature: number;
+};
+
+/** 旧调用方传 thinkingDepth/thinkingEnabled 时映射到新 preference 枚举 */
+function legacyToPreference(
+  thinkingDepth?: ThinkingDepth,
+  thinkingEnabled?: boolean
+): ThinkingPreference {
+  if (thinkingEnabled === false) return 'off';
+  if (thinkingDepth === 'low' || thinkingDepth === 'medium' || thinkingDepth === 'high') {
+    return thinkingDepth;
   }
-  if (
-    requestedDepth === 'low' ||
-    requestedDepth === 'medium' ||
-    requestedDepth === 'high'
-  ) {
-    return requestedDepth;
-  }
-  return provider.thinkingDepth;
+  return 'auto';
 }
 
 /**
- * 计算实际请求要带的 Anthropic Extended Thinking budget_tokens。
- *  thinkingMode = NONE                           → 0（不启用）
- *  thinkingMode = OPTIONAL && enabled !== true   → 0（用户没开）
- *  thinkingMode = OPTIONAL && enabled === true   → 按深度
- *  thinkingMode = FORCED                         → 按深度（无视 enabled）
- *
- * 仅在 Anthropic 路径生效。OpenAI-compat 模型不发 thinking 参数（即使是 o1/R1），
- * 服务器端会自然按模型本身的 reasoning 行为返回。
+ * 根据 provider × mode × userPref 计算这一次请求要带的 thinking 参数。
+ * 详细分支表见 PR 描述。Anthropic 与 OpenAI 兼容两条路径都走这里，
+ * 派生出 thinking / reasoning_effort / temperature 后由调用方拼到请求体里。
  */
-function resolveThinkingBudget(
+function buildThinkingParams(
   provider: LLMProviderConfig,
-  depth?: ThinkingDepth,
-  enabled?: boolean
-): number {
-  if (provider.thinkingMode === 'NONE') return 0;
-  if (provider.thinkingMode === 'OPTIONAL' && enabled !== true) return 0;
-  if (!provider.isAnthropic) return 0;
-  const eff = resolveEffectiveDepth(provider, depth);
-  return THINKING_BUDGET_MAP[eff];
+  userPref: ThinkingPreference
+): ThinkingParams {
+  const isAnthropic = provider.isAnthropic;
+  const mode = provider.thinkingMode;
+
+  // 默认：不发任何 thinking 参数，用 provider.temperature
+  const empty: ThinkingParams = { temperature: provider.temperature };
+
+  if (mode === 'NONE' || mode === 'AUTO') {
+    return empty;
+  }
+
+  if (mode === 'FORCED') {
+    if (isAnthropic) {
+      // Anthropic 的 FORCED：用模型默认深度强制启用
+      return {
+        thinking: {
+          type: 'enabled',
+          budget_tokens: THINKING_BUDGET_MAP[provider.thinkingDepth],
+        },
+        temperature: 1,
+      };
+    }
+    // OpenAI-compat FORCED 模型自带思考，不发 reasoning_effort
+    return empty;
+  }
+
+  // mode === 'DEPTH'
+  if (isAnthropic) {
+    if (userPref === 'off') return empty;
+    const depth: ThinkingDepth =
+      userPref === 'low' || userPref === 'medium' || userPref === 'high'
+        ? userPref
+        : provider.thinkingDepth; // forced / auto → 用模型默认深度
+    return {
+      thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET_MAP[depth] },
+      temperature: 1,
+    };
+  }
+
+  // OpenAI-compat × DEPTH
+  if (userPref === 'off') {
+    return { ...empty, reasoning_effort: 'minimal' };
+  }
+  if (userPref === 'low' || userPref === 'medium' || userPref === 'high') {
+    return { ...empty, reasoning_effort: userPref };
+  }
+  // forced / auto → 用模型默认深度
+  return { ...empty, reasoning_effort: provider.thinkingDepth };
 }
 
 interface LLMCallUsage {
@@ -346,7 +395,7 @@ async function executeLoggedCall(
   provider: LLMProviderConfig,
   context: {
     kind: 'single' | 'history';
-    thinkingDepth?: ThinkingDepth;
+    thinkingPref?: ThinkingPreference;
     promptChars: number;
     messageCount: number;
     purpose?: LlmPurpose;
@@ -358,7 +407,7 @@ async function executeLoggedCall(
   provider: LLMProviderConfig,
   context: {
     kind: 'single' | 'history';
-    thinkingDepth?: ThinkingDepth;
+    thinkingPref?: ThinkingPreference;
     promptChars: number;
     messageCount: number;
     purpose?: LlmPurpose;
@@ -370,7 +419,7 @@ async function executeLoggedCall(
   provider: LLMProviderConfig,
   context: {
     kind: 'single' | 'history';
-    thinkingDepth?: ThinkingDepth;
+    thinkingPref?: ThinkingPreference;
     promptChars: number;
     messageCount: number;
     purpose?: LlmPurpose;
@@ -388,7 +437,8 @@ async function executeLoggedCall(
         model: provider.model,
         purpose: context.purpose ?? provider.purpose,
         kind: context.kind,
-        thinkingDepth: context.thinkingDepth ?? provider.thinkingDepth,
+        thinkingMode: provider.thinkingMode,
+        thinkingPref: context.thinkingPref ?? 'auto',
         promptChars: context.promptChars,
         messageCount: context.messageCount,
         durationMs: Date.now() - startedAt,
@@ -407,7 +457,8 @@ async function executeLoggedCall(
         model: provider.model,
         purpose: context.purpose ?? provider.purpose,
         kind: context.kind,
-        thinkingDepth: context.thinkingDepth ?? provider.thinkingDepth,
+        thinkingMode: provider.thinkingMode,
+        thinkingPref: context.thinkingPref ?? 'auto',
         promptChars: context.promptChars,
         messageCount: context.messageCount,
         durationMs: Date.now() - startedAt,
@@ -423,24 +474,25 @@ async function executeLoggedCall(
 /*  统一调用接口                                                        */
 /* ------------------------------------------------------------------ */
 
-/** 统一调用接口 — 支持按用途 / 按模型 ID / 按 provider 名称查找 */
-export async function callLLM(
-  systemPrompt: string,
-  userMessage: string,
-  options?: {
-    providerOverride?: string;
-    thinkingDepth?: ThinkingDepth;
-    /** 用户是否显式开启思考（仅对 thinkingMode=OPTIONAL 模型生效） */
-    thinkingEnabled?: boolean;
-    streamCallback?: (chunk: string) => void;
-    /** 按用途查找（优先级高于 providerOverride） */
-    purpose?: LlmPurpose;
-    /** 按数据库模型 ID 查找 */
-    modelId?: string;
-  }
-): Promise<string> {
-  let provider: LLMProviderConfig;
+interface CallOptions {
+  providerOverride?: string;
+  /** @deprecated 用 thinkingPreference 代替 */
+  thinkingDepth?: ThinkingDepth;
+  /** @deprecated 用 thinkingPreference 代替 */
+  thinkingEnabled?: boolean;
+  /** 用户对一次请求的思考偏好（4 值新接口） */
+  thinkingPreference?: ThinkingPreference;
+  streamCallback?: (chunk: string) => void;
+  purpose?: LlmPurpose;
+  modelId?: string;
+}
 
+/** 解析调用方传入的 options 找到 provider + thinkingPref */
+async function resolveProviderAndPref(options?: CallOptions): Promise<{
+  provider: LLMProviderConfig;
+  pref: ThinkingPreference;
+}> {
+  let provider: LLMProviderConfig;
   if (options?.modelId) {
     provider = await getModelById(options.modelId);
   } else if (options?.purpose) {
@@ -452,29 +504,39 @@ export async function callLLM(
     provider = getActiveProvider();
   }
 
-  const budget = resolveThinkingBudget(
-    provider,
-    options?.thinkingDepth,
-    options?.thinkingEnabled
-  );
+  const pref =
+    options?.thinkingPreference ??
+    legacyToPreference(options?.thinkingDepth, options?.thinkingEnabled);
+
+  return { provider, pref };
+}
+
+/** 统一调用接口 — 支持按用途 / 按模型 ID / 按 provider 名称查找 */
+export async function callLLM(
+  systemPrompt: string,
+  userMessage: string,
+  options?: CallOptions
+): Promise<string> {
+  const { provider, pref } = await resolveProviderAndPref(options);
+  const thinkingParams = buildThinkingParams(provider, pref);
 
   return executeLoggedCall(
     provider,
     {
       kind: 'single',
-      thinkingDepth: options?.thinkingDepth,
+      thinkingPref: pref,
       promptChars: systemPrompt.length + userMessage.length,
       messageCount: 1,
       purpose: options?.purpose,
     },
     () =>
       provider.isAnthropic
-        ? callAnthropic(provider, systemPrompt, userMessage, budget)
+        ? callAnthropic(provider, systemPrompt, userMessage, thinkingParams)
         : callOpenAICompatible(
             provider,
             systemPrompt,
             userMessage,
-            options?.thinkingDepth
+            thinkingParams
           )
   );
 }
@@ -483,64 +545,23 @@ export async function callLLM(
 export async function callLLMWithHistory(
   systemPrompt: string,
   messages: Array<{ role: 'user' | 'assistant'; content: string }>,
-  options: {
-    providerOverride?: string;
-    thinkingDepth?: ThinkingDepth;
-    thinkingEnabled?: boolean;
-    purpose?: LlmPurpose;
-    modelId?: string;
-    detailed: true;
-  }
+  options: CallOptions & { detailed: true }
 ): Promise<LLMDetailedResult>;
 export async function callLLMWithHistory(
   systemPrompt: string,
   messages: Array<{ role: 'user' | 'assistant'; content: string }>,
-  options?: {
-    providerOverride?: string;
-    thinkingDepth?: ThinkingDepth;
-    /** 用户是否显式开启思考（仅对 thinkingMode=OPTIONAL 模型生效） */
-    thinkingEnabled?: boolean;
-    /** 按用途查找 */
-    purpose?: LlmPurpose;
-    /** 按数据库模型 ID 查找 */
-    modelId?: string;
-    /** 返回详细结果（包含 thinking） */
-    detailed?: false;
-  }
+  options?: CallOptions & { detailed?: false }
 ): Promise<string>;
 export async function callLLMWithHistory(
   systemPrompt: string,
   messages: Array<{ role: 'user' | 'assistant'; content: string }>,
-  options?: {
-    providerOverride?: string;
-    thinkingDepth?: ThinkingDepth;
-    thinkingEnabled?: boolean;
-    purpose?: LlmPurpose;
-    modelId?: string;
-    detailed?: boolean;
-  }
+  options?: CallOptions & { detailed?: boolean }
 ): Promise<string | LLMDetailedResult> {
-  let provider: LLMProviderConfig;
-
-  if (options?.modelId) {
-    provider = await getModelById(options.modelId);
-  } else if (options?.purpose) {
-    provider = await getProviderForPurpose(options.purpose);
-  } else if (options?.providerOverride) {
-    const providers = parseProviders();
-    provider = providers[options.providerOverride] ?? getActiveProvider();
-  } else {
-    provider = getActiveProvider();
-  }
-
-  const budget = resolveThinkingBudget(
-    provider,
-    options?.thinkingDepth,
-    options?.thinkingEnabled
-  );
+  const { provider, pref } = await resolveProviderAndPref(options);
+  const thinkingParams = buildThinkingParams(provider, pref);
   const ctx = {
     kind: 'history' as const,
-    thinkingDepth: options?.thinkingDepth,
+    thinkingPref: pref,
     promptChars:
       systemPrompt.length +
       messages.reduce((total, message) => total + message.content.length, 0),
@@ -549,12 +570,12 @@ export async function callLLMWithHistory(
   };
   const executor = () =>
     provider.isAnthropic
-      ? callAnthropicWithHistory(provider, systemPrompt, messages, budget)
+      ? callAnthropicWithHistory(provider, systemPrompt, messages, thinkingParams)
       : callOpenAICompatibleWithHistory(
           provider,
           systemPrompt,
           messages,
-          options?.thinkingDepth
+          thinkingParams
         );
 
   if (options?.detailed) {
@@ -571,23 +592,18 @@ async function callAnthropic(
   provider: LLMProviderConfig,
   system: string,
   userMsg: string,
-  thinkingBudget: number
+  params: ThinkingParams
 ): Promise<LLMCallResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
     max_tokens: provider.maxTokens,
     system,
     messages: [{ role: 'user', content: userMsg }],
+    temperature: params.temperature,
   };
 
-  if (thinkingBudget > 0) {
-    body.thinking = {
-      type: 'enabled',
-      budget_tokens: thinkingBudget,
-    };
-    body.temperature = 1; // thinking 模式下 temperature 必须为 1
-  } else {
-    body.temperature = provider.temperature;
+  if (params.thinking) {
+    body.thinking = params.thinking;
   }
 
   const res = await fetch(`${provider.apiBase}/v1/messages`, {
@@ -639,23 +655,18 @@ async function callAnthropicWithHistory(
   provider: LLMProviderConfig,
   system: string,
   messages: Array<{ role: string; content: string }>,
-  thinkingBudget: number
+  params: ThinkingParams
 ): Promise<LLMCallResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
     max_tokens: provider.maxTokens,
     system,
     messages,
+    temperature: params.temperature,
   };
 
-  if (thinkingBudget > 0) {
-    body.thinking = {
-      type: 'enabled',
-      budget_tokens: thinkingBudget,
-    };
-    body.temperature = 1;
-  } else {
-    body.temperature = provider.temperature;
+  if (params.thinking) {
+    body.thinking = params.thinking;
   }
 
   const res = await fetch(`${provider.apiBase}/v1/messages`, {
@@ -723,13 +734,35 @@ function extractOpenAIThinking(
   return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
 }
 
+/** 在 reasoning_effort='minimal' 时让 temperature 收紧一点，匹配老逻辑的 low=0.1 */
+function temperatureForOpenAI(
+  provider: LLMProviderConfig,
+  params: ThinkingParams
+): number {
+  if (params.reasoning_effort === 'minimal' || params.reasoning_effort === 'low') {
+    return Math.min(provider.temperature, 0.1);
+  }
+  return params.temperature;
+}
+
 async function callOpenAICompatible(
   provider: LLMProviderConfig,
   system: string,
   userMsg: string,
-  depth?: ThinkingDepth
+  params: ThinkingParams
 ): Promise<LLMCallResult> {
-  const temperature = depth === 'low' ? 0.1 : provider.temperature;
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    max_tokens: provider.maxTokens,
+    temperature: temperatureForOpenAI(provider, params),
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: userMsg },
+    ],
+  };
+  if (params.reasoning_effort) {
+    body.reasoning_effort = params.reasoning_effort;
+  }
 
   const res = await fetch(`${provider.apiBase}/chat/completions`, {
     method: 'POST',
@@ -737,15 +770,7 @@ async function callOpenAICompatible(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${provider.apiKey}`,
     },
-    body: JSON.stringify({
-      model: provider.model,
-      max_tokens: provider.maxTokens,
-      temperature,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: userMsg },
-      ],
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -779,9 +804,17 @@ async function callOpenAICompatibleWithHistory(
   provider: LLMProviderConfig,
   system: string,
   messages: Array<{ role: string; content: string }>,
-  depth?: ThinkingDepth
+  params: ThinkingParams
 ): Promise<LLMCallResult> {
-  const temperature = depth === 'low' ? 0.1 : provider.temperature;
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    max_tokens: provider.maxTokens,
+    temperature: temperatureForOpenAI(provider, params),
+    messages: [{ role: 'system', content: system }, ...messages],
+  };
+  if (params.reasoning_effort) {
+    body.reasoning_effort = params.reasoning_effort;
+  }
 
   const res = await fetch(`${provider.apiBase}/chat/completions`, {
     method: 'POST',
@@ -789,12 +822,7 @@ async function callOpenAICompatibleWithHistory(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${provider.apiKey}`,
     },
-    body: JSON.stringify({
-      model: provider.model,
-      max_tokens: provider.maxTokens,
-      temperature,
-      messages: [{ role: 'system', content: system }, ...messages],
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {

@@ -58,50 +58,46 @@ export async function GET(req: Request) {
         continue;
       }
 
-      const supportsThinking = cfg.isAnthropic;
-      const allowedDepths: ThinkingDepth[] = ['low', 'medium'];
-      if (supportsThinking) {
-        allowedDepths.push('high');
-      }
+      const supportsThinking = cfg.thinkingMode !== 'NONE';
+      // 允许的深度：模型支持调节时给全集，否则只暴露其默认深度（让前端 UI 锁定显示）
+      const allDepths: ThinkingDepth[] = ['low', 'medium', 'high'];
+      const allowedDepths: ThinkingDepth[] = cfg.supportsThinkingDepth
+        ? [...allDepths]
+        : [cfg.thinkingDepth];
 
-      // FREE 用户不能使用 high（expensive）
+      // FREE 用户不能使用 high（成本高）
       if (user.role === 'FREE') {
         const idx = allowedDepths.indexOf('high');
         if (idx !== -1) allowedDepths.splice(idx, 1);
       }
+
+      const buildOption = (purpose: LlmPurpose): ChatModelOption => ({
+        name: cfg.dbModelId!,
+        id: cfg.dbModelId!,
+        modelId: cfg.model,
+        displayName: cfg.displayName || cfg.model,
+        supportsThinking,
+        thinkingMode: cfg.thinkingMode,
+        supportsThinkingDepth: cfg.supportsThinkingDepth,
+        supportsImage: cfg.supportsImage,
+        allowedDepths,
+        purpose,
+      });
 
       // 去重：同一底层模型（modelId + displayName）只保留一条，优先用 CHAT 用途的记录
       const dedupeKey = `${cfg.model}::${cfg.displayName || cfg.model}`;
       const existingIdx = seenModelKeys.get(dedupeKey);
 
       if (existingIdx !== undefined) {
-        // 已存在同名模型，如果当前记录是 CHAT 用途则替换（优先用 CHAT 的 dbModelId）
         if (cfg.purpose === 'CHAT') {
-          models[existingIdx] = {
-            name: cfg.dbModelId!,
-            id: cfg.dbModelId!,
-            modelId: cfg.model,
-            displayName: cfg.displayName || cfg.model,
-            supportsThinking,
-            allowedDepths,
-            purpose: 'CHAT',
-          };
+          models[existingIdx] = buildOption('CHAT');
         }
         continue;
       }
 
       const idx = models.length;
       seenModelKeys.set(dedupeKey, idx);
-
-      models.push({
-        name: cfg.dbModelId!,
-        id: cfg.dbModelId!,
-        modelId: cfg.model,
-        displayName: cfg.displayName || cfg.model,
-        supportsThinking,
-        allowedDepths,
-        purpose: (cfg.purpose ?? 'CHAT') as LlmPurpose,
-      });
+      models.push(buildOption((cfg.purpose ?? 'CHAT') as LlmPurpose));
 
       // 该用途下 isDefault 的模型作为 defaultModel
       if (cfg.purpose === 'CHAT' && !defaultModel) {
@@ -141,11 +137,11 @@ export async function GET(req: Request) {
     const provider = configuredProviders[name];
     if (!provider) continue;
 
-    const supportsThinking = provider.isAnthropic;
-    const allowedDepths: ThinkingDepth[] = ['low', 'medium'];
-    if (supportsThinking) {
-      allowedDepths.push('high');
-    }
+    const supportsThinking = provider.thinkingMode !== 'NONE';
+    const allDepths: ThinkingDepth[] = ['low', 'medium', 'high'];
+    const allowedDepths: ThinkingDepth[] = provider.supportsThinkingDepth
+      ? [...allDepths]
+      : [provider.thinkingDepth];
 
     if (user.role === 'FREE') {
       const idx = allowedDepths.indexOf('high');
@@ -158,6 +154,9 @@ export async function GET(req: Request) {
       modelId: provider.model,
       displayName: provider.displayName || name,
       supportsThinking,
+      thinkingMode: provider.thinkingMode,
+      supportsThinkingDepth: provider.supportsThinkingDepth,
+      supportsImage: provider.supportsImage,
       allowedDepths,
       purpose: 'CHAT',
     });

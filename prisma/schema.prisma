@@ -243,7 +243,18 @@ model LlmModel {
   provider      LlmProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
   modelId       String                          // 模型标识，如 "gpt-4o", "claude-sonnet-4-6"
   displayName   String                          // 显示名称
-  thinkingDepth String      @default("medium")  // "low" | "medium" | "high"
+  // 思考能力控制：
+  //  thinkingMode:
+  //    NONE     - 不支持思考（GPT-3.5、文本生成模型）
+  //    OPTIONAL - 用户可以开/关思考（Claude Extended Thinking）
+  //    FORCED   - 模型自带思考无法关闭（OpenAI o1/o3、DeepSeek R1）
+  //  supportsThinkingDepth - 是否支持调节思考深度（low/medium/high）
+  //  thinkingDepth - 默认深度（不支持调节时也作为固定值使用）
+  thinkingMode          String  @default("NONE")     // "NONE" | "OPTIONAL" | "FORCED"
+  supportsThinkingDepth Boolean @default(false)
+  thinkingDepth         String  @default("medium")   // "low" | "medium" | "high"
+  // 输入能力：是否接受图片输入（多模态）
+  supportsImage Boolean @default(false)
   maxTokens     Int         @default(4096)      // 单次输出 max_tokens（传给 API 的 max_tokens 字段）
   contextWindow Int         @default(8192)      // 模型输入上下文窗口大小（token），用于 LectureLive 内部预算/降级判断
   temperature   Float       @default(0.3)

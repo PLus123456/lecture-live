@@ -6,6 +6,7 @@ import type { ConversationMeta } from '@/stores/chatStore';
 import { useAuthStore } from '@/stores/authStore';
 import type { ChatMessage, ChatModelsResponse, ThinkingDepth } from '@/types/llm';
 import { estimateTokens } from '@/lib/llm/tokenizer';
+import { findCompressionBoundary } from '@/lib/llm/chatCompression';
 
 interface TranscriptSegmentInput {
   text: string;
@@ -166,14 +167,8 @@ export function useChat(sessionId: string | null) {
           }>;
         };
 
-        // 找最近一条 system → 分割成 archivedMessages + messages
-        let lastSystemIdx = -1;
-        for (let i = data.messages.length - 1; i >= 0; i--) {
-          if (data.messages[i].role === 'system') {
-            lastSystemIdx = i;
-            break;
-          }
-        }
+        // 找最近一条压缩边界 → 分割成 archivedMessages + messages
+        const compressionBoundary = findCompressionBoundary(data.messages);
 
         const toChatMessage = (raw: (typeof data.messages)[number]): ChatMessage => ({
           id: raw.id,
@@ -183,11 +178,11 @@ export function useChat(sessionId: string | null) {
         });
 
         const archived = data.messages
-          .slice(0, Math.max(0, lastSystemIdx))
+          .slice(0, compressionBoundary.splitIndex + 1)
           .filter((m) => m.role !== 'system')
           .map(toChatMessage);
         const visible = data.messages
-          .slice(lastSystemIdx + 1)
+          .slice(compressionBoundary.splitIndex + 1)
           .filter((m) => m.role !== 'system')
           .map(toChatMessage);
 

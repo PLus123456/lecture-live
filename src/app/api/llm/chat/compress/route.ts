@@ -10,6 +10,10 @@ import { prisma } from '@/lib/prisma';
 import { callLLM } from '@/lib/llm/gateway';
 import { compressHistory } from '@/lib/llm/chatContextBuilder';
 import type { ConversationTurn } from '@/lib/llm/chatContextBuilder';
+import {
+  encodeCompressedHistorySystemMessage,
+  findCompressionBoundary,
+} from '@/lib/llm/chatCompression';
 import { logger, serializeError } from '@/lib/logger';
 
 const apiLogger = logger.child({ component: 'chat-compress' });
@@ -72,15 +76,15 @@ export async function POST(req: Request) {
     );
   }
 
-  // 取最近一条 role='system' 之后的 user/assistant —— 这些才是"未被压缩"的有效消息
-  const lastSystemIndex = (() => {
-    for (let i = conversation.messages.length - 1; i >= 0; i--) {
-      if (conversation.messages[i].role === 'system') return i;
-    }
-    return -1;
-  })();
-
-  const effectiveMessages = conversation.messages.slice(lastSystemIndex + 1);
+  // 取最近一条压缩边界之后的 user/assistant —— 这些才是"未被压缩"的有效消息
+  const compressionBoundary = findCompressionBoundary(conversation.messages);
+  const effectiveMessages = conversation.messages.slice(
+    compressionBoundary.splitIndex + 1
+  );
+  const effectiveChatMessages = effectiveMessages.filter(
+    (m): m is typeof m & { role: 'user' | 'assistant' } =>
+      m.role === 'user' || m.role === 'assistant'
+  );
   const turns: ConversationTurn[] = effectiveMessages
     .filter(
       (m): m is typeof m & { role: 'user' | 'assistant' } =>
@@ -134,20 +138,31 @@ export async function POST(req: Request) {
     );
   }
 
-  // 插入一条 role='system' 摘要消息。早期 user/assistant 消息保留在 DB，但
-  // chat/route.ts 组装 history 时只取此 system 消息之后的内容 —— 实现"UI 可折叠
-  // 看原文，但不再发给 LLM"。
+  const compressedCount = turns.length - recentKept.length;
+  const compressedThroughMessageId =
+    compressedCount > 0
+      ? effectiveChatMessages[compressedCount - 1]?.id ?? null
+      : null;
+  const combinedSummary = compressionBoundary.summary
+    ? `${compressionBoundary.summary}\n\n${summary}`.trim()
+    : summary;
+
+  // 插入一条 role='system' 摘要消息。早期 user/assistant 消息保留在 DB，并用
+  // compressed-through 标记记录切割点，避免依赖 createdAt 插入位置。
   await prisma.conversationMessage.create({
     data: {
       conversationId,
       role: 'system',
-      content: summary,
+      content: encodeCompressedHistorySystemMessage(
+        combinedSummary,
+        compressedThroughMessageId
+      ),
     },
   });
 
   return NextResponse.json({
     compressed: true,
-    summary,
+    summary: combinedSummary,
     keptTurns: recentKept.length,
   });
 }

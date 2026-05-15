@@ -32,6 +32,13 @@ interface ChatStore {
   // ── 用户偏好（持久化） ──
   selectedModel: string;
   selectedDepth: ThinkingDepth;
+  /**
+   * 用户是否显式开启 thinking。
+   *  - 模型 thinkingMode='OPTIONAL' 时，决定是否带 thinking 参数
+   *  - 模型 thinkingMode='FORCED'   时，UI 不展示开关，发送方仍传 true（无效但无副作用）
+   *  - 模型 thinkingMode='NONE'     时，前端忽略此值
+   */
+  selectedThinkingEnabled: boolean;
 
   // ── 运行时状态（不持久化） ──
   isLoading: boolean;
@@ -55,6 +62,7 @@ interface ChatStore {
   setLoading: (loading: boolean) => void;
   setSelectedModel: (model: string) => void;
   setSelectedDepth: (depth: ThinkingDepth) => void;
+  setSelectedThinkingEnabled: (enabled: boolean) => void;
   setAvailableModels: (models: ChatModelOption[], defaultModel: string) => void;
 
   setActiveConversation: (id: string | null) => void;
@@ -88,11 +96,14 @@ export const useChatStore = create<ChatStore>()(
     (set) => ({
       selectedModel: '',
       selectedDepth: 'medium',
+      selectedThinkingEnabled: false,
       ...initialRuntimeState,
 
       setLoading: (isLoading) => set({ isLoading }),
       setSelectedModel: (selectedModel) => set({ selectedModel }),
       setSelectedDepth: (selectedDepth) => set({ selectedDepth }),
+      setSelectedThinkingEnabled: (selectedThinkingEnabled) =>
+        set({ selectedThinkingEnabled }),
 
       setAvailableModels: (availableModels, defaultModel) =>
         set((state) => ({
@@ -138,6 +149,7 @@ export const useChatStore = create<ChatStore>()(
       partialize: (state) => ({
         selectedModel: state.selectedModel,
         selectedDepth: state.selectedDepth,
+        selectedThinkingEnabled: state.selectedThinkingEnabled,
       }),
     }
   )

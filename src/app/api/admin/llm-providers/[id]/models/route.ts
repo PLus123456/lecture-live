@@ -4,6 +4,7 @@ import { requireAdminAccess } from '@/lib/adminApi';
 
 // 有效的 LLM 用途枚举值
 const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING'];
+const VALID_THINKING_MODES = ['NONE', 'OPTIONAL', 'FORCED'];
 
 // 添加模型到指定供应商
 export async function POST(
@@ -33,6 +34,9 @@ export async function POST(
       modelId,
       displayName,
       thinkingDepth,
+      thinkingMode,
+      supportsThinkingDepth,
+      supportsImage,
       maxTokens,
       contextWindow,
       temperature,
@@ -48,7 +52,6 @@ export async function POST(
       );
     }
 
-    // 验证 purpose 枚举值
     if (purpose && !VALID_PURPOSES.includes(purpose)) {
       return NextResponse.json(
         { error: `无效的用途，允许值: ${VALID_PURPOSES.join(', ')}` },
@@ -56,10 +59,16 @@ export async function POST(
       );
     }
 
-    // 验证 thinkingDepth 值
     if (thinkingDepth && !['low', 'medium', 'high'].includes(thinkingDepth)) {
       return NextResponse.json(
         { error: '无效的 thinkingDepth，允许值: low, medium, high' },
+        { status: 400 }
+      );
+    }
+
+    if (thinkingMode && !VALID_THINKING_MODES.includes(thinkingMode)) {
+      return NextResponse.json(
+        { error: `无效的 thinkingMode，允许值: ${VALID_THINKING_MODES.join(', ')}` },
         { status: 400 }
       );
     }
@@ -83,12 +92,20 @@ export async function POST(
       });
     }
 
+    // thinkingMode=NONE 时强制 supportsThinkingDepth=false（语义一致性）
+    const effectiveThinkingMode = thinkingMode ?? 'NONE';
+    const effectiveSupportsDepth =
+      effectiveThinkingMode === 'NONE' ? false : Boolean(supportsThinkingDepth);
+
     const model = await prisma.llmModel.create({
       data: {
         providerId,
         modelId,
         displayName,
         thinkingDepth: thinkingDepth ?? 'medium',
+        thinkingMode: effectiveThinkingMode,
+        supportsThinkingDepth: effectiveSupportsDepth,
+        supportsImage: Boolean(supportsImage),
         maxTokens: effectiveMaxTokens,
         contextWindow: effectiveContextWindow,
         temperature: temperature ?? 0.3,

@@ -65,17 +65,35 @@ export async function POST(req: Request) {
 
     // 创建供应商，同时创建其模型（如果提供了 models 数组）
     const modelsData = Array.isArray(body.models)
-      ? (body.models as Array<Record<string, unknown>>).map((m, idx) => ({
-          modelId: (m.modelId ?? m.model_id ?? '') as string,
-          displayName: (m.displayName ?? m.display_name ?? '') as string,
-          thinkingDepth: (m.thinkingDepth ?? m.thinking_budget ?? 'medium') as string,
-          maxTokens: Number(m.maxTokens ?? m.max_tokens ?? 4096),
-          contextWindow: Number(m.contextWindow ?? m.context_window ?? 8192),
-          temperature: Number(m.temperature ?? 0.3),
-          purpose: (m.purpose ?? 'CHAT') as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING',
-          isDefault: Boolean(m.isDefault ?? m.is_default ?? false),
-          sortOrder: Number(m.sortOrder ?? m.sort_order ?? idx),
-        }))
+      ? (body.models as Array<Record<string, unknown>>).map((m, idx) => {
+          const thinkingMode = (m.thinkingMode ?? m.thinking_mode ?? 'NONE') as
+            | 'NONE'
+            | 'OPTIONAL'
+            | 'FORCED';
+          const supportsDepth =
+            thinkingMode === 'NONE'
+              ? false
+              : Boolean(m.supportsThinkingDepth ?? m.supports_thinking_depth ?? false);
+          return {
+            modelId: (m.modelId ?? m.model_id ?? '') as string,
+            displayName: (m.displayName ?? m.display_name ?? '') as string,
+            thinkingDepth: (m.thinkingDepth ?? m.thinking_budget ?? 'medium') as string,
+            thinkingMode,
+            supportsThinkingDepth: supportsDepth,
+            supportsImage: Boolean(m.supportsImage ?? m.supports_image ?? false),
+            maxTokens: Number(m.maxTokens ?? m.max_tokens ?? 4096),
+            contextWindow: Number(m.contextWindow ?? m.context_window ?? 8192),
+            temperature: Number(m.temperature ?? 0.3),
+            purpose: (m.purpose ?? 'CHAT') as
+              | 'CHAT'
+              | 'REALTIME_SUMMARY'
+              | 'FINAL_SUMMARY'
+              | 'KEYWORD_EXTRACTION'
+              | 'EMBEDDING',
+            isDefault: Boolean(m.isDefault ?? m.is_default ?? false),
+            sortOrder: Number(m.sortOrder ?? m.sort_order ?? idx),
+          };
+        })
       : [];
 
     const createdProvider = await prisma.llmProvider.create({

@@ -4,6 +4,7 @@ import { requireAdminAccess } from '@/lib/adminApi';
 
 // 有效的 LLM 用途枚举值
 const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING'];
+const VALID_THINKING_MODES = ['NONE', 'OPTIONAL', 'FORCED'];
 
 // 更新模型
 export async function PATCH(
@@ -48,6 +49,13 @@ export async function PATCH(
       );
     }
 
+    if (body.thinkingMode && !VALID_THINKING_MODES.includes(body.thinkingMode)) {
+      return NextResponse.json(
+        { error: `无效的 thinkingMode，允许值: ${VALID_THINKING_MODES.join(', ')}` },
+        { status: 400 }
+      );
+    }
+
     // 验证 contextWindow >= maxTokens 组合（用 patch 中提供的值；未提供则用现有值）
     const nextMaxTokens =
       body.maxTokens !== undefined ? Number(body.maxTokens) : existing.maxTokens;
@@ -65,11 +73,22 @@ export async function PATCH(
     if (body.modelId !== undefined) updateData.modelId = body.modelId;
     if (body.displayName !== undefined) updateData.displayName = body.displayName;
     if (body.thinkingDepth !== undefined) updateData.thinkingDepth = body.thinkingDepth;
+    if (body.thinkingMode !== undefined) updateData.thinkingMode = body.thinkingMode;
+    if (body.supportsThinkingDepth !== undefined)
+      updateData.supportsThinkingDepth = Boolean(body.supportsThinkingDepth);
+    if (body.supportsImage !== undefined)
+      updateData.supportsImage = Boolean(body.supportsImage);
     if (body.maxTokens !== undefined) updateData.maxTokens = body.maxTokens;
     if (body.contextWindow !== undefined) updateData.contextWindow = body.contextWindow;
     if (body.temperature !== undefined) updateData.temperature = body.temperature;
     if (body.purpose !== undefined) updateData.purpose = body.purpose;
     if (body.sortOrder !== undefined) updateData.sortOrder = body.sortOrder;
+
+    // thinkingMode=NONE 时强制 supportsThinkingDepth=false（语义一致性）
+    const finalThinkingMode = (updateData.thinkingMode ?? existing.thinkingMode) as string;
+    if (finalThinkingMode === 'NONE') {
+      updateData.supportsThinkingDepth = false;
+    }
 
     // 处理 isDefault 切换逻辑
     if (body.isDefault !== undefined) {

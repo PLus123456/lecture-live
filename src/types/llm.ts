@@ -39,8 +39,14 @@ export type LlmPurpose =
   | 'KEYWORD_EXTRACTION'
   | 'EMBEDDING';
 
-/** 思考模式（与后端 LlmModel.thinkingMode 一致） */
-export type ThinkingMode = 'NONE' | 'OPTIONAL' | 'FORCED';
+/**
+ * 思考模式（与后端 LlmModel.thinkingMode 一致）：
+ *  - NONE   : 模型不支持思考，请求不带任何 thinking 参数
+ *  - AUTO   : 模型自己决定是否思考，请求不带 thinking/reasoning 参数（GLM-4.5、DeepSeek-V3 等）
+ *  - FORCED : 模型自带思考无法关闭（o1/o3、R1）；OpenAI 兼容不发 reasoning_effort
+ *  - DEPTH  : 支持深度思考（Claude Extended Thinking、gpt-5 reasoning_effort），用户可调 off/low/med/high
+ */
+export type ThinkingMode = 'NONE' | 'AUTO' | 'FORCED' | 'DEPTH';
 
 /** What the /api/llm/models endpoint returns per model */
 export interface ChatModelOption {
@@ -53,19 +59,17 @@ export interface ChatModelOption {
   /** Human-readable label shown in UI */
   displayName: string;
   /**
-   * 是否支持思考。等价于 `thinkingMode !== 'NONE'`。保留字段名兼容旧前端代码。
+   * @deprecated 用 `thinkingMode !== 'NONE'` 代替。保留输出仅为兼容旧前端代码。
    */
   supportsThinking: boolean;
-  /**
-   * 详细思考模式：
-   *  - 'NONE'     : 模型不支持思考，UI 隐藏开关与深度选择器
-   *  - 'OPTIONAL' : 用户可开关，UI 显示开关；开启时按 supportsThinkingDepth 决定是否显示深度
-   *  - 'FORCED'   : 模型自带思考无法关闭，UI 不显示开关，按 supportsThinkingDepth 决定是否显示深度
-   */
+  /** 模型思考能力分类，决定底部"思考"按钮 popover 的选项集 */
   thinkingMode: ThinkingMode;
-  /** 是否允许调节思考深度 */
+  /**
+   * @deprecated 用 `thinkingMode === 'DEPTH'` 代替。
+   * 保留字段：admin 后台数据库还有 supportsThinkingDepth 列，前端临时回显用。
+   */
   supportsThinkingDepth: boolean;
-  /** Allowed thinking depths for this model（不支持调节时为该模型的固定深度） */
+  /** Allowed thinking depths for this model（仅 mode='DEPTH' 时非空） */
   allowedDepths: ThinkingDepth[];
   /** 是否支持图片输入（多模态） */
   supportsImage: boolean;

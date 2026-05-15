@@ -6,6 +6,7 @@ import { useChat } from '@/hooks/useChat';
 import { useKeywords } from '@/hooks/useKeywords';
 import { useTranscriptStore } from '@/stores/transcriptStore';
 import { useSummaryStore } from '@/stores/summaryStore';
+import type { ThinkingPreference } from '@/stores/chatStore';
 import {
   Send,
   Loader2,
@@ -14,8 +15,6 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronUp,
-  Zap,
-  Brain,
   Sparkles,
   CheckCircle2,
   XCircle,
@@ -23,7 +22,7 @@ import {
   Check,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
-import type { ChatMessage, ThinkingDepth } from '@/types/llm';
+import type { ChatMessage, ThinkingMode } from '@/types/llm';
 
 interface ChatContextSegment {
   text: string;
@@ -33,31 +32,64 @@ interface ChatContextSummary {
   summary?: string;
 }
 
-const DEPTH_OPTIONS: {
-  value: ThinkingDepth;
+/* ------------------------------------------------------------------ */
+/*  Thinking 偏好 → 显示元数据                                          */
+/* ------------------------------------------------------------------ */
+
+/** 当前 preference 在 thinking 按钮右下角的角标缩写（更紧凑反馈） */
+function badgeForPreference(pref: ThinkingPreference): string | null {
+  switch (pref) {
+    case 'off':
+      return null; // 关闭态不画角标
+    case 'low':
+      return '低';
+    case 'medium':
+      return '中';
+    case 'high':
+      return '高';
+    case 'forced':
+      return '强';
+    case 'auto':
+      return '自';
+  }
+}
+
+/** 按模型 thinkingMode 计算 popover 选项集 */
+function thinkingOptionsForMode(mode: ThinkingMode): Array<{
+  pref: ThinkingPreference;
   label: string;
   description: string;
-  icon: React.ReactNode;
-}[] = [
-  {
-    value: 'low',
-    label: 'Quick',
-    description: 'Fast, concise answers',
-    icon: <Zap className="w-3 h-3" />,
-  },
-  {
-    value: 'medium',
-    label: 'Normal',
-    description: 'Balanced responses',
-    icon: <Brain className="w-3 h-3" />,
-  },
-  {
-    value: 'high',
-    label: 'Deep',
-    description: 'In-depth analysis with extended thinking',
-    icon: <Sparkles className="w-3 h-3" />,
-  },
-];
+  disabled?: boolean;
+  disabledTitle?: string;
+}> {
+  if (mode === 'DEPTH') {
+    return [
+      { pref: 'off', label: '不思考', description: '快速答复（OpenAI 会发 minimal effort）' },
+      { pref: 'low', label: '低', description: '少量思考 token' },
+      { pref: 'medium', label: '中', description: '默认深度' },
+      { pref: 'high', label: '高', description: '最深思考，速度较慢' },
+    ];
+  }
+  if (mode === 'AUTO') {
+    return [
+      { pref: 'off', label: '不思考', description: '强制不带思考参数' },
+      { pref: 'auto', label: '自动', description: '让模型自己决定' },
+      { pref: 'forced', label: '强制思考', description: '尽可能启用深度思考' },
+    ];
+  }
+  // FORCED
+  return [
+    {
+      pref: 'off',
+      label: '不思考',
+      description: '该模型自带思考无法关闭',
+      disabled: true,
+      disabledTitle: '该模型自带思考，无法关闭',
+    },
+    { pref: 'auto', label: '自动', description: '让模型自己决定' },
+    { pref: 'forced', label: '强制思考', description: '尽可能启用深度思考' },
+  ];
+}
 
 /* ------------------------------------------------------------------ */
 /*  Markdown 渲染（统一样式）                                             */
@@ -218,10 +250,6 @@ function KeywordSteps({ steps }: { steps: KeywordStep[] }) {
     </div>
   );
 }
-
-/* ------------------------------------------------------------------ */
-/*  消息气泡（含 thinking 折叠）                                         */
-/* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
 /*  上下文小圈 + 详情卡                                                  */
@@ -525,8 +553,7 @@ export default function ChatTab({
     archivedMessages,
     isLoading,
     selectedModel,
-    selectedDepth,
-    selectedThinkingEnabled,
+    selectedThinkingPreference,
     availableModels,
     activeConversationId,
     conversations,
@@ -534,8 +561,7 @@ export default function ChatTab({
     contextFull,
     sendMessage,
     setSelectedModel,
-    setSelectedDepth,
-    setSelectedThinkingEnabled,
+    setSelectedThinkingPreference,
     createNewConversation,
     switchConversation,
     compressActive,
@@ -545,12 +571,14 @@ export default function ChatTab({
 
   const [input, setInput] = useState('');
   const [showModelMenu, setShowModelMenu] = useState(false);
+  const [showThinkingMenu, setShowThinkingMenu] = useState(false);
   const [showContextPopover, setShowContextPopover] = useState(false);
   const [showConversationList, setShowConversationList] = useState(false);
   const [keywordSteps, setKeywordSteps] = useState<KeywordStep[] | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
+  const thinkingMenuRef = useRef<HTMLDivElement>(null);
   const contextPopoverRef = useRef<HTMLDivElement>(null);
 
   const segments = useTranscriptStore((s) => s.segments);
@@ -575,6 +603,22 @@ export default function ChatTab({
       return () => document.removeEventListener('mousedown', handleClick);
     }
   }, [showModelMenu]);
+
+  // Close thinking menu on outside click
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (
+        thinkingMenuRef.current &&
+        !thinkingMenuRef.current.contains(e.target as Node)
+      ) {
+        setShowThinkingMenu(false);
+      }
+    };
+    if (showThinkingMenu) {
+      document.addEventListener('mousedown', handleClick);
+      return () => document.removeEventListener('mousedown', handleClick);
+    }
+  }, [showThinkingMenu]);
 
   // Close context popover on outside click
   useEffect(() => {
@@ -799,136 +843,38 @@ export default function ChatTab({
   // Current model display info
   const currentModelInfo = availableModels.find((m) => m.name === selectedModel);
   const currentModelLabel = currentModelInfo?.displayName || selectedModel || 'Default';
+  const currentThinkingMode: ThinkingMode = currentModelInfo?.thinkingMode ?? 'NONE';
 
-  // 思考能力派生状态：根据当前模型决定 UI 显示哪些控件
-  const currentThinkingMode = currentModelInfo?.thinkingMode ?? 'NONE';
-  const currentSupportsThinkingDepth = currentModelInfo?.supportsThinkingDepth ?? false;
-  // 是否要在 UI 显示「开关思考」按钮（只有 OPTIONAL 才有意义）
-  const showThinkingToggle = currentThinkingMode === 'OPTIONAL';
-  // 思考是否处于「打开」状态（决定深度选择器是否激活、是否传 thinkingEnabled=true）
-  const thinkingActive =
-    currentThinkingMode === 'FORCED' ||
-    (currentThinkingMode === 'OPTIONAL' && selectedThinkingEnabled);
-  // 深度选择器：仅当思考激活 + 模型支持调节时展示
-  const showDepthSelector = thinkingActive && currentSupportsThinkingDepth;
-  // Allowed depths for current model（来自 /api/llm/models，已经按模型实际能力裁剪）
-  const currentAllowedDepths = currentModelInfo?.allowedDepths || ['low', 'medium'];
+  // 切模型时：保留 user current preference 如果新模型支持；否则收敛到 'medium'（DEPTH）/'auto'（AUTO/FORCED）
+  const handleSelectModel = (modelName: string) => {
+    const model = availableModels.find((m) => m.name === modelName);
+    setSelectedModel(modelName);
+    if (model) {
+      const validPrefs = thinkingOptionsForMode(model.thinkingMode)
+        .filter((opt) => !opt.disabled)
+        .map((opt) => opt.pref);
+      if (model.thinkingMode === 'NONE') {
+        // NONE 模式下随便存什么都行，UI 会禁用按钮；保留 auto 不至于下次切回 DEPTH 时残留奇怪值
+        setSelectedThinkingPreference('auto');
+      } else if (!validPrefs.includes(selectedThinkingPreference)) {
+        // 当前 preference 在新模型上没意义，回落：DEPTH→medium、其他→auto
+        setSelectedThinkingPreference(
+          model.thinkingMode === 'DEPTH' ? 'medium' : 'auto'
+        );
+      }
+    }
+    setShowModelMenu(false);
+  };
+
+  // 思考按钮：NONE 模式整体置灰、不可点击
+  const thinkingDisabled = currentThinkingMode === 'NONE';
+  const thinkingOptions = thinkingOptionsForMode(currentThinkingMode);
+  const isThinkingActive =
+    !thinkingDisabled && selectedThinkingPreference !== 'off';
+  const thinkingBadge = badgeForPreference(selectedThinkingPreference);
 
   return (
     <div className="flex flex-col h-full">
-      {/* Model & Depth selector bar */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-cream-100 bg-cream-50/50">
-        {/* Model selector */}
-        <div ref={modelMenuRef} className="relative">
-          <button
-            onClick={() => setShowModelMenu(!showModelMenu)}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium
-                       border border-cream-300 bg-white text-charcoal-600
-                       hover:border-cream-400 transition-colors"
-          >
-            <Bot className="w-3 h-3 text-rust-500" />
-            <span className="max-w-[100px] truncate">{currentModelLabel}</span>
-            <ChevronDown className="w-3 h-3 text-charcoal-400" />
-          </button>
-
-          {showModelMenu && availableModels.length > 0 && (
-            <div className="absolute top-full mt-1 left-0 w-56 bg-white border border-cream-300
-                            rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
-              {availableModels.map((model) => {
-                const modeLabel =
-                  model.thinkingMode === 'FORCED'
-                    ? '自带深度思考'
-                    : model.thinkingMode === 'OPTIONAL'
-                      ? '可开启深度思考'
-                      : '标准模式';
-                const imageLabel = model.supportsImage ? '· 文字+图片' : '';
-                return (
-                  <button
-                    key={model.name}
-                    onClick={() => {
-                      setSelectedModel(model.name);
-                      // 切到不支持深度调节的模型时把 selectedDepth 收敛到允许集合内
-                      if (!model.allowedDepths.includes(selectedDepth)) {
-                        setSelectedDepth(model.allowedDepths[0] ?? 'medium');
-                      }
-                      // 切到不支持思考的模型时把开关关掉，避免下次切回 OPTIONAL 时残留
-                      if (model.thinkingMode === 'NONE') {
-                        setSelectedThinkingEnabled(false);
-                      }
-                      setShowModelMenu(false);
-                    }}
-                    className={`w-full text-left px-3 py-2 text-xs hover:bg-cream-50 transition-colors
-                      ${selectedModel === model.name ? 'text-rust-600 bg-rust-50' : 'text-charcoal-600'}`}
-                  >
-                    <div className="font-medium">{model.displayName}</div>
-                    <div className="text-[10px] text-charcoal-400 mt-0.5">
-                      {modeLabel} {imageLabel}
-                    </div>
-                  </button>
-                );
-              })}
-
-              {availableModels.length === 0 && (
-                <div className="px-3 py-2 text-xs text-charcoal-400">
-                  No models available
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* 思考开关（仅 OPTIONAL 模型显示） */}
-        {showThinkingToggle && (
-          <button
-            onClick={() => setSelectedThinkingEnabled(!selectedThinkingEnabled)}
-            title={selectedThinkingEnabled ? '点击关闭深度思考' : '点击开启深度思考'}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium border transition-colors
-              ${
-                selectedThinkingEnabled
-                  ? 'bg-purple-50 text-purple-600 border-purple-200'
-                  : 'bg-white text-charcoal-500 border-cream-300 hover:border-cream-400'
-              }`}
-          >
-            <Sparkles className="w-3 h-3" />
-            {selectedThinkingEnabled ? '思考已开' : '思考已关'}
-          </button>
-        )}
-
-        {/* FORCED 模型显示一个不可关闭的标识 */}
-        {currentThinkingMode === 'FORCED' && (
-          <span
-            title="该模型自带思考，无法关闭"
-            className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium
-                       bg-purple-50 text-purple-600 border border-purple-200"
-          >
-            <Sparkles className="w-3 h-3" />
-            自带思考
-          </span>
-        )}
-
-        {/* 深度选择器（仅在思考激活且模型支持调节时显示） */}
-        {showDepthSelector && (
-          <div className="flex items-center bg-cream-100 rounded-lg p-0.5 border border-cream-200">
-            {DEPTH_OPTIONS.filter((d) => currentAllowedDepths.includes(d.value)).map((opt) => (
-              <button
-                key={opt.value}
-                onClick={() => setSelectedDepth(opt.value)}
-                title={opt.description}
-                className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors
-                  ${
-                    selectedDepth === opt.value
-                      ? 'bg-white text-rust-600 shadow-sm'
-                      : 'text-charcoal-400 hover:text-charcoal-600'
-                  }`}
-              >
-                {opt.icon}
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
         {/* 主动压缩后被折叠的早期消息 —— 用户可展开查看原文 */}
@@ -984,9 +930,9 @@ export default function ChatTab({
             </div>
             <div className="flex flex-col gap-0.5">
               <span className="text-xs text-charcoal-400">
-                {selectedDepth === 'high' ? '深度思考中…' : '思考中…'}
+                {isThinkingActive ? '深度思考中…' : '思考中…'}
               </span>
-              {selectedDepth === 'high' && (
+              {isThinkingActive && (
                 <span className="text-[10px] text-purple-400 flex items-center gap-1">
                   <Sparkles className="w-2.5 h-2.5" />
                   Extended Thinking 已启用
@@ -999,8 +945,8 @@ export default function ChatTab({
         <div ref={scrollRef} />
       </div>
 
-      {/* Input + 小圈 + 详情卡 */}
-      <div className={`border-t border-cream-200 p-3 ${inputSticky ? 'sticky bottom-0 bg-white safe-bottom' : ''}`.trim()}>
+      {/* Input area —— padding 收紧，与顶部 tab bar 视觉对称 */}
+      <div className={`border-t border-cream-200 px-3 py-1.5 ${inputSticky ? 'sticky bottom-0 bg-white safe-bottom' : ''}`.trim()}>
         {contextFull && (
           <div className="mb-2 px-2.5 py-1.5 rounded-md bg-red-50 border border-red-200 text-[11px] text-red-700 flex items-center justify-between">
             <span>上下文已满，所有降级策略均无法塞下。</span>
@@ -1020,6 +966,124 @@ export default function ChatTab({
           </div>
         )}
         <div className="flex items-center gap-2">
+          {/* 模型方形按钮 + popover */}
+          <div ref={modelMenuRef} className="relative">
+            <button
+              type="button"
+              onClick={() => setShowModelMenu((v) => !v)}
+              title={`模型: ${currentModelLabel}`}
+              className="w-9 h-9 rounded-lg border border-cream-300 bg-white text-charcoal-600
+                         hover:border-cream-400 transition-colors flex items-center justify-center"
+            >
+              <Bot className="w-4 h-4 text-rust-500" />
+            </button>
+
+            {showModelMenu && (
+              <div className="absolute bottom-full left-0 mb-2 w-56 bg-white border border-cream-300
+                              rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
+                {availableModels.length === 0 ? (
+                  <div className="px-3 py-2 text-xs text-charcoal-400">
+                    暂无可用模型
+                  </div>
+                ) : (
+                  availableModels.map((model) => {
+                    const modeLabel =
+                      model.thinkingMode === 'FORCED'
+                        ? '自带深度思考'
+                        : model.thinkingMode === 'DEPTH'
+                          ? '可调节深度思考'
+                          : model.thinkingMode === 'AUTO'
+                            ? '自决思考'
+                            : '标准模式';
+                    const imageLabel = model.supportsImage ? '· 文字+图片' : '';
+                    return (
+                      <button
+                        key={model.name}
+                        onClick={() => handleSelectModel(model.name)}
+                        className={`w-full text-left px-3 py-2 text-xs hover:bg-cream-50 transition-colors
+                          ${selectedModel === model.name ? 'text-rust-600 bg-rust-50' : 'text-charcoal-600'}`}
+                      >
+                        <div className="font-medium">{model.displayName}</div>
+                        <div className="text-[10px] text-charcoal-400 mt-0.5">
+                          {modeLabel} {imageLabel}
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* 思考方形按钮 + popover */}
+          <div ref={thinkingMenuRef} className="relative">
+            <button
+              type="button"
+              onClick={() => {
+                if (thinkingDisabled) return;
+                setShowThinkingMenu((v) => !v);
+              }}
+              title={
+                thinkingDisabled
+                  ? '该模型不支持思考'
+                  : `思考: ${selectedThinkingPreference}`
+              }
+              className={`w-9 h-9 rounded-lg border transition-colors flex items-center justify-center relative
+                ${
+                  thinkingDisabled
+                    ? 'pointer-events-none opacity-40 border-cream-300 bg-white'
+                    : isThinkingActive
+                      ? 'bg-purple-50 border-purple-200 text-purple-600 hover:border-purple-300'
+                      : 'bg-white border-cream-300 text-charcoal-500 hover:border-cream-400'
+                }`}
+            >
+              <Sparkles className="w-4 h-4" />
+              {thinkingBadge && !thinkingDisabled && (
+                <span className="absolute -bottom-0.5 -right-0.5 text-[8px] font-bold leading-none
+                                 px-0.5 min-w-[12px] h-3 flex items-center justify-center
+                                 rounded-sm bg-purple-500 text-white">
+                  {thinkingBadge}
+                </span>
+              )}
+            </button>
+
+            {showThinkingMenu && !thinkingDisabled && (
+              <div className="absolute bottom-full left-0 mb-2 w-44 bg-white border border-cream-300
+                              rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
+                {thinkingOptions.map((opt) => {
+                  const isSelected = selectedThinkingPreference === opt.pref;
+                  return (
+                    <button
+                      key={opt.pref}
+                      type="button"
+                      disabled={opt.disabled}
+                      onClick={() => {
+                        if (opt.disabled) return;
+                        setSelectedThinkingPreference(opt.pref);
+                        setShowThinkingMenu(false);
+                      }}
+                      title={opt.disabledTitle ?? opt.description}
+                      className={`w-full text-left px-3 py-1.5 text-xs transition-colors
+                        ${opt.disabled
+                          ? 'text-charcoal-300 cursor-not-allowed'
+                          : isSelected
+                            ? 'bg-purple-50 text-purple-700'
+                            : 'text-charcoal-600 hover:bg-cream-50'}`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-medium">{opt.label}</span>
+                        {isSelected && <Check className="w-3 h-3" />}
+                      </div>
+                      <div className="text-[10px] text-charcoal-400 mt-0.5">
+                        {opt.description}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           <input
             type="text"
             value={input}

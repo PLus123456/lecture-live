@@ -2,8 +2,26 @@ import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { listAvailableModels, parseProviders } from '@/lib/llm/gateway';
-import type { ChatModelOption, ChatModelsResponse, ThinkingDepth, LlmPurpose } from '@/types/llm';
+import type {
+  ChatModelOption,
+  ChatModelsResponse,
+  ThinkingDepth,
+  ThinkingMode,
+  LlmPurpose,
+} from '@/types/llm';
 import { jsonWithCache } from '@/lib/httpCache';
+
+/**
+ * 给定模型 thinkingMode + 用户角色，算出 UI 可选的深度档位。
+ * 非 DEPTH 模型返回空数组，UI 自行渲染 auto/forced。
+ */
+function allowedDepthsFor(
+  mode: ThinkingMode,
+  role: 'ADMIN' | 'PRO' | 'FREE'
+): ThinkingDepth[] {
+  if (mode !== 'DEPTH') return [];
+  return role === 'FREE' ? ['low', 'medium'] : ['low', 'medium', 'high'];
+}
 
 /**
  * GET /api/llm/models
@@ -58,27 +76,17 @@ export async function GET(req: Request) {
         continue;
       }
 
-      const supportsThinking = cfg.thinkingMode !== 'NONE';
-      // 允许的深度：模型支持调节时给全集，否则只暴露其默认深度（让前端 UI 锁定显示）
-      const allDepths: ThinkingDepth[] = ['low', 'medium', 'high'];
-      const allowedDepths: ThinkingDepth[] = cfg.supportsThinkingDepth
-        ? [...allDepths]
-        : [cfg.thinkingDepth];
-
-      // FREE 用户不能使用 high（成本高）
-      if (user.role === 'FREE') {
-        const idx = allowedDepths.indexOf('high');
-        if (idx !== -1) allowedDepths.splice(idx, 1);
-      }
+      const mode = cfg.thinkingMode;
+      const allowedDepths = allowedDepthsFor(mode, user.role);
 
       const buildOption = (purpose: LlmPurpose): ChatModelOption => ({
         name: cfg.dbModelId!,
         id: cfg.dbModelId!,
         modelId: cfg.model,
         displayName: cfg.displayName || cfg.model,
-        supportsThinking,
-        thinkingMode: cfg.thinkingMode,
-        supportsThinkingDepth: cfg.supportsThinkingDepth,
+        supportsThinking: mode !== 'NONE',
+        thinkingMode: mode,
+        supportsThinkingDepth: mode === 'DEPTH',
         supportsImage: cfg.supportsImage,
         allowedDepths,
         purpose,
@@ -137,27 +145,17 @@ export async function GET(req: Request) {
     const provider = configuredProviders[name];
     if (!provider) continue;
 
-    const supportsThinking = provider.thinkingMode !== 'NONE';
-    const allDepths: ThinkingDepth[] = ['low', 'medium', 'high'];
-    const allowedDepths: ThinkingDepth[] = provider.supportsThinkingDepth
-      ? [...allDepths]
-      : [provider.thinkingDepth];
-
-    if (user.role === 'FREE') {
-      const idx = allowedDepths.indexOf('high');
-      if (idx !== -1) allowedDepths.splice(idx, 1);
-    }
-
+    const mode = provider.thinkingMode;
     models.push({
       name,
       id: name,
       modelId: provider.model,
       displayName: provider.displayName || name,
-      supportsThinking,
-      thinkingMode: provider.thinkingMode,
-      supportsThinkingDepth: provider.supportsThinkingDepth,
+      supportsThinking: mode !== 'NONE',
+      thinkingMode: mode,
+      supportsThinkingDepth: mode === 'DEPTH',
       supportsImage: provider.supportsImage,
-      allowedDepths,
+      allowedDepths: allowedDepthsFor(mode, user.role),
       purpose: 'CHAT',
     });
   }

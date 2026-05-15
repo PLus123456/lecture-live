@@ -1,8 +1,11 @@
 'use client';
 
 import { useCallback, useEffect, useRef } from 'react';
-import { useChatStore } from '@/stores/chatStore';
-import type { ConversationMeta } from '@/stores/chatStore';
+import {
+  useChatStore,
+  preferenceToFields,
+  type ConversationMeta,
+} from '@/stores/chatStore';
 import { useAuthStore } from '@/stores/authStore';
 import type { ChatMessage, ChatModelsResponse, ThinkingDepth } from '@/types/llm';
 import { estimateTokens } from '@/lib/llm/tokenizer';
@@ -52,8 +55,7 @@ export function useChat(sessionId: string | null) {
   const {
     isLoading,
     selectedModel,
-    selectedDepth,
-    selectedThinkingEnabled,
+    selectedThinkingPreference,
     availableModels,
     modelsLoaded,
     activeConversationId,
@@ -64,8 +66,7 @@ export function useChat(sessionId: string | null) {
     contextFull,
     setLoading,
     setSelectedModel,
-    setSelectedDepth,
-    setSelectedThinkingEnabled,
+    setSelectedThinkingPreference,
     setAvailableModels,
     setActiveConversation,
     setConversations,
@@ -230,6 +231,9 @@ export function useChat(sessionId: string | null) {
       setTokenUsage(preEstimate);
 
       try {
+        // 把单一 preference 拆成 thinkingDepth + thinkingEnabled 两字段，
+        // undefined 字段不写入请求体 → route.ts 把"无 thinkingEnabled"解读为 auto。
+        const thinkingFields = preferenceToFields(selectedThinkingPreference);
         const res = await fetch('/api/llm/chat', {
           method: 'POST',
           headers: {
@@ -243,8 +247,12 @@ export function useChat(sessionId: string | null) {
             totalTranscriptMs,
             summaryContext,
             model: selectedModel || undefined,
-            thinkingDepth: selectedDepth,
-            thinkingEnabled: selectedThinkingEnabled,
+            ...(thinkingFields.thinkingDepth !== undefined
+              ? { thinkingDepth: thinkingFields.thinkingDepth }
+              : {}),
+            ...(thinkingFields.thinkingEnabled !== undefined
+              ? { thinkingEnabled: thinkingFields.thinkingEnabled }
+              : {}),
           }),
         });
 
@@ -308,8 +316,7 @@ export function useChat(sessionId: string | null) {
       contextFull,
       messages,
       selectedModel,
-      selectedDepth,
-      selectedThinkingEnabled,
+      selectedThinkingPreference,
       tokenUsage,
       addMessage,
       setLoading,
@@ -420,8 +427,7 @@ export function useChat(sessionId: string | null) {
     // state
     isLoading,
     selectedModel,
-    selectedDepth,
-    selectedThinkingEnabled,
+    selectedThinkingPreference,
     availableModels,
     modelsLoaded,
     activeConversationId,
@@ -433,8 +439,7 @@ export function useChat(sessionId: string | null) {
     // actions
     sendMessage,
     setSelectedModel,
-    setSelectedDepth,
-    setSelectedThinkingEnabled,
+    setSelectedThinkingPreference,
     createNewConversation,
     switchConversation,
     compressActive,

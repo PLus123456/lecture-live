@@ -32,6 +32,7 @@ import {
 } from '@/lib/llm/chatContextBuilder';
 import { computeContextBudget } from '@/lib/llm/tokenBudget';
 import { makeRagRetrieverForSession } from '@/lib/llm/embedding/transcriptRag';
+import { findCompressionBoundary } from '@/lib/llm/chatCompression';
 import { logger, serializeError } from '@/lib/logger';
 
 const VALID_DEPTHS: ThinkingDepth[] = ['low', 'medium', 'high'];
@@ -134,6 +135,7 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
         messages: {
           orderBy: { createdAt: 'asc' },
           select: {
+            id: true,
             role: true,
             content: true,
             transcriptOffsetMs: true,
@@ -157,20 +159,13 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
     const language = conversation.session.targetLang || 'zh';
     const sessionId = conversation.sessionId;
 
-    // 找最近一条 role='system' 作为"主动压缩"截断点：
-    //   - 之前的 user/assistant 已被压成 system 摘要，不再发给 LLM
-    //   - 之后的是"未压缩"有效历史
-    // /api/llm/chat/compress 写入 system 摘要 → 此处自然 honor。
-    let lastSystemContent: string | null = null;
-    let splitIndex = -1;
-    for (let i = conversation.messages.length - 1; i >= 0; i--) {
-      if (conversation.messages[i].role === 'system') {
-        lastSystemContent = conversation.messages[i].content;
-        splitIndex = i;
-        break;
-      }
-    }
-    const effectiveMessages = conversation.messages.slice(splitIndex + 1);
+    // 找最近一条 role='system' 作为"主动压缩"截断点。新压缩消息带有
+    // compressed-through 标记，不再依赖 system 消息的 createdAt 物理位置。
+    const compressionBoundary = findCompressionBoundary(conversation.messages);
+    const lastSystemContent = compressionBoundary.summary;
+    const effectiveMessages = conversation.messages.slice(
+      compressionBoundary.splitIndex + 1
+    );
 
     // ── 解析模型 & provider 配置 ──
     const selection = await resolveAuthorizedLlmSelection(
@@ -200,11 +195,20 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
         transcriptOffsetMs: m.transcriptOffsetMs ?? 0,
       }));
 
-    // baseSystemPrompt 含 summary 和 depth 指令；主动压缩的 system 摘要拼在前面
-    const chatSystemPrompt = buildChatPrompt('', summaryContext, finalDepth);
-    const baseSystemPrompt = lastSystemContent
-      ? `[Earlier conversation summary]:\n${lastSystemContent}\n\n${chatSystemPrompt}`
-      : chatSystemPrompt;
+    // 每一级降级都会产出自己的 transcript/summary 窗口，必须在这里重建 prompt。
+    const buildSystemPrompt = (
+      transcriptContext: string,
+      summaryText: string
+    ) => {
+      const chatSystemPrompt = buildChatPrompt(
+        transcriptContext,
+        summaryText,
+        finalDepth
+      );
+      return lastSystemContent
+        ? `[Earlier conversation summary]:\n${lastSystemContent}\n\n${chatSystemPrompt}`
+        : chatSystemPrompt;
+    };
 
     // ── 主循环：降级链 + 反应式 retry ──
     const ragRetriever = makeRagRetrieverForSession(sessionId);
@@ -226,7 +230,7 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
           totalTranscriptMs,
           minLevel: currentLevel,
           inputBudget: budget.inputBudget,
-          baseSystemPrompt,
+          buildSystemPrompt,
           callLLM: (s: string, u: string) =>
             // 压缩历史用 CHAT 用途（其实更适合用 FINAL_SUMMARY 但 CHAT 模型也行）
             import('@/lib/llm/gateway').then(({ callLLM }) =>

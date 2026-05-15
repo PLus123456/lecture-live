@@ -4,7 +4,7 @@ import { requireAdminAccess } from '@/lib/adminApi';
 
 // 有效的 LLM 用途枚举值
 const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING'];
-const VALID_THINKING_MODES = ['NONE', 'OPTIONAL', 'FORCED'];
+const VALID_THINKING_MODES = ['NONE', 'AUTO', 'FORCED', 'DEPTH'];
 
 // 添加模型到指定供应商
 export async function POST(
@@ -35,7 +35,6 @@ export async function POST(
       displayName,
       thinkingDepth,
       thinkingMode,
-      supportsThinkingDepth,
       supportsImage,
       maxTokens,
       contextWindow,
@@ -44,6 +43,7 @@ export async function POST(
       isDefault,
       sortOrder,
     } = body;
+    // supportsThinkingDepth 不再从 body 取，由 thinkingMode === 'DEPTH' 派生
 
     if (!modelId || !displayName) {
       return NextResponse.json(
@@ -92,10 +92,9 @@ export async function POST(
       });
     }
 
-    // thinkingMode=NONE 时强制 supportsThinkingDepth=false（语义一致性）
+    // supportsThinkingDepth 由 mode === 'DEPTH' 派生（一致性保护）
     const effectiveThinkingMode = thinkingMode ?? 'NONE';
-    const effectiveSupportsDepth =
-      effectiveThinkingMode === 'NONE' ? false : Boolean(supportsThinkingDepth);
+    const effectiveSupportsDepth = effectiveThinkingMode === 'DEPTH';
 
     const model = await prisma.llmModel.create({
       data: {

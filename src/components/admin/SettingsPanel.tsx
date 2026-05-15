@@ -99,11 +99,12 @@ type ThinkingBudget = 'low' | 'medium' | 'high';
 
 /**
  * 模型的思考能力分类。
- *  NONE     - 不支持思考（普通 chat 模型）
- *  OPTIONAL - 用户可开/关思考（Claude Extended Thinking）
- *  FORCED   - 模型自带思考无法关闭（OpenAI o1/o3、DeepSeek R1）
+ *  NONE   - 不支持/关闭思考（普通 chat 模型）
+ *  AUTO   - 让模型自行决定是否思考，不发送 thinking 参数
+ *  FORCED - 模型自带思考无法关闭（OpenAI o1/o3、DeepSeek R1），按固定深度发送
+ *  DEPTH  - 支持思考且允许用户在 chat 端调节深度（低/中/高）
  */
-type ThinkingMode = 'NONE' | 'OPTIONAL' | 'FORCED';
+type ThinkingMode = 'NONE' | 'AUTO' | 'FORCED' | 'DEPTH';
 
 /** LLM 模型定义 */
 interface LlmModel {
@@ -205,17 +206,26 @@ function groupProviderModels(models: Record<string, unknown>[]): LlmModel[] {
 
     if (!grouped.has(key)) {
       const rawMode = (model.thinkingMode ?? model.thinking_mode ?? 'NONE') as string;
-      const thinkingMode: ThinkingMode =
-        rawMode === 'OPTIONAL' || rawMode === 'FORCED' ? rawMode : 'NONE';
+      const rawSupportsDepth = Boolean(
+        model.supportsThinkingDepth ?? model.supports_thinking_depth ?? false
+      );
+      // 防御性：后端历史可能仍存 'OPTIONAL'；按 supportsThinkingDepth 拆为 DEPTH / AUTO
+      let thinkingMode: ThinkingMode;
+      if (rawMode === 'FORCED' || rawMode === 'AUTO' || rawMode === 'DEPTH') {
+        thinkingMode = rawMode;
+      } else if (rawMode === 'OPTIONAL') {
+        thinkingMode = rawSupportsDepth ? 'DEPTH' : 'AUTO';
+      } else {
+        thinkingMode = 'NONE';
+      }
       grouped.set(key, {
         id: modelRowId,
         model_id: (model.modelId ?? model.model_id ?? '') as string,
         display_name: (model.displayName ?? model.display_name ?? '') as string,
         thinking_budget: (model.thinkingDepth ?? model.thinking_budget ?? 'medium') as ThinkingBudget,
         thinking_mode: thinkingMode,
-        supports_thinking_depth: Boolean(
-          model.supportsThinkingDepth ?? model.supports_thinking_depth ?? false
-        ),
+        // 始终从派生值得到，保持 supports_thinking_depth 与 thinking_mode 同步
+        supports_thinking_depth: thinkingMode === 'DEPTH',
         supports_image: Boolean(model.supportsImage ?? model.supports_image ?? false),
         max_tokens: toFiniteNumber(model.maxTokens ?? model.max_tokens, 4096),
         context_window: toFiniteNumber(model.contextWindow ?? model.context_window, 8192),
@@ -266,8 +276,8 @@ function expandProviderModelsForSave(models: LlmModel[]) {
       displayName: model.display_name,
       thinkingDepth: model.thinking_budget,
       thinkingMode: model.thinking_mode,
-      supportsThinkingDepth:
-        model.thinking_mode === 'NONE' ? false : model.supports_thinking_depth,
+      // 派生：DEPTH 模式才允许用户调节深度
+      supportsThinkingDepth: model.thinking_mode === 'DEPTH',
       supportsImage: model.supports_image,
       maxTokens: model.max_tokens,
       contextWindow: model.context_window,
@@ -651,10 +661,13 @@ function ModelRow({
   model,
   onUpdate,
   onDelete,
+  onToggleDefaultPurpose,
 }: {
   model: LlmModel;
   onUpdate: (updated: LlmModel) => void;
   onDelete: () => void;
+  /** 由 LlmPanel 处理：勾选默认用途时全局互斥（取消其他 provider 同 purpose 的默认） */
+  onToggleDefaultPurpose: (modelLocalId: string, purpose: ModelPurpose, enabled: boolean) => void;
 }) {
   const { t } = useI18n();
 
@@ -677,31 +690,17 @@ function ModelRow({
     });
   };
 
-  const toggleDefaultPurpose = (purpose: ModelPurpose, enabled: boolean) => {
-    if (!model.purposes.includes(purpose)) {
-      return;
-    }
-
-    const defaultPurposes = enabled
-      ? sortModelPurposes([...model.default_purposes, purpose])
-      : model.default_purposes.filter((item) => item !== purpose);
-
-    onUpdate({
-      ...model,
-      default_purposes: sortModelPurposes(defaultPurposes),
-    });
-  };
-
   const contextWindowTooLow = model.context_window < model.max_tokens;
-  const thinkingModeNone = model.thinking_mode === 'NONE';
-  const showDepthSelect = !thinkingModeNone;
+  // 思考深度仅在 FORCED（固定深度）与 DEPTH（用户可调时的默认回退）时可编辑
+  const depthSelectDisabled =
+    model.thinking_mode === 'NONE' || model.thinking_mode === 'AUTO';
 
   const setThinkingMode = (next: ThinkingMode) => {
     onUpdate({
       ...model,
       thinking_mode: next,
-      // 切换到 NONE 时自动清掉「可调节深度」标记，避免数据不一致
-      supports_thinking_depth: next === 'NONE' ? false : model.supports_thinking_depth,
+      // 派生：仅 DEPTH 模式标记为允许调节深度
+      supports_thinking_depth: next === 'DEPTH',
     });
   };
 
@@ -751,17 +750,18 @@ function ModelRow({
                      focus:outline-none focus:ring-1 focus:ring-rust-200"
         >
           <option value="NONE">{t('adminSettings.thinkingModeNone')}</option>
-          <option value="OPTIONAL">{t('adminSettings.thinkingModeOptional')}</option>
+          <option value="AUTO">{t('adminSettings.thinkingModeAuto')}</option>
           <option value="FORCED">{t('adminSettings.thinkingModeForced')}</option>
+          <option value="DEPTH">{t('adminSettings.thinkingModeDepth')}</option>
         </select>
       </div>
 
-      {/* 默认 / 固定 思考深度 + 是否允许调节 */}
+      {/* 默认 / 固定 思考深度（FORCED 当固定深度，DEPTH 当用户未选时的回退） */}
       <div>
         <label
           className="text-xs text-charcoal-500 dark:text-charcoal-400 mb-0.5 block"
           title={
-            showDepthSelect && !model.supports_thinking_depth
+            model.thinking_mode === 'FORCED'
               ? t('adminSettings.thinkingDepthFixedDesc')
               : t('adminSettings.thinkingDepthDesc')
           }
@@ -770,7 +770,7 @@ function ModelRow({
         </label>
         <select
           value={model.thinking_budget}
-          disabled={thinkingModeNone}
+          disabled={depthSelectDisabled}
           onChange={(e) =>
             onUpdate({ ...model, thinking_budget: e.target.value as ThinkingBudget })
           }
@@ -783,18 +783,6 @@ function ModelRow({
           <option value="medium">{t('adminSettings.thinkingMedium')}</option>
           <option value="high">{t('adminSettings.thinkingHigh')}</option>
         </select>
-        <label className="mt-1 flex items-center gap-1 text-[11px] text-charcoal-500 dark:text-charcoal-400 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={model.supports_thinking_depth}
-            disabled={thinkingModeNone}
-            onChange={(e) =>
-              onUpdate({ ...model, supports_thinking_depth: e.target.checked })
-            }
-            className="rounded border-cream-300 text-rust-500 focus:ring-rust-200 disabled:opacity-50"
-          />
-          {t('adminSettings.supportsThinkingDepth')}
-        </label>
       </div>
 
       {/* 输入模态（文字 / 文字+图片） */}
@@ -910,7 +898,7 @@ function ModelRow({
                     type="checkbox"
                     checked={isDefault}
                     disabled={!selected}
-                    onChange={(e) => toggleDefaultPurpose(purpose, e.target.checked)}
+                    onChange={(e) => onToggleDefaultPurpose(model.id, purpose, e.target.checked)}
                     className="rounded border-cream-300 text-rust-500 focus:ring-rust-200 disabled:opacity-50"
                   />
                   {t('adminSettings.isDefault')}
@@ -942,11 +930,13 @@ function ProviderCard({
   onUpdate,
   onDelete,
   onSaveProvider,
+  onToggleDefaultPurpose,
 }: {
   provider: LlmProvider;
   onUpdate: (updated: LlmProvider) => void;
   onDelete: () => void;
   onSaveProvider: (provider: LlmProvider) => void;
+  onToggleDefaultPurpose: (modelLocalId: string, purpose: ModelPurpose, enabled: boolean) => void;
 }) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
@@ -1098,6 +1088,7 @@ function ProviderCard({
                   model={model}
                   onUpdate={(updated) => handleModelUpdate(idx, updated)}
                   onDelete={() => handleModelDelete(idx)}
+                  onToggleDefaultPurpose={onToggleDefaultPurpose}
                 />
               ))}
               {provider.models.length === 0 && (
@@ -2041,9 +2032,11 @@ function AsrPanel({
 function LlmPanel({
   providers,
   setProviders,
+  reloadProviders,
 }: {
   providers: LlmProvider[];
   setProviders: React.Dispatch<React.SetStateAction<LlmProvider[]>>;
+  reloadProviders: () => Promise<void>;
 }) {
   const { t } = useI18n();
   const [saving, setSaving] = useState(false);
@@ -2053,6 +2046,39 @@ function LlmPanel({
     const newProviders = [...providers];
     newProviders[index] = updated;
     setProviders(newProviders);
+  };
+
+  // 默认用途全局互斥：勾选某 model 的 purpose 为默认时，跨 provider 取消其他所有 model 的同 purpose 默认标记
+  const handleToggleDefaultPurpose = (
+    targetProviderIdx: number,
+    targetModelLocalId: string,
+    purpose: ModelPurpose,
+    makeDefault: boolean,
+  ) => {
+    setProviders((prev) =>
+      prev.map((p, pi) => ({
+        ...p,
+        models: p.models.map((m) => {
+          const isTarget = pi === targetProviderIdx && m.id === targetModelLocalId;
+          if (isTarget) {
+            // 目标 model：仅在它已选中该 purpose 时才允许设默认
+            if (!m.purposes.includes(purpose)) return m;
+            const nextDefaults = makeDefault
+              ? sortModelPurposes([...m.default_purposes, purpose])
+              : m.default_purposes.filter((x) => x !== purpose);
+            return { ...m, default_purposes: nextDefaults };
+          }
+          // 全局清理：勾选默认时把同 purpose 从其他所有 model 的 default_purposes 移除
+          if (makeDefault && m.default_purposes.includes(purpose)) {
+            return {
+              ...m,
+              default_purposes: m.default_purposes.filter((x) => x !== purpose),
+            };
+          }
+          return m;
+        }),
+      })),
+    );
   };
 
   // 保存单个供应商到后端（前端 snake_case → 后端 camelCase 映射）
@@ -2077,12 +2103,9 @@ function LlmPanel({
         body: JSON.stringify(payload),
       });
       if (res.ok) {
-        const data = await res.json();
-        const saved = data.provider ?? data;
-        const mapped = mapProviderFromResponse(saved as Record<string, unknown>);
-        setProviders((prev) =>
-          prev.map((p) => (p.id === provider.id ? mapped : p))
-        );
+        // 全量重载，保证默认用途互斥跨 provider 一致（后端 normalizeDefaultModelsByPurpose
+        // 会改动其他 provider 的 isDefault）
+        await reloadProviders();
         toast.success(isNew ? t('common.createSuccess') : t('common.saveSuccess'));
       } else {
         const data = await res.json().catch(() => null);
@@ -2154,6 +2177,9 @@ function LlmPanel({
           onUpdate={(updated) => handleProviderUpdate(idx, updated)}
           onDelete={() => handleDeleteProvider(provider)}
           onSaveProvider={handleSaveProvider}
+          onToggleDefaultPurpose={(modelLocalId, purpose, makeDefault) =>
+            handleToggleDefaultPurpose(idx, modelLocalId, purpose, makeDefault)
+          }
         />
       ))}
 
@@ -2273,24 +2299,26 @@ export default function SettingsPanel() {
   }, []);
 
   // 加载 LLM 供应商配置（后端 camelCase → 前端 snake_case 映射）
-  useEffect(() => {
-    const loadProviders = async () => {
-      try {
-        const res = await fetch('/api/admin/llm-providers');
-        if (res.ok) {
-          const data = await res.json();
-          const raw = data.providers ?? (Array.isArray(data) ? data : []);
-          const mapped: LlmProvider[] = raw.map((p: Record<string, unknown>) =>
-            mapProviderFromResponse(p)
-          );
-          setProviders(mapped);
-        }
-      } catch (err) {
-        console.error('加载 LLM 供应商失败:', err);
+  // 抽成 useCallback 是为了在保存成功后能全量重载，保证默认用途互斥与后端一致
+  const reloadProviders = useCallback(async () => {
+    try {
+      const res = await fetch('/api/admin/llm-providers');
+      if (res.ok) {
+        const data = await res.json();
+        const raw = data.providers ?? (Array.isArray(data) ? data : []);
+        const mapped: LlmProvider[] = raw.map((p: Record<string, unknown>) =>
+          mapProviderFromResponse(p)
+        );
+        setProviders(mapped);
       }
-    };
-    loadProviders();
+    } catch (err) {
+      console.error('加载 LLM 供应商失败:', err);
+    }
   }, []);
+
+  useEffect(() => {
+    reloadProviders();
+  }, [reloadProviders]);
 
   // 主题切换由 ThemeProvider 管理，此处无需直接操作 DOM
 
@@ -2410,7 +2438,13 @@ export default function SettingsPanel() {
       case 'asr':
         return <AsrPanel settings={settings} onChange={handleChange} />;
       case 'llm':
-        return <LlmPanel providers={providers} setProviders={setProviders} />;
+        return (
+          <LlmPanel
+            providers={providers}
+            setProviders={setProviders}
+            reloadProviders={reloadProviders}
+          />
+        );
       case 'security':
         return <SecurityPanel settings={settings} onChange={handleChange} onToggle={handleToggle} />;
     }

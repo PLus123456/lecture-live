@@ -15,6 +15,10 @@ export interface ChatMessage {
   thinkingDepth?: ThinkingDepth;
   /** LLM 的思考过程（extended thinking 或 /keyword 步骤） */
   thinking?: string;
+  /** 思考耗时（毫秒），用于"已深度思考 Ns"标签（assistant only） */
+  thinkingMs?: number;
+  /** 该消息是否仍在 SSE 流式生成中（assistant only） */
+  streaming?: boolean;
 }
 
 export interface KeywordEntry {
@@ -75,6 +79,8 @@ export interface ChatModelOption {
   allowedDepths: ThinkingDepth[];
   /** 是否支持图片输入（多模态） */
   supportsImage: boolean;
+  /** 模型输入上下文窗口（token），用于前端 token 用量小圈预算估算 */
+  contextWindow: number;
   /** 模型用途 */
   purpose?: LlmPurpose;
 }

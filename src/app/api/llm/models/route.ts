@@ -88,6 +88,7 @@ export async function GET(req: Request) {
         thinkingMode: mode,
         supportsThinkingDepth: mode === 'DEPTH',
         supportsImage: cfg.supportsImage,
+        contextWindow: cfg.contextWindow,
         allowedDepths,
         purpose,
       });
@@ -155,6 +156,7 @@ export async function GET(req: Request) {
       thinkingMode: mode,
       supportsThinkingDepth: mode === 'DEPTH',
       supportsImage: provider.supportsImage,
+      contextWindow: provider.contextWindow,
       allowedDepths: allowedDepthsFor(mode, user.role),
       purpose: 'CHAT',
     });

@@ -29,6 +29,10 @@ export const LLM_LIMITS = {
   providerOverride: 100,
   requestedModel: 100,
   reportSummaryContext: 12000,
+  /** 单条 chat 消息最多附带的图片张数 */
+  chatImageCount: 4,
+  /** 单张 chat 图片解码后的最大字节数（5MB） */
+  chatImageBytes: 5 * 1024 * 1024,
 } as const;
 
 const PROMPT_CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;

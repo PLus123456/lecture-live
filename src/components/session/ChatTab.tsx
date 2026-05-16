@@ -20,9 +20,34 @@ import {
   XCircle,
   MessageSquarePlus,
   Check,
+  ImagePlus,
+  X,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import type { ChatMessage, ThinkingMode } from '@/types/llm';
+
+/* ------------------------------------------------------------------ */
+/*  图片上传约束（与服务端 LLM_LIMITS 对齐）                              */
+/* ------------------------------------------------------------------ */
+const MAX_CHAT_IMAGES = 4;
+const MAX_CHAT_IMAGE_BYTES = 5 * 1024 * 1024;
+const ACCEPTED_IMAGE_TYPES = [
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp',
+  'image/gif',
+];
+
+/** 把 File 读成 base64 data URL */
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error ?? new Error('read failed'));
+    reader.readAsDataURL(file);
+  });
+}
 
 interface ChatContextSegment {
   text: string;
@@ -35,24 +60,6 @@ interface ChatContextSummary {
 /* ------------------------------------------------------------------ */
 /*  Thinking 偏好 → 显示元数据                                          */
 /* ------------------------------------------------------------------ */
-
-/** 当前 preference 在 thinking 按钮右下角的角标缩写（更紧凑反馈） */
-function badgeForPreference(pref: ThinkingPreference): string | null {
-  switch (pref) {
-    case 'off':
-      return null; // 关闭态不画角标
-    case 'low':
-      return '低';
-    case 'medium':
-      return '中';
-    case 'high':
-      return '高';
-    case 'forced':
-      return '强';
-    case 'auto':
-      return '自';
-  }
-}
 
 /** 按模型 thinkingMode 计算 popover 选项集 */
 function thinkingOptionsForMode(mode: ThinkingMode): Array<{
@@ -153,6 +160,16 @@ function Md({ children }: { children: string }) {
           </a>
         ),
         hr: () => <hr className="my-2 border-charcoal-200" />,
+        // 聊天图片：限制最大尺寸，避免大图撑爆气泡
+        img: ({ src, alt }) =>
+          src ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={typeof src === 'string' ? src : undefined}
+              alt={alt || 'image'}
+              className="my-1.5 rounded-md max-w-full max-h-64 object-contain border border-cream-200"
+            />
+          ) : null,
       }}
     >
       {children}
@@ -161,42 +178,67 @@ function Md({ children }: { children: string }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  思考过程折叠组件                                                     */
+/*  思考过程折叠组件（Claude.ai 风格）                                    */
 /* ------------------------------------------------------------------ */
 
-function ThinkingBlock({ thinking }: { thinking: string }) {
-  const [expanded, setExpanded] = useState(false);
-  // 截断显示前 120 字符作为预览
-  const preview =
-    thinking.length > 120 ? thinking.slice(0, 120) + '…' : thinking;
+/**
+ * 干净的可折叠"思考"块。
+ *  - 流式生成中：自动展开，标题显示"思考中…"，让用户实时观看推理。
+ *  - 完成后：默认折叠，标题显示"已深度思考 Ns"，点击展开看 markdown 推理。
+ * 不再有旧版那种把预览文字塞到标题右侧、换行成两行的拥挤布局。
+ */
+function ThinkingBlock({
+  thinking,
+  streaming,
+  thinkingMs,
+}: {
+  thinking: string;
+  streaming?: boolean;
+  thinkingMs?: number;
+}) {
+  // null = 跟随默认（流式中展开、完成后折叠）；boolean = 用户手动选择
+  const [override, setOverride] = useState<boolean | null>(null);
+  const expanded = override ?? Boolean(streaming);
+
+  const seconds =
+    typeof thinkingMs === 'number' && thinkingMs > 0
+      ? Math.max(1, Math.round(thinkingMs / 1000))
+      : null;
+  const label = streaming
+    ? '思考中…'
+    : seconds != null
+      ? `已深度思考 ${seconds} 秒`
+      : '查看思考过程';
 
   return (
-    <div className="mt-1.5 mb-1">
+    <div className="mb-1.5">
       <button
-        onClick={() => setExpanded((v) => !v)}
-        className="flex items-center gap-1 text-[11px] text-purple-500 hover:text-purple-700
-                   transition-colors group"
+        type="button"
+        onClick={() => setOverride(!expanded)}
+        className="flex items-center gap-1 text-[11px] text-charcoal-400
+                   hover:text-charcoal-600 transition-colors"
       >
         {expanded ? (
-          <ChevronDown className="w-3 h-3" />
+          <ChevronDown className="w-3.5 h-3.5" />
         ) : (
-          <ChevronRight className="w-3 h-3" />
+          <ChevronRight className="w-3.5 h-3.5" />
         )}
-        <Sparkles className="w-3 h-3" />
-        <span className="font-medium">思考过程</span>
-        {!expanded && (
-          <span className="text-charcoal-400 font-normal ml-1 truncate max-w-[200px]">
-            {preview}
-          </span>
-        )}
+        <Sparkles
+          className={`w-3 h-3 text-purple-400 ${streaming ? 'animate-breathe' : ''}`}
+        />
+        <span className="font-medium">{label}</span>
       </button>
       {expanded && (
         <div
-          className="mt-1 ml-4 px-2.5 py-2 rounded-md text-[11px] leading-relaxed
-                      bg-purple-50/60 text-purple-800 border border-purple-100
-                      max-h-[240px] overflow-y-auto"
+          className="mt-1 ml-[7px] pl-3 border-l-2 border-purple-100
+                     text-[11px] leading-relaxed text-charcoal-500
+                     max-h-[280px] overflow-y-auto"
         >
-          <Md>{thinking}</Md>
+          {thinking ? (
+            <Md>{thinking}</Md>
+          ) : (
+            <span className="text-charcoal-300 italic">准备思考…</span>
+          )}
         </div>
       )}
     </div>
@@ -484,8 +526,9 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
     return (
       <div className="flex gap-2 justify-end animate-chat-bubble-right">
         <div className="max-w-[80%]">
-          <div className="px-3 py-2 rounded-lg text-xs leading-relaxed bg-charcoal-800 text-white">
-            {msg.content}
+          {/* Markdown 渲染：用户消息可能内嵌图片引用（![](url)） */}
+          <div className="px-3 py-2 rounded-lg text-xs leading-relaxed bg-charcoal-800 text-white chat-user-bubble">
+            <Md>{msg.content}</Md>
           </div>
         </div>
         <div className="w-6 h-6 rounded-full bg-charcoal-200 flex items-center justify-center flex-shrink-0">
@@ -495,20 +538,43 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
     );
   }
 
+  // 流式中且正文尚空：显示一个轻量"正在生成"占位（思考块若有则已先渲染）
+  const showStreamingPlaceholder = msg.streaming && !msg.content;
+
   return (
     <div className="flex gap-2 animate-chat-bubble-left">
       <div className="w-6 h-6 rounded-full bg-rust-100 flex items-center justify-center flex-shrink-0">
-        <Bot className="w-3.5 h-3.5 text-rust-600" />
+        {msg.streaming ? (
+          <Loader2 className="w-3.5 h-3.5 text-rust-600 animate-spin" />
+        ) : (
+          <Bot className="w-3.5 h-3.5 text-rust-600" />
+        )}
       </div>
-      <div className="max-w-[80%]">
-        {/* Thinking 折叠块（放在正文前面） */}
-        {msg.thinking && <ThinkingBlock thinking={msg.thinking} />}
-        {/* 正文内容（Markdown 渲染） */}
-        <div className="px-3 py-2 rounded-lg text-xs leading-relaxed bg-cream-100 text-charcoal-700">
-          <Md>{msg.content}</Md>
-        </div>
-        {/* 模型 & depth 标签 */}
-        {msg.model && (
+      <div className="max-w-[80%] min-w-0">
+        {/* Thinking 折叠块（放在正文前面）—— 流式时自动展开。
+            thinking 一旦收到首个增量就有值（可能为空字符串）。 */}
+        {msg.thinking !== undefined && (
+          <ThinkingBlock
+            thinking={msg.thinking}
+            streaming={msg.streaming}
+            thinkingMs={msg.thinkingMs}
+          />
+        )}
+        {/* 流式中、还没有任何 thinking/text 增量时的占位 */}
+        {showStreamingPlaceholder && msg.thinking === undefined && (
+          <div className="flex items-center gap-1.5 text-[11px] text-charcoal-400 mb-1">
+            <Sparkles className="w-3 h-3 text-purple-400 animate-breathe" />
+            <span>思考中…</span>
+          </div>
+        )}
+        {/* 正文内容（Markdown 渲染）—— 流式中正文为空则暂不渲染气泡 */}
+        {msg.content && (
+          <div className="px-3 py-2 rounded-lg text-xs leading-relaxed bg-cream-100 text-charcoal-700">
+            <Md>{msg.content}</Md>
+          </div>
+        )}
+        {/* 模型 & depth 标签（流式结束后） */}
+        {msg.model && !msg.streaming && (
           <div className="flex items-center gap-1.5 mt-0.5 pl-1">
             <span className="text-[10px] text-charcoal-300">{msg.model}</span>
             {msg.thinkingDepth && msg.thinkingDepth !== 'medium' && (
@@ -520,11 +586,6 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
                 }`}
               >
                 {msg.thinkingDepth}
-              </span>
-            )}
-            {msg.thinking && (
-              <span className="text-[10px] px-1 py-0.5 rounded bg-purple-50 text-purple-400">
-                含思考
               </span>
             )}
           </div>
@@ -576,10 +637,14 @@ export default function ChatTab({
   const [showConversationList, setShowConversationList] = useState(false);
   const [keywordSteps, setKeywordSteps] = useState<KeywordStep[] | null>(null);
   const [showArchived, setShowArchived] = useState(false);
+  /** 已选待发送的图片（base64 data URL 数组） */
+  const [pendingImages, setPendingImages] = useState<string[]>([]);
+  const [imageError, setImageError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const thinkingMenuRef = useRef<HTMLDivElement>(null);
   const contextPopoverRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const segments = useTranscriptStore((s) => s.segments);
   const totalDurationMs = useTranscriptStore((s) => s.totalDurationMs);
@@ -639,7 +704,9 @@ export default function ChatTab({
 
   const handleSend = async () => {
     const value = input.trim();
-    if (!value || isLoading) return;
+    const hasImages = pendingImages.length > 0;
+    // 允许"仅图片"发送：有文字或有图片即可
+    if ((!value && !hasImages) || isLoading) return;
 
     setInput('');
 
@@ -837,7 +904,18 @@ export default function ChatTab({
       .filter(Boolean)
       .join('\n');
 
-    sendMessage(value, transcriptSegmentsForApi, summaryContext, totalDurationMs);
+    // 仅图片时给一个最小占位文本，满足服务端 question 必填校验
+    const questionText = value || (hasImages ? '请看图片。' : value);
+    const imagesToSend = pendingImages;
+    setPendingImages([]);
+    setImageError(null);
+    sendMessage(
+      questionText,
+      transcriptSegmentsForApi,
+      summaryContext,
+      totalDurationMs,
+      imagesToSend
+    );
   };
 
   // Current model display info
@@ -871,7 +949,83 @@ export default function ChatTab({
   const thinkingOptions = thinkingOptionsForMode(currentThinkingMode);
   const isThinkingActive =
     !thinkingDisabled && selectedThinkingPreference !== 'off';
-  const thinkingBadge = badgeForPreference(selectedThinkingPreference);
+
+  // 当前 thinking 偏好的紧凑中文名（用于 input footer 彩色文字）
+  const thinkingLabel = (() => {
+    switch (selectedThinkingPreference) {
+      case 'off':
+        return '不思考';
+      case 'low':
+        return '低思考';
+      case 'medium':
+        return '中思考';
+      case 'high':
+        return '高思考';
+      case 'forced':
+        return '强制思考';
+      case 'auto':
+        return '自动思考';
+    }
+  })();
+
+  /* ── 图片上传：选择 / 粘贴 / 删除 ── */
+  const supportsImage = Boolean(currentModelInfo?.supportsImage);
+
+  // 把一批 File 校验后追加进 pendingImages
+  const addImageFiles = async (files: FileList | File[]) => {
+    setImageError(null);
+    const incoming = Array.from(files).filter((f) =>
+      ACCEPTED_IMAGE_TYPES.includes(f.type)
+    );
+    if (incoming.length === 0) return;
+
+    const accepted: string[] = [];
+    for (const file of incoming) {
+      if (file.size > MAX_CHAT_IMAGE_BYTES) {
+        setImageError('单张图片不能超过 5MB');
+        continue;
+      }
+      if (pendingImages.length + accepted.length >= MAX_CHAT_IMAGES) {
+        setImageError(`最多上传 ${MAX_CHAT_IMAGES} 张图片`);
+        break;
+      }
+      try {
+        accepted.push(await readFileAsDataUrl(file));
+      } catch {
+        setImageError('图片读取失败');
+      }
+    }
+    if (accepted.length > 0) {
+      setPendingImages((prev) => [...prev, ...accepted].slice(0, MAX_CHAT_IMAGES));
+    }
+  };
+
+  const handleImagePick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      void addImageFiles(e.target.files);
+    }
+    // 允许重复选择同一文件
+    e.target.value = '';
+  };
+
+  const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    if (!supportsImage) return;
+    const imageFiles: File[] = [];
+    for (const item of Array.from(e.clipboardData.items)) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) imageFiles.push(file);
+      }
+    }
+    if (imageFiles.length > 0) {
+      e.preventDefault();
+      void addImageFiles(imageFiles);
+    }
+  };
+
+  const removePendingImage = (index: number) => {
+    setPendingImages((prev) => prev.filter((_, i) => i !== index));
+  };
 
   return (
     <div className="flex flex-col h-full">
@@ -922,25 +1076,9 @@ export default function ChatTab({
         {/* /keyword 步骤指示器 */}
         {keywordSteps && <KeywordSteps steps={keywordSteps} />}
 
-        {/* 普通对话 loading 状态 */}
-        {isLoading && !keywordSteps && (
-          <div className="flex items-center gap-2 animate-chat-bubble-left">
-            <div className="w-6 h-6 rounded-full bg-rust-100 flex items-center justify-center">
-              <Loader2 className="w-3.5 h-3.5 text-rust-600 animate-spin" />
-            </div>
-            <div className="flex flex-col gap-0.5">
-              <span className="text-xs text-charcoal-400">
-                {isThinkingActive ? '深度思考中…' : '思考中…'}
-              </span>
-              {isThinkingActive && (
-                <span className="text-[10px] text-purple-400 flex items-center gap-1">
-                  <Sparkles className="w-2.5 h-2.5" />
-                  Extended Thinking 已启用
-                </span>
-              )}
-            </div>
-          </div>
-        )}
+        {/* 普通对话的 loading 反馈现在由流式 assistant 占位消息承担
+            （MessageBubble 在 streaming 态显示思考/正文实时流入），
+            不再需要独立的 spinner 块。 */}
 
         <div ref={scrollRef} />
       </div>
@@ -965,137 +1103,206 @@ export default function ChatTab({
             <code className="text-rust-500">/keyword</code> 提取关键词
           </div>
         )}
+        {imageError && (
+          <div className="mb-1.5 px-2 py-1 rounded-md bg-amber-50 text-[10px] text-amber-700 border border-amber-200">
+            {imageError}
+          </div>
+        )}
+
+        {/* 已选图片缩略图（在输入框上方） */}
+        {pendingImages.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            {pendingImages.map((url, i) => (
+              <div
+                key={i}
+                className="relative w-14 h-14 rounded-md overflow-hidden border border-cream-300"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={url}
+                  alt={`附件 ${i + 1}`}
+                  className="w-full h-full object-cover"
+                />
+                <button
+                  type="button"
+                  onClick={() => removePendingImage(i)}
+                  className="absolute top-0.5 right-0.5 w-4 h-4 rounded-full bg-charcoal-800/80
+                             text-white flex items-center justify-center hover:bg-charcoal-900"
+                  title="移除图片"
+                >
+                  <X className="w-2.5 h-2.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* 输入行：附件按钮 + 文本框 + 发送 */}
         <div className="flex items-center gap-2">
-          {/* 模型方形按钮 + popover */}
-          <div ref={modelMenuRef} className="relative">
-            <button
-              type="button"
-              onClick={() => setShowModelMenu((v) => !v)}
-              title={`模型: ${currentModelLabel}`}
-              className="w-9 h-9 rounded-lg border border-cream-300 bg-white text-charcoal-600
-                         hover:border-cream-400 transition-colors flex items-center justify-center"
-            >
-              <Bot className="w-4 h-4 text-rust-500" />
-            </button>
-
-            {showModelMenu && (
-              <div className="absolute bottom-full left-0 mb-2 w-56 bg-white border border-cream-300
-                              rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
-                {availableModels.length === 0 ? (
-                  <div className="px-3 py-2 text-xs text-charcoal-400">
-                    暂无可用模型
-                  </div>
-                ) : (
-                  availableModels.map((model) => {
-                    const modeLabel =
-                      model.thinkingMode === 'FORCED'
-                        ? '自带深度思考'
-                        : model.thinkingMode === 'DEPTH'
-                          ? '可调节深度思考'
-                          : model.thinkingMode === 'AUTO'
-                            ? '自决思考'
-                            : '标准模式';
-                    const imageLabel = model.supportsImage ? '· 文字+图片' : '';
-                    return (
-                      <button
-                        key={model.name}
-                        onClick={() => handleSelectModel(model.name)}
-                        className={`w-full text-left px-3 py-2 text-xs hover:bg-cream-50 transition-colors
-                          ${selectedModel === model.name ? 'text-rust-600 bg-rust-50' : 'text-charcoal-600'}`}
-                      >
-                        <div className="font-medium">{model.displayName}</div>
-                        <div className="text-[10px] text-charcoal-400 mt-0.5">
-                          {modeLabel} {imageLabel}
-                        </div>
-                      </button>
-                    );
-                  })
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* 思考方形按钮 + popover */}
-          <div ref={thinkingMenuRef} className="relative">
-            <button
-              type="button"
-              onClick={() => {
-                if (thinkingDisabled) return;
-                setShowThinkingMenu((v) => !v);
-              }}
-              title={
-                thinkingDisabled
-                  ? '该模型不支持思考'
-                  : `思考: ${selectedThinkingPreference}`
-              }
-              className={`w-9 h-9 rounded-lg border transition-colors flex items-center justify-center relative
-                ${
-                  thinkingDisabled
-                    ? 'pointer-events-none opacity-40 border-cream-300 bg-white'
-                    : isThinkingActive
-                      ? 'bg-purple-50 border-purple-200 text-purple-600 hover:border-purple-300'
-                      : 'bg-white border-cream-300 text-charcoal-500 hover:border-cream-400'
-                }`}
-            >
-              <Sparkles className="w-4 h-4" />
-              {thinkingBadge && !thinkingDisabled && (
-                <span className="absolute -bottom-0.5 -right-0.5 text-[8px] font-bold leading-none
-                                 px-0.5 min-w-[12px] h-3 flex items-center justify-center
-                                 rounded-sm bg-purple-500 text-white">
-                  {thinkingBadge}
-                </span>
-              )}
-            </button>
-
-            {showThinkingMenu && !thinkingDisabled && (
-              <div className="absolute bottom-full left-0 mb-2 w-44 bg-white border border-cream-300
-                              rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
-                {thinkingOptions.map((opt) => {
-                  const isSelected = selectedThinkingPreference === opt.pref;
-                  return (
-                    <button
-                      key={opt.pref}
-                      type="button"
-                      disabled={opt.disabled}
-                      onClick={() => {
-                        if (opt.disabled) return;
-                        setSelectedThinkingPreference(opt.pref);
-                        setShowThinkingMenu(false);
-                      }}
-                      title={opt.disabledTitle ?? opt.description}
-                      className={`w-full text-left px-3 py-1.5 text-xs transition-colors
-                        ${opt.disabled
-                          ? 'text-charcoal-300 cursor-not-allowed'
-                          : isSelected
-                            ? 'bg-purple-50 text-purple-700'
-                            : 'text-charcoal-600 hover:bg-cream-50'}`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="font-medium">{opt.label}</span>
-                        {isSelected && <Check className="w-3 h-3" />}
-                      </div>
-                      <div className="text-[10px] text-charcoal-400 mt-0.5">
-                        {opt.description}
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept={ACCEPTED_IMAGE_TYPES.join(',')}
+            multiple
+            onChange={handleImagePick}
+            className="hidden"
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isLoading || !supportsImage}
+            title={
+              supportsImage
+                ? '上传图片'
+                : '当前模型不支持图片输入'
+            }
+            className="w-9 h-9 rounded-lg border border-cream-300 bg-white text-charcoal-500
+                       hover:border-cream-400 transition-colors flex items-center justify-center
+                       disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
+          >
+            <ImagePlus className="w-4 h-4" />
+          </button>
 
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            onPaste={handlePaste}
             placeholder="Ask about the lecture..."
             className="flex-1 px-3 py-2 rounded-lg border border-cream-300 text-xs
                        focus:outline-none focus:ring-1 focus:ring-rust-400 focus:border-rust-400
                        bg-white text-charcoal-700 placeholder:text-charcoal-300"
             disabled={isLoading}
           />
-          <div ref={contextPopoverRef} className="relative">
+          <button
+            onClick={handleSend}
+            disabled={isLoading || (!input.trim() && pendingImages.length === 0)}
+            className="p-2 rounded-lg bg-rust-500 text-white hover:bg-rust-600
+                       disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+          >
+            <Send className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        {/* Footer 行（Claude Code 风格）：左侧彩色"模型 · 思考强度"，右侧上下文小圈 */}
+        <div className="flex items-center justify-between mt-1.5 px-0.5">
+          <div className="flex items-center gap-1 text-[11px] min-w-0">
+            {/* 模型：可点击的彩色文字，触发模型 popover */}
+            <div ref={modelMenuRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setShowModelMenu((v) => !v)}
+                title={`模型: ${currentModelLabel}`}
+                className="font-medium text-rust-600 hover:text-rust-700 transition-colors
+                           truncate max-w-[160px]"
+              >
+                {currentModelLabel}
+              </button>
+
+              {showModelMenu && (
+                <div className="absolute bottom-full left-0 mb-2 w-56 bg-white border border-cream-300
+                                rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
+                  {availableModels.length === 0 ? (
+                    <div className="px-3 py-2 text-xs text-charcoal-400">
+                      暂无可用模型
+                    </div>
+                  ) : (
+                    availableModels.map((model) => {
+                      const modeLabel =
+                        model.thinkingMode === 'FORCED'
+                          ? '自带深度思考'
+                          : model.thinkingMode === 'DEPTH'
+                            ? '可调节深度思考'
+                            : model.thinkingMode === 'AUTO'
+                              ? '自决思考'
+                              : '标准模式';
+                      const imageLabel = model.supportsImage ? '· 文字+图片' : '';
+                      return (
+                        <button
+                          key={model.name}
+                          onClick={() => handleSelectModel(model.name)}
+                          className={`w-full text-left px-3 py-2 text-xs hover:bg-cream-50 transition-colors
+                            ${selectedModel === model.name ? 'text-rust-600 bg-rust-50' : 'text-charcoal-600'}`}
+                        >
+                          <div className="font-medium">{model.displayName}</div>
+                          <div className="text-[10px] text-charcoal-400 mt-0.5">
+                            {modeLabel} {imageLabel}
+                          </div>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              )}
+            </div>
+
+            <span className="text-charcoal-300">·</span>
+
+            {/* 思考强度：可点击的彩色文字，触发思考 popover */}
+            <div ref={thinkingMenuRef} className="relative">
+              <button
+                type="button"
+                onClick={() => {
+                  if (thinkingDisabled) return;
+                  setShowThinkingMenu((v) => !v);
+                }}
+                title={
+                  thinkingDisabled
+                    ? '该模型不支持思考'
+                    : `思考: ${thinkingLabel}`
+                }
+                className={`font-medium transition-colors ${
+                  thinkingDisabled
+                    ? 'text-charcoal-300 cursor-not-allowed'
+                    : isThinkingActive
+                      ? 'text-purple-500 hover:text-purple-600'
+                      : 'text-charcoal-400 hover:text-charcoal-600'
+                }`}
+              >
+                {thinkingDisabled ? '不支持思考' : thinkingLabel}
+              </button>
+
+              {showThinkingMenu && !thinkingDisabled && (
+                <div className="absolute bottom-full left-0 mb-2 w-44 bg-white border border-cream-300
+                                rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
+                  {thinkingOptions.map((opt) => {
+                    const isSelected = selectedThinkingPreference === opt.pref;
+                    return (
+                      <button
+                        key={opt.pref}
+                        type="button"
+                        disabled={opt.disabled}
+                        onClick={() => {
+                          if (opt.disabled) return;
+                          setSelectedThinkingPreference(opt.pref);
+                          setShowThinkingMenu(false);
+                        }}
+                        title={opt.disabledTitle ?? opt.description}
+                        className={`w-full text-left px-3 py-1.5 text-xs transition-colors
+                          ${opt.disabled
+                            ? 'text-charcoal-300 cursor-not-allowed'
+                            : isSelected
+                              ? 'bg-purple-50 text-purple-700'
+                              : 'text-charcoal-600 hover:bg-cream-50'}`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-medium">{opt.label}</span>
+                          {isSelected && <Check className="w-3 h-3" />}
+                        </div>
+                        <div className="text-[10px] text-charcoal-400 mt-0.5">
+                          {opt.description}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 右侧：上下文小圈 */}
+          <div ref={contextPopoverRef} className="relative flex-shrink-0">
             <ContextRingButton
               percent={
                 tokenUsage && tokenUsage.budget > 0
@@ -1125,14 +1332,6 @@ export default function ChatTab({
               />
             )}
           </div>
-          <button
-            onClick={handleSend}
-            disabled={isLoading || !input.trim()}
-            className="p-2 rounded-lg bg-rust-500 text-white hover:bg-rust-600
-                       disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-          >
-            <Send className="w-3.5 h-3.5" />
-          </button>
         </div>
       </div>
     </div>

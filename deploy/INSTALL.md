@@ -21,7 +21,7 @@
 | 组件 | 版本 |
 |------|------|
 | OS | Ubuntu 22.04+ / Debian 12+ |
-| Node.js | **20.6+**（需要 `--env-file` 支持） |
+| Node.js | **24 LTS** |
 | MySQL | 8.x |
 | Redis | 7.x |
 | Nginx | 任意 |
@@ -54,7 +54,7 @@ cd lecture-live
 sudo bash deploy/setup.sh
 ```
 
-这会自动安装 Node.js 20、MySQL 8、Redis、Nginx。
+这会自动安装 Node.js 24、MySQL 8、Redis、Nginx。
 
 ### 4. 配置 MySQL
 

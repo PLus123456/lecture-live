@@ -130,14 +130,14 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     const mergedPath = merged.filePath;
 
     // ── 2. probe duration ──
-    const durationSec = await probeDurationSec(mergedPath);
-    if (!durationSec) {
-      throw new Error('Cannot detect audio duration — file may be corrupted');
-    }
-    // Soniox 单文件上限 300 分钟
-    if (durationSec > 300 * 60) {
+    // 流式录制的 WebM（浏览器 MediaRecorder / OBS 等的产物）容器头不写时长，
+    // ffprobe format.duration 为 N/A → probeDurationSec 返回 0。这类文件 ffmpeg
+    // 仍能完整转码，所以不在这里判损坏：转码后 probe 输出的 MP3 拿权威时长。
+    const inputDurationSec = await probeDurationSec(mergedPath);
+    // 提前知道时长就早拒超长文件，省下整段转码开销
+    if (inputDurationSec > 300 * 60) {
       throw new Error(
-        `Duration ${Math.round(durationSec / 60)} min exceeds Soniox 300-min limit`
+        `Duration ${Math.round(inputDurationSec / 60)} min exceeds Soniox 300-min limit`
       );
     }
 
@@ -148,7 +148,8 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
       await transcodeToMp3({
         inputPath: mergedPath,
         outputPath: mp3Path,
-        durationSec,
+        // 时长未知时不传，transcodeToMp3 容忍：进度条直接跳到 100%
+        durationSec: inputDurationSec || undefined,
         bitrateKbps: 128,
         onProgress: (fraction) => {
           transcodingProgressMap.set(session.id, fraction);
@@ -156,6 +157,18 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
       });
     } finally {
       transcodingProgressMap.delete(session.id);
+    }
+
+    // 转码产物 MP3 必带规范时长头：以它为权威时长，也兜底输入容器头缺时长的情况。
+    // 转码成功后仍 probe 不到才是真损坏。
+    const durationSec = (await probeDurationSec(mp3Path)) || inputDurationSec;
+    if (!durationSec) {
+      throw new Error('Cannot detect audio duration — file may be corrupted');
+    }
+    if (durationSec > 300 * 60) {
+      throw new Error(
+        `Duration ${Math.round(durationSec / 60)} min exceeds Soniox 300-min limit`
+      );
     }
 
     // ── 4. persist mp3 → session storage (for playback) ──

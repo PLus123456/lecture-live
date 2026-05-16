@@ -56,6 +56,12 @@ ls -t "$BACKUP_DIR"/app-*.tar.gz 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/n
 
 # ── 2. 安装依赖 ──
 info "安装依赖..."
+# ffmpeg：文件上传转录依赖它。早期 setup.sh 未安装 ffmpeg，这里幂等补装，
+# 让旧部署在升级时自愈。
+if ! command -v ffmpeg &>/dev/null; then
+    info "补装 ffmpeg..."
+    apt-get update -qq && apt-get install -y -qq ffmpeg
+fi
 npm ci
 
 # ── 3. Prisma 迁移 ──

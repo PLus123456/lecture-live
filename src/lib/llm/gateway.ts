@@ -379,6 +379,39 @@ interface LLMCallUsage {
   totalTokens?: number;
 }
 
+/* ------------------------------------------------------------------ */
+/*  多模态消息（图片输入）                                                */
+/* ------------------------------------------------------------------ */
+
+/** 一张随聊天消息上传的图片（base64 data URL 已被拆成 mediaType + data） */
+export interface ChatImageInput {
+  /** 如 "image/png" */
+  mediaType: string;
+  /** 纯 base64（不含 data: 前缀） */
+  data: string;
+}
+
+/** 带历史 + 可选图片的聊天消息（图片仅对当前轮 user 消息有意义） */
+export interface ChatHistoryMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  /** 多模态图片（仅当前轮 user 消息携带；历史消息不重发图片） */
+  images?: ChatImageInput[];
+}
+
+/** 流式事件：思考增量 / 正文增量 / token 用量 */
+export type LLMStreamEvent =
+  | { type: 'thinking'; delta: string }
+  | { type: 'text'; delta: string }
+  | { type: 'usage'; inputTokens?: number; outputTokens?: number };
+
+/** 流式调用结束后的汇总结果 */
+export interface LLMStreamResult {
+  text: string;
+  thinking?: string;
+  usage?: LLMCallUsage;
+}
+
 interface LLMCallResult {
   text: string;
   thinking?: string;
@@ -585,6 +618,151 @@ export async function callLLMWithHistory(
 }
 
 /* ------------------------------------------------------------------ */
+/*  流式调用接口（SSE）                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 逐行读取 fetch Response 的 SSE 流，对每个非空 data 行回调 handler。
+ * 兼容 Anthropic（event:+data: 成对）与 OpenAI（纯 data: 行）两种 SSE 格式 ——
+ * 这里只关心 data: 负载，event: 行交给上层从 JSON 的 type 字段判断。
+ */
+async function readSseLines(
+  res: Response,
+  onData: (data: string) => void
+): Promise<void> {
+  const body = res.body;
+  if (!body) throw new Error('Streaming response has no body');
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE 事件以空行分隔；逐行处理 data: 前缀
+    let newlineIdx: number;
+    while ((newlineIdx = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newlineIdx).replace(/\r$/, '');
+      buffer = buffer.slice(newlineIdx + 1);
+      if (line.startsWith('data:')) {
+        onData(line.slice(5).trim());
+      }
+    }
+  }
+  // flush 残留行
+  const tail = buffer.replace(/\r$/, '');
+  if (tail.startsWith('data:')) {
+    onData(tail.slice(5).trim());
+  }
+}
+
+/**
+ * 流式带历史调用。Anthropic-native 走 /v1/messages?stream=true，
+ * OpenAI 兼容走 /chat/completions?stream=true。每个增量通过 onEvent 上抛，
+ * 全流结束后返回累计的 text/thinking/usage。
+ *
+ * 注意：保留与 callLLMWithHistory 完全一致的 provider/thinking 解析路径，
+ * 非流式接口未受影响（sessionFinalization 等仍用 callLLM/callLLMWithHistory）。
+ */
+export async function callLLMWithHistoryStream(
+  systemPrompt: string,
+  messages: ReadonlyArray<ChatHistoryMessage>,
+  options: CallOptions,
+  onEvent: (ev: LLMStreamEvent) => void
+): Promise<LLMStreamResult> {
+  const { provider, pref } = await resolveProviderAndPref(options);
+  const thinkingParams = buildThinkingParams(provider, pref);
+  const startedAt = Date.now();
+
+  try {
+    const result = provider.isAnthropic
+      ? await streamAnthropicWithHistory(
+          provider,
+          systemPrompt,
+          messages,
+          thinkingParams,
+          onEvent
+        )
+      : await streamOpenAICompatibleWithHistory(
+          provider,
+          systemPrompt,
+          messages,
+          thinkingParams,
+          onEvent
+        );
+    llmLogger.info(
+      {
+        provider: provider.name,
+        model: provider.model,
+        purpose: options.purpose ?? provider.purpose,
+        kind: 'history-stream',
+        thinkingMode: provider.thinkingMode,
+        thinkingPref: pref,
+        messageCount: messages.length,
+        durationMs: Date.now() - startedAt,
+        usage: result.usage,
+      },
+      'LLM streaming request completed'
+    );
+    return result;
+  } catch (error) {
+    llmLogger.error(
+      {
+        provider: provider.name,
+        model: provider.model,
+        purpose: options.purpose ?? provider.purpose,
+        kind: 'history-stream',
+        thinkingMode: provider.thinkingMode,
+        thinkingPref: pref,
+        messageCount: messages.length,
+        durationMs: Date.now() - startedAt,
+        err: serializeError(error),
+      },
+      'LLM streaming request failed'
+    );
+    throw error;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  多模态 content 构建                                                  */
+/* ------------------------------------------------------------------ */
+
+/** Anthropic content block：当前轮带图时拼成 [text, image...] */
+function buildAnthropicContent(
+  msg: ChatHistoryMessage
+): string | Array<Record<string, unknown>> {
+  if (!msg.images || msg.images.length === 0) return msg.content;
+  const blocks: Array<Record<string, unknown>> = [];
+  if (msg.content) blocks.push({ type: 'text', text: msg.content });
+  for (const img of msg.images) {
+    blocks.push({
+      type: 'image',
+      source: { type: 'base64', media_type: img.mediaType, data: img.data },
+    });
+  }
+  return blocks;
+}
+
+/** OpenAI content：当前轮带图时拼成 [text, image_url...] */
+function buildOpenAIContent(
+  msg: ChatHistoryMessage
+): string | Array<Record<string, unknown>> {
+  if (!msg.images || msg.images.length === 0) return msg.content;
+  const blocks: Array<Record<string, unknown>> = [];
+  if (msg.content) blocks.push({ type: 'text', text: msg.content });
+  for (const img of msg.images) {
+    blocks.push({
+      type: 'image_url',
+      image_url: { url: `data:${img.mediaType};base64,${img.data}` },
+    });
+  }
+  return blocks;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Anthropic 原生 API                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -711,6 +889,100 @@ async function callAnthropicWithHistory(
       totalTokens:
         (data.usage?.input_tokens ?? 0) + (data.usage?.output_tokens ?? 0),
     },
+  };
+}
+
+/**
+ * Anthropic 原生流式带历史调用（POST /v1/messages, stream:true）。
+ * 解析 content_block_delta：text_delta → 正文；thinking_delta → 思考。
+ * message_start 携带 input_tokens，message_delta 携带 output_tokens。
+ */
+async function streamAnthropicWithHistory(
+  provider: LLMProviderConfig,
+  system: string,
+  messages: ReadonlyArray<ChatHistoryMessage>,
+  params: ThinkingParams,
+  onEvent: (ev: LLMStreamEvent) => void
+): Promise<LLMStreamResult> {
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    max_tokens: provider.maxTokens,
+    system,
+    messages: messages.map((m) => ({
+      role: m.role,
+      content: buildAnthropicContent(m),
+    })),
+    temperature: params.temperature,
+    stream: true,
+  };
+  if (params.thinking) {
+    body.thinking = params.thinking;
+  }
+
+  const res = await fetch(`${provider.apiBase}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': provider.apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(
+      `Anthropic API error (${res.status}): ${sanitizeApiError(errText)}`
+    );
+  }
+
+  let text = '';
+  let thinking = '';
+  let inputTokens: number | undefined;
+  let outputTokens: number | undefined;
+
+  await readSseLines(res, (data) => {
+    if (!data || data === '[DONE]') return;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(data) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const eventType = parsed.type;
+
+    if (eventType === 'content_block_delta') {
+      const delta = parsed.delta as Record<string, unknown> | undefined;
+      if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+        text += delta.text;
+        onEvent({ type: 'text', delta: delta.text });
+      } else if (
+        delta?.type === 'thinking_delta' &&
+        typeof delta.thinking === 'string'
+      ) {
+        thinking += delta.thinking;
+        onEvent({ type: 'thinking', delta: delta.thinking });
+      }
+    } else if (eventType === 'message_start') {
+      const msg = parsed.message as Record<string, unknown> | undefined;
+      const usage = msg?.usage as Record<string, unknown> | undefined;
+      if (typeof usage?.input_tokens === 'number') {
+        inputTokens = usage.input_tokens;
+        onEvent({ type: 'usage', inputTokens });
+      }
+    } else if (eventType === 'message_delta') {
+      const usage = parsed.usage as Record<string, unknown> | undefined;
+      if (typeof usage?.output_tokens === 'number') {
+        outputTokens = usage.output_tokens;
+        onEvent({ type: 'usage', outputTokens });
+      }
+    }
+  });
+
+  return {
+    text,
+    thinking: thinking || undefined,
+    usage: { inputTokens, outputTokens },
   };
 }
 
@@ -849,6 +1121,104 @@ async function callOpenAICompatibleWithHistory(
       outputTokens: data.usage?.completion_tokens,
       totalTokens: data.usage?.total_tokens,
     },
+  };
+}
+
+/**
+ * OpenAI 兼容流式带历史调用（POST /chat/completions, stream:true）。
+ * 解析 choices[0].delta.content → 正文；delta.reasoning_content / reasoning → 思考。
+ * stream_options.include_usage=true 让最后一个 chunk 携带 usage。
+ */
+async function streamOpenAICompatibleWithHistory(
+  provider: LLMProviderConfig,
+  system: string,
+  messages: ReadonlyArray<ChatHistoryMessage>,
+  params: ThinkingParams,
+  onEvent: (ev: LLMStreamEvent) => void
+): Promise<LLMStreamResult> {
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    max_tokens: provider.maxTokens,
+    temperature: temperatureForOpenAI(provider, params),
+    messages: [
+      { role: 'system', content: system },
+      ...messages.map((m) => ({
+        role: m.role,
+        content: buildOpenAIContent(m),
+      })),
+    ],
+    stream: true,
+    stream_options: { include_usage: true },
+  };
+  if (params.reasoning_effort) {
+    body.reasoning_effort = params.reasoning_effort;
+  }
+
+  const res = await fetch(`${provider.apiBase}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${provider.apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(
+      `OpenAI-compatible API error (${res.status}): ${sanitizeApiError(errText)}`
+    );
+  }
+
+  let text = '';
+  let thinking = '';
+  let inputTokens: number | undefined;
+  let outputTokens: number | undefined;
+
+  await readSseLines(res, (data) => {
+    if (!data || data === '[DONE]') return;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(data) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+
+    const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
+    const delta = choices?.[0]?.delta as Record<string, unknown> | undefined;
+    if (delta) {
+      if (typeof delta.content === 'string' && delta.content) {
+        text += delta.content;
+        onEvent({ type: 'text', delta: delta.content });
+      }
+      const reasoning =
+        typeof delta.reasoning_content === 'string'
+          ? delta.reasoning_content
+          : typeof delta.reasoning === 'string'
+            ? delta.reasoning
+            : '';
+      if (reasoning) {
+        thinking += reasoning;
+        onEvent({ type: 'thinking', delta: reasoning });
+      }
+    }
+
+    const usage = parsed.usage as Record<string, unknown> | undefined;
+    if (usage) {
+      if (typeof usage.prompt_tokens === 'number') {
+        inputTokens = usage.prompt_tokens;
+      }
+      if (typeof usage.completion_tokens === 'number') {
+        outputTokens = usage.completion_tokens;
+      }
+      onEvent({ type: 'usage', inputTokens, outputTokens });
+    }
+  });
+
+  return {
+    text,
+    thinking: thinking || undefined,
+    usage: { inputTokens, outputTokens },
   };
 }
 

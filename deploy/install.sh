@@ -41,12 +41,11 @@ info "运行用户: $(id $APP_USER)"
 [[ -d "$SRC_DIR/.next/static" ]]     || error "未找到 .next/static，请先运行 npm run build"
 [[ -f "$SRC_DIR/dist/websocket.js" ]] || error "未找到 dist/websocket.js，请先运行 npm run build:ws"
 
-# ── 检查 Node.js 版本 (--env-file 需要 20.6+) ──
+# ── 检查 Node.js 版本 (要求 24 LTS) ──
 NODE_VER=$(node -v | sed 's/v//')
 NODE_MAJOR=$(echo "$NODE_VER" | cut -d. -f1)
-NODE_MINOR=$(echo "$NODE_VER" | cut -d. -f2)
-if [[ $NODE_MAJOR -lt 20 ]] || [[ $NODE_MAJOR -eq 20 && $NODE_MINOR -lt 6 ]]; then
-    error "Node.js >= 20.6.0 必须（当前: $NODE_VER），--env-file 支持需要此版本"
+if [[ $NODE_MAJOR -lt 24 ]]; then
+    error "Node.js >= 24 必须（当前: $NODE_VER）"
 fi
 
 info "停止现有服务 (如果存在)..."

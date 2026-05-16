@@ -9,7 +9,7 @@ set -euo pipefail
 APP_DIR="/opt/lecturelive"
 WS_DIR="/opt/lecturelive/ws-server"
 APP_USER="lecturelive"
-NODE_VERSION="20"
+NODE_VERSION="24"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -33,21 +33,13 @@ info "安装系统依赖..."
 apt-get update -qq
 apt-get install -y -qq curl gnupg2 build-essential nginx
 
-# ── 2. Node.js 20 ──
+# ── 2. Node.js 24 ──
 if ! command -v node &>/dev/null || [[ $(node -v | cut -d. -f1 | tr -d v) -lt $NODE_VERSION ]]; then
     info "安装 Node.js ${NODE_VERSION}.x ..."
     curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -
     apt-get install -y -qq nodejs
 fi
 info "Node.js $(node -v), npm $(npm -v)"
-
-# 检查 Node 版本 >= 20.6（--env-file 支持）
-NODE_VER=$(node -v | sed 's/v//')
-NODE_MINOR=$(echo "$NODE_VER" | cut -d. -f2)
-if [[ $(echo "$NODE_VER" | cut -d. -f1) -eq 20 && $NODE_MINOR -lt 6 ]]; then
-    warn "Node.js $NODE_VER < 20.6.0，建议升级以支持 --env-file"
-    warn "运行: sudo apt-get update && sudo apt-get install -y nodejs"
-fi
 
 # ── 3. MySQL 8 ──
 if ! command -v mysql &>/dev/null; then

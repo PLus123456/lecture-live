@@ -1193,5 +1193,11 @@ export default {
     bgPanelTitle: 'Background transcription · {count}',
     aboutMin: '~{n} min',
     aboutSec: '~{n} sec',
+    interrupted: 'Upload interrupted. Please upload this file again.',
+    failedSectionTitle: 'Failed · {count}',
+    deleteSession: 'Delete session',
+    dismiss: 'Dismiss',
+    unknownError: 'Transcription failed',
+    untitledSession: 'Untitled session',
   },
 } as const;

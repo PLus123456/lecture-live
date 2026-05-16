@@ -133,7 +133,7 @@ flowchart LR
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 24+
 - MySQL 8.x
 - Redis 7.x
 - npm or pnpm

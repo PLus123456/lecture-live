@@ -498,7 +498,7 @@ async function releaseFinalizeLock(sessionId: string) {
   }).catch(() => undefined);
 }
 
-interface BackgroundTaskParams {
+export interface BackgroundTaskParams {
   sessionId: string;
   userId: string;
   transcriptPath: string | null;
@@ -513,7 +513,7 @@ interface BackgroundTaskParams {
   bundle: PersistedTranscriptBundle | null;
 }
 
-async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
+export async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
   if (!params.transcriptPath || !params.summaryPath) {
     return;
   }

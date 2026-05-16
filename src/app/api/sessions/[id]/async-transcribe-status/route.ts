@@ -27,6 +27,7 @@ import {
   getSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
 import { convertAsyncTokensToSegments } from '@/lib/soniox/asyncTranscriptConverter';
+import { runBackgroundLLMTasks } from '@/lib/sessionFinalization';
 
 export async function GET(
   req: Request,
@@ -47,7 +48,10 @@ export async function GET(
   });
   if (rateLimited) return rateLimited;
 
-  const session = await prisma.session.findUnique({ where: { id } });
+  const session = await prisma.session.findUnique({
+    where: { id },
+    include: { folders: { select: { folderId: true } } },
+  });
   if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
@@ -158,11 +162,12 @@ export async function GET(
       targetLang: session.targetLang,
     });
 
-    const persisted = await persistSessionTranscriptArtifacts(session, {
+    const bundle = {
       segments,
       summaries: [],
       translations: {},
-    });
+    };
+    const persisted = await persistSessionTranscriptArtifacts(session, bundle);
 
     await prisma.session.update({
       where: { id: session.id },
@@ -177,6 +182,22 @@ export async function GET(
       },
     });
     await invalidateSessionsApiCache(user.id);
+
+    // fire-and-forget：runBackgroundLLMTasks 自带 try/catch，不阻塞 status 响应
+    void runBackgroundLLMTasks({
+      sessionId: session.id,
+      userId: session.userId,
+      transcriptPath: persisted.transcript.path,
+      summaryPath: persisted.summary.path,
+      recordingPath: session.recordingPath,
+      title: session.title,
+      courseName: session.courseName ?? '',
+      durationMs: session.durationMs,
+      createdAt: session.createdAt,
+      targetLang: session.targetLang || 'zh',
+      folderIds: session.folders.map((f) => f.folderId),
+      bundle,
+    });
 
     // 删 Soniox 上的资源（幂等，失败不抛）
     if (session.sonioxFileId) {

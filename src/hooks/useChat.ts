@@ -20,8 +20,8 @@ interface TranscriptSegmentInput {
  * 把 chat 历史 + 当前输入估算成 token 用量。仅用于小圈 UI 展示，
  * 真实预算判定在服务端 chatContextBuilder 里。
  *
- * budget 由调用方传入（来自模型 contextWindow × 0.8）—— 客户端拿不到具体
- * provider 信息时给一个保守值（如 16384 × 0.8 = 13107）。
+ * budget 由调用方传入（来自所选模型的 contextWindow，经 computeContextBudget
+ * 折算 inputBudget）—— 与服务端口径一致，不再使用任何硬编码常量。
  */
 function estimateChatUsage(input: {
   systemPrompt: string;
@@ -48,8 +48,27 @@ function estimateChatUsage(input: {
   };
 }
 
-/** 客户端保守 budget（实际预算由服务端模型决定，前端 UI 仅作展示） */
-const CLIENT_FALLBACK_BUDGET = 13107;
+/**
+ * 从所选模型的 contextWindow 推导前端展示用的 inputBudget。
+ * 没有可用模型信息时返回 0（UI 会按 0 处理，不再编造数字）。
+ *
+ * 口径与服务端 tokenBudget.computeContextBudget 一致：
+ *   inputBudget = (contextWindow - outputMaxTokens) × 0.8
+ * tokenBudget.ts 标了 server-only，故此处内联同样的算式（仅用于 UI 展示）。
+ */
+function deriveBudgetFromModel(
+  models: ReadonlyArray<{ name: string; contextWindow?: number }>,
+  selectedModel: string
+): number {
+  const model = models.find((m) => m.name === selectedModel);
+  const contextWindow = model?.contextWindow ?? 0;
+  if (contextWindow <= 0) return 0;
+  const outputMaxTokens = Math.max(
+    1,
+    Math.min(4096, Math.floor(contextWindow * 0.25), 8192)
+  );
+  return Math.floor(Math.max(0, contextWindow - outputMaxTokens) * 0.8);
+}
 
 export function useChat(sessionId: string | null) {
   const {
@@ -70,9 +89,9 @@ export function useChat(sessionId: string | null) {
     setAvailableModels,
     setActiveConversation,
     setConversations,
-    addConversation,
     setMessages,
     addMessage,
+    updateMessage,
     setTokenUsage,
     setContextFull,
     resetSession,
@@ -166,6 +185,8 @@ export function useChat(sessionId: string | null) {
             content: string;
             transcriptOffsetMs: number | null;
             degradationLevel: number | null;
+            inputTokens: number | null;
+            outputTokens: number | null;
             createdAt: string;
           }>;
         };
@@ -190,49 +211,92 @@ export function useChat(sessionId: string | null) {
           .map(toChatMessage);
 
         setMessages(visible, archived);
+
+        // 用最后一条 assistant 消息的 inputTokens 作为已用量种子，
+        // budget 由所选模型的 contextWindow 推导 —— 进入对话就显示真实数字。
+        const lastAssistant = [...data.messages]
+          .reverse()
+          .find((m) => m.role === 'assistant' && m.inputTokens != null);
+        const budget = deriveBudgetFromModel(
+          useChatStore.getState().availableModels,
+          useChatStore.getState().selectedModel
+        );
+        if (lastAssistant?.inputTokens != null || budget > 0) {
+          const used = lastAssistant?.inputTokens ?? 0;
+          setTokenUsage({
+            used,
+            budget,
+            level: lastAssistant?.degradationLevel ?? 1,
+            breakdown: {
+              systemPrompt: 0,
+              transcript: 0,
+              summary: 0,
+              history: used,
+              userInput: 0,
+            },
+          });
+        }
       } catch (err) {
         console.error('Failed to load conversation messages:', err);
       }
     },
-    [token, setMessages]
+    [token, setMessages, setTokenUsage]
   );
 
   /* ──────────────────────────────────────────────────────────────
-     发送消息
+     发送消息（SSE 流式消费）
      ────────────────────────────────────────────────────────────── */
   const sendMessage = useCallback(
     async (
       question: string,
       transcriptSegments: ReadonlyArray<TranscriptSegmentInput>,
       summaryContext: string,
-      totalTranscriptMs: number
+      totalTranscriptMs: number,
+      images: ReadonlyArray<string> = []
     ) => {
       if (!token || !activeConversationId || contextFull) return;
 
+      // 本地立即渲染：正文 + 图片缩略图（用 data URL 直接渲染为 markdown 图片，
+      // 与服务端持久化口径一致 —— 服务端会把 data URL 换成磁盘 URL）
       const userMsg: ChatMessage = {
         id: crypto.randomUUID(),
         role: 'user',
-        content: question,
+        content:
+          images.length > 0
+            ? `${question}\n\n${images.map((url) => `![image](${url})`).join('\n')}`
+            : question,
         timestamp: Date.now(),
       };
       addMessage(userMsg);
       setLoading(true);
 
-      // 前端预估 token 用量（用于小圈即时反馈）
+      // 前端预估 token 用量（小圈即时反馈）；budget 取所选模型 contextWindow
+      const modelBudget = deriveBudgetFromModel(availableModels, selectedModel);
       const preEstimate = estimateChatUsage({
         systemPrompt: '',
         transcript: transcriptSegments.map((s) => s.text).join(' '),
         summary: summaryContext,
         history: messages,
         userInput: question,
-        budget: tokenUsage?.budget ?? CLIENT_FALLBACK_BUDGET,
+        budget: tokenUsage?.budget || modelBudget,
         level: tokenUsage?.level ?? 1,
       });
       setTokenUsage(preEstimate);
 
+      // 占位 assistant 消息，流式增量直接打到它身上
+      const assistantId = crypto.randomUUID();
+      // 思考耗时：首个 thinking 增量 → 最后一个 thinking 增量之间的时长
+      let thinkingFirstAt = 0;
+      let thinkingLastAt = 0;
+      addMessage({
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        timestamp: Date.now(),
+        streaming: true,
+      });
+
       try {
-        // 把单一 preference 拆成 thinkingDepth + thinkingEnabled 两字段，
-        // undefined 字段不写入请求体 → route.ts 把"无 thinkingEnabled"解读为 auto。
         const thinkingFields = preferenceToFields(selectedThinkingPreference);
         const res = await fetch('/api/llm/chat', {
           method: 'POST',
@@ -247,6 +311,7 @@ export function useChat(sessionId: string | null) {
             totalTranscriptMs,
             summaryContext,
             model: selectedModel || undefined,
+            ...(images.length > 0 ? { images } : {}),
             ...(thinkingFields.thinkingDepth !== undefined
               ? { thinkingDepth: thinkingFields.thinkingDepth }
               : {}),
@@ -256,56 +321,98 @@ export function useChat(sessionId: string | null) {
           }),
         });
 
-        if (res.status === 413) {
-          // 上下文已满：提示用户新建对话
-          setContextFull(true);
-          // 把 level 提到 L7（EOL），让小圈紫色 + L7 与红色横幅语义一致 —
-          // 否则 preEstimate 留下的 L1 会让用户看到"L1 但上下文炸了"的困惑。
-          setTokenUsage({ ...preEstimate, level: 7 });
-          const data = await res.json().catch(() => ({} as Record<string, unknown>));
-          const assistantMsg: ChatMessage = {
-            id: crypto.randomUUID(),
-            role: 'assistant',
+        // 非 SSE 错误响应（鉴权/校验失败等）
+        if (
+          !res.ok ||
+          !res.body ||
+          !(res.headers.get('Content-Type') || '').includes('text/event-stream')
+        ) {
+          const data = await res
+            .json()
+            .catch(() => ({}) as Record<string, unknown>);
+          updateMessage(assistantId, {
             content:
-              (typeof data.message === 'string' && data.message) ||
-              '当前对话上下文已满，建议新建对话继续。',
-            timestamp: Date.now(),
-          };
-          addMessage(assistantMsg);
+              (typeof data.error === 'string' && data.error) ||
+              `Chat API returned ${res.status}`,
+            streaming: false,
+          });
           return;
         }
 
-        if (!res.ok) throw new Error(`Chat API returned ${res.status}`);
+        let accumulatedText = '';
+        let accumulatedThinking = '';
+        let sawError = false;
 
-        const data = (await res.json()) as {
-          reply: string;
-          thinking: string | null;
-          model: string;
-          thinkingDepth: ThinkingDepth;
-          level: number;
-        };
+        await consumeSse(res.body, (event, payload) => {
+          if (event === 'thinking') {
+            const now = Date.now();
+            if (!thinkingFirstAt) thinkingFirstAt = now;
+            thinkingLastAt = now;
+            accumulatedThinking += String(payload.delta ?? '');
+            updateMessage(assistantId, { thinking: accumulatedThinking });
+          } else if (event === 'text') {
+            accumulatedText += String(payload.delta ?? '');
+            updateMessage(assistantId, { content: accumulatedText });
+          } else if (event === 'done') {
+            const budget =
+              typeof payload.budget === 'number' && payload.budget > 0
+                ? payload.budget
+                : preEstimate.budget;
+            const inputTokens =
+              typeof payload.inputTokens === 'number'
+                ? payload.inputTokens
+                : preEstimate.used;
+            updateMessage(assistantId, {
+              streaming: false,
+              model:
+                typeof payload.model === 'string' ? payload.model : undefined,
+              thinkingDepth: payload.thinkingDepth as ThinkingDepth | undefined,
+              thinkingMs:
+                thinkingFirstAt > 0
+                  ? thinkingLastAt - thinkingFirstAt
+                  : undefined,
+            });
+            setTokenUsage({
+              used: inputTokens,
+              budget,
+              level:
+                typeof payload.level === 'number'
+                  ? payload.level
+                  : preEstimate.level,
+              breakdown: {
+                systemPrompt: 0,
+                transcript: 0,
+                summary: 0,
+                history: inputTokens,
+                userInput: 0,
+              },
+            });
+          } else if (event === 'error') {
+            sawError = true;
+            if (payload.contextFull === true) {
+              setContextFull(true);
+              setTokenUsage({ ...preEstimate, level: 7 });
+            }
+            updateMessage(assistantId, {
+              content:
+                accumulatedText ||
+                (typeof payload.error === 'string'
+                  ? payload.error
+                  : '对话失败，请重试。'),
+              streaming: false,
+            });
+          }
+        });
 
-        const assistantMsg: ChatMessage = {
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          content: data.reply,
-          timestamp: Date.now(),
-          model: data.model,
-          thinkingDepth: data.thinkingDepth,
-          thinking: data.thinking ?? undefined,
-        };
-        addMessage(assistantMsg);
-
-        // 更新 token usage（用服务端反馈的 level）
-        setTokenUsage({ ...preEstimate, level: data.level });
+        // 流意外结束但既无 done 也无 error → 收尾占位消息
+        if (!sawError) {
+          updateMessage(assistantId, { streaming: false });
+        }
       } catch (error) {
-        const errMsg: ChatMessage = {
-          id: crypto.randomUUID(),
-          role: 'assistant',
+        updateMessage(assistantId, {
           content: `Error: ${error instanceof Error ? error.message : 'Chat failed'}`,
-          timestamp: Date.now(),
-        };
-        addMessage(errMsg);
+          streaming: false,
+        });
       } finally {
         setLoading(false);
       }
@@ -315,10 +422,12 @@ export function useChat(sessionId: string | null) {
       activeConversationId,
       contextFull,
       messages,
+      availableModels,
       selectedModel,
       selectedThinkingPreference,
       tokenUsage,
       addMessage,
+      updateMessage,
       setLoading,
       setTokenUsage,
       setContextFull,
@@ -445,4 +554,53 @@ export function useChat(sessionId: string | null) {
     compressActive,
     addMessage, // 暴露给 /keyword 等命令保留旧用法
   };
+}
+
+/* ------------------------------------------------------------------ */
+/*  SSE 流消费                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 逐帧读取 SSE 响应。每个 `event:`+`data:` 帧解析后回调 onEvent。
+ */
+async function consumeSse(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: string, payload: Record<string, unknown>) => void
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const flushFrame = (frame: string) => {
+    let event = 'message';
+    let dataLine = '';
+    for (const rawLine of frame.split('\n')) {
+      const line = rawLine.replace(/\r$/, '');
+      if (line.startsWith('event:')) {
+        event = line.slice(6).trim();
+      } else if (line.startsWith('data:')) {
+        dataLine += line.slice(5).trim();
+      }
+    }
+    if (!dataLine) return;
+    try {
+      onEvent(event, JSON.parse(dataLine) as Record<string, unknown>);
+    } catch {
+      // 忽略无法解析的帧
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE 帧以空行（\n\n）分隔
+    let sep: number;
+    while ((sep = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      flushFrame(frame);
+    }
+  }
+  if (buffer.trim()) flushFrame(buffer);
 }

@@ -133,7 +133,7 @@ flowchart LR
 
 ### 环境要求
 
-- Node.js 20+
+- Node.js 24+
 - MySQL 8.x
 - Redis 7.x
 - npm 或 pnpm

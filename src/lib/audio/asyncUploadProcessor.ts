@@ -215,6 +215,7 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
       fileId: sonioxFile.id,
       languageHints: session.sourceLang ? [session.sourceLang] : undefined,
       enableLanguageIdentification: false,
+      enableSpeakerDiarization: true,
       translation,
       clientReferenceId: session.id,
     });

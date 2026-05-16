@@ -25,6 +25,7 @@
 | MySQL | 8.x |
 | Redis | 7.x |
 | Nginx | 任意 |
+| FFmpeg | 任意近期版本（文件上传转录依赖，`setup.sh` 自动安装） |
 | 内存 | 建议 2GB+ |
 
 ---
@@ -54,7 +55,7 @@ cd lecture-live
 sudo bash deploy/setup.sh
 ```
 
-这会自动安装 Node.js 24、MySQL 8、Redis、Nginx。
+这会自动安装 Node.js 24、MySQL 8、Redis、Nginx、FFmpeg。
 
 ### 4. 配置 MySQL
 

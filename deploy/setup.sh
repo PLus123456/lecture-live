@@ -29,9 +29,11 @@ echo "========================================"
 echo ""
 
 # ── 1. 系统依赖 ──
+# ffmpeg：文件上传转录靠它抽音频 / 压 MP3。Docker 在 Dockerfile 里 apk add，
+# 裸机部署必须在这里装，否则上传转录会报 "Cannot detect audio duration"。
 info "安装系统依赖..."
 apt-get update -qq
-apt-get install -y -qq curl gnupg2 build-essential nginx
+apt-get install -y -qq curl gnupg2 build-essential nginx ffmpeg
 
 # ── 2. Node.js 24 ──
 if ! command -v node &>/dev/null || [[ $(node -v | cut -d. -f1 | tr -d v) -lt $NODE_VERSION ]]; then

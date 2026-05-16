@@ -136,6 +136,7 @@ flowchart LR
 - Node.js 24+
 - MySQL 8.x
 - Redis 7.x
+- FFmpeg (audio/video transcoding for file-upload transcription)
 - npm or pnpm
 
 ### Local Development

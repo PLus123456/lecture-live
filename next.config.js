@@ -94,6 +94,12 @@ const securityHeaders = [
 const nextConfig = {
   output: 'standalone',
   outputFileTracingRoot: path.resolve(__dirname),
+  // 经过 middleware 的请求 body 会被 Next.js 克隆，默认上限 10MB，超出部分被静默截断。
+  // 文件转录分片上传单片 20MB（asyncUploadClient.ts CHUNK_SIZE），截断后服务端
+  // req.formData() 解析 multipart 失败并报 400 "Invalid multipart body"。
+  experimental: {
+    middlewareClientMaxBodySize: '32mb',
+  },
   // 显式允许 picture-in-picture（Document PiP API 需要）
   async headers() {
     return [

@@ -114,75 +114,122 @@ export function startAsyncUpload(opts: StartOptions): {
     );
 
     // ── 4. poll status ──
-    let lastStatus: AsyncUploadStatus = 'transcoding';
-    opts.onStatusChange?.(lastStatus);
-
-    while (true) {
-      if (composed.aborted) {
-        return { sessionId: opts.sessionId, finalStatus: 'canceled' };
-      }
-      // 1.5s 间隔：足够快感知状态变化，又不至于 hammer 服务端
-      await sleep(1500, composed);
-      if (composed.aborted) {
-        return { sessionId: opts.sessionId, finalStatus: 'canceled' };
-      }
-
-      const res = await fetch(
-        `/api/sessions/${opts.sessionId}/async-transcribe-status`,
-        { headers: { Authorization: `Bearer ${opts.authToken}` }, signal: composed }
-      );
-      if (!res.ok) {
-        // 502/503 等暂时性错误：继续 poll，不立即失败
-        if (res.status >= 500) continue;
-        const errBody = await readError(res);
-        throw new Error(`Status check failed: ${errBody}`);
-      }
-      const body = (await res.json()) as {
-        status: AsyncUploadStatus | null;
-        error?: string;
-        processingProgress?: number;
-      };
-
-      if (!body.status) {
-        // session 没有 async 状态 —— 异常情况，当失败处理
-        throw new Error('Server returned null status');
-      }
-
-      if (body.status !== lastStatus) {
-        lastStatus = body.status;
-        opts.onStatusChange?.(lastStatus);
-      }
-
-      // transcoding 阶段把后端 ffmpeg 实时进度透传给上层
-      if (
-        typeof body.processingProgress === 'number' &&
-        Number.isFinite(body.processingProgress)
-      ) {
-        opts.onProcessingProgress?.(
-          Math.min(1, Math.max(0, body.processingProgress))
-        );
-      }
-
-      if (body.status === 'completed') {
-        return { sessionId: opts.sessionId, finalStatus: 'completed' };
-      }
-      if (body.status === 'failed') {
-        return {
-          sessionId: opts.sessionId,
-          finalStatus: 'failed',
-          error: body.error || 'Transcription failed',
-        };
-      }
-      if (body.status === 'canceled') {
-        return { sessionId: opts.sessionId, finalStatus: 'canceled' };
-      }
-    }
+    const poll = await pollAsyncTranscribeStatus(opts.sessionId, opts.authToken, {
+      onStatusChange: opts.onStatusChange,
+      onProcessingProgress: opts.onProcessingProgress,
+      signal: composed,
+    });
+    return {
+      sessionId: opts.sessionId,
+      finalStatus: poll.finalStatus,
+      error: poll.error,
+    };
   }
 
   return {
     promise,
     cancel: () => abort.abort(),
   };
+}
+
+interface PollOptions {
+  /** 后端处理阶段（目前仅 transcoding）的子进度 0~1，由 status route 推送 */
+  onProcessingProgress?: (fraction: number) => void;
+  onStatusChange?: (status: AsyncUploadStatus) => void;
+  signal?: AbortSignal;
+  /**
+   * 轮询起点状态。默认 transcoding（startAsyncUpload finalize 后的阶段）；
+   * 刷新重连场景应传入服务端当前状态，避免进度条先倒退一格再修正。
+   */
+  initialStatus?: AsyncUploadStatus;
+}
+
+interface PollResult {
+  finalStatus: AsyncUploadStatus;
+  error?: string;
+}
+
+/**
+ * 轮询 /api/sessions/[id]/async-transcribe-status 直到进入终态。
+ *
+ * 关键点：服务端 async pipeline 的"拉 transcript + 写盘 + 标 completed"那一步是由这个
+ * GET 请求驱动的——没有 client poll，转录就永远停在 transcribing。所以刷新页面后必须
+ * 重新挂上这个 poll（见 UploadJobsTracker），否则 session 变僵尸。
+ *
+ * 起始状态默认 transcoding（startAsyncUpload finalize 后即进入此阶段）；
+ * 刷新重连场景下首个响应会立刻把真实状态透传给 onStatusChange。
+ */
+export async function pollAsyncTranscribeStatus(
+  sessionId: string,
+  authToken: string,
+  opts: PollOptions = {}
+): Promise<PollResult> {
+  const signal = opts.signal;
+  let lastStatus: AsyncUploadStatus = opts.initialStatus ?? 'transcoding';
+  let lastProgress = -1;
+  opts.onStatusChange?.(lastStatus);
+
+  while (true) {
+    if (signal?.aborted) {
+      return { finalStatus: 'canceled' };
+    }
+    // 1.5s 间隔：足够快感知状态变化，又不至于 hammer 服务端
+    await sleep(1500, signal);
+    if (signal?.aborted) {
+      return { finalStatus: 'canceled' };
+    }
+
+    const res = await fetch(
+      `/api/sessions/${sessionId}/async-transcribe-status`,
+      { headers: { Authorization: `Bearer ${authToken}` }, signal }
+    );
+    if (!res.ok) {
+      // 502/503 等暂时性错误：继续 poll，不立即失败
+      if (res.status >= 500) continue;
+      const errBody = await readError(res);
+      throw new Error(`Status check failed: ${errBody}`);
+    }
+    const body = (await res.json()) as {
+      status: AsyncUploadStatus | null;
+      error?: string;
+      processingProgress?: number;
+    };
+
+    if (!body.status) {
+      // session 没有 async 状态 —— 异常情况，当失败处理
+      throw new Error('Server returned null status');
+    }
+
+    if (body.status !== lastStatus) {
+      lastStatus = body.status;
+      opts.onStatusChange?.(lastStatus);
+    }
+
+    // transcoding 阶段把后端 ffmpeg 实时进度透传给上层（值无变化时不触发回调）
+    if (
+      typeof body.processingProgress === 'number' &&
+      Number.isFinite(body.processingProgress)
+    ) {
+      const progress = Math.min(1, Math.max(0, body.processingProgress));
+      if (progress !== lastProgress) {
+        lastProgress = progress;
+        opts.onProcessingProgress?.(progress);
+      }
+    }
+
+    if (body.status === 'completed') {
+      return { finalStatus: 'completed' };
+    }
+    if (body.status === 'failed') {
+      return {
+        finalStatus: 'failed',
+        error: body.error || 'Transcription failed',
+      };
+    }
+    if (body.status === 'canceled') {
+      return { finalStatus: 'canceled' };
+    }
+  }
 }
 
 // ─── 内部 helpers ───

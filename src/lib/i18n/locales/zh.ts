@@ -1179,5 +1179,11 @@ export default {
     bgPanelTitle: '后台转录 · {count}',
     aboutMin: '约 {n} 分钟',
     aboutSec: '约 {n} 秒',
+    interrupted: '上传中断，请重新上传该文件',
+    failedSectionTitle: '失败 · {count}',
+    deleteSession: '删除会话',
+    dismiss: '忽略',
+    unknownError: '转录失败',
+    untitledSession: '未命名会话',
   },
 } as const;

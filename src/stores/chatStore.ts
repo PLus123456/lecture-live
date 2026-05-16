@@ -78,6 +78,8 @@ interface ChatStore {
 
   setMessages: (messages: ChatMessage[], archived?: ChatMessage[]) => void;
   addMessage: (message: ChatMessage) => void;
+  /** 按 id 局部更新一条消息（流式增量用） */
+  updateMessage: (id: string, patch: Partial<ChatMessage>) => void;
 
   setTokenUsage: (usage: ChatTokenUsage | null) => void;
   setContextFull: (full: boolean) => void;
@@ -170,6 +172,13 @@ export const useChatStore = create<ChatStore>()(
 
       addMessage: (message) =>
         set((state) => ({ messages: [...state.messages, message] })),
+
+      updateMessage: (id, patch) =>
+        set((state) => ({
+          messages: state.messages.map((m) =>
+            m.id === id ? { ...m, ...patch } : m
+          ),
+        })),
 
       setTokenUsage: (tokenUsage) => set({ tokenUsage }),
       setContextFull: (contextFull) => set({ contextFull }),

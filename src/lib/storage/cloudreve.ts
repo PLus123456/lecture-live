@@ -13,7 +13,13 @@ import { logSystemEvent } from '@/lib/auditLog';
 
 const cloudreveLogger = logger.child({ component: 'cloudreve-storage' });
 
-const STORAGE_CATEGORIES = ['recordings', 'transcripts', 'summaries', 'reports'] as const;
+const STORAGE_CATEGORIES = [
+  'recordings',
+  'transcripts',
+  'summaries',
+  'reports',
+  'chat-uploads',
+] as const;
 // Cloudreve V4 用 Files.Write 表示读写权限，请求 Files.Read + Files.Write 组合
 // 在部分 Cloudreve 实例上会被同意页拒绝。
 const DEFAULT_CLOUDREVE_OAUTH_SCOPE = 'openid offline_access Files.Write';
@@ -25,6 +31,9 @@ const TOKEN_DB_KEYS = [
 ] as const;
 
 export type StorageCategory = (typeof STORAGE_CATEGORIES)[number];
+
+/** 与 Session 列一一对应的存储类别；chat-uploads 走独立 chat 模块管理。 */
+export type SessionArtifactCategory = Exclude<StorageCategory, 'chat-uploads'>;
 
 export function isStorageCategory(value: string): value is StorageCategory {
   return STORAGE_CATEGORIES.includes(value as StorageCategory);

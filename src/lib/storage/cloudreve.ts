@@ -511,18 +511,19 @@ export async function isCloudreveAuthorizedAsync(): Promise<boolean> {
 
 /**
  * 获取 Cloudreve 当前授权状态（含 access_token 过期时间），用于 admin UI。
+ *
+ * **不要走内存缓存**：Next.js 进程和 WebSocket 进程是两个独立 Node 进程，
+ * 各自维护各自的 `tokenCache`。token refresh loop 跑在 WS 进程里，刷新后
+ * 只更新 WS 进程的内存 + DB；Next.js 进程的 `tokenCache.expiresAt` 永远停在
+ * 它自己最后一次刷新时的值，于是 admin 面板会"看到"授权过期，但实际上 DB
+ * 里 token 一直是新的。
+ *
+ * 这是给 UI 显示用的接口，不在热路径上，性能不重要，跨进程一致性才重要。
  */
 export async function getCloudreveAuthStatus(): Promise<{
   authorized: boolean;
   expiresAt: number | null;
 }> {
-  if (tokenCache?.refreshToken) {
-    return {
-      authorized: true,
-      expiresAt: tokenCache.expiresAt || null,
-    };
-  }
-
   try {
     const rows = await prisma.siteSetting.findMany({
       where: { key: { in: [...TOKEN_DB_KEYS] } },
@@ -788,10 +789,17 @@ export class CloudreveStorage {
       return tokenCache.accessToken;
     }
 
-    // 内存缓存里没有可用 token，先尝试从数据库恢复
-    if (!tokenCache?.refreshToken) {
-      await this.loadTokensFromDb();
-    }
+    // 缓存为空 或 本进程缓存判定为快过期 —— 先从 DB 重读一次。
+    //
+    // 关键：WS 进程跑 token refresh loop，刷新后只更新 WS 内存 + DB；
+    // Next.js 进程的内存缓存里 expiresAt 还停在本进程上次刷新的旧值。
+    // 如果我们直接根据本地 expiresAt 调 refresh API，会和 WS 进程并发刷新，
+    // 此时 refresh_token rotation 后某一方拿到的 refresh_token 已被废 ——
+    // 两个进程的 OAuth 链路会互相踩。
+    //
+    // 因此：先重读 DB；若 DB 里 expires_at 仍有效，直接用 DB 的 token
+    // 更新本进程缓存，跳过 refresh 调用。
+    await this.loadTokensFromDb();
 
     if (tokenCache && tokenCache.expiresAt > Date.now() + 60_000) {
       return tokenCache.accessToken;

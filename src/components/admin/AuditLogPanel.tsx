@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Search,
   ChevronLeft,
@@ -36,6 +36,8 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
+import CleanupModalShell from '@/components/admin/CleanupModalShell';
+import { AUDIT_LOG_CATEGORIES, type AuditLogCategory } from '@/lib/adminCleanup';
 
 interface AuditLogEntry {
   id: string;
@@ -138,6 +140,10 @@ const ACTION_DEFS: Record<string, ActionDef> = {
 
   // 任务队列
   'admin.job.retry':                 { icon: RotateCw,       tone: 'orange', labelKey: 'auditLog.jobRetry' },
+  'admin.job.cleanup':               { icon: Trash2,         tone: 'gray',   labelKey: 'auditLog.jobCleanup' },
+
+  // 审计日志清理
+  'admin.auditlog.cleanup':          { icon: Trash2,         tone: 'gray',   labelKey: 'auditLog.auditLogCleanup' },
 
   // 系统
   'system.start':                    { icon: Server,         tone: 'slate',  labelKey: 'auditLog.systemStart' },
@@ -189,6 +195,7 @@ export default function AuditLogPanel() {
   const [keyword, setKeyword] = useState('');
   const [actionFilter, setActionFilter] = useState('');
   const [searchInput, setSearchInput] = useState('');
+  const [showCleanup, setShowCleanup] = useState(false);
 
   const fetchLogs = useCallback(
     async (page = 1) => {
@@ -307,6 +314,19 @@ export default function AuditLogPanel() {
         >
           <RefreshCw className={`w-4 h-4 transition-transform duration-300 ${loading ? 'animate-spin' : ''}`} />
         </button>
+
+        {/* 清理按钮 */}
+        <button
+          onClick={() => setShowCleanup(true)}
+          className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600
+                     bg-white dark:bg-charcoal-800 text-charcoal-600 dark:text-cream-200 hover:text-charcoal-800
+                     hover:bg-cream-50 dark:hover:bg-charcoal-700 transition-all duration-150 text-sm font-medium
+                     hover:scale-[1.02] active:scale-95"
+          title={t('auditLog.cleanup')}
+        >
+          <Trash2 className="w-4 h-4" />
+          {t('auditLog.cleanup')}
+        </button>
       </div>
 
       {/* 日志列表 */}
@@ -424,6 +444,124 @@ export default function AuditLogPanel() {
           </div>
         )}
       </div>
+
+      {showCleanup && (
+        <AuditLogCleanupModal
+          token={token}
+          onClose={() => setShowCleanup(false)}
+          onCleaned={() => fetchLogs(1)}
+        />
+      )}
     </div>
+  );
+}
+
+// ────────── 清理弹窗 ──────────
+
+const DAY_OPTIONS = [30, 60, 90, 180] as const;
+
+const CATEGORY_LABEL_KEYS: Record<AuditLogCategory, string> = {
+  session: 'auditLog.cleanupCategorySession',
+  share: 'auditLog.cleanupCategoryShare',
+  login: 'auditLog.cleanupCategoryLogin',
+  system: 'auditLog.cleanupCategorySystem',
+};
+
+function AuditLogCleanupModal({
+  token,
+  onClose,
+  onCleaned,
+}: {
+  token: string | null;
+  onClose: () => void;
+  onCleaned: () => void;
+}) {
+  const { t } = useI18n();
+  const [categories, setCategories] = useState<Set<AuditLogCategory>>(
+    new Set(AUDIT_LOG_CATEGORIES)
+  );
+  const [olderThanDays, setOlderThanDays] = useState<number>(DAY_OPTIONS[2]);
+
+  const buildParams = useCallback(() => {
+    const sp = new URLSearchParams();
+    for (const c of categories) sp.append('actionCategories', c);
+    sp.set('olderThanDays', String(olderThanDays));
+    return sp;
+  }, [categories, olderThanDays]);
+
+  const formSignature = useMemo(
+    () => `${[...categories].sort().join(',')}|${olderThanDays}`,
+    [categories, olderThanDays],
+  );
+
+  const toggleCategory = (cat: AuditLogCategory) => {
+    setCategories((prev) => {
+      const next = new Set(prev);
+      if (next.has(cat)) next.delete(cat);
+      else next.add(cat);
+      return next;
+    });
+  };
+
+  return (
+    <CleanupModalShell
+      title={t('auditLog.cleanupDialogTitle')}
+      warning={t('auditLog.cleanupDialogWarning')}
+      endpoint="/api/admin/logs"
+      token={token}
+      buildParams={buildParams}
+      formSignature={formSignature}
+      canSubmit={categories.size > 0}
+      confirmDialogTitle={t('auditLog.cleanupDialogConfirmTitle')}
+      confirmDialogMessage={t('auditLog.cleanupDialogConfirmMessage')}
+      successTitle={(n) => t('auditLog.cleanupSuccess', { n })}
+      failureTitle={t('auditLog.cleanupFailed')}
+      previewErrorTitle={t('auditLog.cleanupDialogPreviewError')}
+      onClose={onClose}
+      onCleaned={onCleaned}
+    >
+      <div>
+        <label className="text-xs font-semibold text-charcoal-600 dark:text-charcoal-300 uppercase tracking-wider mb-2 block">
+          {t('auditLog.cleanupDialogCategories')}
+        </label>
+        <div className="space-y-1.5">
+          {AUDIT_LOG_CATEGORIES.map((cat) => (
+            <label
+              key={cat}
+              className="flex items-center gap-2.5 px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600 cursor-pointer hover:bg-cream-50 dark:hover:bg-charcoal-700/50 transition-colors"
+            >
+              <input
+                type="checkbox"
+                checked={categories.has(cat)}
+                onChange={() => toggleCategory(cat)}
+                className="w-4 h-4 rounded text-rust-500 focus:ring-rust-300 focus:ring-2"
+              />
+              <span className="text-sm text-charcoal-700 dark:text-cream-200">
+                {t(CATEGORY_LABEL_KEYS[cat])}
+              </span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <label className="text-xs font-semibold text-charcoal-600 dark:text-charcoal-300 uppercase tracking-wider mb-2 block">
+          {t('admin.cleanup.olderThan')}
+        </label>
+        <select
+          value={olderThanDays}
+          onChange={(e) => setOlderThanDays(Number(e.target.value))}
+          className="w-full px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600
+                     bg-white dark:bg-charcoal-800 text-sm text-charcoal-700 dark:text-cream-200
+                     focus:outline-none focus:ring-2 focus:ring-rust-300 cursor-pointer"
+        >
+          {DAY_OPTIONS.map((d) => (
+            <option key={d} value={d}>
+              {t('admin.cleanup.days', { n: d })}
+            </option>
+          ))}
+        </select>
+      </div>
+    </CleanupModalShell>
   );
 }

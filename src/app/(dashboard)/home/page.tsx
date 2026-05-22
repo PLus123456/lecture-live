@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import NewSessionModal from '@/components/NewSessionModal';
+import BackgroundTasksIndicator from '@/components/BackgroundTasksIndicator';
 import {
   Mic,
   Search,
@@ -307,32 +308,35 @@ export default function HomePage() {
               </p>
             </div>
 
-            {/* New Session 按钮 */}
-            <button
-              onClick={() => {
-                if (isMobile) {
-                  router.push('/session/new');
-                  return;
-                }
-                setShowNewSession(true);
-              }}
-              className={`group/btn relative flex items-center gap-2.5
-                         bg-gradient-to-r from-rust-500 to-rust-600 text-white rounded-xl
-                         hover:from-rust-600 hover:to-rust-700 active:scale-[0.97]
-                         transition-all duration-200
-                         shadow-lg shadow-rust-500/20 hover:shadow-xl hover:shadow-rust-500/30
-                         animate-fade-in-up stagger-2 ${
-                           isMobile ? 'w-full justify-center px-4 py-3' : 'px-5 py-3'
-                         }`}
-            >
-              <div className="w-8 h-8 rounded-lg bg-white/20 flex items-center justify-center">
-                <Mic className="w-4 h-4" />
-              </div>
-              <div className="text-left">
-                <div className="text-sm font-semibold leading-tight">New Session</div>
-                <div className="text-[10px] text-white/70">Start recording</div>
-              </div>
-            </button>
+            {/* New Session 按钮 + 后台任务指示器 */}
+            <div className={`flex items-center gap-2 ${isMobile ? 'w-full' : ''}`}>
+              <button
+                onClick={() => {
+                  if (isMobile) {
+                    router.push('/session/new');
+                    return;
+                  }
+                  setShowNewSession(true);
+                }}
+                className={`group/btn relative flex items-center gap-2.5
+                           bg-gradient-to-r from-rust-500 to-rust-600 text-white rounded-xl
+                           hover:from-rust-600 hover:to-rust-700 active:scale-[0.97]
+                           transition-all duration-200
+                           shadow-lg shadow-rust-500/20 hover:shadow-xl hover:shadow-rust-500/30
+                           animate-fade-in-up stagger-2 ${
+                             isMobile ? 'flex-1 justify-center px-4 py-3' : 'px-5 py-3'
+                           }`}
+              >
+                <div className="w-8 h-8 rounded-lg bg-white/20 flex items-center justify-center">
+                  <Mic className="w-4 h-4" />
+                </div>
+                <div className="text-left">
+                  <div className="text-sm font-semibold leading-tight">New Session</div>
+                  <div className="text-[10px] text-white/70">Start recording</div>
+                </div>
+              </button>
+              <BackgroundTasksIndicator />
+            </div>
           </div>
 
           {/* 搜索栏 */}

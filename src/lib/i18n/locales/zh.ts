@@ -672,6 +672,16 @@ export default {
     noCustomGroup: '无（使用角色默认值）',
     groupColor: '颜色',
     custom: '自定义',
+
+    // 清理对话框（共用按钮与文案）
+    cleanup: {
+      preview: '预览',
+      previewing: '查询中...',
+      confirm: '确认清理',
+      willDelete: '将删除 {n} 条记录',
+      olderThan: '早于',
+      days: '{n} 天',
+    },
   },
 
   // 管理员设置面板
@@ -945,6 +955,23 @@ export default {
     colTime: '时间',
     colIp: 'IP 地址',
     total: '共 {n} 条记录',
+    // 清理
+    cleanup: '清理',
+    cleanupDialogTitle: '清理审计日志',
+    cleanupDialogCategories: '操作类别',
+    cleanupCategorySession: '会话操作',
+    cleanupCategoryShare: '分享操作',
+    cleanupCategoryLogin: '登录登出',
+    cleanupCategorySystem: '系统事件',
+    cleanupDialogWarning: '管理员操作、用户注册、密码变更、登录失败日志永不删除（合规需要）。',
+    cleanupDialogConfirmTitle: '确认清理审计日志？',
+    cleanupDialogConfirmMessage: '此操作不可撤销，将删除符合条件的日志记录。',
+    cleanupDialogPreviewError: '预览失败',
+    cleanupSuccess: '已清理 {n} 条日志',
+    cleanupFailed: '清理失败',
+    // 审计日志清理（审计日志展示）
+    jobCleanup: '清理任务队列',
+    auditLogCleanup: '清理审计日志',
   },
 
   // 对账
@@ -1033,6 +1060,20 @@ export default {
     retry: '重试',
     retrySuccess: '已重置，等待执行',
     retryFailed: '重试失败',
+    // 清理
+    cleanup: '清理',
+    cleanupDialogTitle: '清理任务队列',
+    cleanupDialogStatuses: '状态',
+    cleanupDialogStatusSuccess: '已完成（SUCCESS）',
+    cleanupDialogStatusFailed: '已失败（FAILED）',
+    cleanupDialogType: '任务类型',
+    cleanupDialogAllTypes: '所有类型',
+    cleanupDialogHint: '进行中（提交 / 待执行 / 处理中）的任务永远不会被清理。',
+    cleanupDialogConfirmTitle: '确认清理任务？',
+    cleanupDialogConfirmMessage: '此操作不可撤销，将删除符合条件的任务记录。',
+    cleanupDialogPreviewError: '预览失败',
+    cleanupSuccess: '已清理 {n} 条任务',
+    cleanupFailed: '清理失败',
     // 分页
     total: '共 {n} 条',
   },

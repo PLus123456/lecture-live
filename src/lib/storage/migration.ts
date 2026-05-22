@@ -7,11 +7,11 @@ import { prisma } from '@/lib/prisma';
 import {
   CloudreveStorage,
   isCloudreveConfiguredAsync,
-  type StorageCategory,
+  type SessionArtifactCategory,
 } from '@/lib/storage/cloudreve';
 
 const DATA_ROOT = path.join(process.cwd(), 'data');
-const CATEGORIES: StorageCategory[] = ['recordings', 'transcripts', 'summaries', 'reports'];
+const CATEGORIES: SessionArtifactCategory[] = ['recordings', 'transcripts', 'summaries', 'reports'];
 
 const PATH_FIELDS = {
   recordings: 'recordingPath',

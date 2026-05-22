@@ -3,11 +3,11 @@ import path from 'path';
 import type { Session } from '@prisma/client';
 import {
   CloudreveStorage,
-  type StorageCategory,
+  type SessionArtifactCategory,
 } from '@/lib/storage/cloudreve';
 
 const DATA_ROOT = path.join(process.cwd(), 'data');
-const LOCAL_DIRS: Record<StorageCategory, string> = {
+const LOCAL_DIRS: Record<SessionArtifactCategory, string> = {
   recordings: path.join(DATA_ROOT, 'recordings'),
   transcripts: path.join(DATA_ROOT, 'transcripts'),
   summaries: path.join(DATA_ROOT, 'summaries'),
@@ -15,7 +15,7 @@ const LOCAL_DIRS: Record<StorageCategory, string> = {
 };
 
 const STATIC_ARTIFACT_EXTENSIONS: Record<
-  Exclude<StorageCategory, 'recordings'>,
+  Exclude<SessionArtifactCategory, 'recordings'>,
   string
 > = {
   transcripts: 'json',
@@ -51,21 +51,21 @@ function normalizeSessionId(sessionId: string): string {
 }
 
 function legacyLocalArtifactPath(
-  category: StorageCategory,
+  category: SessionArtifactCategory,
   sessionId: string
 ): string {
   return path.join(LOCAL_DIRS[category], artifactFileName(category, sessionId));
 }
 
 function buildLocalArtifactPath(
-  category: StorageCategory,
+  category: SessionArtifactCategory,
   fileName: string
 ): string {
   return path.join(LOCAL_DIRS[category], path.basename(fileName));
 }
 
 function buildLocalArtifactReference(
-  category: StorageCategory,
+  category: SessionArtifactCategory,
   fileName: string
 ): string {
   return `local:${category}/${path.basename(fileName)}`;
@@ -109,7 +109,7 @@ function inferRecordingMimeTypeFromReference(
   return 'audio/webm';
 }
 
-async function ensureLocalDir(category: StorageCategory) {
+async function ensureLocalDir(category: SessionArtifactCategory) {
   await fs.mkdir(LOCAL_DIRS[category], { recursive: true });
 }
 
@@ -131,7 +131,7 @@ async function getCloudreveStorageIfConfigured(): Promise<CloudreveStorage | nul
 }
 
 function parseLocalReference(
-  category: StorageCategory,
+  category: SessionArtifactCategory,
   reference: string,
   sessionId: string
 ): string | null {
@@ -156,7 +156,7 @@ function parseLocalReference(
 
 async function readArtifactFromReference(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
-  category: StorageCategory,
+  category: SessionArtifactCategory,
   reference: string | null | undefined
 ): Promise<Buffer | null> {
   let cloudreve: CloudreveStorage | null | undefined;
@@ -208,7 +208,7 @@ async function readArtifactFromReference(
 }
 
 function artifactFileName(
-  category: StorageCategory,
+  category: SessionArtifactCategory,
   sessionId: string,
   options?: { mimeType?: string | null }
 ): string {
@@ -223,7 +223,7 @@ function artifactFileName(
 
 async function persistArtifact(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
-  category: StorageCategory,
+  category: SessionArtifactCategory,
   data: Buffer | string,
   options?: { mimeType?: string | null }
 ): Promise<PersistedArtifactResult> {

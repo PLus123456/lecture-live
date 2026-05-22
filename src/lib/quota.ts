@@ -6,7 +6,7 @@ import {
   getRemainingTranscriptionMinutes,
 } from '@/lib/billing';
 
-type QuotaCheckType = 'transcription_minutes' | 'storage_hours';
+type QuotaCheckType = 'transcription_minutes' | 'storage_hours' | 'storage_bytes';
 
 type QuotaUserRecord = {
   id: string;
@@ -15,6 +15,8 @@ type QuotaUserRecord = {
   transcriptionMinutesLimit: number;
   storageHoursUsed: number;
   storageHoursLimit: number;
+  storageBytesUsed: bigint;
+  storageBytesLimit: bigint;
   allowedModels: string;
   quotaResetAt: Date | null;
 };
@@ -28,12 +30,22 @@ export interface UserQuotaSnapshot {
   remainingTranscriptionMs: number;
   storageHoursUsed: number;
   storageHoursLimit: number;
+  storageBytesUsed: number;
+  storageBytesLimit: number;
+  remainingStorageBytes: number;
   allowedModels: string;
   quotaResetAt: Date | null;
 }
 
 /** ADMIN 配额视为无限 — 使用一个足够大的 sentinel 值（JSON 不支持 Infinity） */
 const ADMIN_UNLIMITED_MINUTES = 999_999;
+/** ADMIN bytes sentinel ≈ 1 TB，远小于 Number.MAX_SAFE_INTEGER (~9 PB)，可安全 JSON 序列化 */
+const ADMIN_UNLIMITED_BYTES = 1_000_000_000_000;
+
+/** 把外部传入的 amount 归一化为非负整数：NaN/Infinity/负数都视为 0 */
+function normalizeNonNegativeAmount(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.ceil(value)) : 0;
+}
 
 function toQuotaSnapshot(user: QuotaUserRecord): UserQuotaSnapshot {
   const remainingTranscriptionMinutes =
@@ -44,6 +56,13 @@ function toQuotaSnapshot(user: QuotaUserRecord): UserQuotaSnapshot {
           user.transcriptionMinutesLimit
         );
 
+  const storageBytesUsed = Number(user.storageBytesUsed);
+  const storageBytesLimit = Number(user.storageBytesLimit);
+  const remainingStorageBytes =
+    user.role === 'ADMIN'
+      ? ADMIN_UNLIMITED_BYTES
+      : Math.max(0, storageBytesLimit - storageBytesUsed);
+
   return {
     id: user.id,
     role: user.role,
@@ -53,6 +72,9 @@ function toQuotaSnapshot(user: QuotaUserRecord): UserQuotaSnapshot {
     remainingTranscriptionMs: remainingTranscriptionMinutes * 60_000,
     storageHoursUsed: user.storageHoursUsed,
     storageHoursLimit: user.storageHoursLimit,
+    storageBytesUsed,
+    storageBytesLimit,
+    remainingStorageBytes,
     allowedModels: user.allowedModels,
     quotaResetAt: user.quotaResetAt,
   };
@@ -65,6 +87,8 @@ const QUOTA_USER_SELECT = {
   transcriptionMinutesLimit: true,
   storageHoursUsed: true,
   storageHoursLimit: true,
+  storageBytesUsed: true,
+  storageBytesLimit: true,
   allowedModels: true,
   quotaResetAt: true,
 } as const;
@@ -150,6 +174,8 @@ export async function checkQuota(
       return user.transcriptionMinutesUsed < user.transcriptionMinutesLimit;
     case 'storage_hours':
       return user.storageHoursUsed < user.storageHoursLimit;
+    case 'storage_bytes':
+      return user.storageBytesUsed < user.storageBytesLimit;
     default:
       return false;
   }
@@ -168,9 +194,7 @@ export async function deductTranscriptionMinutes(
     return toQuotaSnapshot(user);
   }
 
-  const normalizedMinutes = Number.isFinite(minutes)
-    ? Math.max(0, Math.ceil(minutes))
-    : 0;
+  const normalizedMinutes = normalizeNonNegativeAmount(minutes);
 
   if (normalizedMinutes <= 0) {
     return toQuotaSnapshot(user);
@@ -183,16 +207,7 @@ export async function deductTranscriptionMinutes(
         increment: normalizedMinutes,
       },
     },
-    select: {
-      id: true,
-      role: true,
-      transcriptionMinutesUsed: true,
-      transcriptionMinutesLimit: true,
-      storageHoursUsed: true,
-      storageHoursLimit: true,
-      allowedModels: true,
-      quotaResetAt: true,
-    },
+    select: QUOTA_USER_SELECT,
   });
 
   return toQuotaSnapshot(updated);
@@ -286,4 +301,56 @@ export function isModelAllowed(
     .split(',')
     .map((m) => m.trim())
     .includes(modelName);
+}
+
+/**
+ * 在用户的 storageBytesUsed 上加增量（用于 chat 上传文件 / 录音文件计费）。
+ * 输入 bytes 是 JS number；内部转 BigInt 落库。ADMIN 不扣减但仍返回最新 snapshot。
+ */
+export async function addStorageBytes(
+  userId: string,
+  bytes: number
+): Promise<UserQuotaSnapshot | null> {
+  const user = await ensureQuotaWindow(userId);
+  if (!user) return null;
+  if (user.role === 'ADMIN') return toQuotaSnapshot(user);
+
+  const normalized = normalizeNonNegativeAmount(bytes);
+  if (normalized <= 0) return toQuotaSnapshot(user);
+
+  const updated = await prisma.user.update({
+    where: { id: userId },
+    data: {
+      storageBytesUsed: { increment: BigInt(normalized) },
+    },
+    select: QUOTA_USER_SELECT,
+  });
+  return toQuotaSnapshot(updated);
+}
+
+/**
+ * 从 storageBytesUsed 扣减（用于删除 chat 附件释放配额）。低于 0 截断到 0。
+ */
+export async function releaseStorageBytes(
+  userId: string,
+  bytes: number
+): Promise<UserQuotaSnapshot | null> {
+  const user = await ensureQuotaWindow(userId);
+  if (!user) return null;
+  if (user.role === 'ADMIN') return toQuotaSnapshot(user);
+
+  const normalized = normalizeNonNegativeAmount(bytes);
+  if (normalized <= 0) return toQuotaSnapshot(user);
+
+  // 用 raw SQL 保证不会减到负数（Prisma decrement 不带 GREATEST）
+  await prisma.$executeRaw`
+    UPDATE User
+    SET storageBytesUsed = GREATEST(0, storageBytesUsed - ${BigInt(normalized)})
+    WHERE id = ${userId}
+  `;
+  const refreshed = await prisma.user.findUnique({
+    where: { id: userId },
+    select: QUOTA_USER_SELECT,
+  });
+  return refreshed ? toQuotaSnapshot(refreshed) : null;
 }

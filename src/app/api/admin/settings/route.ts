@@ -104,6 +104,13 @@ export async function PUT(req: Request) {
       'jwt_expiry',
       'bcrypt_rounds',
       'trusted_proxy',
+      // Chat 文件配额 & 清理（U13）
+      'chat_files_retention_days',
+      'chat_files_soft_cap_percent',
+      'chat_files_max_upload_mb',
+      'chat_files_quota_free_mb',
+      'chat_files_quota_pro_mb',
+      'chat_files_quota_admin_mb',
     ]);
 
     // 过滤非法键

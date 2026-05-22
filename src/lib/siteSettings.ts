@@ -43,6 +43,13 @@ export interface SiteSettings {
   jwt_expiry: number;
   bcrypt_rounds: number;
   trusted_proxy: boolean;
+  // Chat 文件配额 & 清理（U13 引入；U14 cron / U2 quota 共用）
+  chat_files_retention_days: number;     // 0 = 关闭定期清理
+  chat_files_soft_cap_percent: number;   // 0 = 关闭软上限触发；否则配额占用 > N% 时 LRU 清
+  chat_files_max_upload_mb: number;      // 单次上传大小硬上限（MB）
+  chat_files_quota_free_mb: number;      // FREE 角色 storage_bytes 配额（MB）
+  chat_files_quota_pro_mb: number;       // PRO 角色配额（MB）
+  chat_files_quota_admin_mb: number;     // ADMIN 角色配额（MB），相当于上限
 }
 
 const SITE_SETTINGS_CACHE_TTL_MS = 60_000;
@@ -90,6 +97,12 @@ const DEFAULT_SITE_SETTINGS: SiteSettings = {
   jwt_expiry: 7,
   bcrypt_rounds: 12,
   trusted_proxy: false,
+  chat_files_retention_days: 14,
+  chat_files_soft_cap_percent: 90,
+  chat_files_max_upload_mb: 100,
+  chat_files_quota_free_mb: 100,
+  chat_files_quota_pro_mb: 1024,
+  chat_files_quota_admin_mb: 10240,
 };
 
 let siteSettingsCache: SiteSettings | null = null;
@@ -251,6 +264,36 @@ function normalizeSiteSettings(raw: Record<string, string>): SiteSettings {
       raw.trusted_proxy,
       DEFAULT_SITE_SETTINGS.trusted_proxy
     ),
+    chat_files_retention_days: parseInteger(
+      raw.chat_files_retention_days,
+      DEFAULT_SITE_SETTINGS.chat_files_retention_days,
+      { min: 0, max: 365 }
+    ),
+    chat_files_soft_cap_percent: parseInteger(
+      raw.chat_files_soft_cap_percent,
+      DEFAULT_SITE_SETTINGS.chat_files_soft_cap_percent,
+      { min: 0, max: 100 }
+    ),
+    chat_files_max_upload_mb: parseInteger(
+      raw.chat_files_max_upload_mb,
+      DEFAULT_SITE_SETTINGS.chat_files_max_upload_mb,
+      { min: 1, max: 10240 }
+    ),
+    chat_files_quota_free_mb: parseInteger(
+      raw.chat_files_quota_free_mb,
+      DEFAULT_SITE_SETTINGS.chat_files_quota_free_mb,
+      { min: 0, max: 1_048_576 }
+    ),
+    chat_files_quota_pro_mb: parseInteger(
+      raw.chat_files_quota_pro_mb,
+      DEFAULT_SITE_SETTINGS.chat_files_quota_pro_mb,
+      { min: 0, max: 1_048_576 }
+    ),
+    chat_files_quota_admin_mb: parseInteger(
+      raw.chat_files_quota_admin_mb,
+      DEFAULT_SITE_SETTINGS.chat_files_quota_admin_mb,
+      { min: 0, max: 1_048_576 }
+    ),
   };
 }
 
@@ -295,6 +338,12 @@ export function serializeSiteSettingsForAdmin(settings: SiteSettings) {
     jwt_expiry: String(settings.jwt_expiry),
     bcrypt_rounds: String(settings.bcrypt_rounds),
     trusted_proxy: settings.trusted_proxy,
+    chat_files_retention_days: String(settings.chat_files_retention_days),
+    chat_files_soft_cap_percent: String(settings.chat_files_soft_cap_percent),
+    chat_files_max_upload_mb: String(settings.chat_files_max_upload_mb),
+    chat_files_quota_free_mb: String(settings.chat_files_quota_free_mb),
+    chat_files_quota_pro_mb: String(settings.chat_files_quota_pro_mb),
+    chat_files_quota_admin_mb: String(settings.chat_files_quota_admin_mb),
   };
 }
 

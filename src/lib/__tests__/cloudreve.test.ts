@@ -74,6 +74,12 @@ function createSiteSettings(overrides: Partial<SiteSettings> = {}): SiteSettings
     jwt_expiry: 7,
     bcrypt_rounds: 12,
     trusted_proxy: false,
+    chat_files_retention_days: 14,
+    chat_files_soft_cap_percent: 90,
+    chat_files_max_upload_mb: 100,
+    chat_files_quota_free_mb: 100,
+    chat_files_quota_pro_mb: 1024,
+    chat_files_quota_admin_mb: 10240,
     ...overrides,
   };
 }

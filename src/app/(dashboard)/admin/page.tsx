@@ -20,6 +20,7 @@ import {
   Share2,
   FolderOpen,
   LogOut,
+  Paperclip,
 } from 'lucide-react';
 import SiteLogo from '@/components/SiteLogo';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -33,10 +34,11 @@ import ReconciliationPanel from '@/components/admin/ReconciliationPanel';
 import JobQueuePanel from '@/components/admin/JobQueuePanel';
 import ShareLinksPanel from '@/components/admin/ShareLinksPanel';
 import FilesPanel from '@/components/admin/FilesPanel';
+import ChatFilesPanel from '@/components/admin/ChatFilesPanel';
 
-type AdminTab = 'dashboard' | 'settings' | 'groups' | 'users' | 'files' | 'shareLinks' | 'logs' | 'reconciliation' | 'jobs';
+type AdminTab = 'dashboard' | 'settings' | 'groups' | 'users' | 'files' | 'chatFiles' | 'shareLinks' | 'logs' | 'reconciliation' | 'jobs';
 
-const ADMIN_TABS: AdminTab[] = ['dashboard', 'settings', 'groups', 'users', 'files', 'shareLinks', 'logs', 'reconciliation', 'jobs'];
+const ADMIN_TABS: AdminTab[] = ['dashboard', 'settings', 'groups', 'users', 'files', 'chatFiles', 'shareLinks', 'logs', 'reconciliation', 'jobs'];
 
 const isAdminTab = (v: string | null): v is AdminTab =>
   v !== null && (ADMIN_TABS as string[]).includes(v);
@@ -56,6 +58,7 @@ export default function AdminPage() {
     { id: 'groups', label: t('nav.userGroups'), icon: UserCog },
     { id: 'users', label: t('nav.users'), icon: Users },
     { id: 'files', label: t('nav.files'), icon: FolderOpen },
+    { id: 'chatFiles', label: t('nav.chatFiles'), icon: Paperclip },
     { id: 'shareLinks', label: t('nav.shareLinks'), icon: Share2 },
     { id: 'logs', label: t('nav.logs'), icon: ScrollText },
     { id: 'reconciliation', label: t('nav.reconciliation'), icon: Scale },
@@ -219,6 +222,7 @@ export default function AdminPage() {
             {activeTab === 'groups' && <UserGroupsPanel />}
             {activeTab === 'users' && <UserManagementPanel />}
             {activeTab === 'files' && <FilesPanel />}
+            {activeTab === 'chatFiles' && <ChatFilesPanel />}
             {activeTab === 'shareLinks' && <ShareLinksPanel />}
             {activeTab === 'logs' && <AuditLogPanel />}
             {activeTab === 'reconciliation' && <ReconciliationPanel />}

@@ -5,6 +5,7 @@ export const STORAGE_CATEGORIES = [
   'recordings',
   'transcripts',
   'summaries',
+  'chat-uploads',
 ] as const;
 
 export type StorageCategory = (typeof STORAGE_CATEGORIES)[number];

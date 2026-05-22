@@ -19,6 +19,8 @@ interface SegmentChunk {
   startMs: number;
   endMs: number;
   tokens: number;
+  /** 多录音模式下用于回溯来源；单录音 retriever 留空即可 */
+  recordingId?: string;
 }
 
 interface RagState {
@@ -263,11 +265,60 @@ export async function retrieveTranscriptByEmbedding(args: {
     .join('\n');
 }
 
+/** multi-recording cache key 前缀；与单录音 sessionId 同 Map 共享空间但绝不冲突 */
+const MULTI_KEY_PREFIX = 'multi:';
+
+/**
+ * 把一组 recordingIds 规范化为稳定的 cache key：
+ *  - 去空、去重、排序
+ *  - 输出形如 `multi:r1|r2|r3`
+ * 顺序无关 + 同一组永远命中同一 entry。
+ */
+function buildMultiCacheKey(recordingIds: ReadonlyArray<string>): {
+  key: string;
+  ids: string[];
+} {
+  const ids = Array.from(new Set(recordingIds.map((id) => id.trim()).filter(Boolean))).sort();
+  return { key: `${MULTI_KEY_PREFIX}${ids.join('|')}`, ids };
+}
+
+/**
+ * 检查一个 cache key 是否是 multi-recording entry 且其 ids 列表包含指定 recordingId。
+ * 用于在某录音失效时一并清掉所有引用了该录音的 multi-entries。
+ */
+function multiKeyContainsRecording(key: string, recordingId: string): boolean {
+  if (!key.startsWith(MULTI_KEY_PREFIX)) return false;
+  const ids = key.slice(MULTI_KEY_PREFIX.length).split('|');
+  return ids.includes(recordingId);
+}
+
 /**
  * 主动清空指定 session 的 RAG cache（如用户"新建对话"或 transcript 被重置时调用）。
+ *
+ * 同时清掉所有引用了该 sessionId 的 multi-recording entries（cache key 形如 `multi:a|b|c`
+ * 含 sessionId 时一并删除），避免上层挂载该录音的全局对话仍读到旧 vectors。
  */
 export function invalidateRagCache(sessionId: string): void {
   sessionCache.delete(sessionId);
+  for (const key of [...sessionCache.keys()]) {
+    if (multiKeyContainsRecording(key, sessionId)) {
+      sessionCache.delete(key);
+    }
+  }
+}
+
+/**
+ * 清空特定 recordingIds 组合的 multi-recording cache。
+ *
+ * 与 `invalidateRagCache(singleId)` 不同：这里只清恰好命中该 sortedIds.join('|') 的那
+ * 一条 multi entry；其他 multi entries（即使包含其中某个 id）保持不动。用于"用户在
+ * conversation 里调整附加录音集合"的场景。
+ */
+export function invalidateRagCacheForRecordings(
+  recordingIds: ReadonlyArray<string>
+): void {
+  const { key } = buildMultiCacheKey(recordingIds);
+  sessionCache.delete(key);
 }
 
 /**
@@ -295,4 +346,178 @@ export function makeRagRetrieverForSession(sessionId: string) {
       return '';
     }
   };
+}
+
+/**
+ * 多录音 RAG retriever。给定一组 recordingIds + 各自 transcript loader，返回一个
+ * 与 `makeRagRetrieverForSession` 同形的闭包：
+ *
+ *   (query, ignoredTranscript, maxTokens) => Promise<string>
+ *
+ * 第二个 transcript 参数被忽略（保留只是为了与 chatContextBuilder.ragRetrieve 签名兼容）；
+ * 真正的 transcripts 通过 `loadTranscript(recordingId)` 按需异步拉取，懒加载 + 缓存。
+ *
+ * 输出格式：`[HH:MM:SS] [recId] <text>`，按时间序拼接（每个 chunk 内会预先把 `[recId]`
+ * 写入 chunk text，便于 embedding 向量本身就携带来源信号 + 上层可直接 split 出来源）。
+ *
+ * 缓存：
+ *  - key = `multi:${sortedRecordingIds.join('|')}`，与单录音 `sessionCache` 共用同一个
+ *    Map，但 multi 前缀绝不会与单录音 sessionId 冲突；
+ *  - 命中时若 recordingIds 集合未变 → 复用 vectors；
+ *  - 任一录音消失/重置时由 `invalidateRagCache(recordingId)` 清掉。
+ *
+ * 失败语义与单录音 retriever 一致：embed 抛错 → 返回 ''，让 chatContextBuilder 退化。
+ */
+export function makeRagRetrieverForRecordings(
+  recordingIds: ReadonlyArray<string>,
+  loadTranscript: (
+    recordingId: string
+  ) => Promise<ReadonlyArray<TranscriptSegment>>
+): (
+  query: string,
+  _transcript: ReadonlyArray<TranscriptSegment>,
+  maxTokens: number
+) => Promise<string> {
+  const { key: cacheKey, ids: sortedIds } = buildMultiCacheKey(recordingIds);
+
+  return async (query, _ignored, maxTokens): Promise<string> => {
+    if (sortedIds.length === 0 || !query.trim()) return '';
+
+    try {
+      let state = sessionCache.get(cacheKey);
+
+      if (!state) {
+        // 各 recording 的 transcript 互相独立，并行拉取避免串行 N-1 个 RTT
+        const transcripts = await Promise.all(
+          sortedIds.map((id) => loadTranscript(id))
+        );
+
+        const allChunks: SegmentChunk[] = [];
+        for (let i = 0; i < sortedIds.length; i++) {
+          const recordingId = sortedIds[i];
+          const prefix = `[${recordingId}] `;
+          // prefix 写进 chunk text 是为了让 embedding 向量本身带来源信号，
+          // 同时上层渲染时可直接 split 出 recordingId
+          const prefixTokens = estimateTokens(prefix);
+          for (const chunk of chunkSegments(transcripts[i])) {
+            allChunks.push({
+              text: `${prefix}${chunk.text}`,
+              startMs: chunk.startMs,
+              endMs: chunk.endMs,
+              tokens: chunk.tokens + prefixTokens,
+              recordingId,
+            });
+          }
+        }
+
+        let vectors: number[][] = [];
+        if (allChunks.length > 0) {
+          vectors = await callEmbedding(allChunks.map((c) => c.text));
+        }
+
+        state = {
+          // recordingIds 集合变了 cacheKey 就会变 → 走另一个 entry，
+          // 所以 state 里不需要单独再记一份 ids
+          lastSegmentCount: allChunks.length,
+          chunks: allChunks,
+          vectors,
+          lastUsedAt: Date.now(),
+        };
+        sessionCache.set(cacheKey, state);
+        evictLRU();
+
+        ragLogger.debug(
+          {
+            cacheKey,
+            recordingCount: sortedIds.length,
+            totalChunks: allChunks.length,
+          },
+          'multi-recording RAG cache 已建立'
+        );
+      } else {
+        state.lastUsedAt = Date.now();
+      }
+
+      if (state.chunks.length === 0) return '';
+
+      const [queryVec] = await callEmbedding([query]);
+
+      // 维度不一致兜底：admin 切换了 embedding 模型时 cache 里仍是旧维度
+      // vectors，需要整批重 embed
+      const sampleVec = state.vectors.find((v) => v.length > 0);
+      if (sampleVec && queryVec.length !== sampleVec.length) {
+        ragLogger.warn(
+          {
+            cacheKey,
+            queryDim: queryVec.length,
+            cachedDim: sampleVec.length,
+            chunkCount: state.chunks.length,
+          },
+          'Embedding 维度不一致（可能切换了 embedding 模型），自动清空 multi-cache 并重新 embed'
+        );
+        sessionCache.delete(cacheKey);
+        const freshVectors = await callEmbedding(state.chunks.map((c) => c.text));
+        state = {
+          lastSegmentCount: state.chunks.length,
+          chunks: state.chunks,
+          vectors: freshVectors,
+          lastUsedAt: Date.now(),
+        };
+        sessionCache.set(cacheKey, state);
+      }
+
+      return formatTopKByScore(state.chunks, state.vectors, queryVec, maxTokens);
+    } catch (error) {
+      ragLogger.warn(
+        { cacheKey, err: serializeError(error) },
+        'multi-recording RAG 失败，chat L6/L7 已 fallback 到截尾 transcript；如需启用请到 admin 面板「LLM Providers」配置一个用途为 EMBEDDING 的 OpenAI 兼容 provider 并设为默认'
+      );
+      return '';
+    }
+  };
+}
+
+/** 单条 chunk 最大数量（每次 retrieval 返回的 top-K 上限），避免太多碎片喂给 LLM */
+const RAG_TOP_K_CAP = 16;
+
+/**
+ * 给定已 embed 的 chunks + query 向量，按 cosine 降序选 top-K（受 maxTokens 与
+ * RAG_TOP_K_CAP 限制），再按时间序拼接为最终输出字符串。
+ *
+ * 抽出这个 helper 只是为了 makeRagRetrieverForRecordings 内部读起来不那么长 ——
+ * 单录音版（retrieveTranscriptByEmbedding）有它自己的增量切块逻辑暂未共用，留作
+ * 后续 refactor，避免本 PR 触碰单录音契约。
+ */
+function formatTopKByScore(
+  chunks: ReadonlyArray<SegmentChunk>,
+  vectors: ReadonlyArray<number[]>,
+  queryVec: number[],
+  maxTokens: number
+): string {
+  const scored = chunks.map((chunk, i) => ({
+    chunk,
+    score: cosineSimilarity(queryVec, vectors[i]),
+  }));
+  scored.sort((a, b) => b.score - a.score);
+
+  const picked: typeof scored = [];
+  let usedTokens = 0;
+  for (const item of scored) {
+    if (usedTokens + item.chunk.tokens > maxTokens) {
+      if (picked.length > 0) break;
+      // 一个都塞不下：硬塞最相关的那个，让上层降级判断
+      picked.push(item);
+      break;
+    }
+    picked.push(item);
+    usedTokens += item.chunk.tokens;
+    if (picked.length >= RAG_TOP_K_CAP) break;
+  }
+
+  // 时间序拼回（不按相似度），让 LLM 看到的是叙事流而非按相关性穿插的碎片
+  picked.sort((a, b) => a.chunk.startMs - b.chunk.startMs);
+
+  return picked
+    .map((item) => `[${formatTimeLabel(item.chunk.startMs)}] ${item.chunk.text}`)
+    .join('\n');
 }

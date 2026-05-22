@@ -259,7 +259,7 @@ describe('POST /api/conversations', () => {
   });
 
   it('recordingIds=[] 创建零录音全局对话（200）', async () => {
-    transactionMock.mockImplementation(async (cb: any) => {
+    transactionMock.mockImplementation(async (cb) => {
       return cb({
         conversation: {
           create: vi.fn().mockResolvedValue({
@@ -292,7 +292,7 @@ describe('POST /api/conversations', () => {
   it('recordingIds=["s1","s2"] 创建对话并插入 junction 行', async () => {
     sessionCountMock.mockResolvedValue(2);
     const createSessionMock = vi.fn();
-    transactionMock.mockImplementation(async (cb: any) => {
+    transactionMock.mockImplementation(async (cb) => {
       return cb({
         conversation: {
           create: vi.fn().mockResolvedValue({
@@ -366,7 +366,7 @@ describe('POST /api/conversations', () => {
   });
 
   it('空 body 视作 {} 创建零录音全局对话', async () => {
-    transactionMock.mockImplementation(async (cb: any) => {
+    transactionMock.mockImplementation(async (cb) => {
       return cb({
         conversation: {
           create: vi.fn().mockResolvedValue({

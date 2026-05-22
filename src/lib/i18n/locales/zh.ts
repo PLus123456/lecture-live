@@ -103,6 +103,7 @@ export default {
     files: '文件管理',
     backToHome: '返回首页',
     interpret: '即时口译',
+    chat: '对话',
     appName: 'LectureLive',
     appTagline: '学术讲座转录',
   },
@@ -160,6 +161,9 @@ export default {
     hoursMinutesLeft: '剩余 {hours} 小时 {minutes} 分钟',
     minutesLeft: '剩余 {minutes} 分钟',
     user: '用户',
+    recentChats: '最近对话',
+    noRecentChats: '暂无对话',
+    filesQuota: '字节配额',
   },
 
   // 录制会话

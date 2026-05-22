@@ -36,6 +36,7 @@ import {
   startAsyncUpload,
   estimateAsyncTranscribeMs,
 } from '@/lib/transcribe/asyncUploadClient';
+import { formatBytes } from '@/lib/format';
 
 interface FolderItem {
   id: string;
@@ -48,13 +49,6 @@ interface Props {
   onClose: () => void;
   onNavigate: (sessionId: string) => void;
 }
-
-const formatBytes = (bytes: number) => {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-};
 
 const formatDurationCompact = (ms: number) => {
   if (!ms || !Number.isFinite(ms)) return '--';

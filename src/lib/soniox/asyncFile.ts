@@ -272,7 +272,32 @@ export async function getSonioxTranscript(
     throw new Error(`Soniox get transcript failed: HTTP ${res.status}`);
   }
 
-  return (await res.json()) as SonioxTranscriptResponse;
+  const response = (await res.json()) as SonioxTranscriptResponse;
+
+  // 诊断日志：确认 Soniox 是否返回了 speaker / translation token（用于排查"上传录音
+  // 无说话人分段/无翻译"类问题）。单次遍历统计，避免在大 transcript 上多次扫描。
+  const speakers = new Set<string>();
+  let speakerSampleCount = 0;
+  let translationSampleCount = 0;
+  for (const t of response.tokens) {
+    if (t.speaker) {
+      speakerSampleCount++;
+      speakers.add(t.speaker);
+    }
+    if (t.translation_status === 'translation') translationSampleCount++;
+  }
+  logger.info(
+    {
+      transcriptionId,
+      tokenCount: response.tokens.length,
+      speakerSampleCount,
+      translationSampleCount,
+      uniqueSpeakers: speakers.size,
+    },
+    'Soniox async transcript received'
+  );
+
+  return response;
 }
 
 /**

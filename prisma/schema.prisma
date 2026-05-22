@@ -291,6 +291,8 @@ model JobQueue {
   @@index([status])
   @@index([sessionId])
   @@index([createdAt])
+  @@index([userId])
+  @@index([userId, status])
 }
 
 // ─── Chat 对话历史（每次录音可有多个 Conversation，"新建对话"即关闭旧的开新的） ───

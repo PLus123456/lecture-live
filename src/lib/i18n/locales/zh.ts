@@ -1220,6 +1220,26 @@ export default {
     refreshing: '刷新中…',
   },
 
+  // 全局对话（/chat 路由 — U10）
+  chat: {
+    title: '对话',
+    newConversation: '新建对话',
+    noConversations: '暂无对话，点击「新建」开始',
+    attachFile: '附加文件',
+    attachRecording: '添加录音',
+    unnamed: '未命名对话',
+    loadingConversations: '加载对话列表…',
+    composerPlaceholder: '请输入...',
+    noRecordings: '未挂载录音',
+    recordingPickerComingSoon: '敬请期待',
+    removeRecording: '移除录音',
+    removeAttachment: '移除附件',
+    uploadFailed: '上传失败',
+    fileTooLarge: '文件超出大小限制',
+    unsupportedFileType: '不支持的文件类型',
+    redirectMissing: '对话不存在',
+  },
+
   // 即时口译
   interpret: {
     title: '即时口译',

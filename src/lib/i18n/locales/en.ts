@@ -1231,6 +1231,26 @@ export default {
     refreshing: 'Refreshing…',
   },
 
+  // 全局对话（/chat 路由 — U10）
+  chat: {
+    title: 'Chat',
+    newConversation: 'New conversation',
+    noConversations: 'No conversations yet. Click "New" to start.',
+    attachFile: 'Attach file',
+    attachRecording: 'Attach recording',
+    unnamed: 'Untitled',
+    loadingConversations: 'Loading conversations…',
+    composerPlaceholder: 'Ask anything…',
+    noRecordings: 'No recordings attached',
+    recordingPickerComingSoon: 'Coming soon',
+    removeRecording: 'Remove recording',
+    removeAttachment: 'Remove attachment',
+    uploadFailed: 'Upload failed',
+    fileTooLarge: 'File too large',
+    unsupportedFileType: 'Unsupported file type',
+    redirectMissing: 'Conversation not found',
+  },
+
   // Interpret
   interpret: {
     title: 'Interpret',

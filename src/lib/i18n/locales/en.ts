@@ -104,6 +104,7 @@ export default {
     chatFiles: 'Chat Files',
     backToHome: 'Back to Home',
     interpret: 'Interpret',
+    chat: 'Chat',
     appName: 'LectureLive',
     appTagline: 'Academic Transcription',
   },
@@ -161,6 +162,9 @@ export default {
     hoursMinutesLeft: '{hours}h {minutes}m left',
     minutesLeft: '{minutes}m left',
     user: 'User',
+    recentChats: 'Recent chats',
+    noRecentChats: 'No conversations yet',
+    filesQuota: 'Files quota',
   },
 
   // 录制会话

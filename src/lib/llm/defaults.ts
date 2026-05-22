@@ -5,6 +5,7 @@ export const LLM_PURPOSES = [
   'REALTIME_SUMMARY',
   'FINAL_SUMMARY',
   'KEYWORD_EXTRACTION',
+  'EMBEDDING',
 ] as const;
 
 export type LlmAdminPurpose = (typeof LLM_PURPOSES)[number];

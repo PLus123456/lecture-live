@@ -316,29 +316,28 @@ function ContextRingButton({
   onClick: () => void;
 }) {
   const safePercent = Math.min(1, Math.max(0, percent));
-  const radius = 9;
+  const radius = 7;
   const circumference = 2 * Math.PI * radius;
   const dashOffset = circumference * (1 - safePercent);
   const palette = getRingColor(safePercent, contextFull);
   const displayPercent = Math.round(safePercent * 100);
-  const showLevel = level > 1;
 
   return (
     <button
       type="button"
       onClick={onClick}
       title={`上下文 ${displayPercent}% · 降级级别 L${level}`}
-      className="relative w-7 h-7 rounded-full flex items-center justify-center
+      className="relative w-5 h-5 rounded-full flex items-center justify-center
                  hover:bg-cream-100 transition-colors flex-shrink-0"
     >
-      <svg viewBox="0 0 24 24" className="w-7 h-7 -rotate-90">
+      <svg viewBox="0 0 24 24" className="w-5 h-5 -rotate-90">
         <circle
           cx="12"
           cy="12"
           r={radius}
           fill="none"
           stroke="#e5e7eb"
-          strokeWidth="2.5"
+          strokeWidth="2"
         />
         <circle
           cx="12"
@@ -346,17 +345,12 @@ function ContextRingButton({
           r={radius}
           fill="none"
           stroke={palette.stroke}
-          strokeWidth="2.5"
+          strokeWidth="2"
           strokeDasharray={circumference}
           strokeDashoffset={dashOffset}
           strokeLinecap="round"
         />
       </svg>
-      <span
-        className={`absolute text-[8px] font-semibold ${palette.text}`}
-      >
-        {showLevel ? `L${level}` : `${displayPercent}`}
-      </span>
     </button>
   );
 }
@@ -1084,7 +1078,7 @@ export default function ChatTab({
       </div>
 
       {/* Input area —— padding 收紧，与顶部 tab bar 视觉对称 */}
-      <div className={`border-t border-cream-200 px-3 py-1.5 ${inputSticky ? 'sticky bottom-0 bg-white safe-bottom' : ''}`.trim()}>
+      <div className={`border-t border-cream-200 px-3 pt-1.5 pb-0 ${inputSticky ? 'sticky bottom-0 bg-white safe-bottom' : ''}`.trim()}>
         {contextFull && (
           <div className="mb-2 px-2.5 py-1.5 rounded-md bg-red-50 border border-red-200 text-[11px] text-red-700 flex items-center justify-between">
             <span>上下文已满，所有降级策略均无法塞下。</span>
@@ -1185,9 +1179,9 @@ export default function ChatTab({
           </button>
         </div>
 
-        {/* Footer 行（Claude Code 风格）：左侧彩色"模型 · 思考强度"，右侧上下文小圈 */}
-        <div className="flex items-center justify-between mt-1.5 px-0.5">
-          <div className="flex items-center gap-1 text-[11px] min-w-0">
+        {/* Footer 行（Claude Code 风格）：模型 · 思考强度 · 上下文小圈，全部右下角 */}
+        <div className="flex items-center justify-end gap-1.5 mt-1.5 mb-1.5 px-0.5">
+          <div className="flex items-center gap-1 text-[10px] min-w-0">
             {/* 模型：可点击的彩色文字，触发模型 popover */}
             <div ref={modelMenuRef} className="relative">
               <button
@@ -1195,7 +1189,7 @@ export default function ChatTab({
                 onClick={() => setShowModelMenu((v) => !v)}
                 title={`模型: ${currentModelLabel}`}
                 className="font-medium text-rust-600 hover:text-rust-700 transition-colors
-                           truncate max-w-[160px]"
+                           truncate max-w-[120px]"
               >
                 {currentModelLabel}
               </button>

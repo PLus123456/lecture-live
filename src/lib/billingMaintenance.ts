@@ -13,6 +13,7 @@ import {
 } from '@/lib/quota';
 import { runTranscriptionUsageReconciliation } from '@/lib/reconciliation';
 import { finalizeSession } from '@/lib/sessionFinalization';
+import { runChatFilesCleanup } from '@/lib/jobs/chatFilesCleanupJob';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
 const MAINTENANCE_INTERVAL_MS = 15 * 60_000;
@@ -29,6 +30,12 @@ export interface BillingMaintenanceSummary {
   resetUsers: number;
   reclaimedSessions: number;
   reconciliationRunId: string | null;
+  chatFilesCleanup: {
+    agingDeleted: number;
+    softCapDeleted: number;
+    bytesReleased: string; // bigint 序列化为 string，避免 JSON 序列化抛错
+    errors: number;
+  } | null;
 }
 
 export function startBillingMaintenanceLoop(
@@ -132,7 +139,42 @@ export async function runBillingMaintenance(options?: {
   // 每日对账
   const reconciliationRunId = await maybeRunDailyReconciliation(now);
 
-  if (resetUsers > 0 || reclaimedSessions > 0 || reconciliationRunId) {
+  // Chat 上传文件清理（aging + soft-cap LRU）。失败也不阻塞其他维护工作。
+  let chatFilesCleanup: BillingMaintenanceSummary['chatFilesCleanup'] = null;
+  {
+    const jobId = await createJob({
+      type: JOB_TYPE.CHAT_FILES_CLEANUP,
+      triggeredBy: 'system',
+      params: { source },
+    });
+    if (jobId) markJobProcessing(jobId);
+    try {
+      const cleanup = await runChatFilesCleanup();
+      chatFilesCleanup = {
+        agingDeleted: cleanup.agingDeleted,
+        softCapDeleted: cleanup.softCapDeleted,
+        bytesReleased: cleanup.bytesReleased.toString(),
+        errors: cleanup.errors,
+      };
+      if (jobId) markJobSuccess(jobId, chatFilesCleanup);
+    } catch (err) {
+      if (jobId) markJobFailed(jobId, err);
+      billingLogger.error(
+        { err: serializeError(err) },
+        'chat-files cleanup failed'
+      );
+      // 不 rethrow —— 其他维护任务结果仍要返回
+    }
+  }
+
+  if (
+    resetUsers > 0 ||
+    reclaimedSessions > 0 ||
+    reconciliationRunId ||
+    (chatFilesCleanup &&
+      (chatFilesCleanup.agingDeleted > 0 ||
+        chatFilesCleanup.softCapDeleted > 0))
+  ) {
     logSystemEvent(
       'billing.maintenance.completed',
       JSON.stringify({
@@ -140,6 +182,7 @@ export async function runBillingMaintenance(options?: {
         resetUsers,
         reclaimedSessions,
         reconciliationRunId,
+        chatFilesCleanup,
       })
     );
   }
@@ -148,6 +191,7 @@ export async function runBillingMaintenance(options?: {
     resetUsers,
     reclaimedSessions,
     reconciliationRunId,
+    chatFilesCleanup,
   };
 }
 

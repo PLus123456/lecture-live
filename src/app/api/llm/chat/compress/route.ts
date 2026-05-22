@@ -63,7 +63,8 @@ export async function POST(req: Request) {
     },
   });
 
-  if (!conversation || conversation.session.userId !== user.id) {
+  // Conversation.session 可空（纯 chat 对话无录音绑定）；压缩仅对挂录音的对话有意义。
+  if (!conversation || !conversation.session || conversation.session.userId !== user.id) {
     return NextResponse.json(
       { error: 'Conversation not found' },
       { status: 404 }

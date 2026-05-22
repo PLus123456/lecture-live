@@ -37,7 +37,8 @@ export async function GET(
     },
   });
 
-  if (!conversation || conversation.session.userId !== user.id) {
+  // Conversation.session 可空（纯 chat 对话无录音绑定）；此端点仅服务挂录音的对话。
+  if (!conversation || !conversation.session || conversation.session.userId !== user.id) {
     return NextResponse.json(
       { error: 'Conversation not found' },
       { status: 404 }

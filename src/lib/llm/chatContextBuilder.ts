@@ -2,6 +2,7 @@ import 'server-only';
 
 import {
   estimateTokens,
+  estimateTokensJoined,
   truncateToTokensFromEnd,
 } from './tokenizer';
 import { buildHistoryCompressionPrompt } from './prompts';
@@ -78,6 +79,21 @@ export interface ChatContextInput {
     transcript: ReadonlyArray<TranscriptSegment>,
     maxTokens: number
   ) => Promise<string>;
+  /**
+   * 可选：从指定降级级别开始构造（用于已知 transcript 过长时直接跳到 L6 RAG）。
+   * 若设置，则等价于在 buildChatContext 入口处把 minLevel 提到 max(minLevel, forceMinLevel)。
+   * 不影响单调降级不变量。
+   */
+  forceMinLevel?: DegradationLevel;
+  /**
+   * 可选：录音的最终 report 文本。若提供，会在 chat system prompt 之外
+   * 额外作为一条独立 system 消息固定在所有降级级别（包括 L6/L7），
+   * 用于给长录音补全宏观背景。建议 ≤ 2000 token，调用方自行截断。
+   *
+   * 内部会再做一次 8000 字符 (~2000 token) 的安全截断，并把估算 token 计入
+   * breakdown.systemPrompt，保证预算不被撑爆。
+   */
+  reportText?: string;
 }
 
 export interface TokenBreakdown {
@@ -95,6 +111,18 @@ export interface ChatContextOutput {
   messages: Array<{ role: 'user' | 'assistant'; content: string }>;
   level: DegradationLevel;
   breakdown: TokenBreakdown;
+  /** 若 input.reportText 存在则同时返回；调用方负责把它拼到 messages 头部作为 system 消息 */
+  reportText?: string;
+}
+
+/** reportText 安全上限：8000 字符 ≈ 2000 token（cl100k BPE 大致 1:4 字符比） */
+export const REPORT_TEXT_MAX_CHARS = 8000;
+
+/** 内部：把 reportText 截到上限。空/未传 → undefined */
+function truncateReportText(input: string | undefined): string | undefined {
+  if (!input) return undefined;
+  if (input.length <= REPORT_TEXT_MAX_CHARS) return input;
+  return input.slice(0, REPORT_TEXT_MAX_CHARS);
 }
 
 /* ------------------------------------------------------------------ */
@@ -265,6 +293,10 @@ interface BuildState {
   compressedHistory: Awaited<ReturnType<typeof compressHistory>> | null;
   /** L6+ 用：RAG 检索回调 */
   ragRetrieve?: ChatContextInput['ragRetrieve'];
+  /** 已截断后的 report 文本；undefined 表示调用方未提供。仅用于 token 预算估算与回传。 */
+  reportText?: string;
+  /** reportText 的 token 估算（预先算好，避免在 7 级降级循环里重复 encode 8000 字符）。 */
+  reportTokens: number;
 }
 
 function assembleOutput(
@@ -296,8 +328,13 @@ function assembleOutput(
   const messageTokens =
     finalHistory.reduce((acc, m) => acc + estimateTokens(m.content), 0) +
     estimateTokens(state.userInput);
+  // reportText 由调用方拼到 messages 头部作为独立 system 消息 —— 把它的
+  // token 估算计进 breakdown.systemPrompt 和 total，让降级判定知道这部分占用。
+  // 使用 state.reportTokens（buildChatContext 入口已算过一次），避免在降级循环里重复 encode。
+  const reportTokens = state.reportTokens;
   const breakdown: TokenBreakdown = {
-    systemPrompt: estimateTokens(state.buildSystemPrompt('', '')),
+    systemPrompt:
+      estimateTokens(state.buildSystemPrompt('', '')) + reportTokens,
     timeAnchor: estimateTokens(state.timeAnchor),
     transcript: estimateTokens(transcriptText),
     summary: estimateTokens(summaryText),
@@ -305,10 +342,14 @@ function assembleOutput(
       (compressedHeader ? estimateTokens(compressedHeader) : 0) +
       finalHistory.reduce((acc, m) => acc + estimateTokens(m.content), 0),
     userInput: estimateTokens(state.userInput),
-    total: estimateTokens(systemPrompt) + messageTokens,
+    total: estimateTokens(systemPrompt) + messageTokens + reportTokens,
   };
 
-  return { systemPrompt, messages, level, breakdown };
+  const output: ChatContextOutput = { systemPrompt, messages, level, breakdown };
+  if (state.reportText) {
+    output.reportText = state.reportText;
+  }
+  return output;
 }
 
 /**
@@ -324,6 +365,8 @@ export async function buildChatContext(
     input.language
   );
 
+  const truncatedReport = truncateReportText(input.reportText);
+
   const state: BuildState = {
     buildSystemPrompt: input.buildSystemPrompt,
     timeAnchor,
@@ -333,12 +376,22 @@ export async function buildChatContext(
     userInput: input.userInput,
     compressedHistory: null,
     ragRetrieve: input.ragRetrieve,
+    reportText: truncatedReport,
+    reportTokens: truncatedReport ? estimateTokens(truncatedReport) : 0,
   };
 
   let lastBreakdown: TokenBreakdown | null = null;
 
+  // forceMinLevel：调用方可强行跳过低级别（典型用于已知 transcript 过长）。
+  // 单调降级不变量：实际起点 = max(minLevel, forceMinLevel ?? 1)。
+  const startLevel = Math.max(
+    input.minLevel,
+    input.forceMinLevel ?? DEGRADATION_MIN_LEVEL,
+    DEGRADATION_MIN_LEVEL
+  );
+
   for (
-    let level = Math.max(input.minLevel, DEGRADATION_MIN_LEVEL);
+    let level = startLevel;
     level <= DEGRADATION_MAX_LEVEL;
     level++
   ) {
@@ -583,4 +636,26 @@ async function buildAtLevel(
 // transcript 在内部只用拼成的字符串估算长度，不再需要 segment 结构 —— 用一个壳维持接口一致
 function makeFakeSegments(text: string): TranscriptSegment[] {
   return text ? [{ text, startMs: 0 }] : [];
+}
+
+/**
+ * 估算"原始 transcript + history + user input"的总 token，给调用方判断是否要传 forceMinLevel。
+ * 调用方可据此选择直接跳到 L6（典型阈值：> L1 系统预算的 80%）。
+ *
+ * 不含 summary / system prompt / time anchor / reportText —— 这些都是调用方自己可以单独估算的部分；
+ * 这个函数专注在"会随对话规模膨胀且无法压缩"的三大块上。
+ *
+ * 实现注意：用 estimateTokensJoined 一次性编码（数百 segment 时比逐段累加快一个数量级，
+ * 同时避免段间 token 边界估算误差）。
+ */
+export function estimateRawContextTokens(
+  transcript: ReadonlyArray<TranscriptSegment>,
+  history: ReadonlyArray<ConversationTurn>,
+  userInput: string
+): number {
+  const parts: string[] = [];
+  for (const seg of transcript) if (seg.text) parts.push(seg.text);
+  for (const turn of history) if (turn.content) parts.push(turn.content);
+  if (userInput) parts.push(userInput);
+  return estimateTokensJoined(parts, ' ');
 }

@@ -201,7 +201,8 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
         },
       },
     });
-    if (!conversation || conversation.session.userId !== payload.id) {
+    // Conversation.session 可空（纯 chat 对话无录音绑定）；此端点仅服务挂录音的对话。
+    if (!conversation || !conversation.session || conversation.session.userId !== payload.id) {
       return NextResponse.json(
         { error: 'Conversation not found' },
         { status: 404 }
@@ -215,7 +216,8 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
     }
 
     const language = conversation.session.targetLang || 'zh';
-    const sessionId = conversation.sessionId;
+    // session 非空已守卫，FK 不变量保证 sessionId 同步非空；ts 不跨字段窄化，用 non-null。
+    const sessionId = conversation.sessionId!;
 
     // 找最近一条 role='system' 作为"主动压缩"截断点。新压缩消息带有
     // compressed-through 标记，不再依赖 system 消息的 createdAt 物理位置。

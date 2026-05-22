@@ -45,6 +45,8 @@ model User {
   quotaResetAt                DateTime?
   storageHoursUsed            Float   @default(0)
   storageHoursLimit           Float   @default(10)     // FREE=10h录音, PRO=100h, ADMIN=unlimited
+  storageBytesUsed            BigInt  @default(0)             // chat 上传文件累计字节
+  storageBytesLimit           BigInt  @default(104857600)     // FREE 默认 100MB；admin 可调（PRO/ADMIN 通过 SiteSetting 配置）
   allowedModels               String  @default("local") // 逗号分隔: "local,gpt,claude,deepseek"
   customGroupId               String?                      // 自定义用户组 ID，指向 SiteSetting 中存储的自定义组
 
@@ -98,6 +100,7 @@ model Session {
   shareLinks      ShareLink[]
   folders         FolderSession[]
   conversations   Conversation[]
+  conversationSessions  ConversationSession[]
 
   @@index([userId])
   @@index([asyncTranscribeStatus])
@@ -298,16 +301,29 @@ model JobQueue {
 // ─── Chat 对话历史（每次录音可有多个 Conversation，"新建对话"即关闭旧的开新的） ───
 model Conversation {
   id          String                @id @default(cuid())
-  sessionId   String
-  session     Session               @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionId   String?
+  session     Session?              @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   title       String?                                  // AI 生成的对话标题（首条用户消息提取，可为空）
   startedAt   DateTime              @default(now())
   endedAt     DateTime?                                // null = 当前活跃；非 null = 已关闭，只读
   // 单次对话内的降级状态（单调下降，只能 ≥ 上次记录的值）
   degradationLevel Int              @default(1)        // 1..7，对应 7 级降级链
   messages    ConversationMessage[]
+  attachments  ChatAttachment[]
+  sessions    ConversationSession[]
 
   @@index([sessionId, startedAt])
+}
+
+model ConversationSession {
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sessionId      String
+  session        Session      @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  addedAt        DateTime     @default(now())
+
+  @@id([conversationId, sessionId])
+  @@index([sessionId])
 }
 
 model ConversationMessage {
@@ -326,4 +342,25 @@ model ConversationMessage {
   createdAt        DateTime      @default(now())
 
   @@index([conversationId, createdAt])
+}
+
+// ─── Chat 附件（图片 / 文档 / 文本），持久化到 Cloudreve；每条与 Conversation 多对一 ───
+model ChatAttachment {
+  id                String        @id @default(cuid())
+  conversationId    String
+  conversation      Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  userId            String                                      // 冗余存储便于 admin 按用户清理 + 配额复核
+  kind              String                                      // 'image' | 'document' | 'text'
+  fileName          String                                      // 上传时的原始文件名（已 sanitize）
+  mimeType          String
+  bytes             BigInt                                      // 文件大小，配额扣减依据
+  cloudrevePath     String                                      // /{userId}/chat-uploads/{conversationId}/{filename}
+  extractedTextPath String?                                     // 仅 document 类，抽取出的 .txt 在 Cloudreve 的路径
+  createdAt         DateTime      @default(now())
+  lastAccessedAt    DateTime      @default(now())               // 用于 LRU 清理
+
+  @@index([conversationId])
+  @@index([userId])
+  @@index([createdAt])
+  @@index([userId, lastAccessedAt])
 }

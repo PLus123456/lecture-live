@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import {
   RefreshCw,
   ChevronLeft,
@@ -13,10 +13,13 @@ import {
   Pause,
   Layers,
   RotateCcw,
+  Trash2,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
+import CleanupModalShell from '@/components/admin/CleanupModalShell';
+import { JOB_STATUS, type JobStatus } from '@/lib/jobQueue';
 
 interface Job {
   id: string;
@@ -84,6 +87,7 @@ export default function JobQueuePanel() {
   const [retrying, setRetrying] = useState<string | null>(null);
   const [filterType, setFilterType] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
+  const [showCleanup, setShowCleanup] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
@@ -397,17 +401,30 @@ export default function JobQueuePanel() {
         <h2 className="text-xl md:text-2xl font-serif font-bold text-charcoal-800 dark:text-cream-100">
           {t('jobQueue.title')}
         </h2>
-        <button
-          onClick={() => fetchJobs(pagination.page)}
-          disabled={loading}
-          className="p-2 rounded-lg border border-cream-200 dark:border-charcoal-600
-                     bg-white dark:bg-charcoal-800 text-charcoal-500 hover:text-charcoal-700
-                     hover:bg-cream-50 dark:hover:bg-charcoal-700 transition-all duration-150
-                     disabled:opacity-50 hover:scale-105 active:scale-95"
-          title={t('common.refresh')}
-        >
-          <RefreshCw className={`w-4 h-4 transition-transform duration-300 ${loading ? 'animate-spin' : ''}`} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowCleanup(true)}
+            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600
+                       bg-white dark:bg-charcoal-800 text-charcoal-600 dark:text-cream-200 hover:text-charcoal-800
+                       hover:bg-cream-50 dark:hover:bg-charcoal-700 transition-all duration-150 text-sm font-medium
+                       hover:scale-[1.02] active:scale-95"
+            title={t('jobQueue.cleanup')}
+          >
+            <Trash2 className="w-4 h-4" />
+            {t('jobQueue.cleanup')}
+          </button>
+          <button
+            onClick={() => fetchJobs(pagination.page)}
+            disabled={loading}
+            className="p-2 rounded-lg border border-cream-200 dark:border-charcoal-600
+                       bg-white dark:bg-charcoal-800 text-charcoal-500 hover:text-charcoal-700
+                       hover:bg-cream-50 dark:hover:bg-charcoal-700 transition-all duration-150
+                       disabled:opacity-50 hover:scale-105 active:scale-95"
+            title={t('common.refresh')}
+          >
+            <RefreshCw className={`w-4 h-4 transition-transform duration-300 ${loading ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
       </div>
 
       {/* 筛选栏 */}
@@ -530,6 +547,141 @@ export default function JobQueuePanel() {
           </div>
         )}
       </div>
+
+      {showCleanup && (
+        <JobQueueCleanupModal
+          token={token}
+          onClose={() => setShowCleanup(false)}
+          onCleaned={() => fetchJobs(1)}
+        />
+      )}
     </div>
+  );
+}
+
+// ────────── 清理弹窗 ──────────
+
+const CLEANUP_STATUSES = [JOB_STATUS.SUCCESS, JOB_STATUS.FAILED] as const;
+const JOB_DAY_OPTIONS = [7, 14, 30, 60, 90] as const;
+
+function JobQueueCleanupModal({
+  token,
+  onClose,
+  onCleaned,
+}: {
+  token: string | null;
+  onClose: () => void;
+  onCleaned: () => void;
+}) {
+  const { t } = useI18n();
+  const [statuses, setStatuses] = useState<Set<JobStatus>>(new Set(CLEANUP_STATUSES));
+  const [olderThanDays, setOlderThanDays] = useState<number>(30);
+  const [typeFilter, setTypeFilter] = useState<string>('');
+
+  const buildParams = useCallback(() => {
+    const sp = new URLSearchParams();
+    for (const s of statuses) sp.append('statuses', s);
+    sp.set('olderThanDays', String(olderThanDays));
+    if (typeFilter) sp.set('type', typeFilter);
+    return sp;
+  }, [statuses, olderThanDays, typeFilter]);
+
+  const formSignature = useMemo(
+    () => `${[...statuses].sort().join(',')}|${olderThanDays}|${typeFilter}`,
+    [statuses, olderThanDays, typeFilter],
+  );
+
+  const toggleStatus = (s: JobStatus) => {
+    setStatuses((prev) => {
+      const next = new Set(prev);
+      if (next.has(s)) next.delete(s);
+      else next.add(s);
+      return next;
+    });
+  };
+
+  const labelFor = (s: JobStatus) =>
+    s === JOB_STATUS.SUCCESS
+      ? t('jobQueue.cleanupDialogStatusSuccess')
+      : t('jobQueue.cleanupDialogStatusFailed');
+
+  return (
+    <CleanupModalShell
+      title={t('jobQueue.cleanupDialogTitle')}
+      warning={t('jobQueue.cleanupDialogHint')}
+      endpoint="/api/admin/jobs"
+      token={token}
+      buildParams={buildParams}
+      formSignature={formSignature}
+      canSubmit={statuses.size > 0}
+      confirmDialogTitle={t('jobQueue.cleanupDialogConfirmTitle')}
+      confirmDialogMessage={t('jobQueue.cleanupDialogConfirmMessage')}
+      successTitle={(n) => t('jobQueue.cleanupSuccess', { n })}
+      failureTitle={t('jobQueue.cleanupFailed')}
+      previewErrorTitle={t('jobQueue.cleanupDialogPreviewError')}
+      onClose={onClose}
+      onCleaned={onCleaned}
+    >
+      <div>
+        <label className="text-xs font-semibold text-charcoal-600 dark:text-charcoal-300 uppercase tracking-wider mb-2 block">
+          {t('jobQueue.cleanupDialogStatuses')}
+        </label>
+        <div className="space-y-1.5">
+          {CLEANUP_STATUSES.map((s) => (
+            <label
+              key={s}
+              className="flex items-center gap-2.5 px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600 cursor-pointer hover:bg-cream-50 dark:hover:bg-charcoal-700/50 transition-colors"
+            >
+              <input
+                type="checkbox"
+                checked={statuses.has(s)}
+                onChange={() => toggleStatus(s)}
+                className="w-4 h-4 rounded text-rust-500 focus:ring-rust-300 focus:ring-2"
+              />
+              <span className="text-sm text-charcoal-700 dark:text-cream-200">{labelFor(s)}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <label className="text-xs font-semibold text-charcoal-600 dark:text-charcoal-300 uppercase tracking-wider mb-2 block">
+          {t('jobQueue.cleanupDialogType')}
+        </label>
+        <select
+          value={typeFilter}
+          onChange={(e) => setTypeFilter(e.target.value)}
+          className="w-full px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600
+                     bg-white dark:bg-charcoal-800 text-sm text-charcoal-700 dark:text-cream-200
+                     focus:outline-none focus:ring-2 focus:ring-rust-300 cursor-pointer"
+        >
+          <option value="">{t('jobQueue.cleanupDialogAllTypes')}</option>
+          {JOB_TYPES.map((typ) => (
+            <option key={typ} value={typ}>
+              {t(TYPE_I18N_MAP[typ])}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <label className="text-xs font-semibold text-charcoal-600 dark:text-charcoal-300 uppercase tracking-wider mb-2 block">
+          {t('admin.cleanup.olderThan')}
+        </label>
+        <select
+          value={olderThanDays}
+          onChange={(e) => setOlderThanDays(Number(e.target.value))}
+          className="w-full px-3 py-2 rounded-lg border border-cream-200 dark:border-charcoal-600
+                     bg-white dark:bg-charcoal-800 text-sm text-charcoal-700 dark:text-cream-200
+                     focus:outline-none focus:ring-2 focus:ring-rust-300 cursor-pointer"
+        >
+          {JOB_DAY_OPTIONS.map((d) => (
+            <option key={d} value={d}>
+              {t('admin.cleanup.days', { n: d })}
+            </option>
+          ))}
+        </select>
+      </div>
+    </CleanupModalShell>
   );
 }

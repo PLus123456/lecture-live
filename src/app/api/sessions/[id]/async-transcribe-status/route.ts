@@ -26,7 +26,10 @@ import {
   getSonioxTranscript,
   getSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
-import { convertAsyncTokensToSegments } from '@/lib/soniox/asyncTranscriptConverter';
+import {
+  convertAsyncTokensToSegments,
+  extractTranslationsByTokens,
+} from '@/lib/soniox/asyncTranscriptConverter';
 import { runBackgroundLLMTasks } from '@/lib/sessionFinalization';
 
 export async function GET(
@@ -161,11 +164,12 @@ export async function GET(
     const segments = convertAsyncTokensToSegments(transcript.tokens, {
       targetLang: session.targetLang,
     });
+    const translations = extractTranslationsByTokens(transcript.tokens, segments);
 
     const bundle = {
       segments,
       summaries: [],
-      translations: {},
+      translations,
     };
     const persisted = await persistSessionTranscriptArtifacts(session, bundle);
 

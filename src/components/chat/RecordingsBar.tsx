@@ -1,0 +1,149 @@
+'use client';
+
+import { useState } from 'react';
+import Link from 'next/link';
+import { Mic, X, Plus, Clock } from 'lucide-react';
+import { useI18n } from '@/lib/i18n';
+
+/**
+ * 顶栏录音 pill 数据结构 —— 后端 `/api/conversations/[id]/recordings`
+ * 实际响应在 U9 上线后可能更丰富，这里保持最小子集 + 可选字段。
+ */
+export interface RecordingPill {
+  sessionId: string;
+  title: string;
+  /** 时长毫秒；可空（未完成的录音可能没有 durationMs） */
+  durationMs?: number;
+  /** Transcript 预览，最多展示前 200 字 */
+  transcriptPreview?: string;
+}
+
+function formatDuration(ms: number | undefined): string {
+  if (!ms || !Number.isFinite(ms) || ms < 0) return '--';
+  const totalMin = Math.floor(ms / 60_000);
+  if (totalMin < 1) return '<1 min';
+  if (totalMin >= 60) {
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  }
+  return `${totalMin} min`;
+}
+
+/**
+ * GlobalChat 顶部的「已挂载录音」一行 pills + 添加按钮。
+ *
+ * - 没挂任何录音：显示空态 + 添加按钮（点击后弹出 RecordingPicker，U11）。
+ * - 有挂载：每条录音一个 pill，X 移除（DELETE 子路由 U9）。
+ *   点击 pill 主体 → 展开下方 popover 显示 transcript 预览（点击外部关闭）。
+ *
+ * 后端 API 不可用时静默兜底：onAttach 和 onDetach 被父组件传入，
+ * 父组件负责 try/catch + toast 反馈；本组件只渲染 UI。
+ */
+export default function RecordingsBar({
+  recordings,
+  onAttach,
+  onDetach,
+  attachDisabled = false,
+}: {
+  recordings: RecordingPill[];
+  onAttach?: () => void;
+  onDetach?: (sessionId: string) => void;
+  /** picker 还未就绪（U11 未合并）时禁用「添加录音」按钮 */
+  attachDisabled?: boolean;
+}) {
+  const { t } = useI18n();
+  const [openId, setOpenId] = useState<string | null>(null);
+
+  return (
+    <div className="border-b border-cream-200 bg-cream-50/60">
+      <div className="flex items-center gap-2 px-4 py-2 flex-wrap">
+        {recordings.length === 0 ? (
+          <span className="text-[11px] text-charcoal-400 italic">
+            {t('chat.noRecordings')}
+          </span>
+        ) : (
+          recordings.map((r) => {
+            const isOpen = openId === r.sessionId;
+            return (
+              <div key={r.sessionId} className="relative">
+                <div
+                  className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md
+                              text-[11px] border transition-colors
+                              ${
+                                isOpen
+                                  ? 'bg-rust-50 border-rust-300 text-rust-700'
+                                  : 'bg-white border-cream-300 text-charcoal-600 hover:border-cream-400'
+                              }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setOpenId(isOpen ? null : r.sessionId)}
+                    className="flex items-center gap-1.5 max-w-[200px]"
+                    title={r.title}
+                  >
+                    <Mic className="w-3 h-3 flex-shrink-0" />
+                    <span className="truncate">{r.title}</span>
+                    <span className="text-charcoal-400 flex-shrink-0 inline-flex items-center gap-0.5">
+                      <Clock className="w-2.5 h-2.5" />
+                      {formatDuration(r.durationMs)}
+                    </span>
+                  </button>
+                  {onDetach && (
+                    <button
+                      type="button"
+                      onClick={() => onDetach(r.sessionId)}
+                      className="w-4 h-4 rounded hover:bg-charcoal-100 text-charcoal-400
+                                 hover:text-charcoal-700 flex items-center justify-center"
+                      title={t('chat.removeRecording')}
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+                {isOpen && (
+                  <div
+                    className="absolute top-full left-0 mt-1 w-72 max-w-[80vw] bg-white border border-cream-300
+                               rounded-lg shadow-lg p-3 text-[11px] z-30 animate-fade-in-scale"
+                  >
+                    <div className="font-medium text-charcoal-800 mb-1 truncate">
+                      {r.title}
+                    </div>
+                    <div className="text-charcoal-500 mb-2 line-clamp-4">
+                      {r.transcriptPreview?.slice(0, 200) ||
+                        '...'}
+                    </div>
+                    <Link
+                      href={`/session/${r.sessionId}/playback`}
+                      className="text-rust-500 hover:text-rust-700 underline"
+                    >
+                      Open recording →
+                    </Link>
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
+
+        <button
+          type="button"
+          onClick={() => onAttach?.()}
+          disabled={attachDisabled || !onAttach}
+          title={
+            attachDisabled
+              ? t('chat.recordingPickerComingSoon')
+              : t('chat.attachRecording')
+          }
+          className="inline-flex items-center gap-1 px-2 py-1 rounded-md
+                     border border-dashed border-cream-400 text-[11px] text-charcoal-500
+                     hover:border-rust-300 hover:text-rust-600 transition-colors
+                     disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <Plus className="w-3 h-3" />
+          {t('chat.attachRecording')}
+        </button>
+      </div>
+    </div>
+  );
+}

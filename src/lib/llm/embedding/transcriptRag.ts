@@ -98,6 +98,8 @@ function chunkSegments(
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {
+  // 维度不匹配的诊断由 retrieveTranscriptByEmbedding 在调用前统一处理，
+  // 这里只是兜底保护 —— 在热循环里直接 log 会按 chunk 数刷屏。
   if (a.length !== b.length) return 0;
   let dot = 0;
   let normA = 0;
@@ -198,10 +200,35 @@ export async function retrieveTranscriptByEmbedding(args: {
   }
 
   // 此处 state 在 needsRebuild 分支里被赋值过，断言便于 TS 收窄
-  const ragState = state!;
+  let ragState = state!;
 
   // Query embedding
   const [queryVec] = await callEmbedding([query]);
+
+  // 检测 query vec 与缓存 chunk vec 的维度是否一致：
+  // 不一致通常是 admin 切换了不同维度的 embedding 模型（如 1536 → 1024），
+  // cache 里仍是旧维度的 vectors。一次性 invalidate + 重 embed 整段 transcript。
+  const sampleVec = ragState.vectors.find((v) => v.length > 0);
+  if (sampleVec && queryVec.length !== sampleVec.length) {
+    ragLogger.warn(
+      {
+        sessionId,
+        queryDim: queryVec.length,
+        cachedDim: sampleVec.length,
+        chunkCount: ragState.chunks.length,
+      },
+      'Embedding 维度不一致（可能切换了 embedding 模型），自动清空 cache 并重新 embed'
+    );
+    sessionCache.delete(sessionId);
+    const freshVectors = await callEmbedding(ragState.chunks.map((c) => c.text));
+    ragState = {
+      lastSegmentCount: transcript.length,
+      chunks: ragState.chunks,
+      vectors: freshVectors,
+      lastUsedAt: Date.now(),
+    };
+    sessionCache.set(sessionId, ragState);
+  }
 
   // Cosine 排序
   const scored = ragState.chunks.map((chunk, i) => ({
@@ -263,7 +290,7 @@ export function makeRagRetrieverForSession(sessionId: string) {
     } catch (error) {
       ragLogger.warn(
         { sessionId, err: serializeError(error) },
-        'RAG 检索失败，将由 chatContextBuilder 退化到截尾'
+        'Embedding 调用失败导致 RAG 不可用，chat L6/L7 已 fallback 到截尾 transcript；如需启用 RAG 检索请到 admin 面板「LLM Providers」配置一个用途为 EMBEDDING 的 OpenAI 兼容 provider 并设为默认'
       );
       return '';
     }

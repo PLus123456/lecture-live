@@ -1242,7 +1242,9 @@ export async function callEmbedding(texts: string[]): Promise<number[][]> {
 
   if (provider.isAnthropic) {
     throw new Error(
-      'Anthropic 不支持 embeddings 端点，请在 admin 面板把 EMBEDDING 用途配置到 OpenAI 兼容模型上'
+      `Anthropic provider「${provider.name}」不支持 embeddings 端点。` +
+        '请到 admin 面板「LLM Providers」配置一个 OpenAI 兼容 provider（如 OpenAI、OpenRouter、火山、智谱，或自建的 text-embedding 模型），' +
+        '并把它的某个 model 用途设为 EMBEDDING 并勾选「设为默认」后保存。'
     );
   }
 

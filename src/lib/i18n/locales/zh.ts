@@ -1227,4 +1227,27 @@ export default {
     unknownError: '转录失败',
     untitledSession: '未命名会话',
   },
+
+  // 后台任务指示器（主页 New Session 旁的小圆点）
+  backgroundTasks: {
+    title: '进行中的后台任务',
+    empty: '暂无任务',
+    runningFor: '已运行 {time}',
+    types: {
+      report_generation: '生成报告中',
+      title_generation: '生成标题中',
+      keyword_extraction: '提取关键词中',
+      transcribing: '转录中',
+      uploading_to_soniox: '上传到 Soniox',
+      transcoding: '音频转码中',
+      finalizing: '正在收尾',
+      uploading_chunks: '上传分块中',
+      quota_reset: '配额重置中',
+      stale_session_reclaim: '回收过期会话',
+      reconciliation: '对账中',
+      storage_cleanup: '清理存储中',
+      storage_migration: '迁移存储中',
+      billing_maintenance: '账单维护中',
+    },
+  },
 } as const;

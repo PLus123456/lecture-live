@@ -1241,4 +1241,27 @@ export default {
     unknownError: 'Transcription failed',
     untitledSession: 'Untitled session',
   },
+
+  // Background tasks indicator (the chip next to the New Session button on home)
+  backgroundTasks: {
+    title: 'Active background tasks',
+    empty: 'No active tasks',
+    runningFor: 'Running for {time}',
+    types: {
+      report_generation: 'Generating report',
+      title_generation: 'Generating title',
+      keyword_extraction: 'Extracting keywords',
+      transcribing: 'Transcribing',
+      uploading_to_soniox: 'Uploading to Soniox',
+      transcoding: 'Transcoding audio',
+      finalizing: 'Finalizing',
+      uploading_chunks: 'Uploading chunks',
+      quota_reset: 'Resetting quota',
+      stale_session_reclaim: 'Reclaiming stale sessions',
+      reconciliation: 'Reconciling data',
+      storage_cleanup: 'Cleaning up storage',
+      storage_migration: 'Migrating storage',
+      billing_maintenance: 'Billing maintenance',
+    },
+  },
 } as const;

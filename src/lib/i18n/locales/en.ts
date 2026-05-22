@@ -685,6 +685,16 @@ export default {
     noCustomGroup: 'None (use role defaults)',
     groupColor: 'Color',
     custom: 'Custom',
+
+    // Cleanup dialog (shared buttons & copy)
+    cleanup: {
+      preview: 'Preview',
+      previewing: 'Counting...',
+      confirm: 'Confirm cleanup',
+      willDelete: 'Will delete {n} records',
+      olderThan: 'Older than',
+      days: '{n} days',
+    },
   },
 
   // 管理员设置面板
@@ -959,6 +969,23 @@ export default {
     colTime: 'Time',
     colIp: 'IP Address',
     total: '{n} records total',
+    // Cleanup
+    cleanup: 'Clean up',
+    cleanupDialogTitle: 'Clean up audit logs',
+    cleanupDialogCategories: 'Action categories',
+    cleanupCategorySession: 'Session operations',
+    cleanupCategoryShare: 'Share operations',
+    cleanupCategoryLogin: 'Login / logout',
+    cleanupCategorySystem: 'System events',
+    cleanupDialogWarning: 'Admin operations, user registrations, password changes, and failed logins are never deleted (compliance).',
+    cleanupDialogConfirmTitle: 'Confirm audit log cleanup?',
+    cleanupDialogConfirmMessage: 'This cannot be undone. Matching log records will be deleted.',
+    cleanupDialogPreviewError: 'Preview failed',
+    cleanupSuccess: 'Cleaned up {n} logs',
+    cleanupFailed: 'Cleanup failed',
+    // Cleanup admin action labels
+    jobCleanup: 'Cleanup job queue',
+    auditLogCleanup: 'Cleanup audit logs',
   },
 
   // 对账
@@ -1047,6 +1074,20 @@ export default {
     retry: 'Retry',
     retrySuccess: 'Job has been reset to submitted',
     retryFailed: 'Retry failed',
+    // Cleanup
+    cleanup: 'Clean up',
+    cleanupDialogTitle: 'Clean up job queue',
+    cleanupDialogStatuses: 'Statuses',
+    cleanupDialogStatusSuccess: 'Completed (SUCCESS)',
+    cleanupDialogStatusFailed: 'Failed (FAILED)',
+    cleanupDialogType: 'Job type',
+    cleanupDialogAllTypes: 'All types',
+    cleanupDialogHint: 'In-flight jobs (submitted / pending / processing) are never cleaned up.',
+    cleanupDialogConfirmTitle: 'Confirm job cleanup?',
+    cleanupDialogConfirmMessage: 'This cannot be undone. Matching job records will be deleted.',
+    cleanupDialogPreviewError: 'Preview failed',
+    cleanupSuccess: 'Cleaned up {n} jobs',
+    cleanupFailed: 'Cleanup failed',
     // Pagination
     total: '{n} total',
   },

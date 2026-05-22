@@ -758,6 +758,7 @@ export default {
     cloudreveStatusUnauthorized: '未授权',
     cloudreveStatusExpired: '授权已过期，请重新授权',
     cloudreveTokenExpiresAt: 'Access Token 将于 {time} 过期',
+    cloudreveRefreshStatus: '刷新授权状态',
     cloudreveRevoke: '撤销授权',
     cloudreveRevoking: '撤销中...',
     cloudreveRevokeConfirm: '确认撤销 Cloudreve 授权？撤销后需重新授权才能恢复存储功能。',

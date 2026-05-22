@@ -771,6 +771,7 @@ export default {
     cloudreveStatusUnauthorized: 'Not authorized',
     cloudreveStatusExpired: 'Authorization expired — please reauthorize',
     cloudreveTokenExpiresAt: 'Access token expires at {time}',
+    cloudreveRefreshStatus: 'Refresh authorization status',
     cloudreveRevoke: 'Revoke authorization',
     cloudreveRevoking: 'Revoking...',
     cloudreveRevokeConfirm:

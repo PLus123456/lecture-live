@@ -1311,22 +1311,32 @@ function StoragePanel({
   } | null>(null);
   const [revoking, setRevoking] = useState(false);
   const [revokeConfirmOpen, setRevokeConfirmOpen] = useState(false);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
 
   const refreshAuthStatus = useCallback(async () => {
     if (settings.storage_mode !== 'cloudreve') {
-      setAuthStatus(null);
+      setAuthStatus((prev) => (prev === null ? prev : null));
       return;
     }
+    const applyStatus = (next: { authorized: boolean; expiresAt: number | null }) => {
+      setAuthStatus((prev) =>
+        prev &&
+        prev.authorized === next.authorized &&
+        prev.expiresAt === next.expiresAt
+          ? prev
+          : next
+      );
+    };
     try {
       const res = await fetch('/api/admin/cloudreve/status', {
         cache: 'no-store',
       });
       if (!res.ok) {
-        setAuthStatus({ authorized: false, expiresAt: null });
+        applyStatus({ authorized: false, expiresAt: null });
         return;
       }
       const data = await res.json();
-      setAuthStatus({
+      applyStatus({
         authorized: Boolean(data.authorized),
         expiresAt:
           typeof data.expires_at === 'number' && Number.isFinite(data.expires_at)
@@ -1334,13 +1344,33 @@ function StoragePanel({
             : null,
       });
     } catch {
-      setAuthStatus({ authorized: false, expiresAt: null });
+      applyStatus({ authorized: false, expiresAt: null });
     }
   }, [settings.storage_mode]);
 
+  // Cloudreve token 由 WS 进程定时刷新，刷新后只更新 DB。
+  // 这里轮询拉取一次最新状态，避免 admin 面板看着 "已过期" 直到刷新整页。
   useEffect(() => {
     void refreshAuthStatus();
-  }, [refreshAuthStatus]);
+    if (settings.storage_mode !== 'cloudreve') {
+      return;
+    }
+    const timer = setInterval(() => {
+      void refreshAuthStatus();
+    }, 60_000);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [refreshAuthStatus, settings.storage_mode]);
+
+  const handleManualRefreshAuthStatus = async () => {
+    setManualRefreshing(true);
+    try {
+      await refreshAuthStatus();
+    } finally {
+      setManualRefreshing(false);
+    }
+  };
 
   const handleMigrate = async () => {
     setMigrating(true);
@@ -1526,6 +1556,19 @@ function StoragePanel({
                     ? t('adminSettings.cloudreveStatusAuthorized')
                     : t('adminSettings.cloudreveStatusUnauthorized')}
                 </span>
+                <button
+                  type="button"
+                  onClick={handleManualRefreshAuthStatus}
+                  disabled={manualRefreshing}
+                  title={t('adminSettings.cloudreveRefreshStatus')}
+                  aria-label={t('adminSettings.cloudreveRefreshStatus')}
+                  className="inline-flex items-center justify-center rounded-md p-1 text-charcoal-500 transition-colors hover:bg-charcoal-100 hover:text-charcoal-700 disabled:opacity-50 dark:text-charcoal-400 dark:hover:bg-charcoal-700 dark:hover:text-charcoal-200"
+                >
+                  <RotateCcw
+                    size={14}
+                    className={manualRefreshing ? 'animate-spin' : undefined}
+                  />
+                </button>
                 {isAuthorized && !isExpired && authStatus.expiresAt && (
                   <span className="text-xs text-charcoal-500 dark:text-charcoal-400">
                     {t('adminSettings.cloudreveTokenExpiresAt').replace(

@@ -248,7 +248,14 @@ export async function resetExpiredTranscriptionQuotas(
   return expiredUsers.length;
 }
 
-export async function reconcileTranscriptionUsage() {
+/**
+ * 对账：按已完成 session 的实际时长重算应扣分钟，与 transcriptionMinutesUsed 比对。
+ *
+ * @param asyncMultiplier 异步上传转录的计费倍率（默认 1）。异步路径按倍率计费
+ *   （见 async-transcribe-status 扣费），对账侧必须乘同样倍率，否则会把折扣恒报成 drift。
+ *   实时转录始终全额（不乘倍率）。
+ */
+export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
   const users = await prisma.user.findMany({
     select: {
       id: true,
@@ -268,14 +275,21 @@ export async function reconcileTranscriptionUsage() {
           status: 'COMPLETED',
           createdAt: { gte: cycleStart },
         },
-        select: { durationMs: true },
+        select: { durationMs: true, asyncTranscribeStatus: true },
       });
 
       const actualMinutes = sessions.reduce((total, session) => {
         if (!session.durationMs || session.durationMs <= 0) {
           return total;
         }
-        return total + getBillableMinutes(session.durationMs);
+        const billable = getBillableMinutes(session.durationMs);
+        // 异步上传转录（asyncTranscribeStatus 非空）按倍率，实时转录全额。
+        // 与扣费侧 ceil(分钟×倍率) 完全一致，保证折扣不被误报为 drift。
+        const charged =
+          session.asyncTranscribeStatus != null
+            ? Math.ceil(billable * asyncMultiplier)
+            : billable;
+        return total + charged;
       }, 0);
 
       return {

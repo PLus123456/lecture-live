@@ -1,5 +1,6 @@
 import { prisma } from '@/lib/prisma';
 import { reconcileTranscriptionUsage } from '@/lib/quota';
+import { getSiteSettings } from '@/lib/siteSettings';
 import { logSystemEvent } from '@/lib/auditLog';
 
 interface RunTranscriptionUsageReconciliationOptions {
@@ -20,7 +21,9 @@ export async function runTranscriptionUsageReconciliation(
   });
 
   try {
-    const mismatches = await reconcileTranscriptionUsage();
+    // 异步上传转录按可配置倍率计费，对账须乘同样倍率（口径一致，避免恒报 drift）
+    const { async_upload_billing_multiplier } = await getSiteSettings();
+    const mismatches = await reconcileTranscriptionUsage(async_upload_billing_multiplier);
     const totalUsers = await prisma.user.count();
 
     if (mismatches.length > 0) {

@@ -7,6 +7,7 @@
 // 思考块、消息气泡、模型菜单抽到 src/components/chat/ChatPanel.tsx。
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import {
   Send,
@@ -111,6 +112,13 @@ function readFileAsDataUrl(file: File): Promise<string> {
 /*  Markdown 渲染（从 ChatTab 同步过来；保持视觉一致）                      */
 /* ------------------------------------------------------------------ */
 
+/** 过滤 markdown 链接 href —— 只放行 http/https/mailto/锚点/相对链接，
+ *  丢弃 javascript: / data: 等可执行协议（LLM 输出不可信）。 */
+function safeHref(href: unknown): string | undefined {
+  if (typeof href !== 'string') return undefined;
+  return /^(https?:|mailto:|#|\/)/i.test(href.trim()) ? href : undefined;
+}
+
 function Md({ children }: { children: string }) {
   return (
     <ReactMarkdown
@@ -158,7 +166,7 @@ function Md({ children }: { children: string }) {
         ),
         a: ({ href, children: c }) => (
           <a
-            href={href}
+            href={safeHref(href)}
             target="_blank"
             rel="noopener noreferrer"
             className="text-rust-500 underline hover:text-rust-700"
@@ -405,10 +413,14 @@ async function consumeSse(
 
 export default function GlobalChat({
   conversationId,
+  onAccessDenied,
 }: {
   conversationId: string;
+  /** messages 拉取返回 404/403（无权/不存在）时回调，由父组件决定跳转。 */
+  onAccessDenied?: () => void;
 }) {
   const { t } = useI18n();
+  const router = useRouter();
   const token = useAuthStore((s) => s.token);
 
   // Zustand chat store — 复用模型选择 / 思考偏好 / token 用量
@@ -428,6 +440,8 @@ export default function GlobalChat({
     updateMessage,
     setLoading,
     resetSession,
+    contextFull,
+    setContextFull,
   } = useChatStore();
 
   /* ── 局部 UI state ── */
@@ -446,6 +460,7 @@ export default function GlobalChat({
   const [uploadingFile, setUploadingFile] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const sendAbortRef = useRef<AbortController | null>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const thinkingMenuRef = useRef<HTMLDivElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -492,8 +507,11 @@ export default function GlobalChat({
           );
           if (controller.signal.aborted) return;
           if (!res.ok) {
-            // 404 可能因为 conversation.session 为空 — U10 之前的 messages
-            // 路由仍要求挂录音；纯 chat 对话可能直到 U9 才能正确返回。
+            // 404/403 = 对话不存在或无权访问 → 通知父组件跳转（替代此前在
+            // ChatDetailClient 里的重复预检请求，避免每次进对话发两次 messages）。
+            if (res.status === 404 || res.status === 403) {
+              onAccessDenied?.();
+            }
             setMessages([], []);
             return;
           }
@@ -559,7 +577,11 @@ export default function GlobalChat({
       })(),
     ]);
 
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      // 切换对话/卸载时同时中止仍在进行的发送流，防止旧流写入已重置的全局 store。
+      sendAbortRef.current?.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, conversationId]);
 
@@ -692,33 +714,28 @@ export default function GlobalChat({
         return;
       }
 
+      // /api/chat-uploads 返回扁平结构 { attachmentId, fileName, bytes, kind, ... }
+      // （契约见 route 测试）。此前误读 data.attachment.* 导致上传成功也判失败。
       const data = (await res.json()) as {
-        attachment?: {
-          id: string;
-          fileName: string;
-          bytes: number | string;
-          kind: 'image' | 'document' | 'text';
-          previewUrl?: string;
-        };
+        attachmentId?: string;
+        fileName?: string;
+        bytes?: number | string;
+        kind?: 'image' | 'document' | 'text';
       };
-      if (!data.attachment) {
+      if (!data.attachmentId) {
         toast.error(t('chat.uploadFailed'));
         return;
       }
-      const a = data.attachment;
-      setAttachments((prev) => [
-        ...prev,
-        {
-          id: a.id,
-          fileName: a.fileName,
-          bytes:
-            typeof a.bytes === 'string'
-              ? parseInt(a.bytes, 10) || 0
-              : a.bytes,
-          kind: a.kind,
-          previewUrl: a.previewUrl,
-        },
-      ]);
+      const newChip: AttachmentChipData = {
+        id: data.attachmentId,
+        fileName: data.fileName ?? file.name,
+        bytes:
+          typeof data.bytes === 'string'
+            ? parseInt(data.bytes, 10) || 0
+            : data.bytes ?? file.size,
+        kind: data.kind ?? 'document',
+      };
+      setAttachments((prev) => [...prev, newChip]);
     } catch {
       toast.error(t('chat.uploadFailed'));
     } finally {
@@ -749,7 +766,8 @@ export default function GlobalChat({
               Authorization: `Bearer ${token}`,
               'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ sessionId }),
+            // DELETE 路由要求 { sessionIds: string[] }（与 RecordingPicker 一致）。
+            body: JSON.stringify({ sessionIds: [sessionId] }),
           }
         );
         if (!res.ok) {
@@ -765,6 +783,29 @@ export default function GlobalChat({
   );
 
   /* ──────────────────────────────────────────────────────────────
+     新建对话（EOL 后引导）：带上当前录音另起一个全局对话并跳转
+     ────────────────────────────────────────────────────────────── */
+  const handleNewConversation = useCallback(async () => {
+    if (!token) return;
+    try {
+      const recordingIds = recordings.map((r) => r.sessionId);
+      const res = await fetch('/api/conversations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(recordingIds.length > 0 ? { recordingIds } : {}),
+      });
+      if (!res.ok) throw new Error(`create ${res.status}`);
+      const data = (await res.json()) as { conversation: { id: string } };
+      router.push(`/chat/${data.conversation.id}`);
+    } catch {
+      toast.error(t('common.operationFailed'));
+    }
+  }, [token, recordings, router, t]);
+
+  /* ──────────────────────────────────────────────────────────────
      发送消息（POST /api/llm/chat — SSE 流）
      U12 之前的端点要求 conversation.session 非空；纯全局 chat
      可能返回 404，本组件会把错误内容显示到占位 assistant 气泡里。
@@ -772,7 +813,7 @@ export default function GlobalChat({
   const handleSend = async () => {
     const value = input.trim();
     const hasImages = pendingImages.length > 0;
-    if ((!value && !hasImages) || isLoading || !token) return;
+    if ((!value && !hasImages) || isLoading || !token || contextFull) return;
 
     setInput('');
 
@@ -804,6 +845,11 @@ export default function GlobalChat({
     setPendingImages([]);
     setImageError(null);
 
+    // 取消可能仍在进行的上一条发送流，避免旧流写入已切换/重置的全局 store。
+    sendAbortRef.current?.abort();
+    const abortController = new AbortController();
+    sendAbortRef.current = abortController;
+
     try {
       const thinkingFields = preferenceToFields(selectedThinkingPreference);
       const recordingIds = recordings.map((r) => r.sessionId);
@@ -811,6 +857,7 @@ export default function GlobalChat({
 
       const res = await fetch('/api/llm/chat', {
         method: 'POST',
+        signal: abortController.signal,
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
@@ -880,6 +927,8 @@ export default function GlobalChat({
           });
         } else if (event === 'error') {
           sawError = true;
+          // 上下文已满（EOL）：置位标志，禁用输入并引导新建对话。
+          if (payload.contextFull === true) setContextFull(true);
           updateMessage(assistantId, {
             content:
               accumulatedText ||
@@ -895,6 +944,8 @@ export default function GlobalChat({
         updateMessage(assistantId, { streaming: false });
       }
     } catch (error) {
+      // 流被 abort（切换对话/卸载）—— 静默收尾，不写错误气泡。
+      if ((error as { name?: string })?.name === 'AbortError') return;
       updateMessage(assistantId, {
         content: `Error: ${error instanceof Error ? error.message : 'Chat failed'}`,
         streaming: false,
@@ -980,6 +1031,18 @@ export default function GlobalChat({
 
       {/* Input area — 与 ChatTab 视觉同步 */}
       <div className="border-t border-cream-200 px-3 pt-1.5 pb-0 sticky bottom-0 bg-white safe-bottom">
+        {contextFull && (
+          <div className="mb-2 px-2.5 py-1.5 rounded-md bg-red-50 border border-red-200 text-[11px] text-red-700 flex items-center justify-between">
+            <span>上下文已满，所有降级策略均无法塞下。</span>
+            <button
+              type="button"
+              onClick={() => void handleNewConversation()}
+              className="ml-2 px-2 py-0.5 rounded bg-red-600 text-white hover:bg-red-700 transition-colors flex-shrink-0"
+            >
+              新建对话
+            </button>
+          </div>
+        )}
         {imageError && (
           <div className="mb-1.5 px-2 py-1 rounded-md bg-amber-50 text-[10px] text-amber-700 border border-amber-200">
             {imageError}
@@ -1081,11 +1144,13 @@ export default function GlobalChat({
             className="flex-1 px-3 py-2 rounded-lg border border-cream-300 text-xs
                        focus:outline-none focus:ring-1 focus:ring-rust-400 focus:border-rust-400
                        bg-white text-charcoal-700 placeholder:text-charcoal-300"
-            disabled={isLoading}
+            disabled={isLoading || contextFull}
           />
           <button
             onClick={handleSend}
-            disabled={isLoading || (!input.trim() && pendingImages.length === 0)}
+            disabled={
+              isLoading || contextFull || (!input.trim() && pendingImages.length === 0)
+            }
             className="p-2 rounded-lg bg-rust-500 text-white hover:bg-rust-600
                        disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
           >

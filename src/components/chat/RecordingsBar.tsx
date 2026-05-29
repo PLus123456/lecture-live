@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Mic, X, Plus, Clock } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
@@ -54,9 +54,32 @@ export default function RecordingsBar({
 }) {
   const { t } = useI18n();
   const [openId, setOpenId] = useState<string | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // 打开预览 popover 时：点击组件外部或按 Esc 关闭（与 ChatTab/GlobalChat 菜单一致）。
+  useEffect(() => {
+    if (!openId) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(e.target as Node)
+      ) {
+        setOpenId(null);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpenId(null);
+    };
+    document.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [openId]);
 
   return (
-    <div className="border-b border-cream-200 bg-cream-50/60">
+    <div ref={containerRef} className="border-b border-cream-200 bg-cream-50/60">
       <div className="flex items-center gap-2 px-4 py-2 flex-wrap">
         {recordings.length === 0 ? (
           <span className="text-[11px] text-charcoal-400 italic">

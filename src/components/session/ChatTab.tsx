@@ -102,6 +102,13 @@ function thinkingOptionsForMode(mode: ThinkingMode): Array<{
 /*  Markdown 渲染（统一样式）                                             */
 /* ------------------------------------------------------------------ */
 
+/** 过滤 markdown 链接 href —— 只放行 http/https/mailto/锚点/相对链接，
+ *  丢弃 javascript: / data: 等可执行协议（LLM 输出不可信）。 */
+function safeHref(href: unknown): string | undefined {
+  if (typeof href !== 'string') return undefined;
+  return /^(https?:|mailto:|#|\/)/i.test(href.trim()) ? href : undefined;
+}
+
 /** 聊天气泡 & thinking 块共用的 Markdown 渲染器 */
 function Md({ children }: { children: string }) {
   return (
@@ -151,7 +158,7 @@ function Md({ children }: { children: string }) {
         ),
         a: ({ href, children: c }) => (
           <a
-            href={href}
+            href={safeHref(href)}
             target="_blank"
             rel="noopener noreferrer"
             className="text-rust-500 underline hover:text-rust-700"

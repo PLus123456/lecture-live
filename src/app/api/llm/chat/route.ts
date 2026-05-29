@@ -61,10 +61,26 @@ import {
 } from '@/lib/sessionPersistence';
 import { toExportSegments } from '@/lib/export/types';
 import type { SessionReportData } from '@/types/report';
+import type { SummaryBlock } from '@/types/summary';
 
 const VALID_DEPTHS: ThinkingDepth[] = ['low', 'medium', 'high'];
 
 const chatLogger = logger.child({ component: 'chat-api' });
+
+/**
+ * 丢弃历史末尾"未配对的 user 消息"。
+ * 上一轮若被客户端 abort/中断，user 消息已落库但没有配对的 assistant 回复，
+ * 会在历史里留下一条悬空的 user 轮。本轮提问是单独追加的，所以这里安全地把
+ * 末尾孤儿 user 去掉，避免 LLM 看到连续两个 user 轮。（见 ISSUES_REPORT 第 1 批）
+ */
+function dropTrailingOrphanUser(
+  history: ConversationTurn[]
+): ConversationTurn[] {
+  if (history.length > 0 && history[history.length - 1]?.role === 'user') {
+    return history.slice(0, -1);
+  }
+  return history;
+}
 
 /**
  * 把任意来源的错误转为"是否上下文超长"判定。
@@ -736,6 +752,8 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
       persistedQuestionContent = `${parsed.question}\n\n${refs.join('\n')}`;
     }
   }
+  // user 消息在调用 LLM 之前落库，避免请求中断丢失用户输入。代价是本轮若被
+  // abort/失败且无 assistant 配对会留下"孤儿 user 消息"，由 dropTrailingOrphanUser 兜底。
   await prisma.conversationMessage.create({
     data: {
       conversationId: conversation.id,
@@ -745,15 +763,17 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
     },
   });
 
-  const history: ConversationTurn[] = effectiveMessages
-    .filter((m): m is typeof m & { role: 'user' | 'assistant' } =>
-      m.role === 'user' || m.role === 'assistant'
-    )
-    .map((m) => ({
-      role: m.role,
-      content: m.content,
-      transcriptOffsetMs: m.transcriptOffsetMs ?? 0,
-    }));
+  const history: ConversationTurn[] = dropTrailingOrphanUser(
+    effectiveMessages
+      .filter((m): m is typeof m & { role: 'user' | 'assistant' } =>
+        m.role === 'user' || m.role === 'assistant'
+      )
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+        transcriptOffsetMs: m.transcriptOffsetMs ?? 0,
+      }))
+  );
 
   const currentTurnImages: ChatImageInput[] = parsed.images.map((img) => ({
     mediaType: img.mediaType,
@@ -877,6 +897,7 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
           segments: bundle
             ? bundleSegmentsToTranscriptSegments(bundle.segments)
             : ([] as TranscriptSegment[]),
+          summaries: (bundle?.summaries ?? []) as SummaryBlock[],
         };
       })
     ),
@@ -933,6 +954,8 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
       persistedQuestionContent = `${parsed.question}\n\n${refs.join('\n')}`;
     }
   }
+  // user 消息在调用 LLM 之前落库，避免请求中断丢失用户输入。代价是本轮若被
+  // abort/失败且无 assistant 配对会留下"孤儿 user 消息"，由 dropTrailingOrphanUser 兜底。
   await prisma.conversationMessage.create({
     data: {
       conversationId: conversation.id,
@@ -948,15 +971,17 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
   const effectiveMessages = conversation.messages.slice(
     compressionBoundary.splitIndex + 1
   );
-  const history: ConversationTurn[] = effectiveMessages
-    .filter((m): m is typeof m & { role: 'user' | 'assistant' } =>
-      m.role === 'user' || m.role === 'assistant'
-    )
-    .map((m) => ({
-      role: m.role,
-      content: m.content,
-      transcriptOffsetMs: m.transcriptOffsetMs ?? 0,
-    }));
+  const history: ConversationTurn[] = dropTrailingOrphanUser(
+    effectiveMessages
+      .filter((m): m is typeof m & { role: 'user' | 'assistant' } =>
+        m.role === 'user' || m.role === 'assistant'
+      )
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+        transcriptOffsetMs: m.transcriptOffsetMs ?? 0,
+      }))
+  );
 
   // ── 是否要强制 L6 ── 估算 transcript+history+input 总 token，超 L1*80% 直接 force ──
   const rawEstimate = estimateRawContextTokens(
@@ -1007,9 +1032,13 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
     data: img.data,
   }));
   const attachmentImageInputs = extractAttachmentImages(attachmentBlocks);
-  // 图片张数限制：用户上传图片已在 parseChatImages 校验过；附件图片不再额外限制
-  // 但叠加后总张数仍以 ChatImageInput 数组形式发出。某些 provider 会按图片数计费。
-  const currentTurnImages = [...userImageInputs, ...attachmentImageInputs];
+  // 图片张数限制：用户上传图片已在 parseChatImages 校验过（≤ chatImageCount）；
+  // 叠加附件图片后对合并总数 clamp，防止某些 provider 按图片数计费/超过单请求图片硬限。
+  const MAX_TURN_IMAGES = LLM_LIMITS.chatImageCount * 2;
+  const currentTurnImages = [...userImageInputs, ...attachmentImageInputs].slice(
+    0,
+    MAX_TURN_IMAGES
+  );
 
   // ── 附件文本拼成 system 消息内容 ──
   const attachmentsSystemMessage = buildAttachmentsSystemMessage(attachmentBlocks);
@@ -1042,11 +1071,37 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
     process.env.LLM_ACTIVE_PROVIDER ||
     'default';
 
-  // ── 全局 summary：把所有 session 的 summaries 拼成一段文本 ──
-  // sessionAssets.bundle.summaries 已经在 loadSessionTranscriptBundle 里解析好了；
-  // 这里复用 parsed.summaryContext 之外再拼一份其他 session 的 summary 提要。
-  // 但实务上对话方调用方一般不需要给 summaryContext —— 留下 parsed.summaryContext 兜底。
-  const summary = parsed.summaryContext;
+  // ── 全局 summary：把所有 session 的 summary blocks 渲染成文本并按录音拼接 ──
+  // （此前这里直接丢弃 bundle.summaries、只用恒为空的 parsed.summaryContext，
+  //   导致全局对话的 <lecture_summary> 永远为空 —— 补上多录音 summary 注入。）
+  const renderSummaryBlocks = (blocks: SummaryBlock[]): string =>
+    (Array.isArray(blocks) ? blocks : [])
+      .map((block) => {
+        const prose =
+          typeof block?.summary === 'string' ? block.summary.trim() : '';
+        if (prose) return prose;
+        const kp = Array.isArray(block?.keyPoints)
+          ? block.keyPoints.filter(
+              (k): k is string => typeof k === 'string' && k.trim().length > 0
+            )
+          : [];
+        return kp.length > 0 ? kp.map((k) => `- ${k}`).join('\n') : '';
+      })
+      .filter((s) => s.length > 0)
+      .join('\n');
+
+  const perRecordingSummaries = sessionAssets
+    .map((asset) => {
+      const text = renderSummaryBlocks(asset.summaries);
+      if (!text) return null;
+      return `[Recording: ${asset.session.title || asset.session.id}]\n${text}`;
+    })
+    .filter((s): s is string => s !== null);
+
+  const summary =
+    perRecordingSummaries.length > 0
+      ? perRecordingSummaries.join('\n\n---\n\n')
+      : parsed.summaryContext;
 
   return streamChatResponse({
     conversationId: conversation.id,

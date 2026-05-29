@@ -99,6 +99,7 @@ export function useChat(sessionId: string | null) {
 
   const token = useAuthStore((s) => s.token);
   const lastLoadedSessionRef = useRef<string | null>(null);
+  const sendAbortRef = useRef<AbortController | null>(null);
 
   /* ──────────────────────────────────────────────────────────────
      拉取模型列表（一次性）
@@ -165,6 +166,13 @@ export function useChat(sessionId: string | null) {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, sessionId]);
+
+  /* 切换 session 或卸载时，中止仍在进行的发送流（防止旧流写入共享 chat store）。 */
+  useEffect(() => {
+    return () => {
+      sendAbortRef.current?.abort();
+    };
+  }, [sessionId]);
 
   /* ──────────────────────────────────────────────────────────────
      加载某个 conversation 的消息（含 system 摘要切割）
@@ -296,10 +304,16 @@ export function useChat(sessionId: string | null) {
         streaming: true,
       });
 
+      // 取消可能仍在进行的上一条发送流，避免切换 session/卸载后旧流写入共享 store。
+      sendAbortRef.current?.abort();
+      const abortController = new AbortController();
+      sendAbortRef.current = abortController;
+
       try {
         const thinkingFields = preferenceToFields(selectedThinkingPreference);
         const res = await fetch('/api/llm/chat', {
           method: 'POST',
+          signal: abortController.signal,
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
@@ -409,6 +423,8 @@ export function useChat(sessionId: string | null) {
           updateMessage(assistantId, { streaming: false });
         }
       } catch (error) {
+        // 流被 abort（切换 session/卸载）—— 静默收尾，不写错误气泡。
+        if ((error as { name?: string })?.name === 'AbortError') return;
         updateMessage(assistantId, {
           content: `Error: ${error instanceof Error ? error.message : 'Chat failed'}`,
           streaming: false,

@@ -95,6 +95,15 @@ async function authorize(
   return { ok: true, userId: user.id };
 }
 
+/** 已关闭（endedAt 非空）的对话只读：禁止增删挂载录音。 */
+async function isConversationClosed(conversationId: string): Promise<boolean> {
+  const conv = await prisma.conversation.findUnique({
+    where: { id: conversationId },
+    select: { endedAt: true },
+  });
+  return Boolean(conv?.endedAt);
+}
+
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -115,6 +124,13 @@ export async function POST(
 
   const parsed = await parseSessionIds(req);
   if (!parsed.ok) return parsed.response;
+
+  if (await isConversationClosed(id)) {
+    return NextResponse.json(
+      { error: 'Conversation is closed (read-only)' },
+      { status: 409 }
+    );
+  }
 
   // 验证所有待挂载录音都属于当前用户
   const ownedCount = await prisma.session.count({
@@ -159,6 +175,13 @@ export async function DELETE(
 
   const parsed = await parseSessionIds(req);
   if (!parsed.ok) return parsed.response;
+
+  if (await isConversationClosed(id)) {
+    return NextResponse.json(
+      { error: 'Conversation is closed (read-only)' },
+      { status: 409 }
+    );
+  }
 
   try {
     await prisma.conversationSession.deleteMany({

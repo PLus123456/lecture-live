@@ -61,11 +61,12 @@ function classifyKind(mt: string): AttachmentKind | null {
 async function isConversationAccessible(
   conversationId: string,
   userId: string
-): Promise<{ ok: boolean; exists: boolean }> {
+): Promise<{ ok: boolean; exists: boolean; endedAt?: Date | null }> {
   const conversation = await prisma.conversation.findUnique({
     where: { id: conversationId },
     select: {
       sessionId: true,
+      endedAt: true,
       session: { select: { userId: true } },
       sessions: { select: { session: { select: { userId: true } } } },
     },
@@ -77,18 +78,18 @@ async function isConversationAccessible(
 
   // 1) session-bound（单录音对话）
   if (conversation.session && conversation.session.userId === userId) {
-    return { ok: true, exists: true };
+    return { ok: true, exists: true, endedAt: conversation.endedAt };
   }
 
   // 2) 多录音绑定：sessions[*].session.userId 命中
   if (conversation.sessions.some((row) => row.session.userId === userId)) {
-    return { ok: true, exists: true };
+    return { ok: true, exists: true, endedAt: conversation.endedAt };
   }
 
   // 3) 纯 global 对话：无 sessionId 且无 ConversationSession 行 — 暂时放过
   //    TODO: schema 加上 Conversation.userId 后收紧此分支
   if (!conversation.sessionId && conversation.sessions.length === 0) {
-    return { ok: true, exists: true };
+    return { ok: true, exists: true, endedAt: conversation.endedAt };
   }
 
   return { ok: false, exists: true };
@@ -140,6 +141,12 @@ export async function POST(req: Request) {
   }
   if (!access.ok) {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
+  }
+  if (access.endedAt) {
+    return NextResponse.json(
+      { error: 'Conversation is closed (read-only)' },
+      { status: 409 }
+    );
   }
 
   // 单次上传大小限制（管理员配置，硬封顶 500MB）

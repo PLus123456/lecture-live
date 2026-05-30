@@ -189,6 +189,39 @@ describe('makeRagRetrieverForRecordings', () => {
     const out = await retrieve('alpha', [], 1000);
     expect(out).toBe('');
   });
+
+  it('contentSignature 变化（挂载录音增长）→ 增量重建，新内容可被检索到', async () => {
+    let segs: TranscriptSegment[] = makeSegments(['alpha one']);
+    const loadTranscript = vi.fn(async () => segs);
+
+    // 首次：signature=1（1 段），此时还没有 beta 内容
+    const r1 = makeRagRetrieverForRecordings(['rec-a'], loadTranscript, 1);
+    const out1 = await r1('beta', [], 1000);
+    expect(out1).not.toContain('beta two');
+    const loadsAfterFirst = loadTranscript.mock.calls.length;
+
+    // 录音增长到 2 段，signature=2 → 同一 cacheKey 但签名变化应触发重建
+    segs = makeSegments(['alpha one', 'beta two']);
+    const r2 = makeRagRetrieverForRecordings(['rec-a'], loadTranscript, 2);
+    const out2 = await r2('beta', [], 1000);
+
+    // 重建：loader 再次被调用，且新内容能检索到（旧行为下会整体命中旧快照查不到）
+    expect(loadTranscript.mock.calls.length).toBeGreaterThan(loadsAfterFirst);
+    expect(out2).toContain('beta two');
+  });
+
+  it('contentSignature 未变 → 命中复用，loader 不再调用', async () => {
+    const loadTranscript = vi.fn(async () => makeSegments(['alpha one']));
+
+    const r1 = makeRagRetrieverForRecordings(['rec-a'], loadTranscript, 7);
+    await r1('alpha', [], 1000);
+    const loads = loadTranscript.mock.calls.length;
+
+    // 同 signature 的新 retriever（同 cacheKey）→ 不重载
+    const r2 = makeRagRetrieverForRecordings(['rec-a'], loadTranscript, 7);
+    await r2('alpha', [], 1000);
+    expect(loadTranscript.mock.calls.length).toBe(loads);
+  });
 });
 
 describe('invalidateRagCache(sessionId) 清掉所有包含该 id 的 multi-entries', () => {

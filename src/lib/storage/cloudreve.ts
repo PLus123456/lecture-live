@@ -13,6 +13,7 @@ import { logSystemEvent } from '@/lib/auditLog';
 
 const cloudreveLogger = logger.child({ component: 'cloudreve-storage' });
 
+// 必须与 src/lib/security.ts 的 STORAGE_CATEGORIES 保持一致（两处各有派生类型，暂不合并）。
 const STORAGE_CATEGORIES = [
   'recordings',
   'transcripts',

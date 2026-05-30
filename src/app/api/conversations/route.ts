@@ -16,9 +16,8 @@
 // 的 endedAt 写上时间戳，新建一个 endedAt=null 的活跃 conversation。
 // 旧 conversation 仍可只读查看（不能再发消息）。
 //
-// 所有权说明：在 `Conversation.userId` 列加入之前（见 src/lib/conversations.ts
-// 的 TODO），全局对话的归属通过其 `ConversationSession` 行反推。
-// 真正零录音的"刚出生"全局对话当前对列表不可见，要等首条录音挂上后才会进入列表。
+// 所有权说明：归属用 `Conversation.userId`（创建时由服务端写入）。零录音的纯 global
+// 对话也带 userId，故创建即对列表可见，不再依赖挂载录音反推。
 
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
@@ -89,15 +88,9 @@ export async function GET(req: Request) {
       );
     }
 
-    // 用户所有可见对话 = (legacy sessionId 命中本人) OR (junction 行命中本人)
-    // TODO: 添加 Conversation.userId 列后即可显示真正零录音的全局对话
+    // 用户所有对话 = Conversation.userId 命中本人（含零录音纯 global 对话）
     const conversations = await prisma.conversation.findMany({
-      where: {
-        OR: [
-          { session: { userId: user.id } },
-          { sessions: { some: { session: { userId: user.id } } } },
-        ],
-      },
+      where: { userId: user.id },
       orderBy: { startedAt: 'desc' },
       take: recent,
       select: {
@@ -118,13 +111,11 @@ export async function GET(req: Request) {
 
   // ── 模式 B：?scope=global
   if (scopeParam === 'global') {
-    // 全局对话 = sessionId === null AND 仍有 ConversationSession 行（用于反推 owner）
-    // 没有 ConversationSession 行的"刚出生空对话"目前无主，列表里看不到。
-    // TODO: 添加 Conversation.userId 列后即可显示真正零录音的全局对话
+    // 全局对话 = 本人拥有 且 无 legacy sessionId 绑定（含零录音纯 global 对话，现已可见）
     const conversations = await prisma.conversation.findMany({
       where: {
+        userId: user.id,
         sessionId: null,
-        sessions: { some: { session: { userId: user.id } } },
       },
       orderBy: { startedAt: 'desc' },
       take: GLOBAL_LIMIT,
@@ -241,7 +232,7 @@ export async function POST(req: Request) {
           data: { endedAt: new Date() },
         }),
         prisma.conversation.create({
-          data: { sessionId: legacySessionId },
+          data: { sessionId: legacySessionId, userId: user.id },
           select: {
             id: true,
             title: true,
@@ -292,7 +283,7 @@ export async function POST(req: Request) {
   try {
     const conv = await prisma.$transaction(async (tx) => {
       const created = await tx.conversation.create({
-        data: { sessionId: null },
+        data: { sessionId: null, userId: user.id },
         select: {
           id: true,
           title: true,

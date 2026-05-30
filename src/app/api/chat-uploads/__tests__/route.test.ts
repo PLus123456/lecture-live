@@ -104,11 +104,10 @@ describe('POST /api/chat-uploads', () => {
     releaseStorageBytesMock.mockResolvedValue(null);
     enforceApiRateLimitMock.mockResolvedValue(null);
     getSiteSettingsMock.mockResolvedValue({ chat_files_max_upload_mb: 100 });
-    // 默认 conversation 归属当前用户（session-bound）
+    // 默认 conversation 归属当前用户（Conversation.userId）
     conversationFindUniqueMock.mockResolvedValue({
-      sessionId: 'sess-1',
-      session: { userId: 'user-1' },
-      sessions: [],
+      userId: 'user-1',
+      endedAt: null,
     });
     createCloudreveStorageMock.mockResolvedValue({
       upload: uploadMock,
@@ -256,35 +255,29 @@ describe('POST /api/chat-uploads', () => {
 
   it('conversation 归属其他用户 → 403', async () => {
     conversationFindUniqueMock.mockResolvedValueOnce({
-      sessionId: 'sess-2',
-      session: { userId: 'user-2' },
-      sessions: [],
+      userId: 'user-2',
+      endedAt: null,
     });
     const response = await POST(makeRequest());
     expect(response.status).toBe(403);
   });
 
-  it('纯 global conversation（无 sessionId 且无 ConversationSession）允许任意登录用户', async () => {
+  it('global conversation（userId 命中本人）允许上传', async () => {
     conversationFindUniqueMock.mockResolvedValueOnce({
-      sessionId: null,
-      session: null,
-      sessions: [],
+      userId: 'user-1',
+      endedAt: null,
     });
     const response = await POST(makeRequest());
     expect(response.status).toBe(200);
   });
 
-  it('多录音对话（ConversationSession 命中当前 user）允许', async () => {
+  it('无主孤儿对话（userId=null）→ 403（orphan 宽进已收紧）', async () => {
     conversationFindUniqueMock.mockResolvedValueOnce({
-      sessionId: null,
-      session: null,
-      sessions: [
-        { session: { userId: 'user-x' } },
-        { session: { userId: 'user-1' } },
-      ],
+      userId: null,
+      endedAt: null,
     });
     const response = await POST(makeRequest());
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(403);
   });
 
   it('文件超过 chat_files_max_upload_mb → 413', async () => {
@@ -356,9 +349,8 @@ describe('GET /api/chat-uploads?conversationId=...', () => {
       role: 'PRO',
     });
     conversationFindUniqueMock.mockResolvedValue({
-      sessionId: 'sess-1',
-      session: { userId: 'user-1' },
-      sessions: [],
+      userId: 'user-1',
+      endedAt: null,
     });
     chatAttachmentFindManyMock.mockResolvedValue([
       {
@@ -409,9 +401,8 @@ describe('GET /api/chat-uploads?conversationId=...', () => {
 
   it('conversation 归属他人 → 403', async () => {
     conversationFindUniqueMock.mockResolvedValueOnce({
-      sessionId: 'sess-2',
-      session: { userId: 'user-2' },
-      sessions: [],
+      userId: 'user-2',
+      endedAt: null,
     });
     const req = new Request(
       'http://localhost:3000/api/chat-uploads?conversationId=conv-2'

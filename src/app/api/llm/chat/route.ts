@@ -786,6 +786,27 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
     process.env.LLM_ACTIVE_PROVIDER ||
     'default';
 
+  // ── 长录音决策（与 global chat 一致）── 估算 transcript+history+input 总 token，
+  // 超 L1*80% 直接 forceMinLevel=6 走 RAG：长 transcript 此前在 L1 会因超预算反应式 retry
+  // 逐级升级、首条消息慢，直接跳到 L6 省掉中间的失败-重试。短 transcript 不受影响（仍 L1）。
+  const rawEstimate = estimateRawContextTokens(
+    parsed.transcript,
+    history,
+    parsed.question
+  );
+  const forceMinLevel: DegradationLevel | undefined =
+    rawEstimate > budget.inputBudget * 0.8 ? 6 : undefined;
+  if (forceMinLevel) {
+    chatLogger.info(
+      {
+        conversationId: conversation.id,
+        rawEstimate,
+        inputBudget: budget.inputBudget,
+      },
+      'legacy 单录音 chat 超 L1 80% 阈值，forceMinLevel=6（直接走 RAG，省反应式重试）'
+    );
+  }
+
   return streamChatResponse({
     conversationId: conversation.id,
     buildSystemPrompt,
@@ -805,6 +826,7 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
     finalDepth,
     userTranscriptOffset,
     ragRetriever,
+    forceMinLevel,
   });
 }
 
@@ -909,11 +931,16 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
   const totalTranscriptMs = cumulativeMs;
 
   const recordingIds = conversation.ownedSessions.map((s) => s.id);
+  // 内容签名 = 所有挂载录音的 segment 总数。挂载录音增长（如录制中的录音继续转写）时签名变化
+  // → 多录音 RAG 增量重建感知新内容；集合与各录音长度都不变才整体命中旧快照。
+  const ragContentSignature = combinedTranscript.length;
   const ragRetriever =
     recordingIds.length > 0
-      ? makeRagRetrieverForRecordings(recordingIds, async (rid) => {
-          return segmentsByRecording.get(rid) ?? [];
-        })
+      ? makeRagRetrieverForRecordings(
+          recordingIds,
+          async (rid) => segmentsByRecording.get(rid) ?? [],
+          ragContentSignature
+        )
       : undefined;
 
   // ── 持久化 user 消息（在 LLM 调用之前）──

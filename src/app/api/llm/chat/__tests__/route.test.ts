@@ -343,8 +343,45 @@ describe('POST /api/llm/chat (mode routing)', () => {
       expect(makeRagRetrieverForRecordingsMock).not.toHaveBeenCalled();
       // 不能调附件 loader（legacy 路径不读附件）
       expect(loadAttachmentsAsSystemBlocksMock).not.toHaveBeenCalled();
-      // 也不能调 estimateRawContextTokens（legacy 不做长录音决策）
-      expect(estimateRawContextTokensMock).not.toHaveBeenCalled();
+      // legacy 现在也做长录音决策（与 global 一致）：会调 estimateRawContextTokens；
+      // 小 transcript（默认 mock 返回 100 « budget*0.8）不强制 L6。
+      expect(estimateRawContextTokensMock).toHaveBeenCalled();
+      const builderArg = buildChatContextMock.mock.calls[0][0];
+      expect(builderArg.forceMinLevel).toBeUndefined();
+    });
+
+    it('长 transcript（超 80% budget）→ legacy 也 forceMinLevel=6（省反应式重试）', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-legacy-long',
+        userId: 'user-1',
+        sessionId: 'sess-long',
+        endedAt: null,
+        degradationLevel: 1,
+        session: { userId: 'user-1', targetLang: 'zh' },
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+      // 估算超 budget*0.8（80_000）→ 强制 L6
+      estimateRawContextTokensMock.mockReturnValue(90_000);
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-legacy-long',
+          question: 'hello',
+          transcript: [{ text: 'a very long transcript', startMs: 0 }],
+        },
+      });
+      const res = await POST(req, {} as never);
+      expect(res.status).toBe(200);
+      await consumeSseEvents(res);
+
+      // legacy 仍走单录音 retriever
+      expect(makeRagRetrieverForSessionMock).toHaveBeenCalledWith('sess-long');
+      // buildChatContext 收到 forceMinLevel=6
+      const builderArg = buildChatContextMock.mock.calls[0][0];
+      expect(builderArg.forceMinLevel).toBe(6);
     });
 
     it('当 conversation.userId !== user → 404', async () => {

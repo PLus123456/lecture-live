@@ -193,3 +193,34 @@ export async function retryJob(jobId: string): Promise<boolean> {
 
   return true;
 }
+
+// ─── 僵尸任务回收：PROCESSING 卡死超时标失败 ───
+// trackJob 在请求内执行、markJob* 是 fire-and-forget；进程被部署 / OOM kill 时，
+// 任务会永久卡在 PROCESSING（startedAt 已设、completedAt 始终为空），前端指示器一直转圈，
+// 且 retryJob 只能重试 FAILED。这里把超时的 PROCESSING 任务原子标为 FAILED，
+// 让状态机解锁、前端停转、并可被 retryJob 重试。
+// 阈值取足够大的值（默认 2 小时）：远大于任何单个任务的正常耗时（报告生成 / 对账 / 清理
+// 等最重的任务也在分钟级），避免误杀正在执行的任务（含 billing maintenance 自身）。
+export const STALE_PROCESSING_JOB_THRESHOLD_MS = 2 * 60 * 60_000;
+
+export async function reclaimStaleProcessingJobs(
+  now: Date = new Date(),
+  thresholdMs: number = STALE_PROCESSING_JOB_THRESHOLD_MS
+): Promise<number> {
+  const threshold = new Date(now.getTime() - thresholdMs);
+  const thresholdHours = Math.round(thresholdMs / 3_600_000);
+  // PROCESSING 必然已由 markJobProcessing 写过 startedAt（status 与 startedAt 同一次 update 落库），
+  // 故以 startedAt 为超时判据；条件原子更新，避免与正常的 markJobSuccess/Failed 竞争。
+  const result = await prisma.jobQueue.updateMany({
+    where: {
+      status: JOB_STATUS.PROCESSING,
+      startedAt: { lte: threshold },
+    },
+    data: {
+      status: JOB_STATUS.FAILED,
+      error: `自动回收：任务卡在 PROCESSING 超过 ${thresholdHours} 小时（疑似进程中断）`,
+      completedAt: now,
+    },
+  });
+  return result.count;
+}

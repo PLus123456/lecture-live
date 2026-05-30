@@ -59,6 +59,7 @@ export function useInterpret() {
   const recordingRef = useRef<{ recording: RecordingHandle; client: unknown } | null>(null);
   const processorRef = useRef<TokenProcessor | null>(null);
   const startTimeRef = useRef<number | null>(null);
+  const anchorIdRef = useRef<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const langARef = useRef('en');
   const langBRef = useRef('zh');
@@ -67,9 +68,10 @@ export function useInterpret() {
   const token = useAuthStore((s) => s.token);
 
   const deductQuota = useCallback(
-    async (durationMs: number) => {
+    async (durationMs: number, anchorId: string | null) => {
       const authToken = useAuthStore.getState().token;
-      if (!authToken || durationMs <= 0) return;
+      // 有服务端锚点时即使前端时长为 0 也要让服务端按墙钟结算；无锚点才依赖 durationMs
+      if (!authToken || (durationMs <= 0 && !anchorId)) return;
       try {
         const res = await fetch('/api/interpret/deduct', {
           method: 'POST',
@@ -77,7 +79,7 @@ export function useInterpret() {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${authToken}`,
           },
-          body: JSON.stringify({ durationMs, translationMode: 'soniox' }),
+          body: JSON.stringify({ durationMs, translationMode: 'soniox', anchorId }),
         });
         if (res.ok) {
           const data = (await res.json()) as { quotas?: Record<string, unknown> };
@@ -186,6 +188,26 @@ export function useInterpret() {
       });
       processorRef.current = processor;
 
+      // 建立服务端时长锚点（反作弊：deduct 以服务端墙钟为计费权威）。
+      // 失败不阻塞 interpret 启动，deduct 会降级信任前端时长。
+      anchorIdRef.current = null;
+      try {
+        const anchorRes = await fetch('/api/interpret/start', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({}),
+        });
+        if (anchorRes.ok) {
+          const anchorData = (await anchorRes.json()) as { anchorId?: string | null };
+          anchorIdRef.current = anchorData.anchorId ?? null;
+        }
+      } catch {
+        // 锚点是计费增强项，建立失败时静默降级
+      }
+
       // 计时器
       startTimeRef.current = Date.now();
       setElapsedMs(0);
@@ -280,9 +302,11 @@ export function useInterpret() {
     setPreviewLang(null);
     previewLangRef.current = null;
 
-    // 扣除配额
-    if (duration > 0) {
-      void deductQuota(duration);
+    // 扣除配额：带上服务端锚点 id，由服务端以墙钟为权威结算
+    const anchorId = anchorIdRef.current;
+    anchorIdRef.current = null;
+    if (duration > 0 || anchorId) {
+      void deductQuota(duration, anchorId);
     }
   }, [deductQuota]);
 

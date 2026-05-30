@@ -110,6 +110,17 @@ export async function POST(req: Request) {
     return rateLimited;
   }
 
+  // Content-Length 预检：读 body 前按声明长度挡掉超过硬上限的请求，避免把超大 body
+  // 整个缓冲进内存（OOM 面）。这里用绝对硬上限兜底（精确的 chat_files_max_upload_mb
+  // 校验在下方按配置进行）；multipart 开销给 1MB 余量避免误杀。
+  const declaredLength = Number(req.headers.get('content-length') ?? '');
+  if (Number.isFinite(declaredLength) && declaredLength > ABSOLUTE_MAX_BYTES + 1024 * 1024) {
+    return NextResponse.json(
+      { error: `File too large (max ${Math.floor(ABSOLUTE_MAX_BYTES / (1024 * 1024))} MB)` },
+      { status: 413 }
+    );
+  }
+
   // 解析 form data
   let formData: FormData;
   try {

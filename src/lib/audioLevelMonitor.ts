@@ -4,8 +4,9 @@
 export class AudioLevelMonitor {
   private analyser: AnalyserNode | null = null;
   private audioCtx: AudioContext | null = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private dataArray: any = null;
+  // 用 ArrayBuffer 显式参数化：getByteFrequencyData 的 lib.dom 签名要求 Uint8Array<ArrayBuffer>，
+  // 不接受默认推断出的 Uint8Array<ArrayBufferLike>（含 SharedArrayBuffer 的并集）。
+  private dataArray: Uint8Array<ArrayBuffer> | null = null;
   private animationId: number | null = null;
   private onLevel: (level: number) => void;
 

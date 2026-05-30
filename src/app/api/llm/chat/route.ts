@@ -550,9 +550,9 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
   try {
     const parsed = await parseRequest(req);
 
-    // 一次性把 conversation + messages + 关联 session/recordings/attachments 取出，避免后面分支再多次查询。
-    // attachments 这一层只查存不存在 + 数量（用于 ownership 决断 + 是否要走 attachments 注入），
-    // 实际下载在 chatAttachments.ts 里再做。
+    // 一次性把 conversation + messages + 关联 session/recordings 取出，避免后面分支再多次查询。
+    // 归属用 conversation.userId（include 会带回所有标量字段），不再查 attachments 来反推归属；
+    // 附件实际下载仍在 chatAttachments.ts 里按 conversationId 做。
     const conversation = await prisma.conversation.findUnique({
       where: { id: parsed.conversationId },
       include: {
@@ -582,9 +582,6 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
             },
           },
         },
-        attachments: {
-          select: { id: true, userId: true },
-        },
       },
     });
 
@@ -601,16 +598,19 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
       );
     }
 
+    // 统一归属：Conversation.userId 命中本人才放行。userId 为 NULL 的无主孤儿、或他人
+    // 对话一律 404（同时关闭此前的 orphan"宽进"与"含他人 session 即整体拒绝"的混合放行）。
+    if (conversation.userId !== payload.id) {
+      return NextResponse.json(
+        { error: 'Conversation not found' },
+        { status: 404 }
+      );
+    }
+
     const isLegacy = conversation.session !== null;
 
     if (isLegacy) {
       // ── 旧路径：单录音 chat ── 行为完全不变 ──
-      if (conversation.session!.userId !== payload.id) {
-        return NextResponse.json(
-          { error: 'Conversation not found' },
-          { status: 404 }
-        );
-      }
       return await handleSessionChat({
         parsed,
         conversation: {
@@ -625,28 +625,11 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
     }
 
     // ── 新路径：全局 chat（无 session 绑定）──
-    // ownership：至少有一条已挂的 ConversationSession.session 属于该用户，
-    // 或至少一条 ChatAttachment.userId 属于该用户。两者都没 → 视为 404。
+    // 归属已由 conversation.userId 校验通过。挂载录音在 attach 时已限定属于本人，
+    // 这里仍按 userId 过滤一遍做纵深防御（防历史脏数据混入他人 session）。
     const ownedSessions = conversation.sessions
       .map((cs) => cs.session)
       .filter((s) => s.userId === payload.id);
-    const ownsAttachment = conversation.attachments.some(
-      (a) => a.userId === payload.id
-    );
-    const orphan =
-      conversation.sessions.length === 0 &&
-      conversation.attachments.length === 0;
-
-    // 严格安全：sessions 或 attachments 至少有一组属于该 user；否则 ID 被猜到也无法读取。
-    if (!orphan && ownedSessions.length === 0 && !ownsAttachment) {
-      return NextResponse.json(
-        { error: 'Conversation not found' },
-        { status: 404 }
-      );
-    }
-    // 拒绝出现"挂了其他用户 sessions 但自己也挂了 attachment"的混合权限 ——
-    // 把跨用户 sessions 全部当作不存在处理，attachments 仍可用。
-    // ownedSessions 已经只包含自己的，下面照常用即可。
 
     return await handleGlobalChat({
       parsed,

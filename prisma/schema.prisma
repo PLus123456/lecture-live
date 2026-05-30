@@ -303,6 +303,11 @@ model Conversation {
   id          String                @id @default(cuid())
   sessionId   String?
   session     Session?              @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  // 对话归属用户。创建时由服务端写入（不再靠录音反推）。
+  // 可空仅为兼容历史"零录音纯 global 对话"（无任何反推材料的孤儿，回填后仍为 NULL）；
+  // 代码侧把 NULL 当"无主"——列表不显示、访问一律 404。新建对话恒带 userId，实质非空。
+  // 与 ChatAttachment.userId 同规约：纯冗余列，不建 relation（避免 User 反向关系膨胀）。
+  userId      String?
   title       String?                                  // AI 生成的对话标题（首条用户消息提取，可为空）
   startedAt   DateTime              @default(now())
   endedAt     DateTime?                                // null = 当前活跃；非 null = 已关闭，只读
@@ -313,6 +318,7 @@ model Conversation {
   sessions    ConversationSession[]
 
   @@index([sessionId, startedAt])
+  @@index([userId])
 }
 
 model ConversationSession {

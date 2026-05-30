@@ -54,53 +54,21 @@ describe('getConversationOwnership', () => {
     expect(result).toBeNull();
   });
 
-  it('legacy sessionId 属于用户 → isOwned=true', async () => {
-    findUniqueMock.mockResolvedValue({
-      id: 'c1',
-      sessionId: 's1',
-      session: { userId: 'u1' },
-      sessions: [],
-    });
+  it('userId 命中本人 → isOwned=true', async () => {
+    findUniqueMock.mockResolvedValue({ id: 'c1', userId: 'u1' });
     const result = await getConversationOwnership('c1', 'u1');
-    expect(result).toEqual({
-      conversationId: 'c1',
-      isOwned: true,
-      isFreshGlobal: false,
-    });
+    expect(result).toEqual({ conversationId: 'c1', isOwned: true });
   });
 
-  it('legacy sessionId 属于他人 + junction 命中 → isOwned=true', async () => {
-    findUniqueMock.mockResolvedValue({
-      id: 'c1',
-      sessionId: 's-foreign',
-      session: { userId: 'other' },
-      sessions: [{ session: { userId: 'u1' } }],
-    });
-    const result = await getConversationOwnership('c1', 'u1');
-    expect(result?.isOwned).toBe(true);
-  });
-
-  it('两侧均不属于用户 → isOwned=false', async () => {
-    findUniqueMock.mockResolvedValue({
-      id: 'c1',
-      sessionId: 's-foreign',
-      session: { userId: 'other' },
-      sessions: [{ session: { userId: 'other' } }],
-    });
+  it('userId 属于他人 → isOwned=false', async () => {
+    findUniqueMock.mockResolvedValue({ id: 'c1', userId: 'other' });
     const result = await getConversationOwnership('c1', 'u1');
     expect(result?.isOwned).toBe(false);
-    expect(result?.isFreshGlobal).toBe(false);
   });
 
-  it('sessionId=null & 0 junction → isFreshGlobal=true, isOwned=false', async () => {
-    findUniqueMock.mockResolvedValue({
-      id: 'c1',
-      sessionId: null,
-      session: null,
-      sessions: [],
-    });
+  it('userId 为 NULL（历史无主孤儿）→ isOwned=false', async () => {
+    findUniqueMock.mockResolvedValue({ id: 'c1', userId: null });
     const result = await getConversationOwnership('c1', 'u1');
-    expect(result?.isFreshGlobal).toBe(true);
     expect(result?.isOwned).toBe(false);
   });
 });
@@ -117,25 +85,22 @@ describe('assertConversationOwnership', () => {
     });
   });
 
-  it('未拥有 → 抛 forbidden', async () => {
-    findUniqueMock.mockResolvedValue({
-      id: 'c1',
-      sessionId: 's1',
-      session: { userId: 'other' },
-      sessions: [],
+  it('他人对话 → 抛 forbidden', async () => {
+    findUniqueMock.mockResolvedValue({ id: 'c1', userId: 'other' });
+    await expect(assertConversationOwnership('c1', 'u1')).rejects.toMatchObject({
+      kind: 'forbidden',
     });
+  });
+
+  it('userId 为 NULL 的无主孤儿 → 抛 forbidden', async () => {
+    findUniqueMock.mockResolvedValue({ id: 'c1', userId: null });
     await expect(assertConversationOwnership('c1', 'u1')).rejects.toMatchObject({
       kind: 'forbidden',
     });
   });
 
   it('拥有 → 正常返回', async () => {
-    findUniqueMock.mockResolvedValue({
-      id: 'c1',
-      sessionId: 's1',
-      session: { userId: 'u1' },
-      sessions: [],
-    });
+    findUniqueMock.mockResolvedValue({ id: 'c1', userId: 'u1' });
     const r = await assertConversationOwnership('c1', 'u1');
     expect(r.isOwned).toBe(true);
   });

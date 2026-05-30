@@ -80,6 +80,7 @@ function createSiteSettings(overrides: Partial<SiteSettings> = {}): SiteSettings
     chat_files_quota_free_mb: 100,
     chat_files_quota_pro_mb: 1024,
     chat_files_quota_admin_mb: 10240,
+  async_upload_billing_multiplier: 0.8,
     ...overrides,
   };
 }

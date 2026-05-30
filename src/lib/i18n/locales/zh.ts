@@ -814,6 +814,9 @@ export default {
     defaultTargetLangDesc: '翻译的默认语言',
     translationMode: '翻译模式',
     translationModeDesc: '选择翻译处理方式',
+    asyncUploadBillingMultiplier: '上传转录计费倍率',
+    asyncUploadBillingMultiplierDesc:
+      '文件上传转录按此倍率计费（实时转录为 1.0）。默认 0.8（打 8 折）；0 表示免费',
     sonioxCloud: 'Soniox 云端（低延迟）',
     localTransformers: '本地 Transformers.js（隐私优先）',
 

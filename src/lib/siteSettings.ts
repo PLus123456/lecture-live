@@ -49,6 +49,9 @@ export interface SiteSettings {
   chat_files_max_upload_mb: number;      // 单次上传大小硬上限（MB）
   chat_files_quota_free_mb: number;      // FREE 角色 storage_bytes 配额（MB）
   chat_files_quota_pro_mb: number;       // PRO 角色配额（MB）
+  // 异步文件上传转录计费倍率（批2）：实时转录全额(1.0)；上传转录按此倍率计费，
+  // 默认 0.8（8 折）。扣费与对账两侧共用此值，口径必须一致。范围 [0, 10]。
+  async_upload_billing_multiplier: number;
   chat_files_quota_admin_mb: number;     // ADMIN 角色配额（MB），相当于上限
 }
 
@@ -103,6 +106,7 @@ const DEFAULT_SITE_SETTINGS: SiteSettings = {
   chat_files_quota_free_mb: 100,
   chat_files_quota_pro_mb: 1024,
   chat_files_quota_admin_mb: 10240,
+  async_upload_billing_multiplier: 0.8,
 };
 
 let siteSettingsCache: SiteSettings | null = null;
@@ -122,6 +126,26 @@ function parseInteger(
   options?: { min?: number; max?: number }
 ): number {
   const parsed = Number.parseInt(value ?? '', 10);
+  if (!Number.isFinite(parsed)) return fallback;
+
+  if (options?.min !== undefined && parsed < options.min) {
+    return options.min;
+  }
+
+  if (options?.max !== undefined && parsed > options.max) {
+    return options.max;
+  }
+
+  return parsed;
+}
+
+/** 解析浮点配置（用于计费倍率等小数值）。NaN / 缺失回落 fallback，超界 clamp。 */
+function parseFloatSetting(
+  value: string | null | undefined,
+  fallback: number,
+  options?: { min?: number; max?: number }
+): number {
+  const parsed = Number.parseFloat(value ?? '');
   if (!Number.isFinite(parsed)) return fallback;
 
   if (options?.min !== undefined && parsed < options.min) {
@@ -294,6 +318,11 @@ function normalizeSiteSettings(raw: Record<string, string>): SiteSettings {
       DEFAULT_SITE_SETTINGS.chat_files_quota_admin_mb,
       { min: 0, max: 1_048_576 }
     ),
+    async_upload_billing_multiplier: parseFloatSetting(
+      raw.async_upload_billing_multiplier,
+      DEFAULT_SITE_SETTINGS.async_upload_billing_multiplier,
+      { min: 0, max: 10 }
+    ),
   };
 }
 
@@ -344,6 +373,7 @@ export function serializeSiteSettingsForAdmin(settings: SiteSettings) {
     chat_files_quota_free_mb: String(settings.chat_files_quota_free_mb),
     chat_files_quota_pro_mb: String(settings.chat_files_quota_pro_mb),
     chat_files_quota_admin_mb: String(settings.chat_files_quota_admin_mb),
+    async_upload_billing_multiplier: String(settings.async_upload_billing_multiplier),
   };
 }
 

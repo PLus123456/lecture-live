@@ -51,7 +51,8 @@ export async function POST(req: Request) {
     include: {
       session: { select: { userId: true, targetLang: true } },
       messages: {
-        orderBy: { createdAt: 'asc' },
+        // 按 seq 稳定排序（全局单调，替代 createdAt —— 避免同毫秒时间戳错乱影响切割点定位）
+        orderBy: { seq: 'asc' },
         select: {
           id: true,
           role: true,

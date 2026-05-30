@@ -345,9 +345,13 @@ model ConversationMessage {
   // token 用量（仅 assistant 消息）
   inputTokens      Int?
   outputTokens     Int?
+  // 全局单调自增序号 —— 稳定排序键，替代 createdAt 排序定位压缩切割点（同毫秒时间戳下
+  // user/assistant/system 顺序可能错乱）。全局自增即蕴含"对话内单调"；DB 赋值、写入点无需赋值。
+  // @unique 既满足 MySQL"自增列须为键"，又给 orderBy seq 提供索引。
+  seq              BigInt        @unique @default(autoincrement())
   createdAt        DateTime      @default(now())
 
-  @@index([conversationId, createdAt])
+  @@index([conversationId, seq])
 }
 
 // ─── Chat 附件（图片 / 文档 / 文本），持久化到 Cloudreve；每条与 Conversation 多对一 ───

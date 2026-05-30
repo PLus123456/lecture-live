@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef } from 'react';
 import {
   useChatStore,
   preferenceToFields,
+  EMPTY_CONVERSATION_RUNTIME,
   type ConversationMeta,
 } from '@/stores/chatStore';
 import { useAuthStore } from '@/stores/authStore';
@@ -72,17 +73,13 @@ function deriveBudgetFromModel(
 
 export function useChat(sessionId: string | null) {
   const {
-    isLoading,
     selectedModel,
     selectedThinkingPreference,
     availableModels,
     modelsLoaded,
     activeConversationId,
     conversations,
-    messages,
-    archivedMessages,
-    tokenUsage,
-    contextFull,
+    byConversation,
     setLoading,
     setSelectedModel,
     setSelectedThinkingPreference,
@@ -96,6 +93,14 @@ export function useChat(sessionId: string | null) {
     setContextFull,
     resetSession,
   } = useChatStore();
+
+  // 当前活跃对话的运行时切片 —— messages/isLoading/tokenUsage/contextFull/archived
+  // 全从这里派生（按 conversationId 隔离，不再读全局单例字段）。
+  const activeRuntime =
+    (activeConversationId && byConversation[activeConversationId]) ||
+    EMPTY_CONVERSATION_RUNTIME;
+  const { messages, archivedMessages, isLoading, tokenUsage, contextFull } =
+    activeRuntime;
 
   const token = useAuthStore((s) => s.token);
   const lastLoadedSessionRef = useRef<string | null>(null);
@@ -218,7 +223,7 @@ export function useChat(sessionId: string | null) {
           .filter((m) => m.role !== 'system')
           .map(toChatMessage);
 
-        setMessages(visible, archived);
+        setMessages(conversationId, visible, archived);
 
         // 用最后一条 assistant 消息的 inputTokens 作为已用量种子，
         // budget 由所选模型的 contextWindow 推导 —— 进入对话就显示真实数字。
@@ -231,7 +236,7 @@ export function useChat(sessionId: string | null) {
         );
         if (lastAssistant?.inputTokens != null || budget > 0) {
           const used = lastAssistant?.inputTokens ?? 0;
-          setTokenUsage({
+          setTokenUsage(conversationId, {
             used,
             budget,
             level: lastAssistant?.degradationLevel ?? 1,
@@ -264,6 +269,10 @@ export function useChat(sessionId: string | null) {
     ) => {
       if (!token || !activeConversationId || contextFull) return;
 
+      // 捕获本次发送绑定的 conversationId —— SSE 流的所有写入都打到这一片，
+      // 即使用户流式途中切到别的对话/录音，旧流也只写回已非活跃的切片。
+      const conversationId = activeConversationId;
+
       // 本地立即渲染：正文 + 图片缩略图（用 data URL 直接渲染为 markdown 图片，
       // 与服务端持久化口径一致 —— 服务端会把 data URL 换成磁盘 URL）
       const userMsg: ChatMessage = {
@@ -275,8 +284,8 @@ export function useChat(sessionId: string | null) {
             : question,
         timestamp: Date.now(),
       };
-      addMessage(userMsg);
-      setLoading(true);
+      addMessage(conversationId, userMsg);
+      setLoading(conversationId, true);
 
       // 前端预估 token 用量（小圈即时反馈）；budget 取所选模型 contextWindow
       const modelBudget = deriveBudgetFromModel(availableModels, selectedModel);
@@ -289,14 +298,14 @@ export function useChat(sessionId: string | null) {
         budget: tokenUsage?.budget || modelBudget,
         level: tokenUsage?.level ?? 1,
       });
-      setTokenUsage(preEstimate);
+      setTokenUsage(conversationId, preEstimate);
 
       // 占位 assistant 消息，流式增量直接打到它身上
       const assistantId = crypto.randomUUID();
       // 思考耗时：首个 thinking 增量 → 最后一个 thinking 增量之间的时长
       let thinkingFirstAt = 0;
       let thinkingLastAt = 0;
-      addMessage({
+      addMessage(conversationId, {
         id: assistantId,
         role: 'assistant',
         content: '',
@@ -344,7 +353,7 @@ export function useChat(sessionId: string | null) {
           const data = await res
             .json()
             .catch(() => ({}) as Record<string, unknown>);
-          updateMessage(assistantId, {
+          updateMessage(conversationId, assistantId, {
             content:
               (typeof data.error === 'string' && data.error) ||
               `Chat API returned ${res.status}`,
@@ -363,10 +372,10 @@ export function useChat(sessionId: string | null) {
             if (!thinkingFirstAt) thinkingFirstAt = now;
             thinkingLastAt = now;
             accumulatedThinking += String(payload.delta ?? '');
-            updateMessage(assistantId, { thinking: accumulatedThinking });
+            updateMessage(conversationId, assistantId, { thinking: accumulatedThinking });
           } else if (event === 'text') {
             accumulatedText += String(payload.delta ?? '');
-            updateMessage(assistantId, { content: accumulatedText });
+            updateMessage(conversationId, assistantId, { content: accumulatedText });
           } else if (event === 'done') {
             const budget =
               typeof payload.budget === 'number' && payload.budget > 0
@@ -376,7 +385,7 @@ export function useChat(sessionId: string | null) {
               typeof payload.inputTokens === 'number'
                 ? payload.inputTokens
                 : preEstimate.used;
-            updateMessage(assistantId, {
+            updateMessage(conversationId, assistantId, {
               streaming: false,
               model:
                 typeof payload.model === 'string' ? payload.model : undefined,
@@ -386,7 +395,7 @@ export function useChat(sessionId: string | null) {
                   ? thinkingLastAt - thinkingFirstAt
                   : undefined,
             });
-            setTokenUsage({
+            setTokenUsage(conversationId, {
               used: inputTokens,
               budget,
               level:
@@ -404,10 +413,10 @@ export function useChat(sessionId: string | null) {
           } else if (event === 'error') {
             sawError = true;
             if (payload.contextFull === true) {
-              setContextFull(true);
-              setTokenUsage({ ...preEstimate, level: 7 });
+              setContextFull(conversationId, true);
+              setTokenUsage(conversationId, { ...preEstimate, level: 7 });
             }
-            updateMessage(assistantId, {
+            updateMessage(conversationId, assistantId, {
               content:
                 accumulatedText ||
                 (typeof payload.error === 'string'
@@ -420,17 +429,17 @@ export function useChat(sessionId: string | null) {
 
         // 流意外结束但既无 done 也无 error → 收尾占位消息
         if (!sawError) {
-          updateMessage(assistantId, { streaming: false });
+          updateMessage(conversationId, assistantId, { streaming: false });
         }
       } catch (error) {
         // 流被 abort（切换 session/卸载）—— 静默收尾，不写错误气泡。
         if ((error as { name?: string })?.name === 'AbortError') return;
-        updateMessage(assistantId, {
+        updateMessage(conversationId, assistantId, {
           content: `Error: ${error instanceof Error ? error.message : 'Chat failed'}`,
           streaming: false,
         });
       } finally {
-        setLoading(false);
+        setLoading(conversationId, false);
       }
     },
     [
@@ -474,7 +483,7 @@ export function useChat(sessionId: string | null) {
       );
       setConversations([...updated, data.conversation]);
       setActiveConversation(data.conversation.id);
-      setMessages([], []);
+      setMessages(data.conversation.id, [], []);
     } catch (err) {
       console.error('Failed to create conversation:', err);
     }
@@ -548,6 +557,14 @@ export function useChat(sessionId: string | null) {
     [token, activeConversationId, loadConversationMessages]
   );
 
+  /* 暴露给 /keyword 等命令：注入当前活跃对话 id，对外保持旧 (message) 签名 */
+  const addMessageToActive = useCallback(
+    (message: ChatMessage) => {
+      if (activeConversationId) addMessage(activeConversationId, message);
+    },
+    [activeConversationId, addMessage]
+  );
+
   return {
     // state
     isLoading,
@@ -568,7 +585,7 @@ export function useChat(sessionId: string | null) {
     createNewConversation,
     switchConversation,
     compressActive,
-    addMessage, // 暴露给 /keyword 等命令保留旧用法
+    addMessage: addMessageToActive, // 暴露给 /keyword 等命令保留旧 (message) 用法
   };
 }
 

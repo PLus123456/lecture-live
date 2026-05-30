@@ -27,6 +27,7 @@ import { useAuthStore } from '@/stores/authStore';
 import {
   useChatStore,
   preferenceToFields,
+  EMPTY_CONVERSATION_RUNTIME,
   type ThinkingPreference,
 } from '@/stores/chatStore';
 import { toast } from '@/stores/toastStore';
@@ -423,14 +424,13 @@ export default function GlobalChat({
   const router = useRouter();
   const token = useAuthStore((s) => s.token);
 
-  // Zustand chat store — 复用模型选择 / 思考偏好 / token 用量
+  // Zustand chat store — 偏好/模型列表全局共享；运行时态按 conversationId 隔离
   const {
     selectedModel,
     selectedThinkingPreference,
     availableModels,
     modelsLoaded,
-    messages,
-    isLoading,
+    byConversation,
     setSelectedModel,
     setSelectedThinkingPreference,
     setAvailableModels,
@@ -439,10 +439,13 @@ export default function GlobalChat({
     addMessage,
     updateMessage,
     setLoading,
-    resetSession,
-    contextFull,
+    resetConversation,
     setContextFull,
   } = useChatStore();
+
+  // 本对话的运行时切片 —— messages/isLoading/contextFull 全从这里取（不再读全局单例）
+  const { messages, isLoading, contextFull } =
+    byConversation[conversationId] ?? EMPTY_CONVERSATION_RUNTIME;
 
   /* ── 局部 UI state ── */
   const [input, setInput] = useState('');
@@ -490,7 +493,8 @@ export default function GlobalChat({
      ────────────────────────────────────────────────────────────── */
   useEffect(() => {
     if (!token) return;
-    resetSession();
+    // 只重置本对话的切片（不动其它对话），再设为活跃。
+    resetConversation(conversationId);
     setActiveConversation(conversationId);
     setAttachments([]);
 
@@ -512,7 +516,7 @@ export default function GlobalChat({
             if (res.status === 404 || res.status === 403) {
               onAccessDenied?.();
             }
-            setMessages([], []);
+            setMessages(conversationId, [], []);
             return;
           }
           const data = (await res.json()) as {
@@ -532,11 +536,11 @@ export default function GlobalChat({
               content: m.content,
               timestamp: new Date(m.createdAt).getTime(),
             }));
-          setMessages(visible, []);
+          setMessages(conversationId, visible, []);
         } catch (err) {
           if ((err as { name?: string })?.name === 'AbortError') return;
           console.error('Failed to load conversation messages:', err);
-          setMessages([], []);
+          setMessages(conversationId, [], []);
         }
       })(),
       (async () => {
@@ -579,7 +583,8 @@ export default function GlobalChat({
 
     return () => {
       controller.abort();
-      // 切换对话/卸载时同时中止仍在进行的发送流，防止旧流写入已重置的全局 store。
+      // 切换对话/卸载时中止仍在进行的发送流（切片已按 conversationId 隔离，旧流即便
+      // 漏写也只落到自己那片不污染当前对话；abort 仍保留以省掉无谓的流式开销）。
       sendAbortRef.current?.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -826,13 +831,13 @@ export default function GlobalChat({
           : value,
       timestamp: Date.now(),
     };
-    addMessage(userMsg);
-    setLoading(true);
+    addMessage(conversationId, userMsg);
+    setLoading(conversationId, true);
 
     const assistantId = crypto.randomUUID();
     let thinkingFirstAt = 0;
     let thinkingLastAt = 0;
-    addMessage({
+    addMessage(conversationId, {
       id: assistantId,
       role: 'assistant',
       content: '',
@@ -891,7 +896,7 @@ export default function GlobalChat({
         const data = await res
           .json()
           .catch(() => ({}) as Record<string, unknown>);
-        updateMessage(assistantId, {
+        updateMessage(conversationId, assistantId, {
           content:
             (typeof data.error === 'string' && data.error) ||
             `Chat API returned ${res.status}`,
@@ -910,12 +915,12 @@ export default function GlobalChat({
           if (!thinkingFirstAt) thinkingFirstAt = now;
           thinkingLastAt = now;
           accumulatedThinking += String(payload.delta ?? '');
-          updateMessage(assistantId, { thinking: accumulatedThinking });
+          updateMessage(conversationId, assistantId, { thinking: accumulatedThinking });
         } else if (event === 'text') {
           accumulatedText += String(payload.delta ?? '');
-          updateMessage(assistantId, { content: accumulatedText });
+          updateMessage(conversationId, assistantId, { content: accumulatedText });
         } else if (event === 'done') {
-          updateMessage(assistantId, {
+          updateMessage(conversationId, assistantId, {
             streaming: false,
             model:
               typeof payload.model === 'string' ? payload.model : undefined,
@@ -928,8 +933,8 @@ export default function GlobalChat({
         } else if (event === 'error') {
           sawError = true;
           // 上下文已满（EOL）：置位标志，禁用输入并引导新建对话。
-          if (payload.contextFull === true) setContextFull(true);
-          updateMessage(assistantId, {
+          if (payload.contextFull === true) setContextFull(conversationId, true);
+          updateMessage(conversationId, assistantId, {
             content:
               accumulatedText ||
               (typeof payload.error === 'string'
@@ -941,17 +946,17 @@ export default function GlobalChat({
       });
 
       if (!sawError) {
-        updateMessage(assistantId, { streaming: false });
+        updateMessage(conversationId, assistantId, { streaming: false });
       }
     } catch (error) {
       // 流被 abort（切换对话/卸载）—— 静默收尾，不写错误气泡。
       if ((error as { name?: string })?.name === 'AbortError') return;
-      updateMessage(assistantId, {
+      updateMessage(conversationId, assistantId, {
         content: `Error: ${error instanceof Error ? error.message : 'Chat failed'}`,
         streaming: false,
       });
     } finally {
-      setLoading(false);
+      setLoading(conversationId, false);
     }
   };
 

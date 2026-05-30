@@ -24,6 +24,7 @@ import {
   normalizeRecordedAudioDuration,
 } from '@/lib/audio/recordingDuration';
 import { clampSessionDurationMs, getBillableMinutes } from '@/lib/billing';
+import { deductTranscriptionMinutes } from '@/lib/quota';
 import { callLLM, getProviderForPurpose } from '@/lib/llm/gateway';
 import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
 import { generateSessionReport, generateSessionTitle } from '@/lib/llm/reportManager';
@@ -303,12 +304,10 @@ export async function finalizeSession(
       });
 
       if (shouldDeduct) {
-        await tx.user.update({
-          where: { id: session.userId },
-          data: {
-            transcriptionMinutesUsed: { increment: billableMinutes },
-          },
-        });
+        // 走 deductTranscriptionMinutes（内含 ensureQuotaWindow 跨月度重置点窗口校正，
+        // 修正裸 increment 把分钟加到未重置旧窗口的隐性 drift）；传入 tx 使"扣减 ⟺
+        // status→COMPLETED"在同一事务原子提交（失败一起回滚，杜绝并发/重试双扣或漏扣）。
+        await deductTranscriptionMinutes(session.userId, billableMinutes, tx);
       }
 
       return updated;

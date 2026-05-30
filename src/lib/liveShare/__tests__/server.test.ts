@@ -216,6 +216,51 @@ describe('setupLiveShare', () => {
     });
   });
 
+  it('sync_snapshot 过滤非字符串翻译并截断超长翻译', async () => {
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    const longTranslation = 'x'.repeat(10_050);
+    broadcaster.emit('sync_snapshot', {
+      segments: [{ id: 'seg-1', text: 'Hello' }],
+      translations: {
+        'seg-1': longTranslation, // 超长 → 截断到 10000
+        'seg-2': 12345, // 非字符串 → 过滤
+        'seg-3': '正常翻译', // 合法 → 保留
+      },
+      summaryBlocks: [],
+      status: 'RECORDING',
+    });
+
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+
+    await onceSocketEvent(viewer, 'connect');
+    const viewerInitialStatePromise = onceSocketEvent<{
+      translations: Record<string, string>;
+    }>(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+
+    const state = await viewerInitialStatePromise;
+    expect(state.translations['seg-1']?.length).toBe(10_000);
+    expect(state.translations['seg-2']).toBeUndefined();
+    expect(state.translations['seg-3']).toBe('正常翻译');
+  });
+
   it('阻止 viewer 冒充 broadcaster 发布事件', async () => {
     const viewer = createClient(baseUrl, {
       transports: ['websocket'],

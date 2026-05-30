@@ -145,4 +145,31 @@ describe('TokenProcessor', () => {
       sourceLanguage: 'zh',
     });
   });
+
+  it('多个实例各自独立计数 segment id，互不串号', () => {
+    const segmentsA: TranscriptSegment[] = [];
+    const segmentsB: TranscriptSegment[] = [];
+    const processorA = new TokenProcessor({
+      onSegmentFinalized: (segment) => segmentsA.push(segment),
+    });
+    const processorB = new TokenProcessor({
+      onSegmentFinalized: (segment) => segmentsB.push(segment),
+    });
+
+    processorA.processTokens([
+      buildToken('你好', { is_final: true, start_ms: 0, end_ms: 300 }),
+    ]);
+    processorA.onEndpoint();
+
+    processorB.processTokens([
+      buildToken('世界', { is_final: true, start_ms: 0, end_ms: 300 }),
+    ]);
+    processorB.onEndpoint();
+
+    expect(segmentsA).toHaveLength(1);
+    expect(segmentsB).toHaveLength(1);
+    // 两个实例都应从 seg-1 起算；若仍是模块级全局变量，processorB 会串到 seg-2
+    expect(segmentsA[0]?.id).toBe('seg-1');
+    expect(segmentsB[0]?.id).toBe('seg-1');
+  });
 });

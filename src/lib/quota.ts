@@ -305,6 +305,44 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
   return results.filter((entry) => entry.driftMinutes !== 0);
 }
 
+/**
+ * 字节配额对账：用 ChatAttachment 的真实 SUM(bytes) 回写每个用户的 storageBytesUsed。
+ *
+ * 与转录对账（只记录差异、不自动修）不同，字节用量完全由 ChatAttachment 行决定、是确定性的，
+ * 因此这里直接回写自愈：删录音漏扣 / 上传中断漏扣 / 并发偏差等都会被校准。无附件的用户若残留
+ * 非零计数也会被清零。返回检查与修正的用户数。
+ */
+export async function reconcileStorageBytes(): Promise<{
+  checked: number;
+  corrected: number;
+}> {
+  const sums = await prisma.chatAttachment.groupBy({
+    by: ['userId'],
+    _sum: { bytes: true },
+  });
+  const sumByUser = new Map<string, bigint>();
+  for (const row of sums) {
+    sumByUser.set(row.userId, row._sum.bytes ?? BigInt(0));
+  }
+
+  const users = await prisma.user.findMany({
+    select: { id: true, storageBytesUsed: true },
+  });
+
+  let corrected = 0;
+  for (const user of users) {
+    const actual = sumByUser.get(user.id) ?? BigInt(0);
+    if (actual !== user.storageBytesUsed) {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { storageBytesUsed: actual },
+      });
+      corrected += 1;
+    }
+  }
+  return { checked: users.length, corrected };
+}
+
 export function isModelAllowed(
   user: { allowedModels: string; role: string },
   modelName: string
@@ -340,6 +378,38 @@ export async function addStorageBytes(
     select: QUOTA_USER_SELECT,
   });
   return toQuotaSnapshot(updated);
+}
+
+/**
+ * 原子预留字节配额（用于 chat 上传前的"先占额度"）。
+ *
+ * 与 addStorageBytes 的区别：这是**条件原子**扣减——只有当 `used + bytes <= limit`
+ * 时才真正写库并返回 true；否则不写库、返回 false。用一条 `UPDATE ... WHERE` 完成
+ * 校验+扣减，杜绝"先 checkQuota 再 addStorageBytes"之间的并发击穿（多个上传同时
+ * 通过非原子检查、叠加后超额）。
+ *
+ * ADMIN 视为无限：直接放行、不写库、返回 true。
+ * 调用方在后续步骤失败时应调用 releaseStorageBytes 回滚预留的额度。
+ */
+export async function reserveStorageBytes(
+  userId: string,
+  bytes: number
+): Promise<boolean> {
+  const user = await ensureQuotaWindow(userId);
+  if (!user) return false;
+  if (user.role === 'ADMIN') return true;
+
+  const normalized = normalizeNonNegativeAmount(bytes);
+  if (normalized <= 0) return true;
+
+  // 条件原子扣减：仅当扣减后不超过 limit 才更新。affectedRows=1 表示预留成功。
+  const affected = await prisma.$executeRaw`
+    UPDATE User
+    SET storageBytesUsed = storageBytesUsed + ${BigInt(normalized)}
+    WHERE id = ${userId}
+      AND storageBytesUsed + ${BigInt(normalized)} <= storageBytesLimit
+  `;
+  return affected === 1;
 }
 
 /**

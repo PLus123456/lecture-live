@@ -2,19 +2,27 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
   userFindUniqueMock,
+  userFindManyMock,
   userUpdateMock,
   executeRawMock,
+  chatAttachmentGroupByMock,
 } = vi.hoisted(() => ({
   userFindUniqueMock: vi.fn(),
+  userFindManyMock: vi.fn(),
   userUpdateMock: vi.fn(),
   executeRawMock: vi.fn(),
+  chatAttachmentGroupByMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
     user: {
       findUnique: userFindUniqueMock,
+      findMany: userFindManyMock,
       update: userUpdateMock,
+    },
+    chatAttachment: {
+      groupBy: chatAttachmentGroupByMock,
     },
     $executeRaw: executeRawMock,
   },
@@ -28,7 +36,12 @@ vi.mock('@/lib/billing', () => ({
     Math.max(0, limit - used),
 }));
 
-import { addStorageBytes, releaseStorageBytes } from '@/lib/quota';
+import {
+  addStorageBytes,
+  releaseStorageBytes,
+  reserveStorageBytes,
+  reconcileStorageBytes,
+} from '@/lib/quota';
 
 const futureReset = new Date('2099-01-01T00:00:00.000Z');
 
@@ -203,5 +216,116 @@ describe('releaseStorageBytes', () => {
 
     expect(snap).toBeNull();
     expect(executeRawMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('reserveStorageBytes', () => {
+  beforeEach(() => {
+    userFindUniqueMock.mockReset();
+    userUpdateMock.mockReset();
+    executeRawMock.mockReset();
+  });
+
+  it('正向：额度足够时条件原子扣减成功返回 true', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(freeUser());
+    executeRawMock.mockResolvedValueOnce(1); // affectedRows=1 → 预留成功
+
+    const ok = await reserveStorageBytes('user-free', 1000);
+
+    expect(ok).toBe(true);
+    expect(executeRawMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('配额不足：条件 UPDATE 影响 0 行 → 返回 false', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(freeUser({ storageBytesUsed: BigInt(104_857_500) }));
+    executeRawMock.mockResolvedValueOnce(0); // used+bytes > limit → 不更新
+
+    const ok = await reserveStorageBytes('user-free', 1000);
+
+    expect(ok).toBe(false);
+    expect(executeRawMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('边界：ADMIN 视为无限，不走 SQL 直接 true', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(adminUser());
+
+    const ok = await reserveStorageBytes('user-admin', 999);
+
+    expect(ok).toBe(true);
+    expect(executeRawMock).not.toHaveBeenCalled();
+  });
+
+  it('边界：bytes <= 0 直接 true 不写库', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(freeUser());
+
+    const ok = await reserveStorageBytes('user-free', 0);
+
+    expect(ok).toBe(true);
+    expect(executeRawMock).not.toHaveBeenCalled();
+  });
+
+  it('边界：用户不存在返回 false', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(null);
+
+    const ok = await reserveStorageBytes('missing', 100);
+
+    expect(ok).toBe(false);
+    expect(executeRawMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('reconcileStorageBytes', () => {
+  beforeEach(() => {
+    userFindManyMock.mockReset();
+    userUpdateMock.mockReset();
+    chatAttachmentGroupByMock.mockReset();
+  });
+
+  it('回写漂移：实际 SUM 与 storageBytesUsed 不一致时校正', async () => {
+    chatAttachmentGroupByMock.mockResolvedValueOnce([
+      { userId: 'u-a', _sum: { bytes: BigInt(500) } },
+    ]);
+    userFindManyMock.mockResolvedValueOnce([
+      { id: 'u-a', storageBytesUsed: BigInt(800) }, // 实际 500，记账 800 → 校正
+    ]);
+    userUpdateMock.mockResolvedValue(null);
+
+    const result = await reconcileStorageBytes();
+
+    expect(result).toEqual({ checked: 1, corrected: 1 });
+    expect(userUpdateMock).toHaveBeenCalledWith({
+      where: { id: 'u-a' },
+      data: { storageBytesUsed: BigInt(500) },
+    });
+  });
+
+  it('一致时不写库，corrected=0', async () => {
+    chatAttachmentGroupByMock.mockResolvedValueOnce([
+      { userId: 'u-a', _sum: { bytes: BigInt(500) } },
+    ]);
+    userFindManyMock.mockResolvedValueOnce([
+      { id: 'u-a', storageBytesUsed: BigInt(500) },
+    ]);
+
+    const result = await reconcileStorageBytes();
+
+    expect(result).toEqual({ checked: 1, corrected: 1 - 1 });
+    expect(userUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('无附件的用户若残留非零计数 → 清零', async () => {
+    chatAttachmentGroupByMock.mockResolvedValueOnce([]); // 没有任何附件
+    userFindManyMock.mockResolvedValueOnce([
+      { id: 'u-b', storageBytesUsed: BigInt(300) },
+    ]);
+    userUpdateMock.mockResolvedValue(null);
+
+    const result = await reconcileStorageBytes();
+
+    expect(result).toEqual({ checked: 1, corrected: 1 });
+    expect(userUpdateMock).toHaveBeenCalledWith({
+      where: { id: 'u-b' },
+      data: { storageBytesUsed: BigInt(0) },
+    });
   });
 });

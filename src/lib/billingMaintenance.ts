@@ -10,6 +10,7 @@ import {
 } from '@/lib/transcriptDraftPersistence';
 import {
   resetExpiredTranscriptionQuotas,
+  reconcileStorageBytes,
 } from '@/lib/quota';
 import { runTranscriptionUsageReconciliation } from '@/lib/reconciliation';
 import { finalizeSession } from '@/lib/sessionFinalization';
@@ -43,6 +44,7 @@ export interface BillingMaintenanceSummary {
   resetUsers: number;
   reclaimedSessions: number;
   reclaimedAsyncUploads: number;
+  storageBytesReconciled: number;
   reconciliationRunId: string | null;
   chatFilesCleanup: {
     agingDeleted: number;
@@ -195,10 +197,35 @@ export async function runBillingMaintenance(options?: {
     }
   }
 
+  // 字节配额对账（与转录对账同日触发：reconciliationRunId 非空即今天的每日窗口已开）。
+  // 放在 chat 文件清理之后，反映清理后的真实附件总量；回写自愈 storageBytesUsed。
+  let storageBytesReconciled = 0;
+  if (reconciliationRunId) {
+    const jobId = await createJob({
+      type: JOB_TYPE.RECONCILIATION,
+      triggeredBy: 'system',
+      params: { source, kind: 'storage_bytes' },
+    });
+    if (jobId) markJobProcessing(jobId);
+    try {
+      const result = await reconcileStorageBytes();
+      storageBytesReconciled = result.corrected;
+      if (jobId) markJobSuccess(jobId, result);
+    } catch (err) {
+      if (jobId) markJobFailed(jobId, err);
+      billingLogger.error(
+        { err: serializeError(err) },
+        'storage bytes reconciliation failed'
+      );
+      // 不 rethrow —— 其他维护任务结果仍要返回
+    }
+  }
+
   if (
     resetUsers > 0 ||
     reclaimedSessions > 0 ||
     reclaimedAsyncUploads > 0 ||
+    storageBytesReconciled > 0 ||
     reconciliationRunId ||
     (chatFilesCleanup &&
       (chatFilesCleanup.agingDeleted > 0 ||
@@ -211,6 +238,7 @@ export async function runBillingMaintenance(options?: {
         resetUsers,
         reclaimedSessions,
         reclaimedAsyncUploads,
+        storageBytesReconciled,
         reconciliationRunId,
         chatFilesCleanup,
       })
@@ -221,6 +249,7 @@ export async function runBillingMaintenance(options?: {
     resetUsers,
     reclaimedSessions,
     reclaimedAsyncUploads,
+    storageBytesReconciled,
     reconciliationRunId,
     chatFilesCleanup,
   };

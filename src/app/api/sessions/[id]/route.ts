@@ -8,6 +8,7 @@ import {
   invalidateShareLinksApiCache,
 } from '@/lib/apiResponseCache';
 import { jsonWithCache } from '@/lib/httpCache';
+import { releaseStorageBytes } from '@/lib/quota';
 import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { logAction } from '@/lib/auditLog';
 import {
@@ -223,12 +224,32 @@ export async function DELETE(
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
+  // 删 session 会级联删 Conversation(sessionId=id) 及其 ChatAttachment（schema onDelete: Cascade），
+  // 这些字节占用必须释放，否则配额只增不减、用户最终顶满无法再传。
+  // 注意：仅 legacy 单录音对话（Conversation.sessionId = 本 session）会被级联删；全局多录音对话
+  // 经 ConversationSession 联表挂载，删 session 只级联联表行、对话与其附件保留 —— 故这里只聚合并
+  // 释放 legacy 对话的附件字节，按 owner 分组（一般即当前用户）。
+  const releasableBytes = await prisma.chatAttachment.groupBy({
+    by: ['userId'],
+    where: { conversation: { sessionId: id } },
+    _sum: { bytes: true },
+  });
+
   // 先删除关联表记录（FolderSession / ShareLink），再删除 session
   await prisma.$transaction([
     prisma.folderSession.deleteMany({ where: { sessionId: id } }),
     prisma.shareLink.deleteMany({ where: { sessionId: id } }),
     prisma.session.delete({ where: { id: id } }),
   ]);
+
+  // session 删除成功后释放字节配额（best-effort；失败留给字节对账兜底）
+  for (const row of releasableBytes) {
+    const bytes = row._sum.bytes;
+    if (bytes && bytes > BigInt(0)) {
+      await releaseStorageBytes(row.userId, Number(bytes)).catch(() => undefined);
+    }
+  }
+
   await Promise.all([
     invalidateSessionsApiCache(user.id),
     invalidateFoldersApiCache(user.id),

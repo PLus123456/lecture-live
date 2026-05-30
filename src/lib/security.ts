@@ -1,10 +1,13 @@
 import path from 'path';
 import { sanitizeFileNamePart } from '@/lib/fileNames';
 
+// 必须与 src/lib/storage/cloudreve.ts 的 STORAGE_CATEGORIES 保持一致（两处各有派生类型，
+// 暂不合并以免牵动 cloudreve 的 SessionArtifactCategory 等；改动任一处都要同步另一处）。
 export const STORAGE_CATEGORIES = [
   'recordings',
   'transcripts',
   'summaries',
+  'reports',
   'chat-uploads',
 ] as const;
 

@@ -47,7 +47,9 @@ describe('security helpers', () => {
 
   it('校验存储分类与资源归属', () => {
     expect(parseStorageCategory('recordings')).toBe('recordings');
-    expect(() => parseStorageCategory('reports')).toThrow('Invalid storage category');
+    // 'reports' 现已是合法存储类别（与 cloudreve.ts 白名单对齐后补入）
+    expect(parseStorageCategory('reports')).toBe('reports');
+    expect(() => parseStorageCategory('not-a-category')).toThrow('Invalid storage category');
     expect(() => assertOwnership('user-a', 'user-b')).toThrow('Access denied');
   });
 });

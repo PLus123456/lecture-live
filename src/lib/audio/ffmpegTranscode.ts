@@ -27,6 +27,16 @@ export interface TranscodeOptions {
   durationSec?: number;
   /** 默认 128。speech 用 96 足够，128 安全冗余 */
   bitrateKbps?: number;
+  /**
+   * 空转超时（ms），默认 5 分钟。ffmpeg `-progress pipe:2` 正常每秒输出一行，
+   * 超过该时长无任何 stderr 输出即视为卡死 → SIGKILL。坏文件常表现为长期无输出。
+   */
+  idleTimeoutMs?: number;
+  /**
+   * 绝对硬上限（ms），默认 2 小时。兜底"持续输出但永不收尾"的异常（空转超时抓不到）。
+   * 正常 128k mono 转码远快于实时，300 分钟上限的文件也应在数十分钟内完成。
+   */
+  maxTimeoutMs?: number;
 }
 
 export interface TranscodeResult {
@@ -91,13 +101,38 @@ export async function transcodeToMp3(opts: TranscodeOptions): Promise<TranscodeR
   // 估算 duration：优先用调用方传的，否则现 probe 一下
   const durationSec = opts.durationSec ?? (await probeDurationSec(opts.inputPath));
 
+  const idleTimeoutMs = opts.idleTimeoutMs ?? 5 * 60_000;
+  const maxTimeoutMs = opts.maxTimeoutMs ?? 2 * 60 * 60_000;
+
   return new Promise((resolve, reject) => {
     const proc = spawn(FFMPEG_BIN, args);
 
     let stderrBuf = '';
     let lastReportedFraction = 0;
 
+    // ── 超时看门狗：空转（无输出）+ 绝对硬上限，命中即 SIGKILL ──
+    let killedReason: 'idle' | 'max' | null = null;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        killedReason = 'idle';
+        proc.kill('SIGKILL');
+      }, idleTimeoutMs);
+    };
+    const hardTimer = setTimeout(() => {
+      killedReason = 'max';
+      proc.kill('SIGKILL');
+    }, maxTimeoutMs);
+    const clearTimers = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      clearTimeout(hardTimer);
+    };
+    resetIdleTimer();
+
     proc.stderr.on('data', (chunk: Buffer) => {
+      // 任何 stderr 输出都算"有进展"，重置空转计时器（无 duration 时也能续命）
+      resetIdleTimer();
       const text = chunk.toString();
       stderrBuf += text;
       // 只保留尾部，避免无限增长（错误信息一般在末尾）
@@ -121,10 +156,24 @@ export async function transcodeToMp3(opts: TranscodeOptions): Promise<TranscodeR
     });
 
     proc.on('error', (err) => {
+      clearTimers();
       reject(new Error(`ffmpeg spawn failed: ${err.message}`));
     });
 
     proc.on('close', async (code) => {
+      clearTimers();
+
+      // 被超时看门狗 SIGKILL：给出明确的超时原因，便于上层标失败而非误判"退出码异常"
+      if (killedReason) {
+        const detail =
+          killedReason === 'idle'
+            ? `no output for ${Math.round(idleTimeoutMs / 1000)}s`
+            : `exceeded ${Math.round(maxTimeoutMs / 60_000)}min hard limit`;
+        logger.error({ sessionTimeout: killedReason }, `ffmpeg killed by timeout: ${detail}`);
+        reject(new Error(`ffmpeg timed out (${detail})`));
+        return;
+      }
+
       if (code !== 0) {
         // 摘出最后一段错误（ffmpeg 错误信息通常在 stderr 尾部）
         const errTail = stderrBuf.split('\n').slice(-10).join('\n').trim();

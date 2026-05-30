@@ -61,6 +61,19 @@ export async function POST(
     );
   }
 
+  // 原子 claim：uploading_chunks → transcoding，只有抢到的那次才真正启动后台 pipeline。
+  // 上面的状态检查与这里之间存在 TOCTOU 窗口，两个并发 finalize 都可能通过检查；
+  // 用 updateMany 的条件更新把"启动权"收敛到一次，避免重复转码 / 重复上传 Soniox /
+  // 重复扣 Soniox 配额。processor 首步的 setStatus('transcoding') 对此幂等。
+  const claimed = await prisma.session.updateMany({
+    where: { id: session.id, asyncTranscribeStatus: 'uploading_chunks' },
+    data: { asyncTranscribeStatus: 'transcoding', asyncTranscribeStartedAt: new Date() },
+  });
+  if (claimed.count !== 1) {
+    // 另一个并发请求已抢先启动 —— 幂等返回，不再重复启动
+    return NextResponse.json({ success: true, status: 'already_processing' });
+  }
+
   // Kick off background processing —— 不 await，立即返回。
   startAsyncUploadProcessing({ sessionId: session.id });
 

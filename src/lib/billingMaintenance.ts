@@ -1,7 +1,7 @@
 import { prisma } from '@/lib/prisma';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
-import { trackJob, createJob, markJobProcessing, markJobSuccess, markJobFailed, JOB_TYPE } from '@/lib/jobQueue';
+import { trackJob, createJob, markJobProcessing, markJobSuccess, markJobFailed, JOB_TYPE, reclaimStaleProcessingJobs } from '@/lib/jobQueue';
 import {
   loadRecordingDraftManifest,
 } from '@/lib/recordingDraftPersistence';
@@ -44,6 +44,7 @@ export interface BillingMaintenanceSummary {
   resetUsers: number;
   reclaimedSessions: number;
   reclaimedAsyncUploads: number;
+  reclaimedStaleJobs: number;
   storageBytesReconciled: number;
   reconciliationRunId: string | null;
   chatFilesCleanup: {
@@ -166,6 +167,19 @@ export async function runBillingMaintenance(options?: {
     }
   }
 
+  // 僵尸任务回收：把卡在 PROCESSING 超时的 JobQueue 记录标失败（解锁前端指示器、可被 retryJob 重试）。
+  // 不为本步骤单独建 job —— 它是对 job 表自身的清道夫，建 job 反而引入"清道夫卡住谁来清"的递归。
+  let reclaimedStaleJobs = 0;
+  try {
+    reclaimedStaleJobs = await reclaimStaleProcessingJobs(now);
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'stale processing job reclaim failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
   // 每日对账
   const reconciliationRunId = await maybeRunDailyReconciliation(now);
 
@@ -225,6 +239,7 @@ export async function runBillingMaintenance(options?: {
     resetUsers > 0 ||
     reclaimedSessions > 0 ||
     reclaimedAsyncUploads > 0 ||
+    reclaimedStaleJobs > 0 ||
     storageBytesReconciled > 0 ||
     reconciliationRunId ||
     (chatFilesCleanup &&
@@ -238,6 +253,7 @@ export async function runBillingMaintenance(options?: {
         resetUsers,
         reclaimedSessions,
         reclaimedAsyncUploads,
+        reclaimedStaleJobs,
         storageBytesReconciled,
         reconciliationRunId,
         chatFilesCleanup,
@@ -249,6 +265,7 @@ export async function runBillingMaintenance(options?: {
     resetUsers,
     reclaimedSessions,
     reclaimedAsyncUploads,
+    reclaimedStaleJobs,
     storageBytesReconciled,
     reconciliationRunId,
     chatFilesCleanup,

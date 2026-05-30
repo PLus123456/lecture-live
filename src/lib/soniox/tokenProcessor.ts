@@ -12,8 +12,6 @@ import type {
   TranscriptSegment,
 } from '@/types/transcript';
 
-let segmentCounter = 0;
-
 function formatTimestamp(ms: number): string {
   const totalSeconds = Math.floor(ms / 1000);
   const hours = Math.floor(totalSeconds / 3600);
@@ -66,6 +64,9 @@ export class TokenProcessor {
 
   private targetLang = '';
   private maxSegmentChars = 0;
+  // segment id 自增计数器：用实例字段而非模块级全局，避免多个 TokenProcessor
+  // 并发（录音 / 同传 / 文件转录）时共享同一计数器导致 segment id 串号、碰撞
+  private segmentCounter = 0;
 
   private static SENTENCE_END_RE = /[.!?。！？；]\s*$/;
   private static readonly TRANSLATION_MATCH_TOLERANCE_MS = 250;
@@ -629,9 +630,9 @@ export class TokenProcessor {
     const speaker =
       segmentTokens.find((token) => token.speaker)?.speaker ?? '';
 
-    segmentCounter++;
+    this.segmentCounter++;
     const segment: TranscriptSegment = {
-      id: `seg-${segmentCounter}`,
+      id: `seg-${this.segmentCounter}`,
       sessionIndex: currentSession.index,
       speaker,
       language: dominantLanguage,
@@ -720,7 +721,7 @@ export class TokenProcessor {
   }
 
   setSegmentCounterOffset(offset: number) {
-    segmentCounter = offset;
+    this.segmentCounter = offset;
   }
 
   reset() {
@@ -732,7 +733,7 @@ export class TokenProcessor {
     this.pendingTranslationTokens = [];
     this.clearCurrentPreviewTranslation();
     this.currentSessionIndex = 0;
-    segmentCounter = 0;
+    this.segmentCounter = 0;
     this.startNewSession(0);
     this.onPreviewUpdate?.(EMPTY_STREAMING_PREVIEW_TEXT);
     this.onPreviewTranslationUpdate?.(EMPTY_STREAMING_PREVIEW_TRANSLATION);

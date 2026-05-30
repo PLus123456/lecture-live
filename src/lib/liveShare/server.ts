@@ -59,6 +59,37 @@ interface ViewerJoinPayload {
 
 const snapshots = new Map<string, LiveSnapshot>();
 
+// sync_snapshot / broadcast 快照体量上限：防止主播端（已认证，但可能因 bug 或滥用）
+// 推超大 snapshot 长期驻留服务端内存。maxHttpBufferSize(100KB) 已是消息体硬上限，
+// 这里是防御纵深 + 类型校验——超限截断（而非拒连），正常课堂远达不到此量级。
+const MAX_SNAPSHOT_SEGMENTS = 10_000;
+const MAX_SNAPSHOT_SUMMARY_BLOCKS = 10_000;
+const MAX_SNAPSHOT_TRANSLATIONS = 10_000;
+const MAX_TRANSLATION_LENGTH = 10_000;
+
+// 截断超量数组，保护服务端内存（非数组归一为空数组）
+function clampArray(input: unknown, max: number): unknown[] {
+  if (!Array.isArray(input)) return [];
+  return input.length > max ? input.slice(0, max) : input;
+}
+
+// 清洗 sync_snapshot 的 translations：仅接受 string 值，单条长度封顶 + 条目数封顶
+function sanitizeSnapshotTranslations(input: unknown): Record<string, string> {
+  if (!input || typeof input !== 'object') return {};
+  const out: Record<string, string> = {};
+  let count = 0;
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (count >= MAX_SNAPSHOT_TRANSLATIONS) break;
+    if (typeof value !== 'string') continue;
+    out[key] =
+      value.length > MAX_TRANSLATION_LENGTH
+        ? value.slice(0, MAX_TRANSLATION_LENGTH)
+        : value;
+    count += 1;
+  }
+  return out;
+}
+
 function getRoomId(sessionId: string) {
   return `live:${sessionId}`;
 }
@@ -207,7 +238,6 @@ function mergeEventIntoSnapshot(
         typeof (event.payload as { segmentId?: string }).segmentId === 'string' &&
         typeof (event.payload as { translation?: string }).translation === 'string'
       ) {
-        const MAX_TRANSLATION_LENGTH = 10_000;
         const payload = event.payload as {
           segmentId: string;
           translation: string;
@@ -431,15 +461,40 @@ export function setupLiveShare(io: SocketIO) {
         translationMode?: string;
       };
 
+      const rawSegmentCount = Array.isArray(payload.segments)
+        ? payload.segments.length
+        : 0;
+      const rawSummaryCount = Array.isArray(payload.summaryBlocks)
+        ? payload.summaryBlocks.length
+        : 0;
+      const rawTranslationCount =
+        payload.translations && typeof payload.translations === 'object'
+          ? Object.keys(payload.translations).length
+          : 0;
+      if (
+        rawSegmentCount > MAX_SNAPSHOT_SEGMENTS ||
+        rawSummaryCount > MAX_SNAPSHOT_SUMMARY_BLOCKS ||
+        rawTranslationCount > MAX_SNAPSHOT_TRANSLATIONS
+      ) {
+        liveShareLogger.warn(
+          {
+            socketId: socket.id,
+            sessionId,
+            rawSegmentCount,
+            rawSummaryCount,
+            rawTranslationCount,
+          },
+          'sync_snapshot exceeded size limits; snapshot truncated'
+        );
+      }
+
       const nextSnapshot: LiveSnapshot = {
-        segments: Array.isArray(payload.segments) ? payload.segments : [],
-        translations:
-          payload.translations && typeof payload.translations === 'object'
-            ? payload.translations
-            : {},
-        summaryBlocks: Array.isArray(payload.summaryBlocks)
-          ? payload.summaryBlocks
-          : [],
+        segments: clampArray(payload.segments, MAX_SNAPSHOT_SEGMENTS),
+        translations: sanitizeSnapshotTranslations(payload.translations),
+        summaryBlocks: clampArray(
+          payload.summaryBlocks,
+          MAX_SNAPSHOT_SUMMARY_BLOCKS
+        ),
         status: typeof payload.status === 'string' ? payload.status : null,
         previewText: ext.previewText
           ? normalizePreviewText(ext.previewText)

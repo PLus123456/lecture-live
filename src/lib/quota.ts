@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import {
   getBillableMinutes,
@@ -5,6 +6,13 @@ import {
   getQuotaCycleStartAt,
   getRemainingTranscriptionMinutes,
 } from '@/lib/billing';
+
+/**
+ * 可选 Prisma 客户端：默认用全局 `prisma`；调用方可传入事务客户端（`$transaction`
+ * 的 tx），让配额窗口校验 + 扣减与外层事务在同一事务里原子提交。
+ * PrismaClient 是 TransactionClient 的超集，故 `= prisma` 默认值类型相容。
+ */
+type QuotaDbClient = Prisma.TransactionClient;
 
 type QuotaCheckType = 'transcription_minutes' | 'storage_hours' | 'storage_bytes';
 
@@ -95,9 +103,10 @@ const QUOTA_USER_SELECT = {
 
 async function ensureQuotaWindow(
   userId: string,
-  now = new Date()
+  now = new Date(),
+  db: QuotaDbClient = prisma
 ): Promise<QuotaUserRecord | null> {
-  const user = await prisma.user.findUnique({
+  const user = await db.user.findUnique({
     where: { id: userId },
     select: QUOTA_USER_SELECT,
   });
@@ -108,7 +117,7 @@ async function ensureQuotaWindow(
 
   // 首次：初始化配额窗口
   if (user.quotaResetAt == null) {
-    return prisma.user.update({
+    return db.user.update({
       where: { id: userId },
       data: {
         quotaResetAt: getNextQuotaResetAt(now),
@@ -123,7 +132,7 @@ async function ensureQuotaWindow(
   }
 
   // 已过期：用乐观锁重置，防止并发请求同时重置清零刚扣的配额
-  const resetResult = await prisma.user.updateMany({
+  const resetResult = await db.user.updateMany({
     where: {
       id: userId,
       quotaResetAt: { lte: now },
@@ -136,14 +145,14 @@ async function ensureQuotaWindow(
 
   if (resetResult.count === 0) {
     // 另一个请求已经完成了重置，重新读取最新值
-    return prisma.user.findUnique({
+    return db.user.findUnique({
       where: { id: userId },
       select: QUOTA_USER_SELECT,
     });
   }
 
   // 重置成功，返回最新值
-  return prisma.user.findUnique({
+  return db.user.findUnique({
     where: { id: userId },
     select: QUOTA_USER_SELECT,
   });
@@ -181,11 +190,21 @@ export async function checkQuota(
   }
 }
 
+/**
+ * 扣减转录分钟（finalize / 异步上传 / interpret 共用）。
+ *
+ * 内部先 `ensureQuotaWindow` 做跨月度重置点的窗口校正，再 increment —— 保证扣减
+ * 总是落在正确的当月窗口（裸 increment 会在跨月时把分钟加到未重置的旧窗口，造成隐性 drift）。
+ *
+ * @param db 可选事务客户端。实时 finalize 传入 `$transaction` 的 tx，使"扣减 ⟺ session
+ *   置 COMPLETED"在同一事务原子提交（失败一起回滚，杜绝并发/重试双扣或漏扣）。
+ */
 export async function deductTranscriptionMinutes(
   userId: string,
-  minutes: number
+  minutes: number,
+  db: QuotaDbClient = prisma
 ): Promise<UserQuotaSnapshot | null> {
-  const user = await ensureQuotaWindow(userId);
+  const user = await ensureQuotaWindow(userId, new Date(), db);
   if (!user) {
     return null;
   }
@@ -200,7 +219,7 @@ export async function deductTranscriptionMinutes(
     return toQuotaSnapshot(user);
   }
 
-  const updated = await prisma.user.update({
+  const updated = await db.user.update({
     where: { id: userId },
     data: {
       transcriptionMinutesUsed: {

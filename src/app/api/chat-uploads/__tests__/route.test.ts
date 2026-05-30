@@ -6,8 +6,8 @@ import {
 
 const {
   verifyAuthMock,
-  checkQuotaMock,
-  addStorageBytesMock,
+  reserveStorageBytesMock,
+  releaseStorageBytesMock,
   enforceApiRateLimitMock,
   getSiteSettingsMock,
   uploadMock,
@@ -20,8 +20,8 @@ const {
   isExtractableMimeMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
-  checkQuotaMock: vi.fn(),
-  addStorageBytesMock: vi.fn(),
+  reserveStorageBytesMock: vi.fn(),
+  releaseStorageBytesMock: vi.fn(),
   enforceApiRateLimitMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
   uploadMock: vi.fn(),
@@ -39,8 +39,8 @@ vi.mock('@/lib/auth', () => ({
 }));
 
 vi.mock('@/lib/quota', () => ({
-  checkQuota: checkQuotaMock,
-  addStorageBytes: addStorageBytesMock,
+  reserveStorageBytes: reserveStorageBytesMock,
+  releaseStorageBytes: releaseStorageBytesMock,
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -100,8 +100,8 @@ describe('POST /api/chat-uploads', () => {
       email: 'alice@example.com',
       role: 'PRO',
     });
-    checkQuotaMock.mockResolvedValue(true);
-    addStorageBytesMock.mockResolvedValue(null);
+    reserveStorageBytesMock.mockResolvedValue(true);
+    releaseStorageBytesMock.mockResolvedValue(null);
     enforceApiRateLimitMock.mockResolvedValue(null);
     getSiteSettingsMock.mockResolvedValue({ chat_files_max_upload_mb: 100 });
     // 默认 conversation 归属当前用户（session-bound）
@@ -185,8 +185,8 @@ describe('POST /api/chat-uploads', () => {
     expect(createArgs.data.fileName).toBe('notes.txt');
     expect(createArgs.data.extractedTextPath).toBeTruthy();
 
-    // 扣配额（bytes 等于 file.size = 'hello world'.length = 11）
-    expect(addStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
+    // 预留配额（bytes 等于 file.size = 'hello world'.length = 11）
+    expect(reserveStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
   });
 
   it('upload image/png → kind=image，不调用 extractTextFromBuffer', async () => {
@@ -302,11 +302,20 @@ describe('POST /api/chat-uploads', () => {
     expect(uploadMock).not.toHaveBeenCalled();
   });
 
-  it('配额超限 → 403', async () => {
-    checkQuotaMock.mockResolvedValueOnce(false);
+  it('配额超限（reserveStorageBytes 返回 false）→ 403，不上传', async () => {
+    reserveStorageBytesMock.mockResolvedValueOnce(false);
     const response = await POST(makeRequest());
     expect(response.status).toBe(403);
     expect(uploadMock).not.toHaveBeenCalled();
+  });
+
+  it('预留成功但写 ChatAttachment 失败 → 500，且回滚已预留的字节配额', async () => {
+    chatAttachmentCreateMock.mockRejectedValueOnce(new Error('db down'));
+    const response = await POST(makeRequest());
+    expect(response.status).toBe(500);
+    // 先预留、后回滚，bytes 一致（'hello world' = 11）
+    expect(reserveStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
+    expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
   });
 
   it('未知 MIME → 415', async () => {

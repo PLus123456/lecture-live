@@ -9,6 +9,8 @@ const {
   shareLinkDeleteManyMock,
   sessionDeleteMock,
   transactionMock,
+  chatAttachmentGroupByMock,
+  releaseStorageBytesMock,
   loadSessionAudioArtifactMock,
   loadSessionTranscriptBundleMock,
 } = vi.hoisted(() => ({
@@ -19,6 +21,8 @@ const {
   shareLinkDeleteManyMock: vi.fn(),
   sessionDeleteMock: vi.fn(),
   transactionMock: vi.fn(),
+  chatAttachmentGroupByMock: vi.fn(),
+  releaseStorageBytesMock: vi.fn(),
   loadSessionAudioArtifactMock: vi.fn(),
   loadSessionTranscriptBundleMock: vi.fn(),
 }));
@@ -40,8 +44,16 @@ vi.mock('@/lib/prisma', () => ({
     shareLink: {
       deleteMany: shareLinkDeleteManyMock,
     },
+    // 删 session 时聚合 legacy 对话附件字节以释放配额；默认无附件
+    chatAttachment: {
+      groupBy: chatAttachmentGroupByMock,
+    },
     $transaction: transactionMock,
   },
+}));
+
+vi.mock('@/lib/quota', () => ({
+  releaseStorageBytes: releaseStorageBytesMock,
 }));
 
 vi.mock('@/lib/sessionPersistence', () => ({
@@ -71,6 +83,8 @@ describe('session detail route', () => {
     folderSessionDeleteManyMock.mockResolvedValue({ count: 1 });
     shareLinkDeleteManyMock.mockResolvedValue({ count: 1 });
     sessionDeleteMock.mockResolvedValue({ id: 'session-1' });
+    chatAttachmentGroupByMock.mockResolvedValue([]);
+    releaseStorageBytesMock.mockResolvedValue(null);
     transactionMock.mockImplementation(async (operations: unknown[]) => Promise.all(operations));
   });
 

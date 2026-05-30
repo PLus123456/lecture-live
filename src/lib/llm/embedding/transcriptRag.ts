@@ -26,6 +26,11 @@ interface SegmentChunk {
 interface RagState {
   /** transcript 总 segment 数（变化时增量补 embed） */
   lastSegmentCount: number;
+  /**
+   * 多录音模式：调用方传入的内容签名（各录音 segment 总数之和）。变化即说明某录音
+   * 增长/变动 → 触发增量重建。undefined = 调用方未提供（旧行为：集合不变即整体命中）。
+   */
+  contentSignature?: number;
   chunks: SegmentChunk[];
   vectors: number[][];
   lastUsedAt: number;
@@ -363,8 +368,13 @@ export function makeRagRetrieverForSession(sessionId: string) {
  * 缓存：
  *  - key = `multi:${sortedRecordingIds.join('|')}`，与单录音 `sessionCache` 共用同一个
  *    Map，但 multi 前缀绝不会与单录音 sessionId 冲突；
- *  - 命中时若 recordingIds 集合未变 → 复用 vectors；
+ *  - 命中时按 `contentSignature`（调用方传入的各录音 segment 总数）判断是否增量重建：
+ *    签名变 → 重载 + 重切 + 只补 embed 新增/变动 chunk（复用未变 chunk 旧向量）；
+ *    签名未变（或未传） → 复用 vectors，不重载（loadTranscript 不被调用）；
  *  - 任一录音消失/重置时由 `invalidateRagCache(recordingId)` 清掉。
+ *
+ * @param contentSignature 可选内容签名（典型传各录音 segment 数之和）。用于感知"挂载的
+ *   录音增长"——不传则退化为旧行为（recordingIds 集合不变即整体命中旧快照）。
  *
  * 失败语义与单录音 retriever 一致：embed 抛错 → 返回 ''，让 chatContextBuilder 退化。
  */
@@ -372,7 +382,8 @@ export function makeRagRetrieverForRecordings(
   recordingIds: ReadonlyArray<string>,
   loadTranscript: (
     recordingId: string
-  ) => Promise<ReadonlyArray<TranscriptSegment>>
+  ) => Promise<ReadonlyArray<TranscriptSegment>>,
+  contentSignature?: number
 ): (
   query: string,
   _transcript: ReadonlyArray<TranscriptSegment>,
@@ -386,7 +397,11 @@ export function makeRagRetrieverForRecordings(
     try {
       let state = sessionCache.get(cacheKey);
 
-      if (!state) {
+      // 增量感知：首次无缓存，或调用方传入的 contentSignature 变化（某录音增长/变动）
+      // → 重载 + 重切 + 只补 embed 新增/变动 chunk。签名未变则命中复用、不重载。
+      const needsRebuild = !state || state.contentSignature !== contentSignature;
+
+      if (needsRebuild) {
         // 各 recording 的 transcript 互相独立，并行拉取避免串行 N-1 个 RTT
         const transcripts = await Promise.all(
           sortedIds.map((id) => loadTranscript(id))
@@ -410,14 +425,38 @@ export function makeRagRetrieverForRecordings(
           }
         }
 
-        let vectors: number[][] = [];
-        if (allChunks.length > 0) {
-          vectors = await callEmbedding(allChunks.map((c) => c.text));
+        // 复用已 embed 的 chunk 向量（key=recordingId|startMs|text），只 embed 新增/变动的，
+        // 避免每次增长都整批重 embed（与单录音 retrieveTranscriptByEmbedding 增量逻辑一致）。
+        const oldByKey =
+          state && state.chunks.length > 0
+            ? new Map(
+                state.chunks.map((c, i) => [
+                  `${c.recordingId}|${c.startMs}|${c.text}`,
+                  state!.vectors[i],
+                ])
+              )
+            : null;
+        const vectors: number[][] = allChunks.map(
+          (c) =>
+            oldByKey?.get(`${c.recordingId}|${c.startMs}|${c.text}`) ??
+            ([] as number[])
+        );
+        const missingIndices = vectors
+          .map((v, i) => (v.length === 0 ? i : -1))
+          .filter((i) => i >= 0);
+        if (missingIndices.length > 0) {
+          const newVectors = await callEmbedding(
+            missingIndices.map((i) => allChunks[i].text)
+          );
+          missingIndices.forEach((idx, i) => {
+            vectors[idx] = newVectors[i];
+          });
         }
 
         state = {
           // recordingIds 集合变了 cacheKey 就会变 → 走另一个 entry，
           // 所以 state 里不需要单独再记一份 ids
+          contentSignature,
           lastSegmentCount: allChunks.length,
           chunks: allChunks,
           vectors,
@@ -431,13 +470,17 @@ export function makeRagRetrieverForRecordings(
             cacheKey,
             recordingCount: sortedIds.length,
             totalChunks: allChunks.length,
+            newlyEmbedded: missingIndices.length,
           },
-          'multi-recording RAG cache 已建立'
+          'multi-recording RAG cache 已建立/增量更新'
         );
-      } else {
+      } else if (state) {
         state.lastUsedAt = Date.now();
       }
 
+      // needsRebuild 分支必赋值 state；else-if 必进（needsRebuild=false ⟹ state 非空）。
+      // 此处 state 必非空，下面这行仅为帮 TS 收窄（理论不可达）。
+      if (!state) return '';
       if (state.chunks.length === 0) return '';
 
       const [queryVec] = await callEmbedding([query]);
@@ -458,6 +501,7 @@ export function makeRagRetrieverForRecordings(
         sessionCache.delete(cacheKey);
         const freshVectors = await callEmbedding(state.chunks.map((c) => c.text));
         state = {
+          contentSignature: state.contentSignature,
           lastSegmentCount: state.chunks.length,
           chunks: state.chunks,
           vectors: freshVectors,

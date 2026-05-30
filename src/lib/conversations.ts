@@ -1,33 +1,20 @@
 // Conversation 工具 — 统一所有权与可见性判断
 //
-// 背景：Wave 1 把 `Conversation.sessionId` 改成可空，并新增 `ConversationSession`
-// 多对多联接。一个对话现在可以由 0..N 个录音组成（"全局对话"），所以原本的
-// `conversation.session.userId === user.id` 不再覆盖所有情况。
-//
-// 现状：Conversation 表没有 `userId` 列，所有权只能通过录音反推。所以一个
-// 真正的"零录音全局对话"暂时无主、对列表不可见，要等 U10 给它挂上首条录音
-// 或 follow-up 单元给 Conversation 加 `userId` 才能完全恢复。
-//
-// TODO: 添加 Conversation.userId 列后即可显示真正零录音的全局对话，
-//       并把这里的 OR 子句简化为 `userId === user.id`。
+// 归属权威来源是 `Conversation.userId` 列（创建时由服务端写入，不再靠录音反推）。
+// 历史"零录音纯 global 对话"（无 sessionId、无 ConversationSession、无 ChatAttachment）
+// 在迁移回填后 userId 仍为 NULL —— 视为"无主"，任何人都不拥有（列表不显示 + 访问 404）。
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 
 export interface ConversationOwnership {
   conversationId: string;
   isOwned: boolean;
-  /** sessionId === null && 无 ConversationSession 行 */
-  isFreshGlobal: boolean;
 }
 
 /**
  * 判断指定用户是否拥有该对话。
- * 拥有条件（满足任一即可）：
- *  1. `conversation.sessionId !== null` 且 `Session.userId === userId`
- *  2. 至少一行 `ConversationSession` 的 `Session.userId === userId`
- *
- * 同时返回 `isFreshGlobal`：sessionId 为空且 0 行 ConversationSession，
- * 用于"还在初始化的全局对话"特殊处理（当前对非 admin 用户视作不可见）。
+ * 拥有条件：`Conversation.userId === userId`（且非 NULL）。
+ * userId 为 NULL 的历史无主孤儿 → 任何人都不拥有。
  */
 export async function getConversationOwnership(
   conversationId: string,
@@ -35,29 +22,13 @@ export async function getConversationOwnership(
 ): Promise<ConversationOwnership | null> {
   const conv = await prisma.conversation.findUnique({
     where: { id: conversationId },
-    select: {
-      id: true,
-      sessionId: true,
-      session: { select: { userId: true } },
-      sessions: {
-        select: { session: { select: { userId: true } } },
-      },
-    },
+    select: { id: true, userId: true },
   });
   if (!conv) return null;
 
-  const ownedViaSession =
-    conv.sessionId !== null && conv.session?.userId === userId;
-  const ownedViaJunction = conv.sessions.some(
-    (row) => row.session.userId === userId
-  );
-  const isFreshGlobal =
-    conv.sessionId === null && conv.sessions.length === 0;
-
   return {
     conversationId: conv.id,
-    isOwned: ownedViaSession || ownedViaJunction,
-    isFreshGlobal,
+    isOwned: conv.userId !== null && conv.userId === userId,
   };
 }
 
@@ -75,8 +46,8 @@ export class ConversationOwnershipError extends Error {
  * 校验用户对会话的所有权，否则抛 `ConversationOwnershipError`。
  *
  * - 对话不存在 → kind: 'not-found'
- * - 对话存在但既未通过 `sessionId` 拥有也未通过 `ConversationSession` 拥有
- *   → kind: 'forbidden'（包括"无主全局对话"）
+ * - 对话存在但 `userId` 不等于当前用户（含 userId 为 NULL 的无主孤儿）
+ *   → kind: 'forbidden'
  *
  * 路由处理器应当 catch 该错误并用 `ownershipErrorResponse` 转 HTTP 响应。
  */

@@ -52,16 +52,12 @@ import { GET, POST, DELETE } from '@/app/api/conversations/[id]/recordings/route
 
 const paramsP = (id: string) => Promise.resolve({ id });
 
-function mockOwnedConversation(opts?: { sessionId?: string | null; junctionUserIds?: string[] }) {
+// 归属用 Conversation.userId；route 的 isConversationClosed 也读同一 mock 的 endedAt。
+function mockOwnedConversation(opts?: { userId?: string | null; endedAt?: Date | null }) {
   conversationFindUniqueMock.mockResolvedValue({
     id: 'c1',
-    sessionId: opts?.sessionId ?? null,
-    session: opts?.sessionId
-      ? { userId: (opts.junctionUserIds && opts.junctionUserIds[0]) ?? 'user-1' }
-      : null,
-    sessions: (opts?.junctionUserIds ?? ['user-1']).map((uid) => ({
-      session: { userId: uid },
-    })),
+    userId: opts?.userId ?? 'user-1',
+    endedAt: opts?.endedAt ?? null,
   });
 }
 
@@ -95,7 +91,7 @@ describe('recordings route', () => {
     });
 
     it('对话不属于当前用户返回 403', async () => {
-      mockOwnedConversation({ junctionUserIds: ['someone-else'] });
+      mockOwnedConversation({ userId: 'someone-else' });
       const response = await GET(
         createJsonRequest('http://localhost:3000/api/conversations/c1/recordings'),
         { params: paramsP('c1') }
@@ -130,7 +126,7 @@ describe('recordings route', () => {
 
   describe('POST', () => {
     it('对话不属于当前用户返回 403', async () => {
-      mockOwnedConversation({ junctionUserIds: ['someone-else'] });
+      mockOwnedConversation({ userId: 'someone-else' });
       const response = await POST(
         createJsonRequest('http://localhost:3000/api/conversations/c1/recordings', {
           method: 'POST',
@@ -204,7 +200,7 @@ describe('recordings route', () => {
 
   describe('DELETE', () => {
     it('对话不属于当前用户返回 403', async () => {
-      mockOwnedConversation({ junctionUserIds: ['someone-else'] });
+      mockOwnedConversation({ userId: 'someone-else' });
       const response = await DELETE(
         createJsonRequest('http://localhost:3000/api/conversations/c1/recordings', {
           method: 'DELETE',

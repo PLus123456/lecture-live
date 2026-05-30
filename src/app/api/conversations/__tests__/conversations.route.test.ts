@@ -108,9 +108,7 @@ describe('GET /api/conversations', () => {
       expect.objectContaining({
         take: 5,
         orderBy: { startedAt: 'desc' },
-        where: expect.objectContaining({
-          OR: expect.any(Array),
-        }),
+        where: { userId: 'user-1' },
       })
     );
   });
@@ -130,7 +128,7 @@ describe('GET /api/conversations', () => {
     expect(r3.status).toBe(400);
   });
 
-  it('?scope=global 仅返回 sessionId=null 且有 junction 行的对话', async () => {
+  it('?scope=global 仅返回本人拥有且无 legacy sessionId 的对话（含零录音）', async () => {
     conversationFindManyMock.mockResolvedValue([
       {
         id: 'c-global',
@@ -153,8 +151,8 @@ describe('GET /api/conversations', () => {
 
     const call = conversationFindManyMock.mock.calls[0][0];
     expect(call.where).toEqual({
+      userId: 'user-1',
       sessionId: null,
-      sessions: { some: { session: { userId: 'user-1' } } },
     });
     expect(call.take).toBe(50);
   });
@@ -258,22 +256,19 @@ describe('POST /api/conversations', () => {
     expect(response.status).toBe(403);
   });
 
-  it('recordingIds=[] 创建零录音全局对话（200）', async () => {
+  it('recordingIds=[] 创建零录音全局对话（200），且写入 userId', async () => {
+    const createConvMock = vi.fn().mockResolvedValue({
+      id: 'c-new',
+      title: null,
+      startedAt: new Date('2026-05-22T01:00:00Z'),
+      endedAt: null,
+      degradationLevel: 1,
+      sessionId: null,
+    });
     transactionMock.mockImplementation(async (cb) => {
       return cb({
-        conversation: {
-          create: vi.fn().mockResolvedValue({
-            id: 'c-new',
-            title: null,
-            startedAt: new Date('2026-05-22T01:00:00Z'),
-            endedAt: null,
-            degradationLevel: 1,
-            sessionId: null,
-          }),
-        },
-        conversationSession: {
-          createMany: vi.fn(),
-        },
+        conversation: { create: createConvMock },
+        conversationSession: { createMany: vi.fn() },
       });
     });
 
@@ -287,6 +282,10 @@ describe('POST /api/conversations', () => {
     const body = await readJson<{ conversation: { id: string; sessionIds: string[] } }>(response);
     expect(body.conversation.id).toBe('c-new');
     expect(body.conversation.sessionIds).toEqual([]);
+    // 核心：零录音全局对话创建即带 userId（不再无主）
+    expect(createConvMock).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { sessionId: null, userId: 'user-1' } })
+    );
   });
 
   it('recordingIds=["s1","s2"] 创建对话并插入 junction 行', async () => {
@@ -352,6 +351,12 @@ describe('POST /api/conversations', () => {
     expect(invalidateRagCacheMock).toHaveBeenCalledWith('s1');
     const body = await readJson<{ conversation: { id: string; sessionIds: string[] } }>(response);
     expect(body.conversation.sessionIds).toEqual(['s1']);
+    // legacy 单录音对话创建也带 userId
+    expect(conversationCreateMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { sessionId: 's1', userId: 'user-1' },
+      })
+    );
   });
 
   it('legacy sessionId 不存在返回 404', async () => {

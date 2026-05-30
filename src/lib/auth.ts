@@ -4,7 +4,11 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { JWT_SECRET } from '@/lib/serverSecrets';
 import { getRedisClient } from '@/lib/redis';
-import { getDefaultQuotasForRole, normalizeUserRole } from '@/lib/userRoles';
+import {
+  getDefaultQuotasForRole,
+  normalizeUserRole,
+  resolveRoleStorageBytesLimit,
+} from '@/lib/userRoles';
 import { getNextQuotaResetAt } from '@/lib/billing';
 
 const DEFAULT_JWT_EXPIRY_DAYS = 7;
@@ -379,6 +383,8 @@ export async function registerWithOptions(
 ) {
   const role = normalizeUserRole(options?.role, 'FREE');
   const passwordHash = await bcrypt.hash(password, options?.bcryptRounds ?? 12);
+  // 字节配额上限按角色从 SiteSetting 解析（覆盖 schema 默认 100MB），让 admin 配置真正生效
+  const storageBytesLimit = await resolveRoleStorageBytesLimit(role);
   const user = await prisma.user.create({
     data: {
       email,
@@ -387,6 +393,7 @@ export async function registerWithOptions(
       role,
       quotaResetAt: getNextQuotaResetAt(),
       ...getDefaultQuotasForRole(role),
+      storageBytesLimit,
     },
   });
   const token = signToken({

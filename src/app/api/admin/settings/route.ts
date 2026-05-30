@@ -209,6 +209,27 @@ export async function PUT(req: Request) {
     invalidateCloudreveConfigCache();
     const settings = await getSiteSettings({ fresh: true });
 
+    // Chat 字节配额联动：admin 改了某角色的 chat_files_quota_*_mb 后，把对应角色所有用户的
+    // storageBytesLimit 回填到新值。这是让该设置真正生效的唯一写入点 —— 此前这三个值只存进
+    // SiteSetting、从不推给任何用户，导致所有人（含 PRO）被钉死在 schema 默认 100MB。
+    // 字节配额按角色驱动、自定义组沿用其底层角色配额，故按 role 全量更新（不排除自定义组成员）。
+    const STORAGE_QUOTA_MB = 1024 * 1024;
+    const byteQuotaByRole: Array<{ role: 'FREE' | 'PRO' | 'ADMIN'; mb: number; prevMb: number }> = [
+      { role: 'FREE', mb: settings.chat_files_quota_free_mb, prevMb: previousSettings.chat_files_quota_free_mb },
+      { role: 'PRO', mb: settings.chat_files_quota_pro_mb, prevMb: previousSettings.chat_files_quota_pro_mb },
+      { role: 'ADMIN', mb: settings.chat_files_quota_admin_mb, prevMb: previousSettings.chat_files_quota_admin_mb },
+    ];
+    for (const change of byteQuotaByRole) {
+      if (change.mb !== change.prevMb && Number.isFinite(change.mb) && change.mb >= 0) {
+        await prisma.user.updateMany({
+          where: { role: change.role },
+          data: {
+            storageBytesLimit: BigInt(Math.floor(change.mb)) * BigInt(STORAGE_QUOTA_MB),
+          },
+        });
+      }
+    }
+
     // Cloudreve URL/Client 任一变更后，旧 token 不再匹配新 server/app —
     // 用旧 token 调新 client 必然 401，必须清空让管理员重新走 OAuth。
     const cloudreveCredentialsChanged =

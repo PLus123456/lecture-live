@@ -14,7 +14,7 @@
 
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
-import { checkQuota, addStorageBytes } from '@/lib/quota';
+import { reserveStorageBytes, releaseStorageBytes } from '@/lib/quota';
 import { prisma } from '@/lib/prisma';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { CloudreveStorage } from '@/lib/storage/cloudreve';
@@ -164,9 +164,10 @@ export async function POST(req: Request) {
     );
   }
 
-  // 配额检查
-  const quotaOk = await checkQuota(user.id, 'storage_bytes');
-  if (!quotaOk) {
+  // 配额：原子预留 file.size 字节（条件扣减，杜绝并发击穿）。预留成功后若后续任一
+  // 步骤失败，必须 releaseStorageBytes 回滚，避免配额泄漏。
+  const reserved = await reserveStorageBytes(user.id, file.size);
+  if (!reserved) {
     return NextResponse.json(
       { error: 'Storage quota exceeded' },
       { status: 403 }
@@ -213,6 +214,8 @@ export async function POST(req: Request) {
       { conversationId, userId: user.id, err: serializeError(err) },
       'chat-uploads: Cloudreve upload failed'
     );
+    // 回滚预留的字节配额（文件没传成功，不应占额度）
+    await releaseStorageBytes(user.id, file.size).catch(() => undefined);
     return NextResponse.json(
       { error: 'Upload failed' },
       { status: 500 }
@@ -284,21 +287,17 @@ export async function POST(req: Request) {
       { conversationId, userId: user.id, err: serializeError(err) },
       'chat-uploads: DB insert failed'
     );
+    // 回滚预留的字节配额（行没建成，额度不应被占用）。
+    // 注意：此时 Cloudreve 上已有物理文件成为孤儿，留给清理 cron 兜底（与原行为一致）。
+    await releaseStorageBytes(user.id, file.size).catch(() => undefined);
     return NextResponse.json(
       { error: 'Failed to record attachment' },
       { status: 500 }
     );
   }
 
-  // 扣配额（抽出的 .txt 算衍生产物不再扣，避免双重计费）
-  try {
-    await addStorageBytes(user.id, file.size);
-  } catch (err) {
-    routeLogger.warn(
-      { userId: user.id, err: serializeError(err) },
-      'chat-uploads: addStorageBytes failed; attachment 已记录，配额下次校准会兜底'
-    );
-  }
+  // 注意：字节配额已在上传前用 reserveStorageBytes 原子预留，这里不再重复扣减。
+  // 抽出的 .txt 算衍生产物，本就不计费。
 
   return NextResponse.json({
     attachmentId,

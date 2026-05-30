@@ -5,7 +5,11 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { validatePassword } from '@/lib/auth';
 import { logAction } from '@/lib/auditLog';
 import { getSiteSettings } from '@/lib/siteSettings';
-import { getDefaultQuotasForRole, normalizeUserRole } from '@/lib/userRoles';
+import {
+  getDefaultQuotasForRole,
+  normalizeUserRole,
+  resolveRoleStorageBytesLimit,
+} from '@/lib/userRoles';
 
 // 共享的用户查询 select 字段
 const USER_SELECT = {
@@ -120,8 +124,9 @@ export async function POST(req: Request) {
 
     const passwordHash = await bcrypt.hash(password, siteSettings.bcrypt_rounds);
 
-    // 根据角色设置默认配额
+    // 根据角色设置默认配额（字节上限从 SiteSetting 按角色解析，覆盖 schema 默认 100MB）
     const quotas = getDefaultQuotasForRole(normalizedRole);
+    const storageBytesLimit = await resolveRoleStorageBytesLimit(normalizedRole);
 
     const user = await prisma.user.create({
       data: {
@@ -130,6 +135,7 @@ export async function POST(req: Request) {
         passwordHash,
         role: normalizedRole,
         ...quotas,
+        storageBytesLimit,
       },
       select: USER_SELECT,
     });
@@ -309,6 +315,10 @@ export async function PATCH(req: Request) {
         data.allowedModels = defaults.allowedModels;
         data.transcriptionMinutesLimit = defaults.transcriptionMinutesLimit;
         data.storageHoursLimit = defaults.storageHoursLimit;
+        // 字节上限也回到角色默认（从 SiteSetting 解析）
+        data.storageBytesLimit = await resolveRoleStorageBytesLimit(
+          role as 'ADMIN' | 'PRO' | 'FREE'
+        );
       } else {
         // Bug 5: 先验证自定义组是否存在，再分配
         const groupRow = await prisma.siteSetting.findUnique({ where: { key: 'custom_groups' } });
@@ -328,6 +338,10 @@ export async function PATCH(req: Request) {
         data.allowedModels = group.permissions.allowedModels;
         data.transcriptionMinutesLimit = group.permissions.transcriptionMinutesLimit;
         data.storageHoursLimit = group.permissions.storageHoursLimit;
+        // 字节上限按用户角色解析（自定义组沿用其底层角色的字节配额）
+        data.storageBytesLimit = await resolveRoleStorageBytesLimit(
+          ((data.role as string) || existing.role) as 'ADMIN' | 'PRO' | 'FREE'
+        );
       }
     }
 

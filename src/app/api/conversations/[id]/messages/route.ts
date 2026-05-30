@@ -1,4 +1,4 @@
-// GET /api/conversations/[id]/messages → 拉取 conversation 的所有消息（按 createdAt asc）
+// GET /api/conversations/[id]/messages → 拉取 conversation 的所有消息（按 seq asc 稳定排序）
 //
 // 旧 conversation（endedAt 非 null）也可读，UI 用来展示历史对话只读视图。
 // 全局对话（无 sessionId）也走这个端点 — 所有权用 assertConversationOwnership 统一判定。
@@ -39,7 +39,8 @@ export async function GET(
       endedAt: true,
       degradationLevel: true,
       messages: {
-        orderBy: { createdAt: 'asc' },
+        // 按 seq 稳定排序（全局单调，替代 createdAt —— 避免同毫秒时间戳错乱影响切割点定位）
+        orderBy: { seq: 'asc' },
         select: {
           id: true,
           role: true,

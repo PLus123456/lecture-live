@@ -4,12 +4,14 @@ const {
   userFindUniqueMock,
   userFindManyMock,
   userUpdateMock,
+  userUpdateManyMock,
   executeRawMock,
   chatAttachmentGroupByMock,
 } = vi.hoisted(() => ({
   userFindUniqueMock: vi.fn(),
   userFindManyMock: vi.fn(),
   userUpdateMock: vi.fn(),
+  userUpdateManyMock: vi.fn(),
   executeRawMock: vi.fn(),
   chatAttachmentGroupByMock: vi.fn(),
 }));
@@ -20,6 +22,7 @@ vi.mock('@/lib/prisma', () => ({
       findUnique: userFindUniqueMock,
       findMany: userFindManyMock,
       update: userUpdateMock,
+      updateMany: userUpdateManyMock,
     },
     chatAttachment: {
       groupBy: chatAttachmentGroupByMock,
@@ -36,11 +39,13 @@ vi.mock('@/lib/billing', () => ({
     Math.max(0, limit - used),
 }));
 
+import type { Prisma } from '@prisma/client';
 import {
   addStorageBytes,
   releaseStorageBytes,
   reserveStorageBytes,
   reconcileStorageBytes,
+  deductTranscriptionMinutes,
 } from '@/lib/quota';
 
 const futureReset = new Date('2099-01-01T00:00:00.000Z');
@@ -327,5 +332,131 @@ describe('reconcileStorageBytes', () => {
       where: { id: 'u-b' },
       data: { storageBytesUsed: BigInt(0) },
     });
+  });
+});
+
+describe('deductTranscriptionMinutes', () => {
+  const futureResetLocal = new Date('2099-01-01T00:00:00.000Z');
+
+  function txUser(
+    over: Partial<{
+      transcriptionMinutesUsed: number;
+      quotaResetAt: Date;
+      role: 'ADMIN' | 'PRO' | 'FREE';
+    }> = {}
+  ) {
+    return {
+      id: 'user-1',
+      role: over.role ?? ('FREE' as const),
+      transcriptionMinutesUsed: over.transcriptionMinutesUsed ?? 0,
+      transcriptionMinutesLimit: 600,
+      storageHoursUsed: 0,
+      storageHoursLimit: 10,
+      storageBytesUsed: BigInt(0),
+      storageBytesLimit: BigInt(104_857_600),
+      allowedModels: '*',
+      quotaResetAt: over.quotaResetAt ?? futureResetLocal,
+    };
+  }
+
+  beforeEach(() => {
+    userFindUniqueMock.mockReset();
+    userUpdateMock.mockReset();
+    userUpdateManyMock.mockReset();
+  });
+
+  it('窗口未过期：直接 increment 扣减，不触发重置', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(txUser({ transcriptionMinutesUsed: 10 }));
+    userUpdateMock.mockResolvedValueOnce(txUser({ transcriptionMinutesUsed: 13 }));
+
+    const snap = await deductTranscriptionMinutes('user-1', 3);
+
+    expect(userUpdateManyMock).not.toHaveBeenCalled(); // 未过期不重置
+    expect(userUpdateMock).toHaveBeenCalledWith({
+      where: { id: 'user-1' },
+      data: { transcriptionMinutesUsed: { increment: 3 } },
+      select: expect.objectContaining({ transcriptionMinutesUsed: true }),
+    });
+    expect(snap?.transcriptionMinutesUsed).toBe(13);
+  });
+
+  it('跨月窗口：过期 → 先重置清零再 increment，分钟落在新窗口（修隐性 drift）', async () => {
+    const expired = new Date('2020-01-01T00:00:00.000Z');
+    // ensureQuotaWindow：1st findUnique 拿到过期用户（旧窗口已用 580）
+    userFindUniqueMock.mockResolvedValueOnce(
+      txUser({ transcriptionMinutesUsed: 580, quotaResetAt: expired })
+    );
+    // 乐观锁重置成功
+    userUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    // 2nd findUnique 拿到重置后的用户（新窗口已用 0）
+    userFindUniqueMock.mockResolvedValueOnce(
+      txUser({ transcriptionMinutesUsed: 0, quotaResetAt: futureResetLocal })
+    );
+    // increment 落到新窗口
+    userUpdateMock.mockResolvedValueOnce(
+      txUser({ transcriptionMinutesUsed: 5, quotaResetAt: futureResetLocal })
+    );
+
+    const snap = await deductTranscriptionMinutes('user-1', 5);
+
+    // 关键：重置确实发生（裸 increment 不会调 updateMany），increment 落在重置后的窗口
+    expect(userUpdateManyMock).toHaveBeenCalledTimes(1);
+    expect(userUpdateMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { transcriptionMinutesUsed: { increment: 5 } },
+      })
+    );
+    expect(snap?.transcriptionMinutesUsed).toBe(5); // 新窗口的 5，而非旧窗口的 585
+  });
+
+  it('ADMIN：不扣减，仅返回 snapshot', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(txUser({ role: 'ADMIN' }));
+
+    const snap = await deductTranscriptionMinutes('user-1', 100);
+
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(snap?.role).toBe('ADMIN');
+  });
+
+  it('minutes <= 0：直接返回不写库', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(txUser());
+
+    const snap = await deductTranscriptionMinutes('user-1', 0);
+
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(snap?.transcriptionMinutesUsed).toBe(0);
+  });
+
+  it('用户不存在返回 null', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(null);
+
+    const snap = await deductTranscriptionMinutes('missing', 5);
+
+    expect(snap).toBeNull();
+    expect(userUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('传入事务客户端：在该 tx 上读写、不碰全局 prisma（finalize 原子扣减）', async () => {
+    const txFindUnique = vi
+      .fn()
+      .mockResolvedValueOnce(txUser({ transcriptionMinutesUsed: 0 }));
+    const txUpdate = vi
+      .fn()
+      .mockResolvedValueOnce(txUser({ transcriptionMinutesUsed: 7 }));
+    const tx = {
+      user: { findUnique: txFindUnique, update: txUpdate, updateMany: vi.fn() },
+    } as unknown as Prisma.TransactionClient;
+
+    const snap = await deductTranscriptionMinutes('user-1', 7, tx);
+
+    expect(txUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { transcriptionMinutesUsed: { increment: 7 } },
+      })
+    );
+    // 全局 prisma 的 mock 完全没被调用 —— 证明扣减走在传入的事务上
+    expect(userFindUniqueMock).not.toHaveBeenCalled();
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(snap?.transcriptionMinutesUsed).toBe(7);
   });
 });

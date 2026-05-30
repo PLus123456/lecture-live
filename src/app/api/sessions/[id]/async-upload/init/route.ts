@@ -9,6 +9,7 @@ import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { assertOwnership, parsePositiveInteger, sanitizeTextInput } from '@/lib/security';
 import { enforceRateLimit } from '@/lib/rateLimit';
+import { checkQuota } from '@/lib/quota';
 import { initAsyncUpload } from '@/lib/audio/asyncUploadChunkPersistence';
 
 // 单文件总大小上限：5 GB（足以覆盖 5 小时 1080p mp4）
@@ -43,6 +44,13 @@ export async function POST(
     assertOwnership(user.id, session.userId);
   } catch {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
+  }
+
+  // 异步上传转录要计费（批2）：入口先挡配额耗尽，避免上传/转码后才发现扣不了费。
+  // 注意这里只做"是否还有余量"的前置拦截；实际扣减在转录完成时按 ceil(分钟)×倍率 进行。
+  const quotaOk = await checkQuota(user.id, 'transcription_minutes');
+  if (!quotaOk) {
+    return NextResponse.json({ error: 'Quota exceeded' }, { status: 403 });
   }
 
   let body: {

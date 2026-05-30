@@ -111,6 +111,8 @@ export async function PUT(req: Request) {
       'chat_files_quota_free_mb',
       'chat_files_quota_pro_mb',
       'chat_files_quota_admin_mb',
+      // 异步上传转录计费倍率（批2）
+      'async_upload_billing_multiplier',
     ]);
 
     // 过滤非法键

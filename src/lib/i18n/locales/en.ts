@@ -828,6 +828,9 @@ export default {
     defaultTargetLangDesc: 'Default language for translation',
     translationMode: 'Translation Mode',
     translationModeDesc: 'Choose translation processing method',
+    asyncUploadBillingMultiplier: 'Upload Transcription Billing Multiplier',
+    asyncUploadBillingMultiplierDesc:
+      'File-upload transcription is billed at this multiplier (realtime is 1.0). Default 0.8 (20% off); 0 means free',
     sonioxCloud: 'Soniox Cloud (Low Latency)',
     localTransformers: 'Local Transformers.js (Privacy First)',
 

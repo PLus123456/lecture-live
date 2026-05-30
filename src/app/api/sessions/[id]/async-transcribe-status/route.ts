@@ -31,6 +31,9 @@ import {
   extractTranslationsByTokens,
 } from '@/lib/soniox/asyncTranscriptConverter';
 import { runBackgroundLLMTasks } from '@/lib/sessionFinalization';
+import { deductTranscriptionMinutes } from '@/lib/quota';
+import { getBillableMinutes } from '@/lib/billing';
+import { getSiteSettings } from '@/lib/siteSettings';
 
 export async function GET(
   req: Request,
@@ -186,6 +189,25 @@ export async function GET(
       },
     });
     await invalidateSessionsApiCache(user.id);
+
+    // 异步上传转录计费（批2）：上方 updateMany claim 已保证每个 session 仅有一个 poll
+    // 进到此分支，故扣费恰好执行一次（幂等无须额外锁）。按 ceil(分钟)×倍率 扣减，
+    // 倍率默认 0.8、可在 admin 设置；与对账侧口径一致。计费失败不影响转录完成，
+    // 留给对账兜底。
+    try {
+      const { async_upload_billing_multiplier } = await getSiteSettings();
+      const billableMinutes = Math.ceil(
+        getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
+      );
+      if (billableMinutes > 0) {
+        await deductTranscriptionMinutes(session.userId, billableMinutes);
+      }
+    } catch (billingErr) {
+      logger.error(
+        { err: billingErr, sessionId: session.id },
+        'async upload billing deduct failed (transcription already completed)'
+      );
+    }
 
     // fire-and-forget：runBackgroundLLMTasks 自带 try/catch，不阻塞 status 响应
     void runBackgroundLLMTasks({

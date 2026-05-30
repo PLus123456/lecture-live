@@ -81,6 +81,7 @@ interface SiteSettingsData {
   default_source_lang: string;
   default_target_lang: string;
   translation_mode: string;
+  async_upload_billing_multiplier: string;
   // 安全相关
   rate_limit_auth: string;
   rate_limit_api: string;
@@ -342,6 +343,7 @@ const defaultSettings: SiteSettingsData = {
   default_source_lang: 'en',
   default_target_lang: 'zh',
   translation_mode: 'soniox',
+  async_upload_billing_multiplier: '0.8',
   rate_limit_auth: '5',
   rate_limit_api: '60',
   jwt_expiry: '7',
@@ -2065,6 +2067,17 @@ function AsrPanel({
             { value: 'soniox', label: t('adminSettings.sonioxCloud') },
             { value: 'local', label: t('adminSettings.localTransformers') },
           ]}
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.asyncUploadBillingMultiplier')}
+        description={t('adminSettings.asyncUploadBillingMultiplierDesc')}
+      >
+        <TextInput
+          value={settings.async_upload_billing_multiplier}
+          onChange={(v) => onChange('async_upload_billing_multiplier', v)}
+          type="number"
+          placeholder="0.8"
         />
       </SettingField>
     </div>

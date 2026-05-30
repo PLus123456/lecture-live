@@ -63,8 +63,16 @@ export async function POST(req: Request) {
     },
   });
 
-  // Conversation.session 可空（纯 chat 对话无录音绑定）；压缩仅对挂录音的对话有意义。
-  if (!conversation || !conversation.session || conversation.session.userId !== user.id) {
+  // 归属用 Conversation.userId（与其它端点统一）：userId 为 NULL 的无主孤儿、或他人对话 → 404。
+  if (!conversation || conversation.userId !== user.id) {
+    return NextResponse.json(
+      { error: 'Conversation not found' },
+      { status: 404 }
+    );
+  }
+  // 压缩仅对挂录音的 legacy 对话有意义（需 session.targetLang 决定摘要语言）；
+  // 纯 global 对话暂不支持，保持原 404 行为（本批不扩张 compress 范围）。
+  if (!conversation.session) {
     return NextResponse.json(
       { error: 'Conversation not found' },
       { status: 404 }

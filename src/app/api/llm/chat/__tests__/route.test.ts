@@ -5,8 +5,7 @@ import { createJsonRequest } from '../../../../../../tests/utils/http';
  * 这套测试关注 /api/llm/chat 的"路由 + 模式判定"层：
  *   1. legacy（conversation.session 非空）→ 不影响 ChatTab 的旧路径
  *   2. global（conversation.session 为空）→ 走多录音 + 附件路径
- *   3. ownership 校验：legacy 看 session.userId，global 看 ConversationSession.session.userId
- *      与 ChatAttachment.userId
+ *   3. ownership 校验：统一看 Conversation.userId（userId 为 NULL 的无主孤儿 / 他人对话 → 404）
  *
  * 流式部分（SSE）极难干净 mock，所以这里靠 mock 让 callLLMWithHistoryStream 立即结束，
  * 然后通过 `wasInvokedAsLegacy` / `wasInvokedAsGlobal` 两个间接信号判定是否走对路径：
@@ -314,6 +313,7 @@ describe('POST /api/llm/chat (mode routing)', () => {
     it('单录音 chat 走 makeRagRetrieverForSession，且不走全局路径的 helpers', async () => {
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv-legacy',
+        userId: 'user-1',
         sessionId: 'sess-1',
         endedAt: null,
         degradationLevel: 1,
@@ -347,9 +347,10 @@ describe('POST /api/llm/chat (mode routing)', () => {
       expect(estimateRawContextTokensMock).not.toHaveBeenCalled();
     });
 
-    it('当 session.userId !== user → 404', async () => {
+    it('当 conversation.userId !== user → 404', async () => {
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv-x',
+        userId: 'OTHER-USER',
         sessionId: 'sess-x',
         endedAt: null,
         degradationLevel: 1,
@@ -372,6 +373,7 @@ describe('POST /api/llm/chat (mode routing)', () => {
     it('多录音 + ownership 通过 → 走 makeRagRetrieverForRecordings + 注入附件', async () => {
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv-global',
+        userId: 'user-1',
         sessionId: null,
         endedAt: null,
         degradationLevel: 1,
@@ -470,6 +472,7 @@ describe('POST /api/llm/chat (mode routing)', () => {
     it('当 estimateRawContextTokens 超 80% budget → forceMinLevel=6 + 拼接 reportText', async () => {
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv-long',
+        userId: 'user-1',
         sessionId: null,
         endedAt: null,
         degradationLevel: 1,
@@ -536,9 +539,10 @@ describe('POST /api/llm/chat (mode routing)', () => {
       expect(finalSystemPrompt).toContain('truncated-report');
     });
 
-    it('附件鉴权：sessions/attachments 都不属于 user → 404', async () => {
+    it('归属他人（conversation.userId 不命中）→ 404', async () => {
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv-foreign',
+        userId: 'OTHER-USER',
         sessionId: null,
         endedAt: null,
         degradationLevel: 1,
@@ -572,9 +576,10 @@ describe('POST /api/llm/chat (mode routing)', () => {
       expect(res.status).toBe(404);
     });
 
-    it('空 conversation（无 session 无 attachment）→ 仍允许走全局空 chat', async () => {
+    it('空 conversation（本人拥有，无 session 无 attachment）→ 允许走全局空 chat', async () => {
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv-empty',
+        userId: 'user-1',
         sessionId: null,
         endedAt: null,
         degradationLevel: 1,
@@ -603,6 +608,7 @@ describe('POST /api/llm/chat (mode routing)', () => {
     it('attachmentIds 参数透传给 loader', async () => {
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv-with-att',
+        userId: 'user-1',
         sessionId: null,
         endedAt: null,
         degradationLevel: 1,
@@ -655,6 +661,7 @@ describe('POST /api/llm/chat (mode routing)', () => {
     it('conversation 已 endedAt → 409', async () => {
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv',
+        userId: 'user-1',
         sessionId: 'sess',
         endedAt: new Date(),
         degradationLevel: 1,

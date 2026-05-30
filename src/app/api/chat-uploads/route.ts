@@ -5,12 +5,8 @@
 // 但额外做：MIME 自动分类（image | document | text）、document/text 自动抽文本副本、
 // addStorageBytes 扣配额、按 LRU 更新 lastAccessedAt。
 //
-// 归属校验：Conversation 当前没有直接的 userId 列，因此本端点支持两种来源：
-//   1. session-bound：Conversation.sessionId → Session.userId 等于当前 user
-//   2. 多录音对话：Conversation.sessions[*].session.userId 包含当前 user
-//   3. 纯 global 对话（既无 sessionId 也无 ConversationSession 行）—— 任何登录用户可写
-//      （TODO: 后续 schema 迁移给 Conversation 加 userId 后收紧此分支）
-// 这种"宽进"是临时的，因为 Wave 3 此时 schema 还没为 Conversation 加 userId。
+// 归属校验：用 Conversation.userId（创建时由服务端写入）。userId 命中当前用户才放行；
+// userId 为 NULL 的历史无主孤儿一律拒绝（此前的 orphan"宽进"已收紧）。
 
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
@@ -64,35 +60,16 @@ async function isConversationAccessible(
 ): Promise<{ ok: boolean; exists: boolean; endedAt?: Date | null }> {
   const conversation = await prisma.conversation.findUnique({
     where: { id: conversationId },
-    select: {
-      sessionId: true,
-      endedAt: true,
-      session: { select: { userId: true } },
-      sessions: { select: { session: { select: { userId: true } } } },
-    },
+    select: { userId: true, endedAt: true },
   });
 
   if (!conversation) {
     return { ok: false, exists: false };
   }
 
-  // 1) session-bound（单录音对话）
-  if (conversation.session && conversation.session.userId === userId) {
-    return { ok: true, exists: true, endedAt: conversation.endedAt };
-  }
-
-  // 2) 多录音绑定：sessions[*].session.userId 命中
-  if (conversation.sessions.some((row) => row.session.userId === userId)) {
-    return { ok: true, exists: true, endedAt: conversation.endedAt };
-  }
-
-  // 3) 纯 global 对话：无 sessionId 且无 ConversationSession 行 — 暂时放过
-  //    TODO: schema 加上 Conversation.userId 后收紧此分支
-  if (!conversation.sessionId && conversation.sessions.length === 0) {
-    return { ok: true, exists: true, endedAt: conversation.endedAt };
-  }
-
-  return { ok: false, exists: true };
+  // 归属：Conversation.userId 命中本人即可（userId 为 NULL 的无主孤儿 → 拒绝）。
+  const ok = conversation.userId !== null && conversation.userId === userId;
+  return { ok, exists: true, endedAt: conversation.endedAt };
 }
 
 export async function POST(req: Request) {

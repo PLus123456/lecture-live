@@ -236,9 +236,13 @@ journalctl -u lecturelive-web --since today
 # 进入 MySQL
 sudo mysql lecturelive
 
-# 手动同步 Prisma schema
+# 手动同步数据库结构（数据感知迁移 → db push → 历史归属回填，幂等可重复）
 cd ~/lecture-live
-npx prisma db push
+node scripts/ensure-database.mjs
+
+# 说明：请勿在存量库上直接跑 `npx prisma db push`。对「给有数据的表加必填/自增列」等变更，
+# 裸 db push 会提示 “need to reset / All data will be lost”——此时务必回答 no，
+# 改用上面的 ensure-database.mjs（升级脚本内部也走它）。
 ```
 
 ---

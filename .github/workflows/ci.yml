@@ -61,7 +61,10 @@ jobs:
         run: npm run db:generate
 
       - name: Prepare database schema
-        run: npx prisma db push --skip-generate
+        # 走统一编排器（与裸机 upgrade.sh / Docker entrypoint 同一入口）：
+        # 数据感知迁移 → db push → 历史归属回填。CI 是全新空库，三步均为安全建表/空操作，
+        # 让 CI 成为这套数据库初始化脚本的回归保护（本类 reset bug 以后会在 CI 暴露）。
+        run: node scripts/ensure-database.mjs
 
       - name: Lint
         run: npm run lint

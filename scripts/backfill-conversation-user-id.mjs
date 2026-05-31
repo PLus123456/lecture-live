@@ -13,7 +13,23 @@
 //   类别 3  仅有 ChatAttachment                   → 附件上传者（MIN 取确定值）
 //   类别 4  无任何反推材料                         → 保留 NULL（代码侧当"无主"）
 
+import { existsSync } from 'fs';
 import { PrismaClient } from '@prisma/client';
+
+// 独立运行时（npm run db:backfill-conversation-user-id，无 --env-file）自动加载 env，
+// 使 PrismaClient 能读到 DATABASE_URL。若已由环境注入（编排器 / --env-file）则不覆盖。
+if (!process.env.DATABASE_URL) {
+  for (const f of ['.env', '.env.local']) {
+    if (existsSync(f)) {
+      try {
+        process.loadEnvFile(f);
+      } catch {
+        /* 解析失败时忽略，交由 Prisma 连接报错 */
+      }
+      if (process.env.DATABASE_URL) break;
+    }
+  }
+}
 
 const prisma = new PrismaClient();
 

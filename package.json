@@ -24,6 +24,7 @@
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
     "db:push": "prisma db push",
+    "db:migrate-data": "node scripts/db-migrate-data.mjs",
     "db:migrate": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy",
     "db:generate": "prisma generate",

@@ -65,9 +65,12 @@ fi
 npm ci
 
 # ── 3. Prisma 迁移 ──
-info "同步数据库结构..."
+# 走统一编排器（scripts/ensure-database.mjs）：数据感知迁移 → db push → 历史归属回填。
+# 关键：裸调 `prisma db push` 对「有数据的表加必填自增列」等变更会要求 reset 整库（数据全失）；
+# 编排器先用幂等数据脚本把这类变更铺好，db push 便无需破坏，且自动回填历史 userId。
+info "同步数据库结构（数据感知迁移 → db push → 历史归属回填）..."
 npx prisma generate
-npx prisma db push --skip-generate
+node scripts/ensure-database.mjs
 
 # ── 4. 编译 Next.js ──
 info "编译 Next.js..."

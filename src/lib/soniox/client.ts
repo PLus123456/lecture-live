@@ -94,8 +94,11 @@ export function buildSonioxConfig(config: SessionConfig): SonioxSessionConfig {
     }
   }
 
-  // Add translation config if target language is specified
-  if (config.targetLang && config.translationMode !== 'local') {
+  // Add translation config only in pure cloud mode.
+  // 'local' 走浏览器内置模型，'both' 也由本地引擎产出译文（见 useTranslation）——
+  // 这两种模式下都不能再发 Soniox 云翻译，否则云/本地译文写同一个 translations[segId]
+  // 互相覆盖（对比失效），且 'both' 会平白翻倍 Soniox 翻译成本。
+  if (config.targetLang && config.translationMode === 'soniox') {
     if (config.terms.length > 0) {
       sonioxConfig.context = {
         ...sonioxConfig.context,

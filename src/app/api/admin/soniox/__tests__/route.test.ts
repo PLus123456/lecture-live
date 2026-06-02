@@ -101,7 +101,8 @@ describe('PUT /api/admin/soniox', () => {
   });
 
   it('拒绝指向内网的 restUrl（SSRF 防护）', async () => {
-    const res = await PUT(makeRequest({ regions: { us: { restUrl: 'http://169.254.169.254/' } } }));
+    // 用基线 cloudreve 私网黑名单已覆盖的 10/8 地址，使本单元自洽（不依赖 U6 对 169.254 等网段的补全）。
+    const res = await PUT(makeRequest({ regions: { us: { restUrl: 'http://10.0.0.1/' } } }));
     expect(res.status).toBe(400);
     expect(siteSettingUpsertMock).not.toHaveBeenCalled();
   });

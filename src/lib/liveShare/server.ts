@@ -73,6 +73,66 @@ function clampArray(input: unknown, max: number): unknown[] {
   return input.length > max ? input.slice(0, max) : input;
 }
 
+// 单条字符串长度封顶（仅截长度，类型不符时原样返回，由上层处理）
+function clampString(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  return value.length > MAX_TRANSLATION_LENGTH
+    ? value.slice(0, MAX_TRANSLATION_LENGTH)
+    : value;
+}
+
+// 原地截断 transcript segment 的文本字段长度，防止单条 segment.text 撑爆内存。
+// 数组条数已由 clampArray / MAX_SNAPSHOT_SEGMENTS 另行限制，这里只管单条长度。
+function sanitizeSegment(segment: unknown): unknown {
+  if (!segment || typeof segment !== 'object') return segment;
+  const seg = segment as { text?: unknown; translatedText?: unknown };
+  if (typeof seg.text === 'string') {
+    seg.text = clampString(seg.text);
+  }
+  if (typeof seg.translatedText === 'string') {
+    seg.translatedText = clampString(seg.translatedText);
+  }
+  return segment;
+}
+
+// 原地截断 summary block 内各字符串字段长度（summary / keyPoints[*] /
+// definitions 各 value / suggestedQuestions[*]），防止单条快照撑爆内存。
+// 数组/对象条数由 MAX_SNAPSHOT_SUMMARY_BLOCKS 等另行限制，这里只管单条长度。
+function sanitizeSummaryBlock(block: unknown): unknown {
+  if (!block || typeof block !== 'object') return block;
+  const b = block as {
+    summary?: unknown;
+    keyPoints?: unknown;
+    definitions?: unknown;
+    suggestedQuestions?: unknown;
+  };
+
+  if (typeof b.summary === 'string') {
+    b.summary = clampString(b.summary);
+  }
+
+  if (Array.isArray(b.keyPoints)) {
+    for (let i = 0; i < b.keyPoints.length; i += 1) {
+      b.keyPoints[i] = clampString(b.keyPoints[i]);
+    }
+  }
+
+  if (Array.isArray(b.suggestedQuestions)) {
+    for (let i = 0; i < b.suggestedQuestions.length; i += 1) {
+      b.suggestedQuestions[i] = clampString(b.suggestedQuestions[i]);
+    }
+  }
+
+  if (b.definitions && typeof b.definitions === 'object') {
+    const defs = b.definitions as Record<string, unknown>;
+    for (const key of Object.keys(defs)) {
+      defs[key] = clampString(defs[key]);
+    }
+  }
+
+  return block;
+}
+
 // 清洗 sync_snapshot 的 translations：仅接受 string 值，单条长度封顶 + 条目数封顶
 function sanitizeSnapshotTranslations(input: unknown): Record<string, string> {
   if (!input || typeof input !== 'object') return {};
@@ -176,6 +236,8 @@ function mergeTranscriptSegment(snapshot: LiveSnapshot, segment: unknown) {
     return snapshot;
   }
 
+  sanitizeSegment(segment);
+
   const maybeSegment = segment as { id?: string };
   if (!maybeSegment.id) {
     snapshot.segments.push(segment);
@@ -200,6 +262,8 @@ function mergeSummaryBlock(snapshot: LiveSnapshot, block: unknown) {
   if (!block || typeof block !== 'object') {
     return snapshot;
   }
+
+  sanitizeSummaryBlock(block);
 
   const maybeBlock = block as { id?: string; blockIndex?: number };
   const index = snapshot.summaryBlocks.findIndex((item) => {
@@ -489,12 +553,14 @@ export function setupLiveShare(io: SocketIO) {
       }
 
       const nextSnapshot: LiveSnapshot = {
-        segments: clampArray(payload.segments, MAX_SNAPSHOT_SEGMENTS),
+        segments: clampArray(payload.segments, MAX_SNAPSHOT_SEGMENTS).map(
+          sanitizeSegment
+        ),
         translations: sanitizeSnapshotTranslations(payload.translations),
         summaryBlocks: clampArray(
           payload.summaryBlocks,
           MAX_SNAPSHOT_SUMMARY_BLOCKS
-        ),
+        ).map(sanitizeSummaryBlock),
         status: typeof payload.status === 'string' ? payload.status : null,
         previewText: ext.previewText
           ? normalizePreviewText(ext.previewText)

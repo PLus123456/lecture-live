@@ -1,8 +1,13 @@
 import 'server-only';
 
+import { logger, serializeError } from '@/lib/logger';
 import { prisma } from '@/lib/prisma';
 import { getRedisClient } from '@/lib/redis';
 import { getSiteSettings } from '@/lib/siteSettings';
+
+// /api/health 未授权可读，对外只回固定文案，避免泄露内网主机名/端口/连接串。
+// 原始错误仅进服务端日志，供运维排障。
+const DEPENDENCY_DOWN_DETAIL = 'unavailable';
 
 export type DependencyHealthStatus = 'up' | 'down' | 'disabled';
 export type AppHealthStatus = 'ok' | 'degraded' | 'down';
@@ -37,10 +42,11 @@ async function checkDatabase(): Promise<DependencyHealth> {
       latencyMs: durationMsFrom(startedAt),
     };
   } catch (error) {
+    logger.error({ err: serializeError(error) }, 'Health check: database down');
     return {
       status: 'down',
       latencyMs: durationMsFrom(startedAt),
-      detail: error instanceof Error ? error.message : 'Database unavailable',
+      detail: DEPENDENCY_DOWN_DETAIL,
     };
   }
 }
@@ -65,10 +71,11 @@ async function checkRedis(): Promise<DependencyHealth> {
       ...(pong === 'PONG' ? {} : { detail: `Unexpected ping response: ${pong}` }),
     };
   } catch (error) {
+    logger.error({ err: serializeError(error) }, 'Health check: redis down');
     return {
       status: 'down',
       latencyMs: durationMsFrom(startedAt),
-      detail: error instanceof Error ? error.message : 'Redis unavailable',
+      detail: DEPENDENCY_DOWN_DETAIL,
     };
   }
 }
@@ -122,10 +129,11 @@ async function checkCloudreve(): Promise<DependencyHealth> {
       detail: `HTTP ${response.status}`,
     };
   } catch (error) {
+    logger.error({ err: serializeError(error) }, 'Health check: cloudreve down');
     return {
       status: 'down',
       latencyMs: durationMsFrom(startedAt),
-      detail: error instanceof Error ? error.message : 'Cloudreve unavailable',
+      detail: DEPENDENCY_DOWN_DETAIL,
     };
   }
 }

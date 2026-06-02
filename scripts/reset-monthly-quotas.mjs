@@ -18,37 +18,29 @@ function getNextQuotaResetAt(baseDate = new Date()) {
 
 async function main() {
   const now = new Date();
-  const expiredUsers = await prisma.user.findMany({
+  const nextResetAt = getNextQuotaResetAt(now);
+
+  // 乐观锁：用单条 updateMany WHERE quotaResetAt<=now 条件更新，避免与请求路径上的
+  // ensureQuotaWindow（同样的条件重置）或扣费在毫秒级并发时互相覆写——无条件 update
+  // 会把刚被某请求重置并扣过费的窗口又清零，造成额度被白送。
+  // 直接以 updateMany 的 count 为准（而非先 findMany 再 update），消除两步之间的 TOCTOU 窗口。
+  const result = await prisma.user.updateMany({
     where: {
-      quotaResetAt: {
-        lte: now,
-      },
+      quotaResetAt: { lte: now },
     },
-    select: {
-      id: true,
+    data: {
+      transcriptionMinutesUsed: 0,
+      quotaResetAt: nextResetAt,
     },
   });
 
-  if (expiredUsers.length === 0) {
+  if (result.count === 0) {
     console.log('No expired transcription quota windows found.');
     return;
   }
 
-  const nextResetAt = getNextQuotaResetAt(now);
-  await prisma.$transaction(
-    expiredUsers.map((user) =>
-      prisma.user.update({
-        where: { id: user.id },
-        data: {
-          transcriptionMinutesUsed: 0,
-          quotaResetAt: nextResetAt,
-        },
-      })
-    )
-  );
-
   console.log(
-    `Reset transcription quotas for ${expiredUsers.length} users. Next reset at ${nextResetAt.toISOString()}.`
+    `Reset transcription quotas for ${result.count} users. Next reset at ${nextResetAt.toISOString()}.`
   );
 }
 

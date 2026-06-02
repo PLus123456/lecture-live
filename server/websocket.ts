@@ -20,6 +20,37 @@ const MAX_CONNECTIONS_PER_IP = 50;
 const MAX_MESSAGE_SIZE_BYTES = 100 * 1024;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
+// 每 socket 消息限流（令牌桶）：限制单个已认证 socket 的入站消息频率，
+// 防止被盗号/异常客户端用 broadcast / sync_snapshot 等消息洪泛打爆独立 WS 进程。
+// 稳态上限 ~20 msg/s，桶容量给突发留出余量；持续超限则断连（onAny 无法真正“丢弃”
+// 已派发给业务 handler 的事件，断连是可靠且对滥用者合适的处置）。
+const RATE_LIMIT_REFILL_PER_SEC = 20;
+const RATE_LIMIT_BUCKET_CAPACITY = 40;
+
+interface SocketRateState {
+  tokens: number;
+  lastRefillMs: number;
+}
+
+// 令牌桶限流：消费一个令牌。返回 false 表示桶已空（超限），应断连该 socket。
+function consumeRateToken(state: SocketRateState, nowMs: number): boolean {
+  const elapsedMs = nowMs - state.lastRefillMs;
+  if (elapsedMs > 0) {
+    state.tokens = Math.min(
+      RATE_LIMIT_BUCKET_CAPACITY,
+      state.tokens + (elapsedMs / 1000) * RATE_LIMIT_REFILL_PER_SEC
+    );
+    state.lastRefillMs = nowMs;
+  }
+
+  if (state.tokens < 1) {
+    return false;
+  }
+
+  state.tokens -= 1;
+  return true;
+}
+
 const connectionsByIp = new Map<string, number>();
 const wsLogger = logger.child({ component: 'websocket-server' });
 let isShuttingDown = false;
@@ -120,6 +151,27 @@ io.on('connection', (socket) => {
     },
     'WebSocket client connected'
   );
+
+  // 每 socket 入站消息限流：onAny 在业务 handler 之前对每个收到的事件计数。
+  // 注册早于 setupLiveShare 的连接 handler，确保限流先于业务监听器装载。
+  const rateState: SocketRateState = {
+    tokens: RATE_LIMIT_BUCKET_CAPACITY,
+    lastRefillMs: Date.now(),
+  };
+  socket.onAny(() => {
+    if (consumeRateToken(rateState, Date.now())) {
+      return;
+    }
+
+    wsLogger.warn(
+      {
+        socketId: socket.id,
+        clientIp: socket.data.clientIp,
+      },
+      'Socket exceeded message rate limit; disconnecting'
+    );
+    socket.disconnect(true);
+  });
 
   socket.once('disconnect', () => {
     if (!socket.data.connectionTracked) {

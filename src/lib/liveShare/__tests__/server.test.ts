@@ -261,6 +261,128 @@ describe('setupLiveShare', () => {
     expect(state.translations['seg-3']).toBe('正常翻译');
   });
 
+  it('sync_snapshot 截断超长 segment.text 与 summary 各字符串字段', async () => {
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    const longText = 'a'.repeat(10_050);
+    broadcaster.emit('sync_snapshot', {
+      segments: [{ id: 'seg-1', text: longText, translatedText: longText }],
+      translations: {},
+      summaryBlocks: [
+        {
+          id: 'sum-1',
+          summary: longText,
+          keyPoints: [longText, 'short'],
+          definitions: { term: longText, ok: '短' },
+          suggestedQuestions: [longText],
+        },
+      ],
+      status: 'RECORDING',
+    });
+
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+
+    await onceSocketEvent(viewer, 'connect');
+    const viewerInitialStatePromise = onceSocketEvent<{
+      segments: Array<{ text: string; translatedText: string }>;
+      summaryBlocks: Array<{
+        summary: string;
+        keyPoints: string[];
+        definitions: Record<string, string>;
+        suggestedQuestions: string[];
+      }>;
+    }>(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+
+    const state = await viewerInitialStatePromise;
+    expect(state.segments[0].text.length).toBe(10_000);
+    expect(state.segments[0].translatedText.length).toBe(10_000);
+    expect(state.summaryBlocks[0].summary.length).toBe(10_000);
+    expect(state.summaryBlocks[0].keyPoints[0].length).toBe(10_000);
+    expect(state.summaryBlocks[0].keyPoints[1]).toBe('short');
+    expect(state.summaryBlocks[0].definitions.term.length).toBe(10_000);
+    expect(state.summaryBlocks[0].definitions.ok).toBe('短');
+    expect(state.summaryBlocks[0].suggestedQuestions[0].length).toBe(10_000);
+  });
+
+  it('broadcast 增量路径截断超长 segment.text 与 summary 字段', async () => {
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    const longText = 'b'.repeat(10_050);
+    broadcaster.emit('broadcast', {
+      event: {
+        type: 'transcript_delta',
+        payload: { id: 'seg-1', text: longText },
+        timestamp: Date.now(),
+      },
+    });
+    broadcaster.emit('broadcast', {
+      event: {
+        type: 'summary_update',
+        payload: {
+          id: 'sum-1',
+          blockIndex: 0,
+          summary: longText,
+          keyPoints: [longText],
+          definitions: { term: longText },
+        },
+        timestamp: Date.now(),
+      },
+    });
+
+    // 新 viewer join 后会收到累积快照（含上述两条增量），断言其已被截断
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+
+    await onceSocketEvent(viewer, 'connect');
+    const viewerInitialStatePromise = onceSocketEvent<{
+      segments: Array<{ text: string }>;
+      summaryBlocks: Array<{
+        summary: string;
+        keyPoints: string[];
+        definitions: Record<string, string>;
+      }>;
+    }>(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+
+    const state = await viewerInitialStatePromise;
+    expect(state.segments[0].text.length).toBe(10_000);
+    expect(state.summaryBlocks[0].summary.length).toBe(10_000);
+    expect(state.summaryBlocks[0].keyPoints[0].length).toBe(10_000);
+    expect(state.summaryBlocks[0].definitions.term.length).toBe(10_000);
+  });
+
   it('阻止 viewer 冒充 broadcaster 发布事件', async () => {
     const viewer = createClient(baseUrl, {
       transports: ['websocket'],

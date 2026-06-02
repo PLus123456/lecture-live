@@ -201,6 +201,146 @@ describe('chatContextBuilder', () => {
     });
   });
 
+  describe('attachmentsText（附件进 token 预算）', () => {
+    it('attachmentsText 计入 breakdown.systemPrompt 和 total（与 reportText 同款）', async () => {
+      const attachmentsText = 'A'.repeat(500);
+      const common = {
+        history: [] as ConversationTurn[],
+        userInput: 'q',
+        transcript: [{ text: 't', startMs: 0 }],
+        summary: 's',
+        totalTranscriptMs: 0,
+        minLevel: 1 as const,
+        inputBudget: 100_000,
+        buildSystemPrompt: (t: string, s: string) => `<t>${t}</t><s>${s}</s>`,
+        callLLM: vi.fn(),
+        language: 'zh',
+      };
+      const ctxWith = await buildChatContext({ ...common, attachmentsText });
+      const ctxWithout = await buildChatContext({ ...common });
+
+      // mock estimateTokens = length，delta 应正好等于 attachmentsText.length
+      expect(
+        ctxWith.breakdown.systemPrompt - ctxWithout.breakdown.systemPrompt
+      ).toBe(attachmentsText.length);
+      expect(ctxWith.breakdown.total - ctxWithout.breakdown.total).toBe(
+        attachmentsText.length
+      );
+    });
+
+    it('reportText + attachmentsText 同时存在 → 两者 token 都计入 total', async () => {
+      const reportText = 'R'.repeat(300);
+      const attachmentsText = 'A'.repeat(400);
+      const common = {
+        history: [] as ConversationTurn[],
+        userInput: 'q',
+        transcript: [{ text: 't', startMs: 0 }],
+        summary: 's',
+        totalTranscriptMs: 0,
+        minLevel: 1 as const,
+        inputBudget: 100_000,
+        buildSystemPrompt: (t: string, s: string) => `<t>${t}</t><s>${s}</s>`,
+        callLLM: vi.fn(),
+        language: 'zh',
+      };
+      const ctxNone = await buildChatContext({ ...common });
+      const ctxBoth = await buildChatContext({
+        ...common,
+        reportText,
+        attachmentsText,
+      });
+
+      expect(ctxBoth.breakdown.total - ctxNone.breakdown.total).toBe(
+        reportText.length + attachmentsText.length
+      );
+      expect(
+        ctxBoth.breakdown.systemPrompt - ctxNone.breakdown.systemPrompt
+      ).toBe(reportText.length + attachmentsText.length);
+    });
+
+    it('未传 attachmentsText → 预算不受影响（token 计 0）', async () => {
+      const common = {
+        history: [] as ConversationTurn[],
+        userInput: 'q',
+        transcript: [{ text: 't', startMs: 0 }],
+        summary: 's',
+        totalTranscriptMs: 0,
+        minLevel: 1 as const,
+        inputBudget: 100_000,
+        buildSystemPrompt: (t: string, s: string) => `<t>${t}</t><s>${s}</s>`,
+        callLLM: vi.fn(),
+        language: 'zh',
+      };
+      const ctxUndefined = await buildChatContext({ ...common });
+      const ctxEmpty = await buildChatContext({ ...common, attachmentsText: '' });
+
+      expect(ctxUndefined.breakdown.total).toBe(ctxEmpty.breakdown.total);
+    });
+
+    it('大附件占用使预算收缩 → 降级到更窄 transcript 窗口（核心不变量）', async () => {
+      // 6 轮 user 对话：L1/L2 用 5 轮窗口，更高级别收到 3 轮甚至 1 轮窗口。
+      // 每轮 user 的 transcriptOffsetMs 单调递增，配合 transcript segments 的 startMs
+      // 使「窗口越窄 → transcriptWindowByTurns 截掉越多前缀 → transcript token 越少」。
+      const history: ConversationTurn[] = [];
+      for (let i = 0; i < 6; i++) {
+        history.push({
+          role: 'user',
+          content: `u${i}`,
+          transcriptOffsetMs: i * 1000,
+        });
+        history.push({
+          role: 'assistant',
+          content: `a${i}`,
+          transcriptOffsetMs: i * 1000,
+        });
+      }
+      // 每个 user 轮对应一段 100 字符 transcript。5 轮窗口 ≈ 500 字符；3 轮 ≈ 300；1 轮 ≈ 100。
+      const transcript: TranscriptSegment[] = [];
+      for (let i = 0; i < 6; i++) {
+        transcript.push({ text: 'T'.repeat(100), startMs: i * 1000 });
+      }
+
+      const common = {
+        history,
+        userInput: 'q',
+        summary: '',
+        transcript,
+        totalTranscriptMs: 6000,
+        minLevel: 1 as const,
+        buildSystemPrompt: (t: string, s: string) => `<t>${t}</t><s>${s}</s>`,
+        callLLM: vi.fn(async () => 'compressed-history'),
+        language: 'zh',
+      };
+
+      // 选一个预算：不带附件时 L1（5 轮窗口）正好塞得下，带大附件时 L1 超预算被迫降级。
+      const baseline = await buildChatContext({
+        ...common,
+        inputBudget: 1_000_000,
+      });
+      // baseline 选到 L1，transcript 含全部 6 段拼接文本（user≤5 轮时窗口=整段，
+      // 这里 6 轮>5 → 5 轮窗口截掉最早 1 段，剩 5 段 ≈ 500 字符）
+      expect(baseline.level).toBe(1);
+
+      const budget = baseline.breakdown.total; // 不带附件时 L1 恰好等于预算
+      const attachmentsText = 'A'.repeat(250); // 占掉 250 token 预算
+
+      const withAttach = await buildChatContext({
+        ...common,
+        inputBudget: budget,
+        attachmentsText,
+      });
+
+      // 附件吃掉预算 → L1 容不下 → 必须降级到更窄窗口（level 上升）
+      expect(withAttach.level).toBeGreaterThan(baseline.level);
+      // 收缩后 transcript token 应严格变小（窗口变窄截掉了更多前缀）
+      expect(withAttach.breakdown.transcript).toBeLessThan(
+        baseline.breakdown.transcript
+      );
+      // 且最终 total（含附件占用）仍被压回预算内
+      expect(withAttach.breakdown.total).toBeLessThanOrEqual(budget);
+    });
+  });
+
   describe('estimateRawContextTokens', () => {
     it('数值合理：> 0 且接近手工估算', () => {
       const transcript: TranscriptSegment[] = [

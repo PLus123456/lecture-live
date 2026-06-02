@@ -30,8 +30,11 @@ export default function TranslationPanel({
   const currentPreviewTranslationText = useTranscriptStore(
     (s) => s.currentPreviewTranslationText
   );
-  const mode = useTranslationStore((s) => s.mode);
-  const setMode = useTranslationStore((s) => s.setMode);
+  // 引擎开关读真实生效的 settings.translationMode（translationStore.mode 无引擎侧消费者，点了没用）。
+  // 面板只暴露 云端/本地 两档；'both' 在引擎侧由本地模型产出译文，故面板上等同“本地”激活态。
+  const translationMode = useSettingsStore((s) => s.translationMode);
+  const setTranslationMode = useSettingsStore((s) => s.setTranslationMode);
+  const usesLocalEngine = translationMode === 'local' || translationMode === 'both';
   const localModelLoaded = useTranslationStore((s) => s.localModelLoaded);
   const localModelProgress = useTranslationStore((s) => s.localModelProgress);
   const localModelStatus = useTranslationStore((s) => s.localModelStatus);
@@ -75,9 +78,9 @@ export default function TranslationPanel({
           {/* Mode toggle */}
           <div className="flex items-center bg-cream-100 rounded-lg p-0.5 border border-cream-200">
             <button
-              onClick={() => setMode('soniox')}
+              onClick={() => setTranslationMode('soniox')}
               className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
-                mode === 'soniox'
+                !usesLocalEngine
                   ? 'bg-white text-rust-600 shadow-sm'
                   : 'text-charcoal-400 hover:text-charcoal-600'
               }`}
@@ -86,9 +89,9 @@ export default function TranslationPanel({
               {t('translationPanel.cloud')}
             </button>
             <button
-              onClick={() => setMode('local')}
+              onClick={() => setTranslationMode('local')}
               className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
-                mode === 'local'
+                usesLocalEngine
                   ? 'bg-white text-rust-600 shadow-sm'
                   : 'text-charcoal-400 hover:text-charcoal-600'
               }`}
@@ -101,7 +104,7 @@ export default function TranslationPanel({
       ) : null}
 
       {/* Model loading progress */}
-      {mode === 'local' && !localModelLoaded && (
+      {usesLocalEngine && !localModelLoaded && (
         <div className="px-5 py-3 bg-cream-50 border-b border-cream-200">
           <div className="flex items-center gap-2 mb-1.5">
             <Loader2 className="w-3.5 h-3.5 text-rust-500 animate-spin" />

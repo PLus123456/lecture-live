@@ -22,6 +22,7 @@ import {
   invalidateRagCache,
   invalidateRagCacheForRecordings,
   makeRagRetrieverForRecordings,
+  retrieveTranscriptByEmbedding,
 } from '@/lib/llm/embedding/transcriptRag';
 
 /**
@@ -267,5 +268,57 @@ describe('invalidateRagCache(sessionId) 清掉所有包含该 id 的 multi-entri
     expect(loadAB.mock.calls.length).toBeGreaterThan(abLoads);
     // AC 应该 hit（loader 不再被调用）
     expect(loadAC.mock.calls.length).toBe(acLoads);
+  });
+});
+
+describe('retrieveTranscriptByEmbedding 单录音内容签名（段数守恒也感知文本变化）', () => {
+  /** 到目前为止所有 embed 调用（含 query 与 chunk-batch）拼成的全文，便于断言新文本被 embed 过 */
+  function allEmbeddedTextsSoFar(): string {
+    return callEmbeddingMock.mock.calls.flatMap((args) => args[0]).join('\n');
+  }
+
+  it('段数不变但某段文本被改写 → 重切重 embed，新内容可检索到', async () => {
+    // 首次：2 段，含 "alpha one"
+    const out1 = await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-a',
+      query: 'beta',
+      transcript: makeSegments(['alpha one', 'filler']),
+      maxTokens: 1000,
+    });
+    expect(out1).not.toContain('beta corrected text');
+
+    // 段数仍为 2，但第二段被重转写（文本变、且字符总长变化）→ 内容签名变 → 重建
+    const out2 = await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-a',
+      query: 'beta',
+      transcript: makeSegments(['alpha one', 'beta corrected text']),
+      maxTokens: 1000,
+    });
+
+    // 改写后的段被重 embed（'beta corrected text' 完整短语只可能来自 chunk-batch，
+    // query 仅是 'beta' 不含该短语）→ 证明发生了重建；且能检索回来。
+    expect(allEmbeddedTextsSoFar()).toContain('beta corrected text');
+    expect(out2).toContain('beta corrected text');
+  });
+
+  it('transcript 完全不变 → 第二次命中缓存，只发一次 query embed，不重 embed chunk', async () => {
+    const transcript = makeSegments(['alpha one', 'filler two']);
+
+    await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-b',
+      query: 'alpha',
+      transcript,
+      maxTokens: 1000,
+    });
+    const callsAfterFirst = callEmbeddingMock.mock.calls.length;
+
+    // 同一份 transcript（段数 + 字符长度都不变）→ 命中缓存：只多一次 query embed
+    await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-b',
+      query: 'alpha',
+      transcript,
+      maxTokens: 1000,
+    });
+    expect(callEmbeddingMock.mock.calls.length).toBe(callsAfterFirst + 1);
   });
 });

@@ -30,9 +30,11 @@ import {
   EMPTY_CONVERSATION_RUNTIME,
   type ThinkingPreference,
 } from '@/stores/chatStore';
+import { findCompressionBoundary } from '@/lib/llm/chatCompression';
 import { toast } from '@/stores/toastStore';
 import type {
   ChatMessage,
+  ChatModelOption,
   ChatModelsResponse,
   ThinkingDepth,
   ThinkingMode,
@@ -107,6 +109,28 @@ function readFileAsDataUrl(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error('read failed'));
     reader.readAsDataURL(file);
   });
+}
+
+/**
+ * 从所选模型的 contextWindow 推导前端展示用的 inputBudget，用作 tokenUsage 种子的
+ * budget（消费方据此算百分比；进入对话即真实而非 0%）。无可用模型信息时返回 0。
+ *
+ * 口径与服务端 tokenBudget.computeContextBudget 一致（与 useChat.ts 同步）：
+ *   inputBudget = (contextWindow - outputMaxTokens) × 0.8
+ * tokenBudget.ts 标了 server-only，故此处内联同样的算式（仅用于 UI 展示）。
+ */
+function deriveBudgetFromModel(
+  models: ReadonlyArray<ChatModelOption>,
+  selectedModel: string
+): number {
+  const model = models.find((m) => m.name === selectedModel);
+  const contextWindow = model?.contextWindow ?? 0;
+  if (contextWindow <= 0) return 0;
+  const outputMaxTokens = Math.max(
+    1,
+    Math.min(4096, Math.floor(contextWindow * 0.25), 8192)
+  );
+  return Math.floor(Math.max(0, contextWindow - outputMaxTokens) * 0.8);
 }
 
 /* ------------------------------------------------------------------ */
@@ -439,6 +463,7 @@ export default function GlobalChat({
     addMessage,
     updateMessage,
     setLoading,
+    setTokenUsage,
     resetConversation,
     setContextFull,
   } = useChatStore();
@@ -524,19 +549,60 @@ export default function GlobalChat({
               id: string;
               role: string;
               content: string;
+              degradationLevel: number | null;
+              inputTokens: number | null;
               createdAt: string;
             }>;
           };
           if (controller.signal.aborted) return;
-          const visible: ChatMessage[] = data.messages
+
+          // 找最近一条压缩边界 → 分割成 archivedMessages + messages（与 useChat.ts 同步）。
+          // 此前 archived 恒传 []：压缩过的对话会把摘要切割点之前的历史全当可见消息
+          // 渲染，且 archivedMessages 切片永远为空（消费方拿不到“已折叠 N 条”）。
+          const compressionBoundary = findCompressionBoundary(data.messages);
+          const toChatMessage = (
+            raw: (typeof data.messages)[number]
+          ): ChatMessage => ({
+            id: raw.id,
+            role: raw.role === 'assistant' ? 'assistant' : 'user',
+            content: raw.content,
+            timestamp: new Date(raw.createdAt).getTime(),
+          });
+          const archived: ChatMessage[] = data.messages
+            .slice(0, compressionBoundary.splitIndex + 1)
             .filter((m) => m.role !== 'system')
-            .map((m) => ({
-              id: m.id,
-              role: m.role === 'assistant' ? 'assistant' : 'user',
-              content: m.content,
-              timestamp: new Date(m.createdAt).getTime(),
-            }));
-          setMessages(conversationId, visible, []);
+            .map(toChatMessage);
+          const visible: ChatMessage[] = data.messages
+            .slice(compressionBoundary.splitIndex + 1)
+            .filter((m) => m.role !== 'system')
+            .map(toChatMessage);
+          setMessages(conversationId, visible, archived);
+
+          // 用最后一条 assistant 消息的 inputTokens 作为已用量种子，budget 由所选模型的
+          // contextWindow 推导（与 useChat.ts 同步）—— 此前从不 setTokenUsage，消费方进入
+          // 对话只能读到 null（百分比 0%）；现在一进来就拿到真实已用量。
+          const lastAssistant = [...data.messages]
+            .reverse()
+            .find((m) => m.role === 'assistant' && m.inputTokens != null);
+          const budget = deriveBudgetFromModel(
+            useChatStore.getState().availableModels,
+            useChatStore.getState().selectedModel
+          );
+          if (lastAssistant?.inputTokens != null || budget > 0) {
+            const used = lastAssistant?.inputTokens ?? 0;
+            setTokenUsage(conversationId, {
+              used,
+              budget,
+              level: lastAssistant?.degradationLevel ?? 1,
+              breakdown: {
+                systemPrompt: 0,
+                transcript: 0,
+                summary: 0,
+                history: used,
+                userInput: 0,
+              },
+            });
+          }
         } catch (err) {
           if ((err as { name?: string })?.name === 'AbortError') return;
           console.error('Failed to load conversation messages:', err);

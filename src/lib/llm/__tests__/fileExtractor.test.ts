@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 
+import ExcelJS from 'exceljs';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -13,8 +14,62 @@ import {
 
 const FIXTURE_DIR = path.resolve(__dirname, '../../../../tests/fixtures');
 
+const MIME_XLSX =
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
 async function readFixture(name: string): Promise<Buffer> {
   return fs.readFile(path.join(FIXTURE_DIR, name));
+}
+
+/** Build a real .xlsx workbook in-memory (exceljs) for round-trip parse tests. */
+async function buildXlsx(): Promise<Buffer> {
+  const wb = new ExcelJS.Workbook();
+  const s1 = wb.addWorksheet('Sheet1');
+  s1.addRow(['Name', 'Age']);
+  s1.addRow(['Alice', 30]);
+  const s2 = wb.addWorksheet('Data');
+  s2.addRow(['x', 'y']);
+  // formula + richText to confirm cell.text flattening is used
+  s2.getCell('A2').value = { formula: '1+1', result: 2 };
+  s2.getCell('B2').value = { richText: [{ text: 'rich ' }, { text: 'text' }] };
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
+/** Minimal, valid single-page PDF whose page content stream prints "Hello PDF". */
+function buildMinimalPdf(): Buffer {
+  const pdf = `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 44 >>
+stream
+BT /F1 24 Tf 100 700 Td (Hello PDF) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f
+0000000009 00000 n
+0000000058 00000 n
+0000000115 00000 n
+0000000241 00000 n
+0000000330 00000 n
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+399
+%%EOF`;
+  return Buffer.from(pdf, 'latin1');
 }
 
 describe('fileExtractor', () => {
@@ -92,6 +147,36 @@ describe('fileExtractor', () => {
           'application/x-foo'
         );
       }
+    });
+  });
+
+  describe('document parsing (xlsx / pdf)', () => {
+    it('extracts cell text from a real .xlsx via exceljs', async () => {
+      const buf = await buildXlsx();
+      const result = await extractTextFromBuffer(buf, MIME_XLSX);
+
+      // sheet headers + values across both worksheets
+      expect(result.text).toContain('# Sheet1');
+      expect(result.text).toContain('Name,Age');
+      expect(result.text).toContain('Alice,30');
+      expect(result.text).toContain('# Data');
+      // cell.text flattens formula result and rich text
+      expect(result.text).toContain('2');
+      expect(result.text).toContain('rich text');
+      expect(result.truncated).toBe(false);
+      // xlsx path does not report pages
+      expect(result.pages).toBeUndefined();
+    });
+
+    it('extracts text and page count from a real PDF via pdf-parse v2', async () => {
+      const buf = buildMinimalPdf();
+      const result = await extractTextFromBuffer(buf, 'application/pdf');
+
+      expect(result.text).toContain('Hello PDF');
+      // pageJoiner:'' must suppress the "-- N of M --" page markers
+      expect(result.text).not.toMatch(/-- \d+ of \d+ --/);
+      expect(result.pages).toBe(1);
+      expect(result.truncated).toBe(false);
     });
   });
 

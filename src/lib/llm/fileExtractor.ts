@@ -1,5 +1,6 @@
 import 'server-only';
 
+import { loadZipGuarded } from '@/lib/fileParser';
 import { logger, serializeError } from '@/lib/logger';
 
 const extractLogger = logger.child({ component: 'file-extractor' });
@@ -78,13 +79,23 @@ export async function extractTextFromBuffer(
 
   try {
     if (mt === MIME_PDF) {
-      const pdfParse = (await import('pdf-parse')).default;
-      const result = await pdfParse(buffer);
-      const { text, truncated } = clamp(result.text || '');
-      return { text, pages: result.numpages, truncated };
+      // pdf-parse v2：具名导出 PDFParse 类（无 default 导出）。
+      // getText({ pageJoiner: '' }) 抽全文；pageJoiner 置空避免注入 "-- N of M --" 页码标记。
+      // result.total = 页数（取代 v1 的 numpages）。务必 destroy() 释放底层 pdfjs 资源。
+      const { PDFParse } = await import('pdf-parse');
+      const parser = new PDFParse({ data: buffer });
+      try {
+        const result = await parser.getText({ pageJoiner: '' });
+        const { text, truncated } = clamp(result.text || '');
+        return { text, pages: result.total, truncated };
+      } finally {
+        await parser.destroy();
+      }
     }
 
     if (mt === MIME_DOCX) {
+      // DOCX 是 ZIP 容器：先做解压炸弹防护再交给 mammoth 解压。
+      await loadZipGuarded(buffer);
       const mammoth = await import('mammoth');
       const result = await mammoth.extractRawText({ buffer });
       const { text, truncated } = clamp(result.value || '');
@@ -92,19 +103,37 @@ export async function extractTextFromBuffer(
     }
 
     if (mt === MIME_XLSX || mt === MIME_XLS) {
-      const xlsx = await import('xlsx');
-      const wb = xlsx.read(buffer, { type: 'buffer' });
+      // .xlsx 是 ZIP（OOXML）容器：先做解压炸弹防护再交给 exceljs 解压。
+      // 注意：exceljs 仅支持 OOXML .xlsx，不支持旧 BIFF 二进制 .xls；遇到真正的 .xls
+      // (OLE 复合文档，非 ZIP) loadZipGuarded 会抛 "not a zip" 被外层 catch 记录后向上抛，
+      // 调用方按"抽取失败"降级（附件仍入库、仅无抽取文本）。换 xlsx→exceljs 的取舍。
+      await loadZipGuarded(buffer);
+      const ExcelJS = (await import('exceljs')).default;
+      const wb = new ExcelJS.Workbook();
+      // exceljs 接受 Buffer|ArrayBuffer；用 Uint8Array.from 复制出独立 ArrayBuffer，
+      // 规避 @types/node 的 Buffer<ArrayBufferLike> 与库声明 Buffer 的泛型不兼容。
+      await wb.xlsx.load(Uint8Array.from(buffer).buffer);
       const parts: string[] = [];
-      for (const sheetName of wb.SheetNames) {
-        const sheet = wb.Sheets[sheetName];
-        if (!sheet) continue;
-        parts.push(`# ${sheetName}\n${xlsx.utils.sheet_to_csv(sheet)}`);
-      }
+      wb.eachSheet((sheet) => {
+        const rows: string[] = [];
+        sheet.eachRow({ includeEmpty: false }, (row) => {
+          const cells: string[] = [];
+          // row.eachCell 跳过空单元格；cell.text 已把公式/富文本/超链接/日期/错误统一成显示文本。
+          row.eachCell({ includeEmpty: false }, (cell) => {
+            const t = cell.text;
+            if (t) cells.push(t);
+          });
+          if (cells.length > 0) rows.push(cells.join(','));
+        });
+        parts.push(`# ${sheet.name}\n${rows.join('\n')}`);
+      });
       const { text, truncated } = clamp(parts.join('\n\n'));
       return { text, truncated };
     }
 
     if (mt === MIME_PPTX) {
+      // PPTX 是 ZIP 容器：交给 officeparser 前先做解压炸弹防护。
+      await loadZipGuarded(buffer);
       // officeparser v7 暴露 `parseOffice(buffer) -> Promise<AST>`，AST 有 `.toText()`。
       // 兼容 CJS 默认导出与 ESM 命名导出。
       const mod = (await import('officeparser')) as {

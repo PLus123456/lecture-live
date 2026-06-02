@@ -43,6 +43,7 @@
     "bcryptjs": "^2.4.3",
     "docx": "^9.6.1",
     "dompurify": "^3.4.2",
+    "exceljs": "^4.4.0",
     "fix-webm-duration": "^1.0.6",
     "gpt-tokenizer": "^3.4.0",
     "html2canvas": "^1.4.1",
@@ -54,14 +55,13 @@
     "mammoth": "^1.8.0",
     "next": "15.5.18",
     "officeparser": "^7.0.3",
-    "pdf-parse": "^1.1.1",
+    "pdf-parse": "^2.4.5",
     "pino": "^9.9.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
-    "xlsx": "^0.18.5",
     "zustand": "^5.0.3"
   },
   "devDependencies": {

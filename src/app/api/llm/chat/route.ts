@@ -290,6 +290,10 @@ function streamChatResponse(
               language: args.language,
               ragRetrieve: args.ragRetriever,
               reportText: args.reportText,
+              // 把附件 system 文本喂进预算计算：它会和 reportText 一样被恒定前置到
+              // 所有降级级别（见下方 systemSegments），传入完整前置串使估算 token 与
+              // 真实发送量一致，降级链才能正确感知附件占用、避免反应式重试到 EOL。
+              attachmentsText: args.attachmentsSystemMessage,
               forceMinLevel: args.forceMinLevel,
             });
             effectiveLevel = ctx.level;

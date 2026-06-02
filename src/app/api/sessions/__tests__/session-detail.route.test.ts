@@ -13,6 +13,7 @@ const {
   releaseStorageBytesMock,
   loadSessionAudioArtifactMock,
   loadSessionTranscriptBundleMock,
+  cancelAsyncUploadMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
@@ -25,6 +26,7 @@ const {
   releaseStorageBytesMock: vi.fn(),
   loadSessionAudioArtifactMock: vi.fn(),
   loadSessionTranscriptBundleMock: vi.fn(),
+  cancelAsyncUploadMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({
@@ -61,6 +63,10 @@ vi.mock('@/lib/sessionPersistence', () => ({
   loadSessionTranscriptBundle: loadSessionTranscriptBundleMock,
 }));
 
+vi.mock('@/lib/audio/asyncUploadProcessor', () => ({
+  cancelAsyncUpload: cancelAsyncUploadMock,
+}));
+
 import { DELETE, GET, PATCH } from '@/app/api/sessions/[id]/route';
 
 const params = Promise.resolve({ id: 'session-1' });
@@ -85,6 +91,7 @@ describe('session detail route', () => {
     sessionDeleteMock.mockResolvedValue({ id: 'session-1' });
     chatAttachmentGroupByMock.mockResolvedValue([]);
     releaseStorageBytesMock.mockResolvedValue(null);
+    cancelAsyncUploadMock.mockReset().mockResolvedValue(undefined);
     transactionMock.mockImplementation(async (operations: unknown[]) => Promise.all(operations));
   });
 
@@ -241,5 +248,79 @@ describe('session detail route', () => {
       where: { id: 'session-1' },
     });
     expect(transactionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('删除进行中的异步上传 session 时先取消（清本地盘 + Soniox 文件）', async () => {
+    const liveSession = {
+      id: 'session-1',
+      userId: 'user-1',
+      title: 'Lecture',
+      status: 'CREATED',
+      serverStartedAt: null,
+      serverPausedAt: null,
+      asyncTranscribeStatus: 'transcribing',
+      sonioxFileId: 'sf-123',
+    };
+    sessionFindUniqueMock.mockResolvedValue(liveSession);
+
+    const response = await DELETE(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'DELETE',
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(200);
+    // 取消必须在删行前发生，且拿到的是同一个 session（cancelAsyncUpload 需要 sonioxFileId）
+    expect(cancelAsyncUploadMock).toHaveBeenCalledTimes(1);
+    expect(cancelAsyncUploadMock).toHaveBeenCalledWith(liveSession);
+    expect(sessionDeleteMock).toHaveBeenCalledWith({ where: { id: 'session-1' } });
+  });
+
+  it.each([['completed'], ['failed'], ['canceled'], [null]])(
+    '删除已收尾(%s)的 session 时不触发异步上传取消',
+    async (status) => {
+      sessionFindUniqueMock.mockResolvedValue({
+        id: 'session-1',
+        userId: 'user-1',
+        title: 'Lecture',
+        status: 'COMPLETED',
+        serverStartedAt: null,
+        serverPausedAt: null,
+        asyncTranscribeStatus: status,
+        sonioxFileId: null,
+      });
+
+      const response = await DELETE(
+        createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+          method: 'DELETE',
+        }),
+        { params }
+      );
+
+      expect(response.status).toBe(200);
+      expect(cancelAsyncUploadMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it('删除会话时按 owner 释放 legacy 对话附件字节', async () => {
+    chatAttachmentGroupByMock.mockResolvedValue([
+      { userId: 'user-1', _sum: { bytes: BigInt(4096) } },
+    ]);
+
+    const response = await DELETE(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'DELETE',
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(200);
+    expect(chatAttachmentGroupByMock).toHaveBeenCalledWith({
+      by: ['userId'],
+      where: { conversation: { sessionId: 'session-1' } },
+      _sum: { bytes: true },
+    });
+    expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 4096);
   });
 });

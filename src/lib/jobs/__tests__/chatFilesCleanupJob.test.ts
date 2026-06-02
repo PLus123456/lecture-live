@@ -7,6 +7,7 @@ const chatAttachmentFindManyMock = vi.fn();
 const chatAttachmentDeleteMock = vi.fn();
 const userQueryRawMock = vi.fn();
 const executeRawMock = vi.fn();
+const transactionMock = vi.fn();
 const siteSettingFindUniqueMock = vi.fn();
 
 vi.mock('@/lib/prisma', () => ({
@@ -20,6 +21,7 @@ vi.mock('@/lib/prisma', () => ({
     },
     $queryRaw: (...args: unknown[]) => userQueryRawMock(...args),
     $executeRaw: (...args: unknown[]) => executeRawMock(...args),
+    $transaction: (...args: unknown[]) => transactionMock(...args),
   },
 }));
 
@@ -88,6 +90,12 @@ describe('runChatFilesCleanup', () => {
     chatAttachmentDeleteMock.mockReset().mockResolvedValue(undefined);
     userQueryRawMock.mockReset().mockResolvedValue([]);
     executeRawMock.mockReset().mockResolvedValue(undefined);
+    // deleteAttachment 现把"删行 + 扣字节"包进 $transaction([...])，原子化。
+    // mock 把传入的 operations 数组 await 掉，使内部 delete/executeRaw 仍被求值、
+    // 各自断言保持有效；任一 operation reject 时整个事务 reject（原子语义）。
+    transactionMock
+      .mockReset()
+      .mockImplementation(async (operations: unknown[]) => Promise.all(operations));
     siteSettingFindUniqueMock.mockReset();
   });
 
@@ -115,10 +123,12 @@ describe('runChatFilesCleanup', () => {
     expect(result.bytesReleased).toBe(BigInt(3000));
     expect(result.errors).toBe(0);
 
-    // 验证 findMany 是按 cutoff 查的（最近 14 天之前）
+    // 验证 findMany 是按 cutoff 查的（最近 14 天之前），且同时约束 createdAt 与
+    // lastAccessedAt —— 只看 createdAt 会把近期仍在使用的旧附件误删。
     expect(chatAttachmentFindManyMock).toHaveBeenCalledTimes(1);
     const findArgs = chatAttachmentFindManyMock.mock.calls[0][0];
     expect(findArgs.where.createdAt.lt).toBeInstanceOf(Date);
+    expect(findArgs.where.lastAccessedAt.lt).toBeInstanceOf(Date);
 
     // 验证每条都被 delete 调到
     expect(chatAttachmentDeleteMock).toHaveBeenCalledTimes(2);

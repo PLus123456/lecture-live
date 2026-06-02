@@ -8,6 +8,7 @@ const {
   conversationSessionCreateManyMock,
   conversationSessionDeleteManyMock,
   sessionCountMock,
+  invalidateRagCacheForRecordingsMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   conversationFindUniqueMock: vi.fn(),
@@ -15,10 +16,17 @@ const {
   conversationSessionCreateManyMock: vi.fn(),
   conversationSessionDeleteManyMock: vi.fn(),
   sessionCountMock: vi.fn(),
+  invalidateRagCacheForRecordingsMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({
   verifyAuth: verifyAuthMock,
+}));
+
+// transcriptRag 标了 server-only 并依赖 gateway —— route 测试里 stub 掉，只断言被调用
+// （增删录音后必须使该对话录音组合的 RAG multi-cache 失效）。
+vi.mock('@/lib/llm/embedding/transcriptRag', () => ({
+  invalidateRagCacheForRecordings: invalidateRagCacheForRecordingsMock,
 }));
 
 vi.mock('@/lib/logger', () => ({
@@ -195,6 +203,8 @@ describe('recordings route', () => {
       });
       const body = await readJson<{ recordings: Array<{ sessionId: string }> }>(response);
       expect(body.recordings.map((r) => r.sessionId)).toEqual(['s1', 's2']);
+      // 挂载后用更新后的录音组合使 RAG multi-cache 失效
+      expect(invalidateRagCacheForRecordingsMock).toHaveBeenCalledWith(['s1', 's2']);
     });
   });
 
@@ -228,6 +238,8 @@ describe('recordings route', () => {
       });
       const body = await readJson<{ recordings: Array<unknown> }>(response);
       expect(body.recordings).toEqual([]);
+      // 删除后剩余组合为空，仍要使旧 multi-cache 失效
+      expect(invalidateRagCacheForRecordingsMock).toHaveBeenCalledWith([]);
     });
   });
 });

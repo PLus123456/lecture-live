@@ -66,11 +66,25 @@ describe('GET /api/admin/cloudreve/authorize', () => {
     expect(isCloudreveConfiguredAsyncMock).toHaveBeenCalledTimes(1);
     const redirectUri = buildAuthorizeUrlMock.mock.calls[0]?.[0];
     expect(redirectUri).toMatch(/\/api\/admin\/cloudreve\/callback$/);
-    expect(siteSettingUpsertMock).toHaveBeenNthCalledWith(1, {
-      where: { key: 'cloudreve_code_verifier' },
-      update: { value: 'verifier-123' },
-      create: { key: 'cloudreve_code_verifier', value: 'verifier-123' },
-    });
+
+    // code_verifier 现在以 JSON `{ v, exp }` 编码写入，携带 10 分钟 TTL，
+    // 而非裸明文 —— callback 取用时校验未过期。
+    const verifierCall = siteSettingUpsertMock.mock.calls[0]?.[0] as {
+      where: { key: string };
+      update: { value: string };
+      create: { key: string; value: string };
+    };
+    expect(verifierCall.where).toEqual({ key: 'cloudreve_code_verifier' });
+    expect(verifierCall.create.key).toBe('cloudreve_code_verifier');
+    expect(verifierCall.update.value).toBe(verifierCall.create.value);
+    const decoded = JSON.parse(verifierCall.update.value) as {
+      v: string;
+      exp: number;
+    };
+    expect(decoded.v).toBe('verifier-123');
+    expect(decoded.exp).toBeGreaterThan(Date.now());
+    expect(decoded.exp).toBeLessThanOrEqual(Date.now() + 10 * 60 * 1000);
+
     expect(siteSettingUpsertMock).toHaveBeenNthCalledWith(2, {
       where: { key: 'cloudreve_redirect_uri' },
       update: { value: redirectUri },

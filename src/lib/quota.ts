@@ -165,6 +165,31 @@ export async function getQuotaSnapshot(
   return user ? toQuotaSnapshot(user) : null;
 }
 
+/**
+ * 实时计算某用户已用的"录音存储小时"。
+ *
+ * 口径：SUM(session.durationMs)/3600000，覆盖该用户全部 session。删录音即删 Session 行
+ *（见 DELETE /api/sessions/[id]，整行级联删除，无"删录音留行"路径），故对剩余行求和即为
+ * 当前真实占用——天然随删除回落、无漂移，也无须 increment 维护 storageHoursUsed 列。
+ *
+ * 注意：与按月重置的 transcriptionMinutesUsed 不同，录音存储是累计占用、不随配额周期重置，
+ * 因此这里不按 quotaResetAt 截断，聚合全部历史 session。
+ */
+export async function getStorageHoursUsed(
+  userId: string,
+  db: QuotaDbClient = prisma
+): Promise<number> {
+  const agg = await db.session.aggregate({
+    where: { userId },
+    _sum: { durationMs: true },
+  });
+  const totalMs = agg._sum.durationMs ?? 0;
+  if (!Number.isFinite(totalMs) || totalMs <= 0) {
+    return 0;
+  }
+  return totalMs / 3_600_000;
+}
+
 export async function checkQuota(
   userId: string,
   type: QuotaCheckType
@@ -181,8 +206,12 @@ export async function checkQuota(
   switch (type) {
     case 'transcription_minutes':
       return user.transcriptionMinutesUsed < user.transcriptionMinutesLimit;
-    case 'storage_hours':
-      return user.storageHoursUsed < user.storageHoursLimit;
+    case 'storage_hours': {
+      // storageHoursUsed 列从不 increment（死维度）；实时用 SUM(durationMs)/3600000 作为
+      // 已用量，与 storageHoursLimit 比较。这样删录音后占用自动回落，杜绝"恒 0<limit 恒真"。
+      const usedHours = await getStorageHoursUsed(userId);
+      return usedHours < user.storageHoursLimit;
+    }
     case 'storage_bytes':
       return user.storageBytesUsed < user.storageBytesLimit;
     default:
@@ -235,36 +264,23 @@ export async function deductTranscriptionMinutes(
 export async function resetExpiredTranscriptionQuotas(
   now = new Date()
 ): Promise<number> {
-  const expiredUsers = await prisma.user.findMany({
+  const nextResetAt = getNextQuotaResetAt(now);
+
+  // 乐观锁条件重置（对齐 ensureQuotaWindow 的 updateMany WHERE quotaResetAt<=now）：
+  // 单条原子 updateMany 取代"先 findMany 再逐个无条件 update"。无条件 update 会与请求
+  // 路径上的 ensureQuotaWindow / 扣费在毫秒级并发时互相覆写——把刚被重置并扣过费的窗口
+  // 再次清零（白送额度）。以 updateMany 的 count 为返回值，且消除 findMany→update 的 TOCTOU。
+  const result = await prisma.user.updateMany({
     where: {
-      quotaResetAt: {
-        lte: now,
-      },
+      quotaResetAt: { lte: now },
     },
-    select: {
-      id: true,
+    data: {
+      transcriptionMinutesUsed: 0,
+      quotaResetAt: nextResetAt,
     },
   });
 
-  if (expiredUsers.length === 0) {
-    return 0;
-  }
-
-  const nextResetAt = getNextQuotaResetAt(now);
-
-  await prisma.$transaction(
-    expiredUsers.map((user) =>
-      prisma.user.update({
-        where: { id: user.id },
-        data: {
-          transcriptionMinutesUsed: 0,
-          quotaResetAt: nextResetAt,
-        },
-      })
-    )
-  );
-
-  return expiredUsers.length;
+  return result.count;
 }
 
 /**
@@ -456,4 +472,58 @@ export async function releaseStorageBytes(
     select: QUOTA_USER_SELECT,
   });
   return refreshed ? toQuotaSnapshot(refreshed) : null;
+}
+
+/**
+ * 原子预留转录分钟（用于异步上传入口的"先占额度"门禁）。
+ *
+ * 与 deductTranscriptionMinutes 的区别：这是**条件原子**扣减——只有当
+ * `transcriptionMinutesUsed + minutes <= transcriptionMinutesLimit` 时才真正写库并返回 true；
+ * 否则不写库、返回 false。用一条 `UPDATE ... WHERE` 完成校验+扣减，杜绝"先 checkQuota 再上传"
+ * 之间的并发击穿（多个上传同时通过非原子读检查、叠加后超额），也修正"还剩 1 分钟仍放行
+ * 300 分钟文件"的投影漏洞（按声明时长投影后再判 limit）。
+ *
+ * 先 ensureQuotaWindow 做跨月窗口校正，再原子预留——保证预留落在正确的当月窗口。
+ * ADMIN 视为无限：直接放行、不写库、返回 true。
+ * 调用方在后续步骤失败时应调用 releaseTranscriptionMinutes 回滚预留的额度。
+ */
+export async function reserveTranscriptionMinutes(
+  userId: string,
+  minutes: number,
+  db: QuotaDbClient = prisma
+): Promise<boolean> {
+  const user = await ensureQuotaWindow(userId, new Date(), db);
+  if (!user) return false;
+  if (user.role === 'ADMIN') return true;
+
+  const normalized = normalizeNonNegativeAmount(minutes);
+  if (normalized <= 0) return true;
+
+  // 条件原子扣减：仅当扣减后不超过 limit 才更新。affectedRows=1 表示预留成功。
+  const affected = await db.$executeRaw`
+    UPDATE User
+    SET transcriptionMinutesUsed = transcriptionMinutesUsed + ${normalized}
+    WHERE id = ${userId}
+      AND transcriptionMinutesUsed + ${normalized} <= transcriptionMinutesLimit
+  `;
+  return affected === 1;
+}
+
+/**
+ * 回滚 reserveTranscriptionMinutes 预留的分钟（低于 0 截断到 0）。
+ * 用 raw SQL + GREATEST 保证不会减到负数（Prisma decrement 不带 GREATEST）。
+ */
+export async function releaseTranscriptionMinutes(
+  userId: string,
+  minutes: number,
+  db: QuotaDbClient = prisma
+): Promise<void> {
+  const normalized = normalizeNonNegativeAmount(minutes);
+  if (normalized <= 0) return;
+
+  await db.$executeRaw`
+    UPDATE User
+    SET transcriptionMinutesUsed = GREATEST(0, transcriptionMinutesUsed - ${normalized})
+    WHERE id = ${userId}
+  `;
 }

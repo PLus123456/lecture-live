@@ -7,6 +7,7 @@ const {
   userUpdateManyMock,
   executeRawMock,
   chatAttachmentGroupByMock,
+  sessionAggregateMock,
 } = vi.hoisted(() => ({
   userFindUniqueMock: vi.fn(),
   userFindManyMock: vi.fn(),
@@ -14,6 +15,7 @@ const {
   userUpdateManyMock: vi.fn(),
   executeRawMock: vi.fn(),
   chatAttachmentGroupByMock: vi.fn(),
+  sessionAggregateMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -26,6 +28,9 @@ vi.mock('@/lib/prisma', () => ({
     },
     chatAttachment: {
       groupBy: chatAttachmentGroupByMock,
+    },
+    session: {
+      aggregate: sessionAggregateMock,
     },
     $executeRaw: executeRawMock,
   },
@@ -46,6 +51,11 @@ import {
   reserveStorageBytes,
   reconcileStorageBytes,
   deductTranscriptionMinutes,
+  reserveTranscriptionMinutes,
+  releaseTranscriptionMinutes,
+  resetExpiredTranscriptionQuotas,
+  getStorageHoursUsed,
+  checkQuota,
 } from '@/lib/quota';
 
 const futureReset = new Date('2099-01-01T00:00:00.000Z');
@@ -458,5 +468,185 @@ describe('deductTranscriptionMinutes', () => {
     expect(userFindUniqueMock).not.toHaveBeenCalled();
     expect(userUpdateMock).not.toHaveBeenCalled();
     expect(snap?.transcriptionMinutesUsed).toBe(7);
+  });
+});
+
+describe('reserveTranscriptionMinutes', () => {
+  beforeEach(() => {
+    userFindUniqueMock.mockReset();
+    userUpdateManyMock.mockReset();
+    executeRawMock.mockReset();
+  });
+
+  it('正向：额度足够时条件原子预扣成功返回 true', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(freeUser()); // ensureQuotaWindow，窗口未过期
+    executeRawMock.mockResolvedValueOnce(1); // affectedRows=1 → 预留成功
+
+    const ok = await reserveTranscriptionMinutes('user-free', 30);
+
+    expect(ok).toBe(true);
+    expect(executeRawMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('配额不足：条件 UPDATE 影响 0 行 → 返回 false（投影后超 limit）', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(freeUser());
+    executeRawMock.mockResolvedValueOnce(0); // used+est > limit → 不更新
+
+    const ok = await reserveTranscriptionMinutes('user-free', 300);
+
+    expect(ok).toBe(false);
+    expect(executeRawMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('边界：ADMIN 视为无限，不走 SQL 直接 true', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(adminUser());
+
+    const ok = await reserveTranscriptionMinutes('user-admin', 9999);
+
+    expect(ok).toBe(true);
+    expect(executeRawMock).not.toHaveBeenCalled();
+  });
+
+  it('边界：minutes <= 0 / NaN 直接 true 不写库', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(freeUser());
+    expect(await reserveTranscriptionMinutes('user-free', 0)).toBe(true);
+
+    userFindUniqueMock.mockResolvedValueOnce(freeUser());
+    expect(await reserveTranscriptionMinutes('user-free', NaN)).toBe(true);
+
+    expect(executeRawMock).not.toHaveBeenCalled();
+  });
+
+  it('边界：用户不存在返回 false', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(null);
+
+    const ok = await reserveTranscriptionMinutes('missing', 10);
+
+    expect(ok).toBe(false);
+    expect(executeRawMock).not.toHaveBeenCalled();
+  });
+
+  it('跨月窗口：过期 → ensureQuotaWindow 先乐观锁重置，再在新窗口预留', async () => {
+    const expired = new Date('2020-01-01T00:00:00.000Z');
+    // 1st findUnique：拿到过期用户
+    userFindUniqueMock.mockResolvedValueOnce({
+      ...freeUser(),
+      transcriptionMinutesUsed: 55,
+      quotaResetAt: expired,
+    });
+    userUpdateManyMock.mockResolvedValueOnce({ count: 1 }); // 乐观锁重置成功
+    // 2nd findUnique：重置后的用户（新窗口已用 0）
+    userFindUniqueMock.mockResolvedValueOnce(freeUser());
+    executeRawMock.mockResolvedValueOnce(1); // 预留成功
+
+    const ok = await reserveTranscriptionMinutes('user-free', 30);
+
+    expect(userUpdateManyMock).toHaveBeenCalledTimes(1);
+    expect(ok).toBe(true);
+  });
+});
+
+describe('releaseTranscriptionMinutes', () => {
+  beforeEach(() => {
+    executeRawMock.mockReset();
+  });
+
+  it('正向：用 raw SQL 回滚预留的分钟（GREATEST 防负）', async () => {
+    executeRawMock.mockResolvedValueOnce(1);
+
+    await releaseTranscriptionMinutes('user-free', 30);
+
+    expect(executeRawMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('边界：minutes <= 0 / NaN 不触发 SQL', async () => {
+    await releaseTranscriptionMinutes('user-free', 0);
+    await releaseTranscriptionMinutes('user-free', -5);
+    await releaseTranscriptionMinutes('user-free', NaN);
+
+    expect(executeRawMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('getStorageHoursUsed', () => {
+  beforeEach(() => {
+    sessionAggregateMock.mockReset();
+  });
+
+  it('实时 SUM(durationMs)/3600000：3 小时 = 10_800_000ms → 3', async () => {
+    sessionAggregateMock.mockResolvedValueOnce({ _sum: { durationMs: 10_800_000 } });
+
+    const hours = await getStorageHoursUsed('user-free');
+
+    expect(hours).toBe(3);
+    expect(sessionAggregateMock).toHaveBeenCalledWith({
+      where: { userId: 'user-free' },
+      _sum: { durationMs: true },
+    });
+  });
+
+  it('无 session（_sum.durationMs 为 null）→ 0', async () => {
+    sessionAggregateMock.mockResolvedValueOnce({ _sum: { durationMs: null } });
+
+    expect(await getStorageHoursUsed('user-free')).toBe(0);
+  });
+});
+
+describe("checkQuota('storage_hours')", () => {
+  beforeEach(() => {
+    userFindUniqueMock.mockReset();
+    sessionAggregateMock.mockReset();
+  });
+
+  it('实时用量 < limit → 放行 true', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(freeUser()); // limit=10h
+    sessionAggregateMock.mockResolvedValueOnce({ _sum: { durationMs: 5 * 3_600_000 } }); // 5h
+
+    expect(await checkQuota('user-free', 'storage_hours')).toBe(true);
+  });
+
+  it('实时用量 >= limit → 拦截 false（修死维度恒真）', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(freeUser()); // limit=10h
+    sessionAggregateMock.mockResolvedValueOnce({ _sum: { durationMs: 10 * 3_600_000 } }); // 10h，恰好顶满
+
+    expect(await checkQuota('user-free', 'storage_hours')).toBe(false);
+  });
+
+  it('ADMIN 永远放行，不查 session', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(adminUser());
+
+    expect(await checkQuota('user-admin', 'storage_hours')).toBe(true);
+    expect(sessionAggregateMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('resetExpiredTranscriptionQuotas', () => {
+  beforeEach(() => {
+    userUpdateManyMock.mockReset();
+    userFindManyMock.mockReset();
+  });
+
+  it('用乐观锁 updateMany WHERE quotaResetAt<=now 条件重置，返回 count', async () => {
+    userUpdateManyMock.mockResolvedValueOnce({ count: 3 });
+
+    const now = new Date('2026-02-01T00:00:00.000Z');
+    const count = await resetExpiredTranscriptionQuotas(now);
+
+    expect(count).toBe(3);
+    // 不再先 findMany 再逐个 update —— 单条原子 updateMany
+    expect(userFindManyMock).not.toHaveBeenCalled();
+    expect(userUpdateManyMock).toHaveBeenCalledWith({
+      where: { quotaResetAt: { lte: now } },
+      data: {
+        transcriptionMinutesUsed: 0,
+        quotaResetAt: new Date('2099-01-01T00:00:00.000Z'),
+      },
+    });
+  });
+
+  it('无过期窗口：updateMany count=0 → 返回 0', async () => {
+    userUpdateManyMock.mockResolvedValueOnce({ count: 0 });
+
+    expect(await resetExpiredTranscriptionQuotas(new Date())).toBe(0);
   });
 });

@@ -29,6 +29,7 @@ import { callLLM, getProviderForPurpose } from '@/lib/llm/gateway';
 import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
 import { generateSessionReport, generateSessionTitle } from '@/lib/llm/reportManager';
 import { logSystemEvent } from '@/lib/auditLog';
+import { logger, serializeError } from '@/lib/logger';
 import { trackJob, JOB_TYPE } from '@/lib/jobQueue';
 import {
   invalidateFoldersApiCache,
@@ -244,8 +245,15 @@ export async function finalizeSession(
       normalizedClientDurationMs &&
       Math.abs(normalizedClientDurationMs - finalDurationMs) >= 60_000
     ) {
-      console.warn(
-        `[finalize] duration mismatch session=${session.id} client=${normalizedClientDurationMs}ms server=${serverDurationMs}ms transcript=${transcriptDurationMs}ms final=${finalDurationMs}ms`
+      logger.warn(
+        {
+          sessionId: session.id,
+          clientMs: normalizedClientDurationMs,
+          serverMs: serverDurationMs,
+          transcriptMs: transcriptDurationMs,
+          finalMs: finalDurationMs,
+        },
+        '[finalize] duration mismatch'
       );
     }
 
@@ -528,7 +536,10 @@ export async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
     const bundle =
       params.bundle ?? (await loadSessionTranscriptBundle(sessionForLoad));
     if (!bundle || bundle.segments.length === 0) {
-      console.warn(`[finalize-bg] ${params.sessionId}: no transcript data, skip LLM`);
+      logger.warn(
+        { sessionId: params.sessionId },
+        '[finalize-bg] no transcript data, skip LLM'
+      );
       return;
     }
 
@@ -554,9 +565,13 @@ export async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
             return { folderId };
           }
         ).catch((error) => {
-          console.error(
-            `[finalize-bg] keyword extraction failed folder=${folderId}:`,
-            error
+          logger.error(
+            {
+              sessionId: params.sessionId,
+              folderId,
+              err: serializeError(error),
+            },
+            '[finalize-bg] keyword extraction failed'
           );
         });
       })
@@ -606,7 +621,10 @@ export async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
       // 步骤 2: 标题生成（仅覆盖默认标题）
       const DEFAULT_TITLES = ['新建讲座会话', 'New Lecture Session'];
       if (!DEFAULT_TITLES.includes(params.title)) {
-        console.log(`[finalize-bg] ${params.sessionId}: custom title, skip title generation`);
+        logger.info(
+          { sessionId: params.sessionId },
+          '[finalize-bg] custom title, skip title generation'
+        );
         return;
       }
 
@@ -640,7 +658,10 @@ export async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
         }
       );
     })().catch((error) => {
-      console.error('[finalize-bg] report/title generation failed:', error);
+      logger.error(
+        { sessionId: params.sessionId, err: serializeError(error) },
+        '[finalize-bg] report/title generation failed'
+      );
     });
 
     await Promise.allSettled([keywordPromise, reportAndTitlePromise]);
@@ -648,11 +669,14 @@ export async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
       invalidateSessionsApiCache(params.userId),
       invalidateFoldersApiCache(params.userId),
     ]);
-    console.log(`[finalize-bg] ${params.sessionId}: background tasks completed`);
+    logger.info(
+      { sessionId: params.sessionId },
+      '[finalize-bg] background tasks completed'
+    );
   } catch (error) {
-    console.error(
-      `[finalize-bg] ${params.sessionId}: background task failed:`,
-      error
+    logger.error(
+      { sessionId: params.sessionId, err: serializeError(error) },
+      '[finalize-bg] background task failed'
     );
   }
 }

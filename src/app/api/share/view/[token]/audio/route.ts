@@ -2,8 +2,17 @@ import { prisma } from '@/lib/prisma';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { sanitizeToken } from '@/lib/security';
 import { loadSessionAudioArtifact } from '@/lib/sessionPersistence';
+import { CloudreveStorage } from '@/lib/storage/cloudreve';
 
 const PLAYBACK_STATUSES = new Set(['COMPLETED', 'ARCHIVED']);
+
+/** 从录音引用的扩展名推断音频 MIME（与 sessionPersistence 的推断保持一致）。 */
+function audioContentTypeFromPath(reference: string): string {
+  const normalized = reference.toLowerCase();
+  return normalized.endsWith('.mp4') || normalized.endsWith('.m4a')
+    ? 'audio/mp4'
+    : 'audio/webm';
+}
 
 // 公开 API：通过分享 token 获取已完成会话的音频（无需认证）
 // 严格限流防止流量滥用
@@ -71,6 +80,47 @@ export async function GET(
     );
   }
 
+  const range = req.headers.get('range');
+
+  // Cloudreve 后端：直接流式透传远程文件体，不把整个录音读进内存（大录音会 OOM）。
+  // recordingPath 以 '/' 开头即为 Cloudreve 远程路径；本地文件（local: 前缀）走下方
+  // 缓冲分支（从磁盘读取，非 OOM 风险点）。
+  // 流式失败时不直接 404，而是落到下方缓冲分支 —— 后者还会尝试本地候选文件，
+  // 保持与原有 loadSessionAudioArtifact 回退行为一致。
+  const recordingPath = link.session.recordingPath;
+  if (recordingPath && recordingPath.startsWith('/')) {
+    try {
+      const storage = await CloudreveStorage.create();
+      const upstream = await storage.openDownloadStream(recordingPath, {
+        expectedUserId: link.session.userId,
+        range,
+      });
+
+      const contentType = audioContentTypeFromPath(recordingPath);
+      const headers = new Headers({
+        'Content-Type': contentType,
+        'Accept-Ranges': 'bytes',
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'no-referrer',
+      });
+      // 透传上游长度 / 断点续传相关头
+      for (const name of ['content-length', 'content-range']) {
+        const value = upstream.headers.get(name);
+        if (value) {
+          headers.set(name, value);
+        }
+      }
+
+      return new Response(upstream.body, {
+        status: upstream.status === 206 ? 206 : 200,
+        headers,
+      });
+    } catch (error) {
+      // 流式失败（含 416 / 远程节点错误 / 配置缺失）：落到缓冲回退分支
+      console.error('Share audio stream error, falling back to buffered load:', error);
+    }
+  }
+
   try {
     const artifact = await loadSessionAudioArtifact(link.session);
     if (!artifact) {
@@ -83,8 +133,7 @@ export async function GET(
     const data = artifact.data;
     const totalSize = data.length;
 
-    // 支持 Range 请求（音频流式播放）
-    const range = req.headers.get('range');
+    // 支持 Range 请求（音频流式播放）—— range 已在上方读取
     if (range) {
       const match = range.match(/bytes=(\d+)-(\d*)/);
       if (match) {

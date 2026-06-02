@@ -67,8 +67,13 @@ export async function runChatFilesCleanup(): Promise<ChatFilesCleanupResult> {
   // ─── Aging cleanup ───
   if (retentionDays > 0) {
     const cutoff = new Date(Date.now() - retentionDays * 86_400_000);
+    // 必须同时满足 createdAt < cutoff 且 lastAccessedAt < cutoff：仅看 createdAt 会把
+    // 14 天前上传、但近期仍在引用的附件误删（RAG 检索/聊天会刷新 lastAccessedAt）。
     const stale = await prisma.chatAttachment.findMany({
-      where: { createdAt: { lt: cutoff } },
+      where: {
+        createdAt: { lt: cutoff },
+        lastAccessedAt: { lt: cutoff },
+      },
       select: {
         id: true,
         userId: true,
@@ -168,8 +173,10 @@ export async function runChatFilesCleanup(): Promise<ChatFilesCleanupResult> {
 /**
  * 删除一条 ChatAttachment：
  *   1) 先尽力删 Cloudreve 物理文件（失败不抛 — 删不掉就让它残留，配置/网络问题不应阻塞 DB 清理）
- *   2) 然后删 DB 行（一旦走到这步必须成功，否则下次循环还会撞上同一条）
- *   3) 用 raw SQL 把 user.storageBytesUsed 减掉，GREATEST(0, ...) 防止负数
+ *   2) 然后删 DB 行 + 扣字节（一旦走到这步必须成功，否则下次循环还会撞上同一条）
+ *      —— 二者包进同一事务，保证原子：要么行删掉且字节扣掉，要么都不变；
+ *      避免"行已删但扣字节失败"导致 storageBytesUsed 永久虚高（字节鬼占配额）。
+ *      GREATEST(0, ...) 防止减到负数。
  */
 async function deleteAttachment(
   att: AttachmentRow,
@@ -182,13 +189,14 @@ async function deleteAttachment(
     }
   }
 
-  await prisma.chatAttachment.delete({ where: { id: att.id } });
-
-  await prisma.$executeRaw`
-    UPDATE User
-    SET storageBytesUsed = GREATEST(0, CAST(storageBytesUsed AS SIGNED) - ${att.bytes})
-    WHERE id = ${att.userId}
-  `;
+  await prisma.$transaction([
+    prisma.chatAttachment.delete({ where: { id: att.id } }),
+    prisma.$executeRaw`
+      UPDATE User
+      SET storageBytesUsed = GREATEST(0, CAST(storageBytesUsed AS SIGNED) - ${att.bytes})
+      WHERE id = ${att.userId}
+    `,
+  ]);
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   invalidateShareLinksApiCache,
 } from '@/lib/apiResponseCache';
 import { logAction } from '@/lib/auditLog';
+import { releaseStorageBytes } from '@/lib/quota';
 
 type StatusFilter = '' | 'has-recording' | 'no-recording' | 'completed' | 'archived' | 'recording';
 
@@ -183,12 +184,31 @@ export async function DELETE(req: Request) {
 
     const targetIds = targets.map((t) => t.id);
 
+    // 删 session 会级联删 legacy 单录音对话(Conversation.sessionId 命中)及其 ChatAttachment
+    // (schema onDelete: Cascade)。这些字节必须释放，否则永久"鬼占"用户配额、只增不减。
+    // 全局多录音对话经 ConversationSession 联表挂载，删 session 只级联联表行、对话与附件保留，
+    // 故仅聚合 legacy 对话的附件字节，按 owner 分组（删后逐用户 release）。
+    // 对照用户侧实现：src/app/api/sessions/[id]/route.ts。
+    const releasableBytes = await prisma.chatAttachment.groupBy({
+      by: ['userId'],
+      where: { conversation: { sessionId: { in: targetIds } } },
+      _sum: { bytes: true },
+    });
+
     // 事务：删除外键关联，再删 session 本体
     await prisma.$transaction([
       prisma.folderSession.deleteMany({ where: { sessionId: { in: targetIds } } }),
       prisma.shareLink.deleteMany({ where: { sessionId: { in: targetIds } } }),
       prisma.session.deleteMany({ where: { id: { in: targetIds } } }),
     ]);
+
+    // session 删除成功后释放字节配额（best-effort；失败留给字节对账兜底）
+    for (const row of releasableBytes) {
+      const bytes = row._sum.bytes;
+      if (bytes && bytes > BigInt(0)) {
+        await releaseStorageBytes(row.userId, Number(bytes)).catch(() => undefined);
+      }
+    }
 
     // 失效所有受影响用户的缓存
     const ownerIds = [...new Set(targets.map((t) => t.userId))];

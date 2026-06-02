@@ -94,6 +94,19 @@ export interface ChatContextInput {
    * breakdown.systemPrompt，保证预算不被撑爆。
    */
   reportText?: string;
+  /**
+   * 可选：会话附件（文档/文本）抽取后拼好的 system 消息文本。和 reportText 一样
+   * 由调用方拼到 messages 头部作为独立 system 段，恒定前置在所有降级级别（含 L6/L7）。
+   *
+   * 与 reportText 不同，这里**不做**额外截断 —— 调用方（buildAttachmentsSystemMessage）
+   * 已对单文件 80K、总量 80K 字符做过截断。本字段只负责把这部分文本的估算 token
+   * 计入 breakdown.systemPrompt / total，让降级链感知附件占用、正确收缩窗口，
+   * 避免长附件破坏降级不变量、一路反应式重试到 EOL。
+   *
+   * 注意：传入应是调用方**最终前置的完整字符串**（含其外层 header 包裹），
+   * 这样 token 估算才与真实发送量一致。
+   */
+  attachmentsText?: string;
 }
 
 export interface TokenBreakdown {
@@ -297,6 +310,11 @@ interface BuildState {
   reportText?: string;
   /** reportText 的 token 估算（预先算好，避免在 7 级降级循环里重复 encode 8000 字符）。 */
   reportTokens: number;
+  /**
+   * attachments system 文本的 token 估算（预先算好，避免在 7 级降级循环里重复 encode
+   * 最多 80K 字符）。调用方负责把文本本身前置进 messages，这里只计预算。
+   */
+  attachmentsTokens: number;
 }
 
 function assembleOutput(
@@ -328,13 +346,16 @@ function assembleOutput(
   const messageTokens =
     finalHistory.reduce((acc, m) => acc + estimateTokens(m.content), 0) +
     estimateTokens(state.userInput);
-  // reportText 由调用方拼到 messages 头部作为独立 system 消息 —— 把它的
-  // token 估算计进 breakdown.systemPrompt 和 total，让降级判定知道这部分占用。
-  // 使用 state.reportTokens（buildChatContext 入口已算过一次），避免在降级循环里重复 encode。
+  // reportText 与 attachmentsText 都由调用方拼到 messages 头部作为独立 system 消息 ——
+  // 把它们的 token 估算计进 breakdown.systemPrompt 和 total，让降级判定知道这部分占用。
+  // 使用 state 里预先算好的值（buildChatContext 入口各算过一次），避免在降级循环里重复 encode。
   const reportTokens = state.reportTokens;
+  const attachmentsTokens = state.attachmentsTokens;
   const breakdown: TokenBreakdown = {
     systemPrompt:
-      estimateTokens(state.buildSystemPrompt('', '')) + reportTokens,
+      estimateTokens(state.buildSystemPrompt('', '')) +
+      reportTokens +
+      attachmentsTokens,
     timeAnchor: estimateTokens(state.timeAnchor),
     transcript: estimateTokens(transcriptText),
     summary: estimateTokens(summaryText),
@@ -342,7 +363,11 @@ function assembleOutput(
       (compressedHeader ? estimateTokens(compressedHeader) : 0) +
       finalHistory.reduce((acc, m) => acc + estimateTokens(m.content), 0),
     userInput: estimateTokens(state.userInput),
-    total: estimateTokens(systemPrompt) + messageTokens + reportTokens,
+    total:
+      estimateTokens(systemPrompt) +
+      messageTokens +
+      reportTokens +
+      attachmentsTokens,
   };
 
   const output: ChatContextOutput = { systemPrompt, messages, level, breakdown };
@@ -378,6 +403,11 @@ export async function buildChatContext(
     ragRetrieve: input.ragRetrieve,
     reportText: truncatedReport,
     reportTokens: truncatedReport ? estimateTokens(truncatedReport) : 0,
+    // attachments 文本不在此截断（调用方已限定 80K）；只预估 token 计入预算，
+    // 入口算一次，避免 7 级降级循环里反复 encode 最多 80K 字符。
+    attachmentsTokens: input.attachmentsText
+      ? estimateTokens(input.attachmentsText)
+      : 0,
   };
 
   let lastBreakdown: TokenBreakdown | null = null;

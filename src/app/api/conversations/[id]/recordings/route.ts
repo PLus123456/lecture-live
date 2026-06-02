@@ -13,6 +13,7 @@ import {
   assertConversationOwnership,
   ownershipErrorResponse,
 } from '@/lib/conversations';
+import { invalidateRagCacheForRecordings } from '@/lib/llm/embedding/transcriptRag';
 import { logger, serializeError } from '@/lib/logger';
 
 const apiLogger = logger.child({ component: 'conversation-recordings-api' });
@@ -162,7 +163,13 @@ export async function POST(
     );
   }
 
-  return NextResponse.json({ recordings: await listRecordings(id) });
+  const recordings = await listRecordings(id);
+  // 挂载集合变了 → 该对话下次 chat 会以新的录音组合为 cache key 重建 RAG；这里主动清掉
+  // 恰好命中“新组合”的旧 multi-entry（若历史上曾出现过同一组合且其中某录音 transcript
+  // 已变动），避免复用陈旧向量。死代码 invalidateRagCacheForRecordings 的唯一生产接线。
+  invalidateRagCacheForRecordings(recordings.map((r) => r.sessionId));
+
+  return NextResponse.json({ recordings });
 }
 
 export async function DELETE(
@@ -198,5 +205,10 @@ export async function DELETE(
     );
   }
 
-  return NextResponse.json({ recordings: await listRecordings(id) });
+  const recordings = await listRecordings(id);
+  // 同 POST：移除录音后挂载集合变了，主动清掉恰好命中“新组合”的旧 multi-entry，
+  // 避免该对话下次 chat 复用基于旧组合快照的陈旧向量。
+  invalidateRagCacheForRecordings(recordings.map((r) => r.sessionId));
+
+  return NextResponse.json({ recordings });
 }

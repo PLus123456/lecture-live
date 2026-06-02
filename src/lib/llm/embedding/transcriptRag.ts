@@ -27,6 +27,12 @@ interface RagState {
   /** transcript 总 segment 数（变化时增量补 embed） */
   lastSegmentCount: number;
   /**
+   * 单录音模式：transcript 全文字符总长。段数守恒但文本被改写（如某段被重转写/纠正
+   * 而段数不变）时 segment count 判据感知不到，这里补一个内容长度判据兜底 ——
+   * 长度变即重切重 embed。undefined = 旧 entry 升级前留下（视为需重建）。
+   */
+  lastContentLength?: number;
+  /**
    * 多录音模式：调用方传入的内容签名（各录音 segment 总数之和）。变化即说明某录音
    * 增长/变动 → 触发增量重建。undefined = 调用方未提供（旧行为：集合不变即整体命中）。
    */
@@ -153,8 +159,16 @@ export async function retrieveTranscriptByEmbedding(args: {
 
   let state = sessionCache.get(sessionId);
 
-  // 增量补块：transcript 长度变化时重切（简化处理 —— 实测重切成本远低于 embed）
-  const needsRebuild = !state || state.lastSegmentCount !== transcript.length;
+  // 内容签名：transcript 全文字符总长。配合 segment 数共同判新鲜度 —— segment 数守恒
+  // 但某段被重转写/纠正（文本变、段数不变）时仅靠 segment count 会漏判命中陈旧向量。
+  const contentLength = transcript.reduce((acc, seg) => acc + seg.text.length, 0);
+
+  // 增量补块：segment 数或全文长度任一变化时重切（简化处理 —— 实测重切成本远低于 embed）。
+  // 旧 entry（升级前无 lastContentLength）一律视为需重建，重建后即带上该字段。
+  const needsRebuild =
+    !state ||
+    state.lastSegmentCount !== transcript.length ||
+    state.lastContentLength !== contentLength;
 
   if (needsRebuild) {
     const newChunks = chunkSegments(transcript);
@@ -187,6 +201,7 @@ export async function retrieveTranscriptByEmbedding(args: {
 
     state = {
       lastSegmentCount: transcript.length,
+      lastContentLength: contentLength,
       chunks: newChunks,
       vectors: existingVectors,
       lastUsedAt: Date.now(),
@@ -230,6 +245,7 @@ export async function retrieveTranscriptByEmbedding(args: {
     const freshVectors = await callEmbedding(ragState.chunks.map((c) => c.text));
     ragState = {
       lastSegmentCount: transcript.length,
+      lastContentLength: contentLength,
       chunks: ragState.chunks,
       vectors: freshVectors,
       lastUsedAt: Date.now(),

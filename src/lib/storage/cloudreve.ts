@@ -31,6 +31,18 @@ const TOKEN_DB_KEYS = [
   'cloudreve_token_expires_at',
 ] as const;
 
+/**
+ * 控制面 API 调用（OAuth token、签名链接、上传会话等小 JSON 请求）的超时。
+ * 这些请求体积小、应快速返回，30s 足够覆盖慢网络又能避免无限挂起。
+ */
+const CLOUDREVE_API_TIMEOUT_MS = 30_000;
+
+/**
+ * 文件传输（上传分片 / 下载文件体）的超时。录音可能达数百 MB，需放宽到
+ * 10 分钟以覆盖慢链路上的大文件，同时仍兜底防止 fetch 永久挂起耗尽连接。
+ */
+const CLOUDREVE_TRANSFER_TIMEOUT_MS = 10 * 60_000;
+
 export type StorageCategory = (typeof STORAGE_CATEGORIES)[number];
 
 /** 与 Session 列一一对应的存储类别；chat-uploads 走独立 chat 模块管理。 */
@@ -176,7 +188,18 @@ function isPrivateIpv4Host(hostname: string): boolean {
   }
 
   const [first, second] = parts.map((part) => Number(part));
+  if (parts.some((part) => Number(part) > 255)) {
+    return false;
+  }
+  // 0.0.0.0/8 —— "本机所有地址"，部分协议栈会回环到 127.0.0.1
+  if (first === 0) {
+    return true;
+  }
   if (first === 10 || first === 127) {
+    return true;
+  }
+  // 169.254.0.0/16 —— 链路本地，含云厂商元数据地址 169.254.169.254（可窃取实例凭据）
+  if (first === 169 && second === 254) {
     return true;
   }
   if (first === 172 && second >= 16 && second <= 31) {
@@ -185,12 +208,94 @@ function isPrivateIpv4Host(hostname: string): boolean {
   return first === 192 && second === 168;
 }
 
+/**
+ * 判定 IPv6 主机是否落在私有 / 本地网段。
+ * Node 的 URL.hostname 对 IPv6 会保留方括号（如 `[::1]`），调用方需先去括号。
+ * 覆盖：::1（回环）、fc00::/7（ULA 唯一本地）、fe80::/10（链路本地）、
+ * 以及 ::ffff:a.b.c.d 形式的 IPv4-mapped 地址（复用 IPv4 判定）。
+ */
+function isPrivateIpv6Host(hostname: string): boolean {
+  let addr = hostname.trim().toLowerCase();
+  if (addr.startsWith('[') && addr.endsWith(']')) {
+    addr = addr.slice(1, -1);
+  }
+  // 去掉 zone id（如 fe80::1%eth0）
+  const zoneIndex = addr.indexOf('%');
+  if (zoneIndex !== -1) {
+    addr = addr.slice(0, zoneIndex);
+  }
+  if (!addr.includes(':')) {
+    return false;
+  }
+
+  // IPv4-mapped 地址（::ffff:a.b.c.d）。Node 的 URL.hostname 会把点分形式压成
+  // 十六进制（::ffff:a9fe:a9fe），故两种写法都要还原成 IPv4 再判定，否则
+  // ::ffff:169.254.169.254（云元数据）这类会绕过检测。
+  const mapped = extractIpv4MappedAddress(addr);
+  if (mapped && isPrivateIpv4Host(mapped)) {
+    return true;
+  }
+
+  // 未指定地址 :: 与回环 ::1
+  if (addr === '::' || addr === '::1') {
+    return true;
+  }
+
+  // 取首个 16 位段（hextet）做前缀判定
+  const firstHextet = addr.startsWith('::') ? 0 : parseInt(addr.split(':')[0], 16);
+  if (!Number.isFinite(firstHextet)) {
+    return false;
+  }
+  // fc00::/7 —— ULA（fc00–fdff）
+  if (firstHextet >= 0xfc00 && firstHextet <= 0xfdff) {
+    return true;
+  }
+  // fe80::/10 —— 链路本地（fe80–febf）
+  if (firstHextet >= 0xfe80 && firstHextet <= 0xfebf) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 从 IPv4-mapped IPv6 地址提取内嵌的 IPv4 点分字符串，否则返回 null。
+ * 支持两种写法：
+ *   - 点分尾段：`::ffff:169.254.169.254`
+ *   - 压缩十六进制（Node 规范化结果）：`::ffff:a9fe:a9fe`
+ */
+function extractIpv4MappedAddress(addr: string): string | null {
+  // 点分尾段：取最后一个冒号之后的部分
+  if (addr.includes('.')) {
+    const tail = addr.slice(addr.lastIndexOf(':') + 1);
+    return /^\d+\.\d+\.\d+\.\d+$/.test(tail) ? tail : null;
+  }
+
+  // 压缩十六进制：::ffff:HHHH:HHHH —— 末两段拼成 32 位再拆成 IPv4
+  const match = addr.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (!match) {
+    return null;
+  }
+  const high = parseInt(match[1], 16);
+  const low = parseInt(match[2], 16);
+  return [high >> 8, high & 0xff, low >> 8, low & 0xff].join('.');
+}
+
+/**
+ * 判定 URL.hostname 是否为私有 / 本地地址（IPv4 + IPv6 统一入口）。
+ */
+function isPrivateIpHost(hostname: string): boolean {
+  if (hostname.includes(':')) {
+    return isPrivateIpv6Host(hostname);
+  }
+  return isPrivateIpv4Host(hostname);
+}
+
 function allowPrivateCloudreveHost(): boolean {
   const configured = process.env.CLOUDREVE_ALLOW_PRIVATE_HOST?.trim().toLowerCase();
   return configured === '1' || configured === 'true' || configured === 'yes';
 }
 
-function validateCloudreveBaseUrl(value: string): string {
+export function validateCloudreveBaseUrl(value: string): string {
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -203,13 +308,13 @@ function validateCloudreveBaseUrl(value: string): string {
   }
 
   const usesPrivateHost =
-    parsed.username ||
-    parsed.password ||
+    Boolean(parsed.username) ||
+    Boolean(parsed.password) ||
     parsed.hostname === 'localhost' ||
     parsed.hostname.endsWith('.local') ||
     parsed.hostname.endsWith('.internal') ||
-    parsed.hostname === '::1' ||
-    isPrivateIpv4Host(parsed.hostname);
+    // Node 对 IPv6 给的 hostname 带方括号（如 [::1]），由 isPrivateIpHost 内部去括号判定
+    isPrivateIpHost(parsed.hostname);
 
   if (
     usesPrivateHost &&
@@ -370,6 +475,7 @@ export async function exchangeAuthorizationCode(
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),
+    signal: AbortSignal.timeout(CLOUDREVE_API_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -397,6 +503,7 @@ async function refreshAccessToken(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ refresh_token: currentRefreshToken }),
+    signal: AbortSignal.timeout(CLOUDREVE_API_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -952,7 +1059,9 @@ export class CloudreveStorage {
   }
 
   /**
-   * 带认证头的 fetch 封装
+   * 带认证头的 fetch 封装。默认套用传输超时（兜底防止 fetch 永久挂起占用连接），
+   * 调用方可通过 init.signal 覆盖。直传可携带 20MB 内的请求体，故默认用较宽的
+   * 传输超时而非 API 超时。
    */
   private async authedFetch(
     urlPath: string,
@@ -962,6 +1071,7 @@ export class CloudreveStorage {
     const config = await this.getConfig();
     const url = `${config.baseUrl}${urlPath}`;
     return fetch(url, {
+      signal: AbortSignal.timeout(CLOUDREVE_TRANSFER_TIMEOUT_MS),
       ...init,
       headers: {
         ...init?.headers,
@@ -1162,6 +1272,7 @@ export class CloudreveStorage {
         method: 'POST',
         headers,
         body: chunk,
+        signal: AbortSignal.timeout(CLOUDREVE_TRANSFER_TIMEOUT_MS),
       });
 
       if (!chunkResponse.ok) {
@@ -1185,10 +1296,31 @@ export class CloudreveStorage {
     return this.downloadByRemotePath(remotePath, userId);
   }
 
-  async downloadByRemotePath(
+  /**
+   * 流式下载文件（V4）：返回远程存储节点原始 Response，由路由直接透传，
+   * 不把整个文件读进内存。range 透传以支持断点续传。
+   */
+  async openDownloadStreamByCategory(
+    userId: string,
+    category: StorageCategory,
+    fileName: string,
+    range?: string | null
+  ): Promise<Response> {
+    const remotePath = this.buildRemotePath(userId, category, fileName);
+    return this.openDownloadStream(remotePath, {
+      expectedUserId: userId,
+      range,
+    });
+  }
+
+  /**
+   * 向 Cloudreve 申请签名下载直链（POST /api/v4/file/url）。
+   * 直链由远程存储节点（本地/S3/OSS）直接服务文件体，已内含临时凭据。
+   */
+  private async resolveDownloadUrl(
     remotePath: string,
     expectedUserId?: string
-  ): Promise<Buffer> {
+  ): Promise<string> {
     const safeRemotePath = validateRemotePath(remotePath, expectedUserId);
     const fileUri = this.toFileUri(safeRemotePath);
 
@@ -1200,6 +1332,7 @@ export class CloudreveStorage {
         uris: [fileUri],
         download: true,
       }),
+      signal: AbortSignal.timeout(CLOUDREVE_API_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -1220,13 +1353,57 @@ export class CloudreveStorage {
       throw new Error('Cloudreve 未返回下载链接');
     }
 
-    const downloadUrl = downloadData.urls[0].url;
-    const fileResponse = await fetch(downloadUrl);
+    return downloadData.urls[0].url;
+  }
+
+  async downloadByRemotePath(
+    remotePath: string,
+    expectedUserId?: string
+  ): Promise<Buffer> {
+    const downloadUrl = await this.resolveDownloadUrl(remotePath, expectedUserId);
+    const fileResponse = await fetch(downloadUrl, {
+      signal: AbortSignal.timeout(CLOUDREVE_TRANSFER_TIMEOUT_MS),
+    });
     if (!fileResponse.ok) {
       throw new Error(`Cloudreve 文件下载失败 (${fileResponse.status})`);
     }
 
     return Buffer.from(await fileResponse.arrayBuffer());
+  }
+
+  /**
+   * 流式打开远程文件，返回远程存储节点的原始 Response（含 body ReadableStream），
+   * 由调用方直接透传给客户端，避免把整个文件读进内存（大录音会 OOM）。
+   *
+   * - 透传 `range` 实现断点续传 / 音频拖动播放；
+   * - 套用传输超时兜底，防止慢/挂起的远程节点长期占用连接；
+   * - 返回前已校验 response.ok，调用方拿到的一定是可直接转发的成功响应。
+   */
+  async openDownloadStream(
+    remotePath: string,
+    options?: { expectedUserId?: string; range?: string | null }
+  ): Promise<Response> {
+    const downloadUrl = await this.resolveDownloadUrl(
+      remotePath,
+      options?.expectedUserId
+    );
+
+    const headers: Record<string, string> = {};
+    if (options?.range) {
+      headers['Range'] = options.range;
+    }
+
+    const fileResponse = await fetch(downloadUrl, {
+      headers,
+      signal: AbortSignal.timeout(CLOUDREVE_TRANSFER_TIMEOUT_MS),
+    });
+
+    // 206 Partial Content 也算成功（透传 Range 时远程节点会返回 206）
+    if (!fileResponse.ok && fileResponse.status !== 206) {
+      throw new Error(`Cloudreve 文件下载失败 (${fileResponse.status})`);
+    }
+
+    return fileResponse;
   }
 }
 

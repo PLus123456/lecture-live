@@ -62,13 +62,31 @@ export async function GET(req: Request) {
 
   try {
     const storage = await CloudreveStorage.create();
-    const data = await storage.download(user.id, category, fileName);
+    // 流式透传远程文件体，不把整个文件读进内存（大录音会 OOM）
+    const range = req.headers.get('range');
+    const upstream = await storage.openDownloadStreamByCategory(
+      user.id,
+      category,
+      fileName,
+      range
+    );
 
-    return new Response(new Uint8Array(data), {
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'Content-Disposition': `attachment; filename="${encodeURIComponent(fileName)}"`,
-      },
+    const headers = new Headers({
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(fileName)}"`,
+      'X-Content-Type-Options': 'nosniff',
+    });
+    // 透传上游的长度 / 断点续传相关头（若有）
+    for (const name of ['content-length', 'content-range', 'accept-ranges']) {
+      const value = upstream.headers.get(name);
+      if (value) {
+        headers.set(name, value);
+      }
+    }
+
+    return new Response(upstream.body, {
+      status: upstream.status === 206 ? 206 : 200,
+      headers,
     });
   } catch (error) {
     console.error('Download error:', error);

@@ -20,6 +20,7 @@ import {
   loadSessionAudioArtifact,
   loadSessionTranscriptBundle,
 } from '@/lib/sessionPersistence';
+import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
 
 export async function GET(
   req: Request,
@@ -222,6 +223,19 @@ export async function DELETE(
     assertOwnership(user.id, session.userId);
   } catch {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
+  }
+
+  // 删行前先取消进行中的异步上传转录：否则本地分片/合并/mp3（可达 ~5GB）+ Soniox 上的
+  // 文件会随 session 行消失而失去关联、永久泄漏。cancelAsyncUpload 会清本地盘 + 删 Soniox
+  // 文件 + 把状态置 canceled。终态语义对齐 async-upload DELETE：completed/failed/canceled/null
+  // 视为已收尾、无需取消。
+  if (
+    session.asyncTranscribeStatus !== 'completed' &&
+    session.asyncTranscribeStatus !== 'failed' &&
+    session.asyncTranscribeStatus !== 'canceled' &&
+    session.asyncTranscribeStatus != null
+  ) {
+    await cancelAsyncUpload(session).catch(() => undefined);
   }
 
   // 删 session 会级联删 Conversation(sessionId=id) 及其 ChatAttachment（schema onDelete: Cascade），

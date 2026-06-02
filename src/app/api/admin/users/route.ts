@@ -10,6 +10,78 @@ import {
   normalizeUserRole,
   resolveRoleStorageBytesLimit,
 } from '@/lib/userRoles';
+import { releaseStorageBytes } from '@/lib/quota';
+import { resolveCloudreveConfig } from '@/lib/storage/cloudreve';
+import { decrypt } from '@/lib/crypto';
+import { logger, serializeError } from '@/lib/logger';
+
+const routeLogger = logger.child({ component: 'admin-users' });
+
+/**
+ * 拿 Cloudreve 物理删除所需的 baseUrl + access_token（与 chat-uploads 删除路径同款做法）。
+ * 任一步失败返回 null，调用方据此跳过物理删除，只删 DB —— 不能因外部存储不可达卡住删用户。
+ */
+async function loadCloudreveContext(): Promise<{
+  baseUrl: string;
+  accessToken: string;
+} | null> {
+  try {
+    const config = await resolveCloudreveConfig();
+    if (!config) return null;
+
+    const row = await prisma.siteSetting.findUnique({
+      where: { key: 'cloudreve_access_token' },
+    });
+    if (!row?.value) return null;
+
+    const accessToken = decrypt(row.value);
+    if (!accessToken) return null;
+
+    return {
+      baseUrl: config.baseUrl.replace(/\/+$/, ''),
+      accessToken,
+    };
+  } catch (err) {
+    routeLogger.warn(
+      { err: serializeError(err) },
+      'admin-users: loadCloudreveContext 失败；跳过物理删除'
+    );
+    return null;
+  }
+}
+
+/** 删 Cloudreve 上一个文件（best-effort）；残留由 admin 文件清理工具兜底，绝不阻塞 DB 清理。 */
+async function deleteFromCloudreveByPath(
+  remotePath: string,
+  ctx: { baseUrl: string; accessToken: string }
+): Promise<void> {
+  try {
+    const fileUri = remotePath.startsWith('/')
+      ? `cloudreve://my${remotePath}`
+      : `cloudreve://my/${remotePath}`;
+
+    const response = await fetch(`${ctx.baseUrl}/api/v4/file`, {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${ctx.accessToken}`,
+      },
+      body: JSON.stringify({ uris: [fileUri] }),
+    });
+
+    if (!response.ok) {
+      routeLogger.warn(
+        { remotePath, status: response.status },
+        'admin-users: Cloudreve DELETE non-2xx; 残留由清理工具兜底'
+      );
+    }
+  } catch (err) {
+    routeLogger.warn(
+      { remotePath, err: serializeError(err) },
+      'admin-users: Cloudreve DELETE threw; 残留由清理工具兜底'
+    );
+  }
+}
 
 // 共享的用户查询 select 字段
 const USER_SELECT = {
@@ -183,17 +255,25 @@ export async function DELETE(req: Request) {
       (id) => id !== admin.id && !protectedAdminIds.has(id)
     );
 
-    const result = await prisma.user.deleteMany({
-      where: { id: { in: safeIds } },
-    });
+    if (safeIds.length === 0) {
+      return NextResponse.json({
+        deleted: 0,
+        skipped: {
+          self: userIds.includes(admin.id),
+          admins: protectedAdmins.map((entry) => entry.id),
+        },
+      });
+    }
+
+    const deleted = await cascadeDeleteUsers(safeIds);
 
     logAction(req, 'admin.user.delete', {
       user: admin,
-      detail: `删除 ${result.count} 个用户`,
+      detail: `删除 ${deleted} 个用户`,
     });
 
     return NextResponse.json({
-      deleted: result.count,
+      deleted,
       skipped: {
         self: userIds.includes(admin.id),
         admins: protectedAdmins.map((entry) => entry.id),
@@ -203,6 +283,163 @@ export async function DELETE(req: Request) {
     console.error('删除用户失败:', err);
     return NextResponse.json({ error: '删除失败' }, { status: 500 });
   }
+}
+
+/**
+ * 级联删除一批用户及其所有子数据。
+ *
+ * 背景：schema 里指向 User / Session / Folder 的外键多数为默认 RESTRICT（无 onDelete），
+ * 直接 `user.deleteMany` 在有录音/文件夹/分享/对话的用户上会 FK 500。这里在单事务内
+ * 按依赖顺序预删子数据再删 User，并在事务外尽力清掉 Cloudreve 物理文件 + 释放被删数据
+ * 占用的字节配额（仅对未被删除的 owner 有意义，如跨用户挂载场景）。
+ *
+ * 删除顺序（叶子 → 根）：
+ *   ShareLink（FK→User.createdBy & Session）
+ *   → ChatAttachment（按 owner 或所属 Conversation；其 Cloudreve 文件先删）
+ *   → ConversationMessage（Conversation 级联，显式删更稳）
+ *   → Conversation（owner 或 legacy 绑定到待删 session）
+ *   → FolderSession / FolderKeyword（Folder/Session 的联表）
+ *   → Folder（FK userId 无 relation，按 userId 删）
+ *   → Session（FK→User）
+ *   → JobQueue（冗余 userId，无 FK，清理留痕外的运行态）
+ *   → User
+ *
+ * 注：AuditLog.userId / ReconciliationMismatch.userId 为无 FK 的留痕列，故意保留以便审计。
+ *
+ * @returns 实际删除的用户数
+ */
+async function cascadeDeleteUsers(userIds: string[]): Promise<number> {
+  // 收集待删用户的 session / folder / conversation id 集合
+  const [sessions, folders, ownedConversations] = await Promise.all([
+    prisma.session.findMany({
+      where: { userId: { in: userIds } },
+      select: { id: true },
+    }),
+    prisma.folder.findMany({
+      where: { userId: { in: userIds } },
+      select: { id: true },
+    }),
+    prisma.conversation.findMany({
+      where: { userId: { in: userIds } },
+      select: { id: true },
+    }),
+  ]);
+  const sessionIds = sessions.map((s) => s.id);
+  const folderIds = folders.map((f) => f.id);
+
+  // legacy 单录音对话（Conversation.sessionId 直接指向待删 session）也要删；
+  // 与 owner 拥有的对话合并去重。多录音对话经 ConversationSession 联表挂载，删 session
+  // 只级联联表行、对话本体（可能属他人）保留 —— 故不在此并入。
+  const legacyConversations = sessionIds.length
+    ? await prisma.conversation.findMany({
+        where: { sessionId: { in: sessionIds } },
+        select: { id: true },
+      })
+    : [];
+  const conversationIds = [
+    ...new Set([
+      ...ownedConversations.map((c) => c.id),
+      ...legacyConversations.map((c) => c.id),
+    ]),
+  ];
+
+  // 待删的 chat 附件：按 owner（userId）或所属对话聚合，物理文件先删、字节配额后释放。
+  const attachments = await prisma.chatAttachment.findMany({
+    where: {
+      OR: [
+        { userId: { in: userIds } },
+        ...(conversationIds.length
+          ? [{ conversationId: { in: conversationIds } }]
+          : []),
+      ],
+    },
+    select: {
+      id: true,
+      userId: true,
+      bytes: true,
+      cloudrevePath: true,
+      extractedTextPath: true,
+    },
+  });
+
+  // 物理删除 Cloudreve 文件（best-effort，事务外，失败不阻塞）
+  if (attachments.length > 0) {
+    const cloudreveCtx = await loadCloudreveContext();
+    if (cloudreveCtx) {
+      for (const att of attachments) {
+        await deleteFromCloudreveByPath(att.cloudrevePath, cloudreveCtx);
+        if (att.extractedTextPath) {
+          await deleteFromCloudreveByPath(att.extractedTextPath, cloudreveCtx);
+        }
+      }
+    }
+  }
+
+  const attachmentIds = attachments.map((a) => a.id);
+  const deletedUserSet = new Set(userIds);
+
+  // 单事务内按 FK 依赖顺序删除子数据 + User（数组式 $transaction，与仓库其它删除路径一致，
+  // 数组顺序即执行顺序）。空 `in: []` 的 deleteMany 是安全 no-op，故无需逐项判空。
+  // ConversationMessage / ConversationSession 对 Conversation 虽是 onDelete: Cascade，
+  // 仍显式先删，不依赖级联在同一事务内的触发时序。
+  const txResults = await prisma.$transaction([
+    // ShareLink：既指向 User(createdBy) 又指向 Session，最先清
+    prisma.shareLink.deleteMany({
+      where: {
+        OR: [
+          { createdBy: { in: userIds } },
+          { sessionId: { in: sessionIds } },
+        ],
+      },
+    }),
+    prisma.chatAttachment.deleteMany({ where: { id: { in: attachmentIds } } }),
+    prisma.conversationMessage.deleteMany({
+      where: { conversationId: { in: conversationIds } },
+    }),
+    prisma.conversationSession.deleteMany({
+      where: {
+        OR: [
+          { conversationId: { in: conversationIds } },
+          { sessionId: { in: sessionIds } },
+        ],
+      },
+    }),
+    prisma.conversation.deleteMany({ where: { id: { in: conversationIds } } }),
+    // Folder/Session 联表 + Folder 关键词池，再删 Folder 本体
+    prisma.folderSession.deleteMany({
+      where: {
+        OR: [
+          { sessionId: { in: sessionIds } },
+          { folderId: { in: folderIds } },
+        ],
+      },
+    }),
+    prisma.folderKeyword.deleteMany({ where: { folderId: { in: folderIds } } }),
+    prisma.folder.deleteMany({ where: { id: { in: folderIds } } }),
+    prisma.session.deleteMany({ where: { id: { in: sessionIds } } }),
+    // 冗余 userId 列（无 FK，不阻塞删除，但清掉运行态任务避免悬挂引用）
+    prisma.jobQueue.deleteMany({ where: { userId: { in: userIds } } }),
+    prisma.user.deleteMany({ where: { id: { in: userIds } } }),
+  ]);
+  const userResult = txResults[txResults.length - 1];
+
+  // 释放被删数据占用的字节配额（仅对仍存在的 owner 有意义：被删用户自身的行已随删除消失）。
+  // 复用 releaseStorageBytes，best-effort；失败留给字节对账兜底。
+  const bytesByOwner = new Map<string, bigint>();
+  for (const att of attachments) {
+    if (deletedUserSet.has(att.userId)) continue;
+    bytesByOwner.set(
+      att.userId,
+      (bytesByOwner.get(att.userId) ?? BigInt(0)) + att.bytes
+    );
+  }
+  for (const [ownerId, bytes] of bytesByOwner) {
+    if (bytes > BigInt(0)) {
+      await releaseStorageBytes(ownerId, Number(bytes)).catch(() => undefined);
+    }
+  }
+
+  return userResult.count;
 }
 
 // 编辑用户
@@ -274,7 +511,14 @@ export async function PATCH(req: Request) {
     }
 
     if (fields.status !== undefined) {
-      data.status = fields.status === 1 ? 1 : 0;
+      const nextStatus = fields.status === 1 ? 1 : 0;
+      data.status = nextStatus;
+      // 封禁（1→0）时即时吊销旧 token：自增 tokenVersion 让所有在用 JWT 立即失效，
+      // 否则被禁用者仍能凭旧 cookie 访问（verifyToken 虽已拦 status，但 tokenVersion
+      // 自增可叠加触发 token 不匹配，双保险且兼容缓存读路径）。
+      if (nextStatus === 0 && existing.status === 1) {
+        data.tokenVersion = { increment: 1 };
+      }
     }
 
     if (fields.points !== undefined) {

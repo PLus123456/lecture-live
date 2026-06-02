@@ -12,6 +12,10 @@ import {
   resetExpiredTranscriptionQuotas,
   reconcileStorageBytes,
 } from '@/lib/quota';
+import {
+  getDefaultQuotasForRole,
+  resolveRoleStorageBytesLimit,
+} from '@/lib/userRoles';
 import { runTranscriptionUsageReconciliation } from '@/lib/reconciliation';
 import { finalizeSession } from '@/lib/sessionFinalization';
 import { runChatFilesCleanup } from '@/lib/jobs/chatFilesCleanupJob';
@@ -42,6 +46,7 @@ type BillingMaintenanceGlobal = typeof globalThis & {
 
 export interface BillingMaintenanceSummary {
   resetUsers: number;
+  expiredRoleDowngrades: number;
   reclaimedSessions: number;
   reclaimedAsyncUploads: number;
   reclaimedStaleJobs: number;
@@ -137,6 +142,20 @@ export async function runBillingMaintenance(options?: {
       if (jobId) markJobFailed(jobId, err);
       throw err;
     }
+  }
+
+  // 会员到期降级：roleExpiresAt 已过且有 originalRole 的用户回落原始角色。
+  // 不为本步骤建独立 JobQueue 记录（JOB_TYPE 是其他单元领地、无现成的 role_downgrade 类型），
+  // 失败仅 log 不 rethrow，避免拖垮其余维护步骤。
+  let expiredRoleDowngrades = 0;
+  try {
+    expiredRoleDowngrades = await expireRoleDowngrades(now);
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'expired role downgrade failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
   }
 
   // 过期会话回收
@@ -237,6 +256,7 @@ export async function runBillingMaintenance(options?: {
 
   if (
     resetUsers > 0 ||
+    expiredRoleDowngrades > 0 ||
     reclaimedSessions > 0 ||
     reclaimedAsyncUploads > 0 ||
     reclaimedStaleJobs > 0 ||
@@ -251,6 +271,7 @@ export async function runBillingMaintenance(options?: {
       JSON.stringify({
         source: options?.source ?? 'manual',
         resetUsers,
+        expiredRoleDowngrades,
         reclaimedSessions,
         reclaimedAsyncUploads,
         reclaimedStaleJobs,
@@ -263,6 +284,7 @@ export async function runBillingMaintenance(options?: {
 
   return {
     resetUsers,
+    expiredRoleDowngrades,
     reclaimedSessions,
     reclaimedAsyncUploads,
     reclaimedStaleJobs,
@@ -388,6 +410,71 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
   }
 
   return reclaimedCount;
+}
+
+/**
+ * 会员到期降级。
+ *
+ * 扫描 roleExpiresAt 已过期且 originalRole 非空的用户，把 role 回落到 originalRole，
+ * 清空 originalRole / roleExpiresAt，按目标角色同步配额上限（transcriptionMinutesLimit /
+ * storageHoursLimit / allowedModels / storageBytesLimit），并自增 tokenVersion 把在线会话踢下线。
+ *
+ * 不写时也是幂等：每个用户用条件原子 update（再校验 roleExpiresAt<=now 且 originalRole 非空），
+ * 与 admin 端"续费/改角色"并发时不会误降级已被延期的用户。usage（已用量）不动，留给配额周期重置。
+ */
+export async function expireRoleDowngrades(now: Date): Promise<number> {
+  const candidates = await prisma.user.findMany({
+    where: {
+      roleExpiresAt: { lte: now },
+      originalRole: { not: null },
+    },
+    select: { id: true, role: true, originalRole: true },
+    take: 500,
+    orderBy: { roleExpiresAt: 'asc' },
+  });
+
+  let downgraded = 0;
+
+  for (const user of candidates) {
+    const targetRole = user.originalRole;
+    if (!targetRole) {
+      continue;
+    }
+
+    const quotas = getDefaultQuotasForRole(targetRole);
+    const storageBytesLimit = await resolveRoleStorageBytesLimit(targetRole);
+
+    // 条件原子降级：再次确认仍过期且 originalRole 未被清空（避免与 admin 续费竞争误降级）
+    const result = await prisma.user.updateMany({
+      where: {
+        id: user.id,
+        roleExpiresAt: { lte: now },
+        originalRole: { not: null },
+      },
+      data: {
+        role: targetRole,
+        originalRole: null,
+        roleExpiresAt: null,
+        transcriptionMinutesLimit: quotas.transcriptionMinutesLimit,
+        storageHoursLimit: quotas.storageHoursLimit,
+        allowedModels: quotas.allowedModels,
+        storageBytesLimit,
+        // 自增 tokenVersion 让旧 JWT 失效，把降级用户踢下线（下次请求按新角色重新签发）
+        tokenVersion: { increment: 1 },
+      },
+    });
+
+    if (result.count !== 1) {
+      continue;
+    }
+    downgraded += 1;
+    billingLogger.info(
+      { userId: user.id, from: user.role, to: targetRole },
+      'expired membership downgraded to original role'
+    );
+  }
+
+  return downgraded;
 }
 
 async function isSessionStale(

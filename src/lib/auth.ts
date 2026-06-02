@@ -246,10 +246,16 @@ async function verifyToken(token: string): Promise<AuthSession | null> {
         email: true,
         role: true,
         tokenVersion: true,
+        status: true,
       },
     });
 
     if (!user || user.tokenVersion !== decoded.tokenVersion) {
+      return null;
+    }
+
+    // 被禁用用户（status !== 1）的旧 token 立即失效——一处生效全域。
+    if (user.status !== 1) {
       return null;
     }
 
@@ -447,6 +453,11 @@ export async function login(
   );
 
   if (!user || !passwordMatches) {
+    throw new Error('Invalid credentials');
+  }
+  // 被禁用用户（status !== 1）即使密码正确也不得登录；复用同一错误避免账户枚举侧信道
+  // （不向调用方泄露"该账号存在但被封"）。verifyToken 同步拦截其旧 token。
+  if (user.status !== 1) {
     throw new Error('Invalid credentials');
   }
   const token = signToken({

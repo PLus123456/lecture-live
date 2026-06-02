@@ -13,6 +13,10 @@ import {
 } from '@/lib/security';
 
 const MAX_SEGMENTS = 50_000;
+// 导出请求体是纯文本 JSON（segments + translations + summaries）。MAX_SEGMENTS=50k
+// 配上每段文本，合理上限在几十 MB；这里用 64MB 绝对硬上限做 OOM 兜底，挡掉在
+// req.json() 把整个 body 缓冲进内存之前的明显超大请求。精确的段数校验仍在下方。
+const ABSOLUTE_MAX_BODY_BYTES = 64 * 1024 * 1024;
 
 interface ExportRequestBody {
   format: 'markdown' | 'srt' | 'json' | 'txt';
@@ -46,6 +50,16 @@ export async function POST(req: Request) {
   });
   if (rateLimited) {
     return rateLimited;
+  }
+
+  // Content-Length 预检：在读 body 前按声明长度挡掉明显超限的请求，避免超大 JSON
+  // 整个缓冲进内存（OOM 面）。精确的 MAX_SEGMENTS 校验仍在下方兜底。
+  const declaredLength = Number(req.headers.get('content-length') ?? '');
+  if (Number.isFinite(declaredLength) && declaredLength > ABSOLUTE_MAX_BODY_BYTES) {
+    return NextResponse.json(
+      { error: 'Request body too large' },
+      { status: 413 },
+    );
   }
 
   try {

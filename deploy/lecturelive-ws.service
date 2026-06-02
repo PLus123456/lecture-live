@@ -23,6 +23,28 @@ SyslogIdentifier=lecturelive-ws
 NoNewPrivileges=true
 ProtectHome=true
 PrivateTmp=true
+# 整个文件系统只读，仅放开应用真正需要写的目录。ws-server 的 data 是指向
+# /opt/lecturelive/data 的软链（liveShare 把直播转录落到 data/transcripts），
+# systemd 会解析软链到真实路径，故这里直接列真实目录。
+ProtectSystem=strict
+ReadWritePaths=/opt/lecturelive/data
+# 丢弃全部 capability（监听 3001，非特权端口，无需 CAP_NET_BIND_SERVICE）
+CapabilityBoundingSet=
+# 仅保留出网 / 本地 socket（Socket.IO、Prisma、Redis 均够用）
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 收紧内核 / 进程面
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# 注：不设 MemoryDenyWriteExecute —— Node/V8 的 JIT 需要可写可执行内存，开了会直接崩。
 
 [Install]
 WantedBy=multi-user.target

@@ -729,13 +729,16 @@ export async function executeExport(options: ExportOptions): Promise<void> {
     }
   })();
 
-  const [recordingBlob] = await Promise.all([
+  // 用 allSettled 而非 all：录音下载与文本生成相互独立，任一失败不应连累另一边 ——
+  // 例如录音下载挂了，已生成好的文本（md/srt/…）仍应正常打包给用户，反之亦然。
+  const [recordingResult, textResult] = await Promise.allSettled([
     resolveRecordingBlob(plan.includeRecording, fetchRecording),
     textFilesPromise,
   ]);
 
-  // 获取录音文件
-  if (recordingBlob) {
+  // 获取录音文件（仅在下载成功时追加；textFilesPromise 成功的文本已在其内部 push 进 allFiles）
+  if (recordingResult.status === 'fulfilled' && recordingResult.value) {
+    const recordingBlob = recordingResult.value;
     const ext = recordingBlob.type.includes('webm') ? 'webm'
       : recordingBlob.type.includes('mp4') ? 'mp4'
       : recordingBlob.type.includes('ogg') ? 'ogg'
@@ -748,6 +751,18 @@ export async function executeExport(options: ExportOptions): Promise<void> {
 
   // 3. 下载
   if (allFiles.length === 0) {
+    // 没有任何产物：把最相关的失败原因抛出去（优先录音错误，其次文本错误），
+    // 让上层能展示具体提示而非笼统的 "No export files generated"。
+    if (recordingResult.status === 'rejected') {
+      throw recordingResult.reason instanceof Error
+        ? recordingResult.reason
+        : new Error(String(recordingResult.reason));
+    }
+    if (textResult.status === 'rejected') {
+      throw textResult.reason instanceof Error
+        ? textResult.reason
+        : new Error(String(textResult.reason));
+    }
     throw new Error('No export files generated');
   }
 

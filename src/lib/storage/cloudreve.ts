@@ -190,7 +190,7 @@ function allowPrivateCloudreveHost(): boolean {
   return configured === '1' || configured === 'true' || configured === 'yes';
 }
 
-function validateCloudreveBaseUrl(value: string): string {
+export function validateCloudreveBaseUrl(value: string): string {
   let parsed: URL;
   try {
     parsed = new URL(value);

@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
 import { logAction } from '@/lib/auditLog';
+import { logger, serializeError } from '@/lib/logger';
 import {
   getSiteSettings,
   invalidateSiteSettingsCache,
@@ -30,7 +31,7 @@ export async function GET(req: Request) {
     const settings = await getSiteSettings({ fresh: true });
     return NextResponse.json(serializeSiteSettingsForAdmin(settings));
   } catch (err) {
-    console.error('获取站点设置失败:', err);
+    logger.error({ err: serializeError(err) }, '获取站点设置失败');
     return NextResponse.json({ error: '获取设置失败' }, { status: 500 });
   }
 }
@@ -71,7 +72,8 @@ export async function PUT(req: Request) {
       // 注册相关
       'allow_registration',
       'default_group',
-      'default_user_role',
+      // 注：新用户默认角色由 default_group 驱动（getSiteSettings 读取并在 auth 流程生效）。
+      // 历史上还写过 default_user_role，但从未有读取方 —— 是写得进、读不出的幽灵键，已移除避免误导。
       'email_verification',
       'password_min_length',
       // 邮件相关
@@ -239,7 +241,10 @@ export async function PUT(req: Request) {
 
     if (cloudreveCredentialsChanged) {
       await clearCloudreveTokens().catch((err) =>
-        console.error('[admin.settings] 清除 Cloudreve token 失败:', err)
+        logger.error(
+          { err: serializeError(err) },
+          '[admin.settings] 清除 Cloudreve token 失败'
+        )
       );
     }
 
@@ -252,11 +257,18 @@ export async function PUT(req: Request) {
       // 后台执行，不阻塞响应
       migrateLocalToCloudreve()
         .then((r) =>
-          console.log(
-            `[存储迁移] 完成: 迁移 ${r.migratedCount} 个文件, 跳过 ${r.skippedCount}, 错误 ${r.errorCount}`
+          logger.info(
+            {
+              migratedCount: r.migratedCount,
+              skippedCount: r.skippedCount,
+              errorCount: r.errorCount,
+            },
+            '[存储迁移] 完成'
           )
         )
-        .catch((err) => console.error('[存储迁移] 失败:', err));
+        .catch((err) =>
+          logger.error({ err: serializeError(err) }, '[存储迁移] 失败')
+        );
     }
 
     return NextResponse.json({
@@ -264,7 +276,7 @@ export async function PUT(req: Request) {
       _migrationTriggered: switchedToCloudreve,
     });
   } catch (err) {
-    console.error('更新站点设置失败:', err);
+    logger.error({ err: serializeError(err) }, '更新站点设置失败');
     return NextResponse.json({ error: '更新设置失败' }, { status: 500 });
   }
 }

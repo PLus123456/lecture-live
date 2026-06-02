@@ -72,6 +72,17 @@ export async function POST(
     );
   }
 
+  // Content-Length 预检：读 body 前先按声明长度挡掉明显超限的请求，避免把超大 body
+  // 整个缓冲进内存才发现超限（OOM 面）。multipart 有额外开销，给 1MB 余量避免误杀；
+  // 精确的 file.size 校验仍在下方兜底。
+  const declaredLength = Number(req.headers.get('content-length') ?? '');
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_CHUNK_BYTES + 1024 * 1024) {
+    return NextResponse.json(
+      { error: `Chunk size must be between 1 byte and ${MAX_CHUNK_BYTES} bytes` },
+      { status: 413 }
+    );
+  }
+
   let formData: FormData;
   try {
     formData = await req.formData();

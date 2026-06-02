@@ -39,7 +39,14 @@ export function useLocalTranslation() {
       await scheduler.initLocalTranslator(sourceLang, targetLang);
     } catch (error) {
       console.error('Failed to initialize local translator:', error);
-      setLocalModelStatus('Failed to load model');
+      setLocalModelStatus('Failed to load model — falling back to cloud');
+      // 本地模型加载失败时回退到云端翻译，避免“零翻译”。
+      // 切到 'soniox' 后：① buildSonioxConfig 会重新发 Soniox 云翻译；
+      // ② 上层 effect 依赖 translationMode，会停掉本地引擎（不再重试本地）。
+      const { translationMode, setTranslationMode } = useSettingsStore.getState();
+      if (translationMode !== 'soniox') {
+        setTranslationMode('soniox');
+      }
     }
   }, [setTranslation, setLocalModelLoaded, setLocalModelProgress, setLocalModelStatus]);
 

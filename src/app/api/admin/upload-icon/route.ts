@@ -64,6 +64,17 @@ export async function POST(req: Request) {
     return response;
   }
 
+  // Content-Length 预检：读 body 前先按声明长度挡掉明显超限的请求，避免把超大 body
+  // 整个缓冲进内存才发现超限（OOM 面）。multipart 有额外开销，给 1MB 余量避免误杀；
+  // 精确的 file.size 校验仍在下方兜底。
+  const declaredLength = Number(req.headers.get('content-length') ?? '');
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_FILE_SIZE + 1024 * 1024) {
+    return NextResponse.json(
+      { error: '文件大小超过限制 (最大 2MB)' },
+      { status: 413 }
+    );
+  }
+
   try {
     const formData = await req.formData();
     const file = formData.get('file') as File | null;

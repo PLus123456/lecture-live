@@ -22,6 +22,28 @@ SyslogIdentifier=lecturelive-web
 NoNewPrivileges=true
 ProtectHome=true
 PrivateTmp=true
+# 整个文件系统只读，仅放开应用真正需要写的目录：
+#   data/        —— 录音、转录、摘要、图标、异步上传分片等运行时产物
+#   .next/cache/ —— Next.js standalone 运行时缓存（ISR / fetch cache / 图片优化）
+ProtectSystem=strict
+ReadWritePaths=/opt/lecturelive/data /opt/lecturelive/.next/cache
+# 丢弃全部 capability（监听 3000，非特权端口，无需 CAP_NET_BIND_SERVICE）
+CapabilityBoundingSet=
+# 仅保留出网 / 本地 socket（Prisma、Redis、HTTP 出站均够用）
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 收紧内核 / 进程面
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# 注：不设 MemoryDenyWriteExecute —— Node/V8 的 JIT 需要可写可执行内存，开了会直接崩。
 
 [Install]
 WantedBy=multi-user.target

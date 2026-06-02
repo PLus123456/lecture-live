@@ -59,7 +59,8 @@ services:
     restart: unless-stopped
 
   cloudreve:
-    image: cloudreve/cloudreve:latest
+    # 钉死具体版本，避免 latest 在重建时悄悄拉到不兼容的大版本
+    image: cloudreve/cloudreve:4.16.0
     ports:
       - "127.0.0.1:5212:5212"
     volumes:

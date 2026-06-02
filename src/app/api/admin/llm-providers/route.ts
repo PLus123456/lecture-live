@@ -8,6 +8,7 @@ import {
 } from '@/lib/llm/defaults';
 import { serializeProviderForAdmin } from '@/lib/llm/providerAdmin';
 import { logAction } from '@/lib/auditLog';
+import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
 
 // 获取所有 LLM 供应商及其模型
 export async function GET(req: Request) {
@@ -63,43 +64,83 @@ export async function POST(req: Request) {
       );
     }
 
+    // 校验 apiBase：格式合法 + 私网过滤（防 SSRF，服务端每次请求都会打这个地址）
+    // 复用 Cloudreve 的 validateCloudreveBaseUrl（http/https + 私网黑名单），返回规范化后的 URL
+    let normalizedApiBase: string;
+    try {
+      normalizedApiBase = validateCloudreveBaseUrl(apiBase);
+    } catch {
+      return NextResponse.json(
+        { error: 'apiBase 必须是合法的 http(s) 地址，且不能指向内网/本地地址' },
+        { status: 400 }
+      );
+    }
+
     // 创建供应商，同时创建其模型（如果提供了 models 数组）
-    const modelsData = Array.isArray(body.models)
-      ? (body.models as Array<Record<string, unknown>>).map((m, idx) => {
-          const thinkingMode = (m.thinkingMode ?? m.thinking_mode ?? 'NONE') as
-            | 'NONE'
-            | 'AUTO'
-            | 'FORCED'
-            | 'DEPTH';
-          // supportsThinkingDepth 由 mode === 'DEPTH' 派生（一致性保护，覆盖 body 值）
-          const supportsDepth = thinkingMode === 'DEPTH';
-          return {
-            modelId: (m.modelId ?? m.model_id ?? '') as string,
-            displayName: (m.displayName ?? m.display_name ?? '') as string,
-            thinkingDepth: (m.thinkingDepth ?? m.thinking_budget ?? 'medium') as string,
-            thinkingMode,
-            supportsThinkingDepth: supportsDepth,
-            supportsImage: Boolean(m.supportsImage ?? m.supports_image ?? false),
-            maxTokens: Number(m.maxTokens ?? m.max_tokens ?? 4096),
-            contextWindow: Number(m.contextWindow ?? m.context_window ?? 8192),
-            temperature: Number(m.temperature ?? 0.3),
-            purpose: (m.purpose ?? 'CHAT') as
-              | 'CHAT'
-              | 'REALTIME_SUMMARY'
-              | 'FINAL_SUMMARY'
-              | 'KEYWORD_EXTRACTION'
-              | 'EMBEDDING',
-            isDefault: Boolean(m.isDefault ?? m.is_default ?? false),
-            sortOrder: Number(m.sortOrder ?? m.sort_order ?? idx),
-          };
-        })
+    const incomingModels = Array.isArray(body.models)
+      ? (body.models as Array<Record<string, unknown>>)
       : [];
+
+    const modelsData: Array<{
+      modelId: string;
+      displayName: string;
+      thinkingDepth: string;
+      thinkingMode: 'NONE' | 'AUTO' | 'FORCED' | 'DEPTH';
+      supportsThinkingDepth: boolean;
+      supportsImage: boolean;
+      maxTokens: number;
+      contextWindow: number;
+      temperature: number;
+      purpose: 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING';
+      isDefault: boolean;
+      sortOrder: number;
+    }> = [];
+
+    for (const [idx, m] of incomingModels.entries()) {
+      const maxTokens = Number(m.maxTokens ?? m.max_tokens ?? 4096);
+      const contextWindow = Number(m.contextWindow ?? m.context_window ?? 8192);
+      // 校验 contextWindow >= maxTokens（否则可输入预算 <= 0，所有 chat 都会立刻 EOL）
+      if (contextWindow < maxTokens) {
+        return NextResponse.json(
+          {
+            error: `模型 ${(m.modelId ?? m.model_id ?? '') as string}: contextWindow 必须 ≥ maxTokens（上下文窗口必须大于等于单次输出 token 数）`,
+          },
+          { status: 400 }
+        );
+      }
+      const thinkingMode = (m.thinkingMode ?? m.thinking_mode ?? 'NONE') as
+        | 'NONE'
+        | 'AUTO'
+        | 'FORCED'
+        | 'DEPTH';
+      // supportsThinkingDepth 由 mode === 'DEPTH' 派生（一致性保护，覆盖 body 值）
+      const supportsDepth = thinkingMode === 'DEPTH';
+      modelsData.push({
+        modelId: (m.modelId ?? m.model_id ?? '') as string,
+        displayName: (m.displayName ?? m.display_name ?? '') as string,
+        thinkingDepth: (m.thinkingDepth ?? m.thinking_budget ?? 'medium') as string,
+        thinkingMode,
+        supportsThinkingDepth: supportsDepth,
+        supportsImage: Boolean(m.supportsImage ?? m.supports_image ?? false),
+        maxTokens,
+        contextWindow,
+        temperature: Number(m.temperature ?? 0.3),
+        purpose: (m.purpose ?? 'CHAT') as
+          | 'CHAT'
+          | 'REALTIME_SUMMARY'
+          | 'FINAL_SUMMARY'
+          | 'KEYWORD_EXTRACTION'
+          | 'EMBEDDING',
+        isDefault: Boolean(m.isDefault ?? m.is_default ?? false),
+        sortOrder: Number(m.sortOrder ?? m.sort_order ?? idx),
+      });
+    }
 
     const createdProvider = await prisma.llmProvider.create({
       data: {
         name,
         apiKey: encrypt(apiKey),
-        apiBase,
+        apiBase: normalizedApiBase,
         isAnthropic: isAnthropic ?? false,
         sortOrder: sortOrder ?? 0,
         ...(modelsData.length > 0 ? { models: { create: modelsData } } : {}),

@@ -9,6 +9,21 @@ import { prisma } from '@/lib/prisma';
 import { resolvePublicAppOrigin } from '@/lib/requestOrigin';
 
 /**
+ * PKCE code_verifier 在 SiteSetting 中的存活时间（10 分钟）。
+ * 授权流程从跳转到回调通常只需数秒，10 分钟足够覆盖人工同意页停留，
+ * 又能确保用户中断授权后残留的明文 verifier 很快失效、无法被复用。
+ */
+const PKCE_VERIFIER_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * 把 PKCE code_verifier 连同过期时间戳编码进 SiteSetting 的 value。
+ * 不新增表/列，用 JSON 在单个 value 内携带 TTL；callback 取用时校验未过期。
+ */
+function encodeCodeVerifier(verifier: string, now: number): string {
+  return JSON.stringify({ v: verifier, exp: now + PKCE_VERIFIER_TTL_MS });
+}
+
+/**
  * GET /api/admin/cloudreve/authorize
  * 发起 Cloudreve V4 OAuth 授权流程，返回授权 URL
  */
@@ -31,14 +46,15 @@ export async function GET(req: Request) {
     const origin = await resolvePublicAppOrigin(req);
     const redirectUri = `${origin}/api/admin/cloudreve/callback`;
 
-    // 生成 PKCE code_verifier 并临时存入数据库
+    // 生成 PKCE code_verifier 并临时存入数据库（带过期时间戳）
     const codeVerifier = generateCodeVerifier();
+    const storedVerifier = encodeCodeVerifier(codeVerifier, Date.now());
 
     await Promise.all([
       prisma.siteSetting.upsert({
         where: { key: 'cloudreve_code_verifier' },
-        update: { value: codeVerifier },
-        create: { key: 'cloudreve_code_verifier', value: codeVerifier },
+        update: { value: storedVerifier },
+        create: { key: 'cloudreve_code_verifier', value: storedVerifier },
       }),
       prisma.siteSetting.upsert({
         where: { key: 'cloudreve_redirect_uri' },

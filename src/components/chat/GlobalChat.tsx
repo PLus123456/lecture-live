@@ -11,6 +11,7 @@ import { useRouter } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import {
   Send,
+  Square,
   Loader2,
   User,
   Bot,
@@ -41,6 +42,7 @@ import type {
 } from '@/types/llm';
 import AttachmentChip, { type AttachmentChipData } from './AttachmentChip';
 import RecordingsBar, { type RecordingPill } from './RecordingsBar';
+import RecordingPicker from './RecordingPicker';
 
 /* ------------------------------------------------------------------ */
 /*  图片上传约束（与服务端 LLM_LIMITS 对齐 — 与 ChatTab 同步）              */
@@ -486,6 +488,14 @@ export default function GlobalChat({
   /** API 子路由是否可用（U9 未上线时显示禁用按钮） */
   const [recordingsReady, setRecordingsReady] = useState(false);
   const [uploadingFile, setUploadingFile] = useState(false);
+  /** 「添加录音」选择器是否打开（U11 接线 RecordingPicker） */
+  const [pickerOpen, setPickerOpen] = useState(false);
+  /** 对话已关闭（endedAt 非空）→ 只读：禁止再发消息 / 改附件。null = 活跃。 */
+  const [endedAt, setEndedAt] = useState<string | null>(null);
+  const isEnded = endedAt !== null;
+  /** IME 合成中（中文/日文输入法）—— 合成期间回车不应发送（修输入法回车误发） */
+  const [composing, setComposing] = useState(false);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const sendAbortRef = useRef<AbortController | null>(null);
@@ -522,6 +532,7 @@ export default function GlobalChat({
     resetConversation(conversationId);
     setActiveConversation(conversationId);
     setAttachments([]);
+    setEndedAt(null);
 
     const controller = new AbortController();
     const headers = { Authorization: `Bearer ${token}` };
@@ -545,6 +556,7 @@ export default function GlobalChat({
             return;
           }
           const data = (await res.json()) as {
+            conversation?: { endedAt: string | null };
             messages: Array<{
               id: string;
               role: string;
@@ -555,6 +567,8 @@ export default function GlobalChat({
             }>;
           };
           if (controller.signal.aborted) return;
+          // 已关闭对话 → 置只读（endedAt 非空）
+          setEndedAt(data.conversation?.endedAt ?? null);
 
           // 找最近一条压缩边界 → 分割成 archivedMessages + messages（与 useChat.ts 同步）。
           // 此前 archived 恒传 []：压缩过的对话会把摘要切割点之前的历史全当可见消息
@@ -735,7 +749,7 @@ export default function GlobalChat({
     e.target.value = '';
   };
 
-  const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     if (!supportsImage) return;
     const imageFiles: File[] = [];
     for (const item of Array.from(e.clipboardData.items)) {
@@ -814,9 +828,29 @@ export default function GlobalChat({
     }
   };
 
-  const removeAttachment = (id: string) => {
-    setAttachments((prev) => prev.filter((a) => a.id !== id));
-  };
+  /**
+   * 移除一个已上传附件：乐观从本地移除 + DELETE /api/chat-uploads/[id]
+   * （删 Cloudreve 文件 + 释放配额）。此前只删本地数组 → 取消即留 Cloudreve 孤儿文件。
+   * 失败回滚并 toast。
+   */
+  const removeAttachment = useCallback(
+    async (id: string) => {
+      if (!token) return;
+      const prev = attachments;
+      setAttachments((cur) => cur.filter((a) => a.id !== id));
+      try {
+        const res = await fetch(
+          `/api/chat-uploads/${encodeURIComponent(id)}`,
+          { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch {
+        setAttachments(prev); // 回滚
+        toast.error(t('common.operationFailed'));
+      }
+    },
+    [attachments, token, t]
+  );
 
   /* ──────────────────────────────────────────────────────────────
      录音 pill：移除（DELETE /api/conversations/[id]/recordings）
@@ -854,6 +888,38 @@ export default function GlobalChat({
   );
 
   /* ──────────────────────────────────────────────────────────────
+     重新拉取录音 pill（RecordingPicker 附加成功后刷新带 title/duration 的完整 pill）
+     ────────────────────────────────────────────────────────────── */
+  const reloadRecordings = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(
+        `/api/conversations/${encodeURIComponent(conversationId)}/recordings`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) return;
+      const data: unknown = await res.json();
+      let raw: unknown[] = [];
+      if (Array.isArray(data)) {
+        raw = data;
+      } else if (data && typeof data === 'object') {
+        const obj = data as Record<string, unknown>;
+        if (Array.isArray(obj.recordings)) raw = obj.recordings;
+        else if (Array.isArray(obj.items)) raw = obj.items;
+      }
+      const list = raw.filter(
+        (r): r is RecordingPill =>
+          !!r &&
+          typeof r === 'object' &&
+          typeof (r as RecordingPill).sessionId === 'string'
+      );
+      setRecordings(list);
+    } catch {
+      /* ignore — 刷新失败保留旧 pill，不影响主流程 */
+    }
+  }, [token, conversationId]);
+
+  /* ──────────────────────────────────────────────────────────────
      新建对话（EOL 后引导）：带上当前录音另起一个全局对话并跳转
      ────────────────────────────────────────────────────────────── */
   const handleNewConversation = useCallback(async () => {
@@ -884,9 +950,14 @@ export default function GlobalChat({
   const handleSend = async () => {
     const value = input.trim();
     const hasImages = pendingImages.length > 0;
-    if ((!value && !hasImages) || isLoading || !token || contextFull) return;
+    if ((!value && !hasImages) || isLoading || !token || contextFull || isEnded)
+      return;
+
+    // 本轮是否为对话首轮（用于完成后触发标题自动生成）
+    const isFirstExchange = messages.length === 0;
 
     setInput('');
+    if (composerRef.current) composerRef.current.style.height = 'auto';
 
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
@@ -1013,6 +1084,13 @@ export default function GlobalChat({
 
       if (!sawError) {
         updateMessage(conversationId, assistantId, { streaming: false });
+        // 首轮对话完成 → 异步生成标题（幂等端点；fire-and-forget，列表下次加载即显示）
+        if (isFirstExchange && token) {
+          void fetch(
+            `/api/conversations/${encodeURIComponent(conversationId)}/generate-title`,
+            { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
+          ).catch(() => undefined);
+        }
       }
     } catch (error) {
       // 流被 abort（切换对话/卸载）—— 静默收尾，不写错误气泡。
@@ -1073,17 +1151,29 @@ export default function GlobalChat({
       {/* 顶部录音 bar */}
       <RecordingsBar
         recordings={recordings}
-        attachDisabled={!recordingsReady}
+        attachDisabled={!recordingsReady || isEnded}
         onAttach={() => {
-          // U11 picker 还未就绪 —— 给一个 toast 占位
           if (!recordingsReady) {
             toast.info(t('chat.recordingPickerComingSoon'));
             return;
           }
-          // TODO U11: 打开 RecordingPicker 模态
-          toast.info(t('chat.recordingPickerComingSoon'));
+          if (isEnded) {
+            toast.info(t('chat.endedReadonly'));
+            return;
+          }
+          setPickerOpen(true);
         }}
-        onDetach={recordingsReady ? handleDetachRecording : undefined}
+        onDetach={recordingsReady && !isEnded ? handleDetachRecording : undefined}
+      />
+
+      <RecordingPicker
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        conversationId={conversationId}
+        alreadyAttached={recordings.map((r) => r.sessionId)}
+        onAttached={() => {
+          void reloadRecordings();
+        }}
       />
 
       {/* Messages */}
@@ -1102,6 +1192,18 @@ export default function GlobalChat({
 
       {/* Input area — 与 ChatTab 视觉同步 */}
       <div className="border-t border-cream-200 px-3 pt-1.5 pb-0 sticky bottom-0 bg-white safe-bottom">
+        {isEnded && !contextFull && (
+          <div className="mb-2 px-2.5 py-1.5 rounded-md bg-charcoal-50 border border-charcoal-200 text-[11px] text-charcoal-600 flex items-center justify-between">
+            <span>{t('chat.endedReadonly')}</span>
+            <button
+              type="button"
+              onClick={() => void handleNewConversation()}
+              className="ml-2 px-2 py-0.5 rounded bg-rust-500 text-white hover:bg-rust-600 transition-colors flex-shrink-0"
+            >
+              {t('chat.newConversation')}
+            </button>
+          </div>
+        )}
         {contextFull && (
           <div className="mb-2 px-2.5 py-1.5 rounded-md bg-red-50 border border-red-200 text-[11px] text-red-700 flex items-center justify-between">
             <span>上下文已满，所有降级策略均无法塞下。</span>
@@ -1181,7 +1283,7 @@ export default function GlobalChat({
           <button
             type="button"
             onClick={() => imageInputRef.current?.click()}
-            disabled={isLoading || !supportsImage}
+            disabled={isLoading || !supportsImage || isEnded}
             title={supportsImage ? '上传图片' : '当前模型不支持图片输入'}
             className="w-9 h-9 rounded-lg border border-cream-300 bg-white text-charcoal-500
                        hover:border-cream-400 transition-colors flex items-center justify-center
@@ -1192,7 +1294,7 @@ export default function GlobalChat({
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={isLoading || uploadingFile}
+            disabled={isLoading || uploadingFile || isEnded}
             title={t('chat.attachFile')}
             className="w-9 h-9 rounded-lg border border-cream-300 bg-white text-charcoal-500
                        hover:border-cream-400 transition-colors flex items-center justify-center
@@ -1205,28 +1307,68 @@ export default function GlobalChat({
             )}
           </button>
 
-          <input
-            type="text"
+          <textarea
+            ref={composerRef}
+            rows={1}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            onChange={(e) => {
+              setInput(e.target.value);
+              e.target.style.height = 'auto';
+              e.target.style.height = `${Math.min(e.target.scrollHeight, 128)}px`;
+            }}
+            onKeyDown={(e) => {
+              // 回车发送；Shift+Enter 换行；IME 合成中的回车不发送
+              if (
+                e.key === 'Enter' &&
+                !e.shiftKey &&
+                !composing &&
+                !e.nativeEvent.isComposing
+              ) {
+                e.preventDefault();
+                void handleSend();
+              }
+            }}
+            onCompositionStart={() => setComposing(true)}
+            onCompositionEnd={() => setComposing(false)}
             onPaste={handlePaste}
-            placeholder={t('chat.composerPlaceholder')}
-            className="flex-1 px-3 py-2 rounded-lg border border-cream-300 text-xs
-                       focus:outline-none focus:ring-1 focus:ring-rust-400 focus:border-rust-400
-                       bg-white text-charcoal-700 placeholder:text-charcoal-300"
-            disabled={isLoading || contextFull}
-          />
-          <button
-            onClick={handleSend}
-            disabled={
-              isLoading || contextFull || (!input.trim() && pendingImages.length === 0)
+            placeholder={
+              isEnded ? t('chat.endedReadonly') : t('chat.composerPlaceholder')
             }
-            className="p-2 rounded-lg bg-rust-500 text-white hover:bg-rust-600
-                       disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
-          >
-            <Send className="w-3.5 h-3.5" />
-          </button>
+            className="flex-1 px-3 py-2 rounded-lg border border-cream-300 text-xs resize-none
+                       max-h-32 overflow-y-auto
+                       focus:outline-none focus:ring-1 focus:ring-rust-400 focus:border-rust-400
+                       bg-white text-charcoal-700 placeholder:text-charcoal-300
+                       disabled:bg-cream-50 disabled:cursor-not-allowed"
+            disabled={isLoading || contextFull || isEnded}
+          />
+          {isLoading ? (
+            <button
+              type="button"
+              onClick={() => {
+                sendAbortRef.current?.abort();
+                setLoading(conversationId, false);
+              }}
+              title={t('chat.stop')}
+              aria-label={t('chat.stop')}
+              className="p-2 rounded-lg bg-charcoal-200 text-charcoal-600 hover:bg-charcoal-300
+                         transition-colors flex-shrink-0"
+            >
+              <Square className="w-3.5 h-3.5" />
+            </button>
+          ) : (
+            <button
+              onClick={handleSend}
+              disabled={
+                contextFull ||
+                isEnded ||
+                (!input.trim() && pendingImages.length === 0)
+              }
+              className="p-2 rounded-lg bg-rust-500 text-white hover:bg-rust-600
+                         disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+            >
+              <Send className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
 
         {/* Footer 行（与 ChatTab 同步）：模型 · 思考强度 */}

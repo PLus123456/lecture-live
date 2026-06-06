@@ -11,77 +11,7 @@ import {
   resolveRoleStorageBytesLimit,
 } from '@/lib/userRoles';
 import { releaseStorageBytes } from '@/lib/quota';
-import { resolveCloudreveConfig } from '@/lib/storage/cloudreve';
-import { decrypt } from '@/lib/crypto';
-import { logger, serializeError } from '@/lib/logger';
-
-const routeLogger = logger.child({ component: 'admin-users' });
-
-/**
- * 拿 Cloudreve 物理删除所需的 baseUrl + access_token（与 chat-uploads 删除路径同款做法）。
- * 任一步失败返回 null，调用方据此跳过物理删除，只删 DB —— 不能因外部存储不可达卡住删用户。
- */
-async function loadCloudreveContext(): Promise<{
-  baseUrl: string;
-  accessToken: string;
-} | null> {
-  try {
-    const config = await resolveCloudreveConfig();
-    if (!config) return null;
-
-    const row = await prisma.siteSetting.findUnique({
-      where: { key: 'cloudreve_access_token' },
-    });
-    if (!row?.value) return null;
-
-    const accessToken = decrypt(row.value);
-    if (!accessToken) return null;
-
-    return {
-      baseUrl: config.baseUrl.replace(/\/+$/, ''),
-      accessToken,
-    };
-  } catch (err) {
-    routeLogger.warn(
-      { err: serializeError(err) },
-      'admin-users: loadCloudreveContext 失败；跳过物理删除'
-    );
-    return null;
-  }
-}
-
-/** 删 Cloudreve 上一个文件（best-effort）；残留由 admin 文件清理工具兜底，绝不阻塞 DB 清理。 */
-async function deleteFromCloudreveByPath(
-  remotePath: string,
-  ctx: { baseUrl: string; accessToken: string }
-): Promise<void> {
-  try {
-    const fileUri = remotePath.startsWith('/')
-      ? `cloudreve://my${remotePath}`
-      : `cloudreve://my/${remotePath}`;
-
-    const response = await fetch(`${ctx.baseUrl}/api/v4/file`, {
-      method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${ctx.accessToken}`,
-      },
-      body: JSON.stringify({ uris: [fileUri] }),
-    });
-
-    if (!response.ok) {
-      routeLogger.warn(
-        { remotePath, status: response.status },
-        'admin-users: Cloudreve DELETE non-2xx; 残留由清理工具兜底'
-      );
-    }
-  } catch (err) {
-    routeLogger.warn(
-      { remotePath, err: serializeError(err) },
-      'admin-users: Cloudreve DELETE threw; 残留由清理工具兜底'
-    );
-  }
-}
+import { deleteCloudreveAttachmentFiles } from '@/lib/storage/cloudreveFileDelete';
 
 // 共享的用户查询 select 字段
 const USER_SELECT = {
@@ -363,17 +293,7 @@ async function cascadeDeleteUsers(userIds: string[]): Promise<number> {
   });
 
   // 物理删除 Cloudreve 文件（best-effort，事务外，失败不阻塞）
-  if (attachments.length > 0) {
-    const cloudreveCtx = await loadCloudreveContext();
-    if (cloudreveCtx) {
-      for (const att of attachments) {
-        await deleteFromCloudreveByPath(att.cloudrevePath, cloudreveCtx);
-        if (att.extractedTextPath) {
-          await deleteFromCloudreveByPath(att.extractedTextPath, cloudreveCtx);
-        }
-      }
-    }
-  }
+  await deleteCloudreveAttachmentFiles(attachments);
 
   const attachmentIds = attachments.map((a) => a.id);
   const deletedUserSet = new Set(userIds);

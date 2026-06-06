@@ -25,6 +25,7 @@ import { prisma } from '@/lib/prisma';
 import { invalidateRagCache } from '@/lib/llm/embedding/transcriptRag';
 import { logger, serializeError } from '@/lib/logger';
 import { collectSessionIds } from '@/lib/conversations';
+import { deleteConversationsCascade } from '@/lib/conversationCascade';
 
 const apiLogger = logger.child({ component: 'conversations-api' });
 
@@ -38,6 +39,7 @@ type ConversationListItem = {
   startedAt: string;
   endedAt: string | null;
   degradationLevel: number;
+  archived: boolean;
   messageCount: number;
   sessionIds: string[];
 };
@@ -48,6 +50,7 @@ function serializeConversation(c: {
   startedAt: Date;
   endedAt: Date | null;
   degradationLevel: number;
+  archived: boolean;
   sessionId: string | null;
   sessions: Array<{ sessionId: string }>;
   _count: { messages: number };
@@ -58,6 +61,7 @@ function serializeConversation(c: {
     startedAt: c.startedAt.toISOString(),
     endedAt: c.endedAt?.toISOString() ?? null,
     degradationLevel: c.degradationLevel,
+    archived: c.archived,
     messageCount: c._count.messages,
     sessionIds: collectSessionIds(c),
   };
@@ -73,6 +77,10 @@ export async function GET(req: Request) {
   const scopeParam = url.searchParams.get('scope');
   const recentParam = url.searchParams.get('recent');
   const sessionIdParam = url.searchParams.get('sessionId');
+  // 默认隐藏已归档对话；历史页传 includeArchived=true 拉全部（含归档区）
+  const includeArchived =
+    url.searchParams.get('includeArchived') === 'true';
+  const archivedFilter = includeArchived ? {} : { archived: false };
 
   // ── 模式 A：?recent=N
   if (recentParam !== null) {
@@ -90,7 +98,7 @@ export async function GET(req: Request) {
 
     // 用户所有对话 = Conversation.userId 命中本人（含零录音纯 global 对话）
     const conversations = await prisma.conversation.findMany({
-      where: { userId: user.id },
+      where: { userId: user.id, ...archivedFilter },
       orderBy: { startedAt: 'desc' },
       take: recent,
       select: {
@@ -99,6 +107,7 @@ export async function GET(req: Request) {
         startedAt: true,
         endedAt: true,
         degradationLevel: true,
+        archived: true,
         sessionId: true,
         sessions: { select: { sessionId: true }, orderBy: { addedAt: 'asc' } },
         _count: { select: { messages: true } },
@@ -116,6 +125,7 @@ export async function GET(req: Request) {
       where: {
         userId: user.id,
         sessionId: null,
+        ...archivedFilter,
       },
       orderBy: { startedAt: 'desc' },
       take: GLOBAL_LIMIT,
@@ -125,6 +135,7 @@ export async function GET(req: Request) {
         startedAt: true,
         endedAt: true,
         degradationLevel: true,
+        archived: true,
         sessionId: true,
         sessions: { select: { sessionId: true }, orderBy: { addedAt: 'asc' } },
         _count: { select: { messages: true } },
@@ -155,7 +166,7 @@ export async function GET(req: Request) {
   }
 
   const conversations = await prisma.conversation.findMany({
-    where: { sessionId },
+    where: { sessionId, ...archivedFilter },
     orderBy: { startedAt: 'asc' },
     select: {
       id: true,
@@ -163,6 +174,7 @@ export async function GET(req: Request) {
       startedAt: true,
       endedAt: true,
       degradationLevel: true,
+      archived: true,
       sessionId: true,
       sessions: { select: { sessionId: true }, orderBy: { addedAt: 'asc' } },
       _count: { select: { messages: true } },
@@ -239,6 +251,7 @@ export async function POST(req: Request) {
             startedAt: true,
             endedAt: true,
             degradationLevel: true,
+            archived: true,
             sessionId: true,
             sessions: { select: { sessionId: true } },
           },
@@ -290,6 +303,7 @@ export async function POST(req: Request) {
           startedAt: true,
           endedAt: true,
           degradationLevel: true,
+          archived: true,
           sessionId: true,
         },
       });
@@ -322,6 +336,55 @@ export async function POST(req: Request) {
     );
     return NextResponse.json(
       { error: 'Failed to create conversation' },
+      { status: 500 }
+    );
+  }
+}
+
+// DELETE /api/conversations —— 批量清理本人对话（历史页「清空全部」/「清空已归档」）。
+//   body { all: true }          删除本人全部对话
+//   body { archivedOnly: true } 仅删除本人已归档对话
+// 二者必须显式指定其一（防止裸调误删）。级联清理走 deleteConversationsCascade（清文件+退配额）。
+export async function DELETE(req: Request) {
+  const user = await verifyAuth(req);
+  if (!user) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  let body: { all?: unknown; archivedOnly?: unknown };
+  try {
+    body = await req.json();
+  } catch {
+    body = {};
+  }
+  const archivedOnly = body.archivedOnly === true;
+  const all = body.all === true;
+  if (!all && !archivedOnly) {
+    return NextResponse.json(
+      { error: 'specify { all: true } or { archivedOnly: true }' },
+      { status: 400 }
+    );
+  }
+
+  const rows = await prisma.conversation.findMany({
+    where: { userId: user.id, ...(archivedOnly ? { archived: true } : {}) },
+    select: { id: true },
+  });
+  const ids = rows.map((r) => r.id);
+  if (ids.length === 0) {
+    return NextResponse.json({ deleted: 0 });
+  }
+
+  try {
+    const deleted = await deleteConversationsCascade(ids);
+    return NextResponse.json({ deleted });
+  } catch (err) {
+    apiLogger.error(
+      { count: ids.length, err: serializeError(err) },
+      '批量清理 conversation 失败'
+    );
+    return NextResponse.json(
+      { error: 'Failed to clear conversations' },
       { status: 500 }
     );
   }

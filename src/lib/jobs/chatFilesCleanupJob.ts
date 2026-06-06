@@ -1,11 +1,14 @@
 import 'server-only';
 
+import fs from 'fs/promises';
+import path from 'path';
 import { prisma } from '@/lib/prisma';
 import {
   loadCloudreveContext,
   deleteCloudreveFile,
   type CloudreveDeleteContext,
 } from '@/lib/storage/cloudreveFileDelete';
+import { CHAT_IMAGE_ROOT } from '@/lib/llm/chatImageStorage';
 import { logger, serializeError } from '@/lib/logger';
 
 const jobLogger = logger.child({ component: 'chat-files-cleanup-job' });
@@ -162,6 +165,51 @@ export async function runChatFilesCleanup(): Promise<ChatFilesCleanupResult> {
   );
 
   return result;
+}
+
+/**
+ * 清理本地孤儿聊天图片目录 `data/chatimages/<conversationId>/`。
+ *
+ * 扫描该根目录下所有子项，删掉其名字（=conversationId）在 Conversation 表中已不存在的目录。
+ * 背景：内嵌聊天图片只落本地磁盘、不进 ChatAttachment、不计配额；B1 起“删对话”会主动删
+ * 对应目录，但删 Session 触发的级联删对话、以及 B1 之前删掉的对话都会遗留孤儿目录 —— 本函数
+ * 兜底清理它们。挂在每日 billingMaintenance 里跑。
+ *
+ * best-effort：根目录不存在 / 单条删除失败都不抛，返回已删的目录数。
+ */
+export async function cleanupOrphanChatImageDirs(): Promise<number> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(CHAT_IMAGE_ROOT);
+  } catch {
+    return 0; // 根目录不存在 = 没有任何聊天图片
+  }
+  if (entries.length === 0) return 0;
+
+  // 这些目录名中，哪些 conversationId 仍存在（存在的保留，其余视为孤儿）
+  const existing = await prisma.conversation.findMany({
+    where: { id: { in: entries } },
+    select: { id: true },
+  });
+  const existingSet = new Set(existing.map((c) => c.id));
+
+  let removed = 0;
+  for (const name of entries) {
+    if (existingSet.has(name)) continue;
+    try {
+      await fs.rm(path.join(CHAT_IMAGE_ROOT, name), {
+        recursive: true,
+        force: true,
+      });
+      removed += 1;
+    } catch (err) {
+      jobLogger.warn(
+        { name, err: serializeError(err) },
+        '[chat-files-cleanup] 删孤儿图片目录失败'
+      );
+    }
+  }
+  return removed;
 }
 
 /**

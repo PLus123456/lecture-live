@@ -63,9 +63,9 @@ export default function ChatHomeClient() {
   const [creating, setCreating] = useState(false);
   /**
    * 'ok'    — 后端正确返回
-   * 'fallback' — 端点 404/500，列表降级为空（U9 未上线）
+   * 'error' — 拉取失败（401/500/网络抖动），显示错误 + 重试，不再误报“端点未上线”
    */
-  const [listStatus, setListStatus] = useState<'ok' | 'fallback'>('ok');
+  const [listStatus, setListStatus] = useState<'ok' | 'error'>('ok');
   // 待确认删除的对话（null = 弹窗关闭）
   const [pendingDelete, setPendingDelete] = useState<ConversationCard | null>(
     null
@@ -73,28 +73,19 @@ export default function ChatHomeClient() {
   const [deleting, setDeleting] = useState(false);
 
   /* ──────────────────────────────────────────────────────────────
-     拉取最近 20 条全局 conversation
-     U9 未上线时端点 404 — 静默兜底为空列表 + degradation badge
+     拉取最近 20 条全局 conversation。失败（401/500/网络）置 'error' → 显示重试，
+     不再把任何失败都误报成“端点未上线”。
      ────────────────────────────────────────────────────────────── */
-  useEffect(() => {
-    if (!token) return;
-    const controller = new AbortController();
-    (async () => {
+  const loadConversations = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!token) return;
       setLoading(true);
       try {
-        const res = await fetch(
-          '/api/conversations?scope=global&limit=20',
-          {
-            headers: { Authorization: `Bearer ${token}` },
-            signal: controller.signal,
-          }
-        );
-        if (!res.ok) {
-          setListStatus('fallback');
-          setConversations([]);
-          return;
-        }
-        // U9 未定型 — 接受 []、{ conversations: [] }、{ items: [] }
+        const res = await fetch('/api/conversations?scope=global&limit=20', {
+          headers: { Authorization: `Bearer ${token}` },
+          signal,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data: unknown = await res.json();
         let raw: unknown[] = [];
         if (Array.isArray(data)) {
@@ -114,14 +105,19 @@ export default function ChatHomeClient() {
         setListStatus('ok');
       } catch (err) {
         if ((err as { name?: string })?.name === 'AbortError') return;
-        setListStatus('fallback');
-        setConversations([]);
+        setListStatus('error');
       } finally {
-        setLoading(false);
+        if (!signal?.aborted) setLoading(false);
       }
-    })();
+    },
+    [token]
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadConversations(controller.signal);
     return () => controller.abort();
-  }, [token]);
+  }, [loadConversations]);
 
   /* ──────────────────────────────────────────────────────────────
      新建对话：POST /api/conversations {} → 跳转 /chat/<newId>
@@ -243,15 +239,22 @@ export default function ChatHomeClient() {
 
       {/* 中间：最近对话列表 */}
       <div className="flex-1 min-h-0 overflow-y-auto px-8 lg:px-12">
-        {/* 降级提示（端点未上线时） */}
-        {listStatus === 'fallback' && !loading && (
-          <div className="mb-4 flex items-center gap-2 px-3 py-2 rounded-md
-                          bg-amber-50 border border-amber-200 text-[11px] text-amber-700">
-            <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
-            <span>
-              Conversations API not yet available. The list will populate once
-              the endpoint is live.
+        {/* 加载失败提示 + 重试 */}
+        {listStatus === 'error' && !loading && (
+          <div className="mb-4 flex items-center justify-between gap-2 px-3 py-2 rounded-md
+                          bg-red-50 border border-red-200 text-[11px] text-red-700">
+            <span className="flex items-center gap-2">
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+              {t('chat.loadFailed')}
             </span>
+            <button
+              type="button"
+              onClick={() => void loadConversations()}
+              className="px-2 py-0.5 rounded bg-red-600 text-white hover:bg-red-700
+                         transition-colors flex-shrink-0"
+            >
+              {t('common.retry')}
+            </button>
           </div>
         )}
 

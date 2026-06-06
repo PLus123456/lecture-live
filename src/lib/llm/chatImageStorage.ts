@@ -16,7 +16,7 @@ import { logger, serializeError } from '@/lib/logger';
 
 const imgLogger = logger.child({ component: 'chat-image-storage' });
 
-const CHAT_IMAGE_ROOT = path.join(process.cwd(), 'data', 'chatimages');
+export const CHAT_IMAGE_ROOT = path.join(process.cwd(), 'data', 'chatimages');
 
 /** 受支持的图片 MIME 类型 → 文件扩展名 */
 const MIME_EXTENSION: Record<string, string> = {

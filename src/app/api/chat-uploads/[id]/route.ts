@@ -6,85 +6,20 @@
 //   3. 删 DB 行
 //   4. releaseStorageBytes 释放配额
 //
-// Cloudreve V4 不在 CloudreveStorage 类里暴露 delete，本 handler 直接调
-// V4 API（与 chatFilesCleanupJob 同款做法）。失败不抛 —— 物理残留可由 cron 兜底。
+// Cloudreve 物理删除走 @/lib/storage/cloudreveFileDelete 的统一实现（与删对话 / cron /
+// 删用户共用同一份），失败不抛 —— 物理残留可由 cron 兜底。
 
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { releaseStorageBytes } from '@/lib/quota';
 import {
-  resolveCloudreveConfig,
-} from '@/lib/storage/cloudreve';
-import { decrypt } from '@/lib/crypto';
+  loadCloudreveContext,
+  deleteCloudreveFile,
+} from '@/lib/storage/cloudreveFileDelete';
 import { logger, serializeError } from '@/lib/logger';
 
 const routeLogger = logger.child({ component: 'chat-uploads-delete' });
-
-/**
- * 拿 Cloudreve 物理删除所需的 baseUrl + access_token。
- * 任何一步失败都返回 null，让调用方跳过物理删除直接走 DB 删除。
- */
-async function loadCloudreveContext(): Promise<{
-  baseUrl: string;
-  accessToken: string;
-} | null> {
-  try {
-    const config = await resolveCloudreveConfig();
-    if (!config) return null;
-
-    const row = await prisma.siteSetting.findUnique({
-      where: { key: 'cloudreve_access_token' },
-    });
-    if (!row?.value) return null;
-
-    const accessToken = decrypt(row.value);
-    if (!accessToken) return null;
-
-    return {
-      baseUrl: config.baseUrl.replace(/\/+$/, ''),
-      accessToken,
-    };
-  } catch (err) {
-    routeLogger.warn(
-      { err: serializeError(err) },
-      'chat-uploads-delete: loadCloudreveContext failed; 跳过物理删除'
-    );
-    return null;
-  }
-}
-
-async function deleteFromCloudreveByPath(
-  remotePath: string,
-  ctx: { baseUrl: string; accessToken: string }
-): Promise<void> {
-  try {
-    const fileUri = remotePath.startsWith('/')
-      ? `cloudreve://my${remotePath}`
-      : `cloudreve://my/${remotePath}`;
-
-    const response = await fetch(`${ctx.baseUrl}/api/v4/file`, {
-      method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${ctx.accessToken}`,
-      },
-      body: JSON.stringify({ uris: [fileUri] }),
-    });
-
-    if (!response.ok) {
-      routeLogger.warn(
-        { remotePath, status: response.status },
-        'chat-uploads-delete: Cloudreve DELETE non-2xx; 残留由 cron 兜底'
-      );
-    }
-  } catch (err) {
-    routeLogger.warn(
-      { remotePath, err: serializeError(err) },
-      'chat-uploads-delete: Cloudreve DELETE threw; 残留由 cron 兜底'
-    );
-  }
-}
 
 export async function DELETE(
   req: Request,
@@ -122,9 +57,9 @@ export async function DELETE(
   // 物理文件 best-effort 删除（失败不阻塞 DB 清理）
   const cloudreveCtx = await loadCloudreveContext();
   if (cloudreveCtx) {
-    await deleteFromCloudreveByPath(attachment.cloudrevePath, cloudreveCtx);
+    await deleteCloudreveFile(attachment.cloudrevePath, cloudreveCtx);
     if (attachment.extractedTextPath) {
-      await deleteFromCloudreveByPath(attachment.extractedTextPath, cloudreveCtx);
+      await deleteCloudreveFile(attachment.extractedTextPath, cloudreveCtx);
     }
   }
 

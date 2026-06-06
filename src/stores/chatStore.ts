@@ -102,6 +102,11 @@ interface ChatStore {
   setActiveConversation: (id: string | null) => void;
   setConversations: (list: ConversationMeta[]) => void;
   addConversation: (conv: ConversationMeta) => void;
+  /**
+   * 从导航态移除一个对话（删除对话后调用）：一次性清掉 conversations 列表项 +
+   * byConversation 运行时切片 + 若删的是当前活跃对话则把 activeConversationId 置空。
+   */
+  removeConversation: (id: string) => void;
 
   // ── 按对话隔离的运行时 Setters（均需传 conversationId） ──
   setMessages: (
@@ -214,6 +219,20 @@ export const useChatStore = create<ChatStore>()(
         set((state) => ({
           conversations: [...state.conversations, conv],
         })),
+
+      removeConversation: (id) =>
+        set((state) => {
+          const nextBy = { ...state.byConversation };
+          delete nextBy[id];
+          return {
+            conversations: state.conversations.filter((c) => c.id !== id),
+            byConversation: nextBy,
+            activeConversationId:
+              state.activeConversationId === id
+                ? null
+                : state.activeConversationId,
+          };
+        }),
 
       setMessages: (conversationId, messages, archived = []) =>
         set((state) => ({

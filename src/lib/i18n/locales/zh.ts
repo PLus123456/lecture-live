@@ -1241,6 +1241,11 @@ export default {
     fileTooLarge: '文件超出大小限制',
     unsupportedFileType: '不支持的文件类型',
     redirectMissing: '对话不存在',
+    delete: '删除对话',
+    confirmDeleteTitle: '删除此对话？',
+    confirmDeleteMessage: '将永久删除该对话及其全部消息和附件文件，无法恢复。',
+    deleteSuccess: '对话已删除',
+    deleteFailed: '删除失败',
   },
 
   // 即时口译

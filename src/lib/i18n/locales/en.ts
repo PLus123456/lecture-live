@@ -1252,6 +1252,11 @@ export default {
     fileTooLarge: 'File too large',
     unsupportedFileType: 'Unsupported file type',
     redirectMissing: 'Conversation not found',
+    delete: 'Delete conversation',
+    confirmDeleteTitle: 'Delete this conversation?',
+    confirmDeleteMessage: 'This permanently deletes the conversation and all its messages and attached files. This cannot be undone.',
+    deleteSuccess: 'Conversation deleted',
+    deleteFailed: 'Delete failed',
   },
 
   // Interpret

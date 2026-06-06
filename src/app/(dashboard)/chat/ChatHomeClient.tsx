@@ -9,10 +9,12 @@ import {
   Clock,
   Loader2,
   AlertCircle,
+  Trash2,
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
 import { toast } from '@/stores/toastStore';
+import ConfirmDialog from '@/components/ConfirmDialog';
 
 interface ConversationCard {
   id: string;
@@ -64,6 +66,11 @@ export default function ChatHomeClient() {
    * 'fallback' — 端点 404/500，列表降级为空（U9 未上线）
    */
   const [listStatus, setListStatus] = useState<'ok' | 'fallback'>('ok');
+  // 待确认删除的对话（null = 弹窗关闭）
+  const [pendingDelete, setPendingDelete] = useState<ConversationCard | null>(
+    null
+  );
+  const [deleting, setDeleting] = useState(false);
 
   /* ──────────────────────────────────────────────────────────────
      拉取最近 20 条全局 conversation
@@ -160,6 +167,35 @@ export default function ChatHomeClient() {
     }
   }, [token, creating, router, t]);
 
+  /* ──────────────────────────────────────────────────────────────
+     删除对话：乐观从列表移除 → DELETE /api/conversations/[id]
+     失败回滚并 toast。后端会连带清理附件文件 + 本地图片 + 释放配额。
+     ────────────────────────────────────────────────────────────── */
+  const handleConfirmDelete = useCallback(async () => {
+    const target = pendingDelete;
+    if (!target || !token || deleting) return;
+    setDeleting(true);
+    const prev = conversations;
+    setConversations((list) => list.filter((c) => c.id !== target.id));
+    try {
+      const res = await fetch(`/api/conversations/${target.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setPendingDelete(null);
+      toast.success(t('chat.deleteSuccess'));
+    } catch (err) {
+      setConversations(prev); // 回滚
+      toast.error(
+        t('chat.deleteFailed'),
+        err instanceof Error ? err.message : undefined
+      );
+    } finally {
+      setDeleting(false);
+    }
+  }, [pendingDelete, token, deleting, conversations, t]);
+
   return (
     <div className="flex flex-col h-[100dvh] overflow-hidden">
       {/* 顶部：标题 + 新建按钮 */}
@@ -246,16 +282,19 @@ export default function ChatHomeClient() {
                   : t('chat.unnamed');
               const when = formatRelative(c.updatedAt ?? c.startedAt);
               return (
-                <Link
+                <div
                   key={c.id}
-                  href={`/chat/${c.id}`}
-                  className="group flex items-center gap-4 px-4 py-3.5 rounded-xl
-                             border border-cream-200 bg-white
-                             hover:border-rust-300 hover:shadow-sm card-hover-lift
-                             transition-all duration-200 animate-list-item-in"
+                  className="group relative animate-list-item-in"
                   style={{
                     animationDelay: `${Math.min(index * 0.04, 0.4)}s`,
                   }}
+                >
+                <Link
+                  href={`/chat/${c.id}`}
+                  className="flex items-center gap-4 px-4 py-3.5 pr-12 rounded-xl
+                             border border-cream-200 bg-white
+                             hover:border-rust-300 hover:shadow-sm card-hover-lift
+                             transition-all duration-200"
                 >
                   <div className="w-9 h-9 rounded-lg bg-cream-100 flex items-center justify-center flex-shrink-0">
                     <MessageSquare className="w-4 h-4 text-rust-500" />
@@ -284,11 +323,38 @@ export default function ChatHomeClient() {
                     </div>
                   </div>
                 </Link>
+                <button
+                  type="button"
+                  onClick={() => setPendingDelete(c)}
+                  aria-label={t('chat.delete')}
+                  title={t('chat.delete')}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 w-8 h-8 rounded-lg
+                             flex items-center justify-center text-charcoal-300
+                             hover:text-red-500 hover:bg-red-50
+                             opacity-0 group-hover:opacity-100 focus:opacity-100
+                             transition-all duration-150"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+                </div>
               );
             })}
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        loading={deleting}
+        title={t('chat.confirmDeleteTitle')}
+        message={t('chat.confirmDeleteMessage')}
+        confirmText={t('common.delete')}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => {
+          if (!deleting) setPendingDelete(null);
+        }}
+      />
     </div>
   );
 }

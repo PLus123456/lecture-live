@@ -1,8 +1,11 @@
 import 'server-only';
 
 import { prisma } from '@/lib/prisma';
-import { resolveCloudreveConfig } from '@/lib/storage/cloudreve';
-import { decrypt } from '@/lib/crypto';
+import {
+  loadCloudreveContext,
+  deleteCloudreveFile,
+  type CloudreveDeleteContext,
+} from '@/lib/storage/cloudreveFileDelete';
 import { logger, serializeError } from '@/lib/logger';
 
 const jobLogger = logger.child({ component: 'chat-files-cleanup-job' });
@@ -28,15 +31,6 @@ interface AttachmentRow {
   bytes: bigint;
   cloudrevePath: string;
   extractedTextPath: string | null;
-}
-
-/**
- * 一次运行内复用的 Cloudreve 配置 + token + base URL，避免每条附件都重复查 DB / 解密。
- * null = 未配置 / 未授权，所有删除直接跳过物理文件这一步。
- */
-interface CloudreveContext {
-  baseUrl: string;
-  accessToken: string;
 }
 
 /**
@@ -180,12 +174,12 @@ export async function runChatFilesCleanup(): Promise<ChatFilesCleanupResult> {
  */
 async function deleteAttachment(
   att: AttachmentRow,
-  cloudreve: CloudreveContext | null
+  cloudreve: CloudreveDeleteContext | null
 ): Promise<void> {
   if (cloudreve) {
-    await deleteFromCloudreveByPath(att.cloudrevePath, cloudreve);
+    await deleteCloudreveFile(att.cloudrevePath, cloudreve);
     if (att.extractedTextPath) {
-      await deleteFromCloudreveByPath(att.extractedTextPath, cloudreve);
+      await deleteCloudreveFile(att.extractedTextPath, cloudreve);
     }
   }
 
@@ -215,80 +209,5 @@ async function readNumericSiteSetting(
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
   } catch {
     return fallback;
-  }
-}
-
-/**
- * 把 Cloudreve 配置 + 加密 access_token 一次性解出来，给后续每条附件的删除复用。
- *
- * 为什么不调 CloudreveStorage：
- *   - 该类此刻没有公开 delete 方法（其他单元的领地），按 plan 不许动它。
- *   - access_token 与 refresh_token 都是内部状态，没有公开 getter。
- *
- * 失败语义：任意一步出错（未配置 / 未授权 / 解密失败）都返回 null，调用方据此跳过物理删除。
- * 这是 best-effort —— 不能因为外部存储不可达就把整个 cron 卡住，DB 行该删的还是要删。
- */
-async function loadCloudreveContext(): Promise<CloudreveContext | null> {
-  try {
-    const config = await resolveCloudreveConfig();
-    if (!config) return null;
-
-    const row = await prisma.siteSetting.findUnique({
-      where: { key: 'cloudreve_access_token' },
-    });
-    if (!row?.value) return null;
-
-    const accessToken = decrypt(row.value);
-    if (!accessToken) return null;
-
-    return {
-      baseUrl: config.baseUrl.replace(/\/+$/, ''),
-      accessToken,
-    };
-  } catch (err) {
-    jobLogger.warn(
-      { err: serializeError(err) },
-      '[chat-files-cleanup] 加载 Cloudreve 上下文失败；将跳过所有物理文件删除'
-    );
-    return null;
-  }
-}
-
-/**
- * 删 Cloudreve 上的一个文件（best-effort）。
- *
- * 用 V4 API：DELETE /api/v4/file，body `{ uris: ["cloudreve://my/{path}"] }`。
- * 任何失败（网络 / 鉴权 / 服务端错误）都静默 warn 然后返回 —— 残留文件可由 admin
- * 手动批量清理工具兜底，不能阻塞 DB 清理。
- */
-async function deleteFromCloudreveByPath(
-  remotePath: string,
-  cloudreve: CloudreveContext
-): Promise<void> {
-  try {
-    const fileUri = remotePath.startsWith('/')
-      ? `cloudreve://my${remotePath}`
-      : `cloudreve://my/${remotePath}`;
-
-    const response = await fetch(`${cloudreve.baseUrl}/api/v4/file`, {
-      method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cloudreve.accessToken}`,
-      },
-      body: JSON.stringify({ uris: [fileUri] }),
-    });
-
-    if (!response.ok) {
-      jobLogger.warn(
-        { remotePath, status: response.status },
-        '[chat-files-cleanup] Cloudreve delete non-2xx; 残留文件可由 admin 手动清理'
-      );
-    }
-  } catch (err) {
-    jobLogger.warn(
-      { remotePath, err: serializeError(err) },
-      '[chat-files-cleanup] Cloudreve delete threw; 残留文件可由 admin 手动清理'
-    );
   }
 }

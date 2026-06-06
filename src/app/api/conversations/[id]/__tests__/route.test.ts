@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { verifyAuthMock, findUniqueMock, cascadeMock } = vi.hoisted(() => ({
-  verifyAuthMock: vi.fn(),
-  findUniqueMock: vi.fn(),
-  cascadeMock: vi.fn(),
-}));
+const { verifyAuthMock, findUniqueMock, cascadeMock, updateMock } = vi.hoisted(
+  () => ({
+    verifyAuthMock: vi.fn(),
+    findUniqueMock: vi.fn(),
+    cascadeMock: vi.fn(),
+    updateMock: vi.fn(),
+  })
+);
 
 vi.mock('@/lib/auth', () => ({
   verifyAuth: verifyAuthMock,
@@ -18,6 +21,7 @@ vi.mock('@/lib/prisma', () => ({
   prisma: {
     conversation: {
       findUnique: findUniqueMock,
+      update: updateMock,
     },
   },
 }));
@@ -37,11 +41,12 @@ vi.mock('@/lib/logger', () => {
   };
 });
 
-import { GET, DELETE } from '@/app/api/conversations/[id]/route';
+import { GET, DELETE, PATCH } from '@/app/api/conversations/[id]/route';
 
-function makeReq(method: string) {
+function makeReq(method: string, body?: unknown) {
   return new Request('http://localhost:3000/api/conversations/conv-1', {
     method,
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
 }
 
@@ -156,5 +161,62 @@ describe('GET /api/conversations/[id]', () => {
     verifyAuthMock.mockResolvedValueOnce({ id: 'user-2', role: 'PRO' });
     const res = await GET(makeReq('GET'), makeParams('conv-1'));
     expect(res.status).toBe(403);
+  });
+});
+
+describe('PATCH /api/conversations/[id] (重命名)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    verifyAuthMock.mockResolvedValue({ id: 'user-1', role: 'PRO' });
+    findUniqueMock.mockResolvedValue({ id: 'conv-1', userId: 'user-1' });
+    updateMock.mockResolvedValue({});
+  });
+
+  it('owner 改名 → 200，落库 trim 后标题', async () => {
+    const res = await PATCH(makeReq('PATCH', { title: '  新标题  ' }), makeParams('conv-1'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, title: '新标题' });
+    expect(updateMock).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { title: '新标题' },
+    });
+  });
+
+  it('空标题 → 400，不落库', async () => {
+    const res = await PATCH(makeReq('PATCH', { title: '   ' }), makeParams('conv-1'));
+    expect(res.status).toBe(400);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('缺 title → 400', async () => {
+    const res = await PATCH(makeReq('PATCH', {}), makeParams('conv-1'));
+    expect(res.status).toBe(400);
+  });
+
+  it('超长(>100) → 400', async () => {
+    const res = await PATCH(
+      makeReq('PATCH', { title: 'x'.repeat(101) }),
+      makeParams('conv-1')
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('非 owner 非 ADMIN → 403，不落库', async () => {
+    verifyAuthMock.mockResolvedValueOnce({ id: 'user-2', role: 'PRO' });
+    const res = await PATCH(makeReq('PATCH', { title: 'x' }), makeParams('conv-1'));
+    expect(res.status).toBe(403);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('对话不存在 → 404', async () => {
+    findUniqueMock.mockResolvedValueOnce(null);
+    const res = await PATCH(makeReq('PATCH', { title: 'x' }), makeParams('conv-1'));
+    expect(res.status).toBe(404);
+  });
+
+  it('未登录 → 401', async () => {
+    verifyAuthMock.mockResolvedValueOnce(null);
+    const res = await PATCH(makeReq('PATCH', { title: 'x' }), makeParams('conv-1'));
+    expect(res.status).toBe(401);
   });
 });

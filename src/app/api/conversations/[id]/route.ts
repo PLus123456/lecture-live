@@ -104,3 +104,59 @@ export async function DELETE(
 
   return NextResponse.json({ ok: true });
 }
+
+// PATCH —— 改对话标题（手动重命名）。owner 或 ADMIN。
+const MAX_TITLE_LEN = 100;
+
+export async function PATCH(
+  req: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const user = await verifyAuth(req);
+  if (!user) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const { id } = await params;
+
+  let body: { title?: unknown };
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
+  }
+  if (typeof body.title !== 'string') {
+    return NextResponse.json({ error: 'title required' }, { status: 400 });
+  }
+  const title = body.title.trim();
+  if (title.length === 0 || title.length > MAX_TITLE_LEN) {
+    return NextResponse.json(
+      { error: `title must be 1..${MAX_TITLE_LEN} chars` },
+      { status: 400 }
+    );
+  }
+
+  const conv = await prisma.conversation.findUnique({
+    where: { id },
+    select: { id: true, userId: true },
+  });
+  if (!conv) {
+    return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
+  }
+  const owned = conv.userId !== null && conv.userId === user.id;
+  if (!owned && user.role !== 'ADMIN') {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+  }
+
+  try {
+    await prisma.conversation.update({ where: { id }, data: { title } });
+  } catch (err) {
+    apiLogger.error(
+      { conversationId: id, err: serializeError(err) },
+      'rename conversation failed'
+    );
+    return NextResponse.json({ error: 'Rename failed' }, { status: 500 });
+  }
+
+  return NextResponse.json({ ok: true, title });
+}

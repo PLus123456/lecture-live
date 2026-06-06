@@ -10,6 +10,9 @@ import {
   Loader2,
   AlertCircle,
   Trash2,
+  Pencil,
+  Check,
+  X,
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
@@ -71,6 +74,9 @@ export default function ChatHomeClient() {
     null
   );
   const [deleting, setDeleting] = useState(false);
+  // 重命名：正在编辑的对话 id + 编辑中的标题（null = 未在编辑）
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState('');
 
   /* ──────────────────────────────────────────────────────────────
      拉取最近 20 条全局 conversation。失败（401/500/网络）置 'error' → 显示重试，
@@ -192,6 +198,43 @@ export default function ChatHomeClient() {
     }
   }, [pendingDelete, token, deleting, conversations, t]);
 
+  /* ──────────────────────────────────────────────────────────────
+     重命名对话：乐观更新 → PATCH /api/conversations/[id] { title }，失败回滚。
+     ────────────────────────────────────────────────────────────── */
+  const startRename = useCallback((c: ConversationCard) => {
+    setEditingId(c.id);
+    setEditTitle(c.title?.trim() ?? '');
+  }, []);
+
+  const commitRename = useCallback(async () => {
+    const id = editingId;
+    if (!id) return;
+    const title = editTitle.trim();
+    const target = conversations.find((c) => c.id === id);
+    setEditingId(null);
+    if (!token || !title || title === (target?.title ?? '')) return;
+    const prevTitle = target?.title ?? null;
+    setConversations((list) =>
+      list.map((c) => (c.id === id ? { ...c, title } : c))
+    );
+    try {
+      const res = await fetch(`/api/conversations/${id}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ title }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch {
+      setConversations((list) =>
+        list.map((c) => (c.id === id ? { ...c, title: prevTitle } : c))
+      );
+      toast.error(t('common.operationFailed'));
+    }
+  }, [editingId, editTitle, token, conversations, t]);
+
   return (
     <div className="flex flex-col h-[100dvh] overflow-hidden">
       {/* 顶部：标题 + 新建按钮 */}
@@ -292,9 +335,47 @@ export default function ChatHomeClient() {
                     animationDelay: `${Math.min(index * 0.04, 0.4)}s`,
                   }}
                 >
+                {editingId === c.id ? (
+                  <div className="flex items-center gap-2 px-4 py-3 rounded-xl border border-rust-300 bg-white">
+                    <input
+                      autoFocus
+                      value={editTitle}
+                      maxLength={100}
+                      onChange={(e) => setEditTitle(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void commitRename();
+                        else if (e.key === 'Escape') setEditingId(null);
+                      }}
+                      className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg border border-cream-300 text-sm
+                                 focus:outline-none focus:ring-1 focus:ring-rust-400 focus:border-rust-400
+                                 bg-white text-charcoal-800"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void commitRename()}
+                      aria-label={t('common.save')}
+                      title={t('common.save')}
+                      className="w-8 h-8 rounded-lg flex items-center justify-center
+                                 text-white bg-rust-500 hover:bg-rust-600 transition-colors flex-shrink-0"
+                    >
+                      <Check className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingId(null)}
+                      aria-label={t('common.cancel')}
+                      title={t('common.cancel')}
+                      className="w-8 h-8 rounded-lg flex items-center justify-center
+                                 text-charcoal-400 hover:bg-cream-100 transition-colors flex-shrink-0"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                ) : (
+                <>
                 <Link
                   href={`/chat/${c.id}`}
-                  className="flex items-center gap-4 px-4 py-3.5 pr-12 rounded-xl
+                  className="flex items-center gap-4 px-4 py-3.5 pr-20 rounded-xl
                              border border-cream-200 bg-white
                              hover:border-rust-300 hover:shadow-sm card-hover-lift
                              transition-all duration-200"
@@ -328,6 +409,19 @@ export default function ChatHomeClient() {
                 </Link>
                 <button
                   type="button"
+                  onClick={() => startRename(c)}
+                  aria-label={t('chat.rename')}
+                  title={t('chat.rename')}
+                  className="absolute right-11 top-1/2 -translate-y-1/2 w-8 h-8 rounded-lg
+                             flex items-center justify-center text-charcoal-300
+                             hover:text-rust-500 hover:bg-rust-50
+                             opacity-0 group-hover:opacity-100 focus:opacity-100
+                             transition-all duration-150"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
                   onClick={() => setPendingDelete(c)}
                   aria-label={t('chat.delete')}
                   title={t('chat.delete')}
@@ -339,6 +433,8 @@ export default function ChatHomeClient() {
                 >
                   <Trash2 className="w-4 h-4" />
                 </button>
+                </>
+                )}
                 </div>
               );
             })}

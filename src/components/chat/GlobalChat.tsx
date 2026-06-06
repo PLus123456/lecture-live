@@ -914,6 +914,9 @@ export default function GlobalChat({
     if ((!value && !hasImages) || isLoading || !token || contextFull || isEnded)
       return;
 
+    // 本轮是否为对话首轮（用于完成后触发标题自动生成）
+    const isFirstExchange = messages.length === 0;
+
     setInput('');
 
     const userMsg: ChatMessage = {
@@ -1041,6 +1044,13 @@ export default function GlobalChat({
 
       if (!sawError) {
         updateMessage(conversationId, assistantId, { streaming: false });
+        // 首轮对话完成 → 异步生成标题（幂等端点；fire-and-forget，列表下次加载即显示）
+        if (isFirstExchange && token) {
+          void fetch(
+            `/api/conversations/${encodeURIComponent(conversationId)}/generate-title`,
+            { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
+          ).catch(() => undefined);
+        }
       }
     } catch (error) {
       // 流被 abort（切换对话/卸载）—— 静默收尾，不写错误气泡。

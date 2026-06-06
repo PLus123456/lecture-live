@@ -632,6 +632,9 @@ export default function ChatTab({
   const { extractFromText, addManualKeyword } = useKeywords();
 
   const [input, setInput] = useState('');
+  /** IME 合成中（中文/日文输入法）—— 合成期间回车不应发送 */
+  const [composing, setComposing] = useState(false);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [showThinkingMenu, setShowThinkingMenu] = useState(false);
   const [showContextPopover, setShowContextPopover] = useState(false);
@@ -710,6 +713,7 @@ export default function ChatTab({
     if ((!value && !hasImages) || isLoading) return;
 
     setInput('');
+    if (composerRef.current) composerRef.current.style.height = 'auto';
 
     // /compress 命令：触发主动压缩，不发给 LLM
     if (value === '/compress' || value.startsWith('/compress ')) {
@@ -1009,7 +1013,7 @@ export default function ChatTab({
     e.target.value = '';
   };
 
-  const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     if (!supportsImage) return;
     const imageFiles: File[] = [];
     for (const item of Array.from(e.clipboardData.items)) {
@@ -1164,14 +1168,33 @@ export default function ChatTab({
             <ImagePlus className="w-4 h-4" />
           </button>
 
-          <input
-            type="text"
+          <textarea
+            ref={composerRef}
+            rows={1}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            onChange={(e) => {
+              setInput(e.target.value);
+              e.target.style.height = 'auto';
+              e.target.style.height = `${Math.min(e.target.scrollHeight, 128)}px`;
+            }}
+            onKeyDown={(e) => {
+              // 回车发送；Shift+Enter 换行；IME 合成中的回车不发送
+              if (
+                e.key === 'Enter' &&
+                !e.shiftKey &&
+                !composing &&
+                !e.nativeEvent.isComposing
+              ) {
+                e.preventDefault();
+                void handleSend();
+              }
+            }}
+            onCompositionStart={() => setComposing(true)}
+            onCompositionEnd={() => setComposing(false)}
             onPaste={handlePaste}
             placeholder="Ask about the lecture..."
-            className="flex-1 px-3 py-2 rounded-lg border border-cream-300 text-xs
+            className="flex-1 px-3 py-2 rounded-lg border border-cream-300 text-xs resize-none
+                       max-h-32 overflow-y-auto
                        focus:outline-none focus:ring-1 focus:ring-rust-400 focus:border-rust-400
                        bg-white text-charcoal-700 placeholder:text-charcoal-300"
             disabled={isLoading}

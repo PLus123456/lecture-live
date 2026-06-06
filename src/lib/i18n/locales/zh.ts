@@ -1244,6 +1244,7 @@ export default {
     redirectMissing: '对话不存在',
     delete: '删除对话',
     rename: '重命名',
+    stop: '停止生成',
     endedReadonly: '此对话已关闭（只读），新建对话以继续。',
     confirmDeleteTitle: '删除此对话？',
     confirmDeleteMessage: '将永久删除该对话及其全部消息和附件文件，无法恢复。',

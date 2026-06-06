@@ -1255,6 +1255,7 @@ export default {
     redirectMissing: 'Conversation not found',
     delete: 'Delete conversation',
     rename: 'Rename',
+    stop: 'Stop generating',
     endedReadonly: 'This conversation is closed (read-only). Start a new one to continue.',
     confirmDeleteTitle: 'Delete this conversation?',
     confirmDeleteMessage: 'This permanently deletes the conversation and all its messages and attached files. This cannot be undone.',

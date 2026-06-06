@@ -313,6 +313,8 @@ model Conversation {
   endedAt     DateTime?                                // null = 当前活跃；非 null = 已关闭，只读
   // 单次对话内的降级状态（单调下降，只能 ≥ 上次记录的值）
   degradationLevel Int              @default(1)        // 1..7，对应 7 级降级链
+  // 用户主动归档。关闭(endedAt 非空)≠归档：关闭只是只读但仍在主列表；archived=从主列表隐藏，进历史页归档区。
+  archived    Boolean              @default(false)
   messages    ConversationMessage[]
   attachments  ChatAttachment[]
   sessions    ConversationSession[]

@@ -252,6 +252,16 @@ export default function ChatHomeClient() {
             </h1>
           </div>
 
+          <div className="flex items-center gap-2">
+          <Link
+            href="/conversations"
+            className="flex items-center gap-1.5 px-3.5 py-3 rounded-xl text-sm font-medium
+                       text-charcoal-600 border border-cream-200 bg-white hover:border-rust-300
+                       hover:text-rust-600 transition-colors animate-fade-in-up"
+          >
+            <Clock className="w-4 h-4" />
+            {t('chat.viewAll')}
+          </Link>
           <button
             type="button"
             onClick={handleCreateConversation}
@@ -277,6 +287,7 @@ export default function ChatHomeClient() {
               </div>
             </div>
           </button>
+          </div>
         </div>
       </div>
 

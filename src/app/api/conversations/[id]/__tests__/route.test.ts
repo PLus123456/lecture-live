@@ -182,6 +182,31 @@ describe('PATCH /api/conversations/[id] (重命名)', () => {
     });
   });
 
+  it('归档 → 200，落库 archived=true', async () => {
+    const res = await PATCH(makeReq('PATCH', { archived: true }), makeParams('conv-1'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, archived: true });
+    expect(updateMock).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { archived: true },
+    });
+  });
+
+  it('archived 非 boolean → 400', async () => {
+    const res = await PATCH(
+      makeReq('PATCH', { archived: 'yes' }),
+      makeParams('conv-1')
+    );
+    expect(res.status).toBe(400);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('既无 title 也无 archived → 400', async () => {
+    const res = await PATCH(makeReq('PATCH', {}), makeParams('conv-1'));
+    expect(res.status).toBe(400);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
   it('空标题 → 400，不落库', async () => {
     const res = await PATCH(makeReq('PATCH', { title: '   ' }), makeParams('conv-1'));
     expect(res.status).toBe(400);

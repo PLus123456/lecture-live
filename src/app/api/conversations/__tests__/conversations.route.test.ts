@@ -108,7 +108,7 @@ describe('GET /api/conversations', () => {
       expect.objectContaining({
         take: 5,
         orderBy: { startedAt: 'desc' },
-        where: { userId: 'user-1' },
+        where: { userId: 'user-1', archived: false },
       })
     );
   });
@@ -153,6 +153,7 @@ describe('GET /api/conversations', () => {
     expect(call.where).toEqual({
       userId: 'user-1',
       sessionId: null,
+      archived: false,
     });
     expect(call.take).toBe(50);
   });

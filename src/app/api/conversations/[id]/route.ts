@@ -38,6 +38,7 @@ export async function GET(
       startedAt: true,
       endedAt: true,
       degradationLevel: true,
+      archived: true,
       sessionId: true,
       sessions: { select: { sessionId: true }, orderBy: { addedAt: 'asc' } },
       _count: { select: { messages: true } },
@@ -59,6 +60,7 @@ export async function GET(
       startedAt: conv.startedAt.toISOString(),
       endedAt: conv.endedAt?.toISOString() ?? null,
       degradationLevel: conv.degradationLevel,
+      archived: conv.archived,
       messageCount: conv._count.messages,
       sessionIds: collectSessionIds(conv),
     },
@@ -105,7 +107,8 @@ export async function DELETE(
   return NextResponse.json({ ok: true });
 }
 
-// PATCH —— 改对话标题（手动重命名）。owner 或 ADMIN。
+// PATCH —— 改对话标题（重命名）和/或归档状态。owner 或 ADMIN。
+//   body { title?: string, archived?: boolean }，至少给一个。
 const MAX_TITLE_LEN = 100;
 
 export async function PATCH(
@@ -119,19 +122,39 @@ export async function PATCH(
 
   const { id } = await params;
 
-  let body: { title?: unknown };
+  let body: { title?: unknown; archived?: unknown };
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
   }
-  if (typeof body.title !== 'string') {
-    return NextResponse.json({ error: 'title required' }, { status: 400 });
+
+  const data: { title?: string; archived?: boolean } = {};
+  if (body.title !== undefined) {
+    if (typeof body.title !== 'string') {
+      return NextResponse.json({ error: 'title must be a string' }, { status: 400 });
+    }
+    const title = body.title.trim();
+    if (title.length === 0 || title.length > MAX_TITLE_LEN) {
+      return NextResponse.json(
+        { error: `title must be 1..${MAX_TITLE_LEN} chars` },
+        { status: 400 }
+      );
+    }
+    data.title = title;
   }
-  const title = body.title.trim();
-  if (title.length === 0 || title.length > MAX_TITLE_LEN) {
+  if (body.archived !== undefined) {
+    if (typeof body.archived !== 'boolean') {
+      return NextResponse.json(
+        { error: 'archived must be a boolean' },
+        { status: 400 }
+      );
+    }
+    data.archived = body.archived;
+  }
+  if (Object.keys(data).length === 0) {
     return NextResponse.json(
-      { error: `title must be 1..${MAX_TITLE_LEN} chars` },
+      { error: 'nothing to update (title or archived)' },
       { status: 400 }
     );
   }
@@ -149,14 +172,14 @@ export async function PATCH(
   }
 
   try {
-    await prisma.conversation.update({ where: { id }, data: { title } });
+    await prisma.conversation.update({ where: { id }, data });
   } catch (err) {
     apiLogger.error(
       { conversationId: id, err: serializeError(err) },
-      'rename conversation failed'
+      'update conversation failed'
     );
-    return NextResponse.json({ error: 'Rename failed' }, { status: 500 });
+    return NextResponse.json({ error: 'Update failed' }, { status: 500 });
   }
 
-  return NextResponse.json({ ok: true, title });
+  return NextResponse.json({ ok: true, ...data });
 }

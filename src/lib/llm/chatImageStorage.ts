@@ -16,7 +16,7 @@ import { logger, serializeError } from '@/lib/logger';
 
 const imgLogger = logger.child({ component: 'chat-image-storage' });
 
-const CHAT_IMAGE_ROOT = path.join(process.cwd(), 'data', 'chatimages');
+export const CHAT_IMAGE_ROOT = path.join(process.cwd(), 'data', 'chatimages');
 
 /** 受支持的图片 MIME 类型 → 文件扩展名 */
 const MIME_EXTENSION: Record<string, string> = {
@@ -77,6 +77,28 @@ export async function persistChatImage(
     Buffer.from(image.data, 'base64')
   );
   return `/api/conversations/${conversationId}/images/${fileName}`;
+}
+
+/**
+ * 删除一个对话的全部本地内嵌图片目录 `data/chatimages/<conversationId>/`（best-effort）。
+ *
+ * 这些图片不进 ChatAttachment 表、不计配额，仅被 message.content 的 markdown URL 引用，
+ * 故删对话时必须显式清理本地目录，否则永久残留（cron 也不扫这个目录）。
+ * 失败仅 warn —— 不能因本地 IO 失败阻塞删对话的 DB 清理。
+ */
+export async function deleteConversationImages(
+  conversationId: string
+): Promise<void> {
+  if (!isSafeName(conversationId)) return;
+  const dir = path.join(CHAT_IMAGE_ROOT, conversationId);
+  try {
+    await fs.rm(dir, { recursive: true, force: true });
+  } catch (err) {
+    imgLogger.warn(
+      { conversationId, err: serializeError(err) },
+      'failed to remove chat image dir'
+    );
+  }
 }
 
 /** 从磁盘读回一张聊天图片（供 serving 路由用）。找不到返回 null。 */

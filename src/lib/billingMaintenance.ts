@@ -18,7 +18,10 @@ import {
 } from '@/lib/userRoles';
 import { runTranscriptionUsageReconciliation } from '@/lib/reconciliation';
 import { finalizeSession } from '@/lib/sessionFinalization';
-import { runChatFilesCleanup } from '@/lib/jobs/chatFilesCleanupJob';
+import {
+  runChatFilesCleanup,
+  cleanupOrphanChatImageDirs,
+} from '@/lib/jobs/chatFilesCleanupJob';
 import { deleteAsyncUpload } from '@/lib/audio/asyncUploadChunkPersistence';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
@@ -228,6 +231,20 @@ export async function runBillingMaintenance(options?: {
       );
       // 不 rethrow —— 其他维护任务结果仍要返回
     }
+  }
+
+  // 本地孤儿聊天图片目录清理（best-effort，独立于上面的附件清理，失败不影响其它维护）。
+  // 兜底删 Session 级联删对话 / B1 前删对话残留下来的 data/chatimages/<id>/ 目录。
+  try {
+    const orphanDirs = await cleanupOrphanChatImageDirs();
+    if (orphanDirs > 0) {
+      billingLogger.info({ orphanDirs }, 'orphan chat image dirs cleaned');
+    }
+  } catch (err) {
+    billingLogger.warn(
+      { err: serializeError(err) },
+      'orphan chat image dir cleanup failed'
+    );
   }
 
   // 字节配额对账（与转录对账同日触发：reconciliationRunId 非空即今天的每日窗口已开）。

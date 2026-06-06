@@ -1,8 +1,14 @@
 import 'server-only';
 
+import fs from 'fs/promises';
+import path from 'path';
 import { prisma } from '@/lib/prisma';
-import { resolveCloudreveConfig } from '@/lib/storage/cloudreve';
-import { decrypt } from '@/lib/crypto';
+import {
+  loadCloudreveContext,
+  deleteCloudreveFile,
+  type CloudreveDeleteContext,
+} from '@/lib/storage/cloudreveFileDelete';
+import { CHAT_IMAGE_ROOT } from '@/lib/llm/chatImageStorage';
 import { logger, serializeError } from '@/lib/logger';
 
 const jobLogger = logger.child({ component: 'chat-files-cleanup-job' });
@@ -28,15 +34,6 @@ interface AttachmentRow {
   bytes: bigint;
   cloudrevePath: string;
   extractedTextPath: string | null;
-}
-
-/**
- * 一次运行内复用的 Cloudreve 配置 + token + base URL，避免每条附件都重复查 DB / 解密。
- * null = 未配置 / 未授权，所有删除直接跳过物理文件这一步。
- */
-interface CloudreveContext {
-  baseUrl: string;
-  accessToken: string;
 }
 
 /**
@@ -171,6 +168,51 @@ export async function runChatFilesCleanup(): Promise<ChatFilesCleanupResult> {
 }
 
 /**
+ * 清理本地孤儿聊天图片目录 `data/chatimages/<conversationId>/`。
+ *
+ * 扫描该根目录下所有子项，删掉其名字（=conversationId）在 Conversation 表中已不存在的目录。
+ * 背景：内嵌聊天图片只落本地磁盘、不进 ChatAttachment、不计配额；B1 起“删对话”会主动删
+ * 对应目录，但删 Session 触发的级联删对话、以及 B1 之前删掉的对话都会遗留孤儿目录 —— 本函数
+ * 兜底清理它们。挂在每日 billingMaintenance 里跑。
+ *
+ * best-effort：根目录不存在 / 单条删除失败都不抛，返回已删的目录数。
+ */
+export async function cleanupOrphanChatImageDirs(): Promise<number> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(CHAT_IMAGE_ROOT);
+  } catch {
+    return 0; // 根目录不存在 = 没有任何聊天图片
+  }
+  if (entries.length === 0) return 0;
+
+  // 这些目录名中，哪些 conversationId 仍存在（存在的保留，其余视为孤儿）
+  const existing = await prisma.conversation.findMany({
+    where: { id: { in: entries } },
+    select: { id: true },
+  });
+  const existingSet = new Set(existing.map((c) => c.id));
+
+  let removed = 0;
+  for (const name of entries) {
+    if (existingSet.has(name)) continue;
+    try {
+      await fs.rm(path.join(CHAT_IMAGE_ROOT, name), {
+        recursive: true,
+        force: true,
+      });
+      removed += 1;
+    } catch (err) {
+      jobLogger.warn(
+        { name, err: serializeError(err) },
+        '[chat-files-cleanup] 删孤儿图片目录失败'
+      );
+    }
+  }
+  return removed;
+}
+
+/**
  * 删除一条 ChatAttachment：
  *   1) 先尽力删 Cloudreve 物理文件（失败不抛 — 删不掉就让它残留，配置/网络问题不应阻塞 DB 清理）
  *   2) 然后删 DB 行 + 扣字节（一旦走到这步必须成功，否则下次循环还会撞上同一条）
@@ -180,12 +222,12 @@ export async function runChatFilesCleanup(): Promise<ChatFilesCleanupResult> {
  */
 async function deleteAttachment(
   att: AttachmentRow,
-  cloudreve: CloudreveContext | null
+  cloudreve: CloudreveDeleteContext | null
 ): Promise<void> {
   if (cloudreve) {
-    await deleteFromCloudreveByPath(att.cloudrevePath, cloudreve);
+    await deleteCloudreveFile(att.cloudrevePath, cloudreve);
     if (att.extractedTextPath) {
-      await deleteFromCloudreveByPath(att.extractedTextPath, cloudreve);
+      await deleteCloudreveFile(att.extractedTextPath, cloudreve);
     }
   }
 
@@ -215,80 +257,5 @@ async function readNumericSiteSetting(
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
   } catch {
     return fallback;
-  }
-}
-
-/**
- * 把 Cloudreve 配置 + 加密 access_token 一次性解出来，给后续每条附件的删除复用。
- *
- * 为什么不调 CloudreveStorage：
- *   - 该类此刻没有公开 delete 方法（其他单元的领地），按 plan 不许动它。
- *   - access_token 与 refresh_token 都是内部状态，没有公开 getter。
- *
- * 失败语义：任意一步出错（未配置 / 未授权 / 解密失败）都返回 null，调用方据此跳过物理删除。
- * 这是 best-effort —— 不能因为外部存储不可达就把整个 cron 卡住，DB 行该删的还是要删。
- */
-async function loadCloudreveContext(): Promise<CloudreveContext | null> {
-  try {
-    const config = await resolveCloudreveConfig();
-    if (!config) return null;
-
-    const row = await prisma.siteSetting.findUnique({
-      where: { key: 'cloudreve_access_token' },
-    });
-    if (!row?.value) return null;
-
-    const accessToken = decrypt(row.value);
-    if (!accessToken) return null;
-
-    return {
-      baseUrl: config.baseUrl.replace(/\/+$/, ''),
-      accessToken,
-    };
-  } catch (err) {
-    jobLogger.warn(
-      { err: serializeError(err) },
-      '[chat-files-cleanup] 加载 Cloudreve 上下文失败；将跳过所有物理文件删除'
-    );
-    return null;
-  }
-}
-
-/**
- * 删 Cloudreve 上的一个文件（best-effort）。
- *
- * 用 V4 API：DELETE /api/v4/file，body `{ uris: ["cloudreve://my/{path}"] }`。
- * 任何失败（网络 / 鉴权 / 服务端错误）都静默 warn 然后返回 —— 残留文件可由 admin
- * 手动批量清理工具兜底，不能阻塞 DB 清理。
- */
-async function deleteFromCloudreveByPath(
-  remotePath: string,
-  cloudreve: CloudreveContext
-): Promise<void> {
-  try {
-    const fileUri = remotePath.startsWith('/')
-      ? `cloudreve://my${remotePath}`
-      : `cloudreve://my/${remotePath}`;
-
-    const response = await fetch(`${cloudreve.baseUrl}/api/v4/file`, {
-      method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cloudreve.accessToken}`,
-      },
-      body: JSON.stringify({ uris: [fileUri] }),
-    });
-
-    if (!response.ok) {
-      jobLogger.warn(
-        { remotePath, status: response.status },
-        '[chat-files-cleanup] Cloudreve delete non-2xx; 残留文件可由 admin 手动清理'
-      );
-    }
-  } catch (err) {
-    jobLogger.warn(
-      { remotePath, err: serializeError(err) },
-      '[chat-files-cleanup] Cloudreve delete threw; 残留文件可由 admin 手动清理'
-    );
   }
 }

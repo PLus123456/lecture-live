@@ -21,6 +21,11 @@ import type { SonioxRuntimeConfig } from './env';
 
 export const SONIOX_ASYNC_MODEL = 'stt-async-v4';
 
+// 出站 Soniox 请求超时（防慢速/无响应上游拖住事件循环与连接）。
+// 上传可能是数百 MB 的转码音频，给足 10 分钟；其余控制类请求 30 秒。
+const SONIOX_UPLOAD_TIMEOUT_MS = 10 * 60_000;
+const SONIOX_API_TIMEOUT_MS = 30_000;
+
 export interface SonioxFileUploadResponse {
   id: string;
   filename: string;
@@ -118,6 +123,7 @@ export async function uploadSonioxFile(
     body: body.stream as unknown as BodyInit,
     // Node fetch 在发送流式请求体时需要显式声明 duplex。
     duplex: 'half',
+    signal: AbortSignal.timeout(SONIOX_UPLOAD_TIMEOUT_MS),
   } as RequestInit & { duplex: 'half' });
 
   if (!res.ok) {
@@ -220,6 +226,7 @@ export async function createSonioxTranscription(
     method: 'POST',
     headers: { ...authHeader(config), 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(SONIOX_API_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -240,6 +247,7 @@ export async function getSonioxTranscription(
 ): Promise<SonioxTranscriptionJob> {
   const res = await fetch(`${config.restBaseUrl}/v1/transcriptions/${transcriptionId}`, {
     headers: authHeader(config),
+    signal: AbortSignal.timeout(SONIOX_API_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -260,7 +268,10 @@ export async function getSonioxTranscript(
 ): Promise<SonioxTranscriptResponse> {
   const res = await fetch(
     `${config.restBaseUrl}/v1/transcriptions/${transcriptionId}/transcript`,
-    { headers: authHeader(config) }
+    {
+      headers: authHeader(config),
+      signal: AbortSignal.timeout(SONIOX_API_TIMEOUT_MS),
+    }
   );
 
   if (!res.ok) {
@@ -310,6 +321,7 @@ export async function deleteSonioxFile(
   const res = await fetch(`${config.restBaseUrl}/v1/files/${fileId}`, {
     method: 'DELETE',
     headers: authHeader(config),
+    signal: AbortSignal.timeout(SONIOX_API_TIMEOUT_MS),
   });
 
   if (res.status === 404 || res.ok) return;
@@ -332,6 +344,7 @@ export async function deleteSonioxTranscription(
   const res = await fetch(`${config.restBaseUrl}/v1/transcriptions/${transcriptionId}`, {
     method: 'DELETE',
     headers: authHeader(config),
+    signal: AbortSignal.timeout(SONIOX_API_TIMEOUT_MS),
   });
   if (res.status === 404 || res.ok) return;
 

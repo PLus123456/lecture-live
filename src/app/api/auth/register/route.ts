@@ -8,19 +8,51 @@ import {
   validatePassword,
 } from '@/lib/auth';
 import { enforceRateLimit } from '@/lib/rateLimit';
+import { resolveRequestClientIp } from '@/lib/clientIp';
 import { logAction } from '@/lib/auditLog';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { resolvePublicRegistrationRole } from '@/lib/userRoles';
 
 export async function POST(req: Request) {
   const siteSettings = await getSiteSettings().catch(() => null);
+
+  let body: { email?: string; password?: string; displayName?: string };
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json(
+      { error: 'Invalid request body' },
+      { status: 400 }
+    );
+  }
+
+  const authLimit = siteSettings?.rate_limit_auth ?? 5;
+  // 安全：按 email 维度限流。若退回纯 IP 桶，在 trusted_proxy=false（默认）下所有请求
+  // 共用同一个 ip:unknown 全局桶，单一匿名攻击者发几次即可打满、锁死全站注册（自愈但可持续）。
+  const emailKey = (body.email ?? '').trim().toLowerCase().slice(0, 255);
   const rateLimited = await enforceRateLimit(req, {
     scope: 'auth:register',
-    limit: siteSettings?.rate_limit_auth ?? 5,
+    limit: authLimit,
     windowMs: 10 * 60_000,
+    ...(emailKey ? { key: `email:${emailKey}` } : {}),
   });
   if (rateLimited) {
     return rateLimited;
+  }
+
+  // 额外按真实来源 IP 限流（仅当 IP 可确定时；trusted_proxy=false 时为 'unknown' 则跳过，
+  // 避免再退化成全局桶）。用于挡同一来源批量注册不同 email。
+  const clientIp = resolveRequestClientIp(req);
+  if (clientIp !== 'unknown') {
+    const ipLimited = await enforceRateLimit(req, {
+      scope: 'auth:register:ip',
+      limit: authLimit * 5,
+      windowMs: 10 * 60_000,
+      key: `ip:${clientIp}`,
+    });
+    if (ipLimited) {
+      return ipLimited;
+    }
   }
 
   try {
@@ -35,7 +67,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const { email, password, displayName } = await req.json();
+    const { email, password, displayName } = body;
 
     if (!email || !password || !displayName) {
       return NextResponse.json(

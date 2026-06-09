@@ -139,9 +139,10 @@ export async function POST(
       totalChunks: updated.totalChunks,
     });
   } catch (error) {
+    // 安全：原始错误（可能含服务端文件系统路径）只进日志，对客户端只回固定文案。
     console.error('Async upload chunk error:', error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to save chunk' },
+      { error: 'Failed to save chunk' },
       { status: 500 }
     );
   }

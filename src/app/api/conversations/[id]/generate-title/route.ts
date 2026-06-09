@@ -6,6 +6,7 @@
 
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
+import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { prisma } from '@/lib/prisma';
 import {
   assertConversationOwnership,
@@ -24,6 +25,14 @@ export async function POST(
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
+
+  // 安全：标题生成会调用 LLM（成本操作），按用户限流防成本型 DoS。
+  const rateLimited = await enforceApiRateLimit(req, {
+    scope: 'conversations:generate-title',
+    windowMs: 60_000,
+    key: `user:${user.id}`,
+  });
+  if (rateLimited) return rateLimited;
 
   const { id } = await params;
   try {

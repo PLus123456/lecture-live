@@ -482,6 +482,14 @@ export function setupLiveShare(io: SocketIO) {
         const link = await resolveViewerLink(safeToken);
         const sessionId = link.sessionId;
 
+        // 安全：一个 socket 反复 join 不同 token 时，先退出上一个房间并刷新其计数，
+        // 避免跨房间累积成员资格（viewer_count 虚高）以及被滥用强制驻留多房间。
+        const previousSessionId = socket.data.sessionId as string | undefined;
+        if (previousSessionId && previousSessionId !== sessionId) {
+          socket.leave(getRoomId(previousSessionId));
+          await emitViewerCount(io, previousSessionId);
+        }
+
         socket.data.isHost = false;
         socket.data.sessionId = sessionId;
         socket.join(getRoomId(sessionId));

@@ -1,6 +1,6 @@
 import 'server-only';
 
-import { loadZipGuarded } from '@/lib/fileParser';
+import { loadZipGuarded, withParseTimeout } from '@/lib/fileParser';
 import { logger, serializeError } from '@/lib/logger';
 
 const extractLogger = logger.child({ component: 'file-extractor' });
@@ -85,7 +85,11 @@ export async function extractTextFromBuffer(
       const { PDFParse } = await import('pdf-parse');
       const parser = new PDFParse({ data: buffer });
       try {
-        const result = await parser.getText({ pageJoiner: '' });
+        // 安全：对解析时长封顶，防恶意 PDF 占满 CPU/内存致 DoS。
+        const result = (await withParseTimeout(
+          parser.getText({ pageJoiner: '' }),
+          'PDF'
+        )) as { text?: string; total?: number };
         const { text, truncated } = clamp(result.text || '');
         return { text, pages: result.total, truncated };
       } finally {

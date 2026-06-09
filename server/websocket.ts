@@ -57,6 +57,13 @@ let isShuttingDown = false;
 
 function resolveClientIp(socket: Socket) {
   if (shouldTrustProxyHeaders()) {
+    // 安全：优先 X-Real-IP（nginx 设为 $remote_addr，不可被客户端伪造），再回退
+    // X-Forwarded-For 最后一段。最左段是客户端可伪造的，不能用于每 IP 连接上限/限流。
+    const realIp = socket.handshake.headers['x-real-ip'];
+    if (typeof realIp === 'string' && realIp.trim()) {
+      return realIp.trim();
+    }
+
     const forwardedFor = socket.handshake.headers['x-forwarded-for'];
     const forwardedIp =
       typeof forwardedFor === 'string'
@@ -64,11 +71,6 @@ function resolveClientIp(socket: Socket) {
         : null;
     if (forwardedIp) {
       return forwardedIp;
-    }
-
-    const realIp = socket.handshake.headers['x-real-ip'];
-    if (typeof realIp === 'string' && realIp.trim()) {
-      return realIp.trim();
     }
   }
 

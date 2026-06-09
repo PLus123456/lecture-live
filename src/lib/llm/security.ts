@@ -33,6 +33,10 @@ export const LLM_LIMITS = {
   chatImageCount: 4,
   /** 单张 chat 图片解码后的最大字节数（5MB） */
   chatImageBytes: 5 * 1024 * 1024,
+  /** 客户端单次请求提交的 transcript 最大段数（远超真实多小时讲座，仅防滥用） */
+  transcriptSegments: 100_000,
+  /** 客户端单次请求提交的 transcript 最大总字符数（防超大数组触发 tokenizer CPU 放大） */
+  transcriptTotalChars: 2_000_000,
 } as const;
 
 const PROMPT_CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;

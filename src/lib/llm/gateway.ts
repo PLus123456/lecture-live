@@ -11,6 +11,33 @@ function sanitizeApiError(text: string, maxLen = 200): string {
   return text.length > maxLen ? text.slice(0, maxLen) + '...(truncated)' : text;
 }
 
+/**
+ * 出站 LLM 请求超时（防慢速上游拖垮请求处理器 / 连接耗尽）。
+ *  - 非流式调用（callXxx / embedding）：整次请求总超时。
+ *  - 流式调用（streamXxx）：仅给「响应头到达」设超时，拿到响应头即清除计时器，
+ *    不限制后续 SSE body 流时长，避免误杀合法的长回答（与 nginx SSE 长超时一致）。
+ */
+const LLM_REQUEST_TIMEOUT_MS = 120_000;
+const LLM_STREAM_HEADERS_TIMEOUT_MS = 60_000;
+
+/**
+ * 给流式出站请求加「响应头超时」：超时只在响应头到达前生效，到达后立即清除，
+ * 故长 SSE 流不会被中途 abort。
+ */
+async function fetchStreamWithHeadersTimeout(
+  url: string,
+  init: RequestInit,
+  headersTimeoutMs = LLM_STREAM_HEADERS_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), headersTimeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  类型定义                                                           */
 /* ------------------------------------------------------------------ */
@@ -792,6 +819,7 @@ async function callAnthropic(
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -855,6 +883,7 @@ async function callAnthropicWithHistory(
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -919,15 +948,18 @@ async function streamAnthropicWithHistory(
     body.thinking = params.thinking;
   }
 
-  const res = await fetch(`${provider.apiBase}/v1/messages`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': provider.apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify(body),
-  });
+  const res = await fetchStreamWithHeadersTimeout(
+    `${provider.apiBase}/v1/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': provider.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(body),
+    }
+  );
 
   if (!res.ok) {
     const errText = await res.text();
@@ -1043,6 +1075,7 @@ async function callOpenAICompatible(
       Authorization: `Bearer ${provider.apiKey}`,
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -1095,6 +1128,7 @@ async function callOpenAICompatibleWithHistory(
       Authorization: `Bearer ${provider.apiKey}`,
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -1154,14 +1188,17 @@ async function streamOpenAICompatibleWithHistory(
     body.reasoning_effort = params.reasoning_effort;
   }
 
-  const res = await fetch(`${provider.apiBase}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${provider.apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const res = await fetchStreamWithHeadersTimeout(
+    `${provider.apiBase}/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${provider.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    }
+  );
 
   if (!res.ok) {
     const errText = await res.text();
@@ -1259,6 +1296,7 @@ export async function callEmbedding(texts: string[]): Promise<number[][]> {
       model: provider.model,
       input: texts,
     }),
+    signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {

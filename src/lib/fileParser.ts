@@ -10,6 +10,40 @@ import type JSZipType from 'jszip';
  */
 export const MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024; // 200MB
 
+/**
+ * 解析超时上限（ms）。DOCX/PPTX/XLSX 有 ZIP 解压炸弹防护，但 PDF 经底层 pdfjs 解析，
+ * 恶意/病态 PDF 可让解析长时间占满 CPU/内存。上传大小本身受 chat_files_max_upload_mb
+ * 限制，这里再给解析时长封顶兜底。pdfjs 在 await 点让出事件循环，故超时多数情况可生效。
+ */
+export const PARSE_TIMEOUT_MS = 30_000;
+
+/** 给一个解析 Promise 加超时；超时即 reject（不影响底层 destroy 在 finally 释放资源）。 */
+export function withParseTimeout<T>(
+  task: Promise<T>,
+  label: string,
+  timeoutMs = PARSE_TIMEOUT_MS
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new Error(
+          `${label} 解析超时（>${Math.round(timeoutMs / 1000)}s），疑似恶意文档`
+        )
+      );
+    }, timeoutMs);
+    task.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 /** 单个 ZIP entry 的元数据里 JSZip 暴露的未压缩大小（内部字段，无公开类型）。 */
 interface JSZipEntryInternal {
   _data?: { uncompressedSize?: number };
@@ -65,8 +99,12 @@ export async function extractTextFromFile(file: File): Promise<string> {
       const { PDFParse } = await import('pdf-parse');
       const parser = new PDFParse({ data: buffer });
       try {
-        const result = await parser.getText({ pageJoiner: '' });
-        return result.text;
+        // 安全：对解析时长封顶，防恶意 PDF 占满 CPU/内存致 DoS。
+        const result = (await withParseTimeout(
+          parser.getText({ pageJoiner: '' }),
+          'PDF'
+        )) as { text?: string };
+        return result.text ?? '';
       } finally {
         await parser.destroy();
       }

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { CLIENT_SESSION_TOKEN, getJwtExpiryConfig, login, setAuthCookie } from '@/lib/auth';
 import { enforceRateLimit } from '@/lib/rateLimit';
+import { resolveRequestClientIp } from '@/lib/clientIp';
 import { logAction } from '@/lib/auditLog';
 import { getSiteSettings } from '@/lib/siteSettings';
 
@@ -16,16 +17,33 @@ export async function POST(req: Request) {
     );
   }
 
-  // 使用 email+IP 组合键进行限流，避免共享 IP 环境下误伤其他用户
+  // 按 email 维度限流，避免共享 IP 环境下误伤其他用户（针对单账号的暴破被节流）。
+  const authLimit = siteSettings?.rate_limit_auth ?? 10;
   const emailKey = (body.email ?? '').trim().toLowerCase().slice(0, 255);
   const rateLimited = await enforceRateLimit(req, {
     scope: 'auth:login',
-    limit: siteSettings?.rate_limit_auth ?? 10,
+    limit: authLimit,
     windowMs: 60_000,
     ...(emailKey ? { key: `email:${emailKey}` } : {}),
   });
   if (rateLimited) {
     return rateLimited;
+  }
+
+  // 安全：额外按真实来源 IP 限流，挡「横向密码喷洒」（一个弱口令遍历海量 email，
+  // 每个 email 各享独立 email 桶，单纯 email 限流挡不住）。仅当 IP 可确定时启用，
+  // trusted_proxy=false（'unknown'）则跳过以免退化成全局桶反被 DoS。
+  const clientIp = resolveRequestClientIp(req);
+  if (clientIp !== 'unknown') {
+    const ipLimited = await enforceRateLimit(req, {
+      scope: 'auth:login:ip',
+      limit: authLimit * 5,
+      windowMs: 60_000,
+      key: `ip:${clientIp}`,
+    });
+    if (ipLimited) {
+      return ipLimited;
+    }
   }
 
   try {

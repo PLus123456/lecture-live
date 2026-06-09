@@ -6,6 +6,7 @@
 
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
+import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { prisma } from '@/lib/prisma';
 import { callLLM } from '@/lib/llm/gateway';
 import { compressHistory } from '@/lib/llm/chatContextBuilder';
@@ -23,6 +24,14 @@ export async function POST(req: Request) {
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
+
+  // 安全：压缩会直接调用 LLM（成本操作），按用户限流防成本型 DoS。
+  const rateLimited = await enforceApiRateLimit(req, {
+    scope: 'llm:chat:compress',
+    windowMs: 60_000,
+    key: `user:${user.id}`,
+  });
+  if (rateLimited) return rateLimited;
 
   let body: { conversationId?: unknown; keepTurns?: unknown };
   try {

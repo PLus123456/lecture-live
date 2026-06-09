@@ -56,6 +56,40 @@ export function getTranscodingProgress(sessionId: string): number {
 }
 
 /**
+ * 全局转码并发信号量。ffmpeg 转码是 CPU/内存密集操作，N 个并发上传会派生 N 个 ffmpeg
+ * 进程线性放大资源占用，可拖垮整机。这里用进程内计数信号量把同时转码数封顶，超出排队。
+ * 单 Next 进程部署足够（与 transcodingProgressMap 同口径）；多进程需换 Redis 分布式信号量。
+ */
+const MAX_CONCURRENT_TRANSCODES = Math.max(
+  1,
+  Number(process.env.MAX_CONCURRENT_TRANSCODES) || 2
+);
+
+let activeTranscodes = 0;
+const transcodeWaiters: Array<() => void> = [];
+
+function acquireTranscodeSlot(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (activeTranscodes < MAX_CONCURRENT_TRANSCODES) {
+      activeTranscodes += 1;
+      resolve();
+    } else {
+      transcodeWaiters.push(resolve);
+    }
+  });
+}
+
+function releaseTranscodeSlot(): void {
+  const next = transcodeWaiters.shift();
+  if (next) {
+    // 名额直接转交下一个等待者，activeTranscodes 计数不变。
+    next();
+  } else {
+    activeTranscodes = Math.max(0, activeTranscodes - 1);
+  }
+}
+
+/**
  * 更新 session 状态。
  *
  * 用 updateMany WHERE asyncTranscribeStatus NOT IN ('canceled', 'failed', 'completed')
@@ -144,6 +178,8 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     // ── 3. ffmpeg → mp3 ──
     const mp3Path = path.join(path.dirname(mergedPath), 'audio.mp3');
     transcodingProgressMap.set(session.id, 0);
+    // 安全：全局并发信号量，防 N 个并发上传同时派生 N 个 ffmpeg 进程致资源放大。
+    await acquireTranscodeSlot();
     try {
       await transcodeToMp3({
         inputPath: mergedPath,
@@ -156,6 +192,7 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
         },
       });
     } finally {
+      releaseTranscodeSlot();
       transcodingProgressMap.delete(session.id);
     }
 

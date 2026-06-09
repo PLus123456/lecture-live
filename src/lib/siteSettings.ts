@@ -1,6 +1,33 @@
 import 'server-only';
 
 import { prisma } from '@/lib/prisma';
+import { decrypt } from '@/lib/crypto';
+
+/**
+ * 需要「静态加密落库 + 管理后台 GET 脱敏」的敏感设置键。
+ * 与 LLM/Soniox 凭据一致：这些值在 SiteSetting 表里加密存储，对外只回脱敏占位。
+ */
+export const SENSITIVE_SETTING_KEYS = [
+  'smtp_password',
+  'cloudreve_client_secret',
+] as const;
+
+/**
+ * 脱敏占位符。管理后台 GET 时已设置的敏感值回传它（表示"已配置但隐藏"）；
+ * PUT 收到它（或空串）表示"保持原值不变"，避免脱敏值被回存导致密钥被清空。
+ */
+export const SETTING_SECRET_MASK = '********';
+
+/** 读取敏感设置：解密落库值（明文/未加密值原样返回，兼容历史数据）。 */
+function decryptSensitiveSetting(value: string | undefined): string {
+  if (!value) return '';
+  try {
+    return decrypt(value);
+  } catch {
+    // 解密失败（如轮换 ENCRYPTION_KEY 后旧值不匹配）不抛错，回空避免拖垮整个设置读取。
+    return '';
+  }
+}
 
 export interface SiteSettings {
   site_name: string;
@@ -205,6 +232,9 @@ function normalizeSiteSettings(raw: Record<string, string>): SiteSettings {
   return {
     ...DEFAULT_SITE_SETTINGS,
     ...rest,
+    // 敏感键解密（覆盖 ...rest 里的密文，供 SMTP/Cloudreve 等消费者拿到明文）
+    smtp_password: decryptSensitiveSetting(raw.smtp_password),
+    cloudreve_client_secret: decryptSensitiveSetting(raw.cloudreve_client_secret),
     site_url_backups: parseUrlBackups(raw),
     allow_registration: parseBoolean(
       raw.allow_registration,
@@ -358,6 +388,11 @@ export function invalidateSiteSettingsCache() {
 export function serializeSiteSettingsForAdmin(settings: SiteSettings) {
   return {
     ...settings,
+    // 安全：敏感凭据对外只回脱敏占位（已设置→掩码，未设置→空），杜绝明文经 GET 回传/缓存。
+    smtp_password: settings.smtp_password ? SETTING_SECRET_MASK : '',
+    cloudreve_client_secret: settings.cloudreve_client_secret
+      ? SETTING_SECRET_MASK
+      : '',
     password_min_length: String(settings.password_min_length),
     smtp_port: String(settings.smtp_port),
     max_file_size: String(settings.max_file_size),

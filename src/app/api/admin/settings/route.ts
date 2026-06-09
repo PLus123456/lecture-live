@@ -8,7 +8,10 @@ import {
   invalidateSiteSettingsCache,
   serializeSiteSettingsForAdmin,
   MAX_BACKUP_URLS,
+  SENSITIVE_SETTING_KEYS,
+  SETTING_SECRET_MASK,
 } from '@/lib/siteSettings';
+import { encrypt } from '@/lib/crypto';
 import { invalidateSonioxDbConfigCache } from '@/lib/soniox/env';
 import { invalidateTrustedProxyCache } from '@/lib/clientIp';
 import { migrateLocalToCloudreve } from '@/lib/storage/migration';
@@ -118,11 +121,29 @@ export async function PUT(req: Request) {
     ]);
 
     // 过滤非法键
-    const entries = Object.entries(body).filter(([key]) => allowedKeys.has(key));
+    const filteredEntries = Object.entries(body).filter(([key]) =>
+      allowedKeys.has(key)
+    );
 
-    if (entries.length === 0) {
+    if (filteredEntries.length === 0) {
       return NextResponse.json({ error: '没有有效的设置项' }, { status: 400 });
     }
+
+    // 敏感凭据处理：空串或脱敏占位 '********' = 保持原值（不写，避免把脱敏值回存清空）；
+    // 否则加密后落库（与 LLM/Soniox 凭据一致，静态加密 + GET 脱敏）。
+    const sensitiveKeys = SENSITIVE_SETTING_KEYS as readonly string[];
+    const entries = filteredEntries.flatMap<[string, unknown]>(
+      ([key, value]) => {
+        if (!sensitiveKeys.includes(key)) {
+          return [[key, value]];
+        }
+        const str = typeof value === 'string' ? value.trim() : '';
+        if (!str || str === SETTING_SECRET_MASK) {
+          return []; // 保留原有密文，不写
+        }
+        return [[key, encrypt(str)]];
+      }
+    );
 
     // 预处理 site_url_backups：必须是数组，清洗 + 合法性校验
     const backupsIdx = entries.findIndex(([key]) => key === 'site_url_backups');

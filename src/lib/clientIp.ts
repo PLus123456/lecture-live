@@ -84,15 +84,21 @@ export function getTrustedForwardedIp(
     return null;
   }
 
-  // 取第一个 IP（最原始的客户端），最后一个通常是最近的代理
-  return entries[0] ?? null;
+  // 安全：取【最后】一段，而非最左。nginx 用 `$proxy_add_x_forwarded_for` 会把客户端
+  // 自带的 X-Forwarded-For 原样透传 + 在末尾追加真实 $remote_addr，故最左段是攻击者
+  // 可伪造的（用来绕过 IP 限流/连接上限或污染审计日志），最后一段才是本机反代写入的
+  // 真实来源。多级可信代理场景下应优先用 X-Real-IP（见 resolveRequestClientIp）。
+  return entries[entries.length - 1] ?? null;
 }
 
 export function resolveRequestClientIp(req: Request): string {
   if (shouldTrustProxyHeaders()) {
+    // 安全：优先 X-Real-IP（nginx 设为 $remote_addr，会覆盖客户端伪造值，不可伪造），
+    // 再回退到 X-Forwarded-For 的最后一段。反代后 socket 远端恒为 nginx 自身，故信任
+    // 代理头是拿到真实客户端 IP 的唯一途径——这也是生产必须 TRUSTED_PROXY=true 的原因。
     return (
-      getTrustedForwardedIp(req.headers.get('x-forwarded-for')) ??
       normalizeIp(req.headers.get('x-real-ip')) ??
+      getTrustedForwardedIp(req.headers.get('x-forwarded-for')) ??
       'unknown'
     );
   }

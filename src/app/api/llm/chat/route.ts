@@ -107,12 +107,22 @@ interface TranscriptSegmentInput {
 function parseTranscriptSegments(value: unknown): TranscriptSegment[] {
   if (!Array.isArray(value)) return [];
   const out: TranscriptSegment[] = [];
+  let totalChars = 0;
   for (const raw of value as TranscriptSegmentInput[]) {
     if (!raw || typeof raw !== 'object') continue;
     const text = typeof raw.text === 'string' ? raw.text : '';
     const startMs = typeof raw.startMs === 'number' ? raw.startMs : 0;
     if (!text) continue;
     out.push({ text, startMs });
+    totalChars += text.length;
+    // 安全：对客户端提交的 transcript 体量封顶，防超大数组在降级循环里反复 tokenizer
+    // 编码造成 CPU 放大。上限远超真实多小时讲座，超限即截断（保留较早段，时间锚点不乱）。
+    if (
+      out.length >= LLM_LIMITS.transcriptSegments ||
+      totalChars >= LLM_LIMITS.transcriptTotalChars
+    ) {
+      break;
+    }
   }
   return out;
 }
@@ -435,9 +445,10 @@ function streamChatResponse(
         if (accumulatedText.trim()) {
           await persistAssistantMessage().catch(() => {});
         }
+        // 安全：原始错误（可能含上游 provider 错误措辞/内部模型名）只进日志，
+        // 客户端只回固定文案。
         send('error', {
-          error:
-            err instanceof Error ? err.message : 'Chat generation failed',
+          error: 'Chat generation failed',
           contextFull: false,
         });
         controller.close();

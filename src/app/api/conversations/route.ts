@@ -21,6 +21,7 @@
 
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
+import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { prisma } from '@/lib/prisma';
 import { invalidateRagCache } from '@/lib/llm/embedding/transcriptRag';
 import { logger, serializeError } from '@/lib/logger';
@@ -191,6 +192,14 @@ export async function POST(req: Request) {
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
+
+  // 安全：创建对话是写库操作，按用户限流防低成本刷量。
+  const rateLimited = await enforceApiRateLimit(req, {
+    scope: 'conversations:create',
+    windowMs: 60_000,
+    key: `user:${user.id}`,
+  });
+  if (rateLimited) return rateLimited;
 
   let body: { sessionId?: unknown; recordingIds?: unknown };
   try {

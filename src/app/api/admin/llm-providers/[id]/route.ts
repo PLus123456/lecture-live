@@ -8,6 +8,7 @@ import {
 } from '@/lib/llm/defaults';
 import { serializeProviderForAdmin } from '@/lib/llm/providerAdmin';
 import { logAction } from '@/lib/auditLog';
+import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
 
 // 更新 LLM 供应商
 export async function PATCH(
@@ -53,7 +54,17 @@ export async function PATCH(
       if (!apiBase) {
         return NextResponse.json({ error: 'API Base 不能为空' }, { status: 400 });
       }
-      updateData.apiBase = apiBase;
+      // 安全：与创建路径(POST)一致，校验 http(s) + 私网黑名单防 SSRF。
+      // 否则可先用合法公网地址建 provider 过校验，再 PATCH 改成 169.254.169.254
+      // (云元数据)/内网地址，使服务端每次 LLM 调用都向内网发起携带 apiKey 的 fetch。
+      try {
+        updateData.apiBase = validateCloudreveBaseUrl(apiBase);
+      } catch {
+        return NextResponse.json(
+          { error: 'apiBase 必须是合法的 http(s) 地址，且不能指向内网/本地地址' },
+          { status: 400 }
+        );
+      }
     }
     if (body.isAnthropic !== undefined) updateData.isAnthropic = body.isAnthropic;
     if (body.sortOrder !== undefined) updateData.sortOrder = body.sortOrder;

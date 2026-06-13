@@ -283,25 +283,31 @@ export async function PUT(req: Request) {
     const isSystemRole = (SYSTEM_ROLES as readonly string[]).includes(groupId);
 
     if (isSystemRole) {
-      // 系统角色：存储到 SiteSetting
+      // 系统角色：存储到 SiteSetting + 同步该角色下所有非自定义组用户的配额。
+      // Bug 2: 两步放进同一事务，避免 SiteSetting 已更新但 updateMany 失败导致
+      // 「管理后台显示的配额」与「用户表实际配额」不一致（与下方自定义组分支对称）。
       const settingKey = `group_config_${groupId}`;
-      await prisma.siteSetting.upsert({
-        where: { key: settingKey },
-        update: { value: JSON.stringify(sanitized) },
-        create: { key: settingKey, value: JSON.stringify(sanitized) },
-      });
-      // Bug 2: 同步该角色下所有非自定义组用户的配额
-      await prisma.user.updateMany({
-        where: { role: groupId as 'ADMIN' | 'PRO' | 'FREE', customGroupId: null },
-        data: {
-          allowedModels: sanitized.allowedModels,
-          transcriptionMinutesLimit: sanitized.transcriptionMinutesLimit,
-          storageHoursLimit: sanitized.storageHoursLimit,
-        },
+      await prisma.$transaction(async (tx) => {
+        await tx.siteSetting.upsert({
+          where: { key: settingKey },
+          update: { value: JSON.stringify(sanitized) },
+          create: { key: settingKey, value: JSON.stringify(sanitized) },
+        });
+        await tx.user.updateMany({
+          where: { role: groupId as 'ADMIN' | 'PRO' | 'FREE', customGroupId: null },
+          data: {
+            allowedModels: sanitized.allowedModels,
+            transcriptionMinutesLimit: sanitized.transcriptionMinutesLimit,
+            storageHoursLimit: sanitized.storageHoursLimit,
+          },
+        });
       });
     } else {
-      // Bug 3: 更新名称时校验重名
-      if (name !== undefined && name.trim()) {
+      // Bug 3: 更新名称时校验空名/保留名（与 POST 对称；否则传 name:"" 会把组名覆盖成空串）
+      if (name !== undefined) {
+        if (!name.trim()) {
+          return NextResponse.json({ error: '用户组名称不能为空' }, { status: 400 });
+        }
         if (RESERVED_GROUP_NAMES.includes(name.trim().toLowerCase())) {
           return NextResponse.json({ error: '不能使用系统保留名称' }, { status: 400 });
         }

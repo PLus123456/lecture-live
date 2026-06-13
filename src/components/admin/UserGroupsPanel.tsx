@@ -281,6 +281,8 @@ function PermissionsForm({
           <label className="text-sm font-medium text-charcoal-700 mb-1 block">{t('admin.storageHours')}</label>
           <input
             type="number"
+            step="0.5"
+            min="0"
             value={storageLimit}
             onChange={(e) => setStorageLimit(e.target.value)}
             className="w-full px-3 py-2 text-sm border border-cream-200 rounded-lg
@@ -346,7 +348,9 @@ function usePermissionsForm(
   const handleToggleAll = () => {
     if (selectAll) {
       setSelectAll(false);
-      setSelected(new Set());
+      // 取消全选时预填为当前全部 provider，让用户在全集基础上逐个取消；
+      // 若清空成空集，buildPermissions 会塌缩成 'local'（原 Bug：全选→取消全选→保存丢成 local）。
+      setSelected(new Set(providers.map((p) => p.name)));
     } else {
       setSelectAll(true);
       setSelected(new Set(providers.map((p) => p.name)));
@@ -357,7 +361,9 @@ function usePermissionsForm(
     const allowedModels = selectAll ? '*' : Array.from(selected).filter(Boolean).join(',') || 'local';
     return {
       transcriptionMinutesLimit: parseInt(minutesLimit) || 60,
-      storageHoursLimit: parseInt(storageLimit) || 10,
+      // storageHoursLimit 是 Float（后端已去 Math.floor 保留小数）；前端须用 parseFloat，
+      // 否则 parseInt('2.5')→2 会在到达后端前就截断，使后端保留浮点的修复形同虚设。
+      storageHoursLimit: Math.max(0, parseFloat(storageLimit) || 10),
       allowedModels,
       maxConcurrentSessions: parseInt(concurrent) || 1,
     };

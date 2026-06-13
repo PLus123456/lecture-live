@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from 'react';
 import { useParams } from 'next/navigation';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useChat } from '@/hooks/useChat';
 import { useKeywords } from '@/hooks/useKeywords';
 import { useTranscriptStore } from '@/stores/transcriptStore';
@@ -363,6 +364,7 @@ function ContextRingButton({
 }
 
 function ContextPopover({
+  leaving,
   tokenUsage,
   level,
   conversations,
@@ -373,6 +375,7 @@ function ContextPopover({
   onSwitchConversation,
   onClose,
 }: {
+  leaving: boolean;
   tokenUsage: import('@/stores/chatStore').ChatTokenUsage | null;
   level: number;
   conversations: import('@/stores/chatStore').ConversationMeta[];
@@ -394,8 +397,8 @@ function ContextPopover({
     (activeConv ? `对话 ${formatHM(activeConv.startedAt)} 起` : '当前对话');
 
   return (
-    <div className="absolute bottom-full right-0 mb-2 w-72 bg-white border border-cream-300
-                    rounded-lg shadow-lg z-50 p-3 text-xs animate-fade-in-scale">
+    <div className={`absolute bottom-full right-0 mb-2 w-72 bg-white border border-cream-300
+                    rounded-lg shadow-lg z-50 p-3 text-xs ${leaving ? 'animate-fade-out-scale' : 'animate-fade-in-scale'}`}>
       {/* Conversation 选择器（小箭头展开） */}
       <button
         type="button"
@@ -639,6 +642,11 @@ export default function ChatTab({
   const [showThinkingMenu, setShowThinkingMenu] = useState(false);
   const [showContextPopover, setShowContextPopover] = useState(false);
   const [showConversationList, setShowConversationList] = useState(false);
+
+  // 三个锚定 popover 的进/出场动画（小淡出，150ms）
+  const modelMenuAnim = useExitAnimation(showModelMenu, 150);
+  const thinkingMenuAnim = useExitAnimation(showThinkingMenu, 150);
+  const contextPopoverAnim = useExitAnimation(showContextPopover, 150);
   const [keywordSteps, setKeywordSteps] = useState<KeywordStep[] | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   /** 已选待发送的图片（base64 data URL 数组） */
@@ -1224,9 +1232,9 @@ export default function ChatTab({
                 {currentModelLabel}
               </button>
 
-              {showModelMenu && (
-                <div className="absolute bottom-full left-0 mb-2 w-56 bg-white border border-cream-300
-                                rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
+              {modelMenuAnim.mounted && (
+                <div className={`absolute bottom-full left-0 mb-2 w-56 bg-white border border-cream-300
+                                rounded-lg shadow-lg z-50 py-1 ${modelMenuAnim.leaving ? 'animate-fade-out-scale' : 'animate-fade-in-scale'}`}>
                   {availableModels.length === 0 ? (
                     <div className="px-3 py-2 text-xs text-charcoal-400">
                       暂无可用模型
@@ -1287,9 +1295,9 @@ export default function ChatTab({
                 {thinkingDisabled ? '不支持思考' : thinkingLabel}
               </button>
 
-              {showThinkingMenu && !thinkingDisabled && (
-                <div className="absolute bottom-full left-0 mb-2 w-44 bg-white border border-cream-300
-                                rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
+              {thinkingMenuAnim.mounted && !thinkingDisabled && (
+                <div className={`absolute bottom-full left-0 mb-2 w-44 bg-white border border-cream-300
+                                rounded-lg shadow-lg z-50 py-1 ${thinkingMenuAnim.leaving ? 'animate-fade-out-scale' : 'animate-fade-in-scale'}`}>
                   {thinkingOptions.map((opt) => {
                     const isSelected = selectedThinkingPreference === opt.pref;
                     return (
@@ -1337,8 +1345,9 @@ export default function ChatTab({
               contextFull={contextFull}
               onClick={() => setShowContextPopover((v) => !v)}
             />
-            {showContextPopover && (
+            {contextPopoverAnim.mounted && (
               <ContextPopover
+                leaving={contextPopoverAnim.leaving}
                 tokenUsage={tokenUsage}
                 level={tokenUsage?.level ?? 1}
                 conversations={conversations}

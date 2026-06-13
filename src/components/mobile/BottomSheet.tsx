@@ -3,6 +3,7 @@
 import { useEffect, useRef } from 'react';
 import { X } from 'lucide-react';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 
 interface BottomSheetProps {
   open: boolean;
@@ -20,6 +21,7 @@ export default function BottomSheet({
   maxHeight = '85vh',
 }: BottomSheetProps) {
   const sheetRef = useRef<HTMLDivElement>(null);
+  const { mounted, leaving } = useExitAnimation(open, 250);
 
   useSwipeGesture(sheetRef, {
     onSwipeDown: onClose,
@@ -47,7 +49,7 @@ export default function BottomSheet({
     };
   }, [onClose, open]);
 
-  if (!open) {
+  if (!mounted) {
     return null;
   }
 
@@ -55,13 +57,13 @@ export default function BottomSheet({
     <div className="fixed inset-0 z-[70]">
       <button
         aria-label="Close sheet"
-        className="absolute inset-0 bg-black/30 backdrop-blur-sm animate-backdrop-enter"
+        className={`absolute inset-0 bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
         onClick={onClose}
       />
       <div className="absolute inset-x-0 bottom-0 flex justify-center">
         <div
           ref={sheetRef}
-          className="w-full rounded-t-2xl bg-white shadow-2xl transition-transform duration-300 ease-out"
+          className={`w-full rounded-t-2xl bg-white shadow-2xl ${leaving ? 'animate-sheet-out' : 'animate-sheet-in'}`}
           style={{ maxHeight }}
         >
           <div className="flex items-center justify-between border-b border-cream-200 px-4 pb-3 pt-2">

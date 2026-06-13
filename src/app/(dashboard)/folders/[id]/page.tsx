@@ -32,6 +32,7 @@ import ExportModal from '@/components/ExportModal';
 import ActionSheet, { type ActionSheetItem } from '@/components/mobile/ActionSheet';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { useAuth } from '@/hooks/useAuth';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
@@ -773,60 +774,58 @@ export default function FolderDetailPage() {
         {showNewSession && <NewSessionModal onClose={() => setShowNewSession(false)} defaultFolderId={folderId} />}
         {showExport && <ExportModal isOpen sessionId={exportSessionId} sessionTitle={exportSessionTitle} onClose={() => setShowExport(false)} />}
 
-        {showRenameModal && (
-          <ModalOverlay onClose={() => setShowRenameModal(false)}>
-            <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.renameRecording')}</h2>
-            <input type="text" value={renameValue} onChange={(e) => setRenameValue(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && renameValue.trim()) void handleRenameSession(); if (e.key === 'Escape') setShowRenameModal(false); }}
-              autoFocus className="w-full rounded-lg border border-cream-300 px-3 py-2 text-sm text-charcoal-700 outline-none focus:border-rust-300 focus:ring-1 focus:ring-rust-200" />
-            <div className="mt-4 flex justify-end gap-2">
-              <button onClick={() => setShowRenameModal(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.cancel')}</button>
-              <button onClick={() => void handleRenameSession()} disabled={saving || !renameValue.trim()} className="rounded-lg bg-rust-500 px-4 py-1.5 text-sm font-medium text-white hover:bg-rust-600 disabled:opacity-60">
-                {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : t('common.save')}
-              </button>
-            </div>
-          </ModalOverlay>
-        )}
+        <AnimatedModalOverlay open={showRenameModal} onClose={() => setShowRenameModal(false)}>
+          <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.renameRecording')}</h2>
+          <input type="text" value={renameValue} onChange={(e) => setRenameValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && renameValue.trim()) void handleRenameSession(); if (e.key === 'Escape') setShowRenameModal(false); }}
+            autoFocus className="w-full rounded-lg border border-cream-300 px-3 py-2 text-sm text-charcoal-700 outline-none focus:border-rust-300 focus:ring-1 focus:ring-rust-200" />
+          <div className="mt-4 flex justify-end gap-2">
+            <button onClick={() => setShowRenameModal(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.cancel')}</button>
+            <button onClick={() => void handleRenameSession()} disabled={saving || !renameValue.trim()} className="rounded-lg bg-rust-500 px-4 py-1.5 text-sm font-medium text-white hover:bg-rust-600 disabled:opacity-60">
+              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : t('common.save')}
+            </button>
+          </div>
+        </AnimatedModalOverlay>
 
-        {showMoveModal && (
-          <ModalOverlay onClose={() => setShowMoveModal(false)}>
-            <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.moveToFolderDialog')}</h2>
-            <div className="max-h-60 space-y-1 overflow-y-auto">
-              <button onClick={() => void handleMoveSessionsTo(null)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-charcoal-700 hover:bg-cream-100">
-                <Mic className="h-4 w-4 text-amber-500" /> {t('foldersPage.unarchivedFolder')}
+        <AnimatedModalOverlay open={showMoveModal} onClose={() => setShowMoveModal(false)}>
+          <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.moveToFolderDialog')}</h2>
+          <div className="max-h-60 space-y-1 overflow-y-auto">
+            <button onClick={() => void handleMoveSessionsTo(null)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-charcoal-700 hover:bg-cream-100">
+              <Mic className="h-4 w-4 text-amber-500" /> {t('foldersPage.unarchivedFolder')}
+            </button>
+            {allFolders.filter((f) => f.id !== folderId).map((f) => (
+              <button key={f.id} onClick={() => void handleMoveSessionsTo(f.id)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-charcoal-700 hover:bg-cream-100">
+                <FolderOpen className="h-4 w-4 text-charcoal-300" />
+                <span style={{ paddingLeft: f.depth * 12 }}>{f.name}</span>
               </button>
-              {allFolders.filter((f) => f.id !== folderId).map((f) => (
-                <button key={f.id} onClick={() => void handleMoveSessionsTo(f.id)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-charcoal-700 hover:bg-cream-100">
-                  <FolderOpen className="h-4 w-4 text-charcoal-300" />
-                  <span style={{ paddingLeft: f.depth * 12 }}>{f.name}</span>
-                </button>
-              ))}
-            </div>
-            <div className="mt-4 flex justify-end">
-              <button onClick={() => setShowMoveModal(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.cancel')}</button>
-            </div>
-          </ModalOverlay>
-        )}
+            ))}
+          </div>
+          <div className="mt-4 flex justify-end">
+            <button onClick={() => setShowMoveModal(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.cancel')}</button>
+          </div>
+        </AnimatedModalOverlay>
 
-        {showProperties && propertiesSession && (
-          <ModalOverlay onClose={() => setShowProperties(false)}>
-            <div className="mb-4 flex items-center gap-2">
-              <Mic className="h-5 w-5 text-rust-500" />
-              <h2 className="font-serif text-base font-bold text-charcoal-800">{t('foldersPage.recordingProperties')}</h2>
-            </div>
-            <div className="space-y-3 text-sm">
-              <PropRow label={t('settings.name')} value={propertiesSession.title || t('foldersPage.untitledSession')} />
-              <PropRow label={t('foldersPage.status')} value={propertiesSession.status} />
-              <PropRow label={t('foldersPage.duration')} value={formatDurationShort(propertiesSession.durationMs)} />
-              <PropRow label={t('foldersPage.course')} value={propertiesSession.courseName || '—'} />
-              <PropRow label={t('foldersPage.folderLabel')} value={folder.name} />
-              <PropRow label={t('foldersPage.created')} value={formatDate(propertiesSession.createdAt)} last />
-            </div>
-            <div className="mt-5 flex justify-end">
-              <button onClick={() => setShowProperties(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.close')}</button>
-            </div>
-          </ModalOverlay>
-        )}
+        <AnimatedModalOverlay open={showProperties && !!propertiesSession} onClose={() => setShowProperties(false)}>
+          {propertiesSession && (
+            <>
+              <div className="mb-4 flex items-center gap-2">
+                <Mic className="h-5 w-5 text-rust-500" />
+                <h2 className="font-serif text-base font-bold text-charcoal-800">{t('foldersPage.recordingProperties')}</h2>
+              </div>
+              <div className="space-y-3 text-sm">
+                <PropRow label={t('settings.name')} value={propertiesSession.title || t('foldersPage.untitledSession')} />
+                <PropRow label={t('foldersPage.status')} value={propertiesSession.status} />
+                <PropRow label={t('foldersPage.duration')} value={formatDurationShort(propertiesSession.durationMs)} />
+                <PropRow label={t('foldersPage.course')} value={propertiesSession.courseName || '—'} />
+                <PropRow label={t('foldersPage.folderLabel')} value={folder.name} />
+                <PropRow label={t('foldersPage.created')} value={formatDate(propertiesSession.createdAt)} last />
+              </div>
+              <div className="mt-5 flex justify-end">
+                <button onClick={() => setShowProperties(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.close')}</button>
+              </div>
+            </>
+          )}
+        </AnimatedModalOverlay>
       </div>
     );
   }
@@ -989,62 +988,60 @@ export default function FolderDetailPage() {
       {showExport && <ExportModal isOpen sessionId={exportSessionId} sessionTitle={exportSessionTitle} onClose={() => setShowExport(false)} />}
 
       {/* Rename modal */}
-      {showRenameModal && (
-        <ModalOverlay onClose={() => setShowRenameModal(false)}>
-          <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.renameRecording')}</h2>
-          <input type="text" value={renameValue} onChange={(e) => setRenameValue(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && renameValue.trim()) void handleRenameSession(); if (e.key === 'Escape') setShowRenameModal(false); }}
-            autoFocus className="w-full rounded-lg border border-cream-300 px-3 py-2 text-sm text-charcoal-700 outline-none focus:border-rust-300 focus:ring-1 focus:ring-rust-200" />
-          <div className="mt-4 flex justify-end gap-2">
-            <button onClick={() => setShowRenameModal(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.cancel')}</button>
-            <button onClick={() => void handleRenameSession()} disabled={saving || !renameValue.trim()} className="rounded-lg bg-rust-500 px-4 py-1.5 text-sm font-medium text-white hover:bg-rust-600 disabled:opacity-60">
-              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : t('common.save')}
-            </button>
-          </div>
-        </ModalOverlay>
-      )}
+      <AnimatedModalOverlay open={showRenameModal} onClose={() => setShowRenameModal(false)}>
+        <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.renameRecording')}</h2>
+        <input type="text" value={renameValue} onChange={(e) => setRenameValue(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && renameValue.trim()) void handleRenameSession(); if (e.key === 'Escape') setShowRenameModal(false); }}
+          autoFocus className="w-full rounded-lg border border-cream-300 px-3 py-2 text-sm text-charcoal-700 outline-none focus:border-rust-300 focus:ring-1 focus:ring-rust-200" />
+        <div className="mt-4 flex justify-end gap-2">
+          <button onClick={() => setShowRenameModal(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.cancel')}</button>
+          <button onClick={() => void handleRenameSession()} disabled={saving || !renameValue.trim()} className="rounded-lg bg-rust-500 px-4 py-1.5 text-sm font-medium text-white hover:bg-rust-600 disabled:opacity-60">
+            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : t('common.save')}
+          </button>
+        </div>
+      </AnimatedModalOverlay>
 
       {/* Move modal */}
-      {showMoveModal && (
-        <ModalOverlay onClose={() => setShowMoveModal(false)}>
-          <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.moveToFolderDialog')}</h2>
-          <div className="max-h-60 space-y-1 overflow-y-auto">
-            <button onClick={() => void handleMoveSessionsTo(null)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-charcoal-700 hover:bg-cream-100">
-              <Mic className="h-4 w-4 text-amber-500" /> {t('foldersPage.unarchivedFolder')}
+      <AnimatedModalOverlay open={showMoveModal} onClose={() => setShowMoveModal(false)}>
+        <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.moveToFolderDialog')}</h2>
+        <div className="max-h-60 space-y-1 overflow-y-auto">
+          <button onClick={() => void handleMoveSessionsTo(null)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-charcoal-700 hover:bg-cream-100">
+            <Mic className="h-4 w-4 text-amber-500" /> {t('foldersPage.unarchivedFolder')}
+          </button>
+          {allFolders.filter((f) => f.id !== folderId).map((f) => (
+            <button key={f.id} onClick={() => void handleMoveSessionsTo(f.id)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-charcoal-700 hover:bg-cream-100">
+              <FolderOpen className="h-4 w-4 text-charcoal-300" />
+              <span style={{ paddingLeft: f.depth * 12 }}>{f.name}</span>
             </button>
-            {allFolders.filter((f) => f.id !== folderId).map((f) => (
-              <button key={f.id} onClick={() => void handleMoveSessionsTo(f.id)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-charcoal-700 hover:bg-cream-100">
-                <FolderOpen className="h-4 w-4 text-charcoal-300" />
-                <span style={{ paddingLeft: f.depth * 12 }}>{f.name}</span>
-              </button>
-            ))}
-          </div>
-          <div className="mt-4 flex justify-end">
-            <button onClick={() => setShowMoveModal(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.cancel')}</button>
-          </div>
-        </ModalOverlay>
-      )}
+          ))}
+        </div>
+        <div className="mt-4 flex justify-end">
+          <button onClick={() => setShowMoveModal(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.cancel')}</button>
+        </div>
+      </AnimatedModalOverlay>
 
       {/* Properties modal */}
-      {showProperties && propertiesSession && (
-        <ModalOverlay onClose={() => setShowProperties(false)}>
-          <div className="mb-4 flex items-center gap-2">
-            <Mic className="h-5 w-5 text-rust-500" />
-            <h2 className="font-serif text-base font-bold text-charcoal-800">{t('foldersPage.recordingProperties')}</h2>
-          </div>
-          <div className="space-y-3 text-sm">
-            <PropRow label={t('settings.name')} value={propertiesSession.title || t('foldersPage.untitledSession')} />
-            <PropRow label={t('foldersPage.status')} value={propertiesSession.status} />
-            <PropRow label={t('foldersPage.duration')} value={formatDurationShort(propertiesSession.durationMs)} />
-            <PropRow label={t('foldersPage.course')} value={propertiesSession.courseName || '—'} />
-            <PropRow label={t('foldersPage.folderLabel')} value={folder.name} />
-            <PropRow label={t('foldersPage.created')} value={formatDate(propertiesSession.createdAt)} last />
-          </div>
-          <div className="mt-5 flex justify-end">
-            <button onClick={() => setShowProperties(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.close')}</button>
-          </div>
-        </ModalOverlay>
-      )}
+      <AnimatedModalOverlay open={showProperties && !!propertiesSession} onClose={() => setShowProperties(false)}>
+        {propertiesSession && (
+          <>
+            <div className="mb-4 flex items-center gap-2">
+              <Mic className="h-5 w-5 text-rust-500" />
+              <h2 className="font-serif text-base font-bold text-charcoal-800">{t('foldersPage.recordingProperties')}</h2>
+            </div>
+            <div className="space-y-3 text-sm">
+              <PropRow label={t('settings.name')} value={propertiesSession.title || t('foldersPage.untitledSession')} />
+              <PropRow label={t('foldersPage.status')} value={propertiesSession.status} />
+              <PropRow label={t('foldersPage.duration')} value={formatDurationShort(propertiesSession.durationMs)} />
+              <PropRow label={t('foldersPage.course')} value={propertiesSession.courseName || '—'} />
+              <PropRow label={t('foldersPage.folderLabel')} value={folder.name} />
+              <PropRow label={t('foldersPage.created')} value={formatDate(propertiesSession.createdAt)} last />
+            </div>
+            <div className="mt-5 flex justify-end">
+              <button onClick={() => setShowProperties(false)} className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 hover:bg-cream-100">{t('common.close')}</button>
+            </div>
+          </>
+        )}
+      </AnimatedModalOverlay>
 
       <ConfirmDialog
         open={!!pendingDelete}
@@ -1086,13 +1083,24 @@ function ExpandBtn({ icon, label, onClick, disabled, variant = 'default', title,
 }
 
 /* ═══ Modal overlay ═══ */
-function ModalOverlay({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+function ModalOverlay({ onClose, children, leaving }: { onClose: () => void; children: React.ReactNode; leaving?: boolean }) {
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter" onClick={onClose}>
-      <div className="w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+    <div className={`fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`} onClick={onClose}>
+      <div className={`w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`} onClick={(e) => e.stopPropagation()}>
         {children}
       </div>
     </div>
+  );
+}
+
+/* ═══ Modal overlay with enter/exit animation (boolean-gated) ═══ */
+function AnimatedModalOverlay({ open, onClose, children }: { open: boolean; onClose: () => void; children: React.ReactNode }) {
+  const { mounted, leaving } = useExitAnimation(open);
+  if (!mounted) return null;
+  return (
+    <ModalOverlay onClose={onClose} leaving={leaving}>
+      {children}
+    </ModalOverlay>
   );
 }
 

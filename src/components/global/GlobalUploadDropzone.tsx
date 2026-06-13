@@ -19,6 +19,7 @@ import UploadTranscribeModal from './UploadTranscribeModal';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 
 const ACCEPTED_MEDIA_RE = /^(audio|video)\//i;
 // 5GB —— async file API 走分片上传 + 后端 ffmpeg 抽音频，远高于老路径的 500MB。
@@ -33,6 +34,9 @@ export default function GlobalUploadDropzone() {
   const pathname = usePathname();
   const user = useAuthStore((s) => s.user);
   const { t } = useI18n();
+
+  // 拖拽 overlay 的进入/离场两段式动画（dragActive 为布尔，无 retain-during-leave 崩溃风险）。
+  const { mounted: overlayMounted, leaving: overlayLeaving } = useExitAnimation(dragActive, 150);
 
   // 在登录/公开分享观看/setup 等页面禁用全站拖拽（避免在公开页面误触发，
   // 也避免已登录用户访问他人分享链接时误触发上传流程）
@@ -140,14 +144,22 @@ export default function GlobalUploadDropzone() {
   return (
     <>
       {/* 拖拽 overlay */}
-      {dragActive && (
+      {overlayMounted && (
         <ModalPortal>
           <div
             className="fixed inset-0 z-[1500] flex items-center justify-center pointer-events-none"
             aria-hidden
           >
-            <div className="absolute inset-0 bg-rust-500/8 backdrop-blur-[2px]" />
-            <div className="relative flex flex-col items-center gap-4 rounded-3xl border-4 border-dashed border-rust-400 bg-white/90 px-12 py-10 shadow-2xl">
+            <div
+              className={`absolute inset-0 bg-rust-500/8 backdrop-blur-[2px] ${
+                overlayLeaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'
+              }`}
+            />
+            <div
+              className={`relative flex flex-col items-center gap-4 rounded-3xl border-4 border-dashed border-rust-400 bg-white/90 px-12 py-10 shadow-2xl ${
+                overlayLeaving ? 'animate-fade-out-scale' : 'animate-fade-in-scale'
+              }`}
+            >
               <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-rust-500 shadow-lg shadow-rust-500/30">
                 <UploadIcon className="h-8 w-8 text-white" />
               </div>

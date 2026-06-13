@@ -20,6 +20,7 @@ import {
   X,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import ActionSheet, { type ActionSheetItem } from '@/components/mobile/ActionSheet';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -132,6 +133,20 @@ export default function FoldersPage() {
 
   /* ─── Properties modal ─── */
   const [propertiesFolder, setPropertiesFolder] = useState<FolderListItem | null>(null);
+
+  /* ─── Exit animations ─── */
+  // New-folder modal is gated on a simple boolean → full enter/leave.
+  const createAnim = useExitAnimation(showCreateModal, 180);
+  // Properties modal is gated on an object → retain last folder during leave window.
+  const propsAnim = useExitAnimation(propertiesFolder !== null, 180);
+  const lastPropertiesFolderRef = useRef<FolderListItem | null>(null);
+  if (propertiesFolder) lastPropertiesFolderRef.current = propertiesFolder;
+  const propsFolder = propertiesFolder ?? lastPropertiesFolderRef.current;
+  // Desktop context menu is gated on an object → retain last position during leave window.
+  const ctxAnim = useExitAnimation(ctxMenu !== null, 150);
+  const lastCtxMenuRef = useRef<ContextMenuState | null>(null);
+  if (ctxMenu) lastCtxMenuRef.current = ctxMenu;
+  const ctxMenuSnapshot = ctxMenu ?? lastCtxMenuRef.current;
 
   /* ─── Clipboard ─── */
   const [clipboard, setClipboard] = useState<{ ids: string[]; mode: 'copy' | 'cut' } | null>(null);
@@ -718,6 +733,11 @@ export default function FoldersPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ctxMenu, selectedIds, clipboard, folders]);
 
+  // Retain the last non-empty menu items so the menu stays populated during the leave animation.
+  const lastCtxMenuItemsRef = useRef<typeof ctxMenuItems>([]);
+  if (ctxMenu && ctxMenuItems.length > 0) lastCtxMenuItemsRef.current = ctxMenuItems;
+  const ctxMenuItemsSnapshot = ctxMenu ? ctxMenuItems : lastCtxMenuItemsRef.current;
+
   const mobileActionItems: ActionSheetItem[] =
     !mobileActionFolderId || mobileActionFolderId === UNARCHIVED_ID
       ? [
@@ -895,13 +915,13 @@ export default function FoldersPage() {
           items={mobileActionItems}
         />
 
-        {propertiesFolder && (
+        {propsAnim.mounted && propsFolder && (
           <div
-            className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter"
+            className={`fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm ${propsAnim.leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
             onClick={() => setPropertiesFolder(null)}
           >
             <div
-              className="mx-4 w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl"
+              className={`mx-4 w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl ${propsAnim.leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}
               onClick={(e) => e.stopPropagation()}
             >
               <div className="mb-4 flex items-center gap-2">
@@ -913,23 +933,23 @@ export default function FoldersPage() {
               <div className="space-y-3 text-sm">
                 <div className="flex justify-between border-b border-cream-100 pb-2">
                   <span className="text-charcoal-400">Name</span>
-                  <span className="font-medium text-charcoal-800">{propertiesFolder.name}</span>
+                  <span className="font-medium text-charcoal-800">{propsFolder.name}</span>
                 </div>
                 <div className="flex justify-between border-b border-cream-100 pb-2">
                   <span className="text-charcoal-400">Recordings</span>
-                  <span className="font-medium text-charcoal-800">{propertiesFolder.sessionCount}</span>
+                  <span className="font-medium text-charcoal-800">{propsFolder.sessionCount}</span>
                 </div>
                 <div className="flex justify-between border-b border-cream-100 pb-2">
                   <span className="text-charcoal-400">Keywords</span>
-                  <span className="font-medium text-charcoal-800">{propertiesFolder.keywordCount}</span>
+                  <span className="font-medium text-charcoal-800">{propsFolder.keywordCount}</span>
                 </div>
                 <div className="flex justify-between border-b border-cream-100 pb-2">
                   <span className="text-charcoal-400">Subfolders</span>
-                  <span className="font-medium text-charcoal-800">{propertiesFolder.childCount}</span>
+                  <span className="font-medium text-charcoal-800">{propsFolder.childCount}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-charcoal-400">Created</span>
-                  <span className="font-medium text-charcoal-800">{formatDate(propertiesFolder.createdAt)}</span>
+                  <span className="font-medium text-charcoal-800">{formatDate(propsFolder.createdAt)}</span>
                 </div>
               </div>
               <div className="mt-5 flex justify-end">
@@ -944,13 +964,13 @@ export default function FoldersPage() {
           </div>
         )}
 
-        {showCreateModal && (
+        {createAnim.mounted && (
           <div
-            className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter"
+            className={`fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm ${createAnim.leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
             onClick={() => setShowCreateModal(false)}
           >
             <div
-              className="mx-4 w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl"
+              className={`mx-4 w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl ${createAnim.leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}
               onClick={(e) => e.stopPropagation()}
             >
               <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">
@@ -1156,23 +1176,24 @@ export default function FoldersPage() {
       </div>
 
       {/* ── Context menu ── */}
-      {ctxMenu && (
+      {ctxAnim.mounted && ctxMenuSnapshot && (
         <ContextMenu
           ref={ctxMenuRef}
-          x={ctxMenu.x}
-          y={ctxMenu.y}
-          items={ctxMenuItems}
+          x={ctxMenuSnapshot.x}
+          y={ctxMenuSnapshot.y}
+          items={ctxMenuItemsSnapshot}
+          leaving={ctxAnim.leaving}
         />
       )}
 
       {/* ── Properties Modal ── */}
-      {propertiesFolder && (
+      {propsAnim.mounted && propsFolder && (
         <div
-          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter"
+          className={`fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm ${propsAnim.leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
           onClick={() => setPropertiesFolder(null)}
         >
           <div
-            className="w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl"
+            className={`w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl ${propsAnim.leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-4 flex items-center gap-2">
@@ -1184,33 +1205,33 @@ export default function FoldersPage() {
             <div className="space-y-3 text-sm">
               <div className="flex justify-between border-b border-cream-100 pb-2">
                 <span className="text-charcoal-400">Name</span>
-                <span className="font-medium text-charcoal-800">{propertiesFolder.name}</span>
+                <span className="font-medium text-charcoal-800">{propsFolder.name}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
                 <span className="text-charcoal-400">Recordings</span>
-                <span className="font-medium text-charcoal-800">{propertiesFolder.sessionCount}</span>
+                <span className="font-medium text-charcoal-800">{propsFolder.sessionCount}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
                 <span className="text-charcoal-400">Keywords</span>
-                <span className="font-medium text-charcoal-800">{propertiesFolder.keywordCount}</span>
+                <span className="font-medium text-charcoal-800">{propsFolder.keywordCount}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
                 <span className="text-charcoal-400">Subfolders</span>
-                <span className="font-medium text-charcoal-800">{propertiesFolder.childCount}</span>
+                <span className="font-medium text-charcoal-800">{propsFolder.childCount}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
                 <span className="text-charcoal-400">Depth</span>
-                <span className="font-medium text-charcoal-800">{propertiesFolder.depth}</span>
+                <span className="font-medium text-charcoal-800">{propsFolder.depth}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
                 <span className="text-charcoal-400">Path</span>
                 <span className="font-medium text-charcoal-800 text-right max-w-[200px] truncate">
-                  {propertiesFolder.path.join(' / ') || '/'}
+                  {propsFolder.path.join(' / ') || '/'}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-charcoal-400">Created</span>
-                <span className="font-medium text-charcoal-800">{formatDate(propertiesFolder.createdAt)}</span>
+                <span className="font-medium text-charcoal-800">{formatDate(propsFolder.createdAt)}</span>
               </div>
             </div>
             <div className="mt-5 flex justify-end">
@@ -1226,13 +1247,13 @@ export default function FoldersPage() {
       )}
 
       {/* ── New Folder Modal ── */}
-      {showCreateModal && (
+      {createAnim.mounted && (
         <div
-          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter"
+          className={`fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm ${createAnim.leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
           onClick={() => setShowCreateModal(false)}
         >
           <div
-            className="w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl"
+            className={`w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl ${createAnim.leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}
             onClick={(e) => e.stopPropagation()}
           >
             <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">
@@ -1427,8 +1448,8 @@ interface CtxMenuItem {
   disabled?: boolean;
 }
 
-const ContextMenu = forwardRef<HTMLDivElement, { x: number; y: number; items: CtxMenuItem[] }>(
-  function ContextMenu({ x, y, items }, ref) {
+const ContextMenu = forwardRef<HTMLDivElement, { x: number; y: number; items: CtxMenuItem[]; leaving?: boolean }>(
+  function ContextMenu({ x, y, items, leaving }, ref) {
     const innerRef = useRef<HTMLDivElement>(null);
     const [pos, setPos] = useState({ left: x, top: y });
 
@@ -1458,7 +1479,7 @@ const ContextMenu = forwardRef<HTMLDivElement, { x: number; y: number; items: Ct
           if (typeof ref === 'function') ref(el);
           else if (ref) (ref as React.MutableRefObject<HTMLDivElement | null>).current = el;
         }}
-        className="animate-ctx-menu-in fixed z-[60] min-w-[180px] rounded-xl border border-cream-200 bg-white py-1.5 shadow-xl"
+        className={`${leaving ? 'animate-ctx-menu-out' : 'animate-ctx-menu-in'} fixed z-[60] min-w-[180px] rounded-xl border border-cream-200 bg-white py-1.5 shadow-xl`}
         style={{ left: pos.left, top: pos.top }}
         onClick={(e) => e.stopPropagation()}
       >

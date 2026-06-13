@@ -3,6 +3,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import BottomSheet from '@/components/mobile/BottomSheet';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import {
   X,
   FileText,
@@ -204,6 +205,9 @@ export default function ExportModal({
   const isMobile = useIsMobile();
   const { t } = useI18n();
   const token = useAuthStore((s) => s.token);
+  // 250ms：移动端渲染 BottomSheet（自管 0.25s 离场），父层需保持挂载到其离场播完；
+  // 桌面 modal-leave 为 0.18s（forwards），多挂载 ~70ms 停在终态不可见，无副作用。
+  const { mounted, leaving } = useExitAnimation(isOpen, 250);
 
   const [sessionData, setSessionData] = useState<SessionExportDataResponse | null>(null);
   const [isLoadingSessionData, setIsLoadingSessionData] = useState(false);
@@ -458,7 +462,7 @@ export default function ExportModal({
     }
   };
 
-  if (!isOpen) return null;
+  if (!mounted) return null;
 
   const content = (
     <div className="flex flex-col flex-1 min-h-0">
@@ -686,9 +690,9 @@ export default function ExportModal({
 
   return (
     <>
-      <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 animate-backdrop-enter" onClick={onClose} />
+      <div className={`fixed inset-0 bg-black/30 backdrop-blur-sm z-50 ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`} onClick={onClose} />
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-2xl w-[480px] max-w-full max-h-[calc(100vh-2rem)] flex flex-col animate-modal-enter overflow-hidden">
+        <div className={`bg-white rounded-2xl shadow-2xl w-[480px] max-w-full max-h-[calc(100vh-2rem)] flex flex-col overflow-hidden ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
           {/* Header */}
           <div className="flex items-center justify-between px-5 py-3.5 border-b border-cream-200 bg-gradient-to-r from-rust-50 to-cream-50">
             <div className="flex items-center gap-2">

@@ -71,6 +71,15 @@ const config: Config = {
           '0%': { opacity: '0', transform: 'scale(0.92)' },
           '100%': { opacity: '1', transform: 'scale(1)' },
         },
+        'ctx-menu-out': {
+          '0%': { opacity: '1', transform: 'scale(1)' },
+          '100%': { opacity: '0', transform: 'scale(0.96)' },
+        },
+        /* ─── 气泡淡出（fade-in-scale 的离场配对）─── */
+        'fade-out-scale': {
+          '0%': { opacity: '1', transform: 'scale(1)' },
+          '100%': { opacity: '0', transform: 'scale(0.95)' },
+        },
         /* ─── 页面 & 内容入场 ─── */
         'fade-in-up': {
           '0%': { opacity: '0', transform: 'translateY(16px)' },
@@ -92,6 +101,24 @@ const config: Config = {
         'slide-in-left': {
           '0%': { transform: 'translateX(-100%)' },
           '100%': { transform: 'translateX(0)' },
+        },
+        /* ─── 抽屉 / 面板滑出 ─── */
+        'slide-out-right': {
+          '0%': { transform: 'translateX(0)' },
+          '100%': { transform: 'translateX(100%)' },
+        },
+        'slide-out-left': {
+          '0%': { transform: 'translateX(0)' },
+          '100%': { transform: 'translateX(-100%)' },
+        },
+        /* ─── 底部面板（整屏 sheet）滑入 / 滑出 ─── */
+        'sheet-in': {
+          '0%': { transform: 'translateY(100%)' },
+          '100%': { transform: 'translateY(0)' },
+        },
+        'sheet-out': {
+          '0%': { transform: 'translateY(0)' },
+          '100%': { transform: 'translateY(100%)' },
         },
         'slide-up': {
           '0%': { opacity: '0', transform: 'translateY(24px)' },
@@ -164,11 +191,17 @@ const config: Config = {
         'toolbar-in': 'toolbar-in 0.18s ease-out forwards',
         'toolbar-out': 'toolbar-out 0.12s ease-in forwards',
         'ctx-menu-in': 'ctx-menu-in 0.12s ease-out forwards',
+        'ctx-menu-out': 'ctx-menu-out 0.12s ease-in forwards',
         'fade-in-up': 'fade-in-up 0.4s ease-out both',
         'fade-in': 'fade-in 0.3s ease-out both',
         'fade-in-scale': 'fade-in-scale 0.35s ease-out both',
+        'fade-out-scale': 'fade-out-scale 0.15s ease-in forwards',
         'slide-in-right': 'slide-in-right 0.3s cubic-bezier(0.16, 1, 0.3, 1) both',
         'slide-in-left': 'slide-in-left 0.3s cubic-bezier(0.16, 1, 0.3, 1) both',
+        'slide-out-right': 'slide-out-right 0.25s cubic-bezier(0.4, 0, 1, 1) forwards',
+        'slide-out-left': 'slide-out-left 0.25s cubic-bezier(0.4, 0, 1, 1) forwards',
+        'sheet-in': 'sheet-in 0.3s cubic-bezier(0.16, 1, 0.3, 1) both',
+        'sheet-out': 'sheet-out 0.25s cubic-bezier(0.4, 0, 1, 1) forwards',
         'slide-up': 'slide-up 0.4s ease-out both',
         'pop-in': 'pop-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) both',
         'shake': 'shake 0.4s ease-in-out',

@@ -4,6 +4,7 @@
 // (waiting for last tokens, merging audio, uploading, extracting keywords)
 
 import { AlertCircle, CheckCircle2, Loader2 } from 'lucide-react';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useI18n } from '@/lib/i18n';
 
 export interface FinalizingStep {
@@ -18,12 +19,13 @@ interface SessionFinalizingOverlayProps {
 
 export function SessionFinalizingOverlay({ steps, visible }: SessionFinalizingOverlayProps) {
   const { t } = useI18n();
-  if (!visible) return null;
+  const { mounted, leaving } = useExitAnimation(visible);
+  if (!mounted) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/30 backdrop-blur-sm animate-backdrop-enter" />
-      <div className="relative bg-white rounded-2xl shadow-2xl border border-cream-200 p-8 w-[380px] animate-modal-enter">
+      <div className={`absolute inset-0 bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`} />
+      <div className={`relative bg-white rounded-2xl shadow-2xl border border-cream-200 p-8 w-[380px] ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
         <div className="text-center mb-6">
           <Loader2 className="w-8 h-8 text-rust-500 animate-spin mx-auto mb-3" />
           <h2 className="font-serif font-bold text-charcoal-800 text-lg">{t('session.finalizing.title')}</h2>

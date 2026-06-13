@@ -31,6 +31,7 @@ import {
 } from 'lucide-react';
 import ModalPortal from '@/components/ModalPortal';
 import { useAuth } from '@/hooks/useAuth';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { toast } from '@/stores/toastStore';
 
 interface RecordingItem {
@@ -134,6 +135,7 @@ export default function RecordingPicker({
   onAttached,
 }: RecordingPickerProps) {
   const { token } = useAuth();
+  const { mounted, leaving } = useExitAnimation(open);
 
   const [items, setItems] = useState<RecordingItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -311,7 +313,7 @@ export default function RecordingPicker({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [open, submitting, onClose]);
 
-  if (!open) return null;
+  if (!mounted) return null;
 
   const hasNoRecordings = !loading && items.length === 0 && !loadError;
 
@@ -325,7 +327,9 @@ export default function RecordingPicker({
       >
         {/* Backdrop with blur */}
         <div
-          className="absolute inset-0 bg-black/30 backdrop-blur-sm animate-backdrop-enter"
+          className={`absolute inset-0 bg-black/30 backdrop-blur-sm ${
+            leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'
+          }`}
           onClick={() => {
             if (!submitting) onClose();
           }}
@@ -333,12 +337,13 @@ export default function RecordingPicker({
 
         {/* Modal card — full-screen on mobile, centered on desktop */}
         <div
-          className="
+          className={`
             relative bg-white shadow-2xl
             w-full h-full sm:h-auto sm:max-w-2xl sm:max-h-[80vh]
             sm:rounded-xl border border-cream-200/60
-            flex flex-col animate-modal-enter overflow-hidden
-          "
+            flex flex-col overflow-hidden
+            ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}
+          `}
           onClick={(e) => e.stopPropagation()}
         >
           {/* Header */}

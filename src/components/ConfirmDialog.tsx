@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AlertTriangle, Loader2 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 
 export interface ConfirmDialogProps {
   open: boolean;
@@ -33,10 +34,11 @@ export default function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   const { t } = useI18n();
-  const [mounted, setMounted] = useState(false);
+  const [portalReady, setPortalReady] = useState(false);
+  const { mounted, leaving } = useExitAnimation(open);
 
   useEffect(() => {
-    setMounted(true);
+    setPortalReady(true);
   }, []);
 
   useEffect(() => {
@@ -48,7 +50,7 @@ export default function ConfirmDialog({
     return () => window.removeEventListener('keydown', onKey);
   }, [open, loading, onCancel]);
 
-  if (!mounted || !open) return null;
+  if (!portalReady || !mounted) return null;
 
   const confirmBtnClass = danger
     ? 'bg-red-500 hover:bg-red-600 active:bg-red-700'
@@ -56,7 +58,7 @@ export default function ConfirmDialog({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center px-4 bg-black/40 backdrop-blur-sm animate-backdrop-enter"
+      className={`fixed inset-0 z-[100] flex items-center justify-center px-4 bg-black/40 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
       onClick={() => {
         if (!loading) onCancel();
       }}
@@ -65,7 +67,7 @@ export default function ConfirmDialog({
         role="dialog"
         aria-modal="true"
         onClick={(e) => e.stopPropagation()}
-        className="bg-white dark:bg-charcoal-800 border border-cream-200 dark:border-charcoal-700 rounded-2xl shadow-xl w-full max-w-sm animate-modal-enter overflow-hidden"
+        className={`bg-white dark:bg-charcoal-800 border border-cream-200 dark:border-charcoal-700 rounded-2xl shadow-xl w-full max-w-sm overflow-hidden ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}
       >
         <div className="flex items-start gap-3 p-5">
           {danger && (

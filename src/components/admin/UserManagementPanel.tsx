@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import {
   Plus,
   RefreshCw,
@@ -17,6 +17,7 @@ import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
 import ModalPortal from '@/components/ModalPortal';
 import ConfirmDialog from '@/components/ConfirmDialog';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 
 interface UserItem {
   id: string;
@@ -97,12 +98,14 @@ function UserDetailModal({
   onClose,
   onUpdated,
   customGroups,
+  leaving,
 }: {
   user: UserItem;
   token: string | null;
   onClose: () => void;
   onUpdated: () => void;
   customGroups: CustomGroupOption[];
+  leaving: boolean;
 }) {
   const { t } = useI18n();
   const [email, setEmail] = useState(user.email);
@@ -202,8 +205,8 @@ function UserDetailModal({
 
   return (
     <ModalPortal>
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter px-4">
-      <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto animate-modal-enter">
+    <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm px-4 ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}>
+      <div className={`bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
         {/* 标题栏 */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200">
           <h3 className="text-base font-semibold text-charcoal-800 dark:text-cream-100">{t('admin.userDetails')}</h3>
@@ -422,10 +425,12 @@ function CreateUserModal({
   onClose,
   onCreated,
   token,
+  leaving,
 }: {
   onClose: () => void;
   onCreated: () => void;
   token: string | null;
+  leaving: boolean;
 }) {
   const { t } = useI18n();
   const [email, setEmail] = useState('');
@@ -472,8 +477,8 @@ function CreateUserModal({
 
   return (
     <ModalPortal>
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter px-4">
-      <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-md animate-modal-enter">
+    <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm px-4 ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}>
+      <div className={`bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-md ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200">
           <h3 className="text-base font-semibold text-charcoal-800 dark:text-cream-100">{t('admin.newUser')}</h3>
           <button
@@ -572,6 +577,13 @@ export default function UserManagementPanel() {
   const [filterText, setFilterText] = useState('');
   const [filterGroup, setFilterGroup] = useState('');
   const [customGroups, setCustomGroups] = useState<CustomGroupOption[]>([]);
+
+  // 弹窗离场动画
+  const createAnim = useExitAnimation(showCreateModal);
+  const detailAnim = useExitAnimation(detailUser !== null);
+  // RETAIN-DURING-LEAVE：快照最后一个非空 detailUser，离场期间继续渲染，避免读 null 崩溃
+  const lastDetailUser = useRef<UserItem | null>(null);
+  if (detailUser) lastDetailUser.current = detailUser;
 
   // 加载自定义用户组列表
   const fetchCustomGroups = useCallback(async () => {
@@ -877,21 +889,23 @@ export default function UserManagementPanel() {
         </table>
       </div>
 
-      {showCreateModal && (
+      {createAnim.mounted && (
         <CreateUserModal
           token={token}
           onClose={() => setShowCreateModal(false)}
           onCreated={() => fetchUsers()}
+          leaving={createAnim.leaving}
         />
       )}
 
-      {detailUser && (
+      {detailAnim.mounted && (detailUser ?? lastDetailUser.current) && (
         <UserDetailModal
-          user={detailUser}
+          user={(detailUser ?? lastDetailUser.current)!}
           token={token}
           onClose={() => setDetailUser(null)}
           onUpdated={() => fetchUsers()}
           customGroups={customGroups}
+          leaving={detailAnim.leaving}
         />
       )}
 

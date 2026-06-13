@@ -23,6 +23,7 @@ import {
   X,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useI18n } from '@/lib/i18n';
 
 interface JobItem {
@@ -131,6 +132,7 @@ export default function BackgroundTasksIndicator() {
   const token = useAuthStore((s) => s.token);
   const [data, setData] = useState<BackgroundTasksResponse | null>(null);
   const [open, setOpen] = useState(false);
+  const { mounted: popoverMounted, leaving: popoverLeaving } = useExitAnimation(open, 150);
   const [now, setNow] = useState(() => Date.now());
   const containerRef = useRef<HTMLDivElement>(null);
   const tokenRef = useRef(token);
@@ -280,13 +282,17 @@ export default function BackgroundTasksIndicator() {
         </span>
       </button>
 
-      {open && (
+      {popoverMounted && (
         <div
           role="dialog"
           aria-label={t('backgroundTasks.title')}
-          className="absolute right-0 top-full z-50 mt-1.5 w-80 origin-top-right
-                     animate-[popoverIn_0.18s_ease-out] rounded-xl border border-cream-300
-                     bg-white p-4 shadow-xl"
+          className={`absolute right-0 top-full z-50 mt-1.5 w-80 origin-top-right
+                     ${
+                       popoverLeaving
+                         ? 'animate-[popoverOut_0.15s_ease-in_forwards]'
+                         : 'animate-[popoverIn_0.18s_ease-out]'
+                     } rounded-xl border border-cream-300
+                     bg-white p-4 shadow-xl`}
         >
           <div className="mb-3 flex items-center justify-between">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-charcoal-800">

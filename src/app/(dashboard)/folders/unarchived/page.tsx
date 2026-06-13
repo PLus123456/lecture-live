@@ -33,6 +33,7 @@ import ActionSheet, { type ActionSheetItem } from '@/components/mobile/ActionShe
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
 
@@ -114,6 +115,11 @@ export default function UnarchivedPage() {
     | { kind: 'single'; id: string; title: string }
     | null
   >(null);
+
+  /* ─── Modal exit animations ─── */
+  const renameAnim = useExitAnimation(showRenameModal);
+  const moveAnim = useExitAnimation(showMoveModal);
+  const propertiesAnim = useExitAnimation(showProperties);
 
   /* ─── Selection ─── */
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
@@ -650,8 +656,8 @@ export default function UnarchivedPage() {
         {showNewSession && <NewSessionModal onClose={() => setShowNewSession(false)} />}
         {showExport && <ExportModal isOpen sessionId={exportSessionId} sessionTitle={exportSessionTitle} onClose={() => setShowExport(false)} />}
 
-        {showRenameModal && (
-          <ModalOverlay onClose={() => setShowRenameModal(false)}>
+        {renameAnim.mounted && (
+          <ModalOverlay onClose={() => setShowRenameModal(false)} leaving={renameAnim.leaving}>
             <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.renameRecording')}</h2>
             <input type="text" value={renameValue} onChange={(e) => setRenameValue(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter' && renameValue.trim()) void handleRenameSession(); if (e.key === 'Escape') setShowRenameModal(false); }}
@@ -665,8 +671,8 @@ export default function UnarchivedPage() {
           </ModalOverlay>
         )}
 
-        {showMoveModal && (
-          <ModalOverlay onClose={() => setShowMoveModal(false)}>
+        {moveAnim.mounted && (
+          <ModalOverlay onClose={() => setShowMoveModal(false)} leaving={moveAnim.leaving}>
             <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.moveToFolderDialog')}</h2>
             <div className="max-h-60 space-y-1 overflow-y-auto">
               {allFolders.map((f) => (
@@ -682,8 +688,8 @@ export default function UnarchivedPage() {
           </ModalOverlay>
         )}
 
-        {showProperties && propertiesSession && (
-          <ModalOverlay onClose={() => setShowProperties(false)}>
+        {propertiesAnim.mounted && propertiesSession && (
+          <ModalOverlay onClose={() => setShowProperties(false)} leaving={propertiesAnim.leaving}>
             <div className="mb-4 flex items-center gap-2">
               <Mic className="h-5 w-5 text-rust-500" />
               <h2 className="font-serif text-base font-bold text-charcoal-800">{t('foldersPage.recordingProperties')}</h2>
@@ -813,8 +819,8 @@ export default function UnarchivedPage() {
       {showNewSession && <NewSessionModal onClose={() => setShowNewSession(false)} />}
       {showExport && <ExportModal isOpen sessionId={exportSessionId} sessionTitle={exportSessionTitle} onClose={() => setShowExport(false)} />}
 
-      {showRenameModal && (
-        <ModalOverlay onClose={() => setShowRenameModal(false)}>
+      {renameAnim.mounted && (
+        <ModalOverlay onClose={() => setShowRenameModal(false)} leaving={renameAnim.leaving}>
           <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.renameRecording')}</h2>
           <input type="text" value={renameValue} onChange={(e) => setRenameValue(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter' && renameValue.trim()) void handleRenameSession(); if (e.key === 'Escape') setShowRenameModal(false); }}
@@ -828,8 +834,8 @@ export default function UnarchivedPage() {
         </ModalOverlay>
       )}
 
-      {showMoveModal && (
-        <ModalOverlay onClose={() => setShowMoveModal(false)}>
+      {moveAnim.mounted && (
+        <ModalOverlay onClose={() => setShowMoveModal(false)} leaving={moveAnim.leaving}>
           <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">{t('foldersPage.moveToFolderDialog')}</h2>
           <div className="max-h-60 space-y-1 overflow-y-auto">
             {allFolders.map((f) => (
@@ -845,8 +851,8 @@ export default function UnarchivedPage() {
         </ModalOverlay>
       )}
 
-      {showProperties && propertiesSession && (
-        <ModalOverlay onClose={() => setShowProperties(false)}>
+      {propertiesAnim.mounted && propertiesSession && (
+        <ModalOverlay onClose={() => setShowProperties(false)} leaving={propertiesAnim.leaving}>
           <div className="mb-4 flex items-center gap-2">
             <Mic className="h-5 w-5 text-rust-500" />
             <h2 className="font-serif text-base font-bold text-charcoal-800">{t('foldersPage.recordingProperties')}</h2>
@@ -904,10 +910,10 @@ function ExpandBtn({ icon, label, onClick, disabled, variant = 'default', title,
   );
 }
 
-function ModalOverlay({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+function ModalOverlay({ onClose, children, leaving }: { onClose: () => void; children: React.ReactNode; leaving?: boolean }) {
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter" onClick={onClose}>
-      <div className="w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>{children}</div>
+    <div className={`fixed inset-0 z-[70] flex items-center justify-center bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`} onClick={onClose}>
+      <div className={`w-full max-w-sm rounded-2xl border border-cream-200 bg-white p-6 shadow-2xl ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`} onClick={(e) => e.stopPropagation()}>{children}</div>
     </div>
   );
 }

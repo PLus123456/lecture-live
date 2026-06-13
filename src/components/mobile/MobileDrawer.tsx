@@ -14,6 +14,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useAuthStore } from '@/stores/authStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 
 interface MobileDrawerProps {
   open: boolean;
@@ -43,6 +44,7 @@ function getQuotaPercent(limit?: number, used?: number) {
 
 export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
   const drawerRef = useRef<HTMLDivElement>(null);
+  const { mounted, leaving } = useExitAnimation(open, 250);
   const router = useRouter();
   const { logout } = useAuth();
   const user = useAuthStore((state) => state.user);
@@ -91,7 +93,7 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
     return `${minutes}m remaining`;
   }, [quotas]);
 
-  if (!open) {
+  if (!mounted) {
     return null;
   }
 
@@ -99,12 +101,12 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
     <div className="fixed inset-0 z-[60]">
       <button
         aria-label="Close profile drawer"
-        className="absolute inset-0 bg-black/30 backdrop-blur-sm animate-backdrop-enter"
+        className={`absolute inset-0 bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
         onClick={onClose}
       />
       <div
         ref={drawerRef}
-        className="safe-top absolute bottom-0 left-0 top-0 flex w-[280px] max-w-[82vw] flex-col border-r border-cream-200 bg-white shadow-2xl"
+        className={`safe-top absolute bottom-0 left-0 top-0 flex w-[280px] max-w-[82vw] flex-col border-r border-cream-200 bg-white shadow-2xl ${leaving ? 'animate-slide-out-left' : 'animate-slide-in-left'}`}
       >
         <div className="flex items-start justify-between border-b border-cream-200 px-5 py-5">
           <div className="flex items-center gap-3">

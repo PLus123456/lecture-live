@@ -6,6 +6,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { SONIOX_REGION_OPTIONS } from '@/types/transcript';
 import LanguageSelect from '@/components/LanguageSelect';
 import ModalPortal from '@/components/ModalPortal';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useI18n } from '@/lib/i18n';
 import { UI_LOCALE_OPTIONS, type Locale } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
@@ -27,28 +28,10 @@ function parseTerms(value: string) {
     .filter(Boolean);
 }
 
-const MODAL_LEAVE_MS = 180;
-
 export default function UserSettingsModal() {
   const open = useSettingsStore((s) => s.userSettingsOpen);
   const setOpen = useSettingsStore((s) => s.setUserSettingsOpen);
-  const [mounted, setMounted] = useState(false);
-  const [leaving, setLeaving] = useState(false);
-
-  useEffect(() => {
-    if (open) {
-      setMounted(true);
-      setLeaving(false);
-      return;
-    }
-    if (!mounted) return;
-    setLeaving(true);
-    const timer = setTimeout(() => {
-      setMounted(false);
-      setLeaving(false);
-    }, MODAL_LEAVE_MS);
-    return () => clearTimeout(timer);
-  }, [open, mounted]);
+  const { mounted, leaving } = useExitAnimation(open);
   const settings = useSettingsStore();
   const { user, token } = useAuth();
 

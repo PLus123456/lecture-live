@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import BottomSheet from '@/components/mobile/BottomSheet';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { normalizeMicrophoneDevices } from '@/lib/audio/audioCapture';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -25,6 +26,7 @@ export default function SettingsDrawer({
   onSettingsApplied?: () => void;
 }) {
   const isMobile = useIsMobile();
+  const { mounted, leaving } = useExitAnimation(isOpen, 250);
   const { t } = useI18n();
   const settings = useSettingsStore();
   const currentMicDeviceId = useTranscriptStore((s) => s.currentMicDeviceId);
@@ -99,8 +101,6 @@ export default function SettingsDrawer({
       onSettingsApplied?.();
     }
   };
-
-  if (!isOpen) return null;
 
   const content = (
     <>
@@ -316,18 +316,24 @@ export default function SettingsDrawer({
     );
   }
 
+  if (!mounted) return null;
+
   return (
     <>
       {/* Backdrop */}
       <div
-        className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 animate-backdrop-enter"
+        className={`fixed inset-0 bg-black/30 backdrop-blur-sm z-50 ${
+          leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'
+        }`}
         onClick={onClose}
       />
 
       {/* Drawer */}
       <div
-        className="fixed right-0 top-0 h-full w-[420px] max-w-[90vw] bg-white
-                   shadow-2xl z-50 overflow-y-auto animate-slide-in-right"
+        className={`fixed right-0 top-0 h-full w-[420px] max-w-[90vw] bg-white
+                   shadow-2xl z-50 overflow-y-auto ${
+                     leaving ? 'animate-slide-out-right' : 'animate-slide-in-right'
+                   }`}
       >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">

@@ -4,6 +4,7 @@
 // 安全注意：此组件不访问任何认证状态，不发起任何 API 请求
 
 import { useEffect, useRef } from 'react';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import {
   Settings,
   X,
@@ -54,6 +55,7 @@ function SettingsDrawer() {
   const setAutoScroll = useViewerSettingsStore((s) => s.setAutoScroll);
   const compact = useViewerSettingsStore((s) => s.compact);
   const setCompact = useViewerSettingsStore((s) => s.setCompact);
+  const { mounted, leaving } = useExitAnimation(settingsOpen, 250);
   const fontSizes: { value: ViewerFontSize; label: string }[] = [
     { value: 'small', label: t('viewerSettings.sizeSmall') },
     { value: 'medium', label: t('viewerSettings.sizeMedium') },
@@ -84,22 +86,22 @@ function SettingsDrawer() {
     };
   }, [settingsOpen, setSettingsOpen]);
 
-  if (!settingsOpen) return null;
+  if (!mounted) return null;
 
   return (
     <>
       {/* 半透明遮罩 */}
-      <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-40 animate-backdrop-enter" aria-hidden="true" />
+      <div className={`fixed inset-0 bg-black/30 backdrop-blur-sm z-40 ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`} aria-hidden="true" />
 
       {/* 设置面板 */}
       <div
         ref={drawerRef}
         role="dialog"
         aria-label={t('viewerSettings.viewingSettings')}
-        className="fixed right-0 top-0 h-full w-80 max-w-[90vw] bg-white
+        className={`fixed right-0 top-0 h-full w-80 max-w-[90vw] bg-white
                    border-l border-cream-200 shadow-xl z-50 overflow-y-auto
                    dark:bg-charcoal-800 dark:border-charcoal-600
-                   animate-in slide-in-from-right duration-200"
+                   ${leaving ? 'animate-slide-out-right' : 'animate-slide-in-right'}`}
       >
         {/* 面板头部 */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-cream-200 dark:border-charcoal-600">

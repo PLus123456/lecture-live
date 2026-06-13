@@ -5,6 +5,7 @@ import { Share2, Copy, CheckCheck, X, Link2, Trash2, Loader2 } from 'lucide-reac
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 
 interface PlaybackSharePopoverProps {
   sessionId: string;
@@ -23,6 +24,7 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
   const [error, setError] = useState<string | null>(null);
   const [initialChecked, setInitialChecked] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const { mounted, leaving } = useExitAnimation(open, 150);
 
   // 点击外部关闭
   useEffect(() => {
@@ -173,11 +175,11 @@ export default function PlaybackSharePopover({ sessionId, iconOnly }: PlaybackSh
         </button>
       )}
 
-      {open && (
+      {mounted && (
         <div
-          className="absolute top-full mt-1.5 right-0 w-72 bg-white border border-cream-300
+          className={`absolute top-full mt-1.5 right-0 w-72 bg-white border border-cream-300
                      rounded-xl shadow-xl z-50 p-4 origin-top-right
-                     animate-[popoverIn_0.18s_ease-out]"
+                     ${leaving ? 'animate-[popoverOut_0.15s_ease-in_forwards]' : 'animate-[popoverIn_0.18s_ease-out]'}`}
         >
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold text-charcoal-800">

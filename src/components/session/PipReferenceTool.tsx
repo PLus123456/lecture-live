@@ -1162,6 +1162,11 @@ const PIP_STYLES = `
 
 /** 页内悬浮面板样式 — 所有选择器 scope 到 .pip-inline-panel 下 */
 const INLINE_PIP_STYLES = `
+  @keyframes pipPanelIn {
+    from { opacity: 0; transform: translateY(8px) scale(0.97); }
+    to { opacity: 1; transform: none; }
+  }
+
   .pip-inline-panel {
     display: flex; flex-direction: column;
     background: #fffdf9;
@@ -1171,6 +1176,7 @@ const INLINE_PIP_STYLES = `
     box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.08);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     color: #3d3631;
+    animation: pipPanelIn 0.2s ease-out;
   }
 
   .pip-inline-panel .pip-header {

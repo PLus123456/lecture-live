@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Edit3,
   Users,
@@ -16,6 +16,7 @@ import {
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 
 interface UserGroup {
   id: string;
@@ -379,12 +380,14 @@ function GroupModal({
   onSave,
   saving,
   providers,
+  leaving,
 }: {
   group: UserGroup;
   onClose: () => void;
   onSave: (data: { permissions: UserGroup['permissions']; name?: string; description?: string; color?: string }) => void;
   saving: boolean;
   providers: ProviderInfo[];
+  leaving: boolean;
 }) {
   const { t } = useI18n();
   const [groupName, setGroupName] = useState(group.name);
@@ -400,8 +403,8 @@ function GroupModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
-      <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
+    <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}>
+      <div className={`bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">
           <h3 className="text-base font-semibold text-charcoal-800 dark:text-cream-100">
             {t('admin.editGroup')} — {group.name}
@@ -486,11 +489,13 @@ function CreateGroupModal({
   onCreate,
   saving,
   providers,
+  leaving,
 }: {
   onClose: () => void;
   onCreate: (data: { name: string; description: string; color: string; permissions: UserGroup['permissions'] }) => void;
   saving: boolean;
   providers: ProviderInfo[];
+  leaving: boolean;
 }) {
   const { t } = useI18n();
   const [name, setName] = useState('');
@@ -515,8 +520,8 @@ function CreateGroupModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
-      <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
+    <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}>
+      <div className={`bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">
           <h3 className="text-base font-semibold text-charcoal-800 dark:text-cream-100">{t('admin.createGroup')}</h3>
           <button
@@ -658,6 +663,21 @@ export default function UserGroupsPanel() {
 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<UserGroup | null>(null);
+
+  // 两段式离场动画：保持挂载至离场动画播放结束再卸载。
+  const editModal = useExitAnimation(showModal);
+  const createModal = useExitAnimation(showCreateModal);
+  const deleteModal = useExitAnimation(deleteConfirm !== null);
+
+  // 离场期间 deleteConfirm 会被置空 / editingGroup 可能被清；
+  // 快照最后一个非空值，离场动画播放期间继续渲染，避免读到 null 崩溃。
+  const editSnapshotRef = useRef<UserGroup | undefined>(undefined);
+  if (editingGroup) editSnapshotRef.current = editingGroup;
+  const editGroupForRender = editingGroup ?? editSnapshotRef.current;
+
+  const deleteSnapshotRef = useRef<UserGroup | null>(null);
+  if (deleteConfirm) deleteSnapshotRef.current = deleteConfirm;
+  const deleteGroupForRender = deleteConfirm ?? deleteSnapshotRef.current;
 
   const handleEdit = (group: UserGroup) => {
     setEditingGroup(group);
@@ -828,30 +848,32 @@ export default function UserGroupsPanel() {
         </div>
       )}
 
-      {showModal && editingGroup && (
+      {editModal.mounted && editGroupForRender && (
         <GroupModal
-          group={editingGroup}
+          group={editGroupForRender}
           onClose={() => setShowModal(false)}
           onSave={handleSave}
           saving={saving}
           providers={providers}
+          leaving={editModal.leaving}
         />
       )}
 
-      {showCreateModal && (
+      {createModal.mounted && (
         <CreateGroupModal
           onClose={() => setShowCreateModal(false)}
           onCreate={handleCreate}
           saving={saving}
           providers={providers}
+          leaving={createModal.leaving}
         />
       )}
 
-      {deleteConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm animate-backdrop-enter">
-          <div className="bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-sm mx-4 p-6">
+      {deleteModal.mounted && deleteGroupForRender && (
+        <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm ${deleteModal.leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}>
+          <div className={`bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-sm mx-4 p-6 ${deleteModal.leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
             <p className="text-sm text-charcoal-700 mb-4">
-              {t('admin.deleteGroupConfirm', { name: deleteConfirm.name })}
+              {t('admin.deleteGroupConfirm', { name: deleteGroupForRender.name })}
             </p>
             <div className="flex items-center justify-end gap-3">
               <button
@@ -861,7 +883,7 @@ export default function UserGroupsPanel() {
                 {t('common.cancel')}
               </button>
               <button
-                onClick={() => handleDelete(deleteConfirm)}
+                onClick={() => handleDelete(deleteGroupForRender)}
                 disabled={saving}
                 className="px-4 py-2 text-sm text-white bg-red-500 rounded-lg hover:bg-red-600
                            transition-colors shadow-sm disabled:opacity-50"

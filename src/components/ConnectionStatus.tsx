@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useTranscriptStore } from '@/stores/transcriptStore';
 import type { ConnectionState } from '@/types/transcript';
 import { Activity, Wifi, WifiOff, Loader2 } from 'lucide-react';
@@ -51,6 +52,7 @@ export default function ConnectionStatus() {
   const connectionMeta = useTranscriptStore((s) => s.connectionMeta);
 
   const [showTooltip, setShowTooltip] = useState(false);
+  const { mounted, leaving } = useExitAnimation(showTooltip, 150);
   const [pingResults, setPingResults] = useState<ClientPingResult[] | null>(null);
   const [pinging, setPinging] = useState(false);
   const tooltipRef = useRef<HTMLDivElement>(null);
@@ -142,12 +144,12 @@ export default function ConnectionStatus() {
       </div>
 
       {/* Rich hover tooltip */}
-      {showTooltip && (
+      {mounted && (
         <div
           ref={tooltipRef}
-          className="absolute top-full mt-2 right-0 w-72 z-50
+          className={`absolute top-full mt-2 right-0 w-72 z-50
                      bg-white border border-cream-200 rounded-xl shadow-2xl
-                     overflow-hidden animate-fade-in-scale"
+                     overflow-hidden ${leaving ? 'animate-fade-out-scale' : 'animate-fade-in-scale'}`}
         >
           {/* Header */}
           <div className={`px-4 py-3 ${

@@ -142,30 +142,31 @@ export async function PUT(req: Request) {
       return NextResponse.json({ error: '请提供区域配置' }, { status: 400 });
     }
 
-    // 逐区域更新
+    // U66：先对全部区域的 URL 做预校验（任一非法立即 400，此时尚未写入任何数据），
+    // 再把所有 upsert/delete + soniox_configured 更新放进单事务原子提交，只有提交成功后
+    // 才失效缓存。否则「先写 apiKey → URL 非法早退」会留下已存的密钥，却跳过配置标记
+    // 和缓存失效，导致 GET 仍报 configured:false、实时转录继续用陈旧密钥最长 60s。
+    type Op =
+      | { kind: 'upsert'; key: string; value: string }
+      | { kind: 'delete'; key: string };
+    const ops: Op[] = [];
+
     for (const [region, config] of Object.entries(regions)) {
       if (!VALID_REGIONS.includes(region as typeof VALID_REGIONS[number])) continue;
       if (!config) continue;
 
       const upper = region.toUpperCase();
 
-      // 更新 API Key（仅当提供了非空值时才更新，空字符串表示删除）
+      // API Key：非空则加密写入，空字符串 = 删除
       if (config.apiKey !== undefined) {
         if (config.apiKey) {
-          await prisma.siteSetting.upsert({
-            where: { key: `soniox_${upper}_api_key` },
-            update: { value: encrypt(config.apiKey) },
-            create: { key: `soniox_${upper}_api_key`, value: encrypt(config.apiKey) },
-          });
+          ops.push({ kind: 'upsert', key: `soniox_${upper}_api_key`, value: encrypt(config.apiKey) });
         } else {
-          // 空字符串 = 删除
-          await prisma.siteSetting.deleteMany({
-            where: { key: `soniox_${upper}_api_key` },
-          });
+          ops.push({ kind: 'delete', key: `soniox_${upper}_api_key` });
         }
       }
 
-      // 更新自定义 URL（写入前做格式校验 + 私网过滤，防 SSRF）
+      // 自定义 URL（写入前做格式校验 + 私网过滤，防 SSRF）
       if (config.wsUrl !== undefined) {
         if (config.wsUrl) {
           let safeWsUrl: string;
@@ -177,15 +178,9 @@ export async function PUT(req: Request) {
               { status: 400 }
             );
           }
-          await prisma.siteSetting.upsert({
-            where: { key: `soniox_${upper}_ws_url` },
-            update: { value: safeWsUrl },
-            create: { key: `soniox_${upper}_ws_url`, value: safeWsUrl },
-          });
+          ops.push({ kind: 'upsert', key: `soniox_${upper}_ws_url`, value: safeWsUrl });
         } else {
-          await prisma.siteSetting.deleteMany({
-            where: { key: `soniox_${upper}_ws_url` },
-          });
+          ops.push({ kind: 'delete', key: `soniox_${upper}_ws_url` });
         }
       }
 
@@ -200,42 +195,51 @@ export async function PUT(req: Request) {
               { status: 400 }
             );
           }
-          await prisma.siteSetting.upsert({
-            where: { key: `soniox_${upper}_rest_url` },
-            update: { value: safeRestUrl },
-            create: { key: `soniox_${upper}_rest_url`, value: safeRestUrl },
-          });
+          ops.push({ kind: 'upsert', key: `soniox_${upper}_rest_url`, value: safeRestUrl });
         } else {
-          await prisma.siteSetting.deleteMany({
-            where: { key: `soniox_${upper}_rest_url` },
-          });
+          ops.push({ kind: 'delete', key: `soniox_${upper}_rest_url` });
         }
       }
     }
 
-    // 更新默认区域
+    // 默认区域
     if (defaultRegion && VALID_REGIONS.includes(defaultRegion as typeof VALID_REGIONS[number])) {
-      await prisma.siteSetting.upsert({
-        where: { key: 'soniox_default_region' },
-        update: { value: defaultRegion },
-        create: { key: 'soniox_default_region', value: defaultRegion },
-      });
+      ops.push({ kind: 'upsert', key: 'soniox_default_region', value: defaultRegion });
     }
 
-    // 检查是否有任何区域配置了 API Key
-    const hasAnyKey = await prisma.siteSetting.findFirst({
-      where: {
-        key: { in: VALID_REGIONS.map(r => `soniox_${r.toUpperCase()}_api_key`) },
-      },
+    // 计算提交后是否仍存在任何 API Key（含本次未触及的区域），据此定 soniox_configured。
+    const apiKeyKeys = VALID_REGIONS.map((r) => `soniox_${r.toUpperCase()}_api_key`);
+    const existingApiKeyRows = await prisma.siteSetting.findMany({
+      where: { key: { in: apiKeyKeys } },
+      select: { key: true },
     });
+    const remainingKeys = new Set(existingApiKeyRows.map((row) => row.key));
+    for (const op of ops) {
+      if (!apiKeyKeys.includes(op.key)) continue;
+      if (op.kind === 'upsert') remainingKeys.add(op.key);
+      else remainingKeys.delete(op.key);
+    }
+    const configuredValue = remainingKeys.size > 0 ? 'true' : 'false';
 
-    // 更新配置标记
-    await prisma.siteSetting.upsert({
-      where: { key: 'soniox_configured' },
-      update: { value: hasAnyKey ? 'true' : 'false' },
-      create: { key: 'soniox_configured', value: hasAnyKey ? 'true' : 'false' },
-    });
+    // 原子提交：全部区域写入 + 配置标记同进一个事务
+    await prisma.$transaction([
+      ...ops.map((op) =>
+        op.kind === 'upsert'
+          ? prisma.siteSetting.upsert({
+              where: { key: op.key },
+              update: { value: op.value },
+              create: { key: op.key, value: op.value },
+            })
+          : prisma.siteSetting.deleteMany({ where: { key: op.key } })
+      ),
+      prisma.siteSetting.upsert({
+        where: { key: 'soniox_configured' },
+        update: { value: configuredValue },
+        create: { key: 'soniox_configured', value: configuredValue },
+      }),
+    ]);
 
+    // 只有提交成功后才失效缓存
     invalidateSiteSettingsCache();
     invalidateSonioxDbConfigCache();
 

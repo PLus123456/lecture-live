@@ -189,11 +189,6 @@ export async function PUT(req: Request) {
     // 记录切换前的存储模式，用于检测是否需要迁移
     const previousSettings = await getSiteSettings({ fresh: true });
 
-    logAction(req, 'admin.settings.update', {
-      user: admin,
-      detail: `更新设置项: ${entries.map(([k]) => k).join(', ')}`,
-    });
-
     const normalizedEntries = entries.flatMap(([key, value]) => {
       const normalizedValue =
         typeof value === 'boolean' ? String(value) : String(value ?? '');
@@ -231,6 +226,13 @@ export async function PUT(req: Request) {
     invalidateTrustedProxyCache();
     invalidateCloudreveConfigCache();
     const settings = await getSiteSettings({ fresh: true });
+
+    // U86：审计日志移到事务提交之后。此前在事务前 fire-and-forget 记录，事务失败会留下
+    // 幽灵「已更新」审计行，重试成功后又写第二行，事后追溯配置变更时间会错位。
+    logAction(req, 'admin.settings.update', {
+      user: admin,
+      detail: `更新设置项: ${entries.map(([k]) => k).join(', ')}`,
+    });
 
     // Chat 字节配额联动：admin 改了某角色的 chat_files_quota_*_mb 后，把对应角色所有用户的
     // storageBytesLimit 回填到新值。这是让该设置真正生效的唯一写入点 —— 此前这三个值只存进

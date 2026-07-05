@@ -57,6 +57,58 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
 }
 
 /**
+ * U46：从 SiteSetting.group_config_<role> 解析某系统角色的配额（转录分钟/存储小时/模型），
+ * 缺失或字段非法时逐项回落 getDefaultQuotasForRole 的硬编码默认值。
+ *
+ * 背景：admin 在用户组面板改系统组配额时（PUT /api/admin/groups），只对现有用户做一次性
+ * updateMany，并把配置写进 group_config_<role>。但注册/到期降级/删组恢复/建用户等所有
+ * 后续配额赋值路径此前都直接调 getDefaultQuotasForRole 读硬编码默认值，导致 admin 配置对
+ * 新用户及任何配额重置形同虚设。此 resolver 让 group_config_<role> 成为真正生效来源，
+ * 与已正确读 SiteSetting 的 resolveRoleStorageBytesLimit 对齐。
+ *
+ * 只覆盖系统角色（FREE/PRO/ADMIN）。自定义组配额另经 custom_groups 存储，不走此路径。
+ */
+export async function resolveRoleQuotas(role: UserRole): Promise<GroupPermissions> {
+  const defaults = getDefaultQuotasForRole(role);
+  const row = await prisma.siteSetting.findUnique({
+    where: { key: `group_config_${role}` },
+  });
+  if (!row) {
+    return defaults;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.value);
+  } catch {
+    return defaults;
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return defaults;
+  }
+  const cfg = parsed as Record<string, unknown>;
+
+  // 逐项校验：仅当为有限非负数值/合法字符串时才覆盖，否则回落默认（防御性，避免脏配置污染配额）
+  const transcriptionMinutesLimit =
+    typeof cfg.transcriptionMinutesLimit === 'number' &&
+    Number.isFinite(cfg.transcriptionMinutesLimit) &&
+    cfg.transcriptionMinutesLimit >= 0
+      ? Math.floor(cfg.transcriptionMinutesLimit)
+      : defaults.transcriptionMinutesLimit;
+  const storageHoursLimit =
+    typeof cfg.storageHoursLimit === 'number' &&
+    Number.isFinite(cfg.storageHoursLimit) &&
+    cfg.storageHoursLimit >= 0
+      ? cfg.storageHoursLimit
+      : defaults.storageHoursLimit;
+  const allowedModels =
+    typeof cfg.allowedModels === 'string' && cfg.allowedModels.trim()
+      ? cfg.allowedModels.trim()
+      : defaults.allowedModels;
+
+  return { transcriptionMinutesLimit, storageHoursLimit, allowedModels };
+}
+
+/**
  * 从 SiteSetting 读取某角色的 chat 字节配额上限（字节，BigInt）。
  *
  * 这是把 admin 在「Chat 文件」面板配的 chat_files_quota_{free,pro,admin}_mb 真正

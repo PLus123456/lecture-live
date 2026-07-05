@@ -5,8 +5,8 @@ import { prisma } from '@/lib/prisma';
 import { JWT_SECRET } from '@/lib/serverSecrets';
 import { getRedisClient } from '@/lib/redis';
 import {
-  getDefaultQuotasForRole,
   normalizeUserRole,
+  resolveRoleQuotas,
   resolveRoleStorageBytesLimit,
 } from '@/lib/userRoles';
 import { getNextQuotaResetAt } from '@/lib/billing';
@@ -389,8 +389,12 @@ export async function registerWithOptions(
 ) {
   const role = normalizeUserRole(options?.role, 'FREE');
   const passwordHash = await bcrypt.hash(password, options?.bcryptRounds ?? 12);
-  // 字节配额上限按角色从 SiteSetting 解析（覆盖 schema 默认 100MB），让 admin 配置真正生效
-  const storageBytesLimit = await resolveRoleStorageBytesLimit(role);
+  // U46：转录/存储/模型配额按角色从 SiteSetting.group_config_<role> 解析（缺失回落硬编码默认），
+  // 字节上限同样从 SiteSetting 解析（覆盖 schema 默认 100MB），让 admin 的用户组配置对新用户真正生效。
+  const [quotas, storageBytesLimit] = await Promise.all([
+    resolveRoleQuotas(role),
+    resolveRoleStorageBytesLimit(role),
+  ]);
   const user = await prisma.user.create({
     data: {
       email,
@@ -398,7 +402,7 @@ export async function registerWithOptions(
       displayName,
       role,
       quotaResetAt: getNextQuotaResetAt(),
-      ...getDefaultQuotasForRole(role),
+      ...quotas,
       storageBytesLimit,
     },
   });

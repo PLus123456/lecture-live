@@ -9,6 +9,7 @@ import {
 } from '@/lib/transcriptPreview';
 import { useInterpret, type InterpretLine } from '@/hooks/useInterpret';
 import { useI18n } from '@/lib/i18n';
+import { useAuth } from '@/hooks/useAuth';
 import { useAuthStore } from '@/stores/authStore';
 import type {
   StreamingPreviewText,
@@ -153,6 +154,7 @@ function LangPanel({
 export default function InterpretPage() {
   const { t } = useI18n();
   const quotas = useAuthStore((s) => s.quotas);
+  const { token, fetchQuotas } = useAuth();
   const {
     isRunning,
     connectionState,
@@ -186,6 +188,14 @@ export default function InterpretPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // U82：直达 /interpret（新浏览器/清过 localStorage，仅靠 cookie 恢复会话）时
+  // quotas 恒为 null 会让开始键永久禁用，这里在挂载/quotas 缺失时主动拉一次配额。
+  useEffect(() => {
+    if (token && !quotas) {
+      void fetchQuotas();
+    }
+  }, [token, quotas, fetchQuotas]);
+
   const canStart =
     !isRunning &&
     langA !== langB &&
@@ -200,8 +210,9 @@ export default function InterpretPage() {
 
   const handleStart = useCallback(async () => {
     if (!canStart) return;
-    await start(langA, langB);
-  }, [canStart, langA, langB, start]);
+    // U25：把用户在选择器里选中的麦克风传给录音，避免录成默认设备/系统音频
+    await start(langA, langB, selectedMic || undefined);
+  }, [canStart, langA, langB, selectedMic, start]);
 
   const handleStop = useCallback(async () => {
     await stop();
@@ -261,6 +272,13 @@ export default function InterpretPage() {
   if (!isRunning && !hasContent) {
     return (
       <div className="flex flex-col h-screen bg-white">
+        {/* 配额加载中：避免 quotas 为 null 时开始键无声禁用 */}
+        {quotas === null && (
+          <div className="px-4 py-2 bg-cream-50 border-b border-cream-100 text-charcoal-400 text-sm">
+            {t('interpret.loadingQuota')}
+          </div>
+        )}
+
         {/* 配额不足警告 */}
         {quotas &&
           quotas.transcriptionMinutesUsed >= quotas.transcriptionMinutesLimit && (

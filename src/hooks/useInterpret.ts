@@ -192,6 +192,10 @@ export function useInterpret() {
           setPreviewTranslation(preview);
         },
       });
+      // 双向同传：告知 TokenProcessor 语言对，使每段目标语言按方向解析
+      // （A→B 目标 langB、B→A 目标 langA）。否则 targetLang 恒为 ''，
+      // 「翻译中…」等待指示器永远是死分支。
+      processor.setLanguagePair(langA, langB);
       processorRef.current = processor;
 
       // 建立服务端时长锚点（反作弊：deduct 以服务端墙钟为计费权威）。

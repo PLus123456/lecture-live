@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
-import { checkQuota } from '@/lib/quota';
+import { reserveStorageBytes, releaseStorageBytes } from '@/lib/quota';
 import { prisma } from '@/lib/prisma';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { CloudreveStorage } from '@/lib/storage/cloudreve';
@@ -30,13 +30,10 @@ export async function POST(req: Request) {
     return rateLimited;
   }
 
-  const quotaOk = await checkQuota(user.id, 'storage_hours');
-  if (!quotaOk) {
-    return NextResponse.json(
-      { error: 'Storage quota exceeded' },
-      { status: 403 }
-    );
-  }
+  // 注意：此前用 checkQuota('storage_hours') 作为唯一配额闸门，但 storage_hours =
+  // SUM(Session.durationMs)，上传永远不会增加它 —— 相当于对本端点完全不计量，任意
+  // 用户可无限写入共享 Cloudreve。真正的字节额度在下方拿到 file.size 后用
+  // reserveStorageBytes 原子预留（镜像 chat-uploads），失败再 releaseStorageBytes 回滚。
 
   try {
     // 从数据库读取管理员配置的最大文件大小（MB），转换为字节
@@ -104,9 +101,26 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Access denied' }, { status: 403 });
     }
 
-    const storage = await CloudreveStorage.create();
-    const data = Buffer.from(await file.arrayBuffer());
-    const remotePath = await storage.upload(user.id, category, fileName, data);
+    // 配额：原子预留 file.size 字节（条件扣减，杜绝并发击穿）。预留成功后若上传
+    // 失败必须 releaseStorageBytes 回滚，避免配额泄漏。ADMIN 视为无限。
+    const reserved = await reserveStorageBytes(user.id, file.size);
+    if (!reserved) {
+      return NextResponse.json(
+        { error: 'Storage quota exceeded' },
+        { status: 403 }
+      );
+    }
+
+    let remotePath: string;
+    try {
+      const storage = await CloudreveStorage.create();
+      const data = Buffer.from(await file.arrayBuffer());
+      remotePath = await storage.upload(user.id, category, fileName, data);
+    } catch (uploadErr) {
+      // 上传未成功，回滚预留的字节额度（否则额度泄漏）。
+      await releaseStorageBytes(user.id, file.size).catch(() => undefined);
+      throw uploadErr;
+    }
 
     return NextResponse.json({ path: remotePath });
   } catch (error) {

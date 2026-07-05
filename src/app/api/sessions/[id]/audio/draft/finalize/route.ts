@@ -12,6 +12,7 @@ import {
   normalizeRecordedAudioDuration,
   resolveExpectedRecordingDurationMs,
 } from '@/lib/audio/recordingDuration';
+import { clampSessionDurationMs } from '@/lib/billing';
 
 export async function POST(
   req: Request,
@@ -36,6 +37,14 @@ export async function POST(
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
+  // G3：终态会话不得再被草稿定稿覆写录音。
+  if (session.status === 'COMPLETED' || session.status === 'ARCHIVED') {
+    return NextResponse.json(
+      { error: 'Cannot overwrite recording of a finalized session' },
+      { status: 409 }
+    );
+  }
+
   try {
     const merged = await mergeRecordingDraftChunks(session);
     if (!merged) {
@@ -45,25 +54,42 @@ export async function POST(
       );
     }
 
-    const durationMs = await resolveExpectedRecordingDurationMs(session);
+    // G2：按角色上界 clamp durationMs 后再落库（同 /audio 路由），防伪造 transcript
+    // globalEndMs 撑高 SUM(durationMs) 存储小时用量。
+    const durationMs = clampSessionDurationMs(
+      await resolveExpectedRecordingDurationMs(session),
+      user.role
+    );
     const normalizedBuffer = await normalizeRecordedAudioDuration({
       buffer: merged.buffer,
       mimeType: merged.manifest.mimeType,
       durationMs,
     });
 
+    // G5/G6：persistSessionAudioArtifact 传入 session（含旧 recordingPath），换容器格式
+    // 定稿时会 best-effort 删旧物理文件，避免孤儿。
     const stored = await persistSessionAudioArtifact(
       session,
       normalizedBuffer,
       merged.manifest.mimeType
     );
-    await prisma.session.update({
-      where: { id: id },
+    // G3：原子条件更新，仅在会话仍非终态时写入。
+    const persisted = await prisma.session.updateMany({
+      where: {
+        id: id,
+        status: { notIn: ['COMPLETED', 'ARCHIVED'] },
+      },
       data: {
         recordingPath: stored.path,
         ...(durationMs > 0 ? { durationMs } : {}),
       },
     });
+    if (persisted.count === 0) {
+      return NextResponse.json(
+        { error: 'Cannot overwrite recording of a finalized session' },
+        { status: 409 }
+      );
+    }
     await invalidateSessionsApiCache(user.id);
     await deleteRecordingDraft(session);
 

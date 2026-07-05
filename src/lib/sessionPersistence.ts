@@ -5,6 +5,12 @@ import {
   CloudreveStorage,
   type SessionArtifactCategory,
 } from '@/lib/storage/cloudreve';
+import {
+  loadCloudreveContext,
+  deleteCloudreveFile,
+  type CloudreveDeleteContext,
+} from '@/lib/storage/cloudreveFileDelete';
+import { logger, serializeError } from '@/lib/logger';
 
 const DATA_ROOT = path.join(process.cwd(), 'data');
 const LOCAL_DIRS: Record<SessionArtifactCategory, string> = {
@@ -82,6 +88,21 @@ function sanitizeAudioMimeType(mimeType?: string | null): string {
     return 'audio/mp4';
   }
 
+  // C15: 保留 mp3/wav/ogg 真实容器类型，避免把异步上传转码产物(audio/mpeg)与
+  // wav/ogg 直传一律塌成 audio/webm 导致导出/下载文件名后缀与真实字节不符、被
+  // 严格外部播放器拒收。in-app 回放靠 blob 内容嗅探不受影响，但存储/HTTP 头需正确。
+  if (normalized.includes('mpeg') || normalized.includes('mp3')) {
+    return 'audio/mpeg';
+  }
+
+  if (normalized.includes('wav') || normalized.includes('wave')) {
+    return 'audio/wav';
+  }
+
+  if (normalized.includes('ogg')) {
+    return 'audio/ogg';
+  }
+
   if (normalized.includes('webm')) {
     return 'audio/webm';
   }
@@ -89,8 +110,16 @@ function sanitizeAudioMimeType(mimeType?: string | null): string {
   return 'audio/webm';
 }
 
+const AUDIO_MIME_TO_EXTENSION: Record<string, string> = {
+  'audio/mp4': 'mp4',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'audio/ogg': 'ogg',
+  'audio/webm': 'webm',
+};
+
 function recordingExtensionForMimeType(mimeType?: string | null): string {
-  return sanitizeAudioMimeType(mimeType) === 'audio/mp4' ? 'mp4' : 'webm';
+  return AUDIO_MIME_TO_EXTENSION[sanitizeAudioMimeType(mimeType)] ?? 'webm';
 }
 
 function inferRecordingMimeTypeFromReference(
@@ -104,6 +133,18 @@ function inferRecordingMimeTypeFromReference(
 
   if (normalized.endsWith('.mp4') || normalized.endsWith('.m4a')) {
     return 'audio/mp4';
+  }
+
+  if (normalized.endsWith('.mp3') || normalized.endsWith('.mpeg')) {
+    return 'audio/mpeg';
+  }
+
+  if (normalized.endsWith('.wav')) {
+    return 'audio/wav';
+  }
+
+  if (normalized.endsWith('.ogg') || normalized.endsWith('.oga')) {
+    return 'audio/ogg';
   }
 
   return 'audio/webm';
@@ -162,16 +203,18 @@ async function readArtifactFromReference(
   let cloudreve: CloudreveStorage | null | undefined;
   const defaultCandidates =
     category === 'recordings'
-      ? [
+      ? ([
+          'audio/webm',
+          'audio/mp4',
+          'audio/mpeg',
+          'audio/wav',
+          'audio/ogg',
+        ] as const).map((mimeType) =>
           buildLocalArtifactReference(
             category,
-            artifactFileName(category, session.id, { mimeType: 'audio/webm' })
-          ),
-          buildLocalArtifactReference(
-            category,
-            artifactFileName(category, session.id, { mimeType: 'audio/mp4' })
-          ),
-        ]
+            artifactFileName(category, session.id, { mimeType })
+          )
+        )
       : [buildLocalArtifactReference(category, artifactFileName(category, session.id))];
   const candidates = reference ? [reference, ...defaultCandidates] : defaultCandidates;
 
@@ -221,11 +264,72 @@ function artifactFileName(
   return `${normalizeSessionId(sessionId)}.${STATIC_ARTIFACT_EXTENSIONS[category]}`;
 }
 
+async function inferLocalRecordingMimeType(sessionId: string): Promise<string> {
+  const orderedMimeTypes = [
+    'audio/mp4',
+    'audio/mpeg',
+    'audio/wav',
+    'audio/ogg',
+  ] as const;
+  for (const mimeType of orderedMimeTypes) {
+    const exists = await fileExists(
+      buildLocalArtifactPath(
+        'recordings',
+        artifactFileName('recordings', sessionId, { mimeType })
+      )
+    );
+    if (exists) {
+      return mimeType;
+    }
+  }
+  return 'audio/webm';
+}
+
+const persistenceLogger = logger.child({ component: 'session-persistence' });
+
+/**
+ * best-effort 物理删除一条 artifact 引用（本地文件或 Cloudreve 远程文件）。
+ * reference 形如 `local:{category}/{fileName}`（本地）或 `/{userId}/{category}/{fileName}`
+ * （Cloudreve 远程路径，以 `/` 开头）。任何失败仅 warn、绝不抛。
+ */
+async function deleteArtifactByReference(
+  session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
+  category: SessionArtifactCategory,
+  reference: string | null | undefined,
+  cloudreveCtx?: CloudreveDeleteContext | null
+): Promise<void> {
+  if (!reference) {
+    return;
+  }
+
+  if (reference.startsWith('local:')) {
+    const localPath = parseLocalReference(category, reference, session.id);
+    if (localPath) {
+      await fs.rm(localPath, { force: true }).catch((err) => {
+        persistenceLogger.warn(
+          { localPath, err: serializeError(err) },
+          '删除本地 artifact 失败；残留由清理工具兜底'
+        );
+      });
+    }
+    return;
+  }
+
+  if (reference.startsWith('/')) {
+    const ctx =
+      cloudreveCtx === undefined ? await loadCloudreveContext() : cloudreveCtx;
+    if (!ctx) {
+      return;
+    }
+    await deleteCloudreveFile(reference, ctx);
+  }
+}
+
 async function persistArtifact(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
   category: SessionArtifactCategory,
   data: Buffer | string,
-  options?: { mimeType?: string | null }
+  options?: { mimeType?: string | null; previousReference?: string | null }
 ): Promise<PersistedArtifactResult> {
   const fileName = artifactFileName(category, session.id, options);
 
@@ -234,19 +338,55 @@ async function persistArtifact(
 
   const localReference = buildLocalArtifactReference(category, fileName);
   const storage = await getCloudreveStorageIfConfigured();
-  if (!storage) {
-    return { path: localReference, storage: 'local' };
+  const result: PersistedArtifactResult = storage
+    ? {
+        path: await storage.upload(session.userId, category, fileName, data),
+        storage: 'cloudreve',
+      }
+    : { path: localReference, storage: 'local' };
+
+  // G5/G6：换容器格式重传/草稿定稿会写入不同后缀的新文件；若旧 recordingPath 指向的
+  // 物理文件与新文件不同（本地路径或 Cloudreve 远程路径不一致），best-effort 删旧物理文件，
+  // 避免本地盘 + Cloudreve 永久孤儿。remotePath/localReference 均可稳定比较。
+  const previous = options?.previousReference;
+  if (previous && previous !== result.path && previous !== localReference) {
+    // 同时清掉与新引用不同的旧本地文件（Cloudreve 上传后本地也保留了一份新文件，
+    // 旧本地文件仍需单独删）。
+    await deleteArtifactByReference(session, category, previous);
   }
-  const remotePath = await storage.upload(session.userId, category, fileName, data);
-  return { path: remotePath, storage: 'cloudreve' };
+
+  return result;
 }
 
 export async function persistSessionAudioArtifact(
-  session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
+  session: Pick<SessionArtifactsSource, 'id' | 'userId' | 'recordingPath'>,
   data: Buffer,
   mimeType?: string | null
 ): Promise<PersistedArtifactResult> {
-  return persistArtifact(session, 'recordings', data, { mimeType });
+  return persistArtifact(session, 'recordings', data, {
+    mimeType,
+    previousReference: session.recordingPath,
+  });
+}
+
+/**
+ * U4：best-effort 物理删除一个会话的全部产物（本地 data/ + Cloudreve 远程），
+ * 覆盖录音/转录/摘要/报告。删 session 行前调用（行一删便再无 path→owner 关联）。
+ * 单次加载 Cloudreve 上下文复用。任何失败仅 warn，绝不阻塞 DB 删除。
+ */
+export async function deleteSessionArtifacts(
+  session: SessionArtifactsSource
+): Promise<void> {
+  const ctx = await loadCloudreveContext();
+  const targets: Array<[SessionArtifactCategory, string | null | undefined]> = [
+    ['recordings', session.recordingPath],
+    ['transcripts', session.transcriptPath],
+    ['summaries', session.summaryPath],
+    ['reports', session.reportPath],
+  ];
+  for (const [category, reference] of targets) {
+    await deleteArtifactByReference(session, category, reference, ctx);
+  }
 }
 
 export async function persistSessionTranscriptArtifacts(
@@ -331,14 +471,7 @@ export async function loadSessionAudioArtifact(
 
   const inferredMimeType = session.recordingPath
     ? inferRecordingMimeTypeFromReference(session.recordingPath)
-    : (await fileExists(
-        buildLocalArtifactPath(
-          'recordings',
-          artifactFileName('recordings', session.id, { mimeType: 'audio/mp4' })
-        )
-      ))
-      ? 'audio/mp4'
-      : 'audio/webm';
+    : await inferLocalRecordingMimeType(session.id);
 
   return {
     data: audioBuffer,

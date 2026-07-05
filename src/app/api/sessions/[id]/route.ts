@@ -8,7 +8,6 @@ import {
   invalidateShareLinksApiCache,
 } from '@/lib/apiResponseCache';
 import { jsonWithCache } from '@/lib/httpCache';
-import { releaseStorageBytes } from '@/lib/quota';
 import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { logAction } from '@/lib/auditLog';
 import {
@@ -19,7 +18,10 @@ import {
 import {
   loadSessionAudioArtifact,
   loadSessionTranscriptBundle,
+  deleteSessionArtifacts,
 } from '@/lib/sessionPersistence';
+import { deleteRecordingDraft } from '@/lib/recordingDraftPersistence';
+import { deleteConversationsCascade } from '@/lib/conversationCascade';
 import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
 
 export async function GET(
@@ -98,11 +100,14 @@ export async function PATCH(
 
   // v2.1: validate status transitions — strict one-way lifecycle
   if (nextStatus) {
+    // C4：从 PATCH 状态机移除 FINALIZING→COMPLETED —— COMPLETED 只能经 finalize 端点
+    // 到达，那里才有 deductTranscriptionMinutes 的唯一扣费路径。否则客户端可先存 artifact、
+    // 再 PATCH 把 FINALIZING 直接推到 COMPLETED 而完全不扣转录分钟（白嫖）。
     const VALID_TRANSITIONS: Record<string, string[]> = {
       CREATED:    ['RECORDING'],
       RECORDING:  ['PAUSED', 'FINALIZING'],
       PAUSED:     ['RECORDING', 'FINALIZING'],
-      FINALIZING: ['COMPLETED'],
+      FINALIZING: [],
       COMPLETED:  ['ARCHIVED'],
       ARCHIVED:   [],
     };
@@ -154,14 +159,35 @@ export async function PATCH(
   const durationMs =
     body.durationMs === undefined ? undefined : Number(body.durationMs);
 
-  if (
-    body.durationMs !== undefined &&
-    (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 0)
-  ) {
-    return NextResponse.json(
-      { error: 'Invalid durationMs' },
-      { status: 400 }
-    );
+  if (body.durationMs !== undefined) {
+    if (
+      durationMs === undefined ||
+      !Number.isFinite(durationMs) ||
+      durationMs < 0
+    ) {
+      return NextResponse.json(
+        { error: 'Invalid durationMs' },
+        { status: 400 }
+      );
+    }
+
+    // C2：durationMs 是存储小时配额（SUM(durationMs)/3600000）的唯一依据，且只应由
+    // finalize / audio 保存流写入。终态会话拒绝任何客户端 durationMs（否则用户可对
+    // 已 COMPLETED 会话 PATCH durationMs:0 抹掉已消耗的存储配额、循环白嫖）；非终态也
+    // 只允许不低于当前已记录值（不走 status 时同样挡，防绕过状态机降 duration）。
+    if (session.status === 'COMPLETED' || session.status === 'ARCHIVED') {
+      return NextResponse.json(
+        { error: 'Cannot modify durationMs of a finalized session' },
+        { status: 409 }
+      );
+    }
+
+    if (durationMs < (session.durationMs ?? 0)) {
+      return NextResponse.json(
+        { error: 'durationMs cannot be lowered' },
+        { status: 409 }
+      );
+    }
   }
 
   if (nextStatus === 'COMPLETED') {
@@ -238,16 +264,28 @@ export async function DELETE(
     await cancelAsyncUpload(session).catch(() => undefined);
   }
 
-  // 删 session 会级联删 Conversation(sessionId=id) 及其 ChatAttachment（schema onDelete: Cascade），
-  // 这些字节占用必须释放，否则配额只增不减、用户最终顶满无法再传。
-  // 注意：仅 legacy 单录音对话（Conversation.sessionId = 本 session）会被级联删；全局多录音对话
-  // 经 ConversationSession 联表挂载，删 session 只级联联表行、对话与其附件保留 —— 故这里只聚合并
-  // 释放 legacy 对话的附件字节，按 owner 分组（一般即当前用户）。
-  const releasableBytes = await prisma.chatAttachment.groupBy({
-    by: ['userId'],
-    where: { conversation: { sessionId: id } },
-    _sum: { bytes: true },
+  // U8：先把 legacy 单录音对话（Conversation.sessionId = 本 session）经
+  // deleteConversationsCascade 删干净 —— 它会 best-effort 删 Cloudreve 附件物理文件
+  // （原文件 + 抽取的 .txt）+ 本地内嵌图片 + 释放字节配额 + 删 DB 行。若只靠下面
+  // session.delete 的 onDelete: Cascade 裸删 ChatAttachment 行，Cloudreve 物理文件会成
+  // 永久孤儿（行一删连 cloudrevePath 都拿不到，cron 也无法回收）。
+  // 注：全局多录音对话经 ConversationSession 联表挂载，删 session 只级联联表行、对话与
+  // 附件保留，故这里只处理 sessionId 直挂的 legacy 对话。
+  const legacyConversations = await prisma.conversation.findMany({
+    where: { sessionId: id },
+    select: { id: true },
   });
+  if (legacyConversations.length > 0) {
+    await deleteConversationsCascade(
+      legacyConversations.map((c) => c.id)
+    ).catch(() => undefined);
+  }
+
+  // U4：删行前 best-effort 物理删除会话全部产物（本地 data/ + Cloudreve 录音/转录/
+  // 摘要/报告）+ 录音草稿分片目录。行一删便再无 path→owner 关联，无 cron 可回收，
+  // 故必须在删行前清理。全部 best-effort，失败不阻塞 DB 删除。
+  await deleteSessionArtifacts(session).catch(() => undefined);
+  await deleteRecordingDraft(session).catch(() => undefined);
 
   // 先删除关联表记录（FolderSession / ShareLink），再删除 session
   await prisma.$transaction([
@@ -255,14 +293,6 @@ export async function DELETE(
     prisma.shareLink.deleteMany({ where: { sessionId: id } }),
     prisma.session.delete({ where: { id: id } }),
   ]);
-
-  // session 删除成功后释放字节配额（best-effort；失败留给字节对账兜底）
-  for (const row of releasableBytes) {
-    const bytes = row._sum.bytes;
-    if (bytes && bytes > BigInt(0)) {
-      await releaseStorageBytes(row.userId, Number(bytes)).catch(() => undefined);
-    }
-  }
 
   await Promise.all([
     invalidateSessionsApiCache(user.id),

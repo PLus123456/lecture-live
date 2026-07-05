@@ -148,6 +148,11 @@ export async function finalizeSession(
     }
   }
 
+  // U43：记录本次获取锁的确切时间戳，作为幂等令牌。最终事务只在
+  // finalizeLockedAt 仍等于此值时才提交扣费 —— 若期间被 stale-lock 接管（另一 finalizer
+  // 写入了不同的 finalizeLockedAt）或对方已把状态推到 COMPLETED（锁被置 null），条件不成立、
+  // count===0，本 finalizer 跳过扣费与后台任务，杜绝双重扣费/重复 LLM 任务。
+  const lockTimestamp = new Date();
   const lockAcquired = await prisma.session.updateMany({
     where: {
       id: options.sessionId,
@@ -156,13 +161,13 @@ export async function finalizeSession(
         { finalizeLockedAt: null },
         {
           finalizeLockedAt: {
-            lt: new Date(Date.now() - FINALIZE_LOCK_STALE_MS),
+            lt: new Date(lockTimestamp.getTime() - FINALIZE_LOCK_STALE_MS),
           },
         },
       ],
     },
     data: {
-      finalizeLockedAt: new Date(),
+      finalizeLockedAt: lockTimestamp,
     },
   });
 
@@ -259,6 +264,11 @@ export async function finalizeSession(
 
     let recordingPath = session.recordingPath;
     let recordingMissing = false;
+    // C14：记录本次是否消费了草稿（合并录音/持久化转录成功）；草稿删除延后到最终事务
+    // 提交成功之后，仅成功路径删。否则若事务回滚（如瞬时死锁/超时）而草稿已删，
+    // 无 clientBundle 的重试会用空数据覆写永久转录、孤立录音——不可恢复的数据丢失。
+    let shouldDeleteRecordingDraft = false;
+    let shouldDeleteTranscriptDraft = false;
 
     if (!recordingPath) {
       const merged = await mergeRecordingDraftChunks(session);
@@ -275,7 +285,7 @@ export async function finalizeSession(
           merged.manifest.mimeType
         );
         recordingPath = storedAudio.path;
-        await deleteRecordingDraft(session).catch(() => undefined);
+        shouldDeleteRecordingDraft = true;
       } else {
         recordingMissing = true;
       }
@@ -288,7 +298,7 @@ export async function finalizeSession(
       );
       transcriptPath = stored.transcript.path;
       summaryPath = stored.summary.path;
-      await deleteTranscriptDraft(session).catch(() => undefined);
+      shouldDeleteTranscriptDraft = true;
     }
 
     const normalizedTitle =
@@ -296,9 +306,17 @@ export async function finalizeSession(
         ? options.clientTitle.trim().slice(0, 160)
         : undefined;
     const shouldDeduct = billableMinutes > 0 && session.user.role !== 'ADMIN';
-    const updatedSession = await prisma.$transaction(async (tx) => {
-      const updated = await tx.session.update({
-        where: { id: options.sessionId },
+    const commit = await prisma.$transaction(async (tx) => {
+      // U43：条件原子提交 —— 仅当会话仍处于 FINALIZING 且 finalizeLockedAt 仍等于本次
+      // 获取锁的时间戳时才 update。若 stale-lock 已被另一 finalizer 接管（写入不同
+      // finalizeLockedAt）或对方已把状态推到 COMPLETED（锁置 null），count===0，
+      // 本事务不扣费、返回 lockLost 标记，跳过后台任务，杜绝双重扣费与重复 LLM 任务。
+      const updateResult = await tx.session.updateMany({
+        where: {
+          id: options.sessionId,
+          status: 'FINALIZING',
+          finalizeLockedAt: lockTimestamp,
+        },
         data: {
           status: 'COMPLETED',
           recordingPath,
@@ -311,6 +329,10 @@ export async function finalizeSession(
         },
       });
 
+      if (updateResult.count === 0) {
+        return { lockLost: true as const };
+      }
+
       if (shouldDeduct) {
         // 走 deductTranscriptionMinutes（内含 ensureQuotaWindow 跨月度重置点窗口校正，
         // 修正裸 increment 把分钟加到未重置旧窗口的隐性 drift）；传入 tx 使"扣减 ⟺
@@ -318,8 +340,43 @@ export async function finalizeSession(
         await deductTranscriptionMinutes(session.userId, billableMinutes, tx);
       }
 
-      return updated;
+      const updated = await tx.session.findUnique({
+        where: { id: options.sessionId },
+      });
+      return { lockLost: false as const, updated };
     });
+
+    // U43：锁在处理期间被接管/会话已被对方 COMPLETED —— 本次不做任何写入/扣费/后台任务，
+    // 按"已完成"返回当前库中真实状态，避免重复收尾。
+    if (commit.lockLost) {
+      const latest = await prisma.session.findUnique({
+        where: { id: options.sessionId },
+        select: {
+          recordingPath: true,
+          transcriptPath: true,
+          summaryPath: true,
+          durationMs: true,
+        },
+      });
+      return {
+        success: true,
+        alreadyCompleted: true,
+        recordingPath: latest?.recordingPath ?? recordingPath,
+        transcriptPath: latest?.transcriptPath ?? transcriptPath,
+        summaryPath: latest?.summaryPath ?? summaryPath,
+        durationMs: latest?.durationMs ?? finalDurationMs,
+      };
+    }
+
+    const updatedSession = commit.updated!;
+
+    // C14：事务已成功提交，永久 artifact 的 path 与 COMPLETED 状态已落库，此时才删草稿。
+    if (shouldDeleteRecordingDraft) {
+      await deleteRecordingDraft(session).catch(() => undefined);
+    }
+    if (shouldDeleteTranscriptDraft) {
+      await deleteTranscriptDraft(session).catch(() => undefined);
+    }
 
     if (transcriptMissing) {
       logSystemEvent(
@@ -387,7 +444,9 @@ export async function finalizeSession(
       recordingMissing,
     };
   } catch (error) {
-    await releaseFinalizeLock(options.sessionId);
+    // U43：仅在仍持本次锁时释放（条件匹配 finalizeLockedAt=lockTimestamp），
+    // 避免误清另一 finalizer 接管后写入的锁。
+    await releaseFinalizeLock(options.sessionId, lockTimestamp);
     if (error instanceof FinalizeSessionError) {
       throw error;
     }
@@ -496,7 +555,17 @@ async function resolveTranscriptBundle(
   return null;
 }
 
-async function releaseFinalizeLock(sessionId: string) {
+async function releaseFinalizeLock(sessionId: string, lockTimestamp?: Date) {
+  // 若提供 lockTimestamp，仅在仍持本次锁时释放（条件 updateMany），避免误清被接管后的锁。
+  if (lockTimestamp) {
+    await prisma.session
+      .updateMany({
+        where: { id: sessionId, finalizeLockedAt: lockTimestamp },
+        data: { finalizeLockedAt: null },
+      })
+      .catch(() => undefined);
+    return;
+  }
   await prisma.session.update({
     where: { id: sessionId },
     data: {

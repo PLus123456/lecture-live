@@ -634,6 +634,14 @@ export default function ChatTab({
   } = useChat(sessionId);
   const { extractFromText, addManualKeyword } = useKeywords();
 
+  // U55：当前活跃对话是否已关闭（endedAt 非空）。已关闭对话服务端会 409 拒绝发送，
+  // 前端据此把输入框置只读，避免"本地回显 → 服务端 409 → 切换对话后本地消息消失"。
+  // U10：无活跃对话（初始化失败）或上下文已满时同样不可发送。
+  const activeConv = conversations.find((c) => c.id === activeConversationId);
+  const isActiveConvEnded = Boolean(activeConv?.endedAt);
+  // 输入框/发送不可用的综合条件（不含 isLoading——发送中另行处理）
+  const composerBlocked = isActiveConvEnded || !activeConversationId || contextFull;
+
   const [input, setInput] = useState('');
   /** IME 合成中（中文/日文输入法）—— 合成期间回车不应发送 */
   const [composing, setComposing] = useState(false);
@@ -719,6 +727,23 @@ export default function ChatTab({
     const hasImages = pendingImages.length > 0;
     // 允许"仅图片"发送：有文字或有图片即可
     if ((!value && !hasImages) || isLoading) return;
+
+    // U10 / U55：对话不可发送（已关闭 / 无活跃对话 / 上下文已满）时，在清空输入框之前
+    // 提前返回并给出反馈。此前会先 setInput('') 再进 sendMessage，而 sendMessage 在这些
+    // 状态下静默 return（不 addMessage），导致用户键入的文字凭空消失、无任何提示。
+    if (composerBlocked) {
+      addMessage({
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: isActiveConvEnded
+          ? '此对话已关闭（只读），请新建对话继续。'
+          : contextFull
+            ? '上下文已满，请新建对话继续。'
+            : '对话尚未就绪，请稍候重试。',
+        timestamp: Date.now(),
+      });
+      return;
+    }
 
     setInput('');
     if (composerRef.current) composerRef.current.style.height = 'auto';
@@ -1098,6 +1123,19 @@ export default function ChatTab({
 
       {/* Input area —— padding 收紧，与顶部 tab bar 视觉对称 */}
       <div className={`border-t border-cream-200 px-3 pt-1.5 pb-0 ${inputSticky ? 'sticky bottom-0 bg-white safe-bottom' : ''}`.trim()}>
+        {/* U55：已关闭对话只读横幅（contextFull 时优先显示下方红条，不重复提示） */}
+        {isActiveConvEnded && !contextFull && (
+          <div className="mb-2 px-2.5 py-1.5 rounded-md bg-charcoal-50 border border-charcoal-200 text-[11px] text-charcoal-600 flex items-center justify-between">
+            <span>此对话已关闭（只读）。</span>
+            <button
+              type="button"
+              onClick={() => createNewConversation()}
+              className="ml-2 px-2 py-0.5 rounded bg-rust-500 text-white hover:bg-rust-600 transition-colors flex-shrink-0"
+            >
+              新建对话
+            </button>
+          </div>
+        )}
         {contextFull && (
           <div className="mb-2 px-2.5 py-1.5 rounded-md bg-red-50 border border-red-200 text-[11px] text-red-700 flex items-center justify-between">
             <span>上下文已满，所有降级策略均无法塞下。</span>
@@ -1163,7 +1201,7 @@ export default function ChatTab({
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={isLoading || !supportsImage}
+            disabled={isLoading || !supportsImage || composerBlocked}
             title={
               supportsImage
                 ? '上传图片'
@@ -1200,16 +1238,25 @@ export default function ChatTab({
             onCompositionStart={() => setComposing(true)}
             onCompositionEnd={() => setComposing(false)}
             onPaste={handlePaste}
-            placeholder="Ask about the lecture..."
+            placeholder={
+              isActiveConvEnded
+                ? '此对话已关闭（只读）'
+                : 'Ask about the lecture...'
+            }
             className="flex-1 px-3 py-2 rounded-lg border border-cream-300 text-xs resize-none
                        max-h-32 overflow-y-auto
                        focus:outline-none focus:ring-1 focus:ring-rust-400 focus:border-rust-400
-                       bg-white text-charcoal-700 placeholder:text-charcoal-300"
-            disabled={isLoading}
+                       bg-white text-charcoal-700 placeholder:text-charcoal-300
+                       disabled:bg-cream-50 disabled:cursor-not-allowed"
+            disabled={isLoading || composerBlocked}
           />
           <button
             onClick={handleSend}
-            disabled={isLoading || (!input.trim() && pendingImages.length === 0)}
+            disabled={
+              isLoading ||
+              composerBlocked ||
+              (!input.trim() && pendingImages.length === 0)
+            }
             className="p-2 rounded-lg bg-rust-500 text-white hover:bg-rust-600
                        disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
           >

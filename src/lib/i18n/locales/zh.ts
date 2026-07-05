@@ -1251,6 +1251,8 @@ export default {
     archive: '归档',
     unarchive: '取消归档',
     archivedSection: '已归档',
+    showCollapsed: '展开 {count} 条已折叠消息',
+    hideCollapsed: '收起 {count} 条已折叠消息',
     clearAll: '清空全部',
     confirmClearAllTitle: '清空全部对话？',
     confirmClearAllMessage: '将永久删除你的全部对话及其消息和附件文件，无法恢复。',

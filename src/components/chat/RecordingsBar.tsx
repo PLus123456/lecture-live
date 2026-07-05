@@ -2,32 +2,21 @@
 
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { Mic, X, Plus, Clock } from 'lucide-react';
+import { Mic, X, Plus } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 
 /**
  * 顶栏录音 pill 数据结构 —— 后端 `/api/conversations/[id]/recordings`
- * 实际响应在 U9 上线后可能更丰富，这里保持最小子集 + 可选字段。
+ * 当前仅返回 { sessionId, title, addedAt }。
+ *
+ * U56：曾有 durationMs / transcriptPreview 两个可选字段，但后端 listRecordings 从不返回、
+ * 客户端也不回填，pill 时长恒显示「--」、popover 正文恒显示「...」，是死 UI。
+ * 后端拓宽响应属另一批（recordings route 不在本批文件范围），这里先移除这两块死字段/死 UI，
+ * 待后端补齐字段时再一并恢复。
  */
 export interface RecordingPill {
   sessionId: string;
   title: string;
-  /** 时长毫秒；可空（未完成的录音可能没有 durationMs） */
-  durationMs?: number;
-  /** Transcript 预览，最多展示前 200 字 */
-  transcriptPreview?: string;
-}
-
-function formatDuration(ms: number | undefined): string {
-  if (!ms || !Number.isFinite(ms) || ms < 0) return '--';
-  const totalMin = Math.floor(ms / 60_000);
-  if (totalMin < 1) return '<1 min';
-  if (totalMin >= 60) {
-    const h = Math.floor(totalMin / 60);
-    const m = totalMin % 60;
-    return m > 0 ? `${h}h ${m}m` : `${h}h`;
-  }
-  return `${totalMin} min`;
 }
 
 /**
@@ -107,10 +96,6 @@ export default function RecordingsBar({
                   >
                     <Mic className="w-3 h-3 flex-shrink-0" />
                     <span className="truncate">{r.title}</span>
-                    <span className="text-charcoal-400 flex-shrink-0 inline-flex items-center gap-0.5">
-                      <Clock className="w-2.5 h-2.5" />
-                      {formatDuration(r.durationMs)}
-                    </span>
                   </button>
                   {onDetach && (
                     <button
@@ -129,12 +114,8 @@ export default function RecordingsBar({
                     className="absolute top-full left-0 mt-1 w-72 max-w-[80vw] bg-white border border-cream-300
                                rounded-lg shadow-lg p-3 text-[11px] z-30 animate-fade-in-scale"
                   >
-                    <div className="font-medium text-charcoal-800 mb-1 truncate">
+                    <div className="font-medium text-charcoal-800 mb-2 truncate">
                       {r.title}
-                    </div>
-                    <div className="text-charcoal-500 mb-2 line-clamp-4">
-                      {r.transcriptPreview?.slice(0, 200) ||
-                        '...'}
                     </div>
                     <Link
                       href={`/session/${r.sessionId}/playback`}

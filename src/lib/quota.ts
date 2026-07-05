@@ -289,9 +289,23 @@ export async function resetExpiredTranscriptionQuotas(
  * @param asyncMultiplier 异步上传转录的计费倍率（默认 1）。异步路径按倍率计费
  *   （见 async-transcribe-status 扣费），对账侧必须乘同样倍率，否则会把折扣恒报成 drift。
  *   实时转录始终全额（不乘倍率）。
+ *
+ * U15（口径修正）：排除 ADMIN 用户。扣费侧对 ADMIN 恒短路不扣（deduct/reserve 见 role==='ADMIN'
+ * 分支），故 ADMIN 的 transcriptionMinutesUsed 恒为 0，而本函数会按其 COMPLETED session 重算出
+ * 非 0 的 recordedMinutes → 每次对账都对 ADMIN 永久虚报正向 drift（且"修复"会把 used 写成
+ * recorded，破坏 ADMIN 无限额度语义）。用 WHERE role != ADMIN 从源头排除。
+ *
+ * 已知遗留（interpret 口径，见 PR B10 延后项 U15）：同声传译（/api/interpret/deduct）扣费
+ * 会 increment transcriptionMinutesUsed，但不产生任何 Session 行、也无独立用量台账，本函数
+ * 仅按 Session 重算，故用过同传的用户仍会被报负向 drift。要"计入 interpret 已扣分钟且与扣费侧
+ * 口径逐字一致"需引入持久化的 interpret 用量记录（schema 变更），超出本批范围，暂延后。
  */
 export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
   const users = await prisma.user.findMany({
+    where: {
+      // ADMIN 恒不扣费，重算必永久虚报 drift —— 从对账源头排除
+      role: { not: 'ADMIN' },
+    },
     select: {
       id: true,
       email: true,

@@ -269,7 +269,16 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     }
 
     // ── 7. cleanup local upload dir（chunks + merged + mp3） ──
-    await deleteAsyncUpload(session);
+    // U80：本地清理必须容忍失败。此刻 session 已成功进入 transcribing、Soniox 转录任务
+    // 正在运行（sonioxTranscriptionId 已落库）。若这里裸 await 的 fs 删除抛错，会被外层
+    // catch 当成 pipeline 失败：把健康的会话标 failed、还删掉正在跑的 Soniox 文件。
+    // 用 .catch 吞掉（与本函数其它清理点一致）——残留临时文件留给 cron 兜底。
+    await deleteAsyncUpload(session).catch((cleanupErr) => {
+      logger.warn(
+        { sessionId: session.id, err: cleanupErr },
+        'async upload local cleanup failed after transcribing started (non-fatal)'
+      );
+    });
   } catch (error) {
     // 取消导致的提前退出：状态由 cancelAsyncUpload 维护，这里不覆盖
     if (error instanceof PipelineHaltError) {

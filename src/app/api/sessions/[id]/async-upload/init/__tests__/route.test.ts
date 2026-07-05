@@ -4,7 +4,7 @@ const {
   verifyAuthMock,
   enforceRateLimitMock,
   sessionFindUniqueMock,
-  sessionUpdateMock,
+  sessionUpdateManyMock,
   reserveTranscriptionMinutesMock,
   releaseTranscriptionMinutesMock,
   initAsyncUploadMock,
@@ -12,7 +12,7 @@ const {
   verifyAuthMock: vi.fn(),
   enforceRateLimitMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
-  sessionUpdateMock: vi.fn(),
+  sessionUpdateManyMock: vi.fn(),
   reserveTranscriptionMinutesMock: vi.fn(),
   releaseTranscriptionMinutesMock: vi.fn(),
   initAsyncUploadMock: vi.fn(),
@@ -30,7 +30,8 @@ vi.mock('@/lib/prisma', () => ({
   prisma: {
     session: {
       findUnique: sessionFindUniqueMock,
-      update: sessionUpdateMock,
+      // U42：状态机守卫改用原子 updateMany（仅 null/uploading_chunks/failed/canceled 可 init）
+      updateMany: sessionUpdateManyMock,
     },
   },
 }));
@@ -78,15 +79,20 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
     verifyAuthMock.mockReset();
     enforceRateLimitMock.mockReset();
     sessionFindUniqueMock.mockReset();
-    sessionUpdateMock.mockReset();
+    sessionUpdateManyMock.mockReset();
     reserveTranscriptionMinutesMock.mockReset();
     releaseTranscriptionMinutesMock.mockReset();
     initAsyncUploadMock.mockReset();
 
     verifyAuthMock.mockResolvedValue({ id: 'user-1', role: 'FREE' });
     enforceRateLimitMock.mockResolvedValue(null);
-    sessionFindUniqueMock.mockResolvedValue({ id: 's-1', userId: 'user-1' });
-    sessionUpdateMock.mockResolvedValue({ id: 's-1' });
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 's-1',
+      userId: 'user-1',
+      asyncTranscribeStatus: null,
+    });
+    // 默认：状态机守卫 claim 成功（count=1）
+    sessionUpdateManyMock.mockResolvedValue({ count: 1 });
     reserveTranscriptionMinutesMock.mockResolvedValue(true);
     releaseTranscriptionMinutesMock.mockResolvedValue(undefined);
     initAsyncUploadMock.mockResolvedValue({
@@ -159,6 +165,22 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
     const res = await POST(makeReq(validBody()), { params });
 
     expect(res.status).toBe(500);
+    expect(releaseTranscriptionMinutesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('U42 状态机守卫：会话已在进行中（claim count=0）→ 409，不写 manifest，释放预留', async () => {
+    sessionFindUniqueMock.mockResolvedValueOnce({
+      id: 's-1',
+      userId: 'user-1',
+      asyncTranscribeStatus: 'transcribing',
+    });
+    sessionUpdateManyMock.mockResolvedValueOnce({ count: 0 }); // 抢不到 → 已在跑
+
+    const res = await POST(makeReq(validBody()), { params });
+
+    expect(res.status).toBe(409);
+    expect(initAsyncUploadMock).not.toHaveBeenCalled();
+    // 预留已发生，必须在 finally 释放（避免额度泄漏）
     expect(releaseTranscriptionMinutesMock).toHaveBeenCalledTimes(1);
   });
 

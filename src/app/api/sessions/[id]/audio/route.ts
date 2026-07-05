@@ -17,6 +17,7 @@ import {
   normalizeRecordedAudioDuration,
   resolveExpectedRecordingDurationMs,
 } from '@/lib/audio/recordingDuration';
+import { clampSessionDurationMs } from '@/lib/billing';
 
 // Save audio recording
 export async function POST(
@@ -50,6 +51,15 @@ export async function POST(
     assertOwnership(user.id, session.userId);
   } catch {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
+  }
+
+  // G3：终态会话不得再被覆写录音。已 COMPLETED/ARCHIVED 的会话录音被
+  // playback/export/Soniox 引用，禁止 re-POST 静默替换。
+  if (session.status === 'COMPLETED' || session.status === 'ARCHIVED') {
+    return NextResponse.json(
+      { error: 'Cannot overwrite recording of a finalized session' },
+      { status: 409 }
+    );
   }
 
   try {
@@ -86,7 +96,13 @@ export async function POST(
       );
     }
 
-    const durationMs = await resolveExpectedRecordingDurationMs(session);
+    // G2/G3：durationMs 派生自可被伪造的 transcript globalEndMs（resolveTranscriptDurationMs
+    // 会 Math.max 进来），必须按角色上界 clamp 后再落库，否则 SUM(durationMs)/3600000 存储
+    // 小时用量可被撑到 Int 上界。
+    const durationMs = clampSessionDurationMs(
+      await resolveExpectedRecordingDurationMs(session),
+      user.role
+    );
     const normalizedBuffer = await normalizeRecordedAudioDuration({
       buffer,
       mimeType: normalizedMimeType,
@@ -99,13 +115,25 @@ export async function POST(
       normalizedMimeType
     );
 
-    await prisma.session.update({
-      where: { id: id },
+    // G3：原子条件更新，仅在会话仍处于非终态时写入 recordingPath，杜绝并发下
+    // finalize 已把会话推到 COMPLETED 后本请求再覆写录音。
+    const persisted = await prisma.session.updateMany({
+      where: {
+        id: id,
+        status: { notIn: ['COMPLETED', 'ARCHIVED'] },
+      },
       data: {
         recordingPath: stored.path,
         ...(durationMs > 0 ? { durationMs } : {}),
       },
     });
+
+    if (persisted.count === 0) {
+      return NextResponse.json(
+        { error: 'Cannot overwrite recording of a finalized session' },
+        { status: 409 }
+      );
+    }
     await invalidateSessionsApiCache(user.id);
     await deleteRecordingDraft(session).catch(() => undefined);
 

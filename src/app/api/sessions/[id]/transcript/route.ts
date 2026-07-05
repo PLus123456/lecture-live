@@ -62,6 +62,15 @@ export async function POST(
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
+  // G2：终态会话不得再被覆写转录。已 COMPLETED/ARCHIVED 会话的转录被回放/导出引用，
+  // 且转录里的 globalEndMs 会经 audio 路由派生进 durationMs（存储小时用量），禁止篡改。
+  if (session.status === 'COMPLETED' || session.status === 'ARCHIVED') {
+    return NextResponse.json(
+      { error: 'Cannot overwrite transcript of a finalized session' },
+      { status: 409 }
+    );
+  }
+
   try {
     const body = await req.json();
     let bundle = validatePersistedTranscriptBundle(body);

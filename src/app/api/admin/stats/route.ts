@@ -74,8 +74,13 @@ function buildDailyStats(
   const current = new Date(start);
   current.setHours(0, 0, 0, 0);
 
+  // U72：分桶边界用本地午夜（setHours/setDate），标签也必须用本地日期成分拼接。
+  // 旧写法 toISOString() 取 UTC 日期，在 UTC 东侧（如 UTC+8）部署时标签比实际早一天，
+  // 使前端热图周几/最忙日整体错位。
+  const pad = (n: number) => String(n).padStart(2, '0');
+
   while (current <= end) {
-    const dateStr = current.toISOString().slice(0, 10);
+    const dateStr = `${current.getFullYear()}-${pad(current.getMonth() + 1)}-${pad(current.getDate())}`;
     const nextDay = new Date(current.getTime() + 24 * 60 * 60 * 1000);
 
     days.push({

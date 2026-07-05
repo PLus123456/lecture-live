@@ -7,6 +7,8 @@ const {
   siteSettingUpsertMock,
   siteSettingDeleteManyMock,
   siteSettingFindFirstMock,
+  siteSettingFindManyMock,
+  transactionMock,
   invalidateSiteSettingsCacheMock,
   invalidateSonioxDbConfigCacheMock,
 } = vi.hoisted(() => ({
@@ -14,6 +16,8 @@ const {
   siteSettingUpsertMock: vi.fn(),
   siteSettingDeleteManyMock: vi.fn(),
   siteSettingFindFirstMock: vi.fn(),
+  siteSettingFindManyMock: vi.fn(),
+  transactionMock: vi.fn(),
   invalidateSiteSettingsCacheMock: vi.fn(),
   invalidateSonioxDbConfigCacheMock: vi.fn(),
 }));
@@ -28,8 +32,11 @@ vi.mock('@/lib/prisma', () => ({
       upsert: siteSettingUpsertMock,
       deleteMany: siteSettingDeleteManyMock,
       findFirst: siteSettingFindFirstMock,
-      findMany: vi.fn(),
+      findMany: siteSettingFindManyMock,
     },
+    // U66：写入改走单事务原子提交（数组式 $transaction，元素即 upsert/deleteMany 调用），
+    // 这里直接 resolve 即可——数组构造时各 mock 已被调用，故上层断言仍能看到调用参数。
+    $transaction: transactionMock,
   },
 }));
 
@@ -64,6 +71,8 @@ describe('PUT /api/admin/soniox', () => {
     siteSettingUpsertMock.mockReset();
     siteSettingDeleteManyMock.mockReset();
     siteSettingFindFirstMock.mockReset();
+    siteSettingFindManyMock.mockReset();
+    transactionMock.mockReset();
     invalidateSiteSettingsCacheMock.mockReset();
     invalidateSonioxDbConfigCacheMock.mockReset();
 
@@ -74,6 +83,8 @@ describe('PUT /api/admin/soniox', () => {
     siteSettingUpsertMock.mockResolvedValue({});
     siteSettingDeleteManyMock.mockResolvedValue({ count: 0 });
     siteSettingFindFirstMock.mockResolvedValue(null);
+    siteSettingFindManyMock.mockResolvedValue([]);
+    transactionMock.mockResolvedValue([]);
     delete process.env.CLOUDREVE_ALLOW_PRIVATE_HOST;
   });
 

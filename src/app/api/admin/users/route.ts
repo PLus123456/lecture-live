@@ -6,8 +6,8 @@ import { validatePassword } from '@/lib/auth';
 import { logAction } from '@/lib/auditLog';
 import { getSiteSettings } from '@/lib/siteSettings';
 import {
-  getDefaultQuotasForRole,
   normalizeUserRole,
+  resolveRoleQuotas,
   resolveRoleStorageBytesLimit,
 } from '@/lib/userRoles';
 import { releaseStorageBytes } from '@/lib/quota';
@@ -126,9 +126,12 @@ export async function POST(req: Request) {
 
     const passwordHash = await bcrypt.hash(password, siteSettings.bcrypt_rounds);
 
-    // 根据角色设置默认配额（字节上限从 SiteSetting 按角色解析，覆盖 schema 默认 100MB）
-    const quotas = getDefaultQuotasForRole(normalizedRole);
-    const storageBytesLimit = await resolveRoleStorageBytesLimit(normalizedRole);
+    // 根据角色设置默认配额。U46：转录/存储/模型配额从 SiteSetting.group_config_<role>
+    // 解析（缺失回落硬编码默认），字节上限同样从 SiteSetting 解析，让 admin 用户组配置真正生效。
+    const [quotas, storageBytesLimit] = await Promise.all([
+      resolveRoleQuotas(normalizedRole),
+      resolveRoleStorageBytesLimit(normalizedRole),
+    ]);
 
     const user = await prisma.user.create({
       data: {
@@ -465,6 +468,19 @@ export async function PATCH(req: Request) {
         if (isNaN(d.getTime())) {
           return NextResponse.json({ error: '无效的日期格式' }, { status: 400 });
         }
+        // U85：设置非空到期时间时必须有 originalRole，否则到期降级永不触发
+        // （expireRoleDowngrades 候选查询要求 originalRole:{not:null}）。校验最终生效值
+        // （本次请求写入的 originalRole 优先，否则用库里现有值）。
+        const finalOriginalRole =
+          data.originalRole !== undefined
+            ? (data.originalRole as string | null)
+            : existing.originalRole;
+        if (!finalOriginalRole) {
+          return NextResponse.json(
+            { error: '设置到期时间前必须先指定原始用户组（到期回退目标）' },
+            { status: 400 }
+          );
+        }
         data.roleExpiresAt = d;
       }
     }
@@ -472,10 +488,10 @@ export async function PATCH(req: Request) {
     // 自定义用户组分配
     if (fields.customGroupId !== undefined) {
       if (fields.customGroupId === null || fields.customGroupId === '') {
-        // 清除自定义组，恢复角色默认配额
+        // 清除自定义组，恢复角色默认配额（U46：从 SiteSetting.group_config_<role> 解析）
         data.customGroupId = null;
         const role = (data.role as string) || existing.role;
-        const defaults = getDefaultQuotasForRole(role as 'ADMIN' | 'PRO' | 'FREE');
+        const defaults = await resolveRoleQuotas(role as 'ADMIN' | 'PRO' | 'FREE');
         data.allowedModels = defaults.allowedModels;
         data.transcriptionMinutesLimit = defaults.transcriptionMinutesLimit;
         data.storageHoursLimit = defaults.storageHoursLimit;
@@ -507,6 +523,26 @@ export async function PATCH(req: Request) {
           ((data.role as string) || existing.role) as 'ADMIN' | 'PRO' | 'FREE'
         );
       }
+    }
+
+    // C1：仅改内置角色、且本次未设置/未处于自定义组时，同步回填角色默认配额。
+    // 否则用户 role 变了但 transcription/storage/models/bytes 上限仍停留在旧角色值，
+    // 配额执行读的是这些列，导致升级不放宽、降级不收紧且无任何路径自愈。
+    // 放在 customGroupId 分支之后：若本次分配了自定义组，则组配额已写入 data，此处不覆盖
+    // （data.transcriptionMinutesLimit 已存在即跳过）；清除自定义组分支同样已回填，亦跳过。
+    if (
+      fields.role !== undefined &&
+      data.transcriptionMinutesLimit === undefined &&
+      data.customGroupId === undefined &&
+      existing.customGroupId === null
+    ) {
+      const newRole = data.role as 'ADMIN' | 'PRO' | 'FREE';
+      // U46：角色默认配额从 SiteSetting.group_config_<role> 解析（缺失回落硬编码默认）
+      const defaults = await resolveRoleQuotas(newRole);
+      data.allowedModels = defaults.allowedModels;
+      data.transcriptionMinutesLimit = defaults.transcriptionMinutesLimit;
+      data.storageHoursLimit = defaults.storageHoursLimit;
+      data.storageBytesLimit = await resolveRoleStorageBytesLimit(newRole);
     }
 
     if (Object.keys(data).length === 0) {

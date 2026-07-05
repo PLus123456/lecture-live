@@ -9,6 +9,7 @@ import {
 } from '@/lib/apiResponseCache';
 import { logAction } from '@/lib/auditLog';
 import { releaseStorageBytes } from '@/lib/quota';
+import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
 
 type StatusFilter = '' | 'has-recording' | 'no-recording' | 'completed' | 'archived' | 'recording';
 
@@ -175,7 +176,13 @@ export async function DELETE(req: Request) {
 
     const targets = await prisma.session.findMany({
       where: { id: { in: ids } },
-      select: { id: true, userId: true, title: true },
+      select: {
+        id: true,
+        userId: true,
+        title: true,
+        asyncTranscribeStatus: true,
+        sonioxFileId: true,
+      },
     });
 
     if (targets.length === 0) {
@@ -183,6 +190,20 @@ export async function DELETE(req: Request) {
     }
 
     const targetIds = targets.map((t) => t.id);
+
+    // U12：删行前取消进行中的异步上传转录，对齐用户侧 DELETE。否则本地分片/合并/mp3
+    // （可达 ~5GB）+ Soniox 远端文件会随 session 行消失而失去关联、永久泄漏（回收 cron 只
+    // 扫现存 Session 行）。终态（completed/failed/canceled/null）视为已收尾、无需取消。
+    for (const session of targets) {
+      if (
+        session.asyncTranscribeStatus !== 'completed' &&
+        session.asyncTranscribeStatus !== 'failed' &&
+        session.asyncTranscribeStatus !== 'canceled' &&
+        session.asyncTranscribeStatus != null
+      ) {
+        await cancelAsyncUpload(session).catch(() => undefined);
+      }
+    }
 
     // 删 session 会级联删 legacy 单录音对话(Conversation.sessionId 命中)及其 ChatAttachment
     // (schema onDelete: Cascade)。这些字节必须释放，否则永久"鬼占"用户配额、只增不减。

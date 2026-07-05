@@ -43,6 +43,24 @@ interface CustomGroupOption {
   name: string;
 }
 
+// C20：datetime-local 输入用「本地墙钟」文本，与存储的 UTC 时间戳互转必须对称，
+// 否则每次保存（哪怕未改）都会按浏览器时区偏移把到期时间平移，反复打开+保存越推越早。
+// - toLocalDatetimeInput：UTC ISO → 本地墙钟 'YYYY-MM-DDTHH:mm'（减去时区偏移后取 ISO 前 16 位）。
+// - fromLocalDatetimeInput：本地墙钟输入 → UTC ISO（new Date(local) 按本地解析，再转 ISO）。
+function toLocalDatetimeInput(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 16);
+}
+
+function fromLocalDatetimeInput(local: string): string | null {
+  if (!local) return null;
+  const d = new Date(local);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
 function RoleBadge({ role }: { role: string }) {
   const { t } = useI18n();
   const styles: Record<string, string> = {
@@ -115,7 +133,7 @@ function UserDetailModal({
   const [password, setPassword] = useState('');
   const [originalRole, setOriginalRole] = useState(user.originalRole ?? '');
   const [roleExpiresAt, setRoleExpiresAt] = useState(
-    user.roleExpiresAt ? user.roleExpiresAt.slice(0, 16) : '' // ISO8601 截取到 datetime-local 格式
+    user.roleExpiresAt ? toLocalDatetimeInput(user.roleExpiresAt) : '' // C20：UTC → 本地墙钟
   );
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -155,8 +173,12 @@ function UserDetailModal({
         body.originalRole = newOriginalRole;
       }
 
-      const newExpiresAt = roleExpiresAt ? new Date(roleExpiresAt).toISOString() : null;
-      const oldExpiresAt = user.roleExpiresAt;
+      // C20：本地墙钟输入 → UTC ISO；与旧值比较时也把旧 UTC 归一化为同一 ISO 表示，
+      // 避免毫秒/格式差异导致的假变更（如 '...:00.000Z' vs '...:00Z'），不改则不发送。
+      const newExpiresAt = fromLocalDatetimeInput(roleExpiresAt);
+      const oldExpiresAt = user.roleExpiresAt
+        ? new Date(user.roleExpiresAt).toISOString()
+        : null;
       if (newExpiresAt !== oldExpiresAt) {
         body.roleExpiresAt = newExpiresAt;
       }
@@ -616,6 +638,19 @@ export default function UserManagementPanel() {
       if (res.ok) {
         const data = await res.json();
         setUsers(data.users);
+        // U30：过滤/刷新切换列表后，用新列表的 ID 集合过滤选中集，剔除已离屏用户。
+        // 否则「批量删除」会命中当前列表看不到的陈旧选中项，且残留数恰等于新列表条数时
+        // 表头全选框状态失真（显示勾选但无可见行被选）。
+        const visibleIds = new Set<string>(
+          (data.users as UserItem[]).map((u) => u.id)
+        );
+        setSelectedIds((prev) => {
+          const next = new Set<string>();
+          for (const id of prev) {
+            if (visibleIds.has(id)) next.add(id);
+          }
+          return next.size === prev.size ? prev : next;
+        });
       }
     } catch (err) {
       console.error('Failed to fetch users:', err);

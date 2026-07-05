@@ -13,7 +13,7 @@ import {
   reconcileStorageBytes,
 } from '@/lib/quota';
 import {
-  getDefaultQuotasForRole,
+  resolveRoleQuotas,
   resolveRoleStorageBytesLimit,
 } from '@/lib/userRoles';
 import { runTranscriptionUsageReconciliation } from '@/lib/reconciliation';
@@ -458,8 +458,12 @@ export async function expireRoleDowngrades(now: Date): Promise<number> {
       continue;
     }
 
-    const quotas = getDefaultQuotasForRole(targetRole);
-    const storageBytesLimit = await resolveRoleStorageBytesLimit(targetRole);
+    // U46：到期降级回落目标角色配额时，从 SiteSetting.group_config_<role> 解析（缺失回落默认），
+    // 与 admin 用户组配置一致，避免降级后停留在硬编码默认值而无视 admin 的自定义。
+    const [quotas, storageBytesLimit] = await Promise.all([
+      resolveRoleQuotas(targetRole),
+      resolveRoleStorageBytesLimit(targetRole),
+    ]);
 
     // 条件原子降级：再次确认仍过期且 originalRole 未被清空（避免与 admin 续费竞争误降级）
     const result = await prisma.user.updateMany({

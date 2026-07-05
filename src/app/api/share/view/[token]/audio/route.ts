@@ -22,11 +22,15 @@ export async function GET(
 ) {
   const { token: rawToken } = await params;
 
-  // 严格限流：10 次 / 10 分钟 / IP — 防止被刷流量
+  // 限流按分享 token 分桶（而非纯 IP）：音频走 HTTP Range、单个观众一次播放就会产生多次请求，
+  // 且同一 NAT 出口的多名观众共享一个公网 IP —— 原来的「10 次/10 分钟/IP」会误封第 11 名及以后的观众。
+  // 改为按 token 分桶并放宽额度：既容纳 Range 流式与 NAT 多观众，又把滥用限定在单个分享链接内
+  //（拿到 token 者本就有完整访问权，按 token 限流不额外放权）。
   const rateLimited = await enforceRateLimit(req, {
     scope: 'share:view:audio',
-    limit: 10,
+    limit: 300,
     windowMs: 10 * 60_000,
+    key: `share-audio:${rawToken.slice(0, 128)}`,
   });
   if (rateLimited) {
     return rateLimited;

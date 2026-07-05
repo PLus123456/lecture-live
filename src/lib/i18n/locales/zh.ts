@@ -88,6 +88,8 @@ export default {
 
   // 导航
   nav: {
+    expand: '展开',
+    collapse: '收起',
     home: '首页',
     folders: '文件夹',
     shared: '共享',
@@ -164,6 +166,7 @@ export default {
     user: '用户',
     recentChats: '最近对话',
     noRecentChats: '暂无对话',
+    untitledChat: '未命名对话',
     filesQuota: '字节配额',
   },
 
@@ -339,6 +342,8 @@ export default {
   },
 
   mobile: {
+    ai: 'AI',
+    keywords: '关键词',
     sessionActions: '会话操作',
     exportDesc: '导出转录、字幕或原始数据',
     startLiveShare: '开始实时共享',

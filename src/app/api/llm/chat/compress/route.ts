@@ -162,22 +162,52 @@ export async function POST(req: Request) {
     compressedCount > 0
       ? effectiveChatMessages[compressedCount - 1]?.id ?? null
       : null;
-  const combinedSummary = compressionBoundary.summary
+  const rawCombinedSummary = compressionBoundary.summary
     ? `${compressionBoundary.summary}\n\n${summary}`.trim()
     : summary;
 
+  // 长度上界：每次 recompress 都把上一条完整摘要重新前置（findCompressionBoundary），
+  // combinedSummary 单调增长且无 LLM 输出硬上限。content 是 @db.Text（MySQL 64KB 上限，
+  // 按字节计），一旦某次超限 create() 抛 1406，且下次仍复用这条超大摘要 → 永久 500
+  // （v3 finding U88）。这里在落库前按字符预算截断（CJK UTF-8 约 3B/字符，16K 字符 ≈ 48KB，
+  // 再叠加 encode 包裹的 JSON 结构仍安全落在 64KB 内），保留最新一段（末尾），并在超限时
+  // 标注被截断。
+  const COMBINED_SUMMARY_MAX_CHARS = 16_000;
+  const combinedSummary =
+    rawCombinedSummary.length > COMBINED_SUMMARY_MAX_CHARS
+      ? `[⚠️ 早期摘要已因长度上限截断]\n` +
+        rawCombinedSummary.slice(-COMBINED_SUMMARY_MAX_CHARS)
+      : rawCombinedSummary;
+
   // 插入一条 role='system' 摘要消息。早期 user/assistant 消息保留在 DB，并用
   // compressed-through 标记记录切割点，避免依赖 createdAt 插入位置。
-  await prisma.conversationMessage.create({
-    data: {
-      conversationId,
-      role: 'system',
-      content: encodeCompressedHistorySystemMessage(
-        combinedSummary,
-        compressedThroughMessageId
-      ),
-    },
-  });
+  // 包 try/catch：即使截断后仍触碰某些边界（如 encode 后超限），也优雅降级而非未处理 500。
+  try {
+    await prisma.conversationMessage.create({
+      data: {
+        conversationId,
+        role: 'system',
+        content: encodeCompressedHistorySystemMessage(
+          combinedSummary,
+          compressedThroughMessageId
+        ),
+      },
+    });
+  } catch (err) {
+    apiLogger.error(
+      { conversationId, err: serializeError(err) },
+      '压缩摘要落库失败（可能超 content 长度上限）'
+    );
+    return NextResponse.json(
+      {
+        compressed: false,
+        error: 'compression_persist_failed',
+        message:
+          '压缩摘要保存失败（可能内容过长）。建议直接新建对话继续。',
+      },
+      { status: 502 }
+    );
+  }
 
   return NextResponse.json({
     compressed: true,

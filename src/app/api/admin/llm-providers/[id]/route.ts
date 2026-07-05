@@ -79,15 +79,26 @@ export async function PATCH(
           .filter((mid) => mid && !mid.startsWith('temp-'))
       );
 
-      // 删除前端已移除的模型
-      const toDelete = existingModels.filter((m) => !incomingIds.has(m.id));
-      if (toDelete.length > 0) {
-        await prisma.llmModel.deleteMany({
-          where: { id: { in: toDelete.map((m) => m.id) } },
-        });
-      }
-
-      // 创建或更新模型
+      // U13：先对整批做一次性预校验并规整数据，再在单事务内 delete+update+create。
+      // 否则 deleteMany 先执行、循环中途某模型 contextWindow<maxTokens 返回 400 时，
+      // 已删/已改的模型无法回滚，留下半同步状态（被删的默认模型永久消失）。
+      const preparedModels: Array<{
+        mid: string;
+        data: {
+          modelId: string;
+          displayName: string;
+          thinkingDepth: string;
+          thinkingMode: 'NONE' | 'AUTO' | 'FORCED' | 'DEPTH';
+          supportsThinkingDepth: boolean;
+          supportsImage: boolean;
+          maxTokens: number;
+          contextWindow: number;
+          temperature: number;
+          purpose: 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING';
+          isDefault: boolean;
+          sortOrder: number;
+        };
+      }> = [];
       for (const m of incomingModels) {
         const maxTokens = Number(m.maxTokens ?? m.max_tokens ?? 4096);
         const contextWindow = Number(m.contextWindow ?? m.context_window ?? 8192);
@@ -106,29 +117,43 @@ export async function PATCH(
           | 'DEPTH';
         // supportsThinkingDepth 由 mode === 'DEPTH' 派生（一致性保护，覆盖 body 值）
         const supportsDepth = thinkingMode === 'DEPTH';
-        const modelData = {
-          modelId: (m.modelId ?? m.model_id ?? '') as string,
-          displayName: (m.displayName ?? m.display_name ?? '') as string,
-          thinkingDepth: (m.thinkingDepth ?? m.thinking_budget ?? 'medium') as string,
-          thinkingMode,
-          supportsThinkingDepth: supportsDepth,
-          supportsImage: Boolean(m.supportsImage ?? m.supports_image ?? false),
-          maxTokens,
-          contextWindow,
-          temperature: Number(m.temperature ?? 0.3),
-          purpose: (m.purpose ?? 'CHAT') as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING',
-          isDefault: Boolean(m.isDefault ?? m.is_default ?? false),
-          sortOrder: Number(m.sortOrder ?? m.sort_order ?? 0),
-        };
-        const mid = m.id as string;
-        if (mid && !mid.startsWith('temp-')) {
-          // 更新已有模型
-          await prisma.llmModel.update({ where: { id: mid }, data: modelData });
-        } else {
-          // 创建新模型
-          await prisma.llmModel.create({ data: { ...modelData, providerId: id } });
-        }
+        preparedModels.push({
+          mid: m.id as string,
+          data: {
+            modelId: (m.modelId ?? m.model_id ?? '') as string,
+            displayName: (m.displayName ?? m.display_name ?? '') as string,
+            thinkingDepth: (m.thinkingDepth ?? m.thinking_budget ?? 'medium') as string,
+            thinkingMode,
+            supportsThinkingDepth: supportsDepth,
+            supportsImage: Boolean(m.supportsImage ?? m.supports_image ?? false),
+            maxTokens,
+            contextWindow,
+            temperature: Number(m.temperature ?? 0.3),
+            purpose: (m.purpose ?? 'CHAT') as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING',
+            isDefault: Boolean(m.isDefault ?? m.is_default ?? false),
+            sortOrder: Number(m.sortOrder ?? m.sort_order ?? 0),
+          },
+        });
       }
+
+      // 删除前端已移除的模型
+      const toDelete = existingModels.filter((m) => !incomingIds.has(m.id));
+
+      // 原子提交：删除 + 更新/创建全部包进单事务，任一失败整体回滚
+      await prisma.$transaction(async (tx) => {
+        if (toDelete.length > 0) {
+          await tx.llmModel.deleteMany({
+            where: { id: { in: toDelete.map((m) => m.id) } },
+          });
+        }
+        for (const { mid, data } of preparedModels) {
+          if (mid && !mid.startsWith('temp-')) {
+            await tx.llmModel.update({ where: { id: mid }, data });
+          } else {
+            await tx.llmModel.create({ data: { ...data, providerId: id } });
+          }
+        }
+      });
     }
 
     let provider = await prisma.llmProvider.update({

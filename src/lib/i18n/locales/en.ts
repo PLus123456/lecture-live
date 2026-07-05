@@ -1262,6 +1262,8 @@ export default {
     archive: 'Archive',
     unarchive: 'Unarchive',
     archivedSection: 'Archived',
+    showCollapsed: 'Expand {count} collapsed messages',
+    hideCollapsed: 'Collapse {count} collapsed messages',
     clearAll: 'Clear all',
     confirmClearAllTitle: 'Clear all conversations?',
     confirmClearAllMessage: 'This permanently deletes all your conversations with their messages and attached files. This cannot be undone.',

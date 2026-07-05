@@ -550,6 +550,12 @@ export default function ViewerPage() {
         // 进行中的会话：连接 WebSocket 实时接收数据
         joinAsViewer(shareToken, {
           onInitialState: (snapshot) => {
+            // C6：每次 socket.io 自动重连都会重新 emit join → 服务端重发全量快照，
+            // 而 addFinalSegment/addBlock 按 id 追加不去重，盲目重填会让转录/摘要
+            // 成倍复制。重填前先清空三个 store，保证快照即为当前全量、无重复。
+            clearTranscript();
+            clearSummaries();
+            clearTranslations();
             if (snapshot.segments) {
               (snapshot.segments as TranscriptSegment[]).forEach(addFinalSegment);
             }
@@ -599,6 +605,12 @@ export default function ViewerPage() {
               });
               setIsCompleted(true);
               setSessionInfo((prev) => prev ? { ...prev, status: newStatus } : prev);
+            } else if (newStatus === 'SHARE_LIVE') {
+              // C3：主播瞬断（Wi-Fi 切换 / ping 超时）后重连成功，服务端广播 SHARE_LIVE。
+              // 观众自身 socket 通常并未断开、内存快照仍在，只是此前可能因误报的
+              // SHARE_OFFLINE 被单向锁成静态完成态——这里解锁回实时视图，后续增量继续渲染。
+              setIsCompleted(false);
+              setSessionInfo((prev) => prev ? { ...prev, status: 'LIVE' } : prev);
             }
           },
           onPreviewUpdate: ({ previewText, previewTranslation }) => {

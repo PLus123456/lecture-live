@@ -59,6 +59,53 @@ interface ViewerJoinPayload {
 
 const snapshots = new Map<string, LiveSnapshot>();
 
+// C3/U11：主播 socket 断开时不立即宣告下线，先给一段宽限期。若主播在窗口内重连
+// （Wi-Fi 切换 / ping 超时导致的瞬断），取消宣告并保留内存快照；只有窗口内未回来
+// 才真正广播 SHARE_OFFLINE 并回收快照。intentional stop 走的是 broadcast 事件路径
+// （broadcaster.broadcastStatusUpdate('SHARE_OFFLINE') 在 disconnect 之前发出），
+// 不依赖此处，故加宽限期不会拖慢主动结束的下线提示。
+const HOST_OFFLINE_GRACE_MS = 15_000;
+const pendingHostOffline = new Map<string, NodeJS.Timeout>();
+
+function cancelPendingHostOffline(sessionId: string) {
+  const timer = pendingHostOffline.get(sessionId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingHostOffline.delete(sessionId);
+  }
+}
+
+// U61：观众 join 仅凭持久化的 shareLink.isLive 即可在 snapshots 里落一条（此时主播
+// 可能从未连上本进程），而唯一的清理只在主播 socket 断开时触发；这类"无主播"条目会
+// 永久驻留，WS 进程内存单调增长。用 updatedAt 驱动的后台清扫兜底：定期删除长期无活动
+// 且房间内已无任何 socket 的条目（有观众在看则保留，避免刚建的条目被误删）。
+const SNAPSHOT_TTL_MS = 30 * 60_000; // 30 分钟无更新
+const SNAPSHOT_SWEEP_INTERVAL_MS = 5 * 60_000; // 每 5 分钟扫一次
+
+async function sweepStaleSnapshots(io: SocketIO) {
+  const now = Date.now();
+  for (const [sessionId, snapshot] of snapshots) {
+    if (now - snapshot.updatedAt < SNAPSHOT_TTL_MS) {
+      continue;
+    }
+    // 房间内仍有 socket（观众/主播）则保留；仅回收确无成员的僵尸条目。
+    let roomEmpty = false;
+    try {
+      const roomSockets = await io.in(getRoomId(sessionId)).fetchSockets();
+      roomEmpty = roomSockets.length === 0;
+    } catch {
+      continue;
+    }
+    if (roomEmpty && !pendingHostOffline.has(sessionId)) {
+      snapshots.delete(sessionId);
+      liveShareLogger.info(
+        { sessionId, ageMs: now - snapshot.updatedAt },
+        'Reclaimed stale live snapshot with no active room members'
+      );
+    }
+  }
+}
+
 // sync_snapshot / broadcast 快照体量上限：防止主播端（已认证，但可能因 bug 或滥用）
 // 推超大 snapshot 长期驻留服务端内存。maxHttpBufferSize(100KB) 已是消息体硬上限，
 // 这里是防御纵深 + 类型校验——超限截断（而非拒连），正常课堂远达不到此量级。
@@ -240,7 +287,11 @@ function mergeTranscriptSegment(snapshot: LiveSnapshot, segment: unknown) {
 
   const maybeSegment = segment as { id?: string };
   if (!maybeSegment.id) {
-    snapshot.segments.push(segment);
+    // 无 id 段落只能追加，无法去重——达到条数上限后拒绝新增，防止 broadcast
+    // 增量路径绕过 sync_snapshot 的 MAX_SNAPSHOT_SEGMENTS（U24）。
+    if (snapshot.segments.length < MAX_SNAPSHOT_SEGMENTS) {
+      snapshot.segments.push(segment);
+    }
     return snapshot;
   }
 
@@ -250,7 +301,10 @@ function mergeTranscriptSegment(snapshot: LiveSnapshot, segment: unknown) {
   });
 
   if (index === -1) {
-    snapshot.segments.push(segment);
+    // 新 id：仅在未达上限时追加（已存在的 id 走原地替换，不增长，故不受限）。
+    if (snapshot.segments.length < MAX_SNAPSHOT_SEGMENTS) {
+      snapshot.segments.push(segment);
+    }
   } else {
     snapshot.segments[index] = segment;
   }
@@ -279,7 +333,11 @@ function mergeSummaryBlock(snapshot: LiveSnapshot, block: unknown) {
   });
 
   if (index === -1) {
-    snapshot.summaryBlocks.push(block);
+    // 新增 summary block：仅在未达上限时追加，防止 broadcast 增量路径绕过
+    // MAX_SNAPSHOT_SUMMARY_BLOCKS（U24）。已存在的走原地替换，不增长。
+    if (snapshot.summaryBlocks.length < MAX_SNAPSHOT_SUMMARY_BLOCKS) {
+      snapshot.summaryBlocks.push(block);
+    }
   } else {
     snapshot.summaryBlocks[index] = block;
   }
@@ -309,10 +367,21 @@ function mergeEventIntoSnapshot(
           targetLang?: string;
           translationMode?: string;
         };
-        snapshot.translations[payload.segmentId] =
-          payload.translation.length > MAX_TRANSLATION_LENGTH
-            ? payload.translation.slice(0, MAX_TRANSLATION_LENGTH)
-            : payload.translation;
+        // 新 segmentId 达到条目上限时拒绝新增，防止 broadcast 增量路径绕过
+        // MAX_SNAPSHOT_TRANSLATIONS（U24）。已存在的 key 走覆盖，不增长。
+        const isNewTranslationKey = !Object.prototype.hasOwnProperty.call(
+          snapshot.translations,
+          payload.segmentId
+        );
+        if (
+          !isNewTranslationKey ||
+          Object.keys(snapshot.translations).length < MAX_SNAPSHOT_TRANSLATIONS
+        ) {
+          snapshot.translations[payload.segmentId] =
+            payload.translation.length > MAX_TRANSLATION_LENGTH
+              ? payload.translation.slice(0, MAX_TRANSLATION_LENGTH)
+              : payload.translation;
+        }
         // 更新翻译元数据（如果 delta 中携带）
         if (typeof payload.sourceLang === 'string') snapshot.sourceLang = payload.sourceLang;
         if (typeof payload.targetLang === 'string') snapshot.targetLang = payload.targetLang;
@@ -442,7 +511,18 @@ function createShareErrorHandler(socket: Socket) {
   };
 }
 
-export function setupLiveShare(io: SocketIO) {
+/**
+ * 装载实时分享逻辑，返回一个 teardown 函数：清掉 U61 的 TTL 清扫定时器与所有
+ * 未决的 host 下线宽限计时，并清空快照 Map。生产环境 setupLiveShare 仅调用一次，
+ * teardown 主要用于测试隔离与优雅关停（避免模块级定时器 / 快照跨用例泄漏）。
+ */
+export function setupLiveShare(io: SocketIO): () => void {
+  // U61：后台 TTL 清扫僵尸快照。unref 避免阻塞进程退出。
+  const sweepTimer = setInterval(() => {
+    void sweepStaleSnapshots(io).catch(() => undefined);
+  }, SNAPSHOT_SWEEP_INTERVAL_MS);
+  sweepTimer.unref?.();
+
   io.on('connection', async (socket) => {
     const emitError = createShareErrorHandler(socket);
 
@@ -459,6 +539,10 @@ export function setupLiveShare(io: SocketIO) {
           },
           'Broadcaster authenticated'
         );
+        // C3/U11：主播（重）连成功——取消可能正在等待的下线宣告，保留其内存快照，
+        // 并向房间广播 SHARE_LIVE，让此前误判为"已结束"的观众恢复实时视图。
+        cancelPendingHostOffline(sessionId);
+        socket.to(getRoomId(sessionId)).emit('status_update', { status: 'SHARE_LIVE' });
         const snapshot = await getSessionSnapshot(sessionId);
         socket.emit('initial_state', snapshot);
         await emitViewerCount(io, sessionId);
@@ -625,9 +709,32 @@ export function setupLiveShare(io: SocketIO) {
       }
 
       if (socket.data.isHost) {
-        io.to(getRoomId(sessionId)).emit('status_update', { status: 'SHARE_OFFLINE' });
-        // 安全：broadcaster 断开时清理内存中的 snapshot，防止无限增长
-        snapshots.delete(sessionId);
+        // C3/U11：不立即宣告 SHARE_OFFLINE / 删除快照，先起宽限计时。若主播在窗口内
+        // 于新 socket 上重连，authenticateBroadcaster 会 cancelPendingHostOffline 取消
+        // 本计时并保留快照；只有窗口内未回来才广播下线并回收内存。计时器 unref，避免
+        // 阻塞进程退出。回调内再次核验房间内确无主播 socket，防止极端时序下误报下线。
+        cancelPendingHostOffline(sessionId);
+        const timer = setTimeout(() => {
+          pendingHostOffline.delete(sessionId);
+          void (async () => {
+            try {
+              const roomSockets = await io.in(getRoomId(sessionId)).fetchSockets();
+              const hostStillConnected = roomSockets.some((s) => s.data.isHost);
+              if (hostStillConnected) {
+                return;
+              }
+            } catch {
+              // fetchSockets 失败（如服务器正在关闭）——保守地跳过下线广播，
+              // 快照由 U61 的 TTL 清扫兜底回收。
+              return;
+            }
+            io.to(getRoomId(sessionId)).emit('status_update', { status: 'SHARE_OFFLINE' });
+            // 宽限期满仍无主播：回收内存快照，防止无限增长。
+            snapshots.delete(sessionId);
+          })();
+        }, HOST_OFFLINE_GRACE_MS);
+        timer.unref?.();
+        pendingHostOffline.set(sessionId, timer);
       }
 
       liveShareLogger.info(
@@ -642,4 +749,13 @@ export function setupLiveShare(io: SocketIO) {
       await emitViewerCount(io, sessionId).catch(() => undefined);
     });
   });
+
+  return function teardownLiveShare() {
+    clearInterval(sweepTimer);
+    for (const timer of pendingHostOffline.values()) {
+      clearTimeout(timer);
+    }
+    pendingHostOffline.clear();
+    snapshots.clear();
+  };
 }

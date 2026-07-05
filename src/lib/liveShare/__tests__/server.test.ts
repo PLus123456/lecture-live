@@ -46,6 +46,7 @@ describe('setupLiveShare', () => {
   let httpServer: ReturnType<typeof createServer>;
   let io: SocketIOServer;
   let baseUrl: string;
+  let teardownLiveShare: () => void;
   const clients: Socket[] = [];
 
   beforeEach(async () => {
@@ -88,7 +89,7 @@ describe('setupLiveShare', () => {
     io = new SocketIOServer(httpServer, {
       transports: ['websocket'],
     });
-    setupLiveShare(io);
+    teardownLiveShare = setupLiveShare(io);
 
     await new Promise<void>((resolve) => {
       httpServer.listen(0, '127.0.0.1', () => resolve());
@@ -112,6 +113,10 @@ describe('setupLiveShare', () => {
       })
     );
     clients.length = 0;
+
+    // 清掉 U61 的清扫定时器与 C3/U11 的宽限计时并清空模块级快照 Map，
+    // 避免跨用例泄漏（否则残留快照/定时器会污染下一用例的连接）。
+    teardownLiveShare();
 
     await new Promise<void>((resolve) => {
       io.close(() => {
@@ -406,6 +411,98 @@ describe('setupLiveShare', () => {
     await expect(errorPromise).resolves.toEqual({
       message: 'Only the broadcaster may publish events',
     });
+  });
+
+  it('C3：broadcaster（重）连成功时向房间内既有 viewer 广播 SHARE_LIVE', async () => {
+    // 先让 viewer 连上并 join，此时房间里只有 viewer（模拟主播瞬断后观众仍在）
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+
+    await onceSocketEvent(viewer, 'connect');
+    viewer.emit('join', { shareToken: 'share-token' });
+    await onceSocketEvent(viewer, 'initial_state');
+
+    // 主播（重）连——viewer 应收到 SHARE_LIVE，用于把误锁的"已结束"态恢复为实时
+    const liveStatusPromise = onceSocketEvent<{ status: string }>(
+      viewer,
+      'status_update'
+    );
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+
+    await expect(liveStatusPromise).resolves.toEqual({ status: 'SHARE_LIVE' });
+  });
+
+  it('C3/U11：broadcaster 断开后进入宽限期，快照不被立即回收（新 viewer 仍拿到历史）', async () => {
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    broadcaster.emit('sync_snapshot', {
+      segments: [{ id: 'seg-1', text: 'Hello' }],
+      translations: {},
+      summaryBlocks: [],
+      status: 'RECORDING',
+    });
+
+    // 先用一个 viewer join 确认快照已被服务端处理（避免 sync_snapshot 与后续
+    // disconnect 竞争导致断言不确定）。
+    const settleViewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(settleViewer);
+    await onceSocketEvent(settleViewer, 'connect');
+    const settledStatePromise = onceSocketEvent<{
+      segments: Array<{ id: string; text: string }>;
+    }>(settleViewer, 'initial_state');
+    settleViewer.emit('join', { shareToken: 'share-token' });
+    expect((await settledStatePromise).segments).toEqual([
+      { id: 'seg-1', text: 'Hello' },
+    ]);
+
+    // 主播断开（瞬断）——不应立即删快照，而是进入宽限期
+    await new Promise<void>((resolve) => {
+      broadcaster.once('disconnect', () => resolve());
+      broadcaster.disconnect();
+    });
+
+    // 宽限期内新 viewer join：仍能拿到主播断开前同步的历史（快照未被回收）
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+
+    await onceSocketEvent(viewer, 'connect');
+    const initialStatePromise = onceSocketEvent<{
+      segments: Array<{ id: string; text: string }>;
+    }>(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+
+    const state = await initialStatePromise;
+    expect(state.segments).toEqual([{ id: 'seg-1', text: 'Hello' }]);
   });
 
   it('在无效分享 token 时返回 join 错误', async () => {

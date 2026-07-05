@@ -23,6 +23,12 @@ import {
   cleanupOrphanChatImageDirs,
 } from '@/lib/jobs/chatFilesCleanupJob';
 import { deleteAsyncUpload } from '@/lib/audio/asyncUploadChunkPersistence';
+import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
+import {
+  deleteSonioxFile,
+  deleteSonioxTranscription,
+  getSonioxTranscription,
+} from '@/lib/soniox/asyncFile';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
 // 异步上传转录的停滞阈值取更大值：Soniox 异步任务在 300 分钟上限文件上偶尔较慢，
@@ -382,8 +388,18 @@ async function reclaimStaleSessions(now: Date): Promise<number> {
  * STALE_ASYNC_THRESHOLD_MS 没更新的 session 标为 failed，让前端进度条停下、状态机解锁，
  * 并尽力清掉本地分片/合并/mp3 临时文件。
  *
- * 注意：Soniox 端可能残留文件（已上传但卡住的情况）。这里不耦合 Soniox，留给既有的
- * Soniox 清理路径兜底；本函数只负责把 DB 状态从僵尸态解出来 + 清本地盘。
+ * U23（数据丢失防护）：对卡在 transcribing 且仍持有 sonioxTranscriptionId 的会话，标 failed
+ * 前先向 Soniox 查一次真实状态——绝不盲目丢弃一份 Soniox 侧可能早已完成/仍在跑的转录。
+ *   - Soniox 仍在 queued/processing 或已 completed：说明转录本身没坏，只是 DB 状态机没被
+ *     前端 poll 推进（用户离线）。此时**不标 failed**，只 bump updatedAt 让本轮跳过、并留待
+ *     既有的 status-route poll 路径正常收尾。这样已完成/进行中的转录不再被误杀丢弃。
+ *     （注：在回收侧直接复刻「拉 transcript+落盘+扣费」的收尾/扣费口径风险高，故延后，
+ *      见 PR。）
+ *   - Soniox 报 error 或 404（transcription 不存在）：确属失败，标 failed。
+ * 其余非 transcribing 的僵尸态（合并/转码/上传阶段卡死）无 Soniox 转录产物可救，直接标 failed。
+ *
+ * U7：真正标 failed 时，best-effort 删除 Soniox 上残留的 file + transcription（释放 Soniox
+ * 侧配额），不再只删本地盘就把 Soniox 资源泄漏给"cron 兜底"（本函数即该兜底路径）。
  */
 async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
   const threshold = new Date(now.getTime() - STALE_ASYNC_THRESHOLD_MS);
@@ -392,7 +408,13 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
       asyncTranscribeStatus: { in: ASYNC_RECLAIMABLE_STATUSES },
       updatedAt: { lte: threshold },
     },
-    select: { id: true, userId: true },
+    select: {
+      id: true,
+      userId: true,
+      asyncTranscribeStatus: true,
+      sonioxFileId: true,
+      sonioxTranscriptionId: true,
+    },
     take: 100,
     orderBy: { updatedAt: 'asc' },
   });
@@ -400,7 +422,68 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
   let reclaimedCount = 0;
   const thresholdHours = Math.round(STALE_ASYNC_THRESHOLD_MS / 3_600_000);
 
+  // Soniox 配置只解析一次（可能未配置：为 null 时退化到旧行为，仅标 failed + 清本地）
+  const sonioxConfig = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);
+
   for (const session of stuck) {
+    // U23：transcribing + 有 transcriptionId → 先查 Soniox，salvage 还没坏的转录
+    if (
+      session.asyncTranscribeStatus === 'transcribing' &&
+      session.sonioxTranscriptionId &&
+      sonioxConfig
+    ) {
+      let job;
+      try {
+        job = await getSonioxTranscription(
+          sonioxConfig,
+          session.sonioxTranscriptionId
+        );
+      } catch (err) {
+        // Soniox 查询失败（网络抖动/超时）：本轮先不动它，避免因一次查询失败误杀；
+        // 下个维护周期再试。注意 transcription 不存在时 getSonioxTranscription 抛 HTTP 404，
+        // 会走到这里——保守起见不当作"确认失败"，仍留待下轮或前端 poll 处理。
+        billingLogger.warn(
+          {
+            sessionId: session.id,
+            userId: session.userId,
+            err: serializeError(err),
+          },
+          'soniox status check failed during reclaim; skipping this round'
+        );
+        continue;
+      }
+
+      if (
+        job.status === 'queued' ||
+        job.status === 'processing' ||
+        job.status === 'completed'
+      ) {
+        // 转录本身没坏（进行中或已完成）。不丢弃、不标 failed——回写同值 transcribing
+        // 触发 @updatedAt 自动刷新，让本轮之后不再立刻被当僵尸重扫；把真正的收尾（拉
+        // transcript + 扣费）留给既有的 status-route poll 路径，避免在回收侧复刻扣费口径
+        // 导致双扣/口径漂移。
+        await prisma.session
+          .updateMany({
+            where: {
+              id: session.id,
+              asyncTranscribeStatus: 'transcribing',
+            },
+            data: { asyncTranscribeStatus: 'transcribing' },
+          })
+          .catch(() => undefined);
+        billingLogger.info(
+          {
+            sessionId: session.id,
+            userId: session.userId,
+            sonioxStatus: job.status,
+          },
+          'stuck transcribing session still alive on Soniox; left for status-poll finalization'
+        );
+        continue;
+      }
+      // job.status === 'error' → 落到下方标 failed + 清 Soniox
+    }
+
     // 原子 claim：再次校验仍处于卡住状态且确实超时，避免与正常 poll/cancel 竞争误标
     const claimed = await prisma.session.updateMany({
       where: {
@@ -424,6 +507,20 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
     );
     // 清本地临时文件，容忍失败
     await deleteAsyncUpload({ id: session.id }).catch(() => undefined);
+    // U7：best-effort 清 Soniox 上残留的 file + transcription（幂等，失败不抛）
+    if (sonioxConfig) {
+      if (session.sonioxFileId) {
+        await deleteSonioxFile(sonioxConfig, session.sonioxFileId).catch(
+          () => undefined
+        );
+      }
+      if (session.sonioxTranscriptionId) {
+        await deleteSonioxTranscription(
+          sonioxConfig,
+          session.sonioxTranscriptionId
+        ).catch(() => undefined);
+      }
+    }
   }
 
   return reclaimedCount;

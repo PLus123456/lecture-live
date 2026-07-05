@@ -184,8 +184,15 @@ export async function pollAsyncTranscribeStatus(
       { headers: { Authorization: `Bearer ${authToken}` }, signal }
     );
     if (!res.ok) {
-      // 502/503 等暂时性错误：继续 poll，不立即失败
-      if (res.status >= 500) continue;
+      // 502/503 等暂时性错误：继续 poll，不立即失败。
+      // U35：429（服务端自身对高频 poll 的限流）同样是非致命的——它恰恰意味着
+      // "还在轮询、只是太快了"。旧代码把 <500 一律 throw，会因一次 429 直接中断轮询，
+      // 而收尾（拉 transcript + 标 completed + 扣费）正是由这个 poll 驱动的，导致已完成
+      // 的转录卡死不收尾。这里把 429 纳入退避重试：多等一拍（叠加下方 sleep(1500)）再继续。
+      if (res.status >= 500 || res.status === 429) {
+        await sleep(3000, signal).catch(() => undefined);
+        continue;
+      }
       const errBody = await readError(res);
       throw new Error(`Status check failed: ${errBody}`);
     }

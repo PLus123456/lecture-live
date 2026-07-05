@@ -160,21 +160,47 @@ export async function POST(
   }
 
   try {
+    // 状态机守卫（U42）：只有处于"尚未进入后台 pipeline"的状态才允许（重新）init。
+    // 旧代码用 id-only 的无条件 update 置 uploading_chunks，能把已经在 transcoding /
+    // uploading_to_soniox / transcribing / finalizing / completed 的会话打回 uploading_chunks，
+    // 引发双 pipeline 启动、覆写已上传/已转录产物、乃至对已完成会话重复 init。
+    // 用一条原子 updateMany，仅当当前状态 ∈ {null, uploading_chunks, failed, canceled} 才置位；
+    // 抢不到（会话正在跑或已完成）→ 409，不写 manifest、不动状态。
+    const claimed = await prisma.session.updateMany({
+      where: {
+        id,
+        OR: [
+          { asyncTranscribeStatus: null },
+          {
+            asyncTranscribeStatus: {
+              in: ['uploading_chunks', 'failed', 'canceled'],
+            },
+          },
+        ],
+      },
+      data: {
+        asyncTranscribeStatus: 'uploading_chunks',
+        asyncTranscribeError: null,
+        asyncTranscribeStartedAt: new Date(),
+      },
+    });
+    if (claimed.count !== 1) {
+      return NextResponse.json(
+        {
+          error: `Cannot init: async transcription already in progress (status is ${
+            session.asyncTranscribeStatus ?? 'null'
+          })`,
+        },
+        { status: 409 }
+      );
+    }
+
     const manifest = await initAsyncUpload(session, {
       originalFileName,
       originalMimeType,
       originalSize,
       totalChunks,
       chunkSize,
-    });
-
-    await prisma.session.update({
-      where: { id },
-      data: {
-        asyncTranscribeStatus: 'uploading_chunks',
-        asyncTranscribeError: null,
-        asyncTranscribeStartedAt: new Date(),
-      },
     });
 
     return NextResponse.json({

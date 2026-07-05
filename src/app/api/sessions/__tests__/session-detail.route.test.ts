@@ -9,10 +9,12 @@ const {
   shareLinkDeleteManyMock,
   sessionDeleteMock,
   transactionMock,
-  chatAttachmentGroupByMock,
-  releaseStorageBytesMock,
+  conversationFindManyMock,
   loadSessionAudioArtifactMock,
   loadSessionTranscriptBundleMock,
+  deleteSessionArtifactsMock,
+  deleteRecordingDraftMock,
+  deleteConversationsCascadeMock,
   cancelAsyncUploadMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
@@ -22,10 +24,12 @@ const {
   shareLinkDeleteManyMock: vi.fn(),
   sessionDeleteMock: vi.fn(),
   transactionMock: vi.fn(),
-  chatAttachmentGroupByMock: vi.fn(),
-  releaseStorageBytesMock: vi.fn(),
+  conversationFindManyMock: vi.fn(),
   loadSessionAudioArtifactMock: vi.fn(),
   loadSessionTranscriptBundleMock: vi.fn(),
+  deleteSessionArtifactsMock: vi.fn(),
+  deleteRecordingDraftMock: vi.fn(),
+  deleteConversationsCascadeMock: vi.fn(),
   cancelAsyncUploadMock: vi.fn(),
 }));
 
@@ -46,21 +50,26 @@ vi.mock('@/lib/prisma', () => ({
     shareLink: {
       deleteMany: shareLinkDeleteManyMock,
     },
-    // 删 session 时聚合 legacy 对话附件字节以释放配额；默认无附件
-    chatAttachment: {
-      groupBy: chatAttachmentGroupByMock,
+    // 删 session 时收集 legacy 对话 id 走 deleteConversationsCascade；默认无对话
+    conversation: {
+      findMany: conversationFindManyMock,
     },
     $transaction: transactionMock,
   },
 }));
 
-vi.mock('@/lib/quota', () => ({
-  releaseStorageBytes: releaseStorageBytesMock,
-}));
-
 vi.mock('@/lib/sessionPersistence', () => ({
   loadSessionAudioArtifact: loadSessionAudioArtifactMock,
   loadSessionTranscriptBundle: loadSessionTranscriptBundleMock,
+  deleteSessionArtifacts: deleteSessionArtifactsMock,
+}));
+
+vi.mock('@/lib/recordingDraftPersistence', () => ({
+  deleteRecordingDraft: deleteRecordingDraftMock,
+}));
+
+vi.mock('@/lib/conversationCascade', () => ({
+  deleteConversationsCascade: deleteConversationsCascadeMock,
 }));
 
 vi.mock('@/lib/audio/asyncUploadProcessor', () => ({
@@ -89,8 +98,10 @@ describe('session detail route', () => {
     folderSessionDeleteManyMock.mockResolvedValue({ count: 1 });
     shareLinkDeleteManyMock.mockResolvedValue({ count: 1 });
     sessionDeleteMock.mockResolvedValue({ id: 'session-1' });
-    chatAttachmentGroupByMock.mockResolvedValue([]);
-    releaseStorageBytesMock.mockResolvedValue(null);
+    conversationFindManyMock.mockReset().mockResolvedValue([]);
+    deleteSessionArtifactsMock.mockReset().mockResolvedValue(undefined);
+    deleteRecordingDraftMock.mockReset().mockResolvedValue(undefined);
+    deleteConversationsCascadeMock.mockReset().mockResolvedValue(0);
     cancelAsyncUploadMock.mockReset().mockResolvedValue(undefined);
     transactionMock.mockImplementation(async (operations: unknown[]) => Promise.all(operations));
   });
@@ -127,7 +138,7 @@ describe('session detail route', () => {
     expect(sessionUpdateMock).not.toHaveBeenCalled();
   });
 
-  it('在缺少音频或转录时阻止完成会话', async () => {
+  it('C4: PATCH 无法把 FINALIZING 推到 COMPLETED（只能经 finalize 端点）', async () => {
     sessionFindUniqueMock.mockResolvedValue({
       id: 'session-1',
       userId: 'user-1',
@@ -136,8 +147,6 @@ describe('session detail route', () => {
       serverStartedAt: new Date('2026-03-27T10:00:00.000Z'),
       serverPausedAt: null,
     });
-    loadSessionAudioArtifactMock.mockResolvedValue(null);
-    loadSessionTranscriptBundleMock.mockResolvedValue({ segments: [], summaries: [], translations: {} });
 
     const response = await PATCH(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {
@@ -147,10 +156,88 @@ describe('session detail route', () => {
       { params }
     );
 
+    expect(response.status).toBe(400);
+    await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
+      error: 'Invalid status transition: FINALIZING → COMPLETED',
+    });
+    expect(sessionUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('C2: 终态会话拒绝客户端 durationMs（防抹掉存储配额）', async () => {
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 'session-1',
+      userId: 'user-1',
+      title: 'Lecture',
+      status: 'COMPLETED',
+      serverStartedAt: null,
+      serverPausedAt: null,
+      durationMs: 7_200_000,
+    });
+
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { durationMs: 0 },
+      }),
+      { params }
+    );
+
     expect(response.status).toBe(409);
     await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
-      error: 'Cannot complete session before audio is saved',
+      error: 'Cannot modify durationMs of a finalized session',
     });
+    expect(sessionUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('C2: 非终态会话拒绝把 durationMs 调低', async () => {
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 'session-1',
+      userId: 'user-1',
+      title: 'Lecture',
+      status: 'RECORDING',
+      serverStartedAt: new Date('2026-03-27T10:00:00.000Z'),
+      serverPausedAt: null,
+      durationMs: 60_000,
+    });
+
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { durationMs: 0 },
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(409);
+    await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
+      error: 'durationMs cannot be lowered',
+    });
+    expect(sessionUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('允许在终态会话上重命名（title PATCH 不受 durationMs 守卫影响）', async () => {
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 'session-1',
+      userId: 'user-1',
+      title: 'Lecture',
+      status: 'COMPLETED',
+      serverStartedAt: null,
+      serverPausedAt: null,
+      durationMs: 7_200_000,
+    });
+    sessionUpdateMock.mockResolvedValue({ id: 'session-1', title: 'Renamed' });
+
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { title: 'Renamed' },
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(200);
+    expect(sessionUpdateMock).toHaveBeenCalledTimes(1);
+    expect(sessionUpdateMock.mock.calls[0][0].data.title).toBe('Renamed');
   });
 
   it('PATCH status=FINALIZING 时记录录音结束时间到 serverPausedAt', async () => {
@@ -248,6 +335,9 @@ describe('session detail route', () => {
       where: { id: 'session-1' },
     });
     expect(transactionMock).toHaveBeenCalledTimes(1);
+    // U4：删行前 best-effort 物理清理产物 + 录音草稿目录
+    expect(deleteSessionArtifactsMock).toHaveBeenCalledTimes(1);
+    expect(deleteRecordingDraftMock).toHaveBeenCalledTimes(1);
   });
 
   it('删除进行中的异步上传 session 时先取消（清本地盘 + Soniox 文件）', async () => {
@@ -303,10 +393,8 @@ describe('session detail route', () => {
     }
   );
 
-  it('删除会话时按 owner 释放 legacy 对话附件字节', async () => {
-    chatAttachmentGroupByMock.mockResolvedValue([
-      { userId: 'user-1', _sum: { bytes: BigInt(4096) } },
-    ]);
+  it('U8: 删除会话时 legacy 对话经 deleteConversationsCascade 删干净（含 Cloudreve 物理文件 + 释放字节）', async () => {
+    conversationFindManyMock.mockResolvedValue([{ id: 'conv-1' }, { id: 'conv-2' }]);
 
     const response = await DELETE(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {
@@ -316,11 +404,24 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(chatAttachmentGroupByMock).toHaveBeenCalledWith({
-      by: ['userId'],
-      where: { conversation: { sessionId: 'session-1' } },
-      _sum: { bytes: true },
+    expect(conversationFindManyMock).toHaveBeenCalledWith({
+      where: { sessionId: 'session-1' },
+      select: { id: true },
     });
-    expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 4096);
+    expect(deleteConversationsCascadeMock).toHaveBeenCalledWith(['conv-1', 'conv-2']);
+  });
+
+  it('U8: 无 legacy 对话时不调 deleteConversationsCascade', async () => {
+    conversationFindManyMock.mockResolvedValue([]);
+
+    const response = await DELETE(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'DELETE',
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(200);
+    expect(deleteConversationsCascadeMock).not.toHaveBeenCalled();
   });
 });

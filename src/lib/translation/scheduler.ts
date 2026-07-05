@@ -41,6 +41,11 @@ export class TranslationScheduler {
       this.onModelProgress?.(progress, status);
     });
     this.onModelLoaded?.();
+
+    // U28：模型加载期间入队的定稿句在就绪后补翻一次，避免这些段落永久无译文。
+    if (this.pendingSentences.length > 0 && !this.batchTimer) {
+      this.batchTimer = setTimeout(() => this.flushBatch(), this.batchDelayMs);
+    }
   }
 
   /** 设置目标语言，用于同语言 passthrough */
@@ -55,11 +60,12 @@ export class TranslationScheduler {
       return;
     }
 
-    if (!this.localTranslator?.loaded) return;
-
+    // U28：模型下载/初始化期间（loaded=false）不要丢弃定稿句，先入队；
+    // 待 initLocalTranslator 的 onModelLoaded 后统一 flush，避免这些段落永久无译文。
     this.pendingSentences.push({ id: segmentId, text: sentence });
 
-    if (!this.batchTimer) {
+    // 仅在模型已就绪时才安排 flush；未就绪时积压，加载完成后由 initLocalTranslator 触发。
+    if (this.localTranslator?.loaded && !this.batchTimer) {
       this.batchTimer = setTimeout(() => this.flushBatch(), this.batchDelayMs);
     }
   }

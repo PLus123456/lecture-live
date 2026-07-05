@@ -317,7 +317,7 @@ function RecentChatsSection() {
           const label =
             c.title && c.title.trim().length > 0
               ? c.title
-              : t('sidebar.noRecentChats');
+              : t('sidebar.untitledChat');
           return (
             <li key={c.id}>
               <Link

@@ -19,6 +19,20 @@ export const CLIENT_SESSION_TOKEN = '__cookie_session__';
 const DUMMY_PASSWORD_HASH =
   '$2a$12$l8o61N0Huak0dRlwugeWR.BFVvNTyaqygzfgFHhPLBBEPtvQY9z..';
 
+// 用户不存在时用于恒定时间比较的哑 hash。真实用户 hash 的 cost = siteSettings.bcrypt_rounds；
+// 若哑 hash（固定 cost 12）与之不一致，bcrypt.compare 的耗时差异会重新暴露"账号是否存在"的侧信道。
+// 故按 rounds 缓存一份 cost 匹配的哑 hash（每个 rounds 值只生成一次）。
+const dummyHashByRounds = new Map<number, string>();
+function getDummyPasswordHash(rounds?: number): string {
+  if (rounds == null || rounds === 12) return DUMMY_PASSWORD_HASH;
+  let h = dummyHashByRounds.get(rounds);
+  if (!h) {
+    h = bcrypt.hashSync('lecture-live-dummy-password', rounds);
+    dummyHashByRounds.set(rounds, h);
+  }
+  return h;
+}
+
 interface TokenBlacklistEntry {
   expiresAt: number;
 }
@@ -325,7 +339,11 @@ export function signToken(
 
 /** 获取 JWT 过期天数和对应的 Cookie maxAge */
 export function getJwtExpiryConfig(jwtExpiryDays?: number) {
-  const days = jwtExpiryDays ?? DEFAULT_JWT_EXPIRY_DAYS;
+  // 会话最长绝对存活 = ABSOLUTE_SESSION_LIFETIME_MS（30 天，verifyToken 硬性拦截）；
+  // admin 把 jwt_expiry 配到更大（可达 365 天）只会让 JWT exp/cookie maxAge 与真实存活期不符、
+  // 误导用户。这里把生效值钳到绝对上限，让 cookie/JWT 与实际登出时机一致。
+  const absoluteDays = ABSOLUTE_SESSION_LIFETIME_MS / (24 * 60 * 60 * 1000);
+  const days = Math.min(jwtExpiryDays ?? DEFAULT_JWT_EXPIRY_DAYS, absoluteDays);
   return {
     expiresInDays: days,
     cookieMaxAge: days * 24 * 60 * 60,
@@ -446,14 +464,15 @@ export async function changePassword(
 export async function login(
   email: string,
   password: string,
-  options?: { jwtExpiryDays?: number }
+  options?: { jwtExpiryDays?: number; bcryptRounds?: number }
 ) {
   const user = await prisma.user.findUnique({ where: { email } });
 
   // 用户不存在时也执行一次固定成本的 bcrypt.compare，避免账户枚举时间侧信道。
+  // 哑 hash 的 cost 需与当前 bcrypt_rounds 匹配，否则耗时差异仍会泄露账号是否存在。
   const passwordMatches = await bcrypt.compare(
     password,
-    user?.passwordHash ?? DUMMY_PASSWORD_HASH
+    user?.passwordHash ?? getDummyPasswordHash(options?.bcryptRounds)
   );
 
   if (!user || !passwordMatches) {

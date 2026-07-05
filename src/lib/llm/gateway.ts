@@ -107,6 +107,21 @@ const THINKING_BUDGET_MAP: Record<ThinkingDepth, number> = {
   medium: 5000,
   high: 10000,
 };
+
+/**
+ * Anthropic Extended Thinking 要求 budget_tokens 严格小于 max_tokens，否则整次请求
+ * 返回 400。THINKING_BUDGET_MAP 里的档位（medium=5000/high=10000）可能 >= 模型的
+ * maxTokens（DEPTH 模型默认 maxTokens=4096），故按 maxTokens 钳一次：
+ *  - 上界 maxTokens-1（满足 < max_tokens 硬约束）
+ *  - 下界 1024（Anthropic 要求 budget_tokens>=1024，且预算被压得过小时仍能触发思考）
+ * 极端情况下 maxTokens<=1024 时以 maxTokens-1 为准（宁可小于下限也不能 >= max_tokens）。
+ */
+function clampThinkingBudget(depth: ThinkingDepth, maxTokens: number): number {
+  const desired = THINKING_BUDGET_MAP[depth];
+  const upper = Math.max(1, maxTokens - 1);
+  const clamped = Math.min(desired, upper);
+  return Math.max(Math.min(1024, upper), clamped);
+}
 const llmLogger = logger.child({ component: 'llm-gateway' });
 
 /* ------------------------------------------------------------------ */
@@ -367,7 +382,10 @@ function buildThinkingParams(
       return {
         thinking: {
           type: 'enabled',
-          budget_tokens: THINKING_BUDGET_MAP[provider.thinkingDepth],
+          budget_tokens: clampThinkingBudget(
+            provider.thinkingDepth,
+            provider.maxTokens
+          ),
         },
         temperature: 1,
       };
@@ -384,7 +402,10 @@ function buildThinkingParams(
         ? userPref
         : provider.thinkingDepth; // forced / auto → 用模型默认深度
     return {
-      thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET_MAP[depth] },
+      thinking: {
+        type: 'enabled',
+        budget_tokens: clampThinkingBudget(depth, provider.maxTokens),
+      },
       temperature: 1,
     };
   }
@@ -757,11 +778,18 @@ export async function callLLMWithHistoryStream(
 /*  多模态 content 构建                                                  */
 /* ------------------------------------------------------------------ */
 
-/** Anthropic content block：当前轮带图时拼成 [text, image...] */
+/**
+ * Anthropic content block：当前轮带图时拼成 [text, image...]。
+ * supportsImage=false 时忽略图片、退回纯文本 —— 防止把持久化的图片附件发给纯文本
+ * 模型触发上游 400（该 400 非 context-length，降级重试无效，会导致每轮失败）。
+ */
 function buildAnthropicContent(
-  msg: ChatHistoryMessage
+  msg: ChatHistoryMessage,
+  supportsImage: boolean
 ): string | Array<Record<string, unknown>> {
-  if (!msg.images || msg.images.length === 0) return msg.content;
+  if (!supportsImage || !msg.images || msg.images.length === 0) {
+    return msg.content;
+  }
   const blocks: Array<Record<string, unknown>> = [];
   if (msg.content) blocks.push({ type: 'text', text: msg.content });
   for (const img of msg.images) {
@@ -773,11 +801,18 @@ function buildAnthropicContent(
   return blocks;
 }
 
-/** OpenAI content：当前轮带图时拼成 [text, image_url...] */
+/**
+ * OpenAI content：当前轮带图时拼成 [text, image_url...]。
+ * supportsImage=false 时忽略图片、退回纯文本（同 Anthropic 侧，避免纯文本模型收到
+ * image_url 触发上游 400）。
+ */
 function buildOpenAIContent(
-  msg: ChatHistoryMessage
+  msg: ChatHistoryMessage,
+  supportsImage: boolean
 ): string | Array<Record<string, unknown>> {
-  if (!msg.images || msg.images.length === 0) return msg.content;
+  if (!supportsImage || !msg.images || msg.images.length === 0) {
+    return msg.content;
+  }
   const blocks: Array<Record<string, unknown>> = [];
   if (msg.content) blocks.push({ type: 'text', text: msg.content });
   for (const img of msg.images) {
@@ -937,10 +972,14 @@ async function streamAnthropicWithHistory(
     model: provider.model,
     max_tokens: provider.maxTokens,
     system,
-    messages: messages.map((m) => ({
-      role: m.role,
-      content: buildAnthropicContent(m),
-    })),
+    // 过滤掉 content 为空/纯空白的历史消息：Anthropic Messages API 对空 content
+    // 的消息返回 400，会毒化整条对话（此前某轮落库空 assistant 消息即触发）。
+    messages: messages
+      .filter((m) => m.content.trim().length > 0)
+      .map((m) => ({
+        role: m.role,
+        content: buildAnthropicContent(m, provider.supportsImage),
+      })),
     temperature: params.temperature,
     stream: true,
   };
@@ -972,6 +1011,10 @@ async function streamAnthropicWithHistory(
   let thinking = '';
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
+  // 记录 mid-stream error 事件：Anthropic 上游过载/超限时会先发 {"type":"error",...}
+  // 再关流。若不捕获，截断的半句正文会被当成功返回并永久落库。读完流后统一抛出，
+  // 让路由把它当失败处理（不落库 assistant 消息）。
+  let streamError: string | undefined;
 
   await readSseLines(res, (data) => {
     if (!data || data === '[DONE]') return;
@@ -982,6 +1025,18 @@ async function streamAnthropicWithHistory(
       return;
     }
     const eventType = parsed.type;
+
+    if (eventType === 'error') {
+      const errObj = parsed.error as Record<string, unknown> | undefined;
+      const errMsg =
+        typeof errObj?.message === 'string'
+          ? errObj.message
+          : typeof errObj?.type === 'string'
+            ? errObj.type
+            : 'unknown streaming error';
+      streamError = sanitizeApiError(errMsg);
+      return;
+    }
 
     if (eventType === 'content_block_delta') {
       const delta = parsed.delta as Record<string, unknown> | undefined;
@@ -1010,6 +1065,10 @@ async function streamAnthropicWithHistory(
       }
     }
   });
+
+  if (streamError) {
+    throw new Error(`Anthropic streaming error: ${streamError}`);
+  }
 
   return {
     text,
@@ -1176,10 +1235,14 @@ async function streamOpenAICompatibleWithHistory(
     temperature: temperatureForOpenAI(provider, params),
     messages: [
       { role: 'system', content: system },
-      ...messages.map((m) => ({
-        role: m.role,
-        content: buildOpenAIContent(m),
-      })),
+      // 过滤空 content 历史消息（与 Anthropic 侧一致）：多数 OpenAI 兼容 provider
+      // 容忍空串，但个别实现同样报错；统一过滤避免对话中毒的跨 provider 差异。
+      ...messages
+        .filter((m) => m.content.trim().length > 0)
+        .map((m) => ({
+          role: m.role,
+          content: buildOpenAIContent(m, provider.supportsImage),
+        })),
     ],
     stream: true,
     stream_options: { include_usage: true },
@@ -1211,6 +1274,9 @@ async function streamOpenAICompatibleWithHistory(
   let thinking = '';
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
+  // mid-stream error 兜底（部分 OpenAI 兼容 provider 会在 data 行里塞 {"error":{...}}
+  // 后关流）——读完流后统一抛出，避免把截断正文当成功持久化。
+  let streamError: string | undefined;
 
   await readSseLines(res, (data) => {
     if (!data || data === '[DONE]') return;
@@ -1218,6 +1284,18 @@ async function streamOpenAICompatibleWithHistory(
     try {
       parsed = JSON.parse(data) as Record<string, unknown>;
     } catch {
+      return;
+    }
+
+    const errObj = parsed.error as Record<string, unknown> | undefined;
+    if (errObj) {
+      const errMsg =
+        typeof errObj.message === 'string'
+          ? errObj.message
+          : typeof errObj.type === 'string'
+            ? errObj.type
+            : 'unknown streaming error';
+      streamError = sanitizeApiError(errMsg);
       return;
     }
 
@@ -1252,6 +1330,10 @@ async function streamOpenAICompatibleWithHistory(
     }
   });
 
+  if (streamError) {
+    throw new Error(`OpenAI-compatible streaming error: ${streamError}`);
+  }
+
   return {
     text,
     thinking: thinking || undefined,
@@ -1272,20 +1354,23 @@ async function streamOpenAICompatibleWithHistory(
  *
  * 调用者应在 admin 后台为 LlmPurpose.EMBEDDING 配置一个合适的 OpenAI 兼容模型。
  */
-export async function callEmbedding(texts: string[]): Promise<number[][]> {
-  if (texts.length === 0) return [];
+/**
+ * 单次 /embeddings 请求的最大输入条数。国内 embedding 供应商普遍对单请求 input
+ * 数组长度设上限（如智谱 embedding-3 = 64）；长转录/多录音首建 RAG 时 chunk 数可轻易
+ * 破百。取 32 兼顾各家（远低于常见 64 上限），超出即分批循环调用后按序合并。
+ * 可用环境变量 LLM_EMBEDDING_BATCH_SIZE 覆盖。
+ */
+function getEmbeddingBatchSize(): number {
+  const raw = parseInt(process.env.LLM_EMBEDDING_BATCH_SIZE || '', 10);
+  if (Number.isFinite(raw) && raw >= 1) return raw;
+  return 32;
+}
 
-  const provider = await getProviderForPurpose('EMBEDDING');
-
-  if (provider.isAnthropic) {
-    throw new Error(
-      `Anthropic provider「${provider.name}」不支持 embeddings 端点。` +
-        '请到 admin 面板「LLM Providers」配置一个 OpenAI 兼容 provider（如 OpenAI、OpenRouter、火山、智谱，或自建的 text-embedding 模型），' +
-        '并把它的某个 model 用途设为 EMBEDDING 并勾选「设为默认」后保存。'
-    );
-  }
-
-  const startedAt = Date.now();
+/** 对单批文本调用 /embeddings 端点，返回与输入等长、按 index 有序的向量数组 */
+async function callEmbeddingBatch(
+  provider: LLMProviderConfig,
+  texts: string[]
+): Promise<number[][]> {
   const res = await fetch(`${provider.apiBase}/embeddings`, {
     method: 'POST',
     headers: {
@@ -1321,22 +1406,50 @@ export async function callEmbedding(texts: string[]): Promise<number[][]> {
   const sorted = [...data.data].sort(
     (a, b) => (a.index ?? 0) - (b.index ?? 0)
   );
-  const vectors = sorted.map((item) => {
+  return sorted.map((item) => {
     if (!Array.isArray(item.embedding)) {
       throw new Error('Embedding API response missing embedding array');
     }
     return item.embedding;
   });
+}
+
+export async function callEmbedding(texts: string[]): Promise<number[][]> {
+  if (texts.length === 0) return [];
+
+  const provider = await getProviderForPurpose('EMBEDDING');
+
+  if (provider.isAnthropic) {
+    throw new Error(
+      `Anthropic provider「${provider.name}」不支持 embeddings 端点。` +
+        '请到 admin 面板「LLM Providers」配置一个 OpenAI 兼容 provider（如 OpenAI、OpenRouter、火山、智谱，或自建的 text-embedding 模型），' +
+        '并把它的某个 model 用途设为 EMBEDDING 并勾选「设为默认」后保存。'
+    );
+  }
+
+  const startedAt = Date.now();
+  const batchSize = getEmbeddingBatchSize();
+
+  // 分批：单请求输入条数超供应商上限会整批 400（被上层静默吞成空串导致 RAG 永久失效），
+  // 故按 batchSize 切片循环调用，再按输入顺序合并（各批向量顺序已在 callEmbeddingBatch
+  // 内按 index 归位）。
+  const vectors: number[][] = [];
+  for (let offset = 0; offset < texts.length; offset += batchSize) {
+    const batch = texts.slice(offset, offset + batchSize);
+    const batchVectors = await callEmbeddingBatch(provider, batch);
+    for (const v of batchVectors) vectors.push(v);
+  }
 
   llmLogger.info(
     {
       provider: provider.name,
       model: provider.model,
       purpose: 'EMBEDDING',
-      batchSize: texts.length,
+      inputCount: texts.length,
+      batchSize,
+      batches: Math.ceil(texts.length / batchSize),
       dim: vectors[0]?.length ?? 0,
       durationMs: Date.now() - startedAt,
-      usage: data.usage,
     },
     'Embedding request completed'
   );

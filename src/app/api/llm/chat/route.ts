@@ -83,6 +83,42 @@ function dropTrailingOrphanUser(
 }
 
 /**
+ * 把解析出的 thinkingPreference 归一为「实际发给 gateway 的偏好」，并对 FREE 用户施加
+ * high→medium 的角色 clamp。
+ *
+ *  - 显式 low/medium/high：用 access.ts 已 clamp 过的 finalDepth（FREE high 已降 medium）。
+ *  - forced/auto：此前直接透传，会让 gateway 取 provider.thinkingDepth；当模型默认深度为
+ *    high 时 FREE 用户绕过 clamp 按 high 档消耗思考 token（见 v3 finding U52）。这里对
+ *    DEPTH 模型上默认深度=high 的情况显式降到 medium。
+ *  - off：透传（不启用思考）。
+ */
+function resolveEffectivePreference(
+  parsedPreference: ThinkingPreference,
+  finalDepth: ThinkingDepth,
+  role: 'ADMIN' | 'PRO' | 'FREE',
+  providerConfig?: { thinkingMode?: string; thinkingDepth?: ThinkingDepth }
+): ThinkingPreference {
+  if (
+    parsedPreference === 'low' ||
+    parsedPreference === 'medium' ||
+    parsedPreference === 'high'
+  ) {
+    return finalDepth;
+  }
+  // forced / auto：仅当 FREE + DEPTH 模型 + 模型默认深度=high 时才 clamp 到 medium，
+  // 其余情况保持原语义透传（让 gateway 用 provider.thinkingDepth）。
+  if (
+    (parsedPreference === 'forced' || parsedPreference === 'auto') &&
+    role === 'FREE' &&
+    providerConfig?.thinkingMode === 'DEPTH' &&
+    providerConfig?.thinkingDepth === 'high'
+  ) {
+    return 'medium';
+  }
+  return parsedPreference;
+}
+
+/**
  * 把任意来源的错误转为"是否上下文超长"判定。
  * 各家 LLM API 在超长时返回的错误文本不一致，统一靠关键字嗅探。
  */
@@ -269,6 +305,9 @@ function streamChatResponse(
       // 一旦向客户端发出过 thinking/text 字节，就不能再重试降级了 —— 已 commit。
       let emittedBytes = false;
       let succeeded = false;
+      // 事务提交成功后置 true：done 帧因客户端断开 enqueue 抛错跳入 catch 时，
+      // 用它守卫避免二次插入同一条 assistant 消息（否则历史出现重复回答）。
+      let persisted = false;
 
       const persistAssistantMessage = () =>
         prisma.conversationMessage.create({
@@ -415,6 +454,26 @@ function streamChatResponse(
           return;
         }
 
+        // 空内容守卫：上游可能返回 200 但无正文（开启 thinking 后仅产出 thinking 块 /
+        // 在思考预算内撞 max_tokens / 空白响应）。若无条件落库空 content，下一轮该消息
+        // 会毒化 Anthropic 路径（空 content → 400）——gateway 侧已过滤空历史兜底，这里
+        // 再于源头拒绝落库空消息，当作生成失败回错误帧，避免污染对话。
+        if (!accumulatedText.trim()) {
+          chatLogger.warn(
+            {
+              conversationId: args.conversationId,
+              level: effectiveLevel,
+            },
+            'chat 上游返回空正文，跳过落库并回错误帧（避免空 content 毒化对话）'
+          );
+          send('error', {
+            error: 'Chat generation failed',
+            contextFull: false,
+          });
+          controller.close();
+          return;
+        }
+
         await prisma.$transaction([
           persistAssistantMessage(),
           prisma.conversation.update({
@@ -427,6 +486,7 @@ function streamChatResponse(
             },
           }),
         ]);
+        persisted = true;
 
         send('done', {
           model: args.modelLabel,
@@ -442,7 +502,9 @@ function streamChatResponse(
           { conversationId: args.conversationId, err: serializeError(err) },
           'chat 流式生成失败'
         );
-        if (accumulatedText.trim()) {
+        // 仅在尚未落库时兜底插入：done 帧因客户端断开抛错跳进来时 persisted 已为 true，
+        // 避免二次插入产生重复 assistant 消息。
+        if (!persisted && accumulatedText.trim()) {
           await persistAssistantMessage().catch(() => {});
         }
         // 安全：原始错误（可能含上游 provider 错误措辞/内部模型名）只进日志，
@@ -718,12 +780,12 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
     selection.providerConfig
   );
 
-  const effectivePreference: ThinkingPreference =
-    parsed.thinkingPreference === 'low' ||
-    parsed.thinkingPreference === 'medium' ||
-    parsed.thinkingPreference === 'high'
-      ? finalDepth
-      : parsed.thinkingPreference;
+  const effectivePreference = resolveEffectivePreference(
+    parsed.thinkingPreference,
+    finalDepth,
+    selection.user.role,
+    selection.providerConfig
+  );
 
   const provider =
     selection.providerConfig ?? (await getProviderForPurpose('CHAT'));
@@ -891,12 +953,12 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
     parsed.depth,
     selection.providerConfig
   );
-  const effectivePreference: ThinkingPreference =
-    parsed.thinkingPreference === 'low' ||
-    parsed.thinkingPreference === 'medium' ||
-    parsed.thinkingPreference === 'high'
-      ? finalDepth
-      : parsed.thinkingPreference;
+  const effectivePreference = resolveEffectivePreference(
+    parsed.thinkingPreference,
+    finalDepth,
+    selection.user.role,
+    selection.providerConfig
+  );
 
   const provider =
     selection.providerConfig ?? (await getProviderForPurpose('CHAT'));
@@ -946,9 +1008,15 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
   const totalTranscriptMs = cumulativeMs;
 
   const recordingIds = conversation.ownedSessions.map((s) => s.id);
-  // 内容签名 = 所有挂载录音的 segment 总数。挂载录音增长（如录制中的录音继续转写）时签名变化
-  // → 多录音 RAG 增量重建感知新内容；集合与各录音长度都不变才整体命中旧快照。
-  const ragContentSignature = combinedTranscript.length;
+  // 内容签名 = 段数与全文字符总长的组合。此前仅用 segment 总数，段数守恒但某段被
+  // 重转写/纠正（文本变、段数不变）时签名不变 → 多录音 RAG 命中旧快照、检索到纠正前
+  // 文本（v3 finding U76）。这里叠加全文 char 长度，令同段数文本改写也触发增量重建
+  // （与单录音路径的 lastContentLength 判据一致）。
+  const ragTotalChars = combinedTranscript.reduce(
+    (acc, seg) => acc + seg.text.length,
+    0
+  );
+  const ragContentSignature = combinedTranscript.length * 1_000_003 + ragTotalChars;
   const ragRetriever =
     recordingIds.length > 0
       ? makeRagRetrieverForRecordings(

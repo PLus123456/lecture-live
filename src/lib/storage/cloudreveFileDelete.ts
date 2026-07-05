@@ -19,6 +19,14 @@ import { logger, serializeError } from '@/lib/logger';
 
 const fileLogger = logger.child({ component: 'cloudreve-file-delete' });
 
+/**
+ * 出站 DELETE 的超时（ms）。与 cloudreve.ts 的 CLOUDREVE_API_TIMEOUT_MS 对齐：
+ * 删除是小 JSON 控制面请求，30s 足够覆盖慢网络，又能兜底防止 TCP 已连接但对端
+ * 永不响应（进程 D-state / 网络黑洞）时 fetch 永久挂起——那会无限阻塞用户删除
+ * 请求，并让 chatFilesCleanupJob 在第一个附件上永久卡死。
+ */
+const CLOUDREVE_DELETE_TIMEOUT_MS = 30_000;
+
 export interface CloudreveDeleteContext {
   baseUrl: string;
   accessToken: string;
@@ -71,6 +79,8 @@ export async function deleteCloudreveFile(
         Authorization: `Bearer ${ctx.accessToken}`,
       },
       body: JSON.stringify({ uris: [fileUri] }),
+      // 兜底超时：对端 TCP 已连接但永不响应时，避免 fetch 永久挂起阻塞调用方。
+      signal: AbortSignal.timeout(CLOUDREVE_DELETE_TIMEOUT_MS),
     });
 
     if (!response.ok) {

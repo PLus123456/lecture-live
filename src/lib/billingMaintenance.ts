@@ -29,6 +29,7 @@ import {
   deleteSonioxTranscription,
   getSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
+import { finalizeAsyncTranscription } from '@/lib/audio/asyncTranscribeFinalize';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
 // 异步上传转录的停滞阈值取更大值：Soniox 异步任务在 300 分钟上限文件上偶尔较慢，
@@ -388,13 +389,16 @@ async function reclaimStaleSessions(now: Date): Promise<number> {
  * STALE_ASYNC_THRESHOLD_MS 没更新的 session 标为 failed，让前端进度条停下、状态机解锁，
  * 并尽力清掉本地分片/合并/mp3 临时文件。
  *
- * U23（数据丢失防护）：对卡在 transcribing 且仍持有 sonioxTranscriptionId 的会话，标 failed
- * 前先向 Soniox 查一次真实状态——绝不盲目丢弃一份 Soniox 侧可能早已完成/仍在跑的转录。
- *   - Soniox 仍在 queued/processing 或已 completed：说明转录本身没坏，只是 DB 状态机没被
- *     前端 poll 推进（用户离线）。此时**不标 failed**，只 bump updatedAt 让本轮跳过、并留待
- *     既有的 status-route poll 路径正常收尾。这样已完成/进行中的转录不再被误杀丢弃。
- *     （注：在回收侧直接复刻「拉 transcript+落盘+扣费」的收尾/扣费口径风险高，故延后，
- *      见 PR。）
+ * U23（数据丢失防护）：对卡在 transcribing / finalizing 且仍持有 sonioxTranscriptionId 的会话，
+ * 标 failed 前先向 Soniox 查一次真实状态——绝不盲目丢弃一份 Soniox 侧可能早已完成/仍在跑的转录。
+ * （finalizing 也纳入：收尾中途崩溃会把会话留在 finalizing、而 Soniox 侧可能已 completed。）
+ *   - Soniox 仍在 queued/processing：转录本身没坏、还在跑，**不标 failed**，只 bump updatedAt
+ *     让本轮跳过，等 Soniox 真正完成后再收尾。
+ *   - Soniox 已 completed（v3-R6 后半）：用户离线、前端不再 poll → 回收路径**自动收尾并按相同
+ *     口径扣费**，不再干等前端。复用共享 finalizeAsyncTranscription（与 status-route 同一份
+ *     「拉 transcript+落盘+扣费」口径）+ 同一道幂等 claim（WHERE asyncTranscribeStatus IN
+ *     ['transcribing'] → 'finalizing'）：抢到才收尾，抢不到（并发前端 poll 已在收尾）就跳过。
+ *     二选一执行、绝不双扣。收尾抛错（拉 transcript/落盘瞬时故障）不在回收侧标 failed，留待重试。
  *   - Soniox 报 error 或 404（transcription 不存在）：确属失败，标 failed。
  * 其余非 transcribing 的僵尸态（合并/转码/上传阶段卡死）无 Soniox 转录产物可救，直接标 failed。
  *
@@ -414,6 +418,14 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
       asyncTranscribeStatus: true,
       sonioxFileId: true,
       sonioxTranscriptionId: true,
+      // 以下字段供「Soniox 已完成」时的共享 finalize 自动收尾 + 扣费复用
+      targetLang: true,
+      durationMs: true,
+      recordingPath: true,
+      title: true,
+      courseName: true,
+      createdAt: true,
+      folders: { select: { folderId: true } },
     },
     take: 100,
     orderBy: { updatedAt: 'asc' },
@@ -426,12 +438,14 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
   const sonioxConfig = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);
 
   for (const session of stuck) {
-    // U23：transcribing + 有 transcriptionId → 先查 Soniox，salvage 还没坏的转录
-    if (
-      session.asyncTranscribeStatus === 'transcribing' &&
-      session.sonioxTranscriptionId &&
-      sonioxConfig
-    ) {
+    // U23 + v3-R6：transcribing / finalizing + 有 transcriptionId → 先查 Soniox，salvage 还没
+    // 坏的转录。finalizing 也纳入：前端 poll 或上一轮回收在收尾中途崩溃/抛错（拉 transcript 前）
+    // 会把会话留在 finalizing，而 Soniox 侧转录可能早已 completed；若只救 transcribing，这类会
+    // 落到下方被标 failed 丢弃已完成转录。故一并 poll、completed 就走共享 finalize 收尾。
+    const salvageable =
+      session.asyncTranscribeStatus === 'transcribing' ||
+      session.asyncTranscribeStatus === 'finalizing';
+    if (salvageable && session.sonioxTranscriptionId && sonioxConfig) {
       let job;
       try {
         job = await getSonioxTranscription(
@@ -453,22 +467,18 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
         continue;
       }
 
-      if (
-        job.status === 'queued' ||
-        job.status === 'processing' ||
-        job.status === 'completed'
-      ) {
-        // 转录本身没坏（进行中或已完成）。不丢弃、不标 failed——回写同值 transcribing
-        // 触发 @updatedAt 自动刷新，让本轮之后不再立刻被当僵尸重扫；把真正的收尾（拉
-        // transcript + 扣费）留给既有的 status-route poll 路径，避免在回收侧复刻扣费口径
-        // 导致双扣/口径漂移。
+      if (job.status === 'queued' || job.status === 'processing') {
+        // 转录仍在跑。不丢弃、不标 failed——回写同值触发 @updatedAt 自动刷新，让本轮之后不再
+        // 立刻被当僵尸重扫；等 Soniox 真正 completed 后由本函数（或前端 poll）收尾。
+        // 用当前实际状态做 WHERE + 同值写（transcribing 或 finalizing），保守只在状态未变时刷新。
+        const currentStatus = session.asyncTranscribeStatus;
         await prisma.session
           .updateMany({
             where: {
               id: session.id,
-              asyncTranscribeStatus: 'transcribing',
+              asyncTranscribeStatus: currentStatus,
             },
-            data: { asyncTranscribeStatus: 'transcribing' },
+            data: { asyncTranscribeStatus: currentStatus },
           })
           .catch(() => undefined);
         billingLogger.info(
@@ -477,8 +487,72 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
             userId: session.userId,
             sonioxStatus: job.status,
           },
-          'stuck transcribing session still alive on Soniox; left for status-poll finalization'
+          'stuck async session still processing on Soniox; left for later finalization'
         );
+        continue;
+      }
+
+      if (job.status === 'completed') {
+        // U23 后半（v3-R6）：Soniox 已完成、但用户离线前端不再 poll → 回收路径自动收尾并按
+        // 相同口径扣费，而不是干等前端。复用共享 finalizeAsyncTranscription（与 status-route
+        // 同一份「拉 transcript+落盘+扣费」口径）+ 同一道幂等 claim。allowClaimFrom 含 transcribing
+        // 与 finalizing：finalizing 覆盖「收尾中途崩溃、Soniox 已完成」的残留会话，避免其被误标
+        // failed 丢弃已完成转录。claim 抢到才收尾；即便并发前端 poll 也在 finalizing，最终的单次
+        // 执行由 finalize 守卫（WHERE ='finalizing' → 'completed' 只一个 count===1）保证，绝不双扣。
+        try {
+          const result = await finalizeAsyncTranscription(
+            {
+              id: session.id,
+              userId: session.userId,
+              sonioxFileId: session.sonioxFileId,
+              sonioxTranscriptionId: session.sonioxTranscriptionId,
+              targetLang: session.targetLang,
+              durationMs: session.durationMs,
+              recordingPath: session.recordingPath,
+              title: session.title,
+              courseName: session.courseName,
+              createdAt: session.createdAt,
+              folderIds: session.folders.map((f) => f.folderId),
+            },
+            sonioxConfig,
+            { allowClaimFrom: ['transcribing', 'finalizing'] }
+          );
+
+          if (result.outcome === 'completed') {
+            reclaimedCount += 1;
+            billingLogger.info(
+              {
+                sessionId: session.id,
+                userId: session.userId,
+                segmentCount: result.segmentCount,
+              },
+              'reclaim auto-finalized completed async transcription'
+            );
+          } else {
+            // claim_lost（前端 poll 抢先）/ canceled_during_finalize：不重复处理，交给对方。
+            billingLogger.info(
+              {
+                sessionId: session.id,
+                userId: session.userId,
+                outcome: result.outcome,
+              },
+              'reclaim skipped async finalize (handled elsewhere or canceled)'
+            );
+          }
+        } catch (finalizeErr) {
+          // 拉 transcript / 落盘 阶段抛错（含瞬时网络故障）：不在回收侧标 failed，保守留待
+          // 下一维护周期或前端 poll 重试。此时状态可能已被 claim 置 'finalizing'——若确属瞬时，
+          // 前端 poll 会读到 finalizing 而放弃；下轮回收因 updatedAt 已刷新而暂不重扫，最终由
+          // 前端 status-route 的瞬时/永久错误处理路径收敛。绝不误标 failed 丢弃已完成转录。
+          billingLogger.error(
+            {
+              sessionId: session.id,
+              userId: session.userId,
+              err: serializeError(finalizeErr),
+            },
+            'reclaim auto-finalize failed; left for retry'
+          );
+        }
         continue;
       }
       // job.status === 'error' → 落到下方标 failed + 清 Soniox

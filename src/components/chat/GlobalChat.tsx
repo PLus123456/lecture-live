@@ -16,6 +16,7 @@ import {
   User,
   Bot,
   ChevronDown,
+  ChevronUp,
   ChevronRight,
   Sparkles,
   Check,
@@ -470,8 +471,9 @@ export default function GlobalChat({
     setContextFull,
   } = useChatStore();
 
-  // 本对话的运行时切片 —— messages/isLoading/contextFull 全从这里取（不再读全局单例）
-  const { messages, isLoading, contextFull } =
+  // 本对话的运行时切片 —— messages/archivedMessages/isLoading/contextFull 全从这里取（不再读全局单例）
+  // U19：此前漏读 archivedMessages，压缩过的对话里早期历史被永久隐藏、无展开入口。
+  const { messages, archivedMessages, isLoading, contextFull } =
     byConversation[conversationId] ?? EMPTY_CONVERSATION_RUNTIME;
 
   /* ── 局部 UI state ── */
@@ -495,7 +497,17 @@ export default function GlobalChat({
   const isEnded = endedAt !== null;
   /** IME 合成中（中文/日文输入法）—— 合成期间回车不应发送（修输入法回车误发） */
   const [composing, setComposing] = useState(false);
+  /** U19：主动压缩后被折叠的早期消息是否展开（与 ChatTab 的 展开/收起 一致） */
+  const [showArchived, setShowArchived] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  /**
+   * U79：记录最近一次 compositionend 的时间戳。Safari 的事件顺序是
+   * compositionend → keydown（Chrome 相反），确认 IME 候选词的那次 Enter 到达 keydown 时
+   * composing 已被重置、e.nativeEvent.isComposing 也已是 false，两道 IME 守卫双双失效，
+   * 导致 Safari 下"回车确认候选词"被误当成发送。用时间戳窗口把紧随 compositionend 的
+   * Enter 视为合成确认而非发送。
+   */
+  const lastCompositionEndRef = useRef(0);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const sendAbortRef = useRef<AbortController | null>(null);
@@ -657,6 +669,46 @@ export default function GlobalChat({
           if ((err as { name?: string })?.name === 'AbortError') return;
           setRecordings([]);
           setRecordingsReady(false);
+        }
+      })(),
+      (async () => {
+        // C10：回填已上传的附件 chips。此前刷新后 setAttachments([]) 从不重新拉取，
+        // 导致刷新前上传的附件 chip 消失、无法删除；且下次发送 attachmentIds 只带新附件，
+        // 会把 where 收窄、静默把旧附件从 LLM 上下文里丢掉。这里进对话就把已有附件拉回。
+        try {
+          const res = await fetch(
+            `/api/chat-uploads?conversationId=${encodeURIComponent(conversationId)}`,
+            { headers, signal: controller.signal }
+          );
+          if (controller.signal.aborted) return;
+          if (!res.ok) {
+            // 404（端点未上线）或其它错误 → 保持空列表，不打断对话加载。
+            return;
+          }
+          const data = (await res.json()) as {
+            attachments?: Array<{
+              id?: string;
+              fileName?: string;
+              bytes?: number | string;
+              kind?: 'image' | 'document' | 'text';
+            }>;
+          };
+          if (controller.signal.aborted) return;
+          const chips: AttachmentChipData[] = (data.attachments ?? [])
+            .filter((a): a is { id: string } & typeof a => typeof a.id === 'string')
+            .map((a) => ({
+              id: a.id,
+              fileName: a.fileName ?? a.id,
+              bytes:
+                typeof a.bytes === 'string'
+                  ? parseInt(a.bytes, 10) || 0
+                  : a.bytes ?? 0,
+              kind: a.kind ?? 'document',
+            }));
+          setAttachments(chips);
+        } catch (err) {
+          if ((err as { name?: string })?.name === 'AbortError') return;
+          // best-effort：拉取失败保持空列表，不影响其它加载。
         }
       })(),
     ]);
@@ -1093,8 +1145,13 @@ export default function GlobalChat({
         }
       }
     } catch (error) {
-      // 流被 abort（切换对话/卸载）—— 静默收尾，不写错误气泡。
-      if ((error as { name?: string })?.name === 'AbortError') return;
+      // 流被 abort（切换对话/卸载/点「停止」）—— 静默收尾，不写错误气泡。
+      // U18：必须先清掉占位消息的 streaming 标志再 return，否则该气泡的旋转 loader 与
+      // 「思考中…」占位会永久卡住（直到刷新/切换对话）。
+      if ((error as { name?: string })?.name === 'AbortError') {
+        updateMessage(conversationId, assistantId, { streaming: false });
+        return;
+      }
       updateMessage(conversationId, assistantId, {
         content: `Error: ${error instanceof Error ? error.message : 'Chat failed'}`,
         streaming: false,
@@ -1178,7 +1235,37 @@ export default function GlobalChat({
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
-        {messages.length === 0 && (
+        {/* U19：主动压缩后被折叠的早期消息 —— 用户可展开查看原文（与 ChatTab 一致） */}
+        {archivedMessages.length > 0 && (
+          <div className="border border-cream-200 rounded-md bg-cream-50/30">
+            <button
+              type="button"
+              onClick={() => setShowArchived((v) => !v)}
+              className="w-full flex items-center justify-between px-2.5 py-1.5
+                         text-[11px] text-charcoal-500 hover:bg-cream-100/50 transition-colors"
+            >
+              <span>
+                {showArchived
+                  ? t('chat.hideCollapsed', { count: archivedMessages.length })
+                  : t('chat.showCollapsed', { count: archivedMessages.length })}
+              </span>
+              {showArchived ? (
+                <ChevronUp className="w-3 h-3" />
+              ) : (
+                <ChevronDown className="w-3 h-3" />
+              )}
+            </button>
+            {showArchived && (
+              <div className="border-t border-cream-200 px-2 py-2 space-y-2 opacity-80">
+                {archivedMessages.map((msg) => (
+                  <MessageBubble key={msg.id} msg={msg} />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {messages.length === 0 && archivedMessages.length === 0 && (
           <div className="text-center py-8 text-charcoal-300 animate-fade-in-up">
             <Bot className="w-8 h-8 mx-auto mb-2 opacity-50 animate-breathe" />
             <p className="text-xs">{t('chat.composerPlaceholder')}</p>
@@ -1322,14 +1409,23 @@ export default function GlobalChat({
                 e.key === 'Enter' &&
                 !e.shiftKey &&
                 !composing &&
-                !e.nativeEvent.isComposing
+                !e.nativeEvent.isComposing &&
+                // U79：Safari 在 compositionend 之后才派发确认候选词的 keydown，此时上面两道
+                // 守卫都已失效；用时间窗口把紧随 compositionend（<50ms）的 Enter 视为合成确认，
+                // 不当发送。Chrome 里 isComposing 仍为 true，本就走不到这里，不受影响。
+                // keyCode 229 是部分浏览器对 IME 进行中 keydown 的标记，一并挡掉。
+                e.nativeEvent.keyCode !== 229 &&
+                Date.now() - lastCompositionEndRef.current > 50
               ) {
                 e.preventDefault();
                 void handleSend();
               }
             }}
             onCompositionStart={() => setComposing(true)}
-            onCompositionEnd={() => setComposing(false)}
+            onCompositionEnd={() => {
+              setComposing(false);
+              lastCompositionEndRef.current = Date.now();
+            }}
             onPaste={handlePaste}
             placeholder={
               isEnded ? t('chat.endedReadonly') : t('chat.composerPlaceholder')

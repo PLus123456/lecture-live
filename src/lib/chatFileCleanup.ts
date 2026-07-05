@@ -13,6 +13,9 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 // 共用 adminCleanup.ts 的 cutoff 函数，避免重复实现。
 import { olderThanDaysToCutoff } from '@/lib/adminCleanup';
+// U6：删行前先 best-effort 删 Cloudreve 物理文件（与 conversationCascade.ts 一致），
+// 否则行一删 cloudrevePath 即永久丢失，Cloudreve 上原文件 + .extracted.txt 成不可回收孤儿。
+import { deleteCloudreveAttachmentFiles } from '@/lib/storage/cloudreveFileDelete';
 
 export { olderThanDaysToCutoff };
 
@@ -131,10 +134,11 @@ export async function releaseUserStorageBytesRaw(
 
 /**
  * DELETE / POST 共用的核心清理逻辑：
- *  1. 把符合条件的行拉出来（硬上限 5000，超出留给下一次或 cron）。
- *  2. 在一个事务里：raw SQL clamp 释放每个用户的 storageBytesUsed + 删行。
+ *  1. 把符合条件的行拉出来（硬上限 5000，超出留给下一次或 cron），含物理路径。
+ *  2. 事务外 best-effort 删 Cloudreve 物理文件（原文件 + 抽取的 .txt）。
+ *  3. 在一个事务里：raw SQL clamp 释放每个用户的 storageBytesUsed + 删行。
  *
- * **不会动 Cloudreve 物理文件** —— 那是 U14 cron 的职责。
+ * U6：删物理文件必须在删行前做——行一删 cloudrevePath 即永久丢失，cron 也再扫不到。
  *
  * TODO U2 合并后改用 releaseStorageBytes(userId, bytes) 替代 raw SQL。
  */
@@ -162,7 +166,14 @@ export async function performChatFileCleanup(input: {
 
   const toDelete = await prisma.chatAttachment.findMany({
     where,
-    select: { id: true, userId: true, bytes: true },
+    // U6：多取 cloudrevePath/extractedTextPath，供删行前删物理文件用。
+    select: {
+      id: true,
+      userId: true,
+      bytes: true,
+      cloudrevePath: true,
+      extractedTextPath: true,
+    },
     take: HARD_LIMIT,
     orderBy: [{ createdAt: 'asc' }],
   });
@@ -179,6 +190,11 @@ export async function performChatFileCleanup(input: {
 
   const ids = toDelete.map((r) => r.id);
   let totalReleased = ZERO;
+
+  // U6：事务外 best-effort 删 Cloudreve 物理文件（原文件 + 抽取的 .txt），再删 DB 行。
+  // 顺序刻意放在删行前：一旦行删掉，cloudrevePath 就永久丢失、cron 也再扫不到。
+  // 与 conversationCascade.ts 同一范式；失败仅内部 warn，不阻塞 DB 清理。
+  await deleteCloudreveAttachmentFiles(toDelete);
 
   await prisma.$transaction(async (tx) => {
     for (const [userId, bytes] of byUser) {

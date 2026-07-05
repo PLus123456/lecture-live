@@ -311,7 +311,7 @@ describe('POST /api/chat-uploads', () => {
     expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
   });
 
-  it('未知 MIME → 415', async () => {
+  it('未知 MIME → 415，且回滚已预留的字节配额（U5）', async () => {
     isExtractableMimeMock.mockReturnValueOnce(false);
     const response = await POST(
       makeRequest({
@@ -322,6 +322,38 @@ describe('POST /api/chat-uploads', () => {
     );
     expect(response.status).toBe(415);
     expect(uploadMock).not.toHaveBeenCalled();
+    // U5：415 退出口也要 releaseStorageBytes，避免泄漏 reserveStorageBytes 已预留的字节。
+    // 3 字节内容 → 预留 3、回滚 3。
+    expect(reserveStorageBytesMock).toHaveBeenCalledWith('user-1', 3);
+    expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 3);
+  });
+
+  it('超长文件名被截断，使 fileName / cloudrevePath / extractedTextPath 均 ≤191（U32）', async () => {
+    // 250 字符的 base + .pdf → sanitize 后 254 字符，远超 191。
+    const longName = `${'a'.repeat(250)}.pdf`;
+    const response = await POST(
+      makeRequest({
+        fileName: longName,
+        contents: new Uint8Array([1, 2, 3, 4]),
+        type: 'application/pdf',
+      })
+    );
+    expect(response.status).toBe(200);
+
+    // 传给 Cloudreve 的 composedFileName = `${conversationId}_${safeFileName}`；
+    // 其对应 remotePath /user-1/chat-uploads/<composed>(.extracted.txt) 必须 ≤191。
+    const composed = uploadMock.mock.calls[0]?.[2] as string;
+    const remotePath = `/user-1/chat-uploads/${composed}`;
+    expect(remotePath.length).toBeLessThanOrEqual(191);
+    expect(`${remotePath}.extracted.txt`.length).toBeLessThanOrEqual(191);
+
+    // 落库的 fileName 本身也要 ≤191，且保留 .pdf 扩展名。
+    const createArgs = chatAttachmentCreateMock.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    const savedFileName = createArgs.data.fileName as string;
+    expect(savedFileName.length).toBeLessThanOrEqual(191);
+    expect(savedFileName.endsWith('.pdf')).toBe(true);
   });
 
   it('空 conversationId → 400', async () => {

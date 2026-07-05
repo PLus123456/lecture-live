@@ -76,7 +76,13 @@ export async function POST(
   }
 
   try {
-    await prisma.conversation.update({ where: { id }, data: { title } });
+    // U50：原子条件更新 —— 只在标题仍为 null 时写入，避免覆盖用户在 LLM 生成期间
+    // 经 PATCH 手动改好的标题（check-then-act 竞态）。updateMany 的 where 里带 title 条件，
+    // 命中 0 行即说明期间已被改名，静默跳过。
+    await prisma.conversation.updateMany({
+      where: { id, title: null },
+      data: { title },
+    });
   } catch (err) {
     apiLogger.warn(
       { id, err: serializeError(err) },

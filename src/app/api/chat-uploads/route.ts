@@ -50,6 +50,44 @@ function classifyKind(mt: string): AttachmentKind | null {
   return null;
 }
 
+/** ChatAttachment.fileName / cloudrevePath / extractedTextPath 的列宽（VARCHAR(191)）。 */
+const ATTACHMENT_COLUMN_MAX = 191;
+/** 抽取文本副本追加的后缀，也要计入 extractedTextPath 长度。 */
+const EXTRACTED_SUFFIX = '.extracted.txt';
+
+/**
+ * U32：把清洗后的文件名截断到能让 fileName / cloudrevePath / extractedTextPath 三列
+ * 都 ≤ VARCHAR(191)。最紧约束是 extractedTextPath：
+ *   `/{userId}/chat-uploads/{conversationId}_{name}.extracted.txt`
+ * 反推出 name 的最大可用长度，仅在超限时截断（尽量保留文件扩展名）。
+ */
+function truncateSafeFileName(
+  name: string,
+  userId: string,
+  conversationId: string
+): string {
+  // 固定开销：`/` + userId + `/chat-uploads/` + conversationId + `_` + …name… + `.extracted.txt`
+  const fixed =
+    1 +
+    userId.length +
+    '/chat-uploads/'.length +
+    conversationId.length +
+    1 +
+    EXTRACTED_SUFFIX.length;
+  // fileName 列本身也受 191 限；取两者更紧的上限。
+  const maxNameLen = Math.min(ATTACHMENT_COLUMN_MAX, ATTACHMENT_COLUMN_MAX - fixed);
+  if (name.length <= maxNameLen) return name;
+
+  // 尽量保留扩展名：`base.ext` → 截 base，保留 `.ext`（扩展名过长则整体硬截断）。
+  const dot = name.lastIndexOf('.');
+  const ext = dot > 0 ? name.slice(dot) : '';
+  if (ext && ext.length < maxNameLen) {
+    const base = name.slice(0, maxNameLen - ext.length);
+    return `${base}${ext}`;
+  }
+  return name.slice(0, Math.max(1, maxNameLen));
+}
+
 /**
  * 校验 conversation 是否归属当前用户。
  * 返回 true 表示允许，false 表示拒绝。
@@ -172,6 +210,9 @@ export async function POST(req: Request) {
     .trim();
   const kind = classifyKind(mt);
   if (!kind) {
+    // 回滚预留的字节配额（MIME 不受支持，文件不会入库/入云，额度不应被占用）。
+    // 与下方 Cloudreve-fail / DB-insert-fail 两个退出口一致，杜绝配额泄漏。
+    await releaseStorageBytes(user.id, file.size).catch(() => undefined);
     return NextResponse.json(
       { error: `Unsupported MIME type: ${mt}` },
       { status: 415 }
@@ -181,7 +222,17 @@ export async function POST(req: Request) {
   // 文件名清洗 + 同 conversation 下加前缀防碰撞
   // （CloudreveStorage.upload() 内部 sanitizePath 会去 '/'，无法直接把 conversationId 当目录用；
   // 因此把 conversationId 编入 fileName 仍能保证不同对话间不重名）
-  const safeFileName = sanitizeHeaderFilename(file.name);
+  //
+  // U32：ChatAttachment.fileName / cloudrevePath / extractedTextPath 均为 VARCHAR(191)。
+  // sanitizeHeaderFilename 只截到 255，且 cloudrevePath 还要拼
+  // `/{userId}/chat-uploads/{conversationId}_{name}`（+ 可能的 `.extracted.txt`），
+  // 过长文件名会让 DB insert 在 MySQL strict 下报 "Data too long"（且 Cloudreve 已存文件成孤儿）。
+  // 这里先按最紧约束（extractedTextPath）反推 name 的最大可用长度并截断，保证三列都 ≤191。
+  const safeFileName = truncateSafeFileName(
+    sanitizeHeaderFilename(file.name),
+    user.id,
+    conversationId
+  );
   const composedFileName = `${conversationId}_${safeFileName}`;
 
   // 读 buffer（后续上传 + 可选抽文本都要用同一份）

@@ -20,6 +20,7 @@ import {
   deleteTranscriptDraft,
   loadTranscriptDraft,
 } from '@/lib/transcriptDraftPersistence';
+import { invalidateRagCache } from '@/lib/llm/embedding/transcriptRag';
 
 // Save transcript + summary data
 export async function POST(
@@ -128,6 +129,11 @@ export async function POST(
       invalidateSessionsApiCache(user.id),
       invalidateFoldersApiCache(user.id),
     ]);
+
+    // 转录被改写（纠错/重转写）后主动失效 RAG 缓存：既清该 session 的单录音 entry，
+    // 也清所有引用了该录音的 multi-recording entry（invalidateRagCache 内部同时处理两者），
+    // 避免全局/单录音对话继续检索到改写前的旧文本（v3 finding U76 后半）。
+    invalidateRagCache(session.id);
 
     // 转录稿已永久保存，删除草稿临时文件
     try {

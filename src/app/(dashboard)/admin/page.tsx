@@ -332,6 +332,7 @@ export default function AdminPage() {
           {activeTab === 'groups' && <UserGroupsPanel />}
           {activeTab === 'users' && <UserManagementPanel />}
           {activeTab === 'files' && <FilesPanel />}
+          {activeTab === 'chatFiles' && <ChatFilesPanel />}
           {activeTab === 'shareLinks' && <ShareLinksPanel />}
           {activeTab === 'logs' && <AuditLogPanel />}
           {activeTab === 'reconciliation' && <ReconciliationPanel />}

@@ -1,8 +1,11 @@
 import { NextResponse } from 'next/server';
-import { writeFile, mkdir } from 'fs/promises';
+import { writeFile, mkdir, unlink } from 'fs/promises';
 import path from 'path';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { sanitizeSvgContent } from '@/lib/svgSanitizer';
+
+// 所有允许的图标扩展名（用于重传换格式时清理旧扩展名的残留文件）
+const ALL_ICON_EXTENSIONS = ['.png', '.jpg', '.svg', '.ico', '.webp', '.gif'];
 
 // 允许的图标类型及对应文件名前缀
 const ICON_TYPES: Record<string, string> = {
@@ -139,6 +142,15 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
+    // G7：写入前清理同一图标前缀但扩展名不同的旧文件，否则重传换格式（如 PNG→SVG）后
+    // 旧 logo.png 不再被任何设置引用，却永久残留在 data/icons/（全站无 cron/unlink 兜底）。
+    const prefix = ICON_TYPES[type];
+    await Promise.all(
+      ALL_ICON_EXTENSIONS.filter((otherExt) => otherExt !== ext).map((otherExt) =>
+        unlink(path.join(iconsDir, `${prefix}${otherExt}`)).catch(() => undefined)
+      )
+    );
+
     const filePath = path.join(iconsDir, fileName);
     await writeFile(filePath, buffer);
 

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
+import { logAction } from '@/lib/auditLog';
 
 // 有效的 LLM 用途枚举值
 const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING'];
@@ -11,7 +12,7 @@ export async function POST(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const { response } = await requireAdminAccess(req, {
+  const { user: admin, response } = await requireAdminAccess(req, {
     scope: 'admin:llm-models:create',
     limit: 30,
     windowMs: 10 * 60_000,
@@ -112,6 +113,12 @@ export async function POST(
         isDefault: isDefault ?? false,
         sortOrder: sortOrder ?? 0,
       },
+    });
+
+    // U67：模型级变更补审计（与 provider 级端点对齐），否则删/改默认模型无操作者留痕。
+    logAction(req, 'admin.llm.model.create', {
+      user: admin,
+      detail: `新增 LLM 模型: ${modelId} (${effectivePurpose}${isDefault ? ', 默认' : ''})`,
     });
 
     return NextResponse.json({ model }, { status: 201 });

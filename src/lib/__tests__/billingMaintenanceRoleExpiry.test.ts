@@ -18,7 +18,9 @@ vi.mock('@/lib/prisma', () => ({
 }));
 
 vi.mock('@/lib/userRoles', () => ({
-  getDefaultQuotasForRole: (role: string) =>
+  // U46：billingMaintenance 现从 resolveRoleQuotas 读取（原 getDefaultQuotasForRole）。
+  // 未配置 group_config_<role> 时该 resolver 回落硬编码默认，等价于旧行为，故此处沿用相同返回值。
+  resolveRoleQuotas: async (role: string) =>
     role === 'PRO'
       ? { transcriptionMinutesLimit: 600, storageHoursLimit: 100, allowedModels: 'local,gpt,deepseek' }
       : { transcriptionMinutesLimit: 60, storageHoursLimit: 10, allowedModels: 'local' },

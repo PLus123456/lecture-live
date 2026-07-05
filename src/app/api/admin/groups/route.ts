@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
 import { logAction } from '@/lib/auditLog';
-import { getDefaultQuotasForRole } from '@/lib/userRoles';
+import { resolveRoleQuotas } from '@/lib/userRoles';
 
 // 系统内置角色
 const SYSTEM_ROLES = ['FREE', 'PRO', 'ADMIN'] as const;
@@ -197,9 +197,14 @@ export async function POST(req: Request) {
     // 生成唯一 ID
     const id = `custom_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
+    // U65：真实输入 0 必须保留（如「仅聊天」组转录分钟=0）。旧写法 `Number()||60`/`||10`
+    // 会把 0 静默改成默认值，且该值经 users 分配路径原样写入用户配额、无下游兜底纠正，
+    // 与 PUT 的 `|| 0`（缺省时才回落）语义不一致。改为显式 NaN 兜底，非数字才用默认。
+    const rawMinutes = Number(permissions?.transcriptionMinutesLimit);
+    const rawStorageHours = Number(permissions?.storageHoursLimit);
     const sanitizedPermissions: GroupPermissions = {
-      transcriptionMinutesLimit: Math.max(0, Math.floor(Number(permissions?.transcriptionMinutesLimit) || 60)),
-      storageHoursLimit: Math.max(0, Number(permissions?.storageHoursLimit) || 10),
+      transcriptionMinutesLimit: Math.max(0, Math.floor(Number.isFinite(rawMinutes) ? rawMinutes : 60)),
+      storageHoursLimit: Math.max(0, Number.isFinite(rawStorageHours) ? rawStorageHours : 10),
       allowedModels: rawModels,
       maxConcurrentSessions: Math.max(1, Math.floor(Number(permissions?.maxConcurrentSessions) || 1)),
     };
@@ -409,10 +414,13 @@ export async function DELETE(req: Request) {
       });
 
       // Bug 7: 按 role 分组批量更新，替代逐条 update
+      // U46：删组恢复配额时从 SiteSetting.group_config_<role> 解析（缺失回落默认），
+      // 与 admin 用户组配置一致。读的是 group_config_<role>，与本事务改的 custom_groups
+      // 不同 key，无读写依赖，故用 prisma 读安全。
       if (affectedUsers.length > 0) {
         const roleSet = new Set(affectedUsers.map((u) => u.role));
         for (const role of roleSet) {
-          const defaults = getDefaultQuotasForRole(role);
+          const defaults = await resolveRoleQuotas(role);
           await tx.user.updateMany({
             where: { customGroupId: groupId, role },
             data: {

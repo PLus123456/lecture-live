@@ -72,6 +72,20 @@ interface CloudreveTokenSet {
 /** 内存中的 token 缓存 */
 let tokenCache: CloudreveTokenSet | null = null;
 
+/**
+ * 模块级 single-flight（C8）：Next 进程内**按需刷新**的去重锁。
+ *
+ * 问题：getAccessToken 对 tokenCache 是无锁 check-then-act，临期时并发请求会各自
+ * 用同一份 refresh_token 调 refreshAccessToken；Cloudreve rotation 后只有第一个成功，
+ * 其余拿到的 rotated refresh_token 已作废 → 败者 catch 里 clearPersistedTokens 把
+ * 胜者刚写的新 grant 删掉，全站授权被抹。
+ *
+ * 修法：所有并发调用共享同一个 in-flight Promise —— 只发一次 refresh，大家等同一个
+ * 结果。这样根本不存在"用已被 rotate 的旧 token 再刷一次"的败者，也就不会误删。
+ * 刷新结束（成功或失败）后在 finally 里清空，下一轮临期再重新发起。
+ */
+let inFlightTokenRefresh: Promise<CloudreveTokenSet> | null = null;
+
 /** 内存中的 OAuth 配置缓存（从数据库加载后缓存） */
 let configCache: CloudreveOAuthConfig | null = null;
 let configCacheTime = 0;
@@ -493,7 +507,65 @@ export async function exchangeAuthorizationCode(
 }
 
 /**
- * 刷新 access_token
+ * refresh_token 被 Cloudreve **确定性拒绝**（吊销 / 失效 / invalid_grant）时抛出的错误。
+ *
+ * 只有这一种错误才应触发 clearPersistedTokens —— 因为此时 DB 里的 refresh_token 已经
+ * 不可能再刷新成功，留着只会让每次请求都撞同一份废 token。
+ *
+ * 与之相对：瞬时错误（5xx / 超时 AbortError / 网络 ECONNREFUSED / DNS 抖动 / 或任何
+ * 无法确定是吊销的情形）一律用普通 Error 抛出、**绝不删 token**，让下一次循环 / 请求
+ * 自愈重试。历史 bug：refreshAccessToken 把这两类混为一个 Error，任一处 catch 首次
+ * 失败即永久删 refresh_token（C18）。
+ */
+export class CloudreveAuthRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CloudreveAuthRejectedError';
+  }
+}
+
+/**
+ * 判定 refresh 端点返回的 HTTP 状态是否代表**确定性 token 拒绝**。
+ * 400 / 401 是 OAuth token 刷新失败的标准回码（invalid_grant / 未授权）。
+ * 5xx、408、429 等视为瞬时错误（服务端问题 / 限流），保留 token 重试。
+ */
+function isAuthRejectionStatus(status: number): boolean {
+  return status === 400 || status === 401;
+}
+
+/**
+ * 从 Cloudreve V4 业务响应体判定是否为**确定性 token 拒绝**。
+ * 仅匹配明确的 invalid_grant / token 吊销 / 未授权语义；其余业务码（含未知码）
+ * 一律当瞬时错误处理，避免把一次偶发的服务端异常误判成吊销而误删有效 token。
+ */
+function isAuthRejectionBody(data: unknown): boolean {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+  const envelope = data as Record<string, unknown>;
+  const msg =
+    typeof envelope.msg === 'string' ? envelope.msg.toLowerCase() : '';
+  const err =
+    typeof envelope.error === 'string' ? envelope.error.toLowerCase() : '';
+  const haystack = `${msg} ${err}`;
+  // OAuth 标准 invalid_grant，以及 Cloudreve 常见的 token 吊销/失效/未授权措辞
+  return (
+    haystack.includes('invalid_grant') ||
+    haystack.includes('invalid grant') ||
+    haystack.includes('invalid_token') ||
+    haystack.includes('invalid refresh') ||
+    (haystack.includes('refresh token') && haystack.includes('expired')) ||
+    haystack.includes('revoked') ||
+    haystack.includes('unauthorized')
+  );
+}
+
+/**
+ * 刷新 access_token。
+ *
+ * 错误分类（C18）：
+ * - HTTP 400/401，或响应体含 invalid_grant/吊销语义 → 抛 CloudreveAuthRejectedError（可清 token）
+ * - 其它（5xx/超时/网络/未知业务码）→ 抛普通 Error（保留 token，下次重试）
  */
 async function refreshAccessToken(
   baseUrl: string,
@@ -508,10 +580,31 @@ async function refreshAccessToken(
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => response.statusText);
-    throw new Error(`Cloudreve token 刷新失败 (${response.status}): ${errorText}`);
+    // 尝试从错误体识别 invalid_grant 语义（部分实例 4xx 也带 JSON body）
+    let bodyIsAuthRejection = false;
+    try {
+      bodyIsAuthRejection = isAuthRejectionBody(JSON.parse(errorText));
+    } catch {
+      // 非 JSON 错误体，仅凭 HTTP 状态判定
+    }
+    const message = `Cloudreve token 刷新失败 (${response.status}): ${errorText}`;
+    if (isAuthRejectionStatus(response.status) || bodyIsAuthRejection) {
+      throw new CloudreveAuthRejectedError(message);
+    }
+    // 5xx / 408 / 429 等瞬时错误：保留 token，不删
+    throw new Error(message);
   }
 
   const data = await response.json();
+  // V4 惯例：200 + { code, msg }。code != 0 且措辞明确指向吊销 → 确定性拒绝；
+  // 否则（未知业务码）当瞬时错误，避免误删有效 token。
+  if (isAuthRejectionBody(data)) {
+    const envelope = data as Record<string, unknown>;
+    const msg = typeof envelope.msg === 'string' ? envelope.msg : 'unknown';
+    throw new CloudreveAuthRejectedError(
+      `Cloudreve token 刷新被拒绝（token 已失效/吊销）：${msg}`
+    );
+  }
   const tokenSet = parseTokenResponse(
     data,
     'token 刷新',
@@ -692,47 +785,50 @@ export async function refreshCloudreveTokenProactively(opts: {
     return { action: 'skipped_unconfigured' };
   }
 
-  let refreshToken = tokenCache?.refreshToken ?? '';
-  let currentExpiresAt = tokenCache?.expiresAt ?? 0;
+  // C17：**无条件重读 DB**，绝不因内存里已有 token 就跳过。
+  //
+  // WS 进程与 Next 进程各有独立内存 tokenCache。Next 在按需路径 rotate refresh_token
+  // 后只写 DB，不碰 WS 内存。若这里沿用内存里的旧 refresh_token 去刷新，Cloudreve 端
+  // 该旧 token 已被 rotation 作废 → 刷新失败 → 旧代码会 clearPersistedTokens 把 Next
+  // 刚写的新 grant 删掉，全站授权被抹。DB 是跨进程唯一真相源，与 getAccessToken 的
+  // loadTokensFromDb 对称：刷新前必须以 DB 的 refresh_token / expiresAt 为准。
+  const rows = await prisma.siteSetting.findMany({
+    where: { key: { in: [...TOKEN_DB_KEYS] } },
+  });
+  const map = new Map(rows.map((r) => [r.key, r.value] as const));
+  const refreshTokenRaw = map.get('cloudreve_refresh_token');
+  const expiresAtRaw = map.get('cloudreve_token_expires_at');
 
-  if (!refreshToken) {
-    const rows = await prisma.siteSetting.findMany({
-      where: { key: { in: [...TOKEN_DB_KEYS] } },
-    });
-    const map = new Map(rows.map((r) => [r.key, r.value] as const));
-    const refreshTokenRaw = map.get('cloudreve_refresh_token');
-    const expiresAtRaw = map.get('cloudreve_token_expires_at');
-
-    if (!refreshTokenRaw) {
-      return { action: 'skipped_unauthorized' };
-    }
-
-    try {
-      refreshToken = decrypt(refreshTokenRaw);
-    } catch (err) {
-      cloudreveLogger.error(
-        { source: opts.source, err: serializeError(err) },
-        '[Cloudreve] refresh_token 解密失败，可能 ENCRYPTION_KEY 不匹配'
-      );
-      logSystemEvent(
-        'admin.cloudreve.token.decrypt_failed',
-        JSON.stringify({
-          source: opts.source,
-          hint: 'ENCRYPTION_KEY mismatch suspected',
-        })
-      );
-      await clearPersistedTokens().catch((cleanupErr) => {
-        cloudreveLogger.error(
-          { err: serializeError(cleanupErr) },
-          '[Cloudreve] 解密失败后清除 token 失败'
-        );
-      });
-      throw new Error('Cloudreve refresh_token 解密失败');
-    }
-
-    const parsedExpiry = expiresAtRaw ? Number(expiresAtRaw) : 0;
-    currentExpiresAt = Number.isFinite(parsedExpiry) ? parsedExpiry : 0;
+  if (!refreshTokenRaw) {
+    return { action: 'skipped_unauthorized' };
   }
+
+  let refreshToken: string;
+  try {
+    refreshToken = decrypt(refreshTokenRaw);
+  } catch (err) {
+    cloudreveLogger.error(
+      { source: opts.source, err: serializeError(err) },
+      '[Cloudreve] refresh_token 解密失败，可能 ENCRYPTION_KEY 不匹配'
+    );
+    logSystemEvent(
+      'admin.cloudreve.token.decrypt_failed',
+      JSON.stringify({
+        source: opts.source,
+        hint: 'ENCRYPTION_KEY mismatch suspected',
+      })
+    );
+    await clearPersistedTokens().catch((cleanupErr) => {
+      cloudreveLogger.error(
+        { err: serializeError(cleanupErr) },
+        '[Cloudreve] 解密失败后清除 token 失败'
+      );
+    });
+    throw new Error('Cloudreve refresh_token 解密失败');
+  }
+
+  const parsedExpiry = expiresAtRaw ? Number(expiresAtRaw) : 0;
+  const currentExpiresAt = Number.isFinite(parsedExpiry) ? parsedExpiry : 0;
 
   const msUntilExpiry = currentExpiresAt - Date.now();
   if (currentExpiresAt > 0 && msUntilExpiry > minTimeToExpiry) {
@@ -745,23 +841,31 @@ export async function refreshCloudreveTokenProactively(opts: {
   try {
     refreshed = await refreshAccessToken(baseUrl, refreshToken);
   } catch (err) {
+    // 只有确定性 token 拒绝（invalid_grant / 吊销 / 4xx）才删 token；瞬时错误
+    // （5xx / 超时 / 网络）保留 token，让下次循环重试自愈，避免误删有效 grant（C18）。
+    const isAuthRejection = err instanceof CloudreveAuthRejectedError;
     cloudreveLogger.error(
-      { source: opts.source, err: serializeError(err) },
-      '[Cloudreve] token 刷新失败，清除持久化 token'
+      { source: opts.source, isAuthRejection, err: serializeError(err) },
+      isAuthRejection
+        ? '[Cloudreve] refresh_token 被拒绝，清除持久化 token'
+        : '[Cloudreve] token 刷新瞬时失败，保留 token 待下次重试'
     );
     logSystemEvent(
       'admin.cloudreve.refresh.failed',
       JSON.stringify({
         source: opts.source,
+        transient: !isAuthRejection,
         error: err instanceof Error ? err.message : String(err),
       })
     );
-    await clearPersistedTokens().catch((cleanupErr) => {
-      cloudreveLogger.error(
-        { err: serializeError(cleanupErr) },
-        '[Cloudreve] 刷新失败后清除 token 失败'
-      );
-    });
+    if (isAuthRejection) {
+      await clearPersistedTokens().catch((cleanupErr) => {
+        cloudreveLogger.error(
+          { err: serializeError(cleanupErr) },
+          '[Cloudreve] 刷新失败后清除 token 失败'
+        );
+      });
+    }
     throw err;
   }
 
@@ -924,37 +1028,57 @@ export class CloudreveStorage {
 
     if (tokenCache?.refreshToken) {
       const config = await this.getConfig();
+      const refreshTokenForThisCall = tokenCache.refreshToken;
       try {
-        const refreshed = await refreshAccessToken(
-          config.baseUrl,
-          tokenCache.refreshToken
-        );
-        // 触发异步持久化（不阻塞当前请求）
-        this.persistTokensAsync(refreshed);
+        // single-flight：并发临期请求共享同一次 refreshAccessToken（C8）。
+        // 首个进入的调用建立 in-flight Promise，其余直接 await 它，绝不各自再发一次
+        // refresh —— 从根上消除"用已被 rotate 的旧 refresh_token 二次刷新"的败者。
+        if (!inFlightTokenRefresh) {
+          inFlightTokenRefresh = refreshAccessToken(
+            config.baseUrl,
+            refreshTokenForThisCall
+          ).finally(() => {
+            inFlightTokenRefresh = null;
+          });
+          // 仅由发起者触发异步持久化（不阻塞当前请求）；等待者共享同一结果，无需重复写。
+          const refreshed = await inFlightTokenRefresh;
+          this.persistTokensAsync(refreshed);
+          return refreshed.accessToken;
+        }
+
+        const refreshed = await inFlightTokenRefresh;
         return refreshed.accessToken;
       } catch (err) {
-        // refresh_token 失效 / 被吊销 / 配置变更 —— 清干净后让用户重新授权，
-        // 否则下一次请求会读到同一份失效 token，永远走不通。
+        // 只有确定性 token 拒绝（invalid_grant / 吊销 / 4xx）才清 DB token，让用户重新
+        // 授权；瞬时错误（5xx / 超时 / 网络）保留 token，让下次请求自愈重试，避免误删
+        // 仍有效的 refresh_token（C18）。single-flight 下所有并发调用拿到的是同一次刷新
+        // 的同一个失败，clearPersistedTokens 幂等，重复调用无害。
+        const isAuthRejection = err instanceof CloudreveAuthRejectedError;
         cloudreveLogger.error(
-          { source: 'on_demand', err: serializeError(err) },
-          '[Cloudreve] refresh_token 失效，清除持久化 token'
+          { source: 'on_demand', isAuthRejection, err: serializeError(err) },
+          isAuthRejection
+            ? '[Cloudreve] refresh_token 被拒绝，清除持久化 token'
+            : '[Cloudreve] token 刷新瞬时失败，保留 token 待下次重试'
         );
         logSystemEvent(
           'admin.cloudreve.refresh.failed',
           JSON.stringify({
             source: 'on_demand',
+            transient: !isAuthRejection,
             error: err instanceof Error ? err.message : String(err),
           })
         );
-        await clearPersistedTokens().catch((cleanupErr) => {
-          cloudreveLogger.error(
-            { err: serializeError(cleanupErr) },
-            '[Cloudreve] 清除失效 token 失败'
-          );
-        });
-        throw new Error(
-          'Cloudreve 授权已失效，请在管理面板重新授权'
-        );
+        if (isAuthRejection) {
+          await clearPersistedTokens().catch((cleanupErr) => {
+            cloudreveLogger.error(
+              { err: serializeError(cleanupErr) },
+              '[Cloudreve] 清除失效 token 失败'
+            );
+          });
+          throw new Error('Cloudreve 授权已失效，请在管理面板重新授权');
+        }
+        // 瞬时错误：透出原始错误，调用方可重试；不误导用户去重新授权。
+        throw err;
       }
     }
 

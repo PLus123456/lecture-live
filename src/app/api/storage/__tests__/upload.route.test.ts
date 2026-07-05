@@ -6,7 +6,8 @@ import {
 
 const {
   verifyAuthMock,
-  checkQuotaMock,
+  reserveStorageBytesMock,
+  releaseStorageBytesMock,
   sessionFindUniqueMock,
   enforceApiRateLimitMock,
   getSiteSettingsMock,
@@ -14,7 +15,8 @@ const {
   createCloudreveStorageMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
-  checkQuotaMock: vi.fn(),
+  reserveStorageBytesMock: vi.fn(),
+  releaseStorageBytesMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
   enforceApiRateLimitMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
@@ -27,7 +29,8 @@ vi.mock('@/lib/auth', () => ({
 }));
 
 vi.mock('@/lib/quota', () => ({
-  checkQuota: checkQuotaMock,
+  reserveStorageBytes: reserveStorageBytesMock,
+  releaseStorageBytes: releaseStorageBytesMock,
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -61,7 +64,8 @@ describe('POST /api/storage/upload', () => {
       email: 'alice@example.com',
       role: 'ADMIN',
     });
-    checkQuotaMock.mockResolvedValue(true);
+    reserveStorageBytesMock.mockResolvedValue(true);
+    releaseStorageBytesMock.mockResolvedValue(null);
     enforceApiRateLimitMock.mockResolvedValue(null);
     getSiteSettingsMock.mockResolvedValue({ max_file_size: 10 });
     sessionFindUniqueMock.mockResolvedValue({
@@ -105,10 +109,39 @@ describe('POST /api/storage/upload', () => {
     );
     const uploadedBuffer = uploadMock.mock.calls[0]?.[3] as Buffer;
     expect(Buffer.from(uploadedBuffer).toString('utf8')).toBe('hello world');
+    // C9：按 file.size 原子预留字节额度；上传成功不回滚
+    expect(reserveStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
+    expect(releaseStorageBytesMock).not.toHaveBeenCalled();
+  });
+
+  it('上传失败时回滚已预留的字节额度', async () => {
+    uploadMock.mockRejectedValue(new Error('cloudreve down'));
+
+    const response = await POST(
+      createMultipartRequest(
+        'http://localhost:3000/api/storage/upload',
+        {
+          category: 'transcripts',
+          fileName: 'notes.txt',
+          sessionId: 'session-1',
+        },
+        {
+          fieldName: 'file',
+          fileName: 'notes.txt',
+          contents: 'hello world',
+          type: 'text/plain',
+        }
+      )
+    );
+
+    expect(response.status).toBe(500);
+    // C9：预留成功但上传失败 → 必须 releaseStorageBytes 回滚，避免额度泄漏
+    expect(reserveStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
+    expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
   });
 
   it('在配额不足时返回 403', async () => {
-    checkQuotaMock.mockResolvedValue(false);
+    reserveStorageBytesMock.mockResolvedValue(false);
 
     const response = await POST(
       createMultipartRequest(

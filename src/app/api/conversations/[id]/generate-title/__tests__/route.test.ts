@@ -5,14 +5,15 @@ const {
   assertOwnershipMock,
   ownershipErrorResponseMock,
   findUniqueMock,
-  updateMock,
+  updateManyMock,
   generateTitleMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   assertOwnershipMock: vi.fn(),
   ownershipErrorResponseMock: vi.fn(),
   findUniqueMock: vi.fn(),
-  updateMock: vi.fn(),
+  // U50：落库改用原子条件 updateMany（where 带 title:null），避免覆盖生成期间用户手改的标题。
+  updateManyMock: vi.fn(),
   generateTitleMock: vi.fn(),
 }));
 
@@ -25,7 +26,7 @@ vi.mock('@/lib/conversations', () => ({
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
-    conversation: { findUnique: findUniqueMock, update: updateMock },
+    conversation: { findUnique: findUniqueMock, updateMany: updateManyMock },
   },
 }));
 
@@ -66,7 +67,7 @@ describe('POST /api/conversations/[id]/generate-title', () => {
       title: null,
       messages: [{ content: '怎么优化 React 性能？' }],
     });
-    updateMock.mockResolvedValue({});
+    updateManyMock.mockResolvedValue({ count: 1 });
     generateTitleMock.mockResolvedValue('React 性能优化');
   });
 
@@ -77,8 +78,9 @@ describe('POST /api/conversations/[id]/generate-title', () => {
     expect(generateTitleMock).toHaveBeenCalledWith({
       firstUserMessage: '怎么优化 React 性能？',
     });
-    expect(updateMock).toHaveBeenCalledWith({
-      where: { id: 'c1' },
+    // U50：原子条件写入 —— where 带 title:null，仅当标题仍为空才落库。
+    expect(updateManyMock).toHaveBeenCalledWith({
+      where: { id: 'c1', title: null },
       data: { title: 'React 性能优化' },
     });
   });
@@ -91,7 +93,7 @@ describe('POST /api/conversations/[id]/generate-title', () => {
     const res = await POST(makeReq(), params);
     expect(await res.json()).toEqual({ title: '已有标题' });
     expect(generateTitleMock).not.toHaveBeenCalled();
-    expect(updateMock).not.toHaveBeenCalled();
+    expect(updateManyMock).not.toHaveBeenCalled();
   });
 
   it('无用户消息 → 返回 title:null，不生成', async () => {
@@ -105,7 +107,7 @@ describe('POST /api/conversations/[id]/generate-title', () => {
     generateTitleMock.mockResolvedValueOnce(null);
     const res = await POST(makeReq(), params);
     expect(await res.json()).toEqual({ title: null });
-    expect(updateMock).not.toHaveBeenCalled();
+    expect(updateManyMock).not.toHaveBeenCalled();
   });
 
   it('未登录 → 401', async () => {

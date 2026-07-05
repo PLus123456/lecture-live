@@ -438,6 +438,12 @@ function reattachPoll(server: ActiveAsyncJob, token: string, t: Translate): void
     })
     .catch(() => {
       uploadJobs.unregisterCancel(jobId);
+      // 取消（刷新后重挂的 poll 被 abort）会让 pollAsyncTranscribeStatus reject，
+      // 不应据此把任务持久化成 failed(unknown error)：按取消处理。
+      if (abort.signal.aborted) {
+        uploadJobs.update(jobId, { status: 'canceled' });
+        return;
+      }
       uploadJobs.update(jobId, {
         status: 'failed',
         errorMessage: t('upload.unknownError'),

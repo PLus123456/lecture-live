@@ -377,6 +377,7 @@ export default function ActiveSessionPage() {
   const clearPendingSessionTerms = useSettingsStore((s) => s.clearPendingSessionTerms);
   const setTerms = useSettingsStore((s) => s.setTerms);
   const translationMode = useSettingsStore((s) => s.translationMode);
+  const sourceLang = useSettingsStore((s) => s.sourceLang);
   const targetLang = useSettingsStore((s) => s.targetLang);
 
   const recordingState = useTranscriptStore((s) => s.recordingState);
@@ -841,12 +842,19 @@ export default function ActiveSessionPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionChecked, token, sessionId, backendStatus]);
 
+  // 本地翻译器随 translationMode / 源语言 / 目标语言变化重建。
+  // initLocal 在调用时读取 store 里的 sourceLang/targetLang，其 identity 稳定，
+  // 故必须把 sourceLang、targetLang 纳入依赖，否则录制中改语言（rebuildSession 只重建
+  // Soniox 连接）后本地翻译器仍持旧模型/旧目标语言，与面板标题不一致（U29）。
   useEffect(() => {
+    // 依赖引用（重建的触发信号），实际取值由 initLocal 内部从 store 读取
+    void sourceLang;
+    void targetLang;
     if (translationMode === 'local' || translationMode === 'both') {
       initLocal();
     }
     return () => destroyTranslator();
-  }, [translationMode, initLocal, destroyTranslator]);
+  }, [translationMode, sourceLang, targetLang, initLocal, destroyTranslator]);
 
   useEffect(() => {
     if (segments.length === 0) return;
@@ -1069,6 +1077,26 @@ export default function ActiveSessionPage() {
       if (throttleTimer) clearTimeout(throttleTimer);
     };
   }, [isSharing, broadcaster]);
+
+  // G0：SPA 导航离开录制页时断开主播 socket，撤销孤儿直播链接。
+  // 直播用的 broadcasterInstance 是 useLiveShare 里的模块级单例，卸载时无人断开，
+  // socket 泄漏、服务端快照滞留、ShareLink.isLive 永不复位——公开链接一直「在线」
+  // 却是冻结画面。用 ref 保存最新的 isSharing/sessionId/stopSharing，在仅卸载触发的
+  // effect 里按需断开（保留链接供回放）。放在 page.tsx 卸载 effect，不改 useLiveShare
+  // ——SharePopover 也用该 hook，弹窗开合不能误断主播。
+  const liveShareCleanupRef = useRef({ isSharing, sessionId, stopSharing });
+  liveShareCleanupRef.current = { isSharing, sessionId, stopSharing };
+  useEffect(() => {
+    return () => {
+      const { isSharing: sharing, sessionId: sid, stopSharing: stop } =
+        liveShareCleanupRef.current;
+      // 主动停止/结束录制走 handleStopWithFinalization 已 stopSharing，此处仅兜底
+      // SPA 导航离开的场景；stopSharing 内部对已断开的单例是幂等的。
+      if (sharing && sid) {
+        void stop(sid, { keepForPlayback: true });
+      }
+    };
+  }, []);
 
   // v2.2: 服务端 finalize — 客户端只负责停止录音 + 发信号，服务端从 draft 完成所有持久化
   const handleStopWithFinalization = useCallback(async () => {

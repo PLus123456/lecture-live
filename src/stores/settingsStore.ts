@@ -178,8 +178,9 @@ export const useSettingsStore = create<SettingsStore>()(
         const rest: Partial<SettingsStore> = { ...state };
         delete rest.pendingAutoStart;
         delete rest.pendingSystemStream;
-        delete rest.pendingSessionId;
-        delete rest.pendingSessionTerms;
+        // pendingSessionId / pendingSessionTerms 必须持久化：录制中刷新页面后
+        // reconnectAfterRefresh → getSessionConfig 需靠 pendingSessionId 匹配会话，
+        // 否则回退到手动 terms，丢失文件夹/课程关键词（U77）。
         delete rest.userSettingsOpen;
         return rest;
       },

@@ -64,6 +64,8 @@ export function useSoniox(
   const lastLatencyFlushRef = useRef(0);
   const LATENCY_EMA_ALPHA = 0.3;
   const LATENCY_FLUSH_INTERVAL = 2000; // 每 2 秒更新一次 store
+  // 出字延迟合理上限：正常仅秒级，超过 30s 的样本必为暂停复用 WS 或时钟异常，丢弃（U58）
+  const MAX_PLAUSIBLE_LATENCY_MS = 30_000;
 
   const addFinalSegment = useTranscriptStore((s) => s.addFinalSegment);
   const updatePreview = useTranscriptStore((s) => s.updatePreview);
@@ -493,6 +495,11 @@ export function useSoniox(
       const now = Date.now();
       const latency = now - (sessionStart + lastEndMs);
       if (latency < 0) return; // 时钟偏移，忽略
+      // 手动暂停/恢复复用同一 WS，不会重置 sessionStartWallClockRef，
+      // 而 SDK resume 后 token end_ms 不含暂停墙钟间隔，导致 latency 被整段
+      // 暂停时长虚高（可达数分钟），EMA 收敛到该虚值、延迟徽标永久卡住。
+      // 出字延迟只会是秒级，超过阈值的样本必为暂停/时钟异常，直接丢弃（U58）。
+      if (latency > MAX_PLAUSIBLE_LATENCY_MS) return;
 
       // EMA 平滑
       if (latencyEmaRef.current == null) {
@@ -597,8 +604,13 @@ export function useSoniox(
           return;
         }
 
+        // 减去累计暂停时长，否则先前暂停过的会话在重连后所有段落时间戳
+        // 会前移整段暂停时长、超出实际（已扣暂停）音频长度（U57），与
+        // reconnectAfterRefresh 的算法保持一致。
         const offsetMs = overallStartTimeRef.current
-          ? Date.now() - overallStartTimeRef.current
+          ? Date.now() -
+            overallStartTimeRef.current -
+            useTranscriptStore.getState().totalPausedMs
           : 0;
 
         processorRef.current?.onEndpoint();
@@ -766,6 +778,12 @@ export function useSoniox(
         startOptions?.reuseProcessor && processorRef.current
           ? processorRef.current
           : ensureProcessor();
+
+      // 复用 processor 时重新同步目标语言：ensureProcessor 仅在创建时 setTargetLang，
+      // 录制中改目标语言（SettingsDrawer Apply → rebuildSession → reuseProcessor）后
+      // 若不重设，processor 的 targetLang 保持旧值，新目标语言的段落无法 passthrough，
+      // 永久卡在「translating…」（U37）。
+      processor.setTargetLang(settings.targetLang);
 
       const startedAt =
         startOptions?.preserveStartTime && overallStartTimeRef.current
@@ -1060,12 +1078,46 @@ export function useSoniox(
     }
   }, [recordingState]);
 
-  // 组件卸载时清掉 pending 重连定时器，避免在已卸载后仍尝试新建 WS
+  // 组件卸载时清掉 pending 重连定时器，避免在已卸载后仍尝试新建 WS，
+  // 并兜底停止仍在运行的麦克风 / Soniox WS / 归档 MediaRecorder。
+  //
+  // C0/G1：SPA 导航离开录制页会卸载本 hook，但用户从未点「停止」。此前卸载
+  // 只清 reconnectTimer，麦克风、Soniox WS（recordingRef）、归档 MediaRecorder
+  // （archiveManagerRef）继续运行，其回调靠永不再变的 runId 持续写全局 store、
+  // 上传 draft chunk，形成无法在应用内停止的孤儿录音（麦克风常亮、按分钟计费、
+  // draft 一直刷新使 reclaimStaleSessions 永不回收）。
+  //
+  // 这里递增 runId 使所有在途回调立即失效，再停止硬件并置空 refs。
+  // 刻意不改动 recordingState —— 保留 recording/paused 供返回页面时按刷新恢复
+  // 逻辑（reconnectAfterRefresh）续录，与既有 beforeunload/刷新恢复模型一致。
   useEffect(() => {
     return () => {
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
+      }
+
+      // 使在途录音回调失效，防止孤儿实例继续写 store / 上传 chunk
+      runIdRef.current += 1;
+
+      const orphanRecording = recordingRef.current;
+      const orphanArchiveManager = archiveManagerRef.current;
+      recordingRef.current = null;
+      archiveManagerRef.current = null;
+
+      if (orphanRecording) {
+        try {
+          void Promise.resolve(orphanRecording.recording.stop?.()).catch(() => {});
+        } catch {
+          /* best-effort teardown on unmount */
+        }
+      }
+      if (orphanArchiveManager) {
+        try {
+          void Promise.resolve(orphanArchiveManager.stop()).catch(() => {});
+        } catch {
+          /* best-effort teardown on unmount */
+        }
       }
     };
   }, []);
@@ -1115,11 +1167,27 @@ export function useSoniox(
       return;
     }
 
+    const reuseProcessor =
+      recordingState === 'recording' || recordingState === 'paused';
+
+    // 自动暂停（idle/断连）后 recordingRef 已被置空，走此 fall-through 复用
+    // processor 打开新 Soniox WS。新连接的 token start_ms 从 0 重新计时，
+    // 若不调 startNewSession(offset)，复用的 processor 仍持旧会话 timeOffsetMs，
+    // 导致 resume 后所有段落时间戳错位（C12）。与 attemptReconnect /
+    // switchMicrophone / rebuildSession / reconnectAfterRefresh 四条同类路径对齐。
+    if (reuseProcessor && processorRef.current && overallStartTimeRef.current) {
+      const offsetMs =
+        Date.now() -
+        overallStartTimeRef.current -
+        useTranscriptStore.getState().totalPausedMs;
+      processorRef.current.onEndpoint();
+      processorRef.current.startNewSession(offsetMs);
+    }
+
     await startNewRecording({
       preserveStartTime:
         recordingState === 'recording' || recordingState === 'paused',
-      reuseProcessor:
-        recordingState === 'recording' || recordingState === 'paused',
+      reuseProcessor,
       preservePauseStateUntilConnected: recordingState === 'paused',
     });
   }, [
@@ -1219,8 +1287,11 @@ export function useSoniox(
       }
 
       const activeRecording = recordingRef.current.recording;
+      // 减去累计暂停时长，避免切换麦克风后段落时间戳前移（U57）。
       const offsetMs = overallStartTimeRef.current
-        ? Date.now() - overallStartTimeRef.current
+        ? Date.now() -
+          overallStartTimeRef.current -
+          useTranscriptStore.getState().totalPausedMs
         : 0;
 
       recordingRef.current = null;
@@ -1252,8 +1323,11 @@ export function useSoniox(
     }
 
     const activeRecording = current.recording;
+    // 减去累计暂停时长，避免重建会话后段落时间戳前移（U57）。
     const offsetMs = overallStartTimeRef.current
-      ? Date.now() - overallStartTimeRef.current
+      ? Date.now() -
+        overallStartTimeRef.current -
+        useTranscriptStore.getState().totalPausedMs
       : 0;
 
     recordingRef.current = null;

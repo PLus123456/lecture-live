@@ -1287,6 +1287,7 @@ export default {
     swap: 'Swap languages',
     elapsed: 'Elapsed',
     quotaWarning: 'Insufficient quota to start interpreting',
+    loadingQuota: 'Loading quota...',
     originalText: 'Original',
     translatedText: 'Translation',
     noContent: 'Waiting for speech...',

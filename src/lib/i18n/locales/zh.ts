@@ -1276,6 +1276,7 @@ export default {
     swap: '交换语言',
     elapsed: '已用时',
     quotaWarning: '配额不足，无法开始翻译',
+    loadingQuota: '正在加载配额...',
     originalText: '原文',
     translatedText: '译文',
     noContent: '等待语音输入...',

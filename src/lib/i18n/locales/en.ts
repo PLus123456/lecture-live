@@ -88,6 +88,8 @@ export default {
 
   // 导航
   nav: {
+    expand: 'Expand',
+    collapse: 'Collapse',
     home: 'Home',
     folders: 'Folders',
     shared: 'Shared',
@@ -164,6 +166,7 @@ export default {
     user: 'User',
     recentChats: 'Recent chats',
     noRecentChats: 'No conversations yet',
+    untitledChat: 'Untitled chat',
     filesQuota: 'Files quota',
   },
 
@@ -351,6 +354,8 @@ export default {
   },
 
   mobile: {
+    ai: 'AI',
+    keywords: 'Keywords',
     sessionActions: 'Session actions',
     exportDesc: 'Download transcript, subtitles, or raw data',
     startLiveShare: 'Start live share',

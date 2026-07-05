@@ -120,12 +120,12 @@ export async function enforceRateLimit(
   }
 
   try {
-    // INCR + EXPIRE 原子操作
+    // 原「INCR 然后 if count===1 再 EXPIRE」分两次 round-trip 且不原子：若 EXPIRE 在建键后失败
+    // （网络抖动，count===1 分支不重试），键会永久无 TTL、计数只增不减 → 永久 429 锁死。
+    // 改为先 `SET key 0 EX window NX`（仅当键不存在时原子地创建并附带 TTL）再 INCR，
+    // 保证任何新建的计数键从诞生起就带过期，杜绝「建了键却漏设过期」的窗口。
+    await redis.set(bucketKey, 0, 'EX', windowSec, 'NX');
     const count = await redis.incr(bucketKey);
-
-    if (count === 1) {
-      await redis.expire(bucketKey, windowSec);
-    }
 
     if (count > options.limit) {
       const ttl = await redis.ttl(bucketKey);

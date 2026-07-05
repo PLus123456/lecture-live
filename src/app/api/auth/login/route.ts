@@ -59,6 +59,7 @@ export async function POST(req: Request) {
     const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry);
     const { user, token } = await login(email, password, {
       jwtExpiryDays: jwtConfig.expiresInDays,
+      bcryptRounds: siteSettings?.bcrypt_rounds,
     });
 
     logAction(req, 'user.login', {

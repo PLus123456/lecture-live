@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   EMPTY_STREAMING_PREVIEW_TEXT,
   EMPTY_STREAMING_PREVIEW_TRANSLATION,
@@ -64,6 +64,9 @@ export function useInterpret() {
   const langARef = useRef('en');
   const langBRef = useRef('zh');
   const previewLangRef = useRef<string | null>(null);
+  // 同步重入保护：防止快速双击 start/stop 造成孤儿录音或双重扣费
+  const isStartingRef = useRef(false);
+  const isStoppingRef = useRef(false);
 
   const token = useAuthStore((s) => s.token);
 
@@ -95,8 +98,11 @@ export function useInterpret() {
   );
 
   const start = useCallback(
-    async (langA: string, langB: string) => {
+    async (langA: string, langB: string, deviceId?: string) => {
       if (!token) return;
+      // U27：同步重入保护，快速双击不会派生两条 Soniox WS / 两路麦克风
+      if (isStartingRef.current || recordingRef.current) return;
+      isStartingRef.current = true;
 
       langARef.current = langA;
       langBRef.current = langB;
@@ -250,11 +256,10 @@ export function useInterpret() {
             },
           },
           {
-            sourceType: settings.audioSource,
-            deviceId:
-              settings.audioSource === 'mic'
-                ? settings.preferredMicDeviceId
-                : undefined,
+            // U25：同传恒为麦克风采集，用页面传入的 deviceId；
+            // 不复用讲座页持久化的 audioSource（可能是 'system'）或 preferredMicDeviceId。
+            sourceType: 'mic',
+            deviceId: deviceId || undefined,
             regionPreference: settings.sonioxRegionPreference,
             clientReferenceId: `interpret:${langA}:${langB}`,
           }
@@ -269,18 +274,29 @@ export function useInterpret() {
           clearInterval(timerRef.current);
           timerRef.current = null;
         }
+        // 启动失败：清空计时基准，避免残留的 startTimeRef 让后续 stop 误计费
+        startTimeRef.current = null;
+      } finally {
+        isStartingRef.current = false;
       }
     },
     [token]
   );
 
   const stop = useCallback(async () => {
+    // U26：同步重入保护，快速双击停止不会重复消费锚点/降级扣费两次。
+    // 计时基准、锚点、录音句柄都在任何 await 之前同步取出并清空，
+    // 保证 deductQuota 对同一场同传至多以同一口径调用一次。
+    if (isStoppingRef.current) return;
+    isStoppingRef.current = true;
+
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
 
     const duration = startTimeRef.current ? Date.now() - startTimeRef.current : 0;
+    startTimeRef.current = null;
 
     // 停止录音
     const current = recordingRef.current;
@@ -308,7 +324,23 @@ export function useInterpret() {
     if (duration > 0 || anchorId) {
       void deductQuota(duration, anchorId);
     }
+
+    // 释放重入锁，允许下一场同传重新开始/停止
+    isStoppingRef.current = false;
   }, [deductQuota]);
+
+  // C7：组件卸载（如 SPA 导航离开 /interpret）时拆掉进行中的录音并触发扣费，
+  // 否则孤儿 Soniox WS + 麦克风会一直运行且整场同传不计费。
+  // 用 ref 持有最新 stop，effect 依赖为空只在卸载时执行一次。
+  const stopRef = useRef(stop);
+  stopRef.current = stop;
+  useEffect(() => {
+    return () => {
+      if (recordingRef.current) {
+        void stopRef.current();
+      }
+    };
+  }, []);
 
   return {
     isRunning,

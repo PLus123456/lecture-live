@@ -176,8 +176,13 @@ export async function GET(
     };
     const persisted = await persistSessionTranscriptArtifacts(session, bundle);
 
-    await prisma.session.update({
-      where: { id: session.id },
+    // U60：完成写入必须带状态守卫。上面的 claim 把状态置 'finalizing'，但拉 transcript /
+    // 写盘期间用户仍可能取消（cancelAsyncUpload 的 setStatus 允许 finalizing→canceled）。
+    // 旧代码用 id-only 的无条件 update 会把已 canceled 的会话强行改回 completed 并照常扣费。
+    // 改成条件 updateMany WHERE asyncTranscribeStatus='finalizing'：抢不到（已被取消）→
+    // 不写库、不扣费，直接把当前最新状态返回给前端。
+    const finalized = await prisma.session.updateMany({
+      where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
       data: {
         asyncTranscribeStatus: 'completed',
         transcriptPath: persisted.transcript.path,
@@ -188,12 +193,28 @@ export async function GET(
         status: 'COMPLETED',
       },
     });
+    if (finalized.count !== 1) {
+      // 收尾期间会话已被取消/改状态：不扣费、不跑后续 LLM，但仍尽力清 Soniox 资源，
+      // 避免上传到 Soniox 的文件/transcription 泄漏。
+      if (session.sonioxFileId) {
+        await deleteSonioxFile(sonioxConfig, session.sonioxFileId).catch(() => undefined);
+      }
+      await deleteSonioxTranscription(
+        sonioxConfig,
+        session.sonioxTranscriptionId
+      ).catch(() => undefined);
+      const fresh = await prisma.session.findUnique({ where: { id: session.id } });
+      return NextResponse.json({
+        status: fresh?.asyncTranscribeStatus ?? 'canceled',
+        error: fresh?.asyncTranscribeError ?? undefined,
+      });
+    }
     await invalidateSessionsApiCache(user.id);
 
-    // 异步上传转录计费（批2）：上方 updateMany claim 已保证每个 session 仅有一个 poll
-    // 进到此分支，故扣费恰好执行一次（幂等无须额外锁）。按 ceil(分钟)×倍率 扣减，
-    // 倍率默认 0.8、可在 admin 设置；与对账侧口径一致。计费失败不影响转录完成，
-    // 留给对账兜底。
+    // 异步上传转录计费（批2）：上方 updateMany claim + 此处 finalize 守卫共同保证每个 session
+    // 仅有一个 poll 进到此分支且未被取消，故扣费恰好执行一次（幂等无须额外锁）。按
+    // ceil(分钟)×倍率 扣减，倍率默认 0.8、可在 admin 设置；与对账侧口径一致。计费失败不影响
+    // 转录完成，留给对账兜底。
     try {
       const { async_upload_billing_multiplier } = await getSiteSettings();
       const billableMinutes = Math.ceil(
@@ -241,9 +262,23 @@ export async function GET(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error({ err, sessionId: session.id }, 'failed to finalize async transcript');
-    // 释放 claim：标 failed 而不是回滚到 transcribing，避免反复抢锁
-    await prisma.session.update({
-      where: { id: session.id },
+
+    // U59：区分瞬时错误与永久错误。此刻 Soniox 侧转录早已 completed（transcript 就绪），
+    // 拉取阶段的网络抖动 / 30s 超时 / 上游 5xx 都是可重试的瞬时故障——若一遇错就标 failed，
+    // 会把一份已经产出的转录永久丢弃。瞬时错误回退到 transcribing，让下一次 poll 重新
+    // 抢锁重试；只有解析/落盘等确定性永久错误才标 failed。
+    // 回退/标失败都用 WHERE asyncTranscribeStatus='finalizing' 守卫，避免覆盖并发 cancel。
+    if (isTransientFinalizeError(err)) {
+      await prisma.session.updateMany({
+        where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
+        data: { asyncTranscribeStatus: 'transcribing' },
+      });
+      // 对前端保持 transcribing —— 轮询会继续，下一轮重试收尾
+      return NextResponse.json({ status: 'transcribing', retryable: true });
+    }
+
+    await prisma.session.updateMany({
+      where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
       data: {
         asyncTranscribeStatus: 'failed',
         asyncTranscribeError: `Finalize failed: ${message}`,
@@ -251,4 +286,33 @@ export async function GET(
     });
     return NextResponse.json({ status: 'failed', error: message });
   }
+}
+
+/**
+ * 判定异步转录收尾阶段抛出的错误是否为「瞬时、可重试」。
+ *
+ * 收尾阶段唯一的网络调用是 getSonioxTranscript（拉 transcript）。它在 HTTP 非 2xx 时抛
+ * `Soniox get transcript failed: HTTP <status>`；在 30s 超时时由 AbortSignal.timeout 抛出
+ * name='TimeoutError' 的 DOMException；底层网络故障（DNS/连接重置）抛 name='AbortError'
+ * 或 TypeError('fetch failed')。这些都属于「Soniox 侧转录已完成、只是取回失败」的瞬时故障，
+ * 回退 transcribing 重试即可自愈。
+ *
+ * 反之，解析 token / 落盘 / DB 写入等确定性错误重试也不会好转，视为永久错误标 failed。
+ */
+function isTransientFinalizeError(err: unknown): boolean {
+  const name = err instanceof Error ? err.name : '';
+  if (name === 'TimeoutError' || name === 'AbortError') return true;
+
+  const message = err instanceof Error ? err.message : String(err);
+  // getSonioxTranscript 的 HTTP 错误：5xx / 429 可重试；4xx（除 429）视为永久
+  const httpMatch = /Soniox get transcript failed: HTTP (\d{3})/.exec(message);
+  if (httpMatch) {
+    const status = Number(httpMatch[1]);
+    return status === 429 || status >= 500;
+  }
+  // 底层 fetch 网络故障（Node undici）
+  if (/fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up/i.test(message)) {
+    return true;
+  }
+  return false;
 }

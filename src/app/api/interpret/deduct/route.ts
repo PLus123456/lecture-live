@@ -18,7 +18,13 @@ const interpretLogger = logger.child({ component: 'interpret-deduct' });
  * Body: { durationMs?: number, translationMode?: TranslationMode, anchorId?: string }
  *
  * 计费以服务端时长锚点（/api/interpret/start 建立）为权威，前端 durationMs 仅在容差内被采纳，
- * 防止纯信前端上报少报省钱。本地翻译（translationMode='local'）成本为 0，不扣费。
+ * 防止纯信前端上报少报省钱。
+ *
+ * 安全（U14）：不再信任客户端上报的 translationMode='local' 直接免单。同声传译无论
+ * 前端选什么翻译模式，转录一路恒经 Soniox（后端不观测翻译落地方式），成本恒发生；
+ * 若信任客户端把 'local' 短路成 0，任意用户改一个请求字段即可零成本无限刷同传。
+ * 因此这里恒按服务端时长锚点扣 transcription_minutes（body.translationMode 仅保留为
+ * 类型契约，不再参与计费决策）。
  */
 export async function POST(req: Request) {
   const payload = await verifyAuth(req);
@@ -31,11 +37,6 @@ export async function POST(req: Request) {
     translationMode?: TranslationMode;
     anchorId?: string;
   };
-
-  // 本地翻译不计费
-  if (body.translationMode === 'local') {
-    return NextResponse.json({ quotas: null, deducted: 0, skipped: 'local_translation' });
-  }
 
   const now = Date.now();
   const frontendMs =

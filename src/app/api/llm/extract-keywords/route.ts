@@ -4,6 +4,7 @@ import { callLLM, getProviderForPurpose } from '@/lib/llm/gateway';
 import {
   buildKeywordExtractionPrompt,
   buildKeywordMergePrompt,
+  type KeywordSourceType,
 } from '@/lib/llm/prompts';
 import { extractTextFromFile } from '@/lib/fileParser';
 import { enforceRateLimit } from '@/lib/rateLimit';
@@ -19,12 +20,32 @@ const keywordLogger = logger.child({ component: 'extract-keywords' });
 const KEYWORD_MAP_REDUCE_CONCURRENCY = 3;
 
 /**
+ * 上传文件 MIME → KeywordSourceType 映射。之前恒用 'transcript'，导致 PPTX/DOCX/PDF/TXT
+ * 都套用转录稿 prompt 提示、prompts.ts 里的按类型分支成了死代码（v3 finding U53）。
+ * 未命中（如纯文本输入框）回落 'transcript'。
+ */
+function mimeToKeywordSourceType(mime: string): KeywordSourceType {
+  switch (mime) {
+    case 'application/pdf':
+      return 'pdf';
+    case 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+      return 'pptx';
+    case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+      return 'docx';
+    case 'text/plain':
+      return 'txt';
+    default:
+      return 'transcript';
+  }
+}
+
+/**
  * Map 阶段：每段独立调用 LLM 抽关键词。一段失败不杀整体。
  */
 async function extractKeywordsFromChunks(
   chunks: ReadonlyArray<string>,
   existingKeywords: string | undefined,
-  sourceType: 'transcript' | 'pptx' | 'docx' | 'pdf' | 'txt'
+  sourceType: KeywordSourceType
 ): Promise<string[][]> {
   const results: string[][] = new Array(chunks.length).fill(null).map(() => []);
   let cursor = 0;
@@ -122,6 +143,8 @@ export async function POST(req: Request) {
     const existingKeywords = formData.get('existingKeywords') as string | null;
 
     let sourceText = '';
+    // 默认 transcript（纯文本输入框场景）；上传文件时按 MIME 推导实际类型。
+    let sourceType: KeywordSourceType = 'transcript';
 
     if (file) {
       // 安全检查：文件类型白名单
@@ -146,6 +169,7 @@ export async function POST(req: Request) {
         );
       }
 
+      sourceType = mimeToKeywordSourceType(file.type);
       sourceText = await extractTextFromFile(file);
     } else if (textInput) {
       sourceText = textInput;
@@ -172,7 +196,8 @@ export async function POST(req: Request) {
     if (sourceTokens <= inputBudget) {
       // 单次调用足以覆盖
       const system = buildKeywordExtractionPrompt(
-        existingKeywords ?? undefined
+        existingKeywords ?? undefined,
+        sourceType
       );
       const result = await callLLM(
         system,
@@ -197,7 +222,7 @@ export async function POST(req: Request) {
       const chunkResults = await extractKeywordsFromChunks(
         chunks.map((c) => c.text),
         existingKeywords ?? undefined,
-        'transcript'
+        sourceType
       );
       keywords = await mergeKeywordLists(
         chunkResults,

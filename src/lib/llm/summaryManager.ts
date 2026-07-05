@@ -4,6 +4,11 @@ export class SummaryManager {
   private state: SummaryState = { blocks: [], runningContext: '' };
   private transcriptBuffer: string[] = [];
   private sentenceCount = 0;
+  // in-flight 锁：自动 onNewSentence 路径无 loading 门控，语速快 + LLM 慢时会在上一次
+  // summarize 还在 await 时再次触发，两次都基于同一 runningContext（C0）请求，后 resolve
+  // 的覆盖前者、丢掉另一 block 的内容（v3 finding U75）。用它保证同一时刻只有一个
+  // summarize 在写 runningContext；忙碌时早退、句子留在 buffer 折进下一次。
+  private isSummarizing = false;
   private lastSummaryTime = Date.now();
   private recordingStartMs = Date.now();
   private currentStartMs = 0;
@@ -58,6 +63,11 @@ export class SummaryManager {
 
   async triggerIncrementalSummary() {
     if (this.transcriptBuffer.length === 0) return;
+    // in-flight 守卫：已有一次 summarize 在进行时直接早退，句子仍留在 buffer，
+    // 待本次完成后由下一次触发一并折进去 —— 避免并发请求基于同一旧 runningContext
+    // 互相覆盖丢内容。
+    if (this.isSummarizing) return;
+    this.isSummarizing = true;
 
     const newTranscript = this.transcriptBuffer.join(' ');
     this.transcriptBuffer = [];
@@ -119,6 +129,9 @@ export class SummaryManager {
       this.onSummaryError?.(
         error instanceof Error ? error.message : 'Summary failed'
       );
+    } finally {
+      // 无论成败都释放锁；失败时 newTranscript 已放回 buffer，下次触发会重试。
+      this.isSummarizing = false;
     }
   }
 

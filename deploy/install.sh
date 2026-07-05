@@ -56,10 +56,12 @@ systemctl stop lecturelive-ws 2>/dev/null || true
 info "部署 Next.js standalone 到 $APP_DIR ..."
 mkdir -p "$APP_DIR/data" "$APP_DIR/backups"
 
-# 清理旧的 standalone 文件（保留 data、.env、ws-server、backups）
+# 清理旧的 standalone 文件（保留 data、.env、ws-server、backups、src）
 # 注意: -mindepth 1 避免删除 APP_DIR 本身
+# src：托管 CLI（deploy/lecture-live）把源码放在 $APP_DIR/src，不排除会连同刚编译产物一起删掉，
+#      导致随后的 cp 无源可复制、set -e 中止（卸载命令 deploy/lecture-live 已排除 src，此处对齐）。
 find "$APP_DIR" -mindepth 1 -maxdepth 1 \
-    ! -name "data" ! -name ".env" ! -name "ws-server" ! -name "backups" \
+    ! -name "data" ! -name ".env" ! -name "ws-server" ! -name "backups" ! -name "src" \
     -exec rm -rf {} +
 
 # 复制 standalone 产物（用 /. 语法，确保隐藏目录 .next 也被复制）
@@ -68,6 +70,11 @@ cp -a "$SRC_DIR/.next/standalone/." "$APP_DIR/"
 # 复制静态文件
 mkdir -p "$APP_DIR/.next/static"
 cp -a "$SRC_DIR/.next/static/." "$APP_DIR/.next/static/"
+
+# Next standalone 运行时需要可写的 .next/cache（ISR / fetch cache / 图片优化）；
+# 它不在编译产物里，须显式创建，否则 systemd ProtectSystem=strict + ReadWritePaths 指向不存在目录，
+# web 服务启动失败（或运行时写 cache 触发 EROFS）。
+mkdir -p "$APP_DIR/.next/cache"
 
 # 复制 public 目录
 if [[ -d "$SRC_DIR/public" ]]; then
@@ -106,7 +113,9 @@ cp -r "$SRC_DIR/prisma" "$WS_DIR/"
 cp "$SCRIPT_DIR/ws-package.json" "$WS_DIR/package.json"
 
 info "安装 WebSocket 服务器运行时依赖..."
-(cd "$WS_DIR" && npm install --omit=dev && npx prisma generate)
+# prisma 是 ws-package.json 的 devDependency，--omit=dev 不装它；裸 `npx prisma` 会联网拉最新大版本，
+# 可能与 @prisma/client 5.x 不匹配。钉主版本 prisma@5 确保 generate 出的 client 与运行时一致。
+(cd "$WS_DIR" && npm install --omit=dev && npx prisma@5 generate)
 
 # 链接共享资源
 ln -sfn "$APP_DIR/data" "$WS_DIR/data"

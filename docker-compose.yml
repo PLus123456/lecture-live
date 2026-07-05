@@ -8,7 +8,13 @@ services:
     env_file: .env.local
     environment:
       DATABASE_URL: mysql://lecturelive:${DB_PASSWORD_ENCODED}@db:3306/lecturelive
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      # 用 URL 编码后的口令拼 URL（口令含 '/'、'@'、':' 等时裸拼会让 ioredis 的 url 解析报错）；
+      # redis 服务自身的 --requirepass / healthcheck 仍用未编码的 REDIS_PASSWORD。
+      REDIS_URL: redis://:${REDIS_PASSWORD_ENCODED}@redis:6379
+    # 录音/转录/摘要/报告/聊天图片/图标/异步分片等都写入 /app/data（未配 Cloudreve 时仅存本地）；
+    # 不挂卷则容器重建即丢失全部用户数据、DB 中 local: 引用全部悬空。
+    volumes:
+      - appdata:/app/data
     depends_on:
       db:
         condition: service_healthy
@@ -75,6 +81,7 @@ networks:
     driver: bridge
 
 volumes:
+  appdata:
   mysqldata:
   redisdata:
   cloudreve_data:

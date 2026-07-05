@@ -12,7 +12,7 @@
     "dev:ws": "ts-node server/websocket.ts",
     "prebuild": "prisma generate",
     "build": "next build",
-    "build:ws": "esbuild server/websocket.ts --bundle --platform=node --target=node24 --outfile=dist/websocket.js --external:@prisma/client --external:socket.io --external:ioredis --external:jsonwebtoken --external:bcryptjs --alias:server-only=./deploy/shims/server-only.js",
+    "build:ws": "esbuild server/websocket.ts --bundle --platform=node --target=node24 --outfile=dist/websocket.js --external:@prisma/client --external:ioredis --external:jsonwebtoken --external:bcryptjs --external:bufferutil --external:utf-8-validate --alias:server-only=./deploy/shims/server-only.js",
     "prestart": "node scripts/ensure-database.mjs",
     "start": "next start",
     "prestart:ws": "node scripts/ensure-database.mjs",

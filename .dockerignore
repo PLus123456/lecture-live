@@ -1,0 +1,20 @@
+# 让 Docker 构建上下文确定化：builder 阶段的 `COPY . .` 不得带入宿主的 node_modules，
+# 否则会覆盖 deps 阶段已 npm ci + patch-next-minify 打好补丁的那份（platform 也可能不匹配）。
+node_modules
+.next
+dist
+.git
+.github
+coverage
+test-results
+playwright-report
+data
+backups
+*.log
+.env
+.env.*
+!.env.example
+.claude
+.vscode
+.idea
+ISSUES_REPORT*.md

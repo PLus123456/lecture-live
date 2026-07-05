@@ -70,7 +70,14 @@ npm ci
 # 编排器先用幂等数据脚本把这类变更铺好，db push 便无需破坏，且自动回填历史 userId。
 info "同步数据库结构（数据感知迁移 → db push → 历史归属回填）..."
 npx prisma generate
-node scripts/ensure-database.mjs
+# 升级时 cwd 是源码目录（$APP_DIR/src），其中通常没有 .env，DATABASE_URL 也未导出；
+# ensure-database.mjs 在无 DATABASE_URL 且无 env 文件时会静默 exit 0 → schema 与代码漂移。
+# 用 node --env-file 载入真实生产配置（$APP_DIR/.env，与 systemd ExecStart 一致，能正确处理引号）。
+if [[ -f "$APP_DIR/.env" ]]; then
+    node --env-file="$APP_DIR/.env" scripts/ensure-database.mjs
+else
+    node scripts/ensure-database.mjs
+fi
 
 # ── 4. 编译 Next.js ──
 info "编译 Next.js..."
@@ -90,13 +97,18 @@ systemctl stop lecturelive-ws 2>/dev/null || true
 # ── 7. 部署 Next.js standalone ──
 info "部署 Next.js 产物..."
 # -mindepth 1 避免删除 APP_DIR 本身
+# src：托管 CLI（deploy/lecture-live）把源码放在 $APP_DIR/src，不排除会连同刚编译产物一起删掉，
+#      导致随后的 cp 无源可复制、set -e 中止（与卸载命令 deploy/lecture-live 保持一致）。
 find "$APP_DIR" -mindepth 1 -maxdepth 1 \
-    ! -name "data" ! -name ".env" ! -name "ws-server" ! -name "backups" \
+    ! -name "data" ! -name ".env" ! -name "ws-server" ! -name "backups" ! -name "src" \
     -exec rm -rf {} +
 
 cp -a "$SRC_DIR/.next/standalone/." "$APP_DIR/"
 mkdir -p "$APP_DIR/.next/static"
 cp -a "$SRC_DIR/.next/static/." "$APP_DIR/.next/static/"
+# Next standalone 运行时需要可写的 .next/cache，编译产物不含，须显式创建
+# （否则 systemd ProtectSystem=strict + ReadWritePaths 指向不存在目录，web 启动失败/写 cache 触发 EROFS）。
+mkdir -p "$APP_DIR/.next/cache"
 [[ -d "$SRC_DIR/public" ]] && cp -r "$SRC_DIR/public" "$APP_DIR/public"
 
 # ── 8. 更新 WebSocket 服务器 ──
@@ -108,7 +120,9 @@ cp "$SRC_DIR/dist/websocket.js" "$WS_DIR/"
 cp -r "$SRC_DIR/prisma" "$WS_DIR/"
 cp "$SCRIPT_DIR/ws-package.json" "$WS_DIR/package.json"
 
-(cd "$WS_DIR" && npm install --omit=dev && npx prisma generate)
+# prisma 是 ws-package.json 的 devDependency，--omit=dev 不装它；裸 `npx prisma` 会联网拉最新大版本，
+# 可能与 @prisma/client 5.x 不匹配。钉主版本确保 generate 出的 client 与运行时一致。
+(cd "$WS_DIR" && npm install --omit=dev && npx prisma@5 generate)
 
 ln -sfn "$APP_DIR/data" "$WS_DIR/data"
 ln -sfn "$APP_DIR/.env" "$WS_DIR/.env"

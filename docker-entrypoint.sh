@@ -19,8 +19,10 @@ shutdown() {
 
 trap 'shutdown' INT TERM
 
-wait "$WEB_PID"
-EXIT_CODE=$?
+# 被 SIGTERM 打断时 wait 返回 143；set -e 下若不加守卫会当场退出，
+# 跳过下面对 WS 的优雅停机等待（WS 会被 Docker 直接 SIGKILL，10s SERVER_SHUTDOWN 广播被截断）。
+EXIT_CODE=0
+wait "$WEB_PID" || EXIT_CODE=$?
 
 shutdown
 wait "$WS_PID" 2>/dev/null || true

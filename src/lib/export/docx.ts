@@ -1,7 +1,7 @@
 /**
  * Word (.docx) 导出模块
  * 使用 docx 库在客户端生成格式优美的 Word 文档
- * 自动从 Google Fonts 下载并嵌入 Noto Sans SC 字体，确保跨平台 CJK 显示正确
+ * 内嵌随仓库打包的 Noto Sans SC（思源黑体，OFL 授权，见 public/fonts/），确保跨平台 CJK 显示正确
  */
 import {
   Document,
@@ -28,12 +28,13 @@ import type { ExportTranscriptSegment } from './types';
 let fontCachePromise: Promise<ArrayBuffer | null> | null = null;
 
 /**
- * 通过 Google Fonts CSS API 获取 Noto Sans SC 的 TTF URL 然后下载字体数据。
- * 使用 fetch + User-Agent 模拟技巧拿 truetype 格式（浏览器默认拿 woff2，docx 不支持）。
- * 浏览器不能设置 User-Agent header，因此先尝试本地 /fonts/ 路径，再回退到 Google Fonts woff2。
+ * 获取用于 docx 嵌入的 Noto Sans SC (truetype) 字体数据。
+ * 主路径：随仓库打包的 public/fonts/NotoSansSC-Regular.ttf（同源，CSP 放行，稳定命中）。
+ * 回退路径：Google Fonts CDN（woff2）——仅作最后兜底，生产环境 CSP connect-src 通常会拦截，
+ *          失败即回落到 CSS 字体名链（见 defaultFontName），不影响导出、仅不内嵌字体。
  */
 async function fetchFontData(): Promise<ArrayBuffer | null> {
-  // 优先使用本地字体（如部署方在 public/fonts/ 下放置了 TTF 文件）
+  // 优先使用随仓库打包的本地字体（public/fonts/NotoSansSC-Regular.ttf）
   try {
     const localRes = await fetch('/fonts/NotoSansSC-Regular.ttf');
     if (localRes.ok) {
@@ -41,7 +42,7 @@ async function fetchFontData(): Promise<ArrayBuffer | null> {
     }
   } catch { /* 忽略 */ }
 
-  // 回退：从 Google Fonts CDN 下载（woff2 格式，docx 库也可处理）
+  // 回退：从 Google Fonts CDN 下载（woff2；生产 CSP 通常拦截，best-effort）
   try {
     const cssRes = await fetch(
       'https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400&display=swap',

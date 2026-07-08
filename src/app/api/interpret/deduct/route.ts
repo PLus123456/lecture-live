@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
-import { deductTranscriptionMinutes } from '@/lib/quota';
+import { deductTranscriptionMinutes, recordInterpretUsage } from '@/lib/quota';
 import { getBillableMinutes } from '@/lib/billing';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger } from '@/lib/logger';
@@ -88,6 +88,25 @@ export async function POST(req: Request) {
   const snapshot = await deductTranscriptionMinutes(payload.id, billableMinutes);
   if (!snapshot) {
     return NextResponse.json({ error: 'User not found' }, { status: 404 });
+  }
+
+  // 已成功扣费 → 记一笔同传用量台账，让对账把 interpret 分钟计入 expected（消除虚报 drift）。
+  // billedMinutes 与本次实扣分钟（billableMinutes）一字一致；口径与 deduct 侧完全相同。
+  // ADMIN 恒不扣费（snapshot.role==='ADMIN' 即 deduct 短路未 increment），故不记账。
+  // 台账失败不回滚扣费、也不阻塞响应：扣费已成功落库是权威；台账仅为对账辅助，best-effort 记录。
+  if (snapshot.role !== 'ADMIN') {
+    try {
+      await recordInterpretUsage(payload.id, billableMinutes, effectiveMs);
+    } catch (err) {
+      interpretLogger.warn(
+        {
+          userId: payload.id,
+          billedMinutes: billableMinutes,
+          message: err instanceof Error ? err.message : String(err),
+        },
+        'failed to record interpret usage ledger; deduction already applied'
+      );
+    }
   }
 
   return NextResponse.json({ quotas: snapshot, deducted: billableMinutes });

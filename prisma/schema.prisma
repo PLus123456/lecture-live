@@ -211,6 +211,23 @@ model ReconciliationMismatch {
   @@index([userId])
 }
 
+// ─── 同声传译用量台账（每次 /api/interpret/deduct 成功扣费记一笔） ───
+// interpret 扣费直接 increment User.transcriptionMinutesUsed，但不产生任何 Session 行；
+// 对账（reconcileTranscriptionUsage）仅按 COMPLETED Session 重算，会对用过同传的用户虚报负向
+// drift。此表把每次已扣的 interpret 分钟持久化，让对账把 interpret 用量计入 expected，消除虚报。
+// billedMinutes 与 deduct 侧实扣分钟一字一致（getBillableMinutes(effectiveMs)）。
+// 与 ChatAttachment.userId / Conversation.userId 同规约：userId 为冗余列、不建 User relation
+//（避免 User 反向关系膨胀）。台账只增不减；deduct 已是一次性锚点消费，天然不重复。
+model InterpretUsage {
+  id            String   @id @default(cuid())
+  userId        String                              // 冗余列，不建 relation，便于按用户+周期聚合
+  billedMinutes Int                                 // 本次实扣分钟，口径与 deduct 一字一致
+  durationMs    Int?                                // 本次计费时长（effectiveMs），审计参考
+  chargedAt     DateTime @default(now())            // 扣费时刻，对账按 quotaResetAt 周期窗口截断
+
+  @@index([userId, chargedAt])
+}
+
 // ─── 站点设置（Key-Value 存储） ───
 model SiteSetting {
   key       String   @id          // 如 "site_name", "site_url", "logo_path" 等

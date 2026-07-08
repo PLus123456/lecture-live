@@ -8,6 +8,9 @@ const {
   executeRawMock,
   chatAttachmentGroupByMock,
   sessionAggregateMock,
+  sessionFindManyMock,
+  interpretUsageCreateMock,
+  interpretUsageAggregateMock,
 } = vi.hoisted(() => ({
   userFindUniqueMock: vi.fn(),
   userFindManyMock: vi.fn(),
@@ -16,6 +19,9 @@ const {
   executeRawMock: vi.fn(),
   chatAttachmentGroupByMock: vi.fn(),
   sessionAggregateMock: vi.fn(),
+  sessionFindManyMock: vi.fn(),
+  interpretUsageCreateMock: vi.fn(),
+  interpretUsageAggregateMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -31,6 +37,11 @@ vi.mock('@/lib/prisma', () => ({
     },
     session: {
       aggregate: sessionAggregateMock,
+      findMany: sessionFindManyMock,
+    },
+    interpretUsage: {
+      create: interpretUsageCreateMock,
+      aggregate: interpretUsageAggregateMock,
     },
     $executeRaw: executeRawMock,
   },
@@ -56,6 +67,8 @@ import {
   resetExpiredTranscriptionQuotas,
   getStorageHoursUsed,
   checkQuota,
+  recordInterpretUsage,
+  reconcileTranscriptionUsage,
 } from '@/lib/quota';
 
 const futureReset = new Date('2099-01-01T00:00:00.000Z');
@@ -648,5 +661,168 @@ describe('resetExpiredTranscriptionQuotas', () => {
     userUpdateManyMock.mockResolvedValueOnce({ count: 0 });
 
     expect(await resetExpiredTranscriptionQuotas(new Date())).toBe(0);
+  });
+});
+
+describe('recordInterpretUsage', () => {
+  beforeEach(() => {
+    interpretUsageCreateMock.mockReset();
+  });
+
+  it('正向：写一笔台账，billedMinutes 与传入分钟一致、durationMs 取整', async () => {
+    interpretUsageCreateMock.mockResolvedValueOnce({ id: 'iu-1' });
+
+    await recordInterpretUsage('user-1', 3, 150_500);
+
+    expect(interpretUsageCreateMock).toHaveBeenCalledWith({
+      data: { userId: 'user-1', billedMinutes: 3, durationMs: 150_500 },
+    });
+  });
+
+  it('durationMs 缺省 / 非正 → 落库为 null', async () => {
+    interpretUsageCreateMock.mockResolvedValue({ id: 'iu-2' });
+
+    await recordInterpretUsage('user-1', 2);
+    expect(interpretUsageCreateMock).toHaveBeenLastCalledWith({
+      data: { userId: 'user-1', billedMinutes: 2, durationMs: null },
+    });
+
+    await recordInterpretUsage('user-1', 2, 0);
+    expect(interpretUsageCreateMock).toHaveBeenLastCalledWith({
+      data: { userId: 'user-1', billedMinutes: 2, durationMs: null },
+    });
+  });
+
+  it('边界：minutes <= 0 / NaN 不写库', async () => {
+    await recordInterpretUsage('user-1', 0, 1000);
+    await recordInterpretUsage('user-1', -5, 1000);
+    await recordInterpretUsage('user-1', NaN, 1000);
+
+    expect(interpretUsageCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('传入事务客户端：在该 tx 上 create、不碰全局 prisma', async () => {
+    const txCreate = vi.fn().mockResolvedValueOnce({ id: 'iu-tx' });
+    const tx = {
+      interpretUsage: { create: txCreate },
+    } as unknown as Prisma.TransactionClient;
+
+    await recordInterpretUsage('user-1', 4, 240_000, tx);
+
+    expect(txCreate).toHaveBeenCalledWith({
+      data: { userId: 'user-1', billedMinutes: 4, durationMs: 240_000 },
+    });
+    expect(interpretUsageCreateMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('reconcileTranscriptionUsage — 计入 interpret 台账', () => {
+  beforeEach(() => {
+    userFindManyMock.mockReset();
+    sessionFindManyMock.mockReset();
+    interpretUsageAggregateMock.mockReset();
+  });
+
+  it('纯同传用户：expected = interpret 分钟，drift 归 0（消除虚报）', async () => {
+    // used=5 全部来自 interpret（无任何 Session）。此前只按 Session 重算 → recorded=0 → drift=-5 虚报。
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-interp',
+        email: 'i@x.com',
+        transcriptionMinutesUsed: 5,
+        quotaResetAt: futureReset,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([]); // 无 COMPLETED session
+    interpretUsageAggregateMock.mockResolvedValueOnce({
+      _sum: { billedMinutes: 5 },
+    });
+
+    const result = await reconcileTranscriptionUsage();
+
+    // interpret 5 计入 expected → drift 0 → 被 filter 掉，无虚报
+    expect(result).toEqual([]);
+    // 聚合按当前周期窗口截断（chargedAt >= cycleStart）
+    expect(interpretUsageAggregateMock).toHaveBeenCalledWith({
+      where: {
+        userId: 'u-interp',
+        chargedAt: { gte: new Date('2026-01-01T00:00:00.000Z') },
+      },
+      _sum: { billedMinutes: true },
+    });
+  });
+
+  it('混合用户：expected = session 分钟 + interpret 分钟', async () => {
+    // Session 2 分钟（120000ms → ceil=2）+ interpret 3 分钟 = expected 5；used 5 → drift 0
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-mix',
+        email: 'm@x.com',
+        transcriptionMinutesUsed: 5,
+        quotaResetAt: futureReset,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([
+      { durationMs: 120_000, asyncTranscribeStatus: null },
+    ]);
+    interpretUsageAggregateMock.mockResolvedValueOnce({
+      _sum: { billedMinutes: 3 },
+    });
+
+    const result = await reconcileTranscriptionUsage();
+
+    expect(result).toEqual([]);
+  });
+
+  it('真实 drift 仍被检出：used 少记则报正向 drift', async () => {
+    // Session 2 + interpret 3 = expected 5，但 used 只记了 4 → drift +1 应被报出
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-drift',
+        email: 'd@x.com',
+        transcriptionMinutesUsed: 4,
+        quotaResetAt: futureReset,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([
+      { durationMs: 120_000, asyncTranscribeStatus: null },
+    ]);
+    interpretUsageAggregateMock.mockResolvedValueOnce({
+      _sum: { billedMinutes: 3 },
+    });
+
+    const result = await reconcileTranscriptionUsage();
+
+    expect(result).toEqual([
+      {
+        id: 'u-drift',
+        email: 'd@x.com',
+        recordedMinutes: 5,
+        transcriptionMinutesUsed: 4,
+        driftMinutes: 1,
+      },
+    ]);
+  });
+
+  it('无 interpret 用量（_sum.billedMinutes 为 null）→ 只算 session', async () => {
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-sess',
+        email: 's@x.com',
+        transcriptionMinutesUsed: 2,
+        quotaResetAt: futureReset,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([
+      { durationMs: 120_000, asyncTranscribeStatus: null },
+    ]);
+    interpretUsageAggregateMock.mockResolvedValueOnce({
+      _sum: { billedMinutes: null },
+    });
+
+    const result = await reconcileTranscriptionUsage();
+
+    // session 2 = used 2 → drift 0
+    expect(result).toEqual([]);
   });
 });

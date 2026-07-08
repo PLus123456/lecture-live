@@ -261,6 +261,43 @@ export async function deductTranscriptionMinutes(
   return toQuotaSnapshot(updated);
 }
 
+/**
+ * 记录一笔同声传译用量台账（/api/interpret/deduct 成功扣费后调用）。
+ *
+ * interpret 扣费只 increment transcriptionMinutesUsed、不产生 Session 行，对账无从按 Session
+ * 重算这部分用量。此表把每次已扣的分钟持久化，供 reconcileTranscriptionUsage 把 interpret
+ * 用量计入 expected（消除对同传用户的虚报 drift）。
+ *
+ * @param minutes 本次实扣分钟，口径必须与 deduct 侧一字一致（billableMinutes）。
+ * @param durationMs 本次计费时长（effectiveMs），可选，仅作审计参考。
+ *
+ * 只增不减、天然幂等：deduct 已是一次性锚点消费，同一次会话不会重复扣费/记账。
+ */
+export async function recordInterpretUsage(
+  userId: string,
+  minutes: number,
+  durationMs?: number,
+  db: QuotaDbClient = prisma
+): Promise<void> {
+  const normalizedMinutes = normalizeNonNegativeAmount(minutes);
+  if (normalizedMinutes <= 0) {
+    return;
+  }
+
+  const normalizedDurationMs =
+    typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs > 0
+      ? Math.trunc(durationMs)
+      : null;
+
+  await db.interpretUsage.create({
+    data: {
+      userId,
+      billedMinutes: normalizedMinutes,
+      durationMs: normalizedDurationMs,
+    },
+  });
+}
+
 export async function resetExpiredTranscriptionQuotas(
   now = new Date()
 ): Promise<number> {
@@ -295,10 +332,13 @@ export async function resetExpiredTranscriptionQuotas(
  * 非 0 的 recordedMinutes → 每次对账都对 ADMIN 永久虚报正向 drift（且"修复"会把 used 写成
  * recorded，破坏 ADMIN 无限额度语义）。用 WHERE role != ADMIN 从源头排除。
  *
- * 已知遗留（interpret 口径，见 PR B10 延后项 U15）：同声传译（/api/interpret/deduct）扣费
- * 会 increment transcriptionMinutesUsed，但不产生任何 Session 行、也无独立用量台账，本函数
- * 仅按 Session 重算，故用过同传的用户仍会被报负向 drift。要"计入 interpret 已扣分钟且与扣费侧
- * 口径逐字一致"需引入持久化的 interpret 用量记录（schema 变更），超出本批范围，暂延后。
+ * interpret 口径（v3-R8 补完，原 U15 延后项）：同声传译（/api/interpret/deduct）扣费会
+ * increment transcriptionMinutesUsed，但不产生任何 Session 行。此前本函数仅按 Session 重算，
+ * 故用过同传的用户被虚报负向 drift。现引入持久化台账 InterpretUsage（deduct 成功后记一笔，
+ * billedMinutes 与实扣一字一致），本函数把当前对账周期内该用户的 InterpretUsage.billedMinutes
+ * 之和加入 expected（周期口径与 Session 侧一致：均按 quotaResetAt 窗口 [cycleStart, ...) 截断）。
+ * 于是 expected = session 分钟 + interpret 分钟，drift = expected − transcriptionMinutesUsed
+ * 对纯同传用户回归 0，消除虚报。
  */
 export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
   const users = await prisma.user.findMany({
@@ -327,7 +367,7 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
         select: { durationMs: true, asyncTranscribeStatus: true },
       });
 
-      const actualMinutes = sessions.reduce((total, session) => {
+      const sessionMinutes = sessions.reduce((total, session) => {
         if (!session.durationMs || session.durationMs <= 0) {
           return total;
         }
@@ -341,12 +381,26 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
         return total + charged;
       }, 0);
 
+      // 同传用量：当前对账周期内该用户已扣的 interpret 分钟之和（口径与扣费侧一字一致，
+      // 直接对已落库的 billedMinutes 求和；不做倍率——interpret 恒全额扣，无异步折扣）。
+      // 周期窗口与 Session 侧一致：chargedAt >= cycleStart。
+      const interpretAgg = await prisma.interpretUsage.aggregate({
+        where: {
+          userId: user.id,
+          chargedAt: { gte: cycleStart },
+        },
+        _sum: { billedMinutes: true },
+      });
+      const interpretMinutes = interpretAgg._sum.billedMinutes ?? 0;
+
+      const expectedMinutes = sessionMinutes + interpretMinutes;
+
       return {
         id: user.id,
         email: user.email,
-        recordedMinutes: actualMinutes,
+        recordedMinutes: expectedMinutes,
         transcriptionMinutesUsed: user.transcriptionMinutesUsed,
-        driftMinutes: actualMinutes - user.transcriptionMinutesUsed,
+        driftMinutes: expectedMinutes - user.transcriptionMinutesUsed,
       };
     })
   );

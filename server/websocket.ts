@@ -193,7 +193,7 @@ io.on('connection', (socket) => {
   });
 });
 
-setupLiveShare(io);
+const teardownLiveShare = setupLiveShare(io);
 startBillingMaintenanceLoop();
 startCloudreveTokenRefreshLoop();
 
@@ -210,6 +210,9 @@ async function shutdown(signal: string) {
   wsLogger.info({ signal }, 'Starting websocket server shutdown');
   stopBillingMaintenanceLoop();
   stopCloudreveTokenRefreshLoop();
+  // 清掉直播分享的 TTL 清扫定时器 / host 下线宽限计时并清空内存快照，
+  // 避免优雅关停时残留模块级定时器阻碍进程干净退出。
+  teardownLiveShare();
 
   io.emit('status_update', { status: 'SERVER_SHUTDOWN' });
 

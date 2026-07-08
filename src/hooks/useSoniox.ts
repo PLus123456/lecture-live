@@ -774,10 +774,13 @@ export function useSoniox(
       const selectedMicDeviceId =
         startOptions?.overrideMicDeviceId ?? settings.preferredMicDeviceId;
 
-      const processor =
+      // ensureProcessor 会把新建实例写入 processorRef，故须在解析前先记录是否复用了旧实例。
+      const reusedExistingProcessor = Boolean(
         startOptions?.reuseProcessor && processorRef.current
-          ? processorRef.current
-          : ensureProcessor();
+      );
+      const processor = reusedExistingProcessor
+        ? processorRef.current!
+        : ensureProcessor();
 
       // 复用 processor 时重新同步目标语言：ensureProcessor 仅在创建时 setTargetLang，
       // 录制中改目标语言（SettingsDrawer Apply → rebuildSession → reuseProcessor）后
@@ -785,13 +788,38 @@ export function useSoniox(
       // 永久卡在「translating…」（U37）。
       processor.setTargetLang(settings.targetLang);
 
+      // 冷恢复（后端 draft 重建、store 由 idle 拉起）后 wasRecordingRef 为 false，
+      // reconnectAfterRefresh 从未运行，overallStartTimeRef 与 processor 段偏移都为空。
+      // 此时用户点『继续』走 start→startNewRecording(preserveStartTime)，若不回退读取
+      // store.recordingStartTime，startedAt 会退化为 now → 计时清零、已录时长丢失（U21）。
+      const coldResumeStartTime =
+        startOptions?.preserveStartTime && !overallStartTimeRef.current
+          ? useTranscriptStore.getState().recordingStartTime
+          : null;
       const startedAt =
         startOptions?.preserveStartTime && overallStartTimeRef.current
           ? overallStartTimeRef.current
-          : Date.now();
+          : coldResumeStartTime ?? Date.now();
       const keepPausedUntilConnected =
         startOptions?.preservePauseStateUntilConnected &&
         previousRecordingState === 'paused';
+
+      // 冷恢复且此次是新建的 processor（未复用旧实例）时，恢复段计数偏移与会话时间偏移，
+      // 使续录段号紧接已恢复段（不与 seg-1..seg-N 串号），且全局时间戳从已录时长续接。
+      // 复用旧实例的路径（switchMic/rebuild/热恢复）已在各自调用处 startNewSession，跳过。
+      // 会话时间偏移取「已录时长」= pausedAt - startTime - totalPausedMs（暂停态续录起点），
+      // 而非 now-startTime，避免把 draft 恢复到点击『继续』之间的静置时长计入音频时间轴。
+      if (coldResumeStartTime && !reusedExistingProcessor) {
+        const storeState = useTranscriptStore.getState();
+        const resumeOffsetMs = Math.max(
+          0,
+          (storeState.pausedAt ?? Date.now()) -
+            coldResumeStartTime -
+            storeState.totalPausedMs
+        );
+        processor.setSegmentCounterOffset(storeState.segments.length);
+        processor.startNewSession(resumeOffsetMs);
+      }
 
       overallStartTimeRef.current = startedAt;
       setRecordingStartTime(startedAt);
@@ -1306,10 +1334,15 @@ export function useSoniox(
       processorRef.current?.onEndpoint();
       processorRef.current?.startNewSession(offsetMs);
 
+      // 暂停态下切麦克风：保持暂停直至新连接建立，避免静默恢复录音、
+      // pausedAt 残留与整段暂停时长被计入计费（U20）。重连完成分支会
+      // accumulatePausedTime 并恢复录音。
       await startNewRecording({
         preserveStartTime: true,
         reuseProcessor: true,
         overrideMicDeviceId: deviceId,
+        preservePauseStateUntilConnected:
+          useTranscriptStore.getState().recordingState === 'paused',
       });
     },
     [setConnectionState, setCurrentMicDeviceId, startNewRecording]
@@ -1342,6 +1375,8 @@ export function useSoniox(
     processorRef.current?.onEndpoint();
     processorRef.current?.startNewSession(offsetMs);
 
+    // 暂停态下应用设置（SettingsDrawer Apply → rebuildSession）：保持暂停直至新连接
+    // 建立，避免静默恢复录音、pausedAt 残留与整段暂停时长被计入计费（U20）。
     await startNewRecording({
       preserveStartTime: true,
       reuseProcessor: true,
@@ -1349,6 +1384,8 @@ export function useSoniox(
         settings.audioSource === 'mic'
           ? settings.preferredMicDeviceId
           : undefined,
+      preservePauseStateUntilConnected:
+        useTranscriptStore.getState().recordingState === 'paused',
     });
   }, [setConnectionState, startNewRecording]);
 

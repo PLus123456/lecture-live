@@ -63,6 +63,10 @@ export class TokenProcessor {
   private pendingTranslationTokens: PendingTranslationToken[] = [];
 
   private targetLang = '';
+  // 双向同传（two_way）语言对：设置后，每个段落的目标语言按其检测到的原文语言
+  // 动态取「语言对中的另一个」，而非固定单一 targetLang。这样 A→B 段目标为 langB、
+  // B→A 段目标为 langA，passthrough/waiting 判定对两个方向都成立。
+  private languagePair: { langA: string; langB: string } | null = null;
   private maxSegmentChars = 0;
   // segment id 自增计数器：用实例字段而非模块级全局，避免多个 TokenProcessor
   // 并发（录音 / 同传 / 文件转录）时共享同一计数器导致 segment id 串号、碰撞
@@ -104,6 +108,29 @@ export class TokenProcessor {
 
   setTargetLang(lang: string) {
     this.targetLang = lang;
+    this.languagePair = null;
+  }
+
+  // 双向同传：设置 A↔B 语言对。目标语言按段落原文语言动态解析（见 resolveTargetLang）。
+  setLanguagePair(langA: string, langB: string) {
+    this.languagePair = { langA, langB };
+    // targetLang 仍作为「是否启用翻译判定」的开关：设为 langB 以保证判定分支被激活，
+    // 但实际每段目标由 resolveTargetLang 按方向覆盖，故它自身的值不参与相等比较。
+    this.targetLang = langB;
+  }
+
+  // 解析某段落的目标语言：
+  // - two_way：取语言对中与原文语言不同的那一个（A→B 目标 langB、B→A 目标 langA）。
+  //   若原文语言不在语言对内（误检第三语言），回退到 langB 作为默认目标。
+  // - one_way：恒为固定 targetLang。
+  private resolveTargetLang(sourceLanguage: string | null): string {
+    if (!this.languagePair) {
+      return this.targetLang;
+    }
+    const { langA, langB } = this.languagePair;
+    if (sourceLanguage === langA) return langB;
+    if (sourceLanguage === langB) return langA;
+    return langB;
   }
 
   setMaxSegmentChars(chars: number) {
@@ -238,7 +265,11 @@ export class TokenProcessor {
       return false;
     }
 
-    return this.getDominantLanguage(tokens) === this.targetLang;
+    // 该段原文语言是否已经等于「它自己的目标语言」。双向模式下目标按方向解析，
+    // 因此一个干净的 A↔B 段（A→B 或 B→A）永远不会命中 passthrough——这正是期望：
+    // Soniox 对每段都会产出跨语真实译文，不能被误判为无需翻译。
+    const dominant = this.getDominantLanguage(tokens);
+    return dominant != null && dominant === this.resolveTargetLang(dominant);
   }
 
   private getCurrentPreview(): StreamingPreviewText {

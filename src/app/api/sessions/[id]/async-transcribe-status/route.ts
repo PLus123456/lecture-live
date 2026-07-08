@@ -17,23 +17,14 @@ import { logger } from '@/lib/logger';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership } from '@/lib/security';
 import { enforceRateLimit } from '@/lib/rateLimit';
-import { persistSessionTranscriptArtifacts } from '@/lib/sessionPersistence';
 import { getTranscodingProgress } from '@/lib/audio/asyncUploadProcessor';
 import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
 import {
   deleteSonioxFile,
   deleteSonioxTranscription,
-  getSonioxTranscript,
   getSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
-import {
-  convertAsyncTokensToSegments,
-  extractTranslationsByTokens,
-} from '@/lib/soniox/asyncTranscriptConverter';
-import { runBackgroundLLMTasks } from '@/lib/sessionFinalization';
-import { deductTranscriptionMinutes } from '@/lib/quota';
-import { getBillableMinutes } from '@/lib/billing';
-import { getSiteSettings } from '@/lib/siteSettings';
+import { finalizeAsyncTranscription } from '@/lib/audio/asyncTranscribeFinalize';
 
 export async function GET(
   req: Request,
@@ -144,120 +135,54 @@ export async function GET(
   }
 
   // ── job.status === 'completed' ──
-  // 用 updateMany WHERE status='transcribing' 抢锁，只有一个并发 poll 能进 finish 分支
-  const claim = await prisma.session.updateMany({
-    where: { id: session.id, asyncTranscribeStatus: 'transcribing' },
-    data: { asyncTranscribeStatus: 'finalizing' },
-  });
-
-  if (claim.count !== 1) {
-    // 另一个 poll 已经在收尾。读最新状态返回。
-    const fresh = await prisma.session.findUnique({ where: { id: session.id } });
-    return NextResponse.json({
-      status: fresh?.asyncTranscribeStatus ?? 'transcribing',
-      error: fresh?.asyncTranscribeError ?? undefined,
-    });
-  }
-
+  // 收尾（claim + 拉 transcript + 落盘 + 扣费）抽到共享 finalizeAsyncTranscription，
+  // 与回收兜底（billingMaintenance.reclaimStaleAsyncUploads）复用同一份口径 + 同一道幂等
+  // claim（WHERE asyncTranscribeStatus IN ['transcribing'] → 'finalizing'），确保「前端 poll
+  // vs 回收」二选一执行、绝不双扣。
   try {
-    const transcript = await getSonioxTranscript(
-      sonioxConfig,
-      session.sonioxTranscriptionId
-    );
-    const segments = convertAsyncTokensToSegments(transcript.tokens, {
-      targetLang: session.targetLang,
-    });
-    const translations = extractTranslationsByTokens(transcript.tokens, segments);
-
-    const bundle = {
-      segments,
-      summaries: [],
-      translations,
-    };
-    const persisted = await persistSessionTranscriptArtifacts(session, bundle);
-
-    // U60：完成写入必须带状态守卫。上面的 claim 把状态置 'finalizing'，但拉 transcript /
-    // 写盘期间用户仍可能取消（cancelAsyncUpload 的 setStatus 允许 finalizing→canceled）。
-    // 旧代码用 id-only 的无条件 update 会把已 canceled 的会话强行改回 completed 并照常扣费。
-    // 改成条件 updateMany WHERE asyncTranscribeStatus='finalizing'：抢不到（已被取消）→
-    // 不写库、不扣费，直接把当前最新状态返回给前端。
-    const finalized = await prisma.session.updateMany({
-      where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
-      data: {
-        asyncTranscribeStatus: 'completed',
-        transcriptPath: persisted.transcript.path,
-        summaryPath: persisted.summary.path,
-        // 清掉 Soniox 引用 —— 文件已经删了/即将删
-        sonioxFileId: null,
-        sonioxTranscriptionId: null,
-        status: 'COMPLETED',
+    const result = await finalizeAsyncTranscription(
+      {
+        id: session.id,
+        userId: session.userId,
+        sonioxFileId: session.sonioxFileId,
+        sonioxTranscriptionId: session.sonioxTranscriptionId,
+        targetLang: session.targetLang,
+        durationMs: session.durationMs,
+        recordingPath: session.recordingPath,
+        title: session.title,
+        courseName: session.courseName,
+        createdAt: session.createdAt,
+        folderIds: session.folders.map((f) => f.folderId),
       },
-    });
-    if (finalized.count !== 1) {
-      // 收尾期间会话已被取消/改状态：不扣费、不跑后续 LLM，但仍尽力清 Soniox 资源，
-      // 避免上传到 Soniox 的文件/transcription 泄漏。
-      if (session.sonioxFileId) {
-        await deleteSonioxFile(sonioxConfig, session.sonioxFileId).catch(() => undefined);
+      sonioxConfig,
+      {
+        allowClaimFrom: ['transcribing'],
+        onCompleted: () => invalidateSessionsApiCache(user.id),
       }
-      await deleteSonioxTranscription(
-        sonioxConfig,
-        session.sonioxTranscriptionId
-      ).catch(() => undefined);
+    );
+
+    if (result.outcome === 'claim_lost') {
+      // 另一个 poll（或回收）已经在收尾。读最新状态返回。
+      const fresh = await prisma.session.findUnique({ where: { id: session.id } });
+      return NextResponse.json({
+        status: fresh?.asyncTranscribeStatus ?? 'transcribing',
+        error: fresh?.asyncTranscribeError ?? undefined,
+      });
+    }
+
+    if (result.outcome === 'canceled_during_finalize') {
+      // 收尾期间会话已被取消/改状态：未扣费、未跑 LLM、已清 Soniox 资源，读最新状态返回。
       const fresh = await prisma.session.findUnique({ where: { id: session.id } });
       return NextResponse.json({
         status: fresh?.asyncTranscribeStatus ?? 'canceled',
         error: fresh?.asyncTranscribeError ?? undefined,
       });
     }
-    await invalidateSessionsApiCache(user.id);
-
-    // 异步上传转录计费（批2）：上方 updateMany claim + 此处 finalize 守卫共同保证每个 session
-    // 仅有一个 poll 进到此分支且未被取消，故扣费恰好执行一次（幂等无须额外锁）。按
-    // ceil(分钟)×倍率 扣减，倍率默认 0.8、可在 admin 设置；与对账侧口径一致。计费失败不影响
-    // 转录完成，留给对账兜底。
-    try {
-      const { async_upload_billing_multiplier } = await getSiteSettings();
-      const billableMinutes = Math.ceil(
-        getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
-      );
-      if (billableMinutes > 0) {
-        await deductTranscriptionMinutes(session.userId, billableMinutes);
-      }
-    } catch (billingErr) {
-      logger.error(
-        { err: billingErr, sessionId: session.id },
-        'async upload billing deduct failed (transcription already completed)'
-      );
-    }
-
-    // fire-and-forget：runBackgroundLLMTasks 自带 try/catch，不阻塞 status 响应
-    void runBackgroundLLMTasks({
-      sessionId: session.id,
-      userId: session.userId,
-      transcriptPath: persisted.transcript.path,
-      summaryPath: persisted.summary.path,
-      recordingPath: session.recordingPath,
-      title: session.title,
-      courseName: session.courseName ?? '',
-      durationMs: session.durationMs,
-      createdAt: session.createdAt,
-      targetLang: session.targetLang || 'zh',
-      folderIds: session.folders.map((f) => f.folderId),
-      bundle,
-    });
-
-    // 删 Soniox 上的资源（幂等，失败不抛）
-    if (session.sonioxFileId) {
-      await deleteSonioxFile(sonioxConfig, session.sonioxFileId).catch(() => undefined);
-    }
-    await deleteSonioxTranscription(sonioxConfig, session.sonioxTranscriptionId).catch(
-      () => undefined
-    );
 
     return NextResponse.json({
       status: 'completed',
       sessionId: session.id,
-      segmentCount: segments.length,
+      segmentCount: result.segmentCount,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

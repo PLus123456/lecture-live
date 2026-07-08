@@ -89,6 +89,8 @@ const FORMAT_OPTIONS: FormatOption[] = [
 
 interface SessionExportDataResponse {
   title?: string;
+  /** 讲座创建日期（session.createdAt 的 ISO 字符串），用于导出文档头部 */
+  date?: string;
   sourceLang?: string;
   targetLang?: string;
   segments?: ExportTranscriptSegment[];
@@ -431,7 +433,8 @@ export default function ExportModal({
         documentMode,
         payload: {
           title: resolvedTitle,
-          date: new Date().toISOString(),
+          // 使用真实讲座日期（session.createdAt），无则回退到当前时间
+          date: latestSessionData?.date ?? new Date().toISOString(),
           sourceLang: sessionSourceLang,
           targetLang: sessionTargetLang,
           segments,

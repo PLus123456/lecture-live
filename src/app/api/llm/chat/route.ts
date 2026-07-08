@@ -990,15 +990,19 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
   // 平移 + 偏移基准），并准备多录音 RAG 闭包 ──
   const combinedTranscript: TranscriptSegment[] = [];
   let cumulativeMs = 0;
+  // 各录音喂给 RAG 的 segments 用「已平移到全局轴」的 startMs（= 本录音全局偏移 +
+  // 本地 startMs），使 RAG 检索片段打的 [HH:MM:SS] 标签与 totalTranscriptMs / 时间锚点
+  // 系统消息同轴。此前这里存的是未平移的 per-recording 本地轴 segments，两套坐标冲突，
+  // 模型给出的时间引用与播放器/锚点对不上（v3 finding U54）。
   const segmentsByRecording = new Map<string, TranscriptSegment[]>();
   for (const asset of sessionAssets) {
-    segmentsByRecording.set(asset.session.id, asset.segments);
-    for (const seg of asset.segments) {
-      combinedTranscript.push({
-        text: seg.text,
-        startMs: cumulativeMs + seg.startMs,
-      });
-    }
+    const recordingOffsetMs = cumulativeMs;
+    const shiftedSegments = asset.segments.map((seg) => ({
+      text: seg.text,
+      startMs: recordingOffsetMs + seg.startMs,
+    }));
+    segmentsByRecording.set(asset.session.id, shiftedSegments);
+    combinedTranscript.push(...shiftedSegments);
     // 用最后一段的 endMs 作为该 session 的总长度近似（segments 已按时间序）
     const last = asset.segments[asset.segments.length - 1];
     if (last) {

@@ -620,7 +620,13 @@ export default function ActiveSessionPage() {
     onAutoPause: handleAutoPauseNotice,
     onAutoResume: handleAutoResumeNotice,
   });
-  const { initLocal, translateSentence, destroy: destroyTranslator } = useLocalTranslation();
+  const { initLocal, translateSentence, destroy: destroyTranslator } = useLocalTranslation({
+    // 本地模型加载失败自动回退云端时，重建活跃 Soniox 会话使云翻译真正生效（U81）。
+    // rebuildSession 在无活跃录音会话（recordingRef 为空）时会自行早退，故安全。
+    onFallbackToCloud: () => {
+      void rebuildSession();
+    },
+  });
   const { init: initSummary, onNewSentence, triggerManual, reset: resetSummary } = useSummary();
   const prevSegmentCountRef = useRef(0);
   const prevSummaryCountRef = useRef(0);

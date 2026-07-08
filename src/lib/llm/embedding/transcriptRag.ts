@@ -127,6 +127,28 @@ function cosineSimilarity(a: number[], b: number[]): number {
 }
 
 /**
+ * 检测「缓存 vectors 是否存在与 query 维度不一致的向量」。
+ *
+ * 增量重建会对未变 chunk 复用旧向量、只对变动 chunk 用新维度重 embed；切换过
+ * embedding 维度（如 1536→1024）后就会得到混合维度的 vectors。若只采样第一个非空
+ * 向量（旧实现），当变动 chunk 恰在最前（新维度、与 query 同维）时守卫会误判"维度
+ * 一致"，剩下的旧维度 chunk 经 cosineSimilarity 维度不等短路静默得 0 分、检索长期漏
+ * 内容且无日志（见 v3 finding U41）。这里改为对整个数组做统一维度断言：只要有任一
+ * 非空向量维度 ≠ queryDim（或彼此不一致），即判为需整段重 embed 自愈。
+ *
+ * 返回首个不一致向量的维度（用于日志）；全部一致或无非空向量时返回 null。
+ */
+function findMismatchedVectorDim(
+  vectors: ReadonlyArray<number[]>,
+  queryDim: number
+): number | null {
+  for (const v of vectors) {
+    if (v.length > 0 && v.length !== queryDim) return v.length;
+  }
+  return null;
+}
+
+/**
  * 格式化时间戳为 HH:MM:SS（用于检索结果上的时间标签）。
  */
 function formatTimeLabel(ms: number): string {
@@ -229,14 +251,19 @@ export async function retrieveTranscriptByEmbedding(args: {
 
   // 检测 query vec 与缓存 chunk vec 的维度是否一致：
   // 不一致通常是 admin 切换了不同维度的 embedding 模型（如 1536 → 1024），
-  // cache 里仍是旧维度的 vectors。一次性 invalidate + 重 embed 整段 transcript。
-  const sampleVec = ragState.vectors.find((v) => v.length > 0);
-  if (sampleVec && queryVec.length !== sampleVec.length) {
+  // cache 里仍是旧维度的 vectors（增量重建后可能是新旧混合维度）。一次性 invalidate +
+  // 重 embed 整段 transcript。对整个数组做统一维度断言而非只采样第一个非空向量 ——
+  // 否则变动 chunk 恰在最前时守卫会漏检混合维度（U41）。
+  const mismatchedDim = findMismatchedVectorDim(
+    ragState.vectors,
+    queryVec.length
+  );
+  if (mismatchedDim !== null) {
     ragLogger.warn(
       {
         sessionId,
         queryDim: queryVec.length,
-        cachedDim: sampleVec.length,
+        cachedDim: mismatchedDim,
         chunkCount: ragState.chunks.length,
       },
       'Embedding 维度不一致（可能切换了 embedding 模型），自动清空 cache 并重新 embed'
@@ -502,14 +529,18 @@ export function makeRagRetrieverForRecordings(
       const [queryVec] = await callEmbedding([query]);
 
       // 维度不一致兜底：admin 切换了 embedding 模型时 cache 里仍是旧维度
-      // vectors，需要整批重 embed
-      const sampleVec = state.vectors.find((v) => v.length > 0);
-      if (sampleVec && queryVec.length !== sampleVec.length) {
+      // vectors（增量重建后可能新旧混合维度），需要整批重 embed。对整个数组做统一
+      // 维度断言而非只采样第一个非空向量 —— 否则变动 chunk 在最前时会漏检（U41）。
+      const mismatchedDim = findMismatchedVectorDim(
+        state.vectors,
+        queryVec.length
+      );
+      if (mismatchedDim !== null) {
         ragLogger.warn(
           {
             cacheKey,
             queryDim: queryVec.length,
-            cachedDim: sampleVec.length,
+            cachedDim: mismatchedDim,
             chunkCount: state.chunks.length,
           },
           'Embedding 维度不一致（可能切换了 embedding 模型），自动清空 multi-cache 并重新 embed'

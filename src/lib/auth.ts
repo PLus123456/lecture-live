@@ -15,6 +15,14 @@ const DEFAULT_JWT_EXPIRY_DAYS = 7;
 const COOKIE_NAME = 'lecture-live-token';
 const ABSOLUTE_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const TOKEN_BLACKLIST_PREFIX = 'auth:blacklist:';
+// 刷新幂等宽限窗：旧 jti 被 rotate 后，把「旧 jti → 刚 rotate 出的新原始 token」
+// 短暂记一份。并发第二个 Tab（丢包、或还没收到新 cookie）带着刚 rotate 的旧 jti 再来刷新时，
+// 返回同一个新 token 而非 401——两个 Tab 收敛到同一个 cookie。
+// 宽限窗一过记录即失效，旧 jti 仍在黑名单里（TTL=剩余寿命），重放保护完全不变。
+// 返回前对新 token 走一次完整 verifyAuthToken（签名/绝对上限/黑名单/tokenVersion/status），
+// 故改密/封禁/版本递增的即时吊销一律不受宽限影响。
+const TOKEN_REFRESH_GRACE_PREFIX = 'auth:refresh-grace:';
+const TOKEN_REFRESH_GRACE_TTL_MS = 30 * 1000;
 export const CLIENT_SESSION_TOKEN = '__cookie_session__';
 const DUMMY_PASSWORD_HASH =
   '$2a$12$l8o61N0Huak0dRlwugeWR.BFVvNTyaqygzfgFHhPLBBEPtvQY9z..';
@@ -41,6 +49,17 @@ const TOKEN_BLACKLIST_STORE_KEY = '__lectureLiveTokenBlacklistStore';
 
 type TokenBlacklistGlobal = typeof globalThis & {
   [TOKEN_BLACKLIST_STORE_KEY]?: Map<string, TokenBlacklistEntry>;
+};
+
+interface RefreshGraceEntry {
+  token: string;
+  expiresAt: number;
+}
+
+const TOKEN_REFRESH_GRACE_STORE_KEY = '__lectureLiveTokenRefreshGraceStore';
+
+type TokenRefreshGraceGlobal = typeof globalThis & {
+  [TOKEN_REFRESH_GRACE_STORE_KEY]?: Map<string, RefreshGraceEntry>;
 };
 
 export interface UserPayload {
@@ -211,6 +230,87 @@ export async function revokeToken(
   store.set(payload.jti, { expiresAt });
 }
 
+// --------------- Refresh idempotency (grace window) ---------------
+
+function getRefreshGraceStore(): Map<string, RefreshGraceEntry> {
+  const globalState = globalThis as TokenRefreshGraceGlobal;
+  if (!globalState[TOKEN_REFRESH_GRACE_STORE_KEY]) {
+    globalState[TOKEN_REFRESH_GRACE_STORE_KEY] = new Map<string, RefreshGraceEntry>();
+  }
+  return globalState[TOKEN_REFRESH_GRACE_STORE_KEY] as Map<string, RefreshGraceEntry>;
+}
+
+function pruneExpiredGraceEntries(store: Map<string, RefreshGraceEntry>) {
+  const now = Date.now();
+  store.forEach((entry, jti) => {
+    if (entry.expiresAt <= now) {
+      store.delete(jti);
+    }
+  });
+}
+
+/**
+ * 记录一次刷新 rotation：旧 jti → 刚 rotate 出的新原始 token，短 TTL（默认 30s）。
+ * 仅用于让并发/丢包的第二个 Tab 幂等拿到同一个新 token；不影响任何吊销逻辑。
+ * Redis 优先，不可用时回落进程内存（与黑名单同构）。
+ */
+export async function recordRefreshGrace(
+  oldJti: string,
+  newToken: string
+): Promise<void> {
+  const ttlSeconds = Math.ceil(TOKEN_REFRESH_GRACE_TTL_MS / 1000);
+
+  const redis = getRedisClient();
+  if (redis && redis.status === 'ready') {
+    try {
+      await redis.set(
+        `${TOKEN_REFRESH_GRACE_PREFIX}${oldJti}`,
+        newToken,
+        'EX',
+        ttlSeconds
+      );
+      return;
+    } catch {
+      // Fall back to in-memory grace store when Redis is unavailable.
+    }
+  }
+
+  const store = getRefreshGraceStore();
+  pruneExpiredGraceEntries(store);
+  store.set(oldJti, {
+    token: newToken,
+    expiresAt: Date.now() + TOKEN_REFRESH_GRACE_TTL_MS,
+  });
+}
+
+/**
+ * 查一个（已被 rotate 的）旧 jti 是否有仍在宽限窗内的新 token。
+ * 命中返回该新原始 token（调用方仍需对它走完整 verifyAuthToken 再放行）；
+ * 未命中/已过期返回 null。
+ */
+export async function lookupRefreshGrace(oldJti: string): Promise<string | null> {
+  const redis = getRedisClient();
+  if (redis && redis.status === 'ready') {
+    try {
+      return await redis.get(`${TOKEN_REFRESH_GRACE_PREFIX}${oldJti}`);
+    } catch {
+      // Fall back to in-memory grace store when Redis is unavailable.
+    }
+  }
+
+  const store = getRefreshGraceStore();
+  pruneExpiredGraceEntries(store);
+  const entry = store.get(oldJti);
+  if (!entry) {
+    return null;
+  }
+  if (entry.expiresAt <= Date.now()) {
+    store.delete(oldJti);
+    return null;
+  }
+  return entry.token;
+}
+
 export function extractTokenFromCookieHeader(
   cookieHeader: string | null | undefined
 ): string | null {
@@ -282,6 +382,29 @@ async function verifyToken(token: string): Promise<AuthSession | null> {
       token: decoded,
       rawToken: token,
     };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 只校验签名、载荷结构与绝对上限，返回 jti——不查黑名单、不查 DB。
+ * 用于刷新幂等：当 verifyAuthSession 因「旧 jti 已入黑名单」而拒绝时，
+ * 仍需拿到这个（真实签发过的）jti 去查宽限记录。伪造/过期/篡改 token 一律返回 null，
+ * 故不会放宽任何伪造保护——攻击者没有签名密钥就构造不出匹配的 jti。
+ */
+export function peekTokenJti(token: string): string | null {
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: ['HS256'],
+    }) as AuthTokenPayload;
+    if (!isValidTokenPayload(decoded)) {
+      return null;
+    }
+    if (decoded.sessionStartedAt + ABSOLUTE_SESSION_LIFETIME_MS < Date.now()) {
+      return null;
+    }
+    return decoded.jti;
   } catch {
     return null;
   }

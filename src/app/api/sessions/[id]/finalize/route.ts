@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
+import { prisma } from '@/lib/prisma';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { withRequestLogging } from '@/lib/requestLogger';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
@@ -22,13 +23,25 @@ export const POST = withRequestLogging(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const rateLimited = await enforceRateLimit(req, {
-      scope: 'sessions:finalize',
-      limit: 10,
-      windowMs: 60_000,
-      key: `user:${user.id}`,
+    // 幂等短路：已 COMPLETED/ARCHIVED 的会话跳过按次限流，直接交给 finalizeSession 的
+    // alreadyCompleted 早退返回成功（其内部仍做归属校验）。避免 429 风暴冷却期内、合法的
+    // 收尾补发（前端 FINALIZING 轮询重试、多标签）被 10/分限流误伤而「收不了尾」。
+    const preCheck = await prisma.session.findUnique({
+      where: { id },
+      select: { status: true },
     });
-    if (rateLimited) return rateLimited;
+    const alreadyDone =
+      preCheck?.status === 'COMPLETED' || preCheck?.status === 'ARCHIVED';
+
+    if (!alreadyDone) {
+      const rateLimited = await enforceRateLimit(req, {
+        scope: 'sessions:finalize',
+        limit: 10,
+        windowMs: 60_000,
+        key: `user:${user.id}`,
+      });
+      if (rateLimited) return rateLimited;
+    }
 
     const { searchParams } = new URL(req.url);
     const finalizeSource =

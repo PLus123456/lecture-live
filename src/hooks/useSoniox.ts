@@ -32,6 +32,8 @@ const RECONNECT_BASE_DELAY_MS = 1500;
 // 连接需持续稳定这么久未再断开，才复位重连退避计数。防止断网抖动(连上→秒断→再连)下
 // 每次短暂 WS open 都把计数清零，导致 MAX_RECONNECT_ATTEMPTS 永远到不了、无限重连风暴。
 const STABLE_CONNECTION_MS = 8000;
+// 分片上传撞 429 后，无 Retry-After 时的默认退避基值。
+const CHUNK_BACKOFF_BASE_MS = 3000;
 
 interface UseSonioxOptions {
   idleTimeoutMs?: number;
@@ -58,6 +60,8 @@ export function useSoniox(
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stableConnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const remoteDraftSeqsRef = useRef<Set<number>>(new Set());
+  // 分片上传的 429 退避截止时刻(epoch ms)。窗口内一律短路不再撞限流。
+  const chunkBackoffUntilRef = useRef(0);
   const syncDraftPromiseRef = useRef<Promise<boolean> | null>(null);
   const lastAudioActivityAtRef = useRef<number | null>(null);
   const autoPauseReasonRef = useRef<'idle' | 'disconnect' | null>(null);
@@ -147,6 +151,17 @@ export function useSoniox(
         return true;
       }
 
+      // 429 退避窗口内直接短路，不发网络请求 —— 避免「无退避重传 → 更多 429」的正反馈风暴。
+      if (Date.now() < chunkBackoffUntilRef.current) {
+        publishBackupMeta({
+          localChunkCount,
+          remoteChunkCount: remoteDraftSeqsRef.current.size,
+          syncState: 'pending',
+          lastError: 'Backup upload is backing off after rate limiting',
+        });
+        return false;
+      }
+
       publishBackupMeta({
         localChunkCount,
         remoteChunkCount: remoteDraftSeqsRef.current.size,
@@ -170,6 +185,15 @@ export function useSoniox(
         );
 
         if (!response.ok) {
+          if (response.status === 429) {
+            // 尊重服务端 Retry-After；缺省用基值退避。窗口内后续上传/补传会被上面的短路拦下。
+            const retryAfter = Number(response.headers.get('Retry-After'));
+            const backoffMs =
+              Number.isFinite(retryAfter) && retryAfter > 0
+                ? retryAfter * 1000
+                : CHUNK_BACKOFF_BASE_MS;
+            chunkBackoffUntilRef.current = Date.now() + backoffMs;
+          }
           publishBackupMeta({
             localChunkCount,
             remoteChunkCount: remoteDraftSeqsRef.current.size,
@@ -179,6 +203,8 @@ export function useSoniox(
           return false;
         }
 
+        // 成功即解除退避（限流已恢复）。
+        chunkBackoffUntilRef.current = 0;
         remoteDraftSeqsRef.current.add(seq);
         publishBackupMeta({
           localChunkCount,
@@ -262,6 +288,12 @@ export function useSoniox(
         for (const entry of localEntries) {
           if (remoteDraftSeqsRef.current.has(entry.seq)) {
             continue;
+          }
+
+          // 退避窗口内直接停止本轮补传（而非逐个撞限流），剩余缺失分片留待下次触发。
+          if (Date.now() < chunkBackoffUntilRef.current) {
+            hadFailures = true;
+            break;
           }
 
           const uploaded = await uploadDraftChunk(entry.seq, entry.blob, mimeType);

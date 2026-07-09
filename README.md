@@ -53,7 +53,7 @@ LectureLive is a full-stack web application for live teaching scenarios. It comb
     </td>
     <td width="50%">
       <strong>Multilingual translation</strong><br />
-      Use cloud translation or run a local ONNX pipeline in the browser with WebGPU acceleration.
+      Use cloud translation or run a local ONNX pipeline in the browser with WebGPU acceleration, plus a live simultaneous-interpretation mode.
     </td>
   </tr>
   <tr>
@@ -86,6 +86,8 @@ flowchart LR
 ```
 
 ## Architecture
+
+> For a deeper, structured breakdown of the runtime processes, data model, subsystems, and API surface, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 <p align="center">
   <img src="public/readme/architecture-en.png" alt="LectureLive self-hosted architecture visual" width="920" />
@@ -186,26 +188,28 @@ lecture-live/
 ├── src/
 │   ├── app/                # Next.js App Router pages and API routes
 │   │   ├── (auth)/         # Login and registration
-│   │   ├── (dashboard)/    # Home, folders, settings, admin
+│   │   ├── (dashboard)/    # Home, chat, folders, interpret, conversations, shared, settings, admin
 │   │   ├── session/        # Recording, live view, playback
 │   │   ├── library/        # Shared sessions
-│   │   └── api/            # REST API endpoints
-│   ├── components/         # React UI and mobile-specific components
-│   ├── hooks/              # Custom hooks for ASR, auth, live share, translation
-│   ├── lib/                # Core domain logic, services, security, export, billing
+│   │   └── api/            # REST API endpoints (auth, sessions, conversations, llm, interpret, share, storage, admin, ...)
+│   ├── components/         # React UI (admin, chat, session, viewer, folder, mobile, layout, global)
+│   ├── hooks/              # Custom hooks for ASR, chat, interpret, auth, live share, translation
+│   ├── lib/                # Core domain logic: auth, quota/billing, LLM gateway, Soniox, audio, live-share, storage, export
 │   ├── stores/             # Zustand stores
 │   └── types/              # Shared TypeScript types
 ├── prisma/
-│   └── schema.prisma       # Database schema
+│   └── schema.prisma       # Database schema (18 models)
 ├── server/
-│   └── websocket.ts        # Independent Socket.IO server
-├── scripts/                # Database, billing, and maintenance scripts
+│   └── websocket.ts        # Independent Socket.IO live-share server
+├── scripts/                # DB ensure/migrate, quota reset, reconciliation, billing maintenance, key re-encryption
+├── docs/
+│   └── ARCHITECTURE.md     # Architecture & data-model manifest
 ├── tests/                  # Test assets and shared testing support
 ├── e2e/                    # Playwright end-to-end tests
-├── public/                 # App icons and static assets
+├── public/                 # App icons, static assets, fonts/ (bundled Noto Sans SC for CJK export)
 ├── docker-compose.yml
 ├── Dockerfile
-└── deploy/                 # Deployment shims and runtime helpers
+└── deploy/                 # systemd units, install/upgrade/rollback scripts, lecture-live CLI, nginx config
 ```
 
 ## Configuration & Security
@@ -263,6 +267,7 @@ LectureLive uses the Cloudreve v4 OAuth authorization code flow with PKCE for st
 | `npm run db:migrate` | Run Prisma development migrations |
 | `npm run db:migrate:deploy` | Apply production migrations |
 | `npm run db:studio` | Open Prisma Studio |
+| `npm run db:backfill-conversation-user-id` | Backfill `Conversation.userId` for legacy rows |
 | `npm run billing:reset-quotas` | Reset monthly transcription quotas |
 | `npm run billing:reconcile` | Reconcile transcription usage |
 | `npm run billing:maintenance` | Run billing maintenance tasks |

@@ -53,7 +53,7 @@ LectureLive 是一个面向直播授课与课堂记录的全栈 Web 应用。它
     </td>
     <td width="50%">
       <strong>多语言翻译</strong><br />
-      既支持云端翻译，也支持浏览器内使用 WebGPU 加速的本地 ONNX 翻译。
+      既支持云端翻译，也支持浏览器内使用 WebGPU 加速的本地 ONNX 翻译，并提供实时同声传译模式。
     </td>
   </tr>
   <tr>
@@ -86,6 +86,8 @@ flowchart LR
 ```
 
 ## 系统架构
+
+> 如需更深入、结构化的运行进程、数据模型、子系统与 API 说明，请参阅 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 <p align="center">
   <img src="public/readme/architecture-zh.png" alt="LectureLive 自托管系统架构视觉图" width="920" />
@@ -185,26 +187,28 @@ lecture-live/
 ├── src/
 │   ├── app/                # Next.js App Router 页面与 API 路由
 │   │   ├── (auth)/         # 登录与注册
-│   │   ├── (dashboard)/    # 首页、文件夹、设置、管理后台
+│   │   ├── (dashboard)/    # 首页、对话、文件夹、同传、会话记录、共享、设置、管理后台
 │   │   ├── session/        # 录制、直播查看、回放
 │   │   ├── library/        # 共享会话
-│   │   └── api/            # REST API 接口
-│   ├── components/         # React UI 与移动端组件
-│   ├── hooks/              # ASR、认证、实时分享、翻译等自定义 Hooks
-│   ├── lib/                # 核心业务逻辑、服务、鉴权、导出、计费
+│   │   └── api/            # REST API 接口（auth、sessions、conversations、llm、interpret、share、storage、admin 等）
+│   ├── components/         # React UI（admin、chat、session、viewer、folder、mobile、layout、global）
+│   ├── hooks/              # ASR、对话、同传、认证、实时分享、翻译等自定义 Hooks
+│   ├── lib/                # 核心业务逻辑：鉴权、配额/计费、LLM 网关、Soniox、音频、实时分享、存储、导出
 │   ├── stores/             # Zustand 状态仓库
 │   └── types/              # 共享 TypeScript 类型
 ├── prisma/
-│   └── schema.prisma       # 数据库模型
+│   └── schema.prisma       # 数据库模型（18 个 model）
 ├── server/
-│   └── websocket.ts        # 独立 Socket.IO 服务
-├── scripts/                # 数据库、计费与维护脚本
+│   └── websocket.ts        # 独立 Socket.IO 实时分享服务
+├── scripts/                # 数据库就绪/迁移、配额重置、对账、计费维护、密钥重加密脚本
+├── docs/
+│   └── ARCHITECTURE.md     # 架构与数据模型 manifest
 ├── tests/                  # 测试资源与公共测试支持
 ├── e2e/                    # Playwright 端到端测试
-├── public/                 # 图标与静态资源
+├── public/                 # 图标、静态资源、fonts/（内嵌思源黑体 Noto Sans SC 用于 CJK 导出）
 ├── docker-compose.yml
 ├── Dockerfile
-└── deploy/                 # 部署辅助文件与运行时兼容层
+└── deploy/                 # systemd 服务单元、安装/升级/回滚脚本、lecture-live CLI、nginx 配置
 ```
 
 ## 配置与安全
@@ -262,6 +266,7 @@ LectureLive 接入 Cloudreve 存储时，使用的是 Cloudreve v4 的 OAuth 授
 | `npm run db:migrate` | 执行 Prisma 开发迁移 |
 | `npm run db:migrate:deploy` | 执行生产迁移 |
 | `npm run db:studio` | 打开 Prisma Studio |
+| `npm run db:backfill-conversation-user-id` | 为历史对话回填 `Conversation.userId` |
 | `npm run billing:reset-quotas` | 重置月度转录配额 |
 | `npm run billing:reconcile` | 对账转录使用量 |
 | `npm run billing:maintenance` | 执行计费维护任务 |

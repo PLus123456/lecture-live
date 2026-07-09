@@ -721,9 +721,12 @@ export default function ActiveSessionPage() {
       const storeState = useTranscriptStore.getState();
       const isResumable = storeState.recordingState === 'recording' ||
                           storeState.recordingState === 'paused';
-      // 如果 recordingState 是 'stopped' 且还有数据，说明是 FINALIZING 期间刷新的，不能清除
+      // 如果 recordingState 是 'stopped' 且还有数据，说明是 FINALIZING 期间刷新的，不能清除。
+      // 段落尚未落 store 就刷新时 segments 可能为空，但只要还有计时基准(recordingStartTime)
+      // 也一并保留，否则会连 recordingStartTime/pausedAt/totalPausedMs 清掉，冷恢复补不回计时基准(S1)。
       const hasDataAfterStop = storeState.recordingState === 'stopped' &&
-                               storeState.segments.length > 0;
+                               (storeState.segments.length > 0 ||
+                                storeState.recordingStartTime != null);
       wasRecordingRef.current = isResumable;
 
       if (!isResumable && !hasDataAfterStop) {
@@ -1239,10 +1242,13 @@ export default function ActiveSessionPage() {
         steps.findIndex((step) => step.status === 'active'),
         error instanceof Error ? error.message : t('session.finalizing.failed')
       );
-      isFinalizingRef.current = false;
+      // 先把状态落到 paused、再置 isFinalizingRef=false：否则两者之间若发生卸载
+      // (StrictMode 双挂载 / SPA 导航)，cleanup 会在「recordingState 仍是 stopped、
+      // isFinalizingRef 已 false」的窗口里误清全部转录数据（S1 刷新丢状态）。
       const store = useTranscriptStore.getState();
       store.setConnectionState('error');
       store.setRecordingState('paused');
+      isFinalizingRef.current = false;
     }
   }, [
     stopRecording,

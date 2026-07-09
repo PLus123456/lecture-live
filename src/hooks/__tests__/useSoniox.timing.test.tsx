@@ -293,3 +293,106 @@ describe('U21：冷恢复续录不清零计时、段号连续', () => {
     nowSpy.mockRestore();
   });
 });
+
+describe('U57/时间戳：暂停/断网空档不计入续录偏移（computeResumeOffset）', () => {
+  it('暂停中切麦重连后，新段 globalStartMs 以 pausedAt 冻结点为准（60s），不含暂停/切麦空档', async () => {
+    const nowSpy = vi.spyOn(Date, 'now');
+    // 录音开始于 t=1_000_000
+    nowSpy.mockReturnValue(1_000_000);
+
+    const { result } = renderHook(() => useSoniox('sess-ts'));
+    await act(async () => {
+      await result.current.start();
+    });
+    act(() => {
+      capturedCallbacks[capturedCallbacks.length - 1].onConnectionChange('connected');
+    });
+    expect(useTranscriptStore.getState().recordingState).toBe('recording');
+    expect(useTranscriptStore.getState().recordingStartTime).toBe(1_000_000);
+
+    // t=1_060_000：录了 60s 后暂停
+    nowSpy.mockReturnValue(1_060_000);
+    act(() => {
+      result.current.pause();
+    });
+    expect(useTranscriptStore.getState().pausedAt).toBe(1_060_000);
+
+    // t=1_070_000：暂停 10s 后切麦（走 computeResumeOffset —— 以 pausedAt 冻结点算偏移=60_000，
+    // 而非旧的 now 基准 70_000）。
+    nowSpy.mockReturnValue(1_070_000);
+    await act(async () => {
+      await result.current.switchMicrophone('mic-b');
+    });
+    expect(useTranscriptStore.getState().recordingState).toBe('paused');
+
+    // t=1_075_000：新连接建立完成
+    nowSpy.mockReturnValue(1_075_000);
+    act(() => {
+      capturedCallbacks[capturedCallbacks.length - 1].onConnectionChange('connected');
+    });
+    expect(useTranscriptStore.getState().recordingState).toBe('recording');
+
+    // 喂一条 final token（start_ms=0）→ 新段 globalStartMs = timeOffsetMs(=60_000) + 0 = 60_000。
+    // 关键：不是 now 基准的 70_000/75_000 —— 暂停/切麦这段空档不被当成音频时长算进偏移。
+    const cb = capturedCallbacks[capturedCallbacks.length - 1];
+    act(() => {
+      cb.onPartialResult([
+        {
+          text: 'resumed',
+          is_final: true,
+          start_ms: 0,
+          end_ms: 500,
+          confidence: 1,
+          language: 'en',
+        },
+      ]);
+      cb.onEndpoint();
+    });
+
+    const segs = useTranscriptStore.getState().segments;
+    const newSeg = segs[segs.length - 1];
+    expect(newSeg.globalStartMs).toBe(60_000);
+
+    nowSpy.mockRestore();
+  });
+});
+
+describe('S2：断网抖动不复位重连计数，MAX 封顶生效（重连风暴封顶）', () => {
+  it('反复短暂连上又断开 > MAX 次后最终触发 onReconnectFailed（短暂连接不清零计数）', async () => {
+    vi.useFakeTimers();
+    const onReconnectFailed = vi.fn();
+    const lastCb = () => capturedCallbacks[capturedCallbacks.length - 1];
+
+    const { result } = renderHook(() =>
+      // idleTimeoutMs 拉大，避免推进假时钟时误触发静音自动暂停干扰计数。
+      useSoniox('sess-storm', { onReconnectFailed, idleTimeoutMs: 999_999_999 })
+    );
+
+    await act(async () => {
+      await result.current.start();
+    });
+    act(() => {
+      lastCb().onConnectionChange('connected');
+    });
+    expect(useTranscriptStore.getState().recordingState).toBe('recording');
+
+    // 抖动：连上→立即断→重连→连上→立即断……每次连接都远不到 8s 稳定阈值。
+    // 旧逻辑(WS open 即清零计数)下 MAX 永远到不了 = 无限重连风暴；
+    // 修复后计数持续累计，超过 MAX 后 attemptReconnect 放弃并触发 onReconnectFailed。
+    for (let i = 0; i < 8; i++) {
+      act(() => {
+        lastCb().onError(new Error('flap'));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      act(() => {
+        lastCb().onConnectionChange('connected');
+      });
+    }
+
+    expect(onReconnectFailed).toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+});

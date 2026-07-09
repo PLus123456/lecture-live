@@ -76,6 +76,18 @@ vi.mock('@/components/admin/JobQueuePanel', () => ({
 vi.mock('@/components/SiteLogo', () => ({ default: () => <div /> }));
 
 import AdminPage from '@/app/(dashboard)/admin/page';
+import AdminSidebar from '@/components/admin/AdminSidebar';
+
+// 桌面端的 tab 导航已提升到 dashboard layout 的 <AdminSidebar>（SlidingSidebar
+// 滑动模式，与对话区同套动画）。这里按 layout 的组合方式渲染 侧栏 + 页面，
+// 交互（点 tab）发生在侧栏、断言（面板渲染）发生在页面。
+const renderAdmin = () =>
+  render(
+    <>
+      <AdminSidebar visible />
+      <AdminPage />
+    </>
+  );
 
 beforeEach(() => {
   replaceMock.mockClear();
@@ -88,27 +100,27 @@ afterEach(() => {
 
 describe('AdminPage URL state', () => {
   it('默认显示 dashboard tab（无 query 参数）', () => {
-    render(<AdminPage />);
+    renderAdmin();
     expect(screen.getByTestId('panel-dashboard')).toBeInTheDocument();
     expect(screen.queryByTestId('panel-settings')).not.toBeInTheDocument();
   });
 
   it('?tab=settings 时显示 Settings 面板', () => {
     currentSearch = 'tab=settings';
-    render(<AdminPage />);
+    renderAdmin();
     expect(screen.getByTestId('panel-settings')).toBeInTheDocument();
     expect(screen.queryByTestId('panel-dashboard')).not.toBeInTheDocument();
   });
 
   it('?tab=users 时显示 Users 面板', () => {
     currentSearch = 'tab=users';
-    render(<AdminPage />);
+    renderAdmin();
     expect(screen.getByTestId('panel-users')).toBeInTheDocument();
   });
 
   it('点击 tab 通过 router.replace 写入 URL（非默认 tab 写 query 参数）', async () => {
     const user = userEvent.setup();
-    render(<AdminPage />);
+    renderAdmin();
     await user.click(screen.getByRole('button', { name: /User Groups/i }));
     expect(replaceMock).toHaveBeenCalledWith('/admin?tab=groups', expect.anything());
   });
@@ -116,7 +128,7 @@ describe('AdminPage URL state', () => {
   it('回到 dashboard 时清掉 tab query', async () => {
     currentSearch = 'tab=users';
     const user = userEvent.setup();
-    render(<AdminPage />);
+    renderAdmin();
     await user.click(screen.getByRole('button', { name: /Dashboard/i }));
     // dashboard 是默认 tab，URL 应该裸路径
     expect(replaceMock).toHaveBeenCalledWith('/admin', expect.anything());
@@ -125,7 +137,7 @@ describe('AdminPage URL state', () => {
   it('切换主 tab 时清掉残留的 subtab', async () => {
     currentSearch = 'tab=settings&subtab=email';
     const user = userEvent.setup();
-    render(<AdminPage />);
+    renderAdmin();
     await user.click(screen.getByRole('button', { name: /User Groups/i }));
     const url = replaceMock.mock.calls[0][0] as string;
     expect(url).not.toContain('subtab');
@@ -134,7 +146,7 @@ describe('AdminPage URL state', () => {
 
   it('未知 tab 值回退到 dashboard', () => {
     currentSearch = 'tab=hacker';
-    render(<AdminPage />);
+    renderAdmin();
     expect(screen.getByTestId('panel-dashboard')).toBeInTheDocument();
   });
 });

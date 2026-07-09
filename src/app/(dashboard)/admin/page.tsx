@@ -1,29 +1,12 @@
 'use client';
 
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useI18n } from '@/lib/i18n';
-import { useRouter, useSearchParams, usePathname } from 'next/navigation';
-import Link from 'next/link';
-import {
-  LayoutDashboard,
-  Settings,
-  Users,
-  UserCog,
-  AlertTriangle,
-  ArrowLeft,
-  ChevronRight,
-  ScrollText,
-  Scale,
-  Layers,
-  Share2,
-  FolderOpen,
-  LogOut,
-  Paperclip,
-} from 'lucide-react';
-import SiteLogo from '@/components/SiteLogo';
-import { useSettingsStore } from '@/stores/settingsStore';
+import { useRouter } from 'next/navigation';
+import { AlertTriangle, ArrowLeft } from 'lucide-react';
+import { useAdminTabs, useAdminTabState } from '@/components/admin/adminTabs';
 
 import DashboardPanel from '@/components/admin/DashboardPanel';
 import SettingsPanel from '@/components/admin/SettingsPanel';
@@ -36,54 +19,16 @@ import ShareLinksPanel from '@/components/admin/ShareLinksPanel';
 import FilesPanel from '@/components/admin/FilesPanel';
 import ChatFilesPanel from '@/components/admin/ChatFilesPanel';
 
-type AdminTab = 'dashboard' | 'settings' | 'groups' | 'users' | 'files' | 'chatFiles' | 'shareLinks' | 'logs' | 'reconciliation' | 'jobs';
-
-const ADMIN_TABS: AdminTab[] = ['dashboard', 'settings', 'groups', 'users', 'files', 'chatFiles', 'shareLinks', 'logs', 'reconciliation', 'jobs'];
-
-const isAdminTab = (v: string | null): v is AdminTab =>
-  v !== null && (ADMIN_TABS as string[]).includes(v);
-
 export default function AdminPage() {
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
   const isMobile = useIsMobile();
   const { t } = useI18n();
   const router = useRouter();
-  const pathname = usePathname();
-  const searchParams = useSearchParams();
-  const setUserSettingsOpen = useSettingsStore((s) => s.setUserSettingsOpen);
 
-  const tabs: { id: AdminTab; label: string; icon: typeof Users }[] = [
-    { id: 'dashboard', label: t('nav.dashboard'), icon: LayoutDashboard },
-    { id: 'settings', label: t('nav.settings'), icon: Settings },
-    { id: 'groups', label: t('nav.userGroups'), icon: UserCog },
-    { id: 'users', label: t('nav.users'), icon: Users },
-    { id: 'files', label: t('nav.files'), icon: FolderOpen },
-    { id: 'chatFiles', label: t('nav.chatFiles'), icon: Paperclip },
-    { id: 'shareLinks', label: t('nav.shareLinks'), icon: Share2 },
-    { id: 'logs', label: t('nav.logs'), icon: ScrollText },
-    { id: 'reconciliation', label: t('nav.reconciliation'), icon: Scale },
-    { id: 'jobs', label: t('nav.jobQueue'), icon: Layers },
-  ];
-
-  // tab 状态由 URL `?tab=` 驱动，刷新后保留
-  const tabFromUrl = searchParams.get('tab');
-  const activeTab: AdminTab = isAdminTab(tabFromUrl) ? tabFromUrl : 'dashboard';
-
-  const setActiveTab = useCallback(
-    (next: AdminTab) => {
-      const params = new URLSearchParams(searchParams.toString());
-      if (next === 'dashboard') {
-        params.delete('tab');
-      } else {
-        params.set('tab', next);
-      }
-      // 切换主 tab 时清掉子 tab，避免无效组合
-      params.delete('subtab');
-      const qs = params.toString();
-      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
-    },
-    [pathname, router, searchParams],
-  );
+  // tab 定义与 URL `?tab=` 状态与 AdminSidebar（桌面侧栏，挂在 dashboard layout）
+  // 共享同一来源 —— 见 src/components/admin/adminTabs.ts
+  const tabs = useAdminTabs();
+  const [activeTab, setActiveTab] = useAdminTabState();
 
   // ─── 左右滑动切换 tab（移动端） ───
   const touchRef = useRef<{ startX: number; startY: number; startTime: number } | null>(null);
@@ -233,111 +178,21 @@ export default function AdminPage() {
     );
   }
 
+  // 桌面：左侧导航由 dashboard layout 的 <AdminSidebar>（SlidingSidebar 滑动模式，
+  // 与对话区同一套进出动画）接管，这里只渲染内容区（layout 已留 ml-56）。
   return (
-    <div className="h-screen flex overflow-hidden">
-      {/* 管理面板左侧导航 */}
-      <aside className="w-56 bg-white dark:bg-charcoal-800 border-r border-cream-200 dark:border-charcoal-700 flex flex-col flex-shrink-0">
-        {/* 品牌 + 返回 */}
-        <div className="flex items-center justify-between px-3 h-16 border-b border-cream-200 dark:border-charcoal-700">
-          <div className="flex items-center gap-2.5">
-            <SiteLogo size="w-8 h-8" iconSize="w-4 h-4" />
-            <div>
-              <h1 className="font-serif font-bold text-charcoal-800 dark:text-cream-100 text-sm leading-tight">{t('admin.title')}</h1>
-              <p className="text-[10px] text-charcoal-400 tracking-wider uppercase">{t('nav.appName')}</p>
-            </div>
-          </div>
-          <Link
-            href="/home"
-            className="w-7 h-7 rounded-md flex items-center justify-center
-                       text-charcoal-400 hover:bg-cream-100 dark:hover:bg-charcoal-700 hover:text-charcoal-600 transition-colors"
-            title={t('nav.backToHome')}
-          >
-            <ArrowLeft className="w-4 h-4" />
-          </Link>
-        </div>
-
-        {/* 导航项 */}
-        <nav className="flex-1 py-4 px-2 space-y-0.5">
-          {tabs.map((tab, idx) => {
-            const Icon = tab.icon;
-            const isActive = activeTab === tab.id;
-            return (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                style={{ animationDelay: `${idx * 30}ms` }}
-                className={`
-                  group relative w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium
-                  transition-all duration-200 ease-out animate-fade-in-up
-                  ${isActive
-                    ? 'bg-rust-50 dark:bg-rust-900/30 text-rust-600 dark:text-rust-400 border border-rust-200 dark:border-rust-800 shadow-sm scale-[1.01]'
-                    : 'text-charcoal-500 dark:text-charcoal-400 hover:bg-cream-100 dark:hover:bg-charcoal-700 hover:text-charcoal-700 dark:hover:text-cream-200 hover:translate-x-0.5 border border-transparent'
-                  }
-                `}
-              >
-                <Icon className={`w-4 h-4 flex-shrink-0 transition-transform duration-200 ${isActive ? 'scale-110' : 'group-hover:scale-110'}`} />
-                <span>{tab.label}</span>
-                <ChevronRight
-                  className={`w-3.5 h-3.5 ml-auto transition-all duration-200 ${
-                    isActive
-                      ? 'opacity-100 translate-x-0'
-                      : 'opacity-0 -translate-x-1 group-hover:opacity-50 group-hover:translate-x-0'
-                  }`}
-                />
-              </button>
-            );
-          })}
-        </nav>
-
-        {/* 底部用户信息 + 设置 / 退出 */}
-        <div className="p-3 border-t border-cream-200 dark:border-charcoal-700 space-y-2">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-rust-400 to-rust-600 flex items-center justify-center flex-shrink-0">
-              <span className="text-white text-xs font-bold">
-                {user.displayName.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2)}
-              </span>
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium text-charcoal-800 dark:text-cream-100 truncate">{user.displayName}</div>
-              <div className="text-[10px] text-charcoal-400 truncate">{user.email}</div>
-            </div>
-            <button
-              onClick={() => setUserSettingsOpen(true)}
-              className="w-7 h-7 rounded-md flex items-center justify-center
-                         text-charcoal-400 hover:bg-cream-100 dark:hover:bg-charcoal-700 hover:text-charcoal-600 transition-colors"
-              title={t('nav.settings')}
-            >
-              <Settings className="w-3.5 h-3.5" />
-            </button>
-            <button
-              onClick={async () => {
-                await logout();
-                router.replace('/login');
-              }}
-              className="w-7 h-7 rounded-md flex items-center justify-center
-                         text-charcoal-400 hover:bg-red-50 hover:text-red-500 transition-colors"
-              title={t('auth.signOut')}
-            >
-              <LogOut className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-      </aside>
-
-      {/* 右侧内容 */}
-      <div className="flex-1 overflow-y-auto p-8 bg-cream-50 dark:bg-charcoal-900">
-        <div key={activeTab} className="animate-fade-in-up">
-          {activeTab === 'dashboard' && <DashboardPanel />}
-          {activeTab === 'settings' && <SettingsPanel />}
-          {activeTab === 'groups' && <UserGroupsPanel />}
-          {activeTab === 'users' && <UserManagementPanel />}
-          {activeTab === 'files' && <FilesPanel />}
-          {activeTab === 'chatFiles' && <ChatFilesPanel />}
-          {activeTab === 'shareLinks' && <ShareLinksPanel />}
-          {activeTab === 'logs' && <AuditLogPanel />}
-          {activeTab === 'reconciliation' && <ReconciliationPanel />}
-          {activeTab === 'jobs' && <JobQueuePanel />}
-        </div>
+    <div className="h-screen overflow-y-auto p-8 bg-cream-50 dark:bg-charcoal-900">
+      <div key={activeTab} className="animate-fade-in-up">
+        {activeTab === 'dashboard' && <DashboardPanel />}
+        {activeTab === 'settings' && <SettingsPanel />}
+        {activeTab === 'groups' && <UserGroupsPanel />}
+        {activeTab === 'users' && <UserManagementPanel />}
+        {activeTab === 'files' && <FilesPanel />}
+        {activeTab === 'chatFiles' && <ChatFilesPanel />}
+        {activeTab === 'shareLinks' && <ShareLinksPanel />}
+        {activeTab === 'logs' && <AuditLogPanel />}
+        {activeTab === 'reconciliation' && <ReconciliationPanel />}
+        {activeTab === 'jobs' && <JobQueuePanel />}
       </div>
     </div>
   );

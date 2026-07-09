@@ -2,7 +2,6 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { useEffect, useState } from 'react';
 import {
   Home,
   FolderOpen,
@@ -23,7 +22,12 @@ import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
 import { formatBytes } from '@/lib/format';
 
-export default function Sidebar() {
+/**
+ * slideOut：dashboard layout 在进入对话区（/chat、/conversations）时传 true，
+ * 主侧栏整体向左滑出、由 ChatSidebar 滑入接替；离开对话区反向滑回。
+ * 其它调用方（/library、/session 等）不传即恒为可见。
+ */
+export default function Sidebar({ slideOut = false }: { slideOut?: boolean }) {
   const pathname = usePathname();
   const router = useRouter();
   const sidebarCollapsed = useSettingsStore((s) => s.sidebarCollapsed);
@@ -110,7 +114,9 @@ export default function Sidebar() {
         bg-white border-r border-cream-200
         flex flex-col transition-all duration-300 ease-in-out overflow-hidden
         ${sidebarCollapsed ? 'w-16' : 'w-56'}
+        ${slideOut ? '-translate-x-full invisible' : 'translate-x-0 visible'}
       `}
+      aria-hidden={slideOut}
     >
       {/* Logo */}
       <div className="flex items-center h-16 border-b border-cream-200 flex-shrink-0 px-3 overflow-hidden">
@@ -153,8 +159,6 @@ export default function Sidebar() {
           );
         })}
       </nav>
-
-      {!sidebarCollapsed && <RecentChatsSection />}
 
       {/* 底部用户信息区域 */}
       <div className="flex-shrink-0 border-t border-cream-200 mt-auto">
@@ -257,88 +261,5 @@ export default function Sidebar() {
         </div>
       </div>
     </aside>
-  );
-}
-
-/**
- * 「最近对话」侧栏小列表。
- *
- * 调用 GET /api/conversations?recent=8 — 该端点在 U9 单元才会上线，
- * 因此 404/500/网络错误一律静默渲染 nothing，避免给用户看到红色错误。
- */
-interface RecentChatItem {
-  id: string;
-  title?: string | null;
-  updatedAt?: string;
-}
-
-function RecentChatsSection() {
-  const pathname = usePathname();
-  const { t } = useI18n();
-  const [items, setItems] = useState<RecentChatItem[] | null>(null);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const res = await fetch('/api/conversations?recent=8', {
-          signal: controller.signal,
-          credentials: 'include',
-        });
-        if (!res.ok) {
-          // 404/500 — 端点尚未上线（U9），静默忽略
-          return;
-        }
-        const data = (await res.json()) as
-          | { conversations?: RecentChatItem[]; items?: RecentChatItem[] }
-          | RecentChatItem[];
-        const list = Array.isArray(data)
-          ? data
-          : data.conversations ?? data.items ?? [];
-        setItems(list.filter((x) => typeof x?.id === 'string').slice(0, 8));
-      } catch {
-        // 网络错误 / abort — 静默
-      }
-    })();
-    return () => controller.abort();
-  }, []);
-
-  if (!items || items.length === 0) return null;
-
-  return (
-    <div className="flex-1 min-h-0 overflow-y-auto px-3 pt-1 pb-2">
-      <div className="text-[10px] font-medium text-charcoal-400 tracking-wider uppercase whitespace-nowrap px-[10px] mb-1">
-        {t('sidebar.recentChats')}
-      </div>
-      <ul className="space-y-0.5">
-        {items.map((c) => {
-          const href = `/chat/${c.id}`;
-          const isActive = pathname === href;
-          const label =
-            c.title && c.title.trim().length > 0
-              ? c.title
-              : t('sidebar.untitledChat');
-          return (
-            <li key={c.id}>
-              <Link
-                href={href}
-                title={label}
-                className={`
-                  flex items-center h-7 px-[10px] rounded-md text-xs
-                  transition-colors duration-100 overflow-hidden
-                  ${
-                    isActive
-                      ? 'bg-cream-100 text-charcoal-800'
-                      : 'text-charcoal-500 hover:bg-cream-50 hover:text-charcoal-700'
-                  }
-                `}
-              >
-                <span className="truncate whitespace-nowrap">{label}</span>
-              </Link>
-            </li>
-          );
-        })}
-      </ul>
-    </div>
   );
 }

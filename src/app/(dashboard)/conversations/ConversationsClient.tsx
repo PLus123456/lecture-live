@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import {
   MessageSquare,
+  Mic,
   Clock,
   AlertCircle,
   Trash2,
@@ -18,6 +19,7 @@ import {
 import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
 import { toast } from '@/stores/toastStore';
+import { useConversationListStore } from '@/stores/conversationListStore';
 import ConfirmDialog from '@/components/ConfirmDialog';
 
 interface ConversationCard {
@@ -27,6 +29,8 @@ interface ConversationCard {
   endedAt?: string | null;
   messageCount?: number;
   archived?: boolean;
+  /** true = 录音会话内的对话（显示录音角标；「清空全部」不触及） */
+  sessionBound?: boolean;
 }
 
 function formatRelative(iso?: string): string {
@@ -75,6 +79,8 @@ export default function ConversationsClient() {
       if (!token) return;
       setLoading(true);
       try {
+        // recent=50：与侧栏/首页同一套数据（全局对话 + 录音会话内的对话），
+        // 本页额外带归档区。0 条消息的录音空壳对话由下方 filter 统一隐藏。
         const res = await fetch(
           '/api/conversations?recent=50&includeArchived=true',
           { headers: { Authorization: `Bearer ${token}` }, signal }
@@ -88,12 +94,15 @@ export default function ConversationsClient() {
           if (Array.isArray(obj.conversations)) raw = obj.conversations;
           else if (Array.isArray(obj.items)) raw = obj.items;
         }
-        const list = raw.filter(
-          (c): c is ConversationCard =>
-            !!c &&
-            typeof c === 'object' &&
-            typeof (c as ConversationCard).id === 'string'
-        );
+        const list = raw
+          .filter(
+            (c): c is ConversationCard =>
+              !!c &&
+              typeof c === 'object' &&
+              typeof (c as ConversationCard).id === 'string'
+          )
+          // 与共享列表同规则：录音会话内 0 条消息的自动创建空壳不显示
+          .filter((c) => !(c.sessionBound && (c.messageCount ?? 1) === 0));
         setConversations(list);
         setListStatus('ok');
       } catch (err) {
@@ -125,6 +134,8 @@ export default function ConversationsClient() {
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setPendingDelete(null);
+      // 同步侧栏/首页共享列表
+      useConversationListStore.getState().remove(target.id);
       toast.success(t('chat.deleteSuccess'));
     } catch (err) {
       setConversations(prev);
@@ -163,6 +174,8 @@ export default function ConversationsClient() {
         body: JSON.stringify({ title }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // 同步侧栏/首页共享列表
+      useConversationListStore.getState().rename(id, title);
     } catch {
       setConversations((list) =>
         list.map((c) => (c.id === id ? { ...c, title: prevTitle } : c))
@@ -188,6 +201,8 @@ export default function ConversationsClient() {
           body: JSON.stringify({ archived: next }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        // 归档状态影响侧栏可见性（侧栏只显示非归档）→ 强刷共享列表
+        void useConversationListStore.getState().refresh(token, { force: true });
       } catch {
         setConversations((list) =>
           list.map((x) => (x.id === c.id ? { ...x, archived: c.archived } : x))
@@ -209,11 +224,14 @@ export default function ConversationsClient() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ all: true }),
+        // globalOnly：本页只展示全局对话，清空也只清全局 —— 不能把录音会话
+        // 里的对话（本页看不见）连带删掉。
+        body: JSON.stringify({ all: true, globalOnly: true }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setConversations([]);
       setClearOpen(false);
+      void useConversationListStore.getState().refresh(token, { force: true });
       toast.success(t('chat.clearAllSuccess'));
     } catch (err) {
       setConversations(prev);
@@ -236,10 +254,14 @@ export default function ConversationsClient() {
   const active = filtered.filter((c) => !c.archived);
   const archived = filtered.filter((c) => c.archived);
 
-  const renderCard = (c: ConversationCard) => {
+  const renderCard = (c: ConversationCard, index: number) => {
     const title =
       c.title && c.title.trim().length > 0 ? c.title : t('chat.unnamed');
     const when = formatRelative(c.startedAt);
+    // 入场动画统一由此控制：列表逐项 stagger，上限 0.4s
+    const animStyle = {
+      animationDelay: `${Math.min(index * 0.04, 0.4)}s`,
+    };
     if (editingId === c.id) {
       return (
         <div
@@ -283,15 +305,20 @@ export default function ConversationsClient() {
     return (
       <div
         key={c.id}
+        style={animStyle}
         className="group flex items-center gap-3 px-4 py-3 rounded-xl border border-cream-200 bg-white
-                   hover:border-rust-300 hover:shadow-sm transition-all duration-200"
+                   hover:border-rust-300 hover:shadow-sm transition-all duration-200 animate-list-item-in"
       >
         <Link
           href={`/chat/${c.id}`}
           className="flex items-center gap-3 flex-1 min-w-0"
         >
           <div className="w-9 h-9 rounded-lg bg-cream-100 flex items-center justify-center flex-shrink-0">
-            <MessageSquare className="w-4 h-4 text-rust-500" />
+            {c.sessionBound ? (
+              <Mic className="w-4 h-4 text-rust-500" />
+            ) : (
+              <MessageSquare className="w-4 h-4 text-rust-500" />
+            )}
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-0.5">
@@ -358,7 +385,7 @@ export default function ConversationsClient() {
     <div className="flex flex-col h-[100dvh] overflow-hidden">
       {/* 顶部：返回 + 标题 + 清空全部 */}
       <div className="flex-shrink-0 px-8 lg:px-12 pt-8 lg:pt-10 pb-4">
-        <div className="flex items-center justify-between gap-4 mb-4">
+        <div className="flex items-center justify-between gap-4 mb-4 animate-fade-in-up">
           <div className="flex items-center gap-3 min-w-0">
             <Link
               href="/chat"
@@ -385,7 +412,7 @@ export default function ConversationsClient() {
         </div>
 
         {/* 搜索 */}
-        <div className="relative">
+        <div className="relative animate-fade-in-up stagger-2">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-charcoal-300" />
           <input
             type="text"
@@ -399,8 +426,8 @@ export default function ConversationsClient() {
         </div>
       </div>
 
-      {/* 列表 */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-8 lg:px-12 pb-8">
+      {/* 列表（max-md:pb-28 给移动端 fixed BottomTabBar 让位） */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-8 lg:px-12 pb-8 max-md:pb-28">
         {listStatus === 'error' && !loading && (
           <div className="mb-4 flex items-center justify-between gap-2 px-3 py-2 rounded-md bg-red-50 border border-red-200 text-[11px] text-red-700">
             <span className="flex items-center gap-2">
@@ -442,15 +469,17 @@ export default function ConversationsClient() {
         ) : (
           <div className="space-y-4">
             {active.length > 0 && (
-              <div className="space-y-1.5">{active.map(renderCard)}</div>
+              <div className="space-y-1.5">
+                {active.map((c, i) => renderCard(c, i))}
+              </div>
             )}
             {archived.length > 0 && (
               <div className="space-y-1.5">
-                <div className="flex items-center gap-2 px-1 pt-2 text-[11px] font-medium uppercase tracking-wider text-charcoal-400">
+                <div className="flex items-center gap-2 px-1 pt-2 text-[11px] font-medium uppercase tracking-wider text-charcoal-400 animate-fade-in-up">
                   <Archive className="w-3 h-3" />
                   {t('chat.archivedSection')}（{archived.length}）
                 </div>
-                {archived.map(renderCard)}
+                {archived.map((c, i) => renderCard(c, active.length + i))}
               </div>
             )}
           </div>

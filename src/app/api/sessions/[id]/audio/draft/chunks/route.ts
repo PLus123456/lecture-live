@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
-import { enforceRateLimit } from '@/lib/rateLimit';
 import { isAllowedAudioMimeType, normalizeAudioMimeType } from '@/lib/audio/uploadValidation';
 import {
   assertOwnership,
@@ -22,15 +21,12 @@ export async function POST(
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const rateLimited = await enforceRateLimit(req, {
-    scope: 'sessions:audio-draft-chunks',
-    limit: 600,
-    windowMs: 60_000,
-    key: `user:${user.id}`,
-  });
-  if (rateLimited) {
-    return rateLimited;
-  }
+  // 【临时移除限流 — 见 fix/hotfix】录音结束时 syncRemoteDraft 会对本人自己的录音做
+  // 增量补传；按请求数硬限流（600/分）在「服务端 chunk 缺失 → 全量补传」时会被打成 429，
+  // 与限流卡死 key 叠加造成「疯狂同步、会话结束不了」。此端点是 owner 认证 + assertOwnership
+  // 的自有会话批量写，暂时不做按请求数限流。
+  // TODO(真正修复)：① 修 syncRemoteDraft 的「GET 失败→全量重传」放大器（不清空已传记录）；
+  //   ② 如需防滥用，改为按会话总分片数/字节配额限制，而非按请求速率。
 
   const session = await prisma.session.findUnique({
     where: { id: id },

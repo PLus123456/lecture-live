@@ -473,6 +473,19 @@ export function useSoniox(
     }, STABLE_CONNECTION_MS);
   }, []);
 
+  // 续录/重连时传给 processor.startNewSession 的时间偏移（=已录音频毫秒）。
+  // 暂停中（pausedAt 有值）以 pausedAt 为「当前音频时刻」冻结点，避免把暂停/断网空档
+  // （pausedAt→now）当成音频时长算进偏移——否则重连/切麦/重建后段落时间戳整体前移那段空档。
+  // 未暂停（pausedAt 为空，如录制中重建）用 now。Math.max(0) 兜底抖动下 totalPausedMs 虚高致负。
+  // 与 accumulatePausedTime（连接完成后把空档折进 totalPausedMs 供计时）配合但不双算：offset 用
+  // pausedAt 冻结点、totalPausedMs 此刻尚未含本次空档，故一次性正确。overallStart 为空返回 0。
+  const computeResumeOffset = useCallback(() => {
+    if (!overallStartTimeRef.current) return 0;
+    const { pausedAt, totalPausedMs } = useTranscriptStore.getState();
+    const ref = pausedAt ?? Date.now();
+    return Math.max(0, ref - overallStartTimeRef.current - totalPausedMs);
+  }, []);
+
   const ensureProcessor = useCallback(() => {
     if (processorRef.current) {
       return processorRef.current;
@@ -680,14 +693,7 @@ export function useSoniox(
         // 减去累计暂停时长，否则先前暂停过的会话在重连后所有段落时间戳
         // 会前移整段暂停时长、超出实际（已扣暂停）音频长度（U57），与
         // reconnectAfterRefresh 的算法保持一致。
-        const offsetMs = overallStartTimeRef.current
-          ? Math.max(
-              0,
-              Date.now() -
-                overallStartTimeRef.current -
-                useTranscriptStore.getState().totalPausedMs
-            )
-          : 0;
+        const offsetMs = computeResumeOffset();
 
         processorRef.current?.onEndpoint();
         processorRef.current?.startNewSession(offsetMs);
@@ -816,6 +822,7 @@ export function useSoniox(
     },
     [
       canRecoverLocally,
+      computeResumeOffset,
       cancelStableConn,
       markConnectedStable,
       onReconnectFailed,
@@ -1293,12 +1300,7 @@ export function useSoniox(
     // 导致 resume 后所有段落时间戳错位（C12）。与 attemptReconnect /
     // switchMicrophone / rebuildSession / reconnectAfterRefresh 四条同类路径对齐。
     if (reuseProcessor && processorRef.current && overallStartTimeRef.current) {
-      const offsetMs = Math.max(
-        0,
-        Date.now() -
-          overallStartTimeRef.current -
-          useTranscriptStore.getState().totalPausedMs
-      );
+      const offsetMs = computeResumeOffset();
       processorRef.current.onEndpoint();
       processorRef.current.startNewSession(offsetMs);
     }
@@ -1311,6 +1313,7 @@ export function useSoniox(
     });
   }, [
     accumulatePausedTime,
+    computeResumeOffset,
     markAudioActivity,
     recordingState,
     setConnectionState,
@@ -1407,16 +1410,8 @@ export function useSoniox(
       }
 
       const activeRecording = recordingRef.current.recording;
-      // 减去累计暂停时长，避免切换麦克风后段落时间戳前移（U57）。
-      // Math.max(0)：抖动下 totalPausedMs 可能虚高致偏移为负、段落时间戳回绕，钳到 0 兜底。
-      const offsetMs = overallStartTimeRef.current
-        ? Math.max(
-            0,
-            Date.now() -
-              overallStartTimeRef.current -
-              useTranscriptStore.getState().totalPausedMs
-          )
-        : 0;
+      // 减去暂停时长/空档，避免切换麦克风后段落时间戳前移（U57）。见 computeResumeOffset。
+      const offsetMs = computeResumeOffset();
 
       recordingRef.current = null;
       setConnectionState('connecting');
@@ -1441,7 +1436,7 @@ export function useSoniox(
           useTranscriptStore.getState().recordingState === 'paused',
       });
     },
-    [setConnectionState, setCurrentMicDeviceId, startNewRecording]
+    [computeResumeOffset, setConnectionState, setCurrentMicDeviceId, startNewRecording]
   );
 
   const rebuildSession = useCallback(async () => {
@@ -1452,16 +1447,8 @@ export function useSoniox(
     }
 
     const activeRecording = current.recording;
-    // 减去累计暂停时长，避免重建会话后段落时间戳前移（U57）。
-    // Math.max(0)：抖动下 totalPausedMs 可能虚高致偏移为负、段落时间戳回绕，钳到 0 兜底。
-    const offsetMs = overallStartTimeRef.current
-      ? Math.max(
-          0,
-          Date.now() -
-            overallStartTimeRef.current -
-            useTranscriptStore.getState().totalPausedMs
-        )
-      : 0;
+    // 减去暂停时长/空档，避免重建会话后段落时间戳前移（U57）。见 computeResumeOffset。
+    const offsetMs = computeResumeOffset();
 
     recordingRef.current = null;
     setConnectionState('connecting');
@@ -1487,7 +1474,7 @@ export function useSoniox(
       preservePauseStateUntilConnected:
         useTranscriptStore.getState().recordingState === 'paused',
     });
-  }, [setConnectionState, startNewRecording]);
+  }, [computeResumeOffset, setConnectionState, startNewRecording]);
 
   /**
    * 页面刷新后恢复录音。

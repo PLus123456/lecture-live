@@ -222,19 +222,24 @@ export function useSoniox(
           syncState: 'syncing',
         });
 
-        let remoteSeqs = new Set<number>();
+        // 默认保留本会话已知「已成功上传」的 seq 集合：GET /audio/draft 失败(!ok 或抛错)时
+        // 绝不清零，否则会误判「服务端啥都没有」而把全部分片重传一遍——正是造成
+        // 「录音结束疯狂同步 chunks / 撞限流 429 / 会话收不了尾」的放大器。
+        let remoteSeqs = new Set<number>(remoteDraftSeqsRef.current);
         try {
           const response = await fetch(`/api/sessions/${sessionId}/audio/draft`, {
             headers: { Authorization: `Bearer ${token}` },
           });
           if (response.ok) {
             const data = (await response.json()) as { seqs?: number[] };
+            // GET 成功：以服务端为权威（可能比本地记录少 = 确有分片没传上去，需补传）
             remoteSeqs = new Set(
               Array.isArray(data.seqs) ? data.seqs.filter(Number.isInteger) : []
             );
           }
+          // GET 返回 !ok：保留上面的本地已知集合，只补真正缺失的（不全量重传）
         } catch {
-          // Best effort: fall through and try direct chunk uploads.
+          // 网络异常同理：保留本地已知集合，避免全量重传打爆限流
         }
 
         remoteDraftSeqsRef.current = remoteSeqs;

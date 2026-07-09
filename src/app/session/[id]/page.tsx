@@ -471,6 +471,13 @@ export default function ActiveSessionPage() {
     });
   }, [t]);
 
+  const handleReconnectFailedNotice = useCallback(() => {
+    // 断网自动重连放弃：弹持久橙色提示 + toast，引导用户点「继续」手动重连（走 start → Branch 3）。
+    const message = t('session.notices.reconnectFailed');
+    setBillingNotice({ tone: 'warning', message });
+    toast.error(message);
+  }, [t]);
+
   const handleAutoResumeNotice = useCallback((reason: 'disconnect') => {
     if (reason !== 'disconnect') {
       return;
@@ -646,6 +653,7 @@ export default function ActiveSessionPage() {
     idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS,
     onAutoPause: handleAutoPauseNotice,
     onAutoResume: handleAutoResumeNotice,
+    onReconnectFailed: handleReconnectFailedNotice,
   });
   const { initLocal, translateSentence, destroy: destroyTranslator } = useLocalTranslation({
     // 本地模型加载失败自动回退云端时，重建活跃 Soniox 会话使云翻译真正生效（U81）。

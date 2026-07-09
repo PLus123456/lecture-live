@@ -1275,7 +1275,7 @@ export default {
     hideCollapsed: 'Collapse {count} collapsed messages',
     clearAll: 'Clear all',
     confirmClearAllTitle: 'Clear all conversations?',
-    confirmClearAllMessage: 'This permanently deletes all your conversations with their messages and attached files. This cannot be undone.',
+    confirmClearAllMessage: 'This permanently deletes all your global conversations with their messages and attached files. This cannot be undone. Conversations inside recording sessions are not affected.',
     clearAllSuccess: 'All conversations cleared',
     noResults: 'No matching conversations',
     endedReadonly: 'This conversation is closed (read-only). Start a new one to continue.',

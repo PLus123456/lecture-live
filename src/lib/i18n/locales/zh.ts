@@ -1263,7 +1263,7 @@ export default {
     hideCollapsed: '收起 {count} 条已折叠消息',
     clearAll: '清空全部',
     confirmClearAllTitle: '清空全部对话？',
-    confirmClearAllMessage: '将永久删除你的全部对话及其消息和附件文件，无法恢复。',
+    confirmClearAllMessage: '将永久删除你的全部全局对话及其消息和附件文件，无法恢复。录音会话内的对话不受影响。',
     clearAllSuccess: '已清空全部对话',
     noResults: '没有匹配的对话',
     endedReadonly: '此对话已关闭（只读），新建对话以继续。',

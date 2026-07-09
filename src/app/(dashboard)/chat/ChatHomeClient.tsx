@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
   MessageSquare,
+  Mic,
   Clock,
   Loader2,
   AlertCircle,
@@ -382,7 +383,11 @@ export default function ChatHomeClient() {
                                      transition-all duration-200"
                         >
                           <div className="w-8 h-8 rounded-lg bg-cream-100 flex items-center justify-center flex-shrink-0">
-                            <MessageSquare className="w-3.5 h-3.5 text-rust-500" />
+                            {c.sessionBound ? (
+                              <Mic className="w-3.5 h-3.5 text-rust-500" />
+                            ) : (
+                              <MessageSquare className="w-3.5 h-3.5 text-rust-500" />
+                            )}
                           </div>
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">

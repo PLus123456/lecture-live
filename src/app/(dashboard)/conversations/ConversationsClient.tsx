@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import {
   MessageSquare,
+  Mic,
   Clock,
   AlertCircle,
   Trash2,
@@ -28,6 +29,8 @@ interface ConversationCard {
   endedAt?: string | null;
   messageCount?: number;
   archived?: boolean;
+  /** true = 录音会话内的对话（显示录音角标；「清空全部」不触及） */
+  sessionBound?: boolean;
 }
 
 function formatRelative(iso?: string): string {
@@ -76,11 +79,10 @@ export default function ConversationsClient() {
       if (!token) return;
       setLoading(true);
       try {
-        // scope=global：与 /chat 首页、ChatSidebar 同一套过滤（只列全局对话），
-        // 录音会话里自动创建的对话不再混进来 —— 此前用 recent=50 导致
-        // 「全部对话里有、外面没有」的不一致。
+        // recent=50：与侧栏/首页同一套数据（全局对话 + 录音会话内的对话），
+        // 本页额外带归档区。0 条消息的录音空壳对话由下方 filter 统一隐藏。
         const res = await fetch(
-          '/api/conversations?scope=global&includeArchived=true',
+          '/api/conversations?recent=50&includeArchived=true',
           { headers: { Authorization: `Bearer ${token}` }, signal }
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -92,12 +94,15 @@ export default function ConversationsClient() {
           if (Array.isArray(obj.conversations)) raw = obj.conversations;
           else if (Array.isArray(obj.items)) raw = obj.items;
         }
-        const list = raw.filter(
-          (c): c is ConversationCard =>
-            !!c &&
-            typeof c === 'object' &&
-            typeof (c as ConversationCard).id === 'string'
-        );
+        const list = raw
+          .filter(
+            (c): c is ConversationCard =>
+              !!c &&
+              typeof c === 'object' &&
+              typeof (c as ConversationCard).id === 'string'
+          )
+          // 与共享列表同规则：录音会话内 0 条消息的自动创建空壳不显示
+          .filter((c) => !(c.sessionBound && (c.messageCount ?? 1) === 0));
         setConversations(list);
         setListStatus('ok');
       } catch (err) {
@@ -309,7 +314,11 @@ export default function ConversationsClient() {
           className="flex items-center gap-3 flex-1 min-w-0"
         >
           <div className="w-9 h-9 rounded-lg bg-cream-100 flex items-center justify-center flex-shrink-0">
-            <MessageSquare className="w-4 h-4 text-rust-500" />
+            {c.sessionBound ? (
+              <Mic className="w-4 h-4 text-rust-500" />
+            ) : (
+              <MessageSquare className="w-4 h-4 text-rust-500" />
+            )}
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-0.5">

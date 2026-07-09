@@ -43,6 +43,8 @@ type ConversationListItem = {
   archived: boolean;
   messageCount: number;
   sessionIds: string[];
+  /** true = 录音会话内的对话（legacy sessionId 绑定），前端用来打录音角标/过滤空壳 */
+  sessionBound: boolean;
 };
 
 function serializeConversation(c: {
@@ -65,6 +67,7 @@ function serializeConversation(c: {
     archived: c.archived,
     messageCount: c._count.messages,
     sessionIds: collectSessionIds(c),
+    sessionBound: c.sessionId !== null,
   };
 }
 

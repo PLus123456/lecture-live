@@ -633,7 +633,20 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
     const conversation = await prisma.conversation.findUnique({
       where: { id: parsed.conversationId },
       include: {
-        session: { select: { userId: true, targetLang: true } },
+        // legacy 来源录音的字段集与 sessions.session 对齐：从全局对话区打开这类对话时
+        // 会走 global 路径，把来源录音并入 ownedSessions（文件态 transcript 上下文）。
+        session: {
+          select: {
+            id: true,
+            userId: true,
+            targetLang: true,
+            title: true,
+            recordingPath: true,
+            transcriptPath: true,
+            summaryPath: true,
+            reportPath: true,
+          },
+        },
         messages: {
           // 按 seq 稳定排序（全局单调，替代 createdAt —— 避免同毫秒时间戳错乱影响切割点定位）
           orderBy: { seq: 'asc' },
@@ -687,7 +700,19 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
 
     const isLegacy = conversation.session !== null;
 
-    if (isLegacy) {
+    // legacy 会话分两条路：
+    //  · ChatTab 实时路径 —— 请求自带 live transcript/时间轴/摘要，行为完全不变；
+    //  · 全局对话区打开 —— 三者皆空（GlobalChat 发 transcript:[] / totalTranscriptMs:0 /
+    //    summaryContext:''），改走下方 global 路径，把来源录音并入 ownedSessions，
+    //    从落盘的 transcript 文件构建上下文（“打开即自动挂载好录音”）。
+    //    ChatTab 在零转录/零偏移/零摘要的退化场景下两条路径上下文等价（都为空）。
+    const isLiveSessionRequest =
+      isLegacy &&
+      (parsed.transcript.length > 0 ||
+        parsed.totalTranscriptMs > 0 ||
+        parsed.summaryContext.trim().length > 0);
+
+    if (isLiveSessionRequest) {
       // ── 旧路径：单录音 chat ── 行为完全不变 ──
       return await handleSessionChat({
         parsed,
@@ -702,12 +727,24 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
       });
     }
 
-    // ── 新路径：全局 chat（无 session 绑定）──
+    // ── 全局 chat 路径（无 session 绑定，或 legacy 会话从全局对话区发起）──
     // 归属已由 conversation.userId 校验通过。挂载录音在 attach 时已限定属于本人，
     // 这里仍按 userId 过滤一遍做纵深防御（防历史脏数据混入他人 session）。
-    const ownedSessions = conversation.sessions
+    const junctionOwned = conversation.sessions
       .map((cs) => cs.session)
       .filter((s) => s.userId === payload.id);
+    // 来源录音排最前（language 取第一个录音的 targetLang，与 ChatTab 行为一致），
+    // 并按 id 去重防联表混入同一录音。
+    const legacySession =
+      isLegacy && conversation.session!.userId === payload.id
+        ? conversation.session!
+        : null;
+    const ownedSessions = legacySession
+      ? [
+          legacySession,
+          ...junctionOwned.filter((s) => s.id !== legacySession.id),
+        ]
+      : junctionOwned;
 
     return await handleGlobalChat({
       parsed,

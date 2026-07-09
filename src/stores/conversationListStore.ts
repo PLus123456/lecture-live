@@ -3,11 +3,15 @@
 import { create } from 'zustand';
 
 /**
- * 全局对话列表（scope=global）的共享 store。
+ * 对话列表（recent=50，全局对话 + 录音会话内的对话）的共享 store。
  *
  * ChatSidebar / ChatHome / 全部对话页共用同一份非归档列表，保证
- * 「侧栏、首页最近对话、全部对话」三处永远一致（此前首页 scope=global、
- * 历史页 recent=N 两套过滤器，录音会话里自动建的对话只在历史页出现）。
+ * 「侧栏、首页最近对话、全部对话」三处永远一致。
+ *
+ * 录音会话内的对话（sessionBound）也在列表里 —— 从对话区打开时来源录音
+ * 自动挂载（recordings 接口返回 legacy pill + llm/chat 走文件态上下文）。
+ * 但 **0 条消息的空壳不显示**：打开录音页会自动创建一个空对话，把它们全
+ * 列出来只会淹没列表（用户最初抱怨的「莫名其妙多出来的对话」就是它们）。
  *
  * 归档对话不进这份列表（只在 /conversations 页单独拉 includeArchived=true）。
  */
@@ -18,6 +22,13 @@ export interface ConversationListItem {
   endedAt?: string | null;
   archived?: boolean;
   messageCount?: number;
+  /** true = 录音会话内的对话（UI 上打录音角标） */
+  sessionBound?: boolean;
+}
+
+/** 过滤空壳：录音会话内 0 条消息的自动创建对话不显示（messageCount 未知时保守放行） */
+export function isDisplayableConversation(c: ConversationListItem): boolean {
+  return !(c.sessionBound && (c.messageCount ?? 1) === 0);
 }
 
 interface ConversationListStore {
@@ -47,12 +58,14 @@ function parseList(data: unknown): ConversationListItem[] {
     if (Array.isArray(obj.conversations)) raw = obj.conversations;
     else if (Array.isArray(obj.items)) raw = obj.items;
   }
-  return raw.filter(
-    (c): c is ConversationListItem =>
-      !!c &&
-      typeof c === 'object' &&
-      typeof (c as ConversationListItem).id === 'string'
-  );
+  return raw
+    .filter(
+      (c): c is ConversationListItem =>
+        !!c &&
+        typeof c === 'object' &&
+        typeof (c as ConversationListItem).id === 'string'
+    )
+    .filter(isDisplayableConversation);
 }
 
 // 并发守卫：只有最新一次 refresh 的结果允许落盘（防旧响应覆盖新数据）
@@ -74,7 +87,8 @@ export const useConversationListStore = create<ConversationListStore>()(
       const seq = ++refreshSeq;
       set({ loading: true });
       try {
-        const res = await fetch('/api/conversations?scope=global', {
+        // recent=50：本人全部对话（全局 + 录音会话内），非归档
+        const res = await fetch('/api/conversations?recent=50', {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);

@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useEffect } from 'react';
-import { ArrowLeft, Plus, History, MessageSquare } from 'lucide-react';
+import { ArrowLeft, Plus, History, MessageSquare, Mic } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 import { useAuthStore } from '@/stores/authStore';
 import { useConversationListStore } from '@/stores/conversationListStore';
@@ -110,7 +110,7 @@ export default function ChatSidebar({ visible }: { visible: boolean }) {
                     href={href}
                     title={label}
                     className={`
-                      flex items-center h-8 px-[10px] rounded-md text-xs
+                      flex items-center gap-1.5 h-8 px-[10px] rounded-md text-xs
                       transition-colors duration-100 overflow-hidden
                       ${
                         isActive
@@ -119,6 +119,9 @@ export default function ChatSidebar({ visible }: { visible: boolean }) {
                       }
                     `}
                   >
+                    {c.sessionBound && (
+                      <Mic className="w-3 h-3 flex-shrink-0 text-rust-400" />
+                    )}
                     <span className="truncate whitespace-nowrap">{label}</span>
                   </Link>
                 </li>

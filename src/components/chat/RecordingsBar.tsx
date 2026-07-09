@@ -17,6 +17,8 @@ import { useI18n } from '@/lib/i18n';
 export interface RecordingPill {
   sessionId: string;
   title: string;
+  /** true = 对话的来源录音（legacy sessionId 绑定），常驻挂载、不显示移除按钮 */
+  legacy?: boolean;
 }
 
 /**
@@ -97,7 +99,8 @@ export default function RecordingsBar({
                     <Mic className="w-3 h-3 flex-shrink-0" />
                     <span className="truncate">{r.title}</span>
                   </button>
-                  {onDetach && (
+                  {/* 来源录音（legacy）常驻，不给移除按钮（服务端 DELETE 也会 400 拒绝） */}
+                  {onDetach && !r.legacy && (
                     <button
                       type="button"
                       onClick={() => onDetach(r.sessionId)}

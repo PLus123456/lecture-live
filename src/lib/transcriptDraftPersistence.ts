@@ -70,6 +70,36 @@ export async function persistTranscriptDraft(
 
   const now = Date.now();
   const existing = await loadTranscriptDraftManifest(session);
+  const incomingCount = Array.isArray(payload.segments) ? payload.segments.length : 0;
+
+  // 单调守卫：绝不让「更短/重置」的 payload 覆盖掉盘上更完整的草稿。
+  // 与音频 chunk 的 seq 续号防覆盖(#19)对称 —— 音频侧新录音从 maxSeq+1 续号不覆盖旧块，
+  // 转录侧此前是无守卫的整体替换，一旦刷新后「僵尸录音」从 0 段重新 PUT，就把整份转录盖成
+  // 只剩重启后那段。这里命中缩水/重置时：把 incoming 写入带时间戳的 .conflict 备份留档，
+  // 主草稿保持更完整的那份不动（备份文件随 deleteTranscriptDraft 整目录清理，不泄漏）。
+  // 转录在单次会话与冷恢复续录中都只增不减，故正常写入永远 incomingCount >= 现有段数。
+  if (existing && existing.segmentCount > 0 && incomingCount < existing.segmentCount) {
+    try {
+      await fs.writeFile(
+        path.join(getDraftDir(session), `transcript.conflict-${now}.json`),
+        JSON.stringify(payload, null, 2),
+        'utf-8'
+      );
+    } catch {
+      // 备份失败不阻断：主草稿不动即可，本次 PUT 视为「已保护地忽略」
+    }
+    console.warn(
+      `[transcriptDraft] 拒绝覆盖草稿：incoming ${incomingCount} 段 < 现有 ${existing.segmentCount} 段，` +
+        `session=${session.id}，已存 .conflict 备份，主草稿保持不变`
+    );
+    return {
+      sessionId: session.id,
+      userId: session.userId,
+      createdAt: existing.createdAt,
+      updatedAt: existing.updatedAt,
+      segmentCount: existing.segmentCount,
+    };
+  }
 
   // 写入完整数据
   await fs.writeFile(

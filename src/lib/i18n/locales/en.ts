@@ -1252,6 +1252,8 @@ export default {
     unnamed: 'Untitled',
     loadingConversations: 'Loading conversations…',
     composerPlaceholder: 'Ask anything…',
+    greeting: 'How can I help you today?',
+    send: 'Send',
     noRecordings: 'No recordings attached',
     recordingPickerComingSoon: 'Coming soon',
     removeRecording: 'Remove recording',

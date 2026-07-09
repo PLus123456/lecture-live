@@ -1240,6 +1240,8 @@ export default {
     unnamed: '未命名对话',
     loadingConversations: '加载对话列表…',
     composerPlaceholder: '请输入...',
+    greeting: '有什么可以帮你的？',
+    send: '发送',
     noRecordings: '未挂载录音',
     recordingPickerComingSoon: '敬请期待',
     removeRecording: '移除录音',

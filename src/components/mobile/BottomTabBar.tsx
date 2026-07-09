@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Home, Languages, Plus, Share2, User } from 'lucide-react';
+import { Home, Languages, MessageSquare, Plus, Share2, User } from 'lucide-react';
 
 interface BottomTabBarProps {
   onProfileTap: () => void;
@@ -43,6 +43,15 @@ export default function BottomTabBar({ onProfileTap }: BottomTabBarProps) {
           <span className="flex h-12 w-12 items-center justify-center rounded-full bg-rust-500 text-white shadow-lg shadow-rust-500/25 transition-transform active:scale-95">
             <Plus className="h-5 w-5" />
           </span>
+        </Link>
+        <Link
+          href="/chat"
+          className={tabClassName(
+            isActivePath(pathname, '/chat') || pathname === '/conversations'
+          )}
+        >
+          <MessageSquare className="h-5 w-5" />
+          <span>Chat</span>
         </Link>
         <Link href="/shared" className={tabClassName(isActivePath(pathname, '/shared'))}>
           <Share2 className="h-5 w-5" />

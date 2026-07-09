@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Sidebar from '@/components/Sidebar';
 import UserSettingsModal from '@/components/UserSettingsModal';
@@ -389,6 +389,11 @@ export default function ActiveSessionPage() {
   const pausedAt = useTranscriptStore((s) => s.pausedAt);
   const updateDuration = useTranscriptStore((s) => s.updateDuration);
   const segments = useTranscriptStore((s) => s.segments);
+  // 挂载时(sessionStorage 同步水合)捕获的初始 recordingState 快照，
+  // 用于计算刷新恢复的单一权威 recoveryMode（不随后续 effect 改写而变）。
+  const [initialRecordingState] = useState(
+    () => useTranscriptStore.getState().recordingState
+  );
   const translations = useTranslationStore((s) => s.translations);
   const summaryBlocks = useSummaryStore((s) => s.blocks);
   const clearTranscript = useTranscriptStore((s) => s.clearAll);
@@ -547,6 +552,28 @@ export default function ActiveSessionPage() {
       })
       .catch(() => setSessionChecked(true));
   }, [token, sessionId, router]);
+
+  // 刷新恢复的单一权威：由后端 status + 挂载时本地 recordingState 快照共同决定。
+  // 四个恢复相关分支（自动续录 / 冷恢复 draft / FINALIZING 遮罩 / clear 守卫）统一按它
+  // 分派，避免各读 recordingState/connectionState/backendStatus 子集导致「误续录」与
+  // 「刷新丢状态」两难（见录音健壮性调查）。
+  //  - pending    : 后端 status 尚未拉回，任何恢复/清除都不动
+  //  - terminal   : 后端已 COMPLETED/ARCHIVED（路由守卫会跳回放，这里兜底不续录）
+  //  - finalizing : 后端 FINALIZING（挂遮罩轮询，绝不自动开麦）
+  //  - live-refresh: 后端 RECORDING/PAUSED 且本地也在录 → 同标签刷新，恢复为 paused 展示、不自动开麦
+  //  - resume-cold: 后端 RECORDING/PAUSED 但本地无录音态 → 冷设备/丢本地，从后端 draft 恢复
+  //  - fresh      : 其它（新会话等）
+  const recoveryMode = useMemo(() => {
+    if (!sessionChecked) return 'pending' as const;
+    if (backendStatus === 'COMPLETED' || backendStatus === 'ARCHIVED') return 'terminal' as const;
+    if (backendStatus === 'FINALIZING') return 'finalizing' as const;
+    if (backendStatus === 'RECORDING' || backendStatus === 'PAUSED') {
+      return initialRecordingState === 'recording' || initialRecordingState === 'paused'
+        ? ('live-refresh' as const)
+        : ('resume-cold' as const);
+    }
+    return 'fresh' as const;
+  }, [sessionChecked, backendStatus, initialRecordingState]);
 
   // Service availability check on mount
   const [serviceAvailable, setServiceAvailable] = useState<boolean | null>(null);
@@ -726,9 +753,9 @@ export default function ActiveSessionPage() {
   useEffect(() => {
     if (draftRestorationDoneRef.current) return;
     if (!sessionChecked || !token || !sessionId) return;
-    // 在会话状态为 PAUSED、RECORDING 或 FINALIZING 时尝试恢复
-    // FINALIZING：用户可能在结束录制后刷新了页面，需要从后端 draft 恢复数据
-    if (backendStatus !== 'PAUSED' && backendStatus !== 'RECORDING' && backendStatus !== 'FINALIZING') return;
+    // 仅在「冷恢复(本地无录音态)」或「finalizing(刷新后恢复数据供遮罩展示)」时从后端拉。
+    // live-refresh 由 sessionStorage 水合，segments 非空，会被下面的早退拦掉，不走这里。
+    if (recoveryMode !== 'resume-cold' && recoveryMode !== 'finalizing') return;
     // 如果 store 已经有数据（从 sessionStorage 恢复的页面刷新场景），无需从后端拉取
     if (useTranscriptStore.getState().segments.length > 0) return;
 
@@ -761,7 +788,9 @@ export default function ActiveSessionPage() {
         const now = Date.now();
         tStore.setRecordingStartTime(now - durationMs);
         tStore.setPausedAt(now);
-        tStore.setRecordingState('paused');
+        // finalizing：恢复数据仅供遮罩背景展示，置终态 stopped，绝不作为可续录的 paused；
+        // resume-cold：恢复为 paused 展示，等用户手动继续（不自动开麦）。
+        tStore.setRecordingState(recoveryMode === 'finalizing' ? 'stopped' : 'paused');
         tStore.updateDuration(durationMs);
         if (typeof draft.currentSessionIndex === 'number') {
           tStore.setCurrentSessionIndex(draft.currentSessionIndex);
@@ -792,12 +821,12 @@ export default function ActiveSessionPage() {
         console.error('从后端恢复草稿失败:', err);
       }
     })();
-  }, [sessionChecked, token, sessionId, backendStatus]);
+  }, [sessionChecked, token, sessionId, recoveryMode]);
 
   // FINALIZING 恢复：刷新后检测到 FINALIZING 状态时，轮询等待完成并跳转回放
   useEffect(() => {
     if (!sessionChecked || !token || !sessionId) return;
-    if (backendStatus !== 'FINALIZING') return;
+    if (recoveryMode !== 'finalizing') return;
     // 如果是当前录制触发的 finalize，不重复处理（handleStopWithFinalization 会自行跳转）
     if (isFinalizingRef.current) return;
 
@@ -846,7 +875,7 @@ export default function ActiveSessionPage() {
 
     return () => clearInterval(poll);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionChecked, token, sessionId, backendStatus]);
+  }, [sessionChecked, token, sessionId, recoveryMode]);
 
   // 本地翻译器随 translationMode / 源语言 / 目标语言变化重建。
   // initLocal 在调用时读取 store 里的 sourceLang/targetLang，其 identity 稳定，
@@ -1346,21 +1375,25 @@ export default function ActiveSessionPage() {
     }
   }, [handleStartRecording, pendingAutoStart, recordingState, setPendingAutoStart, sessionChecked]);
 
-  // 刷新后自动恢复录音 — 检测到 store 中有录音状态但无活跃连接时自动重连
+  // 刷新后恢复录音 — 仅「同标签刷新且后端仍认为在录」(recoveryMode==='live-refresh')才恢复。
+  // 单一权威闸门：后端已 FINALIZING/COMPLETED/ARCHIVED 一律不恢复，否则会把收尾中的会话
+  // 又当录音重连开麦（正是「收尾卡死后刷新又开始录音」的根因）。恢复只把状态还原为 paused
+  // 展示态，绝不自动开麦——由用户点「继续」再续录（见 reconnectAfterRefresh）。
   const refreshReconnectFired = useRef(false);
   useEffect(() => {
     if (refreshReconnectFired.current) return;
     if (!token || !sessionChecked) return;
+    if (recoveryMode !== 'live-refresh') return;
     if (!wasRecordingRef.current) return;
     // Store 有录音状态但连接已断开 → 刷新恢复场景
     const storeState = useTranscriptStore.getState();
     if ((storeState.recordingState === 'recording' || storeState.recordingState === 'paused') &&
         storeState.connectionState === 'disconnected') {
       refreshReconnectFired.current = true;
-      console.log('Detected refresh during recording, auto-reconnecting...');
+      console.log('Detected refresh during recording, restoring to paused (no auto mic)...');
       reconnectAfterRefresh();
     }
-  }, [token, sessionChecked, reconnectAfterRefresh]);
+  }, [token, sessionChecked, recoveryMode, reconnectAfterRefresh]);
 
   // Title editing
   const handleStartEditTitle = useCallback(() => {

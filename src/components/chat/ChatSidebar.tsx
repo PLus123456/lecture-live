@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useEffect } from 'react';
 import { ArrowLeft, Plus, History, MessageSquare, Mic } from 'lucide-react';
+import SlidingSidebar from '@/components/layout/SlidingSidebar';
 import { useI18n } from '@/lib/i18n';
 import { useAuthStore } from '@/stores/authStore';
 import { useConversationListStore } from '@/stores/conversationListStore';
@@ -11,9 +12,8 @@ import { useConversationListStore } from '@/stores/conversationListStore';
 /**
  * 对话区专属侧栏（Claude 式）：返回主应用 + 新建对话 + 会话列表 + 全部对话入口。
  *
- * 与主 Sidebar 同宽同位（fixed left-0 w-56），由 dashboard layout 控制两者互斥
- * 滑动：进入 /chat 区域时主侧栏 -translate-x-full 滑出、本侧栏滑入；离开时反向。
- * visible=false 时仍保持挂载（否则没有离场动画）。
+ * 滑动进出走通用 SlidingSidebar 模式（与 AdminSidebar 一致）：由 dashboard
+ * layout 常驻挂载并与主 Sidebar 互斥滑动，进入 /chat 区域时滑入、离开反向。
  */
 export default function ChatSidebar({ visible }: { visible: boolean }) {
   const pathname = usePathname();
@@ -32,16 +32,7 @@ export default function ChatSidebar({ visible }: { visible: boolean }) {
   }, [visible, token, pathname, refresh]);
 
   return (
-    <aside
-      className={`
-        fixed left-0 top-0 h-full z-40 w-56
-        bg-white border-r border-cream-200
-        flex flex-col overflow-hidden
-        transition-[transform,visibility] duration-300 ease-in-out
-        ${visible ? 'translate-x-0 visible' : '-translate-x-full invisible'}
-      `}
-      aria-hidden={!visible}
-    >
+    <SlidingSidebar visible={visible}>
       {/* 顶部：返回主应用 + 标题（与主侧栏 Logo 行同高） */}
       <div className="flex items-center gap-1.5 h-16 border-b border-cream-200 flex-shrink-0 px-3">
         <button
@@ -149,6 +140,6 @@ export default function ChatSidebar({ visible }: { visible: boolean }) {
           <span className="whitespace-nowrap">{t('chat.viewAll')}</span>
         </Link>
       </div>
-    </aside>
+    </SlidingSidebar>
   );
 }

@@ -197,12 +197,19 @@ describe('LiveBroadcaster 连接/重连补发快照（C16/U11）', () => {
     });
     clients.push(settleViewer);
     await onceSocketEvent(settleViewer, 'connect');
-    const settledPromise = onceSocketEvent<{ segments: unknown[] }>(
-      settleViewer,
-      'initial_state'
-    );
-    settleViewer.emit('join', { shareToken: 'share-token' });
-    expect((await settledPromise).segments).toHaveLength(1);
+    // 轮询直到服务端确实吃到 broadcaster 的 sync_snapshot —— broadcaster 的 sync_snapshot
+    // 与 settleViewer 的 join 分属两个 socket，到达服务端的先后不确定；单发一次 join 若
+    // 抢在 sync_snapshot 之前会拿到空历史（CI 高负载下偶发）。join 处理器每次都回 initial_state
+    // (server.ts)，故可安全重发直到快照就位，消除跨 socket 竞争的 flaky。
+    let settled: { segments: unknown[] } = { segments: [] };
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const p = onceSocketEvent<{ segments: unknown[] }>(settleViewer, 'initial_state');
+      settleViewer.emit('join', { shareToken: 'share-token' });
+      settled = await p;
+      if (settled.segments.length === 1) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(settled.segments).toHaveLength(1);
 
     // 触发一次底层断连——socket.io-client 默认 reconnection:true，会自动重连并再次
     // 触发 'connect'，此时 broadcaster 应补发缓存快照。先挂上"重连后再次 connect"的

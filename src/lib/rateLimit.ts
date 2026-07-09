@@ -120,12 +120,22 @@ export async function enforceRateLimit(
   }
 
   try {
-    // 原「INCR 然后 if count===1 再 EXPIRE」分两次 round-trip 且不原子：若 EXPIRE 在建键后失败
-    // （网络抖动，count===1 分支不重试），键会永久无 TTL、计数只增不减 → 永久 429 锁死。
-    // 改为先 `SET key 0 EX window NX`（仅当键不存在时原子地创建并附带 TTL）再 INCR，
-    // 保证任何新建的计数键从诞生起就带过期，杜绝「建了键却漏设过期」的窗口。
-    await redis.set(bucketKey, 0, 'EX', windowSec, 'NX');
+    // INCR 计数：
+    // - 键不存在时 INCR 自动以 count=1 建键（无 TTL），随即 EXPIRE 设窗口过期；
+    //   这天然覆盖「键到期边界被重建」的竞态——重建后的键 count 必为 1，会重新设过期。
+    // - 已存在的键（count>1）若发现无 TTL（-1），说明是历史遗留 / 极少数 EXPIRE 失败留下的
+    //   「无过期卡死键」（会导致计数只增不减 → 永久 429），此处防御性补设过期以自愈。
+    //   （切勿用 `SET key 0 EX win NX`：键将到期时 NX 会空操作、不刷 TTL，随后 INCR 又把它
+    //   重建成无 TTL 的键，反而制造永久 429。）
     const count = await redis.incr(bucketKey);
+    if (count === 1) {
+      await redis.expire(bucketKey, windowSec);
+    } else {
+      const ttl = await redis.ttl(bucketKey);
+      if (ttl === -1) {
+        await redis.expire(bucketKey, windowSec);
+      }
+    }
 
     if (count > options.limit) {
       const ttl = await redis.ttl(bucketKey);

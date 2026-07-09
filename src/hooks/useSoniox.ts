@@ -29,6 +29,9 @@ type RecordingHandle = {
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 1500;
+// 连接需持续稳定这么久未再断开，才复位重连退避计数。防止断网抖动(连上→秒断→再连)下
+// 每次短暂 WS open 都把计数清零，导致 MAX_RECONNECT_ATTEMPTS 永远到不了、无限重连风暴。
+const STABLE_CONNECTION_MS = 8000;
 
 interface UseSonioxOptions {
   idleTimeoutMs?: number;
@@ -51,6 +54,7 @@ export function useSoniox(
   const lastAudioBlobRef = useRef<Blob | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stableConnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const remoteDraftSeqsRef = useRef<Set<number>>(new Set());
   const syncDraftPromiseRef = useRef<Promise<boolean> | null>(null);
   const lastAudioActivityAtRef = useRef<number | null>(null);
@@ -413,6 +417,27 @@ export function useSoniox(
     }
   }, [sessionId]);
 
+  // 取消「稳定连接」计时器（连接又断开/进入重连/停止时调用），使抖动不会复位退避计数。
+  const cancelStableConn = useCallback(() => {
+    if (stableConnTimerRef.current) {
+      clearTimeout(stableConnTimerRef.current);
+      stableConnTimerRef.current = null;
+    }
+  }, []);
+
+  // WS 'connected' 后不立即复位退避计数，而是等连接持续稳定 STABLE_CONNECTION_MS 未再断开
+  // 才复位。任一断开/重连/停止都会 cancelStableConn 取消本计时器，从而让断网抖动不断累计
+  // reconnectAttemptsRef、MAX_RECONNECT_ATTEMPTS 封顶得以真正生效，杜绝无限重连风暴。
+  const markConnectedStable = useCallback(() => {
+    if (stableConnTimerRef.current) {
+      clearTimeout(stableConnTimerRef.current);
+    }
+    stableConnTimerRef.current = setTimeout(() => {
+      reconnectAttemptsRef.current = 0;
+      stableConnTimerRef.current = null;
+    }, STABLE_CONNECTION_MS);
+  }, []);
+
   const ensureProcessor = useCallback(() => {
     if (processorRef.current) {
       return processorRef.current;
@@ -532,6 +557,9 @@ export function useSoniox(
         return;
       }
 
+      // 连接刚断，取消尚未触发的稳定复位，让本次断网计入重连计数。
+      cancelStableConn();
+
       if (reason === 'disconnect') {
         shouldReconnectRef.current = true;
       } else {
@@ -566,7 +594,7 @@ export function useSoniox(
       autoPauseReasonRef.current = reason;
       onAutoPause?.(reason);
     },
-    [onAutoPause, setConnectionState, setPausedAt, setRecordingState]
+    [cancelStableConn, onAutoPause, setConnectionState, setPausedAt, setRecordingState]
   );
 
   // 内部重连函数 — 断网后自动尝试重新建立 Soniox 连接
@@ -577,6 +605,8 @@ export function useSoniox(
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+      // 进入新的重连周期，取消任何待触发的稳定复位。
+      cancelStableConn();
 
       if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
         console.error('Max reconnect attempts reached, giving up');
@@ -687,7 +717,7 @@ export function useSoniox(
                 if (runId !== runIdRef.current) return;
                 setConnectionState(state as 'connecting' | 'connected' | 'error');
                 if (state === 'connected') {
-                  reconnectAttemptsRef.current = 0;
+                  markConnectedStable();
                   const latencyMs = Math.round(performance.now() - connectStartMs);
                   sessionStartWallClockRef.current = Date.now();
                   latencyEmaRef.current = null;
@@ -701,6 +731,8 @@ export function useSoniox(
                   shouldReconnectRef.current = false;
                   markAudioActivity();
                   onAutoResume?.('disconnect');
+                } else {
+                  cancelStableConn();
                 }
               },
             },
@@ -743,6 +775,8 @@ export function useSoniox(
     },
     [
       canRecoverLocally,
+      cancelStableConn,
+      markConnectedStable,
       accumulatePausedTime,
       audioActivityThreshold,
       markAudioActivity,
@@ -921,7 +955,7 @@ export function useSoniox(
               }
               setConnectionState(state as 'connecting' | 'connected' | 'error');
               if (state === 'connected') {
-                reconnectAttemptsRef.current = 0;
+                markConnectedStable();
                 const latencyMs = Math.round(performance.now() - connectStartMs);
                 sessionStartWallClockRef.current = Date.now();
                 latencyEmaRef.current = null;
@@ -942,6 +976,8 @@ export function useSoniox(
                   autoPauseReasonRef.current = null;
                   markAudioActivity();
                 }
+              } else {
+                cancelStableConn();
               }
             },
           },
@@ -999,6 +1035,8 @@ export function useSoniox(
       accumulatePausedTime,
       audioActivityThreshold,
       canRecoverLocally,
+      cancelStableConn,
+      markConnectedStable,
       ensureProcessor,
       markAudioActivity,
       onAutoResume,
@@ -1129,6 +1167,10 @@ export function useSoniox(
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+      if (stableConnTimerRef.current) {
+        clearTimeout(stableConnTimerRef.current);
+        stableConnTimerRef.current = null;
+      }
 
       // 使在途录音回调失效，防止孤儿实例继续写 store / 上传 chunk
       runIdRef.current += 1;
@@ -1238,6 +1280,7 @@ export function useSoniox(
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
+    cancelStableConn();
     reconnectAttemptsRef.current = 0;
     shouldReconnectRef.current = false;
     autoPauseReasonRef.current = null;
@@ -1292,7 +1335,7 @@ export function useSoniox(
     setRecordingStartTime(null);
 
     setRecordingState('stopped');
-  }, [sessionId, setConnectionState, setRecordingStartTime, setRecordingState]);
+  }, [cancelStableConn, sessionId, setConnectionState, setRecordingStartTime, setRecordingState]);
 
   const pause = useCallback(() => {
     if (reconnectTimerRef.current) {

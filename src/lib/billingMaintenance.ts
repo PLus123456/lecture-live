@@ -32,6 +32,9 @@ import {
 import { finalizeAsyncTranscription } from '@/lib/audio/asyncTranscribeFinalize';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
+// FINALIZING 专项：已发起收尾但卡住的会话（前端崩/断网/服务端重启导致 finalize 没跑完）
+// 不必等 4h —— 超此阈值即自动重试收尾，避免遮罩长期转圈、会话「收不了尾」。
+const FINALIZING_STALE_THRESHOLD_MS = 10 * 60_000;
 // 异步上传转录的停滞阈值取更大值：Soniox 异步任务在 300 分钟上限文件上偶尔较慢，
 // 6 小时仍无进展才判定为僵尸，避免误杀正常的长任务。
 const STALE_ASYNC_THRESHOLD_MS = 6 * 60 * 60_000;
@@ -328,11 +331,17 @@ async function reclaimStaleSessions(now: Date): Promise<number> {
       OR: [
         { updatedAt: { lte: new Date(now.getTime() - STALE_SESSION_THRESHOLD_MS) } },
         { serverStartedAt: { lte: new Date(now.getTime() - STALE_SESSION_THRESHOLD_MS) } },
+        // FINALIZING 专项短阈值：已发起收尾但卡住的会话超 10min 就纳入候选（下面 isSessionStale 复核）。
+        {
+          status: 'FINALIZING',
+          updatedAt: { lte: new Date(now.getTime() - FINALIZING_STALE_THRESHOLD_MS) },
+        },
       ],
     },
     select: {
       id: true,
       userId: true,
+      status: true,
       updatedAt: true,
     },
     take: 100,
@@ -673,6 +682,7 @@ async function isSessionStale(
   session: {
     id: string;
     userId: string;
+    status: string;
     updatedAt: Date;
   },
   now: Date
@@ -688,7 +698,13 @@ async function isSessionStale(
     transcriptDraft?.updatedAt ?? 0
   );
 
-  return now.getTime() - lastActivityMs >= STALE_SESSION_THRESHOLD_MS;
+  // FINALIZING（已发起收尾）用短阈值自愈重试；RECORDING/PAUSED 仍按 4h 判定长期无活动。
+  const threshold =
+    session.status === 'FINALIZING'
+      ? FINALIZING_STALE_THRESHOLD_MS
+      : STALE_SESSION_THRESHOLD_MS;
+
+  return now.getTime() - lastActivityMs >= threshold;
 }
 
 async function maybeRunDailyReconciliation(now: Date): Promise<string | null> {

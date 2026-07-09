@@ -32,12 +32,16 @@ const RECONNECT_BASE_DELAY_MS = 1500;
 // 连接需持续稳定这么久未再断开，才复位重连退避计数。防止断网抖动(连上→秒断→再连)下
 // 每次短暂 WS open 都把计数清零，导致 MAX_RECONNECT_ATTEMPTS 永远到不了、无限重连风暴。
 const STABLE_CONNECTION_MS = 8000;
+// 分片上传撞 429 后，无 Retry-After 时的默认退避基值。
+const CHUNK_BACKOFF_BASE_MS = 3000;
 
 interface UseSonioxOptions {
   idleTimeoutMs?: number;
   audioActivityThreshold?: number;
   onAutoPause?: (reason: 'idle' | 'disconnect') => void;
   onAutoResume?: (reason: 'disconnect') => void;
+  /** 断网自动重连达上限、放弃重连时触发（供上层弹出「重连失败，请手动继续」提示）。 */
+  onReconnectFailed?: () => void;
 }
 
 export function useSoniox(
@@ -56,6 +60,8 @@ export function useSoniox(
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stableConnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const remoteDraftSeqsRef = useRef<Set<number>>(new Set());
+  // 分片上传的 429 退避截止时刻(epoch ms)。窗口内一律短路不再撞限流。
+  const chunkBackoffUntilRef = useRef(0);
   const syncDraftPromiseRef = useRef<Promise<boolean> | null>(null);
   const lastAudioActivityAtRef = useRef<number | null>(null);
   const autoPauseReasonRef = useRef<'idle' | 'disconnect' | null>(null);
@@ -92,6 +98,7 @@ export function useSoniox(
     options.audioActivityThreshold ?? DEFAULT_AUDIO_ACTIVITY_LEVEL_THRESHOLD;
   const onAutoPause = options.onAutoPause;
   const onAutoResume = options.onAutoResume;
+  const onReconnectFailed = options.onReconnectFailed;
 
   const markAudioActivity = useCallback(() => {
     lastAudioActivityAtRef.current = Date.now();
@@ -144,6 +151,17 @@ export function useSoniox(
         return true;
       }
 
+      // 429 退避窗口内直接短路，不发网络请求 —— 避免「无退避重传 → 更多 429」的正反馈风暴。
+      if (Date.now() < chunkBackoffUntilRef.current) {
+        publishBackupMeta({
+          localChunkCount,
+          remoteChunkCount: remoteDraftSeqsRef.current.size,
+          syncState: 'pending',
+          lastError: 'Backup upload is backing off after rate limiting',
+        });
+        return false;
+      }
+
       publishBackupMeta({
         localChunkCount,
         remoteChunkCount: remoteDraftSeqsRef.current.size,
@@ -167,6 +185,15 @@ export function useSoniox(
         );
 
         if (!response.ok) {
+          if (response.status === 429) {
+            // 尊重服务端 Retry-After；缺省用基值退避。窗口内后续上传/补传会被上面的短路拦下。
+            const retryAfter = Number(response.headers.get('Retry-After'));
+            const backoffMs =
+              Number.isFinite(retryAfter) && retryAfter > 0
+                ? retryAfter * 1000
+                : CHUNK_BACKOFF_BASE_MS;
+            chunkBackoffUntilRef.current = Date.now() + backoffMs;
+          }
           publishBackupMeta({
             localChunkCount,
             remoteChunkCount: remoteDraftSeqsRef.current.size,
@@ -176,6 +203,8 @@ export function useSoniox(
           return false;
         }
 
+        // 成功即解除退避（限流已恢复）。
+        chunkBackoffUntilRef.current = 0;
         remoteDraftSeqsRef.current.add(seq);
         publishBackupMeta({
           localChunkCount,
@@ -259,6 +288,12 @@ export function useSoniox(
         for (const entry of localEntries) {
           if (remoteDraftSeqsRef.current.has(entry.seq)) {
             continue;
+          }
+
+          // 退避窗口内直接停止本轮补传（而非逐个撞限流），剩余缺失分片留待下次触发。
+          if (Date.now() < chunkBackoffUntilRef.current) {
+            hadFailures = true;
+            break;
           }
 
           const uploaded = await uploadDraftChunk(entry.seq, entry.blob, mimeType);
@@ -436,6 +471,19 @@ export function useSoniox(
       reconnectAttemptsRef.current = 0;
       stableConnTimerRef.current = null;
     }, STABLE_CONNECTION_MS);
+  }, []);
+
+  // 续录/重连时传给 processor.startNewSession 的时间偏移（=已录音频毫秒）。
+  // 暂停中（pausedAt 有值）以 pausedAt 为「当前音频时刻」冻结点，避免把暂停/断网空档
+  // （pausedAt→now）当成音频时长算进偏移——否则重连/切麦/重建后段落时间戳整体前移那段空档。
+  // 未暂停（pausedAt 为空，如录制中重建）用 now。Math.max(0) 兜底抖动下 totalPausedMs 虚高致负。
+  // 与 accumulatePausedTime（连接完成后把空档折进 totalPausedMs 供计时）配合但不双算：offset 用
+  // pausedAt 冻结点、totalPausedMs 此刻尚未含本次空档，故一次性正确。overallStart 为空返回 0。
+  const computeResumeOffset = useCallback(() => {
+    if (!overallStartTimeRef.current) return 0;
+    const { pausedAt, totalPausedMs } = useTranscriptStore.getState();
+    const ref = pausedAt ?? Date.now();
+    return Math.max(0, ref - overallStartTimeRef.current - totalPausedMs);
   }, []);
 
   const ensureProcessor = useCallback(() => {
@@ -616,6 +664,9 @@ export function useSoniox(
           setRecordingState('paused');
         }
         reconnectAttemptsRef.current = 0;
+        // 明确通知上层「重连失败」——否则会话停在 paused、connectionState='error' 的红标又被
+        // isActive 挡住，用户看不到失败信号(静默死)。上层据此弹持久提示引导手动点「继续」重连。
+        onReconnectFailed?.();
         return;
       }
 
@@ -642,11 +693,7 @@ export function useSoniox(
         // 减去累计暂停时长，否则先前暂停过的会话在重连后所有段落时间戳
         // 会前移整段暂停时长、超出实际（已扣暂停）音频长度（U57），与
         // reconnectAfterRefresh 的算法保持一致。
-        const offsetMs = overallStartTimeRef.current
-          ? Date.now() -
-            overallStartTimeRef.current -
-            useTranscriptStore.getState().totalPausedMs
-          : 0;
+        const offsetMs = computeResumeOffset();
 
         processorRef.current?.onEndpoint();
         processorRef.current?.startNewSession(offsetMs);
@@ -775,8 +822,10 @@ export function useSoniox(
     },
     [
       canRecoverLocally,
+      computeResumeOffset,
       cancelStableConn,
       markConnectedStable,
+      onReconnectFailed,
       accumulatePausedTime,
       audioActivityThreshold,
       markAudioActivity,
@@ -1251,10 +1300,7 @@ export function useSoniox(
     // 导致 resume 后所有段落时间戳错位（C12）。与 attemptReconnect /
     // switchMicrophone / rebuildSession / reconnectAfterRefresh 四条同类路径对齐。
     if (reuseProcessor && processorRef.current && overallStartTimeRef.current) {
-      const offsetMs =
-        Date.now() -
-        overallStartTimeRef.current -
-        useTranscriptStore.getState().totalPausedMs;
+      const offsetMs = computeResumeOffset();
       processorRef.current.onEndpoint();
       processorRef.current.startNewSession(offsetMs);
     }
@@ -1267,6 +1313,7 @@ export function useSoniox(
     });
   }, [
     accumulatePausedTime,
+    computeResumeOffset,
     markAudioActivity,
     recordingState,
     setConnectionState,
@@ -1363,12 +1410,8 @@ export function useSoniox(
       }
 
       const activeRecording = recordingRef.current.recording;
-      // 减去累计暂停时长，避免切换麦克风后段落时间戳前移（U57）。
-      const offsetMs = overallStartTimeRef.current
-        ? Date.now() -
-          overallStartTimeRef.current -
-          useTranscriptStore.getState().totalPausedMs
-        : 0;
+      // 减去暂停时长/空档，避免切换麦克风后段落时间戳前移（U57）。见 computeResumeOffset。
+      const offsetMs = computeResumeOffset();
 
       recordingRef.current = null;
       setConnectionState('connecting');
@@ -1393,7 +1436,7 @@ export function useSoniox(
           useTranscriptStore.getState().recordingState === 'paused',
       });
     },
-    [setConnectionState, setCurrentMicDeviceId, startNewRecording]
+    [computeResumeOffset, setConnectionState, setCurrentMicDeviceId, startNewRecording]
   );
 
   const rebuildSession = useCallback(async () => {
@@ -1404,12 +1447,8 @@ export function useSoniox(
     }
 
     const activeRecording = current.recording;
-    // 减去累计暂停时长，避免重建会话后段落时间戳前移（U57）。
-    const offsetMs = overallStartTimeRef.current
-      ? Date.now() -
-        overallStartTimeRef.current -
-        useTranscriptStore.getState().totalPausedMs
-      : 0;
+    // 减去暂停时长/空档，避免重建会话后段落时间戳前移（U57）。见 computeResumeOffset。
+    const offsetMs = computeResumeOffset();
 
     recordingRef.current = null;
     setConnectionState('connecting');
@@ -1435,7 +1474,7 @@ export function useSoniox(
       preservePauseStateUntilConnected:
         useTranscriptStore.getState().recordingState === 'paused',
     });
-  }, [setConnectionState, startNewRecording]);
+  }, [computeResumeOffset, setConnectionState, startNewRecording]);
 
   /**
    * 页面刷新后恢复录音。

@@ -10,10 +10,9 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
 import {
-  Send,
+  ArrowUp,
   Square,
   Loader2,
-  User,
   Bot,
   ChevronDown,
   ChevronUp,
@@ -26,6 +25,7 @@ import {
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 import { useAuthStore } from '@/stores/authStore';
+import { useConversationListStore } from '@/stores/conversationListStore';
 import {
   useChatStore,
   preferenceToFields,
@@ -151,22 +151,22 @@ function Md({ children }: { children: string }) {
   return (
     <ReactMarkdown
       components={{
-        p: ({ children: c }) => <p className="mb-1.5 last:mb-0">{c}</p>,
+        p: ({ children: c }) => <p className="mb-2 last:mb-0">{c}</p>,
         strong: ({ children: c }) => (
           <strong className="font-semibold">{c}</strong>
         ),
         em: ({ children: c }) => <em className="italic">{c}</em>,
         ul: ({ children: c }) => (
-          <ul className="list-disc list-inside mb-1.5 space-y-0.5">{c}</ul>
+          <ul className="list-disc list-inside mb-2 space-y-1">{c}</ul>
         ),
         ol: ({ children: c }) => (
-          <ol className="list-decimal list-inside mb-1.5 space-y-0.5">{c}</ol>
+          <ol className="list-decimal list-inside mb-2 space-y-1">{c}</ol>
         ),
         li: ({ children: c }) => <li>{c}</li>,
         code: ({ children: c, className: codeClass }) => {
           const isInline = !codeClass;
           return isInline ? (
-            <code className="px-1 py-0.5 rounded bg-charcoal-100 text-rust-600 text-[10px] font-mono">
+            <code className="px-1 py-0.5 rounded bg-charcoal-100 text-rust-600 text-xs font-mono">
               {c}
             </code>
           ) : (
@@ -174,23 +174,23 @@ function Md({ children }: { children: string }) {
           );
         },
         pre: ({ children: c }) => (
-          <pre className="my-1.5 p-2 rounded-md bg-charcoal-800 text-cream-100 text-[10px] font-mono overflow-x-auto">
+          <pre className="my-2 p-3 rounded-lg bg-charcoal-800 text-cream-100 text-xs font-mono overflow-x-auto">
             {c}
           </pre>
         ),
         blockquote: ({ children: c }) => (
-          <blockquote className="border-l-2 border-rust-300 pl-2 my-1.5 text-charcoal-500 italic">
+          <blockquote className="border-l-2 border-rust-300 pl-3 my-2 text-charcoal-500 italic">
             {c}
           </blockquote>
         ),
         h1: ({ children: c }) => (
-          <h1 className="font-bold text-sm mb-1">{c}</h1>
+          <h1 className="font-bold text-base mb-1.5">{c}</h1>
         ),
         h2: ({ children: c }) => (
-          <h2 className="font-bold text-xs mb-1">{c}</h2>
+          <h2 className="font-bold text-sm mb-1">{c}</h2>
         ),
         h3: ({ children: c }) => (
-          <h3 className="font-semibold text-xs mb-0.5">{c}</h3>
+          <h3 className="font-semibold text-sm mb-0.5">{c}</h3>
         ),
         a: ({ href, children: c }) => (
           <a
@@ -287,14 +287,12 @@ function ThinkingBlock({
 function MessageBubble({ msg }: { msg: ChatMessage }) {
   if (msg.role === 'user') {
     return (
-      <div className="flex gap-2 justify-end animate-chat-bubble-right">
-        <div className="max-w-[80%]">
-          <div className="px-3 py-2 rounded-lg text-xs leading-relaxed bg-charcoal-800 text-white chat-user-bubble">
-            <Md>{msg.content}</Md>
-          </div>
-        </div>
-        <div className="w-6 h-6 rounded-full bg-charcoal-200 flex items-center justify-center flex-shrink-0">
-          <User className="w-3.5 h-3.5 text-charcoal-600" />
+      <div className="flex justify-end animate-chat-bubble-right">
+        <div
+          className="max-w-[80%] px-4 py-2.5 rounded-2xl rounded-br-md text-sm leading-relaxed
+                     bg-charcoal-800 text-white chat-user-bubble"
+        >
+          <Md>{msg.content}</Md>
         </div>
       </div>
     );
@@ -303,50 +301,41 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
   const showStreamingPlaceholder = msg.streaming && !msg.content;
 
   return (
-    <div className="flex gap-2 animate-chat-bubble-left">
-      <div className="w-6 h-6 rounded-full bg-rust-100 flex items-center justify-center flex-shrink-0">
-        {msg.streaming ? (
-          <Loader2 className="w-3.5 h-3.5 text-rust-600 animate-spin" />
-        ) : (
-          <Bot className="w-3.5 h-3.5 text-rust-600" />
-        )}
-      </div>
-      <div className="max-w-[80%] min-w-0">
-        {msg.thinking !== undefined && (
-          <ThinkingBlock
-            thinking={msg.thinking}
-            streaming={msg.streaming}
-            thinkingMs={msg.thinkingMs}
-          />
-        )}
-        {showStreamingPlaceholder && msg.thinking === undefined && (
-          <div className="flex items-center gap-1.5 text-[11px] text-charcoal-400 mb-1">
-            <Sparkles className="w-3 h-3 text-purple-400 animate-breathe" />
-            <span>思考中…</span>
-          </div>
-        )}
-        {msg.content && (
-          <div className="px-3 py-2 rounded-lg text-xs leading-relaxed bg-cream-100 text-charcoal-700">
-            <Md>{msg.content}</Md>
-          </div>
-        )}
-        {msg.model && !msg.streaming && (
-          <div className="flex items-center gap-1.5 mt-0.5 pl-1">
-            <span className="text-[10px] text-charcoal-300">{msg.model}</span>
-            {msg.thinkingDepth && msg.thinkingDepth !== 'medium' && (
-              <span
-                className={`text-[10px] px-1 py-0.5 rounded ${
-                  msg.thinkingDepth === 'high'
-                    ? 'bg-purple-50 text-purple-500'
-                    : 'bg-cream-100 text-charcoal-400'
-                }`}
-              >
-                {msg.thinkingDepth}
-              </span>
-            )}
-          </div>
-        )}
-      </div>
+    <div className="animate-chat-bubble-left min-w-0">
+      {msg.thinking !== undefined && (
+        <ThinkingBlock
+          thinking={msg.thinking}
+          streaming={msg.streaming}
+          thinkingMs={msg.thinkingMs}
+        />
+      )}
+      {showStreamingPlaceholder && msg.thinking === undefined && (
+        <div className="flex items-center gap-1.5 text-xs text-charcoal-400 mb-1">
+          <Sparkles className="w-3.5 h-3.5 text-purple-400 animate-breathe" />
+          <span>思考中…</span>
+        </div>
+      )}
+      {msg.content && (
+        <div className="text-sm leading-relaxed text-charcoal-800">
+          <Md>{msg.content}</Md>
+        </div>
+      )}
+      {msg.model && !msg.streaming && (
+        <div className="flex items-center gap-1.5 mt-1">
+          <span className="text-[10px] text-charcoal-300">{msg.model}</span>
+          {msg.thinkingDepth && msg.thinkingDepth !== 'medium' && (
+            <span
+              className={`text-[10px] px-1 py-0.5 rounded ${
+                msg.thinkingDepth === 'high'
+                  ? 'bg-purple-50 text-purple-500'
+                  : 'bg-cream-100 text-charcoal-400'
+              }`}
+            >
+              {msg.thinkingDepth}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -495,6 +484,14 @@ export default function GlobalChat({
   /** 对话已关闭（endedAt 非空）→ 只读：禁止再发消息 / 改附件。null = 活跃。 */
   const [endedAt, setEndedAt] = useState<string | null>(null);
   const isEnded = endedAt !== null;
+  /**
+   * 历史消息是否已加载完成（含失败兜底）。加载完成前禁止发送：否则 GET /messages
+   * 返回后的 setMessages 全量覆盖会清掉刚发送的乐观消息与流式占位，SSE 增量
+   * updateMessage 因 id 不存在而全部落空（消息凭空消失、loader 卡死、诱导重发）。
+   * ref 供 handleSend 同步判断（effect 闭包里的 state 是旧值），state 供按钮态渲染。
+   */
+  const historyLoadedRef = useRef(false);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   /** IME 合成中（中文/日文输入法）—— 合成期间回车不应发送（修输入法回车误发） */
   const [composing, setComposing] = useState(false);
   /** U19：主动压缩后被折叠的早期消息是否展开（与 ChatTab 的 展开/收起 一致） */
@@ -545,6 +542,8 @@ export default function GlobalChat({
     setActiveConversation(conversationId);
     setAttachments([]);
     setEndedAt(null);
+    historyLoadedRef.current = false;
+    setHistoryLoaded(false);
 
     const controller = new AbortController();
     const headers = { Authorization: `Bearer ${token}` };
@@ -563,8 +562,18 @@ export default function GlobalChat({
             // ChatDetailClient 里的重复预检请求，避免每次进对话发两次 messages）。
             if (res.status === 404 || res.status === 403) {
               onAccessDenied?.();
+            } else {
+              // 5xx 等服务端错误：给出可见反馈，与真正的空对话区分开
+              toast.error(t('chat.loadFailed'), `HTTP ${res.status}`);
             }
             setMessages(conversationId, [], []);
+            historyLoadedRef.current = true;
+            setHistoryLoaded(true);
+            // 首页暂存的首条消息发不出去了 → 放回输入框，避免文本丢失
+            const orphaned = useChatStore
+              .getState()
+              .takePendingFirstMessage(conversationId);
+            if (orphaned) setInput(orphaned.text);
             return;
           }
           const data = (await res.json()) as {
@@ -629,10 +638,42 @@ export default function GlobalChat({
               },
             });
           }
+
+          // 历史加载完成 → 解锁发送（必须先于自动发送置位，handleSend 有门闩守卫）
+          historyLoadedRef.current = true;
+          setHistoryLoaded(true);
+
+          // Claude 式起聊：首页 composer 暂存的首条消息在加载完成后自动发送。
+          // takePendingFirstMessage 取到即清空 —— StrictMode 首次挂载的 effect
+          // 在 fetch 返回前就被 abort（走不到这里），只有存活的那次拿到文本。
+          const pending = useChatStore
+            .getState()
+            .takePendingFirstMessage(conversationId);
+          if (pending) {
+            if (
+              data.messages.length === 0 &&
+              (data.conversation?.endedAt ?? null) === null &&
+              // 新鲜度守卫：加载途中切走留下的陈旧残留，数小时后重开该对话时
+              // 不应突然自动发送 —— 放回输入框由用户决定。
+              pending.ageMs < 60_000
+            ) {
+              void handleSend(pending.text);
+            } else {
+              setInput(pending.text);
+            }
+          }
         } catch (err) {
           if ((err as { name?: string })?.name === 'AbortError') return;
           console.error('Failed to load conversation messages:', err);
+          toast.error(t('chat.loadFailed'));
           setMessages(conversationId, [], []);
+          historyLoadedRef.current = true;
+          setHistoryLoaded(true);
+          // 加载失败时把暂存的首条消息还给输入框，避免文本丢失
+          const orphaned = useChatStore
+            .getState()
+            .takePendingFirstMessage(conversationId);
+          if (orphaned) setInput(orphaned.text);
         }
       })(),
       (async () => {
@@ -949,6 +990,11 @@ export default function GlobalChat({
         `/api/conversations/${encodeURIComponent(conversationId)}/recordings`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
+      // 响应到达时用户可能已切到别的对话（组件实例不卸载，仅 prop 变化）——
+      // 迟到的旧对话响应不允许写进新对话的 recordings 状态。
+      if (useChatStore.getState().activeConversationId !== conversationId) {
+        return;
+      }
       if (!res.ok) return;
       const data: unknown = await res.json();
       let raw: unknown[] = [];
@@ -988,6 +1034,8 @@ export default function GlobalChat({
       });
       if (!res.ok) throw new Error(`create ${res.status}`);
       const data = (await res.json()) as { conversation: { id: string } };
+      // 强刷共享列表：路由变化触发的侧栏刷新不带 force，可能被 1.5s 去抖吞掉
+      void useConversationListStore.getState().refresh(token, { force: true });
       router.push(`/chat/${data.conversation.id}`);
     } catch {
       toast.error(t('common.operationFailed'));
@@ -999,17 +1047,31 @@ export default function GlobalChat({
      U12 之前的端点要求 conversation.session 非空；纯全局 chat
      可能返回 404，本组件会把错误内容显示到占位 assistant 气泡里。
      ────────────────────────────────────────────────────────────── */
-  const handleSend = async () => {
-    const value = input.trim();
+  const handleSend = async (textOverride?: string) => {
+    const value = (textOverride ?? input).trim();
     const hasImages = pendingImages.length > 0;
-    if ((!value && !hasImages) || isLoading || !token || contextFull || isEnded)
+    if (
+      (!value && !hasImages) ||
+      isLoading ||
+      !token ||
+      contextFull ||
+      isEnded ||
+      // 历史未加载完不发（防 setMessages 全量覆盖清掉乐观消息，见 historyLoadedRef 注释）
+      !historyLoadedRef.current ||
+      // 附件上传中不发：此时 attachments 还没有该文件的 chip，这条消息会静默丢附件
+      uploadingFile
+    )
       return;
 
-    // 本轮是否为对话首轮（用于完成后触发标题自动生成）
-    const isFirstExchange = messages.length === 0;
+    // 本对话是否还没有任何 assistant 回复（用于完成后触发标题自动生成）。
+    // 不用 messages.length === 0：首轮失败/被停止时服务端已持久化 user 消息，
+    // 按长度判定会让该对话永远错过自动标题（服务端幂等，已有标题直接返回）。
+    const isFirstExchange = !messages.some((m) => m.role === 'assistant');
 
-    setInput('');
-    if (composerRef.current) composerRef.current.style.height = 'auto';
+    if (textOverride === undefined) {
+      setInput('');
+      if (composerRef.current) composerRef.current.style.height = 'auto';
+    }
 
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
@@ -1136,12 +1198,19 @@ export default function GlobalChat({
 
       if (!sawError) {
         updateMessage(conversationId, assistantId, { streaming: false });
-        // 首轮对话完成 → 异步生成标题（幂等端点；fire-and-forget，列表下次加载即显示）
+        // 首轮对话完成 → 异步生成标题；完成后强刷共享会话列表，
+        // 侧栏/首页的「未命名对话」即时换成真实标题。
         if (isFirstExchange && token) {
           void fetch(
             `/api/conversations/${encodeURIComponent(conversationId)}/generate-title`,
             { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
-          ).catch(() => undefined);
+          )
+            .then(() =>
+              useConversationListStore
+                .getState()
+                .refresh(token, { force: true })
+            )
+            .catch(() => undefined);
         }
       }
     } catch (error) {
@@ -1233,52 +1302,55 @@ export default function GlobalChat({
         }}
       />
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
-        {/* U19：主动压缩后被折叠的早期消息 —— 用户可展开查看原文（与 ChatTab 一致） */}
-        {archivedMessages.length > 0 && (
-          <div className="border border-cream-200 rounded-md bg-cream-50/30">
-            <button
-              type="button"
-              onClick={() => setShowArchived((v) => !v)}
-              className="w-full flex items-center justify-between px-2.5 py-1.5
-                         text-[11px] text-charcoal-500 hover:bg-cream-100/50 transition-colors"
-            >
-              <span>
-                {showArchived
-                  ? t('chat.hideCollapsed', { count: archivedMessages.length })
-                  : t('chat.showCollapsed', { count: archivedMessages.length })}
-              </span>
-              {showArchived ? (
-                <ChevronUp className="w-3 h-3" />
-              ) : (
-                <ChevronDown className="w-3 h-3" />
+      {/* Messages —— Claude 式居中窄栏 */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto w-full px-4 lg:px-6 py-5 space-y-5">
+          {/* U19：主动压缩后被折叠的早期消息 —— 用户可展开查看原文（与 ChatTab 一致） */}
+          {archivedMessages.length > 0 && (
+            <div className="border border-cream-200 rounded-md bg-cream-50/30">
+              <button
+                type="button"
+                onClick={() => setShowArchived((v) => !v)}
+                className="w-full flex items-center justify-between px-2.5 py-1.5
+                           text-[11px] text-charcoal-500 hover:bg-cream-100/50 transition-colors"
+              >
+                <span>
+                  {showArchived
+                    ? t('chat.hideCollapsed', { count: archivedMessages.length })
+                    : t('chat.showCollapsed', { count: archivedMessages.length })}
+                </span>
+                {showArchived ? (
+                  <ChevronUp className="w-3 h-3" />
+                ) : (
+                  <ChevronDown className="w-3 h-3" />
+                )}
+              </button>
+              {showArchived && (
+                <div className="border-t border-cream-200 px-2 py-2 space-y-2 opacity-80">
+                  {archivedMessages.map((msg) => (
+                    <MessageBubble key={msg.id} msg={msg} />
+                  ))}
+                </div>
               )}
-            </button>
-            {showArchived && (
-              <div className="border-t border-cream-200 px-2 py-2 space-y-2 opacity-80">
-                {archivedMessages.map((msg) => (
-                  <MessageBubble key={msg.id} msg={msg} />
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+            </div>
+          )}
 
-        {messages.length === 0 && archivedMessages.length === 0 && (
-          <div className="text-center py-8 text-charcoal-300 animate-fade-in-up">
-            <Bot className="w-8 h-8 mx-auto mb-2 opacity-50 animate-breathe" />
-            <p className="text-xs">{t('chat.composerPlaceholder')}</p>
-          </div>
-        )}
-        {messages.map((msg) => (
-          <MessageBubble key={msg.id} msg={msg} />
-        ))}
-        <div ref={scrollRef} />
+          {messages.length === 0 && archivedMessages.length === 0 && (
+            <div className="text-center py-16 text-charcoal-300 animate-fade-in-up">
+              <Bot className="w-9 h-9 mx-auto mb-3 opacity-50 animate-breathe" />
+              <p className="text-sm">{t('chat.composerPlaceholder')}</p>
+            </div>
+          )}
+          {messages.map((msg) => (
+            <MessageBubble key={msg.id} msg={msg} />
+          ))}
+          <div ref={scrollRef} />
+        </div>
       </div>
 
-      {/* Input area — 与 ChatTab 视觉同步 */}
-      <div className="border-t border-cream-200 px-3 pt-1.5 pb-0 sticky bottom-0 bg-white safe-bottom">
+      {/* Input area —— Claude 式 composer 卡片（居中窄栏） */}
+      <div className="px-4 lg:px-6 pb-4 pt-1 sticky bottom-0 bg-white safe-bottom">
+        <div className="max-w-3xl mx-auto w-full">
         {isEnded && !contextFull && (
           <div className="mb-2 px-2.5 py-1.5 rounded-md bg-charcoal-50 border border-charcoal-200 text-[11px] text-charcoal-600 flex items-center justify-between">
             <span>{t('chat.endedReadonly')}</span>
@@ -1309,6 +1381,12 @@ export default function GlobalChat({
           </div>
         )}
 
+        {/* Composer 卡片：附件 chips + 图片缩略图 + 文本框 + 工具行 */}
+        <div
+          className="rounded-2xl border border-cream-300 bg-white shadow-sm
+                     focus-within:border-rust-400 focus-within:ring-1 focus-within:ring-rust-400
+                     px-3 pt-2.5 pb-2 transition-colors"
+        >
         {/* 已上传文件附件 chips */}
         {attachments.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mb-2">
@@ -1350,50 +1428,23 @@ export default function GlobalChat({
           </div>
         )}
 
-        {/* 输入行：图片按钮 + 文件按钮 + 文本框 + 发送 */}
-        <div className="flex items-center gap-2">
-          <input
-            ref={imageInputRef}
-            type="file"
-            accept={ACCEPTED_IMAGE_TYPES.join(',')}
-            multiple
-            onChange={handleImagePick}
-            className="hidden"
-          />
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept={ACCEPT_FILE_INPUT_STRING}
-            onChange={handleFilePick}
-            className="hidden"
-          />
-          <button
-            type="button"
-            onClick={() => imageInputRef.current?.click()}
-            disabled={isLoading || !supportsImage || isEnded}
-            title={supportsImage ? '上传图片' : '当前模型不支持图片输入'}
-            className="w-9 h-9 rounded-lg border border-cream-300 bg-white text-charcoal-500
-                       hover:border-cream-400 transition-colors flex items-center justify-center
-                       disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
-          >
-            <ImagePlus className="w-4 h-4" />
-          </button>
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isLoading || uploadingFile || isEnded}
-            title={t('chat.attachFile')}
-            className="w-9 h-9 rounded-lg border border-cream-300 bg-white text-charcoal-500
-                       hover:border-cream-400 transition-colors flex items-center justify-center
-                       disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
-          >
-            {uploadingFile ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <Paperclip className="w-4 h-4" />
-            )}
-          </button>
+        <input
+          ref={imageInputRef}
+          type="file"
+          accept={ACCEPTED_IMAGE_TYPES.join(',')}
+          multiple
+          onChange={handleImagePick}
+          className="hidden"
+        />
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept={ACCEPT_FILE_INPUT_STRING}
+          onChange={handleFilePick}
+          className="hidden"
+        />
 
+        {/* 文本框（无边框，卡片本身是输入区边界） */}
           <textarea
             ref={composerRef}
             rows={1}
@@ -1430,46 +1481,48 @@ export default function GlobalChat({
             placeholder={
               isEnded ? t('chat.endedReadonly') : t('chat.composerPlaceholder')
             }
-            className="flex-1 px-3 py-2 rounded-lg border border-cream-300 text-xs resize-none
+            className="w-full px-1 py-1 bg-transparent text-sm resize-none
                        max-h-32 overflow-y-auto
-                       focus:outline-none focus:ring-1 focus:ring-rust-400 focus:border-rust-400
-                       bg-white text-charcoal-700 placeholder:text-charcoal-300
-                       disabled:bg-cream-50 disabled:cursor-not-allowed"
+                       focus:outline-none
+                       text-charcoal-700 placeholder:text-charcoal-300
+                       disabled:cursor-not-allowed"
             disabled={isLoading || contextFull || isEnded}
           />
-          {isLoading ? (
+
+        {/* 工具行：图片/文件（左） —— 模型 · 思考 · 发送（右） */}
+        <div className="flex items-center justify-between mt-1">
+          <div className="flex items-center gap-0.5">
             <button
               type="button"
-              onClick={() => {
-                sendAbortRef.current?.abort();
-                setLoading(conversationId, false);
-              }}
-              title={t('chat.stop')}
-              aria-label={t('chat.stop')}
-              className="p-2 rounded-lg bg-charcoal-200 text-charcoal-600 hover:bg-charcoal-300
-                         transition-colors flex-shrink-0"
+              onClick={() => imageInputRef.current?.click()}
+              disabled={isLoading || !supportsImage || isEnded}
+              title={supportsImage ? '上传图片' : '当前模型不支持图片输入'}
+              className="w-8 h-8 rounded-lg text-charcoal-400
+                         hover:bg-cream-100 hover:text-charcoal-600 transition-colors
+                         flex items-center justify-center
+                         disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
             >
-              <Square className="w-3.5 h-3.5" />
+              <ImagePlus className="w-4 h-4" />
             </button>
-          ) : (
             <button
-              onClick={handleSend}
-              disabled={
-                contextFull ||
-                isEnded ||
-                (!input.trim() && pendingImages.length === 0)
-              }
-              className="p-2 rounded-lg bg-rust-500 text-white hover:bg-rust-600
-                         disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isLoading || uploadingFile || isEnded}
+              title={t('chat.attachFile')}
+              className="w-8 h-8 rounded-lg text-charcoal-400
+                         hover:bg-cream-100 hover:text-charcoal-600 transition-colors
+                         flex items-center justify-center
+                         disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
             >
-              <Send className="w-3.5 h-3.5" />
+              {uploadingFile ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Paperclip className="w-4 h-4" />
+              )}
             </button>
-          )}
-        </div>
+          </div>
 
-        {/* Footer 行（与 ChatTab 同步）：模型 · 思考强度 */}
-        <div className="flex items-center justify-end gap-1.5 mt-1.5 mb-1.5 px-0.5">
-          <div className="flex items-center gap-1 text-[10px] min-w-0">
+          <div className="flex items-center gap-1.5 text-[11px] min-w-0">
             <div ref={modelMenuRef} className="relative">
               <button
                 type="button"
@@ -1481,7 +1534,7 @@ export default function GlobalChat({
                 {currentModelLabel}
               </button>
               {showModelMenu && (
-                <div className="absolute bottom-full left-0 mb-2 w-56 bg-white border border-cream-300
+                <div className="absolute bottom-full right-0 mb-2 w-56 bg-white border border-cream-300
                                 rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
                   {availableModels.length === 0 ? (
                     <div className="px-3 py-2 text-xs text-charcoal-400">
@@ -1541,7 +1594,7 @@ export default function GlobalChat({
               </button>
 
               {showThinkingMenu && !thinkingDisabled && (
-                <div className="absolute bottom-full left-0 mb-2 w-44 bg-white border border-cream-300
+                <div className="absolute bottom-full right-0 mb-2 w-44 bg-white border border-cream-300
                                 rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale">
                   {thinkingOptions.map((opt) => {
                     const isSelected = selectedThinkingPreference === opt.pref;
@@ -1578,7 +1631,44 @@ export default function GlobalChat({
                 </div>
               )}
             </div>
+
+            {isLoading ? (
+              <button
+                type="button"
+                onClick={() => {
+                  sendAbortRef.current?.abort();
+                  setLoading(conversationId, false);
+                }}
+                title={t('chat.stop')}
+                aria-label={t('chat.stop')}
+                className="w-8 h-8 rounded-lg bg-charcoal-200 text-charcoal-600 hover:bg-charcoal-300
+                           flex items-center justify-center transition-colors flex-shrink-0"
+              >
+                <Square className="w-3.5 h-3.5" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void handleSend()}
+                disabled={
+                  contextFull ||
+                  isEnded ||
+                  !historyLoaded ||
+                  uploadingFile ||
+                  (!input.trim() && pendingImages.length === 0)
+                }
+                aria-label={t('chat.send')}
+                title={t('chat.send')}
+                className="w-8 h-8 rounded-lg bg-rust-500 text-white hover:bg-rust-600
+                           flex items-center justify-center
+                           disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+              >
+                <ArrowUp className="w-4 h-4" />
+              </button>
+            )}
           </div>
+        </div>
+        </div>
         </div>
       </div>
     </div>

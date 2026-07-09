@@ -2,6 +2,7 @@
 
 import { useCallback } from 'react';
 import { useAuthStore } from '@/stores/authStore';
+import { useConversationListStore } from '@/stores/conversationListStore';
 
 export function useAuth() {
   const { user, token, quotas, sessionChecked, setAuth, setQuotas, setSessionChecked, logout: clearStore } = useAuthStore();
@@ -72,6 +73,8 @@ export function useAuth() {
   const logout = useCallback(async () => {
     // 1. 先清除客户端 store（立即阻止后续请求携带 token）
     clearStore();
+    // 同步清掉全局会话列表缓存，防止换账号后残留上一个用户的对话列表
+    useConversationListStore.getState().clear();
 
     // 2. 显式清除 localStorage 中 persist 的数据，防止刷新后恢复
     try {

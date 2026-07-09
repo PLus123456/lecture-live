@@ -240,6 +240,8 @@ export default {
       disconnectPaused:
         'Connection interrupted. Recording time has been paused and will continue once reconnected.',
       disconnectResumed: 'Connection restored. Recording resumed.',
+      reconnectFailed:
+        'Connection lost and automatic reconnection failed. Click Resume to reconnect manually.',
       quotaExhaustedStart:
         'This month\'s transcription quota has been used up. This account cannot start a new recording.',
       maxDurationReached:

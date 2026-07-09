@@ -310,14 +310,14 @@ describe('POST /api/llm/chat (mode routing)', () => {
   });
 
   describe('legacy mode (conversation.session 非空)', () => {
-    it('单录音 chat 走 makeRagRetrieverForSession，且不走全局路径的 helpers', async () => {
+    it('ChatTab 实时请求（带 live transcript）走 makeRagRetrieverForSession，且不走全局路径的 helpers', async () => {
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv-legacy',
         userId: 'user-1',
         sessionId: 'sess-1',
         endedAt: null,
         degradationLevel: 1,
-        session: { userId: 'user-1', targetLang: 'zh' },
+        session: { id: 'sess-1', userId: 'user-1', targetLang: 'zh' },
         messages: [],
         sessions: [],
         attachments: [],
@@ -328,7 +328,8 @@ describe('POST /api/llm/chat (mode routing)', () => {
         body: {
           conversationId: 'conv-legacy',
           question: 'hello',
-          transcript: [],
+          // ChatTab 的实时路径特征：请求自带 live transcript
+          transcript: [{ text: 'live segment', startMs: 0 }],
         },
       });
       const res = await POST(req, {} as never);
@@ -337,7 +338,7 @@ describe('POST /api/llm/chat (mode routing)', () => {
       const { done } = await consumeSseEvents(res);
       expect(done?.level).toBe(1);
 
-      // 关键断言：legacy 必须用 single-session retriever
+      // 关键断言：legacy 实时路径必须用 single-session retriever
       expect(makeRagRetrieverForSessionMock).toHaveBeenCalledWith('sess-1');
       // 不能走多录音 retriever
       expect(makeRagRetrieverForRecordingsMock).not.toHaveBeenCalled();
@@ -348,6 +349,61 @@ describe('POST /api/llm/chat (mode routing)', () => {
       expect(estimateRawContextTokensMock).toHaveBeenCalled();
       const builderArg = buildChatContextMock.mock.calls[0][0];
       expect(builderArg.forceMinLevel).toBeUndefined();
+    });
+
+    it('全局对话区打开（无 live transcript/偏移/摘要）→ 走 global 路径，来源录音自动并入 ownedSessions', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-legacy',
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        endedAt: null,
+        degradationLevel: 1,
+        session: {
+          id: 'sess-1',
+          userId: 'user-1',
+          targetLang: 'zh',
+          title: '录音一',
+          recordingPath: null,
+          transcriptPath: '/t/sess-1.json',
+          summaryPath: null,
+          reportPath: null,
+        },
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+      loadSessionTranscriptBundleMock.mockResolvedValue({
+        segments: [{ text: 'stored segment', startMs: 0 }],
+        summaries: [],
+        translations: {},
+      });
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-legacy',
+          question: 'hello',
+          // GlobalChat 的请求特征：无任何 live 上下文
+          transcript: [],
+          summaryContext: '',
+          totalTranscriptMs: 0,
+        },
+      });
+      const res = await POST(req, {} as never);
+      expect(res.status).toBe(200);
+      await consumeSseEvents(res);
+
+      // 来源录音的文件态 transcript 被加载（"自动挂载"）
+      expect(loadSessionTranscriptBundleMock).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'sess-1' })
+      );
+      // 走多录音 retriever（recordingIds = ['sess-1']），不走单录音 retriever
+      expect(makeRagRetrieverForRecordingsMock).toHaveBeenCalledWith(
+        ['sess-1'],
+        expect.any(Function),
+        expect.any(Number)
+      );
+      expect(makeRagRetrieverForSessionMock).not.toHaveBeenCalled();
     });
 
     it('长 transcript（超 80% budget）→ legacy 也 forceMinLevel=6（省反应式重试）', async () => {

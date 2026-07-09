@@ -1,8 +1,12 @@
 // /api/conversations/[id]/recordings — 管理某对话挂载的录音（ConversationSession 行）
 //
-//   GET    返回 [{ sessionId, title, addedAt }]
+//   GET    返回 [{ sessionId, title, addedAt, legacy? }]
 //   POST   { sessionIds: string[] }  追加挂载（重复用 skipDuplicates 跳过）
 //   DELETE { sessionIds: string[] }  从联表删除指定行
+//
+// legacy：录音会话内创建的对话（Conversation.sessionId 非空）把来源录音作为
+// 第一个 pill 返回并标 legacy=true —— 它定义了对话的归属，不允许移除/重复挂载
+// （在全局对话区打开这类对话时录音即"自动挂载好"）。
 //
 // 鉴权：401 未登录；404 对话不存在；403 非所有者；403 录音不属于当前用户。
 
@@ -22,23 +26,61 @@ type RecordingRow = {
   sessionId: string;
   title: string | null;
   addedAt: string;
+  /** true = 对话的来源录音（legacy sessionId），UI 不提供移除按钮 */
+  legacy?: boolean;
 };
 
-async function listRecordings(conversationId: string): Promise<RecordingRow[]> {
-  const rows = await prisma.conversationSession.findMany({
-    where: { conversationId },
-    orderBy: { addedAt: 'asc' },
+/** 取对话的 legacy 来源录音（sessionId 非空时），供 GET 拼首个 pill / 增删守卫用。 */
+async function getLegacyBinding(
+  conversationId: string
+): Promise<{ sessionId: string; title: string | null; startedAt: Date } | null> {
+  const conv = await prisma.conversation.findUnique({
+    where: { id: conversationId },
     select: {
       sessionId: true,
-      addedAt: true,
+      startedAt: true,
       session: { select: { title: true } },
     },
   });
-  return rows.map((r) => ({
-    sessionId: r.sessionId,
-    title: r.session?.title ?? null,
-    addedAt: r.addedAt.toISOString(),
-  }));
+  if (!conv?.sessionId) return null;
+  return {
+    sessionId: conv.sessionId,
+    title: conv.session?.title ?? null,
+    startedAt: conv.startedAt,
+  };
+}
+
+async function listRecordings(conversationId: string): Promise<RecordingRow[]> {
+  const [legacy, rows] = await Promise.all([
+    getLegacyBinding(conversationId),
+    prisma.conversationSession.findMany({
+      where: { conversationId },
+      orderBy: { addedAt: 'asc' },
+      select: {
+        sessionId: true,
+        addedAt: true,
+        session: { select: { title: true } },
+      },
+    }),
+  ]);
+  const junction = rows
+    // 防历史脏数据：联表里若混入与 legacy 相同的录音，只保留 legacy 那条
+    .filter((r) => r.sessionId !== legacy?.sessionId)
+    .map((r) => ({
+      sessionId: r.sessionId,
+      title: r.session?.title ?? null,
+      addedAt: r.addedAt.toISOString(),
+    }));
+  if (!legacy) return junction;
+  return [
+    {
+      sessionId: legacy.sessionId,
+      title: legacy.title,
+      addedAt: legacy.startedAt.toISOString(),
+      legacy: true,
+    },
+    ...junction,
+  ];
 }
 
 type SessionIdsResult =
@@ -133,6 +175,15 @@ export async function POST(
     );
   }
 
+  // 来源录音（legacy）本就常驻上下文，不允许再往联表里挂一份重复的
+  const legacyForPost = await getLegacyBinding(id);
+  if (legacyForPost && parsed.sessionIds.includes(legacyForPost.sessionId)) {
+    return NextResponse.json(
+      { error: 'source recording is always attached; cannot attach it again' },
+      { status: 400 }
+    );
+  }
+
   // 验证所有待挂载录音都属于当前用户
   const ownedCount = await prisma.session.count({
     where: { id: { in: parsed.sessionIds }, userId: auth.userId },
@@ -187,6 +238,15 @@ export async function DELETE(
     return NextResponse.json(
       { error: 'Conversation is closed (read-only)' },
       { status: 409 }
+    );
+  }
+
+  // 来源录音（legacy）定义了对话归属，不允许移除
+  const legacyForDelete = await getLegacyBinding(id);
+  if (legacyForDelete && parsed.sessionIds.includes(legacyForDelete.sessionId)) {
+    return NextResponse.json(
+      { error: 'source recording cannot be detached' },
+      { status: 400 }
     );
   }
 

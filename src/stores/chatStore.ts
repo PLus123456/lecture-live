@@ -89,6 +89,17 @@ interface ChatStore {
   activeConversationId: string | null;
   /** 当前 session 下所有 conversations（含已关闭的，用于切换选择） */
   conversations: ConversationMeta[];
+  /**
+   * 首页 composer 输入后待发送的首条消息：先 POST 创建对话 → 记录在这里 →
+   * 跳转 /chat/<id> → GlobalChat 加载完消息后取走并自动发送（Claude 式首页起聊）。
+   * createdAt 由 setter 打点，消费方用它判断新鲜度（加载途中切走导致的陈旧残留
+   * 不应在数小时后重新打开时突然自动发送）。
+   */
+  pendingFirstMessage: {
+    conversationId: string;
+    text: string;
+    createdAt: number;
+  } | null;
 
   // ── 按 conversationId 隔离的运行时切片（不持久化） ──
   byConversation: Record<string, ConversationRuntime>;
@@ -100,6 +111,16 @@ interface ChatStore {
 
   // ── 导航 Setters ──
   setActiveConversation: (id: string | null) => void;
+  setPendingFirstMessage: (
+    pending: { conversationId: string; text: string } | null
+  ) => void;
+  /**
+   * 原子地取走指定对话的待发首条消息（取到即清空，StrictMode 二次挂载/
+   * 并发调用只有一方拿到），无匹配返回 null。
+   */
+  takePendingFirstMessage: (
+    conversationId: string
+  ) => { text: string; ageMs: number } | null;
   setConversations: (list: ConversationMeta[]) => void;
   addConversation: (conv: ConversationMeta) => void;
   /**
@@ -140,6 +161,11 @@ const INITIAL_RUNTIME = {
   activeConversationId: null as string | null,
   conversations: [] as ConversationMeta[],
   byConversation: {} as Record<string, ConversationRuntime>,
+  pendingFirstMessage: null as {
+    conversationId: string;
+    text: string;
+    createdAt: number;
+  } | null,
 } as const;
 
 const DEFAULT_PREFERENCE: ThinkingPreference = 'auto';
@@ -190,7 +216,7 @@ function migrateLegacyThinking(state: unknown): ThinkingPreference {
 
 export const useChatStore = create<ChatStore>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       selectedModel: '',
       selectedThinkingPreference: DEFAULT_PREFERENCE,
       ...INITIAL_RUNTIME,
@@ -212,6 +238,20 @@ export const useChatStore = create<ChatStore>()(
 
       setActiveConversation: (activeConversationId) =>
         set({ activeConversationId }),
+
+      setPendingFirstMessage: (pending) =>
+        set({
+          pendingFirstMessage: pending
+            ? { ...pending, createdAt: Date.now() }
+            : null,
+        }),
+
+      takePendingFirstMessage: (conversationId) => {
+        const pending = get().pendingFirstMessage;
+        if (!pending || pending.conversationId !== conversationId) return null;
+        set({ pendingFirstMessage: null });
+        return { text: pending.text, ageMs: Date.now() - pending.createdAt };
+      },
 
       setConversations: (conversations) => set({ conversations }),
 
@@ -300,6 +340,7 @@ export const useChatStore = create<ChatStore>()(
           activeConversationId: null,
           conversations: [],
           byConversation: {},
+          pendingFirstMessage: null,
         }),
     }),
     {

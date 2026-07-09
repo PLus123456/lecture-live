@@ -7,6 +7,7 @@ import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
 import { useAuthStore } from '@/stores/authStore';
 import { useChatStore } from '@/stores/chatStore';
+import { useConversationListStore } from '@/stores/conversationListStore';
 import GlobalChat from '@/components/chat/GlobalChat';
 import ConfirmDialog from '@/components/ConfirmDialog';
 
@@ -39,6 +40,8 @@ export default function ChatDetailClient({
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       removeConversation(conversationId);
+      // 同步侧栏/首页共享列表
+      useConversationListStore.getState().remove(conversationId);
       toast.success(t('chat.deleteSuccess'));
       router.replace('/chat');
     } catch (err) {
@@ -51,7 +54,12 @@ export default function ChatDetailClient({
   }, [token, deleting, conversationId, removeConversation, router, t]);
 
   return (
-    <div className="relative h-[100dvh] overflow-hidden">
+    // 移动端把 fixed BottomTabBar 的高度（h-16 + 0.5rem + safe-inset）从可用高度里扣掉，
+    // 否则 composer 的发送/模型行会被 z-50 的 TabBar 盖住。
+    <div
+      className="relative h-[100dvh] overflow-hidden
+                 max-md:h-[calc(100dvh-4.5rem-env(safe-area-inset-bottom))]"
+    >
       <button
         type="button"
         onClick={() => setConfirmOpen(true)}

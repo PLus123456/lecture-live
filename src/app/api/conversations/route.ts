@@ -43,6 +43,8 @@ type ConversationListItem = {
   archived: boolean;
   messageCount: number;
   sessionIds: string[];
+  /** true = 录音会话内的对话（legacy sessionId 绑定），前端用来打录音角标/过滤空壳 */
+  sessionBound: boolean;
 };
 
 function serializeConversation(c: {
@@ -65,6 +67,7 @@ function serializeConversation(c: {
     archived: c.archived,
     messageCount: c._count.messages,
     sessionIds: collectSessionIds(c),
+    sessionBound: c.sessionId !== null,
   };
 }
 
@@ -353,14 +356,17 @@ export async function POST(req: Request) {
 // DELETE /api/conversations —— 批量清理本人对话（历史页「清空全部」/「清空已归档」）。
 //   body { all: true }          删除本人全部对话
 //   body { archivedOnly: true } 仅删除本人已归档对话
-// 二者必须显式指定其一（防止裸调误删）。级联清理走 deleteConversationsCascade（清文件+退配额）。
+//   body { globalOnly: true }   可叠加：限定 sessionId=null 的全局对话
+//     （「全部对话」页只展示全局对话，清空不应连带删掉录音会话里的对话）
+// all/archivedOnly 必须显式指定其一（防止裸调误删）。级联清理走
+// deleteConversationsCascade（清文件+退配额）。
 export async function DELETE(req: Request) {
   const user = await verifyAuth(req);
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  let body: { all?: unknown; archivedOnly?: unknown };
+  let body: { all?: unknown; archivedOnly?: unknown; globalOnly?: unknown };
   try {
     body = await req.json();
   } catch {
@@ -368,6 +374,7 @@ export async function DELETE(req: Request) {
   }
   const archivedOnly = body.archivedOnly === true;
   const all = body.all === true;
+  const globalOnly = body.globalOnly === true;
   if (!all && !archivedOnly) {
     return NextResponse.json(
       { error: 'specify { all: true } or { archivedOnly: true }' },
@@ -376,7 +383,11 @@ export async function DELETE(req: Request) {
   }
 
   const rows = await prisma.conversation.findMany({
-    where: { userId: user.id, ...(archivedOnly ? { archived: true } : {}) },
+    where: {
+      userId: user.id,
+      ...(archivedOnly ? { archived: true } : {}),
+      ...(globalOnly ? { sessionId: null } : {}),
+    },
     select: { id: true },
   });
   const ids = rows.map((r) => r.id);

@@ -1470,16 +1470,13 @@ export function useSoniox(
     processor.setSegmentCounterOffset(segmentOffset);
     processor.startNewSession(offsetMs);
 
+    // 刷新恢复只把会话还原为「暂停展示」态，绝不自动开麦续录：
+    // 已恢复 processor / 段号偏移 / overallStartTimeRef，用户点「继续」时 start() 的
+    // 复用分支(Branch 3)会据此接上并续录。此处不建立 Soniox 连接、不抢麦。
     setPausedAt(Date.now());
     setRecordingState('paused');
-    setConnectionState('reconnecting');
+    setConnectionState('disconnected');
     shouldReconnectRef.current = false;
-
-    await startNewRecording({
-      preserveStartTime: true,
-      reuseProcessor: true,
-      preservePauseStateUntilConnected: true,
-    });
   }, [
     addFinalSegment,
     ensureProcessor,
@@ -1487,7 +1484,6 @@ export function useSoniox(
     setPausedAt,
     setRecordingState,
     setTranslationEntry,
-    startNewRecording,
     updatePreview,
     updatePreviewTranslation,
   ]);

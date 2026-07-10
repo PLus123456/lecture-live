@@ -136,6 +136,7 @@ flowchart LR
 - Node.js 24+
 - MySQL 8.x
 - Redis 7.x
+- FFmpeg（文件上传转录的音视频转码）
 - npm 或 pnpm
 
 ### 本地开发

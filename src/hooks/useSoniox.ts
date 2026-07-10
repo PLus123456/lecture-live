@@ -1243,8 +1243,13 @@ export function useSoniox(
           /* best-effort teardown on unmount */
         }
       }
+
+      // 硬件已停，连接确实死了 —— 让全局 store 的 connectionState 诚实反映。
+      // connectionState 不进 partialize，SPA 导航（store 内存单例不销毁）返回时若残留
+      // 'connected'，会导致连接指示器虚假常绿、且刷新恢复闸门误判（审计 high：假录音僵尸）。
+      setConnectionState('disconnected');
     };
-  }, []);
+  }, [setConnectionState]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {

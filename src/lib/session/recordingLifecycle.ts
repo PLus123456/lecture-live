@@ -65,3 +65,59 @@ export function resolveFinalizeOutcome(ok: boolean, body: unknown): FinalizeOutc
 
   return { kind: 'ok' };
 }
+
+/** 刷新/导航恢复的分派模式，由后端 status + 挂载时本地录音态共同决定。 */
+export type RecoveryMode =
+  | 'pending'
+  | 'terminal'
+  | 'finalizing'
+  | 'live-refresh'
+  | 'resume-cold'
+  | 'fresh';
+
+/**
+ * 推导恢复分派模式 —— 四个恢复分支（自动续录 / 冷恢复 draft / FINALIZING 遮罩 /
+ * clear 守卫）的单一权威。从 page.tsx 的 useMemo 抽出便于单测。
+ *
+ * @param sessionChecked  后端 status 是否已拉回（false → pending，任何恢复/清除都不动）
+ * @param backendStatus   后端会话状态；**GET 失败或响应缺 status 字段时为 null**
+ * @param localRecording  挂载时本地 store 的 recordingState 快照
+ *
+ * 关键修复（审计 high）：`backendStatus === null`（拉取失败/无 status）时，**不能**无脑
+ * 判 fresh —— 若本地明确处于 recording/paused，说明这台设备正在录，必须保守视同
+ * live-refresh 恢复到 paused 展示，保护本地录音；否则一次网络抖动就会把进行中的会话
+ * 当成新会话，后续开录会清除覆盖。只有本地也不在录时才真的当 fresh。
+ */
+export function deriveRecoveryMode(
+  sessionChecked: boolean,
+  backendStatus: string | null | undefined,
+  localRecording: string | null | undefined
+): RecoveryMode {
+  if (!sessionChecked) return 'pending';
+  if (backendStatus === 'COMPLETED' || backendStatus === 'ARCHIVED') return 'terminal';
+  if (backendStatus === 'FINALIZING') return 'finalizing';
+
+  const localActive = localRecording === 'recording' || localRecording === 'paused';
+
+  if (backendStatus === 'RECORDING' || backendStatus === 'PAUSED') {
+    return localActive ? 'live-refresh' : 'resume-cold';
+  }
+
+  // backendStatus 未知（拉取失败 / 无 status）：本地在录 → 保护本地（live-refresh），
+  // 否则才当新会话。
+  if (localActive) return 'live-refresh';
+  return 'fresh';
+}
+
+/**
+ * 回放/查看页在同步/清空全局实时 store 前的守卫：若此刻正有活跃录音（麦克风开着），
+ * 回放页既不应清空、也不应把自己的历史 segments 灌进全局 store —— 否则会抹掉/污染
+ * 正在进行的录音状态（含刷新恢复所依赖的 sessionStorage 快照）。审计 high：录音中
+ * 打开回放页 clearAll 毁掉 live-refresh 本地状态。
+ *
+ * 只拦 'recording'（真正开着麦克风）：'paused' 允许去看回放，其本地状态被清后仍可由
+ * resume-cold 从服务端 draft 兜底恢复，且不与「已回收→paused」态相互干扰。
+ */
+export function isActivelyRecording(recordingState: string | null | undefined): boolean {
+  return recordingState === 'recording';
+}

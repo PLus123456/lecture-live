@@ -15,6 +15,7 @@ import { mergeSessionTerms } from '@/lib/keywords/sessionTerms';
 import {
   classifyStatusSync,
   resolveFinalizeOutcome,
+  deriveRecoveryMode,
   type StatusSyncResult,
 } from '@/lib/session/recordingLifecycle';
 import { summaryBlocksToResponses } from '@/lib/summary';
@@ -579,17 +580,10 @@ export default function ActiveSessionPage() {
   //  - live-refresh: 后端 RECORDING/PAUSED 且本地也在录 → 同标签刷新，恢复为 paused 展示、不自动开麦
   //  - resume-cold: 后端 RECORDING/PAUSED 但本地无录音态 → 冷设备/丢本地，从后端 draft 恢复
   //  - fresh      : 其它（新会话等）
-  const recoveryMode = useMemo(() => {
-    if (!sessionChecked) return 'pending' as const;
-    if (backendStatus === 'COMPLETED' || backendStatus === 'ARCHIVED') return 'terminal' as const;
-    if (backendStatus === 'FINALIZING') return 'finalizing' as const;
-    if (backendStatus === 'RECORDING' || backendStatus === 'PAUSED') {
-      return initialRecordingState === 'recording' || initialRecordingState === 'paused'
-        ? ('live-refresh' as const)
-        : ('resume-cold' as const);
-    }
-    return 'fresh' as const;
-  }, [sessionChecked, backendStatus, initialRecordingState]);
+  const recoveryMode = useMemo(
+    () => deriveRecoveryMode(sessionChecked, backendStatus, initialRecordingState),
+    [sessionChecked, backendStatus, initialRecordingState]
+  );
 
   // Service availability check on mount
   const [serviceAvailable, setServiceAvailable] = useState<boolean | null>(null);
@@ -1451,12 +1445,15 @@ export default function ActiveSessionPage() {
     if (!token || !sessionChecked) return;
     if (recoveryMode !== 'live-refresh') return;
     if (!wasRecordingRef.current) return;
-    // Store 有录音状态但连接已断开 → 刷新恢复场景
+    // 只依赖单一权威 recoveryMode + 本地录音态。**不再查 connectionState** —— 它不进
+    // partialize 持久化，SPA 导航返回时内存里残留 'connected' 会使原条件恒假，
+    // reconnectAfterRefresh 永不触发 → 「返回后 UI 显示录音中但麦克风已死」的假录音僵尸
+    // （审计 high）。live-refresh 场景下连接必然已断（刷新销毁 / 卸载已 stop 硬件），
+    // 无需再用易残留的旧信号二次确认。
     const storeState = useTranscriptStore.getState();
-    if ((storeState.recordingState === 'recording' || storeState.recordingState === 'paused') &&
-        storeState.connectionState === 'disconnected') {
+    if (storeState.recordingState === 'recording' || storeState.recordingState === 'paused') {
       refreshReconnectFired.current = true;
-      console.log('Detected refresh during recording, restoring to paused (no auto mic)...');
+      console.log('Detected refresh/return during recording, restoring to paused (no auto mic)...');
       reconnectAfterRefresh();
     }
   }, [token, sessionChecked, recoveryMode, reconnectAfterRefresh]);

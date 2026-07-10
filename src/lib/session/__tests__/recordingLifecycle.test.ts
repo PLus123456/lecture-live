@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   classifyStatusSync,
   resolveFinalizeOutcome,
+  deriveRecoveryMode,
+  isActivelyRecording,
 } from '../recordingLifecycle';
 
 describe('classifyStatusSync', () => {
@@ -76,5 +78,57 @@ describe('resolveFinalizeOutcome', () => {
     // 防御性：!ok 优先于 alreadyCompleted 判定，异常响应一律不清库
     const outcome = resolveFinalizeOutcome(false, { alreadyCompleted: true });
     expect(outcome.kind).toBe('error');
+  });
+});
+
+describe('deriveRecoveryMode', () => {
+  it('后端 status 未拉回 → pending（任何恢复/清除都不动）', () => {
+    expect(deriveRecoveryMode(false, 'RECORDING', 'recording')).toBe('pending');
+    expect(deriveRecoveryMode(false, null, null)).toBe('pending');
+  });
+
+  it('后端终态 → terminal', () => {
+    expect(deriveRecoveryMode(true, 'COMPLETED', 'recording')).toBe('terminal');
+    expect(deriveRecoveryMode(true, 'ARCHIVED', 'paused')).toBe('terminal');
+  });
+
+  it('后端 FINALIZING → finalizing（挂遮罩，绝不开麦）', () => {
+    expect(deriveRecoveryMode(true, 'FINALIZING', 'recording')).toBe('finalizing');
+  });
+
+  it('后端在录 + 本地也在录 → live-refresh；本地无录音态 → resume-cold', () => {
+    expect(deriveRecoveryMode(true, 'RECORDING', 'recording')).toBe('live-refresh');
+    expect(deriveRecoveryMode(true, 'PAUSED', 'paused')).toBe('live-refresh');
+    expect(deriveRecoveryMode(true, 'RECORDING', 'idle')).toBe('resume-cold');
+    expect(deriveRecoveryMode(true, 'PAUSED', null)).toBe('resume-cold');
+  });
+
+  it('关键回归：后端 status 未知（GET 失败/无 status）且本地在录 → live-refresh 兜底，不误判 fresh', () => {
+    // 一次网络抖动不能把进行中的会话当新会话，否则后续开录会清除覆盖
+    expect(deriveRecoveryMode(true, null, 'recording')).toBe('live-refresh');
+    expect(deriveRecoveryMode(true, undefined, 'paused')).toBe('live-refresh');
+  });
+
+  it('后端 status 未知且本地不在录 → fresh（真新会话）', () => {
+    expect(deriveRecoveryMode(true, null, 'idle')).toBe('fresh');
+    expect(deriveRecoveryMode(true, null, null)).toBe('fresh');
+  });
+
+  it('CREATED（新会话）本地不在录 → fresh；本地异常在录 → 优先保护 live-refresh', () => {
+    expect(deriveRecoveryMode(true, 'CREATED', 'idle')).toBe('fresh');
+    expect(deriveRecoveryMode(true, 'CREATED', 'recording')).toBe('live-refresh');
+  });
+});
+
+describe('isActivelyRecording', () => {
+  it('仅 recording 为 true（麦克风开着）', () => {
+    expect(isActivelyRecording('recording')).toBe(true);
+  });
+  it('paused / stopped / idle / 空 → false（可去看回放，靠 resume-cold 兜底）', () => {
+    expect(isActivelyRecording('paused')).toBe(false);
+    expect(isActivelyRecording('stopped')).toBe(false);
+    expect(isActivelyRecording('idle')).toBe(false);
+    expect(isActivelyRecording(null)).toBe(false);
+    expect(isActivelyRecording(undefined)).toBe(false);
   });
 });

@@ -814,7 +814,7 @@ describe('reconcileTranscriptionUsage — 计入 interpret 台账', () => {
       },
     ]);
     sessionFindManyMock.mockResolvedValueOnce([
-      { durationMs: 120_000, asyncTranscribeStatus: null },
+      { durationMs: 120_000, asyncTranscribeStatus: null, fullTranscribeStatus: null },
     ]);
     interpretUsageAggregateMock.mockResolvedValueOnce({
       _sum: { billedMinutes: null },
@@ -823,6 +823,103 @@ describe('reconcileTranscriptionUsage — 计入 interpret 台账', () => {
     const result = await reconcileTranscriptionUsage();
 
     // session 2 = used 2 → drift 0
+    expect(result).toEqual([]);
+  });
+});
+
+describe('reconcileTranscriptionUsage — 计入完整版补全转录（B6）', () => {
+  beforeEach(() => {
+    userFindManyMock.mockReset();
+    sessionFindManyMock.mockReset();
+    interpretUsageAggregateMock.mockReset();
+  });
+
+  it('实时 + 完整版补全转录：expected 含完整版那笔（倍率 0.8），drift 归 0（消除虚报）', async () => {
+    // 实时 10min（durationMs=600000 → billable=10，全额）+ 完整版 ceil(10×0.8)=8 = expected 18
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-full',
+        email: 'f@x.com',
+        transcriptionMinutesUsed: 18,
+        quotaResetAt: futureReset,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([
+      { durationMs: 600_000, asyncTranscribeStatus: null, fullTranscribeStatus: 'completed' },
+    ]);
+    interpretUsageAggregateMock.mockResolvedValueOnce({ _sum: { billedMinutes: null } });
+
+    const result = await reconcileTranscriptionUsage(0.8);
+
+    // 此前完整版那 8 分钟完全不计入 → drift=18-10=-8 虚报；现计入 → drift 0
+    expect(result).toEqual([]);
+  });
+
+  it('完整版扣费但 used 未含 → 报正向 drift（安全网仍有效）', async () => {
+    // expected 实时10 + 完整版8 = 18，但 used 只记 10（漏了完整版）→ drift +8 应被报出
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-full-drift',
+        email: 'fd@x.com',
+        transcriptionMinutesUsed: 10,
+        quotaResetAt: futureReset,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([
+      { durationMs: 600_000, asyncTranscribeStatus: null, fullTranscribeStatus: 'completed' },
+    ]);
+    interpretUsageAggregateMock.mockResolvedValueOnce({ _sum: { billedMinutes: null } });
+
+    const result = await reconcileTranscriptionUsage(0.8);
+
+    expect(result).toEqual([
+      {
+        id: 'u-full-drift',
+        email: 'fd@x.com',
+        recordedMinutes: 18,
+        transcriptionMinutesUsed: 10,
+        driftMinutes: 8,
+      },
+    ]);
+  });
+
+  it('异步上传 + 完整版补全转录叠加：两笔都按倍率计入 expected', async () => {
+    // 异步上传 ceil(10×0.8)=8 + 完整版 ceil(10×0.8)=8 = expected 16
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-async-full',
+        email: 'af@x.com',
+        transcriptionMinutesUsed: 16,
+        quotaResetAt: futureReset,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([
+      { durationMs: 600_000, asyncTranscribeStatus: 'completed', fullTranscribeStatus: 'completed' },
+    ]);
+    interpretUsageAggregateMock.mockResolvedValueOnce({ _sum: { billedMinutes: null } });
+
+    const result = await reconcileTranscriptionUsage(0.8);
+
+    expect(result).toEqual([]);
+  });
+
+  it('完整版尚未完成（transcribing/failed 等）不计费 → 不计入 expected', async () => {
+    // 实时 10；完整版仍在 transcribing（未扣费）→ expected 只有 10，used 10 → drift 0
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-full-inflight',
+        email: 'fi@x.com',
+        transcriptionMinutesUsed: 10,
+        quotaResetAt: futureReset,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([
+      { durationMs: 600_000, asyncTranscribeStatus: null, fullTranscribeStatus: 'transcribing' },
+    ]);
+    interpretUsageAggregateMock.mockResolvedValueOnce({ _sum: { billedMinutes: null } });
+
+    const result = await reconcileTranscriptionUsage(0.8);
+
     expect(result).toEqual([]);
   });
 });

@@ -339,6 +339,13 @@ export async function resetExpiredTranscriptionQuotas(
  * 之和加入 expected（周期口径与 Session 侧一致：均按 quotaResetAt 窗口 [cycleStart, ...) 截断）。
  * 于是 expected = session 分钟 + interpret 分钟，drift = expected − transcriptionMinutesUsed
  * 对纯同传用户回归 0，消除虚报。
+ *
+ * 完整版补全转录口径（B6 补完）：完整版补全转录（fullTranscribeStatus）在实时/异步上传扣费之上
+ * 额外扣一笔 ceil(getBillableMinutes(durationMs) × asyncMultiplier)（见 fullTranscribeFinalize）。
+ * 此前 expected 完全不含这笔——凡完成过完整版补全转录的用户每轮对账都被虚报负向 drift，且据此
+ * 「修复」会把这笔真实扣费退掉。现对 fullTranscribeStatus==='completed' 的 session 按同一确定性
+ * 口径（与扣费侧一字一致）计入 expected，消除虚报。完整版扣费是确定性的（由 durationMs 唯一决定），
+ * 故无须像 interpret 那样引入台账，直接按 completed 状态重算即可。
  */
 export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
   const users = await prisma.user.findMany({
@@ -364,7 +371,11 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
           status: 'COMPLETED',
           createdAt: { gte: cycleStart },
         },
-        select: { durationMs: true, asyncTranscribeStatus: true },
+        select: {
+          durationMs: true,
+          asyncTranscribeStatus: true,
+          fullTranscribeStatus: true,
+        },
       });
 
       const sessionMinutes = sessions.reduce((total, session) => {
@@ -374,11 +385,18 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
         const billable = getBillableMinutes(session.durationMs);
         // 异步上传转录（asyncTranscribeStatus 非空）按倍率，实时转录全额。
         // 与扣费侧 ceil(分钟×倍率) 完全一致，保证折扣不被误报为 drift。
-        const charged =
+        const transcribeCharged =
           session.asyncTranscribeStatus != null
             ? Math.ceil(billable * asyncMultiplier)
             : billable;
-        return total + charged;
+        // 完整版补全转录（fullTranscribeStatus==='completed'）是叠加在实时/异步转录之上的
+        // 额外一笔扣费，口径 ceil(分钟×倍率)，与 fullTranscribeFinalize 扣费侧一字一致（B6）。
+        // 未完成态（transcribing/finalizing/pending/failed 等）尚未扣费，计 0。
+        const fullCharged =
+          session.fullTranscribeStatus === 'completed'
+            ? Math.ceil(billable * asyncMultiplier)
+            : 0;
+        return total + transcribeCharged + fullCharged;
       }, 0);
 
       // 同传用量：当前对账周期内该用户已扣的 interpret 分钟之和（口径与扣费侧一字一致，

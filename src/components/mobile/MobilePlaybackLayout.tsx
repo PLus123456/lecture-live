@@ -27,6 +27,7 @@ import {
   AlertCircle,
   Loader2,
   RefreshCw,
+  Layers,
 } from 'lucide-react';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
 import PlaybackSharePopover from '@/components/session/PlaybackSharePopover';
@@ -79,6 +80,27 @@ interface MobilePlaybackLayoutProps {
   regeneratingTitle?: boolean;
   /** 分享模式：隐藏 Chat tab 和重新生成标题 */
   isShareMode?: boolean;
+  // 完整版补全转录（阶段C）：父级 owns 状态/轮询/收费确认弹窗，这里只渲染入口 + 切换。
+  /** 门控：非分享 + 会话已完成/归档 + 有录音 时可生成完整版。 */
+  canGenerateFull?: boolean;
+  /** 打开收费确认弹窗（父级渲染 ConfirmDialog）。 */
+  onGenerateFull?: () => void;
+  /** 完整版转录进行中（禁用按钮 + spinner）。 */
+  fullInProgress?: boolean;
+  /** 触发请求在途（禁用按钮）。 */
+  fullTriggering?: boolean;
+  /** 生成按钮文案（父级按 status 计算：进行中态文案 / 重新生成 / 生成）。 */
+  fullButtonLabel?: string;
+  /** 完整版就绪 → 显示「实时/完整版」切换。 */
+  hasFullTranscript?: boolean;
+  /** 当前展示视图。 */
+  transcriptView?: 'live' | 'full';
+  /** 切换视图（切到 full 时父级懒加载完整版 bundle）。 */
+  onSwitchTranscriptView?: (view: 'live' | 'full') => void;
+  /** 切换后要展示的转录（父级 computes：full 视图=完整版 segments，否则=实时 segments）。 */
+  displaySegments?: TranscriptSegment[];
+  /** 完整版 bundle 是否已加载（区分「加载中」与「就绪但空」的空态文案，对齐 desktop）。 */
+  fullLoaded?: boolean;
 }
 
 const TAB_KEYS: MobilePlaybackTab[] = ['report', 'transcript', 'summary', 'chat', 'info'];
@@ -291,6 +313,16 @@ export default function MobilePlaybackLayout({
   onRegenerateTitle,
   regeneratingTitle,
   isShareMode,
+  canGenerateFull,
+  onGenerateFull,
+  fullInProgress,
+  fullTriggering,
+  fullButtonLabel,
+  hasFullTranscript,
+  transcriptView = 'live',
+  onSwitchTranscriptView,
+  displaySegments,
+  fullLoaded,
 }: MobilePlaybackLayoutProps) {
   const router = useRouter();
   const { t } = useI18n();
@@ -306,6 +338,9 @@ export default function MobilePlaybackLayout({
   ];
 
   const effectiveTabKeys = tabs.map((tab) => tab.key);
+
+  // 「实时/完整版」切换后要展示的转录：父级 computes 传 displaySegments；未接完整版则回退实时。
+  const transcriptSegments = displaySegments ?? segments;
 
   // 滑动切换 Tab
   useSwipeGesture(contentRef, {
@@ -406,10 +441,74 @@ export default function MobilePlaybackLayout({
           {/* Transcript */}
           {activeTab === 'transcript' && (
             <div className="space-y-3">
-              {segments.length === 0 ? (
+              {/* 完整版补全转录：生成入口 + 「实时/完整版」切换（收费确认弹窗由父级渲染） */}
+              {(canGenerateFull || hasFullTranscript) && (
+                <div className="space-y-2 pb-1">
+                  {canGenerateFull && (
+                    <button
+                      onClick={onGenerateFull}
+                      disabled={fullInProgress || fullTriggering}
+                      data-testid="full-transcribe-btn"
+                      className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg
+                                 bg-rust-50 text-rust-600 text-xs font-medium
+                                 active:bg-rust-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {fullInProgress ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Layers className="w-3.5 h-3.5" />
+                      )}
+                      {fullButtonLabel}
+                    </button>
+                  )}
+                  {hasFullTranscript && (
+                    <div
+                      className="inline-flex w-full items-center rounded-lg bg-cream-100 p-0.5"
+                      role="tablist"
+                      aria-label={t('playback.transcript')}
+                    >
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={transcriptView === 'live'}
+                        data-testid="view-live"
+                        onClick={() => onSwitchTranscriptView?.('live')}
+                        className={`flex-1 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors ${
+                          transcriptView === 'live'
+                            ? 'bg-white text-charcoal-700 shadow-sm'
+                            : 'text-charcoal-400'
+                        }`}
+                      >
+                        {t('playback.fullTranscribe.viewLive')}
+                      </button>
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={transcriptView === 'full'}
+                        data-testid="view-full"
+                        onClick={() => onSwitchTranscriptView?.('full')}
+                        className={`flex-1 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors ${
+                          transcriptView === 'full'
+                            ? 'bg-white text-rust-600 shadow-sm'
+                            : 'text-charcoal-400'
+                        }`}
+                      >
+                        {t('playback.fullTranscribe.viewFull')}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+              {transcriptSegments.length === 0 ? (
                 <div className="text-center text-charcoal-400 text-sm py-12">
                   <FileText className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                  <p>{t('playback.transcriptEmpty')}</p>
+                  <p>
+                    {transcriptView === 'full'
+                      ? fullLoaded
+                        ? t('playback.fullTranscribe.empty')
+                        : t('playback.fullTranscribe.loading')
+                      : t('playback.transcriptEmpty')}
+                  </p>
                 </div>
               ) : (
                 <>
@@ -417,10 +516,10 @@ export default function MobilePlaybackLayout({
                     <Globe className="w-3 h-3" />
                     {session.sourceLang.toUpperCase()} → {session.targetLang.toUpperCase()}
                     <span className="ml-auto">
-                      {t('playback.transcriptSegments', { count: segments.length })}
+                      {t('playback.transcriptSegments', { count: transcriptSegments.length })}
                     </span>
                   </div>
-                  {segments.map((seg) => (
+                  {transcriptSegments.map((seg) => (
                     <div
                       key={seg.id}
                       ref={activeSegmentId === seg.id ? activeSegmentRef : undefined}

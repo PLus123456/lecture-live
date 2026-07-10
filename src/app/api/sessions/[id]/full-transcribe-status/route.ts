@@ -4,7 +4,11 @@ import { prisma } from '@/lib/prisma';
 import { assertOwnership } from '@/lib/security';
 import { logger } from '@/lib/logger';
 import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
-import { getSonioxTranscription } from '@/lib/soniox/asyncFile';
+import {
+  getSonioxTranscription,
+  deleteSonioxFile,
+  deleteSonioxTranscription,
+} from '@/lib/soniox/asyncFile';
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
 
 // 完整版补全转录状态轮询（前端 poll 驱动收尾，同 async-transcribe-status 模式）：
@@ -72,13 +76,25 @@ export async function GET(
   }
 
   if (job.status === 'error') {
-    await prisma.session.updateMany({
+    const failed = await prisma.session.updateMany({
       where: { id, fullTranscribeStatus: 'transcribing' },
       data: {
         fullTranscribeStatus: 'failed',
         fullTranscribeError: 'Soniox transcription failed',
       },
     });
+    // 抢到才清 Soniox 残留（file + errored transcription）：不让 error 态会话把 Soniox 侧配额
+    // 泄漏到「删会话/重触发」才回收（与 cron mark-failed 同口径）。best-effort、幂等、失败不抛。
+    // 此处 fullSonioxTranscriptionId 必非空（上方 status!=='transcribing' || 无 id 已提前返回）。
+    if (failed.count === 1) {
+      if (session.fullSonioxFileId) {
+        await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(() => undefined);
+      }
+      await deleteSonioxTranscription(
+        sonioxConfig,
+        session.fullSonioxTranscriptionId
+      ).catch(() => undefined);
+    }
     return NextResponse.json({
       status: 'failed',
       error: 'Soniox transcription failed',

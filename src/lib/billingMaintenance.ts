@@ -1,3 +1,5 @@
+import fs from 'fs/promises';
+import path from 'path';
 import { prisma } from '@/lib/prisma';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
@@ -30,6 +32,7 @@ import {
   getSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
 import { finalizeAsyncTranscription } from '@/lib/audio/asyncTranscribeFinalize';
+import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
 // FINALIZING 专项：已发起收尾但卡住的会话（前端崩/断网/服务端重启导致 finalize 没跑完）
@@ -47,6 +50,18 @@ const ASYNC_RECLAIMABLE_STATUSES = [
   'transcribing',
   'finalizing',
 ];
+// 完整版补全转录（full* 状态机，独立于实时/异步上传）的停滞阈值。与异步上传同为 Soniox
+// 异步文件任务（≤300 分钟文件），取相同的 6 小时保守阈值，避免误杀正常的长任务。
+const STALE_FULL_TRANSCRIBE_THRESHOLD_MS = 6 * 60 * 60_000;
+// full* 非终态（终态：completed/failed）。卡在任一态超阈值都应回收。
+const FULL_TRANSCRIBE_RECLAIMABLE_STATUSES = [
+  'pending',
+  'transcoding',
+  'transcribing',
+  'finalizing',
+];
+// 与 fullTranscribeProcessor 的 TMP_ROOT 约定一致：回收硬崩残留的转码临时目录时兜底清理。
+const FULL_TRANSCRIBE_TMP_ROOT = path.join(process.cwd(), 'data', 'full-transcribe-tmp');
 const MAINTENANCE_INTERVAL_MS = 15 * 60_000;
 const RECONCILIATION_LAST_RUN_KEY = 'billing.reconciliation.lastRunUtcDate';
 const billingLogger = logger.child({ component: 'billing-maintenance' });
@@ -62,6 +77,7 @@ export interface BillingMaintenanceSummary {
   expiredRoleDowngrades: number;
   reclaimedSessions: number;
   reclaimedAsyncUploads: number;
+  reclaimedFullTranscribes: number;
   reclaimedStaleJobs: number;
   storageBytesReconciled: number;
   reconciliationRunId: string | null;
@@ -199,6 +215,20 @@ export async function runBillingMaintenance(options?: {
     }
   }
 
+  // 停滞的完整版补全转录回收（full* 状态机，独立于实时/异步上传，单独扫描）
+  let reclaimedFullTranscribes = 0;
+  {
+    const jobId = await createJob({ type: JOB_TYPE.STALE_SESSION_RECLAIM, triggeredBy: 'system', params: { source, kind: 'full_transcribe' } });
+    if (jobId) markJobProcessing(jobId);
+    try {
+      reclaimedFullTranscribes = await reclaimStaleFullTranscribes(now);
+      if (jobId) markJobSuccess(jobId, { reclaimedFullTranscribes });
+    } catch (err) {
+      if (jobId) markJobFailed(jobId, err);
+      throw err;
+    }
+  }
+
   // 僵尸任务回收：把卡在 PROCESSING 超时的 JobQueue 记录标失败（解锁前端指示器、可被 retryJob 重试）。
   // 不为本步骤单独建 job —— 它是对 job 表自身的清道夫，建 job 反而引入"清道夫卡住谁来清"的递归。
   let reclaimedStaleJobs = 0;
@@ -286,6 +316,7 @@ export async function runBillingMaintenance(options?: {
     expiredRoleDowngrades > 0 ||
     reclaimedSessions > 0 ||
     reclaimedAsyncUploads > 0 ||
+    reclaimedFullTranscribes > 0 ||
     reclaimedStaleJobs > 0 ||
     storageBytesReconciled > 0 ||
     reconciliationRunId ||
@@ -301,6 +332,7 @@ export async function runBillingMaintenance(options?: {
         expiredRoleDowngrades,
         reclaimedSessions,
         reclaimedAsyncUploads,
+        reclaimedFullTranscribes,
         reclaimedStaleJobs,
         storageBytesReconciled,
         reconciliationRunId,
@@ -314,6 +346,7 @@ export async function runBillingMaintenance(options?: {
     expiredRoleDowngrades,
     reclaimedSessions,
     reclaimedAsyncUploads,
+    reclaimedFullTranscribes,
     reclaimedStaleJobs,
     storageBytesReconciled,
     reconciliationRunId,
@@ -601,6 +634,215 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
         await deleteSonioxTranscription(
           sonioxConfig,
           session.sonioxTranscriptionId
+        ).catch(() => undefined);
+      }
+    }
+  }
+
+  return reclaimedCount;
+}
+
+/**
+ * 回收停滞的完整版补全转录（cron 兜底，防僵尸）。
+ *
+ * 完整版转录用独立的 full* 状态机（fullTranscribeStatus / fullTranscribeStartedAt /
+ * fullSonioxFileId / fullSonioxTranscriptionId / fullTranscriptPath），与实时收尾
+ * （reclaimStaleSessions）、异步上传（reclaimStaleAsyncUploads）都不同，单独扫描。停滞成因：
+ * 用户触发后离线不再 poll，而 GET full-transcribe-status（前端 poll 驱动收尾）没人调，转录就
+ * 永远停在 transcribing —— Soniox 侧可能早已完成却没人收尾。
+ *
+ * 处理（按 fullTranscribeStartedAt 超阈值筛选，per-session 分支）：
+ *   - transcribing / finalizing（持有或曾持有 Soniox 转录任务，可能已完成）：查 Soniox 真实状态
+ *     后 salvage。与 reclaimStaleAsyncUploads 同构 —— finalizing 僵尸（收尾中途崩溃、用户已离线）
+ *     也走 salvage、经 allowClaimFrom=['transcribing','finalizing'] **复收到 completed**，而不是
+ *     盲目回退 transcribing（回退会与「刚发起、在途」的 finalize 赛跑，把它逼进
+ *     canceled_during_finalize 误删 Soniox 转录，致会话永久卡死）。
+ *       · queued/processing：还在跑，不标 failed，bump fullTranscribeStartedAt 避免本轮后重扫；
+ *       · completed：复用共享 finalizeFullTranscription 收尾并按相同口径扣费。其原子 claim +
+ *         finalize 守卫与前端 poll 互斥——扣费恰好一次、绝不双扣；
+ *       · error：落到下方标 failed + 清 Soniox。
+ *       · 无 transcriptionId / Soniox 未配置（含 resolveSoniox 瞬时抛错被吞成 null）：**保守跳过**，
+ *         绝不误标 failed 丢弃可能已完成的转录，留待下轮或配置恢复。
+ *   - pending / transcoding 僵尸（后台管线在 Soniox 建任务前就崩，无转录产物可救）：原子 claim
+ *     再校验后标 failed，best-effort 清本地转码临时目录 + Soniox 残留 file/transcription。
+ *
+ * 幂等/防赛跑关键：finalizeFullTranscription 的 claim 会刷新 fullTranscribeStartedAt，故一个刚被
+ * claim 的在途 finalize 不会满足本函数「startedAt 超阈值」的僵尸判定，不会被误处理。
+ */
+export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
+  const threshold = new Date(now.getTime() - STALE_FULL_TRANSCRIBE_THRESHOLD_MS);
+  const stuck = await prisma.session.findMany({
+    where: {
+      fullTranscribeStatus: { in: FULL_TRANSCRIBE_RECLAIMABLE_STATUSES },
+      fullTranscribeStartedAt: { lte: threshold },
+    },
+    select: {
+      id: true,
+      userId: true,
+      fullTranscribeStatus: true,
+      fullSonioxFileId: true,
+      fullSonioxTranscriptionId: true,
+      // 以下字段供「Soniox 已完成」时的共享 finalize 自动收尾 + 扣费复用
+      targetLang: true,
+      durationMs: true,
+    },
+    take: 100,
+    orderBy: { fullTranscribeStartedAt: 'asc' },
+  });
+
+  let reclaimedCount = 0;
+  const thresholdHours = Math.round(STALE_FULL_TRANSCRIBE_THRESHOLD_MS / 3_600_000);
+
+  // Soniox 配置只解析一次（可能未配置：为 null 时退化到「仅标僵尸 failed」）
+  const sonioxConfig = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);
+
+  for (const session of stuck) {
+    const status = session.fullTranscribeStatus;
+
+    // transcribing / finalizing：持有（或曾持有）Soniox 转录任务，可能已完成 → 查 Soniox 真实状态
+    // 后 salvage。finalizing 僵尸不再盲目回退 transcribing（会与在途 finalize 赛跑），而是与
+    // transcribing 一起走 salvage、经 allowClaimFrom 复收到 completed。
+    const salvageable = status === 'transcribing' || status === 'finalizing';
+    if (salvageable) {
+      // 需 Soniox 才能判定真实进度：无 transcriptionId 或 Soniox 未配置（含 resolveSoniox 瞬时抛错
+      // 被 .catch(()=>null) 吞掉）→ 保守跳过，绝不误标 failed 丢弃可能已完成的转录，留待下轮/配置恢复。
+      if (!session.fullSonioxTranscriptionId || !sonioxConfig) {
+        billingLogger.warn(
+          { sessionId: session.id, userId: session.userId, status },
+          'stuck full-transcribe not pollable (no soniox config / transcriptionId); skipping this round'
+        );
+        continue;
+      }
+
+      let job;
+      try {
+        job = await getSonioxTranscription(
+          sonioxConfig,
+          session.fullSonioxTranscriptionId
+        );
+      } catch (err) {
+        // Soniox 查询失败（网络抖动/超时，或 transcription 不存在返回 404）：本轮先不动它，
+        // 保守不误标 failed，下个维护周期或前端 poll 再处理。
+        billingLogger.warn(
+          { sessionId: session.id, userId: session.userId, err: serializeError(err) },
+          'soniox status check failed during full-transcribe reclaim; skipping this round'
+        );
+        continue;
+      }
+
+      if (job.status === 'queued' || job.status === 'processing') {
+        // 转录仍在跑：不丢弃、不标 failed。bump fullTranscribeStartedAt=now，让本轮之后不再
+        // 立刻被当僵尸重扫；等 Soniox 真正 completed 后由本函数（或前端 poll）收尾。
+        await prisma.session
+          .updateMany({
+            where: { id: session.id, fullTranscribeStatus: status },
+            data: { fullTranscribeStartedAt: now },
+          })
+          .catch(() => undefined);
+        billingLogger.info(
+          { sessionId: session.id, userId: session.userId, sonioxStatus: job.status },
+          'stuck full-transcribe still processing on Soniox; left for later finalization'
+        );
+        continue;
+      }
+
+      if (job.status === 'completed') {
+        // Soniox 已完成、用户离线前端不再 poll → 回收路径自动收尾并按相同口径扣费。复用共享
+        // finalizeFullTranscription（与 full-transcribe-status 路由同一份「claim + 拉 transcript +
+        // 落盘 + 扣费」口径）。allowClaimFrom 含 transcribing 与 finalizing：finalizing 覆盖「收尾
+        // 中途崩溃、Soniox 已完成」的残留会话，直接复收到 completed。即便并发前端 poll 也在收尾，
+        // 最终单次执行由 finalize 守卫(finalizing→completed 只一个 count===1)保证，扣费恰好一次、
+        // 绝不双扣。
+        try {
+          const result = await finalizeFullTranscription(session, sonioxConfig, {
+            allowClaimFrom: ['transcribing', 'finalizing'],
+          });
+          if (result.outcome === 'completed') {
+            reclaimedCount += 1;
+            billingLogger.info(
+              {
+                sessionId: session.id,
+                userId: session.userId,
+                segmentCount: result.segmentCount,
+              },
+              'reclaim auto-finalized completed full transcription'
+            );
+          } else {
+            // claim_lost（前端 poll 抢先）/ canceled_during_finalize：交给对方，不重复处理。
+            billingLogger.info(
+              {
+                sessionId: session.id,
+                userId: session.userId,
+                outcome: result.outcome,
+              },
+              'reclaim skipped full-transcribe finalize (handled elsewhere or canceled)'
+            );
+          }
+        } catch (finalizeErr) {
+          // 拉 transcript / 落盘瞬时故障：不在回收侧标 failed，留待重试。claim 已把状态置 finalizing
+          // 并刷新 startedAt，下一轮回收超阈值后经 allowClaimFrom(含 finalizing) 再次 salvage 收尾。
+          billingLogger.error(
+            {
+              sessionId: session.id,
+              userId: session.userId,
+              err: serializeError(finalizeErr),
+            },
+            'reclaim full-transcribe auto-finalize failed; left for retry'
+          );
+        }
+        continue;
+      }
+      // job.status === 'error' → 落到下方标 failed + 清 Soniox
+    }
+
+    // 其余：pending / transcoding 僵尸（无 Soniox 转录产物可救），或 salvageable 但 Soniox 明确报
+    // error —— 原子 claim 再校验仍卡住且超时后标 failed。startedAt 由 in-flight finalize 的 claim
+    // 刷新，故绝不误标刚发起收尾的会话。
+    const claimed = await prisma.session
+      .updateMany({
+        where: {
+          id: session.id,
+          fullTranscribeStatus: { in: ['pending', 'transcoding', 'transcribing', 'finalizing'] },
+          fullTranscribeStartedAt: { lte: threshold },
+        },
+        data: {
+          fullTranscribeStatus: 'failed',
+          fullTranscribeError: `自动回收：完整版转录停滞超过 ${thresholdHours} 小时`,
+        },
+      })
+      .catch(() => ({ count: 0 }));
+
+    if (claimed.count !== 1) {
+      continue;
+    }
+    reclaimedCount += 1;
+    billingLogger.warn(
+      { sessionId: session.id, userId: session.userId },
+      'reclaimed stuck full transcription'
+    );
+
+    // best-effort 清本地转码临时目录（processFullTranscribe 正常自清，此处兜底硬崩残留）。
+    await fs
+      .rm(
+        path.join(
+          FULL_TRANSCRIBE_TMP_ROOT,
+          session.id.replace(/[^a-zA-Z0-9_-]/g, '')
+        ),
+        { recursive: true, force: true }
+      )
+      .catch(() => undefined);
+
+    // best-effort 清 Soniox 上残留的 file + transcription（幂等，失败不抛）。
+    if (sonioxConfig) {
+      if (session.fullSonioxFileId) {
+        await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(
+          () => undefined
+        );
+      }
+      if (session.fullSonioxTranscriptionId) {
+        await deleteSonioxTranscription(
+          sonioxConfig,
+          session.fullSonioxTranscriptionId
         ).catch(() => undefined);
       }
     }

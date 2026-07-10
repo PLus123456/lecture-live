@@ -8,6 +8,7 @@ export const STORAGE_CATEGORIES = [
   'transcripts',
   'summaries',
   'reports',
+  'full-transcripts',
   'chat-uploads',
 ] as const;
 

@@ -1,20 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * loadFullTranscript 回归测试：读 fullTranscriptPath 落盘的 JSON bundle，
- * 覆盖正常读取、文件缺失、JSON 损坏、非对象、防御性字段归一。
+ * loadFullTranscript 回归测试（阶段C：读取走 sessionPersistence.readArtifactFromReference，
+ * 统一兼容 local: 引用与 Cloudreve 远程路径）。本测试把 readArtifactFromReference 桩成返回
+ * Buffer / null，专测 loadFullTranscript 的解析 + 防御性字段归一。
+ * full-transcripts category 的真实 persist/load/delete 往返在 fullTranscribeStorage.test.ts。
  */
-const { readFileMock } = vi.hoisted(() => ({ readFileMock: vi.fn() }));
+const { readArtifactMock } = vi.hoisted(() => ({ readArtifactMock: vi.fn() }));
 
-vi.mock('fs/promises', () => ({
-  default: {
-    readFile: readFileMock,
-    // 落盘用（persist 路径），本测试不触发，占位避免 undefined
-    mkdir: vi.fn(async () => undefined),
-    writeFile: vi.fn(async () => undefined),
-    rename: vi.fn(async () => undefined),
-    rm: vi.fn(async () => undefined),
-  },
+vi.mock('@/lib/sessionPersistence', () => ({
+  persistArtifact: vi.fn(),
+  readArtifactFromReference: readArtifactMock,
 }));
 // 隔离 prisma / 计费 / soniox 的 import 副作用（本测试只跑纯读取逻辑）
 vi.mock('@/lib/prisma', () => ({ prisma: { session: { updateMany: vi.fn() } } }));
@@ -34,8 +30,13 @@ import { loadFullTranscript } from '@/lib/audio/fullTranscribeFinalize';
 
 const session = {
   id: 'sess-x',
+  userId: 'user-1',
   fullTranscriptPath: 'local:full-transcripts/sess-x.json',
 };
+
+function buf(value: unknown): Buffer {
+  return Buffer.from(typeof value === 'string' ? value : JSON.stringify(value));
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -43,8 +44,8 @@ beforeEach(() => {
 
 describe('loadFullTranscript', () => {
   it('正常读取：返回归一后的 segments/summaries/translations', async () => {
-    readFileMock.mockResolvedValue(
-      JSON.stringify({
+    readArtifactMock.mockResolvedValue(
+      buf({
         segments: [{ id: 's0', text: 'hi' }],
         summaries: [{ summary: 'x' }],
         translations: { s0: '你好' },
@@ -56,26 +57,33 @@ describe('loadFullTranscript', () => {
     expect(bundle!.segments).toHaveLength(1);
     expect(bundle!.summaries).toHaveLength(1);
     expect(bundle!.translations).toEqual({ s0: '你好' });
+
+    // 阶段C：读取经 readArtifactFromReference（'full-transcripts' + fullTranscriptPath 引用）
+    expect(readArtifactMock).toHaveBeenCalledWith(
+      session,
+      'full-transcripts',
+      session.fullTranscriptPath
+    );
   });
 
-  it('文件缺失（readFile 抛错）：返回 null', async () => {
-    readFileMock.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+  it('引用不存在（readArtifactFromReference 返回 null）：返回 null', async () => {
+    readArtifactMock.mockResolvedValue(null);
     expect(await loadFullTranscript(session as never)).toBeNull();
   });
 
   it('JSON 损坏：返回 null', async () => {
-    readFileMock.mockResolvedValue('{ not json ');
+    readArtifactMock.mockResolvedValue(buf('{ not json '));
     expect(await loadFullTranscript(session as never)).toBeNull();
   });
 
   it('顶层是数组（非对象 bundle）：返回 null', async () => {
-    readFileMock.mockResolvedValue('[1,2,3]');
+    readArtifactMock.mockResolvedValue(buf('[1,2,3]'));
     expect(await loadFullTranscript(session as never)).toBeNull();
   });
 
   it('防御性归一：非数组 segments → []，非字符串译文被过滤', async () => {
-    readFileMock.mockResolvedValue(
-      JSON.stringify({
+    readArtifactMock.mockResolvedValue(
+      buf({
         segments: 'oops',
         translations: { good: 'ok', bad: 123, nested: { x: 1 } },
       })
@@ -86,13 +94,19 @@ describe('loadFullTranscript', () => {
     expect(bundle!.translations).toEqual({ good: 'ok' });
   });
 
-  it('无 fullTranscriptPath：按 sessionId 约定路径回退读取（文件存在则成功）', async () => {
-    readFileMock.mockResolvedValue(JSON.stringify({ segments: [{ id: 's0' }] }));
-    const bundle = await loadFullTranscript({ id: 'sess-x', fullTranscriptPath: null } as never);
+  it('无 fullTranscriptPath：以 null 引用委托 readArtifactFromReference 回退候选', async () => {
+    readArtifactMock.mockResolvedValue(buf({ segments: [{ id: 's0' }] }));
+    const bundle = await loadFullTranscript({
+      id: 'sess-x',
+      userId: 'user-1',
+      fullTranscriptPath: null,
+    } as never);
     expect(bundle!.segments).toHaveLength(1);
-    // 读取路径落在 full-transcripts 目录内
-    const calledPath = String(readFileMock.mock.calls[0][0]);
-    expect(calledPath).toContain('full-transcripts');
-    expect(calledPath).toContain('sess-x.json');
+    // 引用为 null → readArtifactFromReference 内部按 sessionId 约定候选回退读取
+    expect(readArtifactMock).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'sess-x' }),
+      'full-transcripts',
+      null
+    );
   });
 });

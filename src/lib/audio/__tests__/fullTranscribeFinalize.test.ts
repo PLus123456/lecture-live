@@ -14,6 +14,7 @@ const {
   extractMock,
   deductMock,
   getSiteSettingsMock,
+  persistArtifactMock,
 } = vi.hoisted(() => ({
   sessionUpdateManyMock: vi.fn(),
   getSonioxTranscriptMock: vi.fn(),
@@ -23,15 +24,13 @@ const {
   extractMock: vi.fn(),
   deductMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
+  persistArtifactMock: vi.fn(),
 }));
 
-vi.mock('fs/promises', () => ({
-  default: {
-    mkdir: vi.fn(async () => undefined),
-    writeFile: vi.fn(async () => undefined),
-    rename: vi.fn(async () => undefined),
-    rm: vi.fn(async () => undefined),
-  },
+// 阶段C：落盘走 sessionPersistence 的 persistArtifact（'full-transcripts' category）。
+vi.mock('@/lib/sessionPersistence', () => ({
+  persistArtifact: persistArtifactMock,
+  readArtifactFromReference: vi.fn(),
 }));
 vi.mock('@/lib/prisma', () => ({
   prisma: { session: { updateMany: sessionUpdateManyMock } },
@@ -70,6 +69,10 @@ beforeEach(() => {
   deductMock.mockResolvedValue(undefined);
   deleteFileMock.mockResolvedValue(undefined);
   deleteTranscriptionMock.mockResolvedValue(undefined);
+  persistArtifactMock.mockResolvedValue({
+    path: 'local:full-transcripts/sess-full.json',
+    storage: 'local',
+  });
 });
 
 describe('finalizeFullTranscription', () => {
@@ -80,6 +83,14 @@ describe('finalizeFullTranscription', () => {
     const result = await finalizeFullTranscription(session as never, sonioxConfig);
 
     expect(result.outcome).toBe('completed');
+
+    // 阶段C：落盘走 sessionPersistence.persistArtifact('full-transcripts')，传 session（含 userId）
+    expect(persistArtifactMock).toHaveBeenCalledTimes(1);
+    expect(persistArtifactMock).toHaveBeenCalledWith(
+      session,
+      'full-transcripts',
+      expect.any(String)
+    );
 
     // 扣费恰好一次，口径 = ceil(getBillableMinutes(125000)=3 × 0.8=2.4 → ceil 3)
     expect(deductMock).toHaveBeenCalledTimes(1);
@@ -105,17 +116,37 @@ describe('finalizeFullTranscription', () => {
     expect(deductMock).not.toHaveBeenCalled();
   });
 
-  it('finalize 守卫失败(收尾期间被取消)：不扣费，清 Soniox 资源', async () => {
+  it('finalize 守卫失败(收尾期间状态被改)：不扣费，且**绝不删 Soniox 资源**(留待重新 salvage)', async () => {
     sessionUpdateManyMock
       .mockResolvedValueOnce({ count: 1 }) // claim 成功
-      .mockResolvedValueOnce({ count: 0 }); // finalize 守卫抢不到（已取消）
+      .mockResolvedValueOnce({ count: 0 }); // finalize 守卫抢不到（状态已非 finalizing）
 
     const result = await finalizeFullTranscription(session as never, sonioxConfig);
 
     expect(result.outcome).toBe('canceled_during_finalize');
     expect(deductMock).not.toHaveBeenCalled();
-    expect(deleteFileMock).toHaveBeenCalled();
-    expect(deleteTranscriptionMock).toHaveBeenCalled();
+    // 关键回归：守卫抢不到时不能删 Soniox —— 否则「前端 poll 盲目回退 finalizing→transcribing」
+    // 撞上并发 finalize 时会销毁仍需要的转录、致会话永久卡死。转录保留供下一轮 salvage。
+    expect(deleteFileMock).not.toHaveBeenCalled();
+    expect(deleteTranscriptionMock).not.toHaveBeenCalled();
+  });
+
+  it('并发两路径（前端 poll + cron 回收）：claim 互斥 → 扣费恰好一次、绝不双扣', async () => {
+    // 路径 A（先到者，如 cron 回收）：claim transcribing→finalizing (1) + finalize 守卫 (1) → 收尾扣费。
+    // 路径 B（后到者，如前端 poll）：claim 抢不到 (0) → claim_lost，不拉 transcript、不扣费。
+    sessionUpdateManyMock
+      .mockResolvedValueOnce({ count: 1 }) // A: claim 成功
+      .mockResolvedValueOnce({ count: 1 }) // A: finalize 守卫成功
+      .mockResolvedValueOnce({ count: 0 }); // B: claim 抢不到（A 已在收尾/已完成）
+
+    const a = await finalizeFullTranscription(session as never, sonioxConfig);
+    const b = await finalizeFullTranscription(session as never, sonioxConfig);
+
+    expect(a.outcome).toBe('completed');
+    expect(b.outcome).toBe('claim_lost');
+    // 两路径共扣费恰好一次（幂等由两道原子 claim 保证）
+    expect(deductMock).toHaveBeenCalledTimes(1);
+    expect(deductMock).toHaveBeenCalledWith('user-1', 3);
   });
 
   it('无 fullSonioxTranscriptionId：直接 claim_lost，不动任何东西', async () => {

@@ -18,6 +18,8 @@ const LOCAL_DIRS: Record<SessionArtifactCategory, string> = {
   transcripts: path.join(DATA_ROOT, 'transcripts'),
   summaries: path.join(DATA_ROOT, 'summaries'),
   reports: path.join(DATA_ROOT, 'reports'),
+  // 完整版补全转录：与实时 transcripts 完全分离的独立类别，落 data/full-transcripts/{id}.json。
+  'full-transcripts': path.join(DATA_ROOT, 'full-transcripts'),
 };
 
 const STATIC_ARTIFACT_EXTENSIONS: Record<
@@ -27,6 +29,7 @@ const STATIC_ARTIFACT_EXTENSIONS: Record<
   transcripts: 'json',
   summaries: 'json',
   reports: 'json',
+  'full-transcripts': 'json',
 };
 
 export interface PersistedTranscriptBundle {
@@ -50,7 +53,7 @@ export interface LoadedBinaryArtifact {
 type SessionArtifactsSource = Pick<
   Session,
   'id' | 'userId' | 'recordingPath' | 'transcriptPath' | 'summaryPath'
-> & { reportPath?: string | null };
+> & { reportPath?: string | null; fullTranscriptPath?: string | null };
 
 function normalizeSessionId(sessionId: string): string {
   return sessionId.replace(/[^a-zA-Z0-9_-]/g, '');
@@ -195,7 +198,7 @@ function parseLocalReference(
   return buildLocalArtifactPath(category, remainder);
 }
 
-async function readArtifactFromReference(
+export async function readArtifactFromReference(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
   category: SessionArtifactCategory,
   reference: string | null | undefined
@@ -325,7 +328,7 @@ async function deleteArtifactByReference(
   }
 }
 
-async function persistArtifact(
+export async function persistArtifact(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
   category: SessionArtifactCategory,
   data: Buffer | string,
@@ -371,7 +374,7 @@ export async function persistSessionAudioArtifact(
 
 /**
  * U4：best-effort 物理删除一个会话的全部产物（本地 data/ + Cloudreve 远程），
- * 覆盖录音/转录/摘要/报告。删 session 行前调用（行一删便再无 path→owner 关联）。
+ * 覆盖录音/转录/摘要/报告/完整版转录。删 session 行前调用（行一删便再无 path→owner 关联）。
  * 单次加载 Cloudreve 上下文复用。任何失败仅 warn，绝不阻塞 DB 删除。
  */
 export async function deleteSessionArtifacts(
@@ -383,6 +386,9 @@ export async function deleteSessionArtifacts(
     ['transcripts', session.transcriptPath],
     ['summaries', session.summaryPath],
     ['reports', session.reportPath],
+    // C3：完整版补全转录产物（本地 data/full-transcripts/ 或 Cloudreve 远程），
+    // 与其它产物一并清理，删会话不留孤儿。fullTranscriptPath 为空则被 deleteArtifactByReference 跳过。
+    ['full-transcripts', session.fullTranscriptPath],
   ];
   for (const [category, reference] of targets) {
     await deleteArtifactByReference(session, category, reference, ctx);

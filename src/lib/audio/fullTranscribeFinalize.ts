@@ -12,8 +12,6 @@
  * 计费口径：ceil(getBillableMinutes(durationMs) × async_upload_billing_multiplier)，与异步上传
  * 转录同口径（倍率默认 0.8、admin 可配）。
  */
-import fs from 'fs/promises';
-import path from 'path';
 import type { Session } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { logger } from '@/lib/logger';
@@ -27,47 +25,13 @@ import {
   convertAsyncTokensToSegments,
   extractTranslationsByTokens,
 } from '@/lib/soniox/asyncTranscriptConverter';
+import {
+  persistArtifact,
+  readArtifactFromReference,
+} from '@/lib/sessionPersistence';
 import { deductTranscriptionMinutes } from '@/lib/quota';
 import { getBillableMinutes } from '@/lib/billing';
 import { getSiteSettings } from '@/lib/siteSettings';
-
-const FULL_TRANSCRIPTS_DIR = path.join(process.cwd(), 'data', 'full-transcripts');
-
-function normalizeSessionId(sessionId: string): string {
-  return sessionId.replace(/[^a-zA-Z0-9_-]/g, '');
-}
-
-/** 完整版转录落盘引用（本地）。回放页新端点据此读取，与实时 transcriptPath 完全分离。 */
-export function fullTranscriptReference(sessionId: string): string {
-  return `local:full-transcripts/${normalizeSessionId(sessionId)}.json`;
-}
-
-function fullTranscriptLocalPath(sessionId: string): string {
-  return path.join(FULL_TRANSCRIPTS_DIR, `${normalizeSessionId(sessionId)}.json`);
-}
-
-/** 原子写（tmp+rename），避免半截损坏的 JSON。 */
-async function writeJsonAtomic(filePath: string, data: string): Promise<void> {
-  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random()
-    .toString(36)
-    .slice(2)}`;
-  try {
-    await fs.writeFile(tmp, data, 'utf-8');
-    await fs.rename(tmp, filePath);
-  } catch (err) {
-    await fs.rm(tmp, { force: true }).catch(() => {});
-    throw err;
-  }
-}
-
-export async function persistFullTranscript(
-  sessionId: string,
-  bundle: { segments: unknown[]; summaries: unknown[]; translations: Record<string, string> }
-): Promise<string> {
-  await fs.mkdir(FULL_TRANSCRIPTS_DIR, { recursive: true });
-  await writeJsonAtomic(fullTranscriptLocalPath(sessionId), JSON.stringify(bundle, null, 2));
-  return fullTranscriptReference(sessionId);
-}
 
 export interface FullTranscriptBundle {
   segments: unknown[];
@@ -76,40 +40,48 @@ export interface FullTranscriptBundle {
 }
 
 /**
- * 从 fullTranscriptPath 引用解析出本地文件路径。
- * 阶段B 只落本地（`local:full-transcripts/{id}.json`）；阶段C 接 Cloudreve 时在读取端扩展远程分支。
- * 用 path.basename 收口，杜绝路径穿越；无引用则回退按 sessionId 约定路径（兼容文件已落盘但
- * path 尚未写回 DB 的边缘态）。
+ * 落盘完整版补全转录 bundle。
+ *
+ * 阶段C：走 sessionPersistence 的 persistArtifact（'full-transcripts' category），与实时
+ * 转录/摘要/报告同一套 category + Cloudreve 存储系统 —— Cloudreve 已配置则上传远程并返回
+ * 远程路径，否则落本地 data/full-transcripts/{id}.json 并返回 `local:` 引用。返回值写回
+ * fullTranscriptPath；与实时 transcriptPath 完全分离，绝不互相覆盖。
  */
-function resolveLocalFullTranscriptPath(
-  session: Pick<Session, 'id' | 'fullTranscriptPath'>
-): string {
-  const ref = session.fullTranscriptPath;
-  if (ref && ref.startsWith('local:')) {
-    const remainder = ref.slice('local:'.length); // e.g. full-transcripts/{id}.json
-    return path.join(FULL_TRANSCRIPTS_DIR, path.basename(remainder));
-  }
-  return fullTranscriptLocalPath(session.id);
+export async function persistFullTranscript(
+  session: Pick<Session, 'id' | 'userId'>,
+  bundle: FullTranscriptBundle
+): Promise<string> {
+  const result = await persistArtifact(
+    session,
+    'full-transcripts',
+    JSON.stringify(bundle, null, 2)
+  );
+  return result.path;
 }
 
 /**
  * 读取完整版补全转录 bundle（回放页「完整版」视图 + 读取端点 GET full-transcript 用）。
- * 找不到 / JSON 损坏 → null（调用方降级为空）。字段做防御性归一，绝不抛。
+ *
+ * 阶段C：走 sessionPersistence 的 readArtifactFromReference —— 统一兼容 `local:` 引用（含
+ * 阶段B 落的老数据）与 Cloudreve 远程路径；fullTranscriptPath 为空时回退按 sessionId 约定的
+ * 本地候选（兼容文件已落盘但 path 尚未写回 DB 的边缘态）。找不到 / JSON 损坏 → null
+ * （调用方降级为空）。字段做防御性归一，绝不抛。
  */
 export async function loadFullTranscript(
-  session: Pick<Session, 'id' | 'fullTranscriptPath'>
+  session: Pick<Session, 'id' | 'userId' | 'fullTranscriptPath'>
 ): Promise<FullTranscriptBundle | null> {
-  const filePath = resolveLocalFullTranscriptPath(session);
-  let raw: string;
-  try {
-    raw = await fs.readFile(filePath, 'utf-8');
-  } catch {
+  const buffer = await readArtifactFromReference(
+    session,
+    'full-transcripts',
+    session.fullTranscriptPath
+  );
+  if (!buffer) {
     return null;
   }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(buffer.toString('utf-8'));
   } catch {
     return null;
   }
@@ -150,7 +122,8 @@ export type FinalizeFullResult =
  */
 export async function finalizeFullTranscription(
   session: FinalizableFullSession,
-  sonioxConfig: SonioxRuntimeConfig
+  sonioxConfig: SonioxRuntimeConfig,
+  options?: { allowClaimFrom?: string[] }
 ): Promise<FinalizeFullResult> {
   const transcriptionId = session.fullSonioxTranscriptionId;
   if (!transcriptionId) {
@@ -158,9 +131,15 @@ export async function finalizeFullTranscription(
   }
 
   // ── 条件原子 claim：transcribing → finalizing ──
+  // allowClaimFrom：前端 poll 默认只从 transcribing 抢；cron 回收兜底可传 ['transcribing','finalizing']
+  // 以复收「收尾中途崩溃」的 finalizing 僵尸（幂等仍由下方 finalize 守卫保证，扣费恰好一次）。
+  // 同时刷新 fullTranscribeStartedAt：把「刚发起、在途」的 finalize 与「6h 前发起、已崩」的 finalizing
+  // 僵尸区分开——否则 cron 回收会把刚被 claim 的在途 finalize 误当僵尸处理，与其 finalize 守卫赛跑，
+  // 把它逼进 canceled_during_finalize 误删 Soniox 转录、致会话永久卡死（回归红线）。
+  const allowClaimFrom = options?.allowClaimFrom ?? ['transcribing'];
   const claim = await prisma.session.updateMany({
-    where: { id: session.id, fullTranscribeStatus: 'transcribing' },
-    data: { fullTranscribeStatus: 'finalizing' },
+    where: { id: session.id, fullTranscribeStatus: { in: allowClaimFrom } },
+    data: { fullTranscribeStatus: 'finalizing', fullTranscribeStartedAt: new Date() },
   });
   if (claim.count !== 1) {
     return { outcome: 'claim_lost' };
@@ -174,7 +153,8 @@ export async function finalizeFullTranscription(
   const bundle = { segments, summaries: [] as unknown[], translations };
 
   // 落盘到独立的 full-transcripts（**不碰** transcriptPath / recordingPath / status）。
-  const fullPath = await persistFullTranscript(session.id, bundle);
+  // session 含 userId，Cloudreve 已配置时按 userId 归属上传远程。
+  const fullPath = await persistFullTranscript(session, bundle);
 
   // finalize 守卫：finalizing → completed，抢不到（收尾期间被取消/重置）则不扣费。
   const finalized = await prisma.session.updateMany({
@@ -187,10 +167,14 @@ export async function finalizeFullTranscription(
     },
   });
   if (finalized.count !== 1) {
-    if (session.fullSonioxFileId) {
-      await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(() => undefined);
-    }
-    await deleteSonioxTranscription(sonioxConfig, transcriptionId).catch(() => undefined);
+    // 守卫抢不到：收尾期间状态已不是 finalizing。**关键：此处绝不删 Soniox 资源。**
+    // 完整版转录没有「用户取消」路径，故 finalizing 被抢走只可能是两种情形，删 Soniox 都是错的：
+    //  (1) 另一条 finalize（前端 poll / cron 回收）先赢了守卫 → 它已落盘、会自行清 Soniox，
+    //      这里再删是多余；
+    //  (2) 前端 poll 的 catch 把 finalizing 盲目回退成 transcribing（可能撞到本条并发 finalize）
+    //      → 转录仍需要，若这里删了 Soniox transcription，后续 salvage 会 getSoniox 404、
+    //      会话永久卡在 transcribing 且转录被销毁（回归红线）。保留 Soniox → 交由下一轮 poll/
+    //      cron 重新 salvage 收尾。任一路径最终都会清 Soniox（completed）或删会话时清（delete 路由）。
     return { outcome: 'canceled_during_finalize' };
   }
 

@@ -898,6 +898,18 @@ export default function PlaybackPage() {
   const displaySegments = transcriptView === 'full' ? fullSegments : segments;
   const hasFullTranscript = fullStatus === 'completed';
   const fullInProgress = isFullTranscribeInProgress(fullStatus);
+  // 完整版转录入口门控（desktop header 按钮同口径）：非分享 + 会话已完成/归档 + 有录音。
+  const canGenerateFull =
+    !isShareMode &&
+    !!session &&
+    (session.status === 'COMPLETED' || session.status === 'ARCHIVED') &&
+    Boolean(session.recordingPath);
+  // 生成按钮文案：进行中态文案 / 已就绪→重新生成 / 未生成→生成。
+  const fullButtonLabel = fullInProgress
+    ? t(`playback.fullTranscribe.status${statusSuffix(fullStatus)}`)
+    : hasFullTranscript
+      ? t('playback.fullTranscribe.regenerate')
+      : t('playback.fullTranscribe.button');
 
   // Determine which segment is "active" based on current playback time
   const activeSegmentId = displaySegments.find(
@@ -1209,6 +1221,16 @@ export default function PlaybackPage() {
           onRegenerateTitle={handleRegenerateTitle}
           regeneratingTitle={regeneratingTitle}
           isShareMode={isShareMode}
+          canGenerateFull={canGenerateFull}
+          onGenerateFull={handleGenerateFull}
+          fullInProgress={fullInProgress}
+          fullTriggering={fullTriggering}
+          fullButtonLabel={fullButtonLabel}
+          hasFullTranscript={hasFullTranscript}
+          transcriptView={transcriptView}
+          onSwitchTranscriptView={handleSwitchTranscriptView}
+          displaySegments={displaySegments}
+          fullLoaded={fullLoaded}
         />
 
         {/* 音频元素 — 移动端也需要 */}
@@ -1280,6 +1302,21 @@ export default function PlaybackPage() {
             fetchRecording={fetchRecordingForExport}
           />
         )}
+
+        {/* 完整版转录·收费确认弹窗（移动端；desktop 分支末尾另有一份，二者互斥渲染） */}
+        <ConfirmDialog
+          open={fullConfirmOpen}
+          title={t('playback.fullTranscribe.confirmTitle')}
+          message={t('playback.fullTranscribe.confirmMessage', {
+            minutes: String(fullEstimateMinutes),
+          })}
+          confirmText={t('playback.fullTranscribe.confirmCta', {
+            minutes: String(fullEstimateMinutes),
+          })}
+          loading={fullTriggering}
+          onConfirm={handleGenerateFullConfirm}
+          onCancel={() => setFullConfirmOpen(false)}
+        />
       </>
     );
   }

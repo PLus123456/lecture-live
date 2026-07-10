@@ -11,13 +11,14 @@ import {
 } from '@/lib/storage/cloudreve';
 
 const DATA_ROOT = path.join(process.cwd(), 'data');
-const CATEGORIES: SessionArtifactCategory[] = ['recordings', 'transcripts', 'summaries', 'reports'];
+const CATEGORIES: SessionArtifactCategory[] = ['recordings', 'transcripts', 'summaries', 'reports', 'full-transcripts'];
 
 const PATH_FIELDS = {
   recordings: 'recordingPath',
   transcripts: 'transcriptPath',
   summaries: 'summaryPath',
   reports: 'reportPath',
+  'full-transcripts': 'fullTranscriptPath',
 } as const;
 
 export interface MigrationResult {
@@ -85,6 +86,7 @@ export async function migrateLocalToCloudreve(): Promise<MigrationResult> {
         { transcriptPath: { startsWith: 'local:' } },
         { summaryPath: { startsWith: 'local:' } },
         { reportPath: { startsWith: 'local:' } },
+        { fullTranscriptPath: { startsWith: 'local:' } },
       ],
     },
     select: {
@@ -94,6 +96,7 @@ export async function migrateLocalToCloudreve(): Promise<MigrationResult> {
       transcriptPath: true,
       summaryPath: true,
       reportPath: true,
+      fullTranscriptPath: true,
     },
   });
 
@@ -162,6 +165,7 @@ export async function cleanupExpiredLocalFiles(
         { transcriptPath: { startsWith: '/' } },
         { summaryPath: { startsWith: '/' } },
         { reportPath: { startsWith: '/' } },
+        { fullTranscriptPath: { startsWith: '/' } },
       ],
     },
     select: {
@@ -170,6 +174,7 @@ export async function cleanupExpiredLocalFiles(
       transcriptPath: true,
       summaryPath: true,
       reportPath: true,
+      fullTranscriptPath: true,
     },
   });
 

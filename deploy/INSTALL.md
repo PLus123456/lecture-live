@@ -312,7 +312,7 @@ sudo systemctl restart lecturelive-web lecturelive-ws
 
 原方案用 `ts-node` 直接在生产环境运行 TypeScript，但项目的 `tsconfig.json` 使用 `moduleResolution: "bundler"`（Next.js 需要），ts-node 不支持这个模式会直接报错。
 
-现在用 `esbuild` 把 `server/websocket.ts` 及其所有本地依赖打包成一个 20KB 的 `websocket.js`，外部 npm 包（socket.io、prisma 等）通过 `--packages=external` 保留为 require，由 `ws-server/node_modules` 提供。
+现在用 `esbuild --bundle` 把 `server/websocket.ts` 及其本地依赖（含 socket.io）打包进一个约 250KB 的 `websocket.js`；仅少数重型/原生 npm 包（`@prisma/client`、`ioredis`、`jsonwebtoken`、`bcryptjs`、`bufferutil`、`utf-8-validate`）通过逐个 `--external:` 标记保留为运行时 require，由 `ws-server/node_modules` 提供。
 
 好处：
 - **不需要 ts-node / TypeScript**，生产环境只跑原生 JS

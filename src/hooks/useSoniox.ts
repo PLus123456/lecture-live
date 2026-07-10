@@ -678,6 +678,10 @@ export function useSoniox(
       setConnectionState('reconnecting');
 
       reconnectTimerRef.current = setTimeout(async () => {
+        // 记录进入本次重连时的 runId 代际：ensureArchive / getSenderStream 等 await 之后据此
+        // 判断期间是否发生了 stop / 卸载（两者都会递增 runId），若是则放弃，避免在已停止/
+        // 已卸载的会话上复活一条录音流（审计 high）。
+        const genAtStart = runIdRef.current;
         const storeState = useTranscriptStore.getState();
         if (
           storeState.recordingState === 'idle' ||
@@ -732,6 +736,24 @@ export function useSoniox(
           });
           const managedStream = await archiveManager.getSenderStream();
           void syncRemoteDraft();
+
+          // await（ensureArchive / getSenderStream）期间用户可能已 stop 或组件已卸载 ——
+          // 建立新 Soniox 连接前再复查一次，否则会白建一条 WS 并把已停止的会话复活成录音态。
+          if (runIdRef.current !== genAtStart) {
+            shouldReconnectRef.current = false;
+            reconnectAttemptsRef.current = 0;
+            return;
+          }
+          const latestState = useTranscriptStore.getState().recordingState;
+          if (
+            latestState === 'idle' ||
+            latestState === 'stopped' ||
+            latestState === 'finalizing'
+          ) {
+            shouldReconnectRef.current = false;
+            reconnectAttemptsRef.current = 0;
+            return;
+          }
 
           const runId = runIdRef.current + 1;
           runIdRef.current = runId;
@@ -1280,6 +1302,17 @@ export function useSoniox(
   }, [sendFinalizeBeacon, syncRemoteDraft]);
 
   const start = useCallback(async () => {
+    // 手动开始/继续录音时接管连接生命周期：取消任何待触发/进行中的自动重连，否则它稍后
+    // 会再开出第二条 Soniox WS，与本次手动建立的连接并存 → 旧句柄被覆盖却不 stop，形成
+    // 双流、双计费（审计 high）。stop() 已有同款接管逻辑，这里对齐。
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    cancelStableConn();
+    reconnectAttemptsRef.current = 0;
+    shouldReconnectRef.current = false;
+
     if (recordingRef.current && recordingState === 'paused') {
       autoPauseReasonRef.current = null;
       shouldReconnectRef.current = false;
@@ -1318,6 +1351,7 @@ export function useSoniox(
     });
   }, [
     accumulatePausedTime,
+    cancelStableConn,
     computeResumeOffset,
     markAudioActivity,
     recordingState,

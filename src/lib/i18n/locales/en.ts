@@ -579,6 +579,27 @@ export default {
     shareCopyLink: 'Copy link',
     shareCreateFailed: 'Failed to create share link. Please try again.',
     shareRevokeFailed: 'Failed to revoke share link. Please try again.',
+    fullTranscribe: {
+      button: 'Full Transcript',
+      regenerate: 'Regenerate Full',
+      confirmTitle: 'Generate full transcript?',
+      confirmMessage:
+        'Re-transcribe the complete audio (including any offline-captured gaps) in a separate, higher-completeness pass. This creates a full transcript alongside the live one — it will not touch your existing transcript.\n\nThis will consume about {minutes} extra minute(s) of transcription quota (full audio length × 0.8). Continue?',
+      confirmCta: 'Generate ({minutes} min)',
+      insufficientQuota:
+        'Not enough transcription quota — this needs about {minutes} minute(s). Free up quota and try again.',
+      triggerFail: 'Failed to start full transcription. Please try again.',
+      doneToast: 'Full transcript ready',
+      failToast: 'Full transcription failed',
+      viewLive: 'Live',
+      viewFull: 'Full',
+      empty: 'The full transcript will appear here.',
+      loading: 'Loading full transcript…',
+      statusPending: 'Queued…',
+      statusTranscoding: 'Transcoding…',
+      statusTranscribing: 'Transcribing…',
+      statusFinalizing: 'Finalizing…',
+    },
   },
 
   exportModal: {

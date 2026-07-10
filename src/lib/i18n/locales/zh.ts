@@ -562,6 +562,27 @@ export default {
     shareCopyLink: '复制链接',
     shareCreateFailed: '创建分享链接失败，请稍后再试。',
     shareRevokeFailed: '撤销分享链接失败，请稍后再试。',
+    fullTranscribe: {
+      button: '完整版转录',
+      regenerate: '重新生成完整版',
+      confirmTitle: '生成完整版转录？',
+      confirmMessage:
+        '对完整音频（含断网续采的空档段）重跑一次更完整的转录，生成一份独立于实时转录的完整版——绝不改动你现有的实时转录。\n\n将额外消耗约 {minutes} 分钟转写额度（完整音频时长 × 0.8）。是否继续？',
+      confirmCta: '生成（约 {minutes} 分钟）',
+      insufficientQuota:
+        '转写额度不足——本次约需 {minutes} 分钟。请释放额度后重试。',
+      triggerFail: '启动完整版转录失败，请稍后重试。',
+      doneToast: '完整版转录已就绪',
+      failToast: '完整版转录失败',
+      viewLive: '实时转录',
+      viewFull: '完整版转录',
+      empty: '完整版转录将显示于此。',
+      loading: '正在加载完整版转录…',
+      statusPending: '排队中…',
+      statusTranscoding: '转码中…',
+      statusTranscribing: '转录中…',
+      statusFinalizing: '收尾中…',
+    },
   },
 
   exportModal: {

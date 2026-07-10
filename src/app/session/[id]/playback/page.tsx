@@ -47,7 +47,14 @@ import {
   AlertCircle,
   Loader2,
   RefreshCw,
+  Layers,
 } from 'lucide-react';
+import {
+  triggerFullTranscribe,
+  pollFullTranscribeStatus,
+  isFullTranscribeInProgress,
+  type FullTranscribeStatus,
+} from '@/lib/transcribe/fullTranscribeClient';
 import type { TranscriptSegment } from '@/types/transcript';
 import type { SummaryBlock } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
@@ -64,6 +71,29 @@ interface SessionData {
   courseName?: string;
   audioSource?: string;
   sonioxRegion?: string;
+  recordingPath?: string | null;
+  fullTranscribeStatus?: string | null;
+  fullTranscriptPath?: string | null;
+}
+
+// 完整版补全转录的默认计费倍率（异步文件转录，admin 可在站点设置里调整）。
+// 收费确认弹窗按此在前端预估「约 N 分钟」；服务端 finalize 时按站点实际倍率精确扣费，
+// 额度不足由服务端 402 兜底 —— 故此处用「约」表述。
+const FULL_TRANSCRIBE_MULTIPLIER = 0.8;
+
+// 进行中状态 → i18n key 后缀（playback.fullTranscribe.status<Suffix>）。
+function statusSuffix(status: FullTranscribeStatus | null): string {
+  switch (status) {
+    case 'transcoding':
+      return 'Transcoding';
+    case 'transcribing':
+      return 'Transcribing';
+    case 'finalizing':
+      return 'Finalizing';
+    case 'pending':
+    default:
+      return 'Pending';
+  }
 }
 
 interface PlaybackAudioSegment {
@@ -237,6 +267,16 @@ export default function PlaybackPage() {
   const [reportLoading, setReportLoading] = useState(false);
   const [regeneratingTitle, setRegeneratingTitle] = useState(false);
   const [regenerateConfirmOpen, setRegenerateConfirmOpen] = useState(false);
+
+  // 完整版补全转录（阶段B）：触发 → 收费确认 → 进度轮询 → 「实时/完整版」切换查看
+  const [fullStatus, setFullStatus] = useState<FullTranscribeStatus | null>(null);
+  const [fullConfirmOpen, setFullConfirmOpen] = useState(false);
+  const [fullTriggering, setFullTriggering] = useState(false);
+  const [transcriptView, setTranscriptView] = useState<'live' | 'full'>('live');
+  const [fullSegments, setFullSegments] = useState<TranscriptSegment[]>([]);
+  const [fullLoaded, setFullLoaded] = useState(false);
+  const fullPollAbortRef = useRef<AbortController | null>(null);
+  const fullInitializedRef = useRef(false);
 
   // Audio player state
   const [isPlaying, setIsPlaying] = useState(false);
@@ -853,8 +893,14 @@ export default function PlaybackPage() {
     audioRef.current.playbackRate = playbackRate;
   }, [activeAudioSegment, playbackRate]);
 
+  // 「实时/完整版」切换：仅影响可见转录列表 + 高亮 + 计数；ChatTab/导出仍绑定实时 segments。
+  // 完整版 segments 与实时同一音频时间轴，故点击跳转 seek 逻辑无需改动。
+  const displaySegments = transcriptView === 'full' ? fullSegments : segments;
+  const hasFullTranscript = fullStatus === 'completed';
+  const fullInProgress = isFullTranscribeInProgress(fullStatus);
+
   // Determine which segment is "active" based on current playback time
-  const activeSegmentId = segments.find(
+  const activeSegmentId = displaySegments.find(
     (s) => s.globalStartMs <= currentTimeMs && s.globalEndMs >= currentTimeMs
   )?.id;
 
@@ -958,6 +1004,129 @@ export default function PlaybackPage() {
       return null;
     }
   }, [sessionId, token, isShareMode, shareToken]);
+
+  // ─── 完整版补全转录（阶段B） ───
+
+  // 收费预估：ceil(可计费分钟 × 倍率)，与服务端 402 判定同口径（用默认倍率，故弹窗表述「约」）。
+  const fullEstimateMinutes = useMemo(() => {
+    const billableMinutes = Math.ceil(Math.max(0, session?.durationMs ?? 0) / 60_000);
+    return Math.max(0, Math.ceil(billableMinutes * FULL_TRANSCRIBE_MULTIPLIER));
+  }, [session?.durationMs]);
+
+  // 读取完整版转录 bundle（切到「完整版」视图 / 收尾完成时懒加载一次）。
+  const loadFullTranscriptData = useCallback(async () => {
+    if (!token || !sessionId) return;
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/full-transcript`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.segments)) {
+        const tr: Record<string, string> = data.translations || {};
+        setFullSegments(
+          data.segments.map((seg: TranscriptSegment) => ({
+            ...seg,
+            translatedText: seg.translatedText || tr[seg.id] || undefined,
+          }))
+        );
+        setFullLoaded(true);
+      }
+    } catch {
+      // 非关键：加载失败保持切换按钮，用户可重试
+    }
+  }, [token, sessionId]);
+
+  // 接管一次状态轮询（触发后 / 刷新回到进行中态时）。收尾完成即拉取完整版并提示。
+  const startFullPoll = useCallback(() => {
+    if (!token || !sessionId) return;
+    fullPollAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    fullPollAbortRef.current = ctrl;
+    void pollFullTranscribeStatus(sessionId, token, {
+      signal: ctrl.signal,
+      onStatusChange: (s) => setFullStatus(s),
+    }).then((result) => {
+      if (ctrl.signal.aborted) return;
+      if (result.finalStatus === 'completed') {
+        setFullStatus('completed');
+        void loadFullTranscriptData();
+        toast.success(t('playback.fullTranscribe.doneToast'));
+      } else if (result.finalStatus === 'failed') {
+        setFullStatus('failed');
+        toast.error(t('playback.fullTranscribe.failToast'), result.error || undefined);
+      }
+    });
+  }, [token, sessionId, loadFullTranscriptData, t]);
+
+  const handleGenerateFull = useCallback(() => {
+    if (!sessionId || !token) return;
+    setFullConfirmOpen(true);
+  }, [sessionId, token]);
+
+  const handleGenerateFullConfirm = useCallback(async () => {
+    if (!sessionId || !token) return;
+    setFullTriggering(true);
+    try {
+      const result = await triggerFullTranscribe(sessionId, token);
+      if (result.httpStatus === 402) {
+        toast.error(
+          t('playback.fullTranscribe.insufficientQuota', {
+            minutes: String(result.estimatedMinutes ?? fullEstimateMinutes),
+          })
+        );
+        setFullConfirmOpen(false);
+        return;
+      }
+      if (!result.ok) {
+        // 409（会话未完成/无录音）等
+        toast.error(t('playback.fullTranscribe.triggerFail'), result.error || undefined);
+        setFullConfirmOpen(false);
+        return;
+      }
+      // 200：{status:'pending', estimatedMinutes} 或 {alreadyRunning:true, status}
+      // 重新生成时重置已加载的旧完整版，回到实时视图，等新一轮收尾后再懒加载。
+      setFullLoaded(false);
+      setFullSegments([]);
+      setTranscriptView('live');
+      setFullStatus(result.status ?? 'pending');
+      setFullConfirmOpen(false);
+      startFullPoll();
+    } catch {
+      toast.error(t('playback.fullTranscribe.triggerFail'));
+      setFullConfirmOpen(false);
+    } finally {
+      setFullTriggering(false);
+    }
+  }, [sessionId, token, fullEstimateMinutes, startFullPoll, t]);
+
+  // 初始化：会话加载后读初始 fullTranscribeStatus；若进行中则接管轮询（刷新恢复）。
+  useEffect(() => {
+    if (isShareMode || !session || fullInitializedRef.current) return;
+    fullInitializedRef.current = true;
+    const initial = (session.fullTranscribeStatus as FullTranscribeStatus | null) ?? null;
+    setFullStatus(initial);
+    if (isFullTranscribeInProgress(initial)) {
+      startFullPoll();
+    }
+  }, [session, isShareMode, startFullPoll]);
+
+  // 卸载时中止在途轮询，避免泄漏 / setState-after-unmount。
+  useEffect(() => {
+    return () => {
+      fullPollAbortRef.current?.abort();
+    };
+  }, []);
+
+  const handleSwitchTranscriptView = useCallback(
+    (view: 'live' | 'full') => {
+      setTranscriptView(view);
+      if (view === 'full' && !fullLoaded) {
+        void loadFullTranscriptData();
+      }
+    },
+    [fullLoaded, loadFullTranscriptData]
+  );
 
   if (!isShareMode && (!user || !token)) {
     return (
@@ -1162,6 +1331,28 @@ export default function PlaybackPage() {
             </div>
 
             <div className="flex items-center gap-2">
+              {!isShareMode &&
+                (session.status === 'COMPLETED' || session.status === 'ARCHIVED') &&
+                Boolean(session.recordingPath) && (
+                  <button
+                    className="btn-ghost text-xs flex items-center gap-1.5"
+                    onClick={handleGenerateFull}
+                    disabled={fullInProgress || fullTriggering}
+                    data-testid="full-transcribe-btn"
+                    title={t('playback.fullTranscribe.button')}
+                  >
+                    {fullInProgress ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Layers className="w-3.5 h-3.5" />
+                    )}
+                    {fullInProgress
+                      ? t(`playback.fullTranscribe.status${statusSuffix(fullStatus)}`)
+                      : hasFullTranscript
+                        ? t('playback.fullTranscribe.regenerate')
+                        : t('playback.fullTranscribe.button')}
+                  </button>
+                )}
               {!isShareMode && (
                 <button
                   className="btn-ghost text-xs flex items-center gap-1.5"
@@ -1195,9 +1386,52 @@ export default function PlaybackPage() {
               <FileText className="w-4 h-4 text-charcoal-400" />
               <span className="text-xs font-semibold text-charcoal-600">{t('playback.transcript')}</span>
               <span className="text-[10px] text-charcoal-400">
-                {t('playback.transcriptSegments', { count: segments.length })}
+                {t('playback.transcriptSegments', { count: displaySegments.length })}
               </span>
-              <span className="text-[10px] text-charcoal-400 ml-auto flex items-center gap-1">
+
+              {/* 「实时 / 完整版」切换：仅完整版就绪后出现 */}
+              {hasFullTranscript && (
+                <div
+                  className="ml-auto inline-flex items-center rounded-lg bg-cream-100 p-0.5"
+                  role="tablist"
+                  aria-label={t('playback.transcript')}
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={transcriptView === 'live'}
+                    data-testid="view-live"
+                    onClick={() => handleSwitchTranscriptView('live')}
+                    className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                      transcriptView === 'live'
+                        ? 'bg-white text-charcoal-700 shadow-sm'
+                        : 'text-charcoal-400 hover:text-charcoal-600'
+                    }`}
+                  >
+                    {t('playback.fullTranscribe.viewLive')}
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={transcriptView === 'full'}
+                    data-testid="view-full"
+                    onClick={() => handleSwitchTranscriptView('full')}
+                    className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                      transcriptView === 'full'
+                        ? 'bg-white text-rust-600 shadow-sm'
+                        : 'text-charcoal-400 hover:text-charcoal-600'
+                    }`}
+                  >
+                    {t('playback.fullTranscribe.viewFull')}
+                  </button>
+                </div>
+              )}
+
+              <span
+                className={`text-[10px] text-charcoal-400 flex items-center gap-1 ${
+                  hasFullTranscript ? '' : 'ml-auto'
+                }`}
+              >
                 <Globe className="w-3 h-3" />
                 {session.sourceLang.toUpperCase()} → {session.targetLang.toUpperCase()}
               </span>
@@ -1208,13 +1442,19 @@ export default function PlaybackPage() {
               onScroll={handleTranscriptScroll}
               className="flex-1 overflow-y-auto p-4 space-y-4 min-h-0"
             >
-              {segments.length === 0 ? (
+              {displaySegments.length === 0 ? (
                 <div className="text-center text-charcoal-400 text-sm py-12">
                   <FileText className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                  <p>{t('playback.transcriptEmpty')}</p>
+                  <p>
+                    {transcriptView === 'full'
+                      ? fullLoaded
+                        ? t('playback.fullTranscribe.empty')
+                        : t('playback.fullTranscribe.loading')
+                      : t('playback.transcriptEmpty')}
+                  </p>
                 </div>
               ) : (
-                segments.map((seg) => (
+                displaySegments.map((seg) => (
                   <div
                     key={seg.id}
                     ref={activeSegmentId === seg.id ? activeSegmentRef : undefined}
@@ -1719,6 +1959,20 @@ export default function PlaybackPage() {
         loading={regeneratingTitle}
         onConfirm={handleRegenerateTitleConfirm}
         onCancel={() => setRegenerateConfirmOpen(false)}
+      />
+      {/* 完整版转录·收费确认弹窗（不可省，用户明确要求点击前清楚提示计费） */}
+      <ConfirmDialog
+        open={fullConfirmOpen}
+        title={t('playback.fullTranscribe.confirmTitle')}
+        message={t('playback.fullTranscribe.confirmMessage', {
+          minutes: String(fullEstimateMinutes),
+        })}
+        confirmText={t('playback.fullTranscribe.confirmCta', {
+          minutes: String(fullEstimateMinutes),
+        })}
+        loading={fullTriggering}
+        onConfirm={handleGenerateFullConfirm}
+        onCancel={() => setFullConfirmOpen(false)}
       />
     </div>
   );

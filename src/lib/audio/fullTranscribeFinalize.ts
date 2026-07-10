@@ -69,6 +69,71 @@ export async function persistFullTranscript(
   return fullTranscriptReference(sessionId);
 }
 
+export interface FullTranscriptBundle {
+  segments: unknown[];
+  summaries: unknown[];
+  translations: Record<string, string>;
+}
+
+/**
+ * 从 fullTranscriptPath 引用解析出本地文件路径。
+ * 阶段B 只落本地（`local:full-transcripts/{id}.json`）；阶段C 接 Cloudreve 时在读取端扩展远程分支。
+ * 用 path.basename 收口，杜绝路径穿越；无引用则回退按 sessionId 约定路径（兼容文件已落盘但
+ * path 尚未写回 DB 的边缘态）。
+ */
+function resolveLocalFullTranscriptPath(
+  session: Pick<Session, 'id' | 'fullTranscriptPath'>
+): string {
+  const ref = session.fullTranscriptPath;
+  if (ref && ref.startsWith('local:')) {
+    const remainder = ref.slice('local:'.length); // e.g. full-transcripts/{id}.json
+    return path.join(FULL_TRANSCRIPTS_DIR, path.basename(remainder));
+  }
+  return fullTranscriptLocalPath(session.id);
+}
+
+/**
+ * 读取完整版补全转录 bundle（回放页「完整版」视图 + 读取端点 GET full-transcript 用）。
+ * 找不到 / JSON 损坏 → null（调用方降级为空）。字段做防御性归一，绝不抛。
+ */
+export async function loadFullTranscript(
+  session: Pick<Session, 'id' | 'fullTranscriptPath'>
+): Promise<FullTranscriptBundle | null> {
+  const filePath = resolveLocalFullTranscriptPath(session);
+  let raw: string;
+  try {
+    raw = await fs.readFile(filePath, 'utf-8');
+  } catch {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+
+  const record = parsed as Partial<FullTranscriptBundle>;
+  const translations =
+    record.translations && typeof record.translations === 'object' && !Array.isArray(record.translations)
+      ? Object.fromEntries(
+          Object.entries(record.translations as Record<string, unknown>).filter(
+            ([, v]) => typeof v === 'string'
+          ) as [string, string][]
+        )
+      : {};
+
+  return {
+    segments: Array.isArray(record.segments) ? record.segments : [],
+    summaries: Array.isArray(record.summaries) ? record.summaries : [],
+    translations,
+  };
+}
+
 export type FinalizableFullSession = Pick<
   Session,
   'id' | 'userId' | 'fullSonioxFileId' | 'fullSonioxTranscriptionId' | 'targetLang' | 'durationMs'

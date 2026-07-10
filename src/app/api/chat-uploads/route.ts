@@ -1,7 +1,7 @@
 // POST /api/chat-uploads   → 上传聊天附件（图片 / 文档 / 文本）到 Cloudreve，扣配额
 // GET  /api/chat-uploads?conversationId=...  → 列出某对话下附件并 touch lastAccessedAt
 //
-// 路由设计沿用 /api/storage/upload 的"auth + rate-limit + quota + Cloudreve.upload"骨架，
+// 路由结构：auth + rate-limit + quota(原子预留) + Cloudreve.upload 骨架，
 // 但额外做：MIME 自动分类（image | document | text）、document/text 自动抽文本副本、
 // addStorageBytes 扣配额、按 LRU 更新 lastAccessedAt。
 //

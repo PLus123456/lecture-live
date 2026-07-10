@@ -251,7 +251,9 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     const job = await createSonioxTranscription(sonioxConfig, {
       fileId: sonioxFile.id,
       languageHints: session.sourceLang ? [session.sourceLang] : undefined,
-      enableLanguageIdentification: false,
+      // 与 realtime 一致开启语言识别：否则 token 不带 language 字段，分段的 language
+      // 会全部落到 'en' 兜底（非英文上传标签错）。source 语言仍由 languageHints 提供。
+      enableLanguageIdentification: true,
       enableSpeakerDiarization: true,
       translation,
       clientReferenceId: session.id,

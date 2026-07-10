@@ -359,6 +359,13 @@ export function useSoniox(
 
     await syncRemoteDraft();
 
+    // 补传后完整性校验：本地仍有分片没传到服务端（持续 429 退避 / 断网），说明服务端 draft
+    // 缺尾。仍 best-effort POST finalize 持久化已到达的分片，但把「不完整」如实回报给上层
+    // ——调用方据此保留本地 IndexedDB 完整副本、不清库（审计 high：停止收尾丢尾部音频）。
+    const audioComplete = !(
+      localChunkCount > 0 && remoteDraftSeqsRef.current.size < localChunkCount
+    );
+
     try {
       const response = await fetch(
         `/api/sessions/${sessionId}/audio/draft/finalize`,
@@ -380,10 +387,11 @@ export function useSoniox(
 
       publishBackupMeta({
         localChunkCount,
-        remoteChunkCount: localChunkCount,
-        syncState: localChunkCount > 0 ? 'synced' : 'idle',
+        remoteChunkCount: remoteDraftSeqsRef.current.size,
+        syncState: audioComplete ? (localChunkCount > 0 ? 'synced' : 'idle') : 'pending',
+        lastError: audioComplete ? null : 'Some audio is not yet backed up to the server',
       });
-      return true;
+      return audioComplete;
     } catch (error) {
       publishBackupMeta({
         localChunkCount,
@@ -1527,7 +1535,15 @@ export function useSoniox(
     // 恢复 overallStartTimeRef（刷新后 ref 丢失）
     overallStartTimeRef.current = storeState.recordingStartTime;
 
-    const offsetMs = Date.now() - storeState.recordingStartTime - storeState.totalPausedMs;
+    // 暂停态刷新：用暂停冻结点 pausedAt 算 offset，暂停空档不计入录音时长（与
+    // computeResumeOffset 一致）；录音态刷新（pausedAt 为空）等价于在刷新这一刻暂停，用 now。
+    // 加负值护栏。旧代码一律用 Date.now()，暂停挂机后刷新会把整段空档算进续录偏移，
+    // 导致后续段时间戳整体前移（审计 high）。
+    const freezePoint = storeState.pausedAt ?? Date.now();
+    const offsetMs = Math.max(
+      0,
+      freezePoint - storeState.recordingStartTime - storeState.totalPausedMs
+    );
 
     // 把刷新前残留的 preview 文本保存为一个 segment，防止丢失
     let segmentOffset = storeState.segments.length;
@@ -1594,7 +1610,13 @@ export function useSoniox(
     // 刷新恢复只把会话还原为「暂停展示」态，绝不自动开麦续录：
     // 已恢复 processor / 段号偏移 / overallStartTimeRef，用户点「继续」时 start() 的
     // 复用分支(Branch 3)会据此接上并续录。此处不建立 Soniox 连接、不抢麦。
-    setPausedAt(Date.now());
+    //
+    // 保留暂停冻结点：刷新前若已是暂停态，pausedAt 维持原值，否则刷新前的暂停空档会在
+    // 点「继续」时（accumulatePausedTime / computeResumeOffset）漏扣、被当作录音时长
+    // （审计 high）。刷新前是录音态（pausedAt 为空）才以刷新这一刻作为暂停起点。
+    if (storeState.pausedAt == null) {
+      setPausedAt(Date.now());
+    }
     setRecordingState('paused');
     setConnectionState('disconnected');
     shouldReconnectRef.current = false;

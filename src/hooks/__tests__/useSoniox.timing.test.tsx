@@ -442,3 +442,54 @@ describe('R686：手动继续取消 pending 自动重连，避免双流双计费
     vi.useRealTimers();
   });
 });
+
+describe('R1491：暂停态刷新恢复不把暂停空档算入续录偏移', () => {
+  it('reconnectAfterRefresh 保留原 pausedAt 冻结点，续录段时间基于冻结点而非刷新时刻', async () => {
+    const nowSpy = vi.spyOn(Date, 'now');
+    const t0 = 2_000_000;
+    const pausedAt = t0 + 60_000; // 录了 60s 后暂停
+    const refreshAt = t0 + 60_000 + 300_000; // 暂停挂机 5min 后刷新
+    nowSpy.mockReturnValue(refreshAt);
+
+    useTranscriptStore.setState({
+      segments: [],
+      recordingState: 'paused',
+      recordingStartTime: t0,
+      pausedAt,
+      totalPausedMs: 0,
+      connectionState: 'disconnected',
+      currentPreviewText: { finalText: '', nonFinalText: '' },
+    } as never);
+
+    const { result } = renderHook(() => useSoniox('sess-refresh'));
+
+    await act(async () => {
+      await result.current.reconnectAfterRefresh();
+    });
+
+    // 直接断言：暂停冻结点必须保留，不被 setPausedAt(now) 覆盖，否则点继续时暂停空档漏扣。
+    expect(useTranscriptStore.getState().pausedAt).toBe(pausedAt);
+
+    // 续录并连接完成后喂一个 token（start_ms=0）：段偏移应 ≈ 60s（冻结点），
+    // 而非 ≈ 360s（若把 5min 暂停空档算入录音时长）。
+    await act(async () => {
+      await result.current.start();
+    });
+    const lastCb = capturedCallbacks[capturedCallbacks.length - 1];
+    act(() => {
+      lastCb.onConnectionChange('connected');
+    });
+    act(() => {
+      lastCb.onPartialResult([
+        { text: 'x', is_final: true, start_ms: 0, end_ms: 200, confidence: 1, language: 'en' },
+      ]);
+      lastCb.onEndpoint();
+    });
+    const segs = useTranscriptStore.getState().segments;
+    expect(segs.length).toBeGreaterThan(0);
+    const seg = segs[segs.length - 1];
+    expect(seg.globalStartMs).toBeLessThan(120_000);
+
+    nowSpy.mockRestore();
+  });
+});

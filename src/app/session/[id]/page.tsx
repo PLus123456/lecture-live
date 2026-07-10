@@ -1210,7 +1210,7 @@ export default function ActiveSessionPage() {
       const translationEntries = useTranslationStore.getState().translations;
 
       // 并行：上传最新转录 draft + 同步剩余音频 chunks
-      await Promise.allSettled([
+      const draftResults = await Promise.allSettled([
         fetch(`/api/sessions/${sessionId}/transcript/draft`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -1224,6 +1224,10 @@ export default function ActiveSessionPage() {
         }),
         finalizeRemoteDraft().catch(() => false),
       ]);
+      // 音频分片是否已完整补传到服务端 —— 决定停止后能否安全清本地 IndexedDB 音频。
+      // finalizeRemoteDraft 在补传不完整（持续 429/断网）时返回 false（审计 high）。
+      const audioDraftComplete =
+        draftResults[1].status === 'fulfilled' && draftResults[1].value === true;
 
       steps[1].status = 'done';
       steps[2].status = 'active';
@@ -1276,17 +1280,25 @@ export default function ActiveSessionPage() {
       setFinalizingSteps([...steps]);
       clearPendingSessionTerms();
 
-      // 清除本地缓存（已由服务端持久化）
+      // 清除本地缓存（已由服务端持久化）。转录随 session finalize body 完整提交，可清；
+      // 音频只有在确认完整补传到服务端后才清 IndexedDB，否则保留本地完整副本防尾部丢失。
       try {
         sessionStorage.removeItem('lecture-live-transcript');
         sessionStorage.removeItem('lecture-live-translations');
         sessionStorage.removeItem('lecture-live-summary');
         sessionStorage.removeItem('lecture-live-archive-mime');
       } catch { /* silent */ }
-      try {
-        const { clearAudioChunks } = await import('@/lib/audio/audioChunkStore');
-        await clearAudioChunks(sessionId);
-      } catch { /* silent */ }
+      if (audioDraftComplete) {
+        try {
+          const { clearAudioChunks } = await import('@/lib/audio/audioChunkStore');
+          await clearAudioChunks(sessionId);
+        } catch { /* silent */ }
+      } else {
+        // 音频未完整补传（退避/断网）：保留本地 IndexedDB 完整副本，避免停止即丢尾部（审计 high）。
+        console.warn(
+          'Audio draft incomplete at stop; keeping local audio chunks for recovery'
+        );
+      }
 
       setTimeout(() => {
         router.push(`/session/${sessionId}/playback`);

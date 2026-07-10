@@ -19,6 +19,11 @@ vi.mock('fs/promises', () => {
       writeFile: vi.fn(async (p: string, data: string) => {
         mockFiles.set(p, data);
       }),
+      rename: vi.fn(async (from: string, to: string) => {
+        if (!mockFiles.has(from)) throw enoent();
+        mockFiles.set(to, mockFiles.get(from)!);
+        mockFiles.delete(from);
+      }),
       readFile: vi.fn(async (p: string) => {
         if (!mockFiles.has(p)) throw enoent();
         return mockFiles.get(p)!;

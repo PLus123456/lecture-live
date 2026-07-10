@@ -296,6 +296,13 @@ export class RecordingArchiveManager {
       const write = Promise.all([persistChunk, notifyChunk])
         .then(async ([didPersist, didNotify]) => {
           if (!didPersist && !didNotify) {
+            // 本地 IndexedDB 写入与服务端上传双双失败：该分片既没落本地也没传服务端，
+            // nextSeq 已递增 → 归档将出现无法恢复的 seq 空洞。不再静默吞（旧行为直接 return），
+            // 至少告警使问题可诊断/上层可感知（审计 medium：IDB 写失败静默出洞）。
+            console.error(
+              `[archive] chunk seq=${seq} 本地写入与上传均失败，归档出现空洞，` +
+                `session=${this.sessionId}`
+            );
             return;
           }
           await this.ensureSessionRecord(archiveStatus);

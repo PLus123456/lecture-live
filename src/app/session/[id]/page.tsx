@@ -504,6 +504,10 @@ export default function ActiveSessionPage() {
   // COMPLETED）。此后继续录制的内容不会保存到原会话 —— 置位后给出持久提示，避免用户
   // 在毫不知情的情况下继续录、最后停止时静默丢失（审计 critical）。
   const [sessionReclaimed, setSessionReclaimed] = useState(false);
+  // 本标签是否已取得录音控制权（用户在此标签主动开始/继续录音）。仅用于抑制「被动观察标签」
+  // 的状态回写：在另一标签打开正在录音的会话时会走 resume-cold 冷恢复、把本地态设为 paused，
+  // 若无此守卫会 PATCH 后端 PAUSED、掐停另一标签正在进行的录音（审计 medium）。
+  const recordingControlRef = useRef(false);
   const [quotaSnapshot, setQuotaSnapshot] = useState<UserQuotas | null>(cachedQuotas);
   const [billingNotice, setBillingNotice] = useState<{
     tone: 'info' | 'warning';
@@ -934,13 +938,17 @@ export default function ActiveSessionPage() {
     if (!sessionChecked) return;
     if (finalizingError) return;
     if (recordingState !== 'recording' && recordingState !== 'paused') return;
+    // 只有本标签取得录音控制权（主动开始/继续），或是同标签刷新恢复（live-refresh，原录音
+    // 标签），才回写录制态。否则「另一标签打开正在录音的会话」(resume-cold 观察者，本地被
+    // 冷恢复设为 paused) 会 PATCH 后端 PAUSED、掐停另一标签正在进行的录音（审计 medium）。
+    if (!recordingControlRef.current && recoveryMode !== 'live-refresh') return;
     const target: SessionStatus = recordingState === 'recording' ? 'RECORDING' : 'PAUSED';
     void syncSessionStatus(target).then((result) => {
       // 后端拒绝把会话置回录制态（4xx）→ 会话已被回收/收尾。仅提示，不做破坏性动作
       // （网络瞬断归为 network-error，不会误触发）；真正防丢在停止时的 finalize 分支。
       if (result === 'rejected') setSessionReclaimed(true);
     });
-  }, [finalizingError, recordingState, sessionChecked, syncSessionStatus]);
+  }, [finalizingError, recordingState, sessionChecked, syncSessionStatus, recoveryMode]);
 
   // 会话被回收的持久提示：从 false→true 只触发一次，让用户在录制途中就知情，而不是
   // 等到停止时才发现续录内容没保存。
@@ -1366,6 +1374,8 @@ export default function ActiveSessionPage() {
 
   const handleStartRecording = useCallback(async () => {
     setBillingNotice(null);
+    // 用户在本标签主动开始/继续 → 本标签取得录音控制权，此后才允许把录制态回写后端。
+    recordingControlRef.current = true;
 
     if (recordingState === 'paused') {
       await startRecording();

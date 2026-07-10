@@ -12,6 +12,11 @@ import MobileSessionLayout from '@/components/mobile/MobileSessionLayout';
 import LiveShareBadge from '@/components/session/LiveShareBadge';
 import { useI18n } from '@/lib/i18n';
 import { mergeSessionTerms } from '@/lib/keywords/sessionTerms';
+import {
+  classifyStatusSync,
+  resolveFinalizeOutcome,
+  type StatusSyncResult,
+} from '@/lib/session/recordingLifecycle';
 import { summaryBlocksToResponses } from '@/lib/summary';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -494,6 +499,10 @@ export default function ActiveSessionPage() {
   const isFinalizingRef = useRef(false);
   const [finalizingSteps, setFinalizingSteps] = useState<FinalizingStep[]>([]);
   const [finalizingError, setFinalizingError] = useState<string | null>(null);
+  // 会话在录制/暂停期间被服务端回收（reclaimStaleSessions 把长时间未活动的会话收成
+  // COMPLETED）。此后继续录制的内容不会保存到原会话 —— 置位后给出持久提示，避免用户
+  // 在毫不知情的情况下继续录、最后停止时静默丢失（审计 critical）。
+  const [sessionReclaimed, setSessionReclaimed] = useState(false);
   const [quotaSnapshot, setQuotaSnapshot] = useState<UserQuotas | null>(cachedQuotas);
   const [billingNotice, setBillingNotice] = useState<{
     tone: 'info' | 'warning';
@@ -607,19 +616,33 @@ export default function ActiveSessionPage() {
     void loadQuotaSnapshot();
   }, [loadQuotaSnapshot, token]);
 
-  // v2.1: Helper to sync session status with backend
-  const syncSessionStatus = useCallback(async (status: SessionStatus) => {
-    if (!token) return;
-    try {
-      await fetch(`/api/sessions/${sessionId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ status }),
-      });
-    } catch {
-      console.error(`Failed to sync session status to ${status}`);
-    }
-  }, [token, sessionId]);
+  // v2.1: Helper to sync session status with backend.
+  // 返回结果分类（见 classifyStatusSync）：调用方据此感知「会话已被服务端回收」——
+  // 4xx（Invalid status transition）说明会话已到 COMPLETED/ARCHIVED/FINALIZING，
+  // 继续录制的内容不会保存到原会话（审计 critical：回收后静默丢录音的一环）。
+  const syncSessionStatus = useCallback(
+    async (status: SessionStatus): Promise<StatusSyncResult> => {
+      if (!token) return 'network-error';
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ status }),
+        });
+        const result = classifyStatusSync({ ok: res.ok, status: res.status });
+        if (result === 'rejected') {
+          console.warn(
+            `Session status sync to ${status} rejected (${res.status}); session likely reclaimed`
+          );
+        }
+        return result;
+      } catch {
+        console.error(`Failed to sync session status to ${status}`);
+        return 'network-error';
+      }
+    },
+    [token, sessionId]
+  );
 
   const maxSessionDurationMs = user
     ? getMaxSessionDurationMs(user.role)
@@ -916,12 +939,23 @@ export default function ActiveSessionPage() {
   useEffect(() => {
     if (!sessionChecked) return;
     if (finalizingError) return;
-    if (recordingState === 'recording') {
-      syncSessionStatus('RECORDING');
-    } else if (recordingState === 'paused') {
-      syncSessionStatus('PAUSED');
-    }
+    if (recordingState !== 'recording' && recordingState !== 'paused') return;
+    const target: SessionStatus = recordingState === 'recording' ? 'RECORDING' : 'PAUSED';
+    void syncSessionStatus(target).then((result) => {
+      // 后端拒绝把会话置回录制态（4xx）→ 会话已被回收/收尾。仅提示，不做破坏性动作
+      // （网络瞬断归为 network-error，不会误触发）；真正防丢在停止时的 finalize 分支。
+      if (result === 'rejected') setSessionReclaimed(true);
+    });
   }, [finalizingError, recordingState, sessionChecked, syncSessionStatus]);
+
+  // 会话被回收的持久提示：从 false→true 只触发一次，让用户在录制途中就知情，而不是
+  // 等到停止时才发现续录内容没保存。
+  useEffect(() => {
+    if (!sessionReclaimed) return;
+    const message = t('session.notices.sessionReclaimed');
+    setBillingNotice({ tone: 'warning', message });
+    toast.error(message);
+  }, [sessionReclaimed, t]);
 
   // 录制期间每 15 秒自动上传转录稿草稿到服务器
   const transcriptDraftTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1214,13 +1248,31 @@ export default function ActiveSessionPage() {
           title: sessionTitle,
         }),
       });
-      if (!finalizeRes.ok) {
-        const data = await finalizeRes.json().catch(() => ({}));
-        throw new Error(
-          typeof data.error === 'string' ? data.error : t('session.finalizing.failed')
-        );
+      const finalizeBody = await finalizeRes.json().catch(() => ({}));
+      const outcome = resolveFinalizeOutcome(finalizeRes.ok, finalizeBody);
+
+      if (outcome.kind === 'error') {
+        throw new Error(outcome.message ?? t('session.finalizing.failed'));
       }
 
+      if (outcome.kind === 'already-completed') {
+        // 会话已在本客户端之外被收尾（服务端 reclaimStaleSessions 回收 / 另一标签抢先）。
+        // 本次带上的 segments/音频未被服务端采纳 —— 本地缓存可能是唯一完整副本，绝不清空。
+        // 给出专门提示、保留 sessionStorage 与 IndexedDB 音频，不跳回放（避免用户以为正常）。
+        steps[2].status = 'done';
+        setFinalizingSteps([...steps]);
+        clearPendingSessionTerms();
+        const store = useTranscriptStore.getState();
+        store.setConnectionState('error');
+        store.setRecordingState('paused');
+        isFinalizingRef.current = false;
+        setIsFinalizing(false); // 收起收尾遮罩，否则会常驻盖住页面
+        setSessionReclaimed(true);
+        setFinalizingError(t('session.finalizing.staleCompleted'));
+        return;
+      }
+
+      // outcome.kind === 'ok'：服务端已采纳本地数据，清缓存安全。
       // 录制完成后自动停止分享，但保留链接供回放访问
       if (isSharing) {
         await stopSharing(sessionId, { keepForPlayback: true });

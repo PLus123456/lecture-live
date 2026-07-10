@@ -46,6 +46,11 @@ interface UseSonioxOptions {
   onAutoResume?: (reason: 'disconnect') => void;
   /** 断网自动重连达上限、放弃重连时触发（供上层弹出「重连失败，请手动继续」提示）。 */
   onReconnectFailed?: () => void;
+  /**
+   * 断网续采：网络断开但本地采集仍在继续（音频照常写入，只有 Soniox 转录连接中断）时触发。
+   * 与 onAutoPause 的区别在于「录音没有暂停」——供上层提示「转录暂停但录音继续」，而非「已暂停」。
+   */
+  onTranscriptionInterrupted?: () => void;
 }
 
 export function useSoniox(
@@ -103,6 +108,7 @@ export function useSoniox(
   const onAutoPause = options.onAutoPause;
   const onAutoResume = options.onAutoResume;
   const onReconnectFailed = options.onReconnectFailed;
+  const onTranscriptionInterrupted = options.onTranscriptionInterrupted;
 
   const markAudioActivity = useCallback(() => {
     lastAudioActivityAtRef.current = Date.now();
@@ -626,6 +632,29 @@ export function useSoniox(
       // 连接刚断，取消尚未触发的稳定复位，让本次断网计入重连计数。
       cancelStableConn();
 
+      // ── 断网续采 ──
+      // 网络断开、但本地采集(MediaRecorder)仍活着时：只停 Soniox 转录发送，让 archiveManager
+      // 继续把音频写入 IndexedDB —— 断网空档的音频不再丢失（转录空洞留待重连后 Soniox 从连续
+      // offset 续接 / 后续异步补全）。recordingState 保持 'recording'，不进暂停语义、不 setPausedAt，
+      // 时间轴连续、offset 不需扣除断网空档。仅在本地采集也不可用时才回退到完整暂停。
+      if (reason === 'disconnect' && archiveManagerRef.current?.hasLiveCapture()) {
+        shouldReconnectRef.current = true;
+        const current = recordingRef.current;
+        recordingRef.current = null;
+        runIdRef.current += 1;
+        try {
+          await current?.recording.stop?.();
+        } catch (error) {
+          console.error('Error stopping Soniox during disconnect (continuous capture):', error);
+        }
+        processorRef.current?.onEndpoint();
+        // 不 pause archiveManager、不 setPausedAt、recordingState 保持 recording
+        setConnectionState('reconnecting');
+        autoPauseReasonRef.current = 'disconnect';
+        onTranscriptionInterrupted?.();
+        return;
+      }
+
       if (reason === 'disconnect') {
         shouldReconnectRef.current = true;
       } else {
@@ -660,7 +689,14 @@ export function useSoniox(
       autoPauseReasonRef.current = reason;
       onAutoPause?.(reason);
     },
-    [cancelStableConn, onAutoPause, setConnectionState, setPausedAt, setRecordingState]
+    [
+      cancelStableConn,
+      onAutoPause,
+      onTranscriptionInterrupted,
+      setConnectionState,
+      setPausedAt,
+      setRecordingState,
+    ]
   );
 
   // 内部重连函数 — 断网后自动尝试重新建立 Soniox 连接
@@ -1215,7 +1251,13 @@ export function useSoniox(
     }
 
     const interval = window.setInterval(() => {
-      if (useTranscriptStore.getState().recordingState !== 'recording') {
+      const store = useTranscriptStore.getState();
+      if (store.recordingState !== 'recording') {
+        return;
+      }
+      // 断网续采期间转录连接未连上，没有 Soniox token/电平活动属正常现象，绝不能据此按
+      // idle 自动暂停打断正在继续的本地录音（否则断网续采会在 5min 后被误暂停）。
+      if (store.connectionState !== 'connected') {
         return;
       }
 

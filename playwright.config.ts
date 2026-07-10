@@ -16,9 +16,28 @@ export default defineConfig({
   },
   projects: [
     {
+      // 常规 e2e：用 installBrowserStubs 的假音频 API（不真录音）。
       name: 'chromium',
+      testIgnore: /recording-offline-capture/,
       use: {
         ...devices['Desktop Chrome'],
+      },
+    },
+    {
+      // 需要真实录音（archiveManager 真录、hasLiveCapture 为真）的 e2e：用 chromium 假麦克风
+      // 提供真实音频轨 + 自动授权。仅限断网续采等必须驱动到真实录音态的用例，避免与常规
+      // e2e 的假音频桩冲突。
+      name: 'chromium-media',
+      testMatch: /recording-offline-capture/,
+      use: {
+        ...devices['Desktop Chrome'],
+        permissions: ['microphone'],
+        launchOptions: {
+          args: [
+            '--use-fake-device-for-media-stream',
+            '--use-fake-ui-for-media-stream',
+          ],
+        },
       },
     },
   ],

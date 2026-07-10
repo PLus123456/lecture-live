@@ -234,10 +234,14 @@ export async function finalizeSession(
       (session.durationMs ?? 0) === 0
         ? Math.max(0, normalizedClientDurationMs ?? 0)
         : 0;
+    // 自动回收（客户端崩溃/长时间无活动被 reclaim）时不信服务端墙钟时长：serverStartedAt 到
+    // now 的墙钟含全部暂停/挂机空闲，客户端没能上报暂停时会把空闲整段当录音计费、超额扣配额
+    // （审计 medium）。此路径改以实际转录覆盖的时长为准（更接近真实录音量，宁少勿多）。
+    const isAutoReclaim = options.finalizeSource === 'system_auto_reclaim';
     const resolvedDurationMs = Math.max(
       session.durationMs ?? 0,
       transcriptDurationMs,
-      serverDurationMs,
+      isAutoReclaim ? 0 : serverDurationMs,
       legacyDurationFallbackMs
     );
     const finalDurationMs = clampSessionDurationMs(
@@ -269,6 +273,10 @@ export async function finalizeSession(
     // 无 clientBundle 的重试会用空数据覆写永久转录、孤立录音——不可恢复的数据丢失。
     let shouldDeleteRecordingDraft = false;
     let shouldDeleteTranscriptDraft = false;
+    // 本次收尾是否真正产出了 recordingPath。只有产出时才在提交事务里回写它，否则不覆盖
+    // 数据库当前值 —— 否则会用「事前快照的 recordingPath」覆盖并发的 audio/draft/finalize
+    // 刚写入的更新录音路径（审计 medium：竞态覆盖已定稿录音）。
+    let recordingPathResolvedHere = false;
 
     if (!recordingPath) {
       const merged = await mergeRecordingDraftChunks(session);
@@ -285,6 +293,7 @@ export async function finalizeSession(
           merged.manifest.mimeType
         );
         recordingPath = storedAudio.path;
+        recordingPathResolvedHere = true;
         shouldDeleteRecordingDraft = true;
       } else {
         recordingMissing = true;
@@ -319,7 +328,8 @@ export async function finalizeSession(
         },
         data: {
           status: 'COMPLETED',
-          recordingPath,
+          // 只在本次真正产出录音时才回写 recordingPath，避免用事前快照覆盖并发写入的新值。
+          ...(recordingPathResolvedHere ? { recordingPath } : {}),
           transcriptPath,
           summaryPath,
           finalizeLockedAt: null,
@@ -528,12 +538,30 @@ async function resolveTranscriptBundle(
   session: FinalizeSessionRecord,
   clientBundle?: PersistedTranscriptBundle | null
 ): Promise<PersistedTranscriptBundle | null> {
-  if (clientBundle && clientBundle.segments.length > 0) {
-    return clientBundle;
+  const draft = await loadTranscriptDraft(session);
+  const draftSegs = draft?.segments.length ?? 0;
+  const clientSegs = clientBundle?.segments.length ?? 0;
+
+  // 取段数更多的一方为主转录（防陈旧标签用更短的 clientBundle 覆盖服务端更完整的草稿——
+  // 转录只增不减，段数是完整度的可靠代理；审计 medium）。summaries/translations 取任一非空。
+  // 段数相同时优先 clientBundle（本次收尾请求，通常最新）。
+  const pickClient = clientSegs > 0 && clientSegs >= draftSegs;
+
+  if (pickClient && clientBundle) {
+    return {
+      segments: clientBundle.segments,
+      summaries:
+        clientBundle.summaries?.length > 0
+          ? clientBundle.summaries
+          : (draft?.summaries ?? []),
+      translations:
+        Object.keys(clientBundle.translations ?? {}).length > 0
+          ? clientBundle.translations
+          : (draft?.translations ?? {}),
+    };
   }
 
-  const draft = await loadTranscriptDraft(session);
-  if (draft && draft.segments.length > 0) {
+  if (draft && draftSegs > 0) {
     return {
       segments: draft.segments,
       summaries:

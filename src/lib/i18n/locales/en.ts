@@ -250,6 +250,8 @@ export default {
         'Only {minutes} minute(s) of transcription quota remain. The recording will stop automatically when quota is exhausted.',
       quotaExhaustedStop:
         'This month\'s transcription quota has been exhausted. Saving and stopping the current recording now.',
+      sessionReclaimed:
+        'This recording was already ended on the server, so anything recorded now will not be saved to the original session. Please stop and export your local recording.',
     },
     finalizing: {
       title: 'Finalizing Session',
@@ -259,6 +261,8 @@ export default {
       stepFinalize: 'Finalizing on server',
       missingToken: 'Missing authentication token',
       failed: 'Failed to finalize session',
+      staleCompleted:
+        'This recording was already ended on the server (it may have been reclaimed after a long pause), so anything recorded afterward was not saved to the original session. Your local recording has been kept — please export it or contact an administrator to recover it.',
     },
     status: {
       error: 'Error',

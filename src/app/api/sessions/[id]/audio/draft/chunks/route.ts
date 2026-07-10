@@ -10,6 +10,10 @@ import {
 import { persistRecordingDraftChunk } from '@/lib/recordingDraftPersistence';
 
 const MAX_CHUNK_BYTES = 2 * 1024 * 1024;
+// 单会话草稿分片总数上界（约 69 小时 @ 每 5s 一片，上界写盘 ~100GB/会话）。配合 owner 认证 +
+// 终态守卫，取代 #156 移除的按请求速率限流 —— 后者会误伤「服务端缺片→增量补传」，前者按
+// 分片数配额限制、防单用户无限写盘耗尽磁盘（审计 high），且不阻碍正常补传。
+const MAX_DRAFT_CHUNKS_PER_SESSION = 50_000;
 
 export async function POST(
   req: Request,
@@ -39,6 +43,16 @@ export async function POST(
     assertOwnership(user.id, session.userId);
   } catch {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
+  }
+
+  // 终态守卫：已 COMPLETED/ARCHIVED 的会话不再接受草稿分片写入，防止被回收/收尾后的会话
+  // 继续被写盘（审计）。仍允许 CREATED/RECORDING/PAUSED/FINALIZING —— 收尾中(FINALIZING)
+  // 的增量补传必须放行，否则尾部音频传不上去。
+  if (session.status === 'COMPLETED' || session.status === 'ARCHIVED') {
+    return NextResponse.json(
+      { error: 'Session already finalized; draft chunks no longer accepted' },
+      { status: 409 }
+    );
   }
 
   try {
@@ -72,7 +86,10 @@ export async function POST(
       );
     }
 
-    const seq = parsePositiveInteger(seqInput, { min: 0, max: 1_000_000 });
+    const seq = parsePositiveInteger(seqInput, {
+      min: 0,
+      max: MAX_DRAFT_CHUNKS_PER_SESSION,
+    });
     const buffer = Buffer.from(await file.arrayBuffer());
     const manifest = await persistRecordingDraftChunk(session, {
       seq,

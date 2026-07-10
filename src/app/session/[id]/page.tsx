@@ -12,6 +12,12 @@ import MobileSessionLayout from '@/components/mobile/MobileSessionLayout';
 import LiveShareBadge from '@/components/session/LiveShareBadge';
 import { useI18n } from '@/lib/i18n';
 import { mergeSessionTerms } from '@/lib/keywords/sessionTerms';
+import {
+  classifyStatusSync,
+  resolveFinalizeOutcome,
+  deriveRecoveryMode,
+  type StatusSyncResult,
+} from '@/lib/session/recordingLifecycle';
 import { summaryBlocksToResponses } from '@/lib/summary';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -494,6 +500,14 @@ export default function ActiveSessionPage() {
   const isFinalizingRef = useRef(false);
   const [finalizingSteps, setFinalizingSteps] = useState<FinalizingStep[]>([]);
   const [finalizingError, setFinalizingError] = useState<string | null>(null);
+  // 会话在录制/暂停期间被服务端回收（reclaimStaleSessions 把长时间未活动的会话收成
+  // COMPLETED）。此后继续录制的内容不会保存到原会话 —— 置位后给出持久提示，避免用户
+  // 在毫不知情的情况下继续录、最后停止时静默丢失（审计 critical）。
+  const [sessionReclaimed, setSessionReclaimed] = useState(false);
+  // 本标签是否已取得录音控制权（用户在此标签主动开始/继续录音）。仅用于抑制「被动观察标签」
+  // 的状态回写：在另一标签打开正在录音的会话时会走 resume-cold 冷恢复、把本地态设为 paused，
+  // 若无此守卫会 PATCH 后端 PAUSED、掐停另一标签正在进行的录音（审计 medium）。
+  const recordingControlRef = useRef(false);
   const [quotaSnapshot, setQuotaSnapshot] = useState<UserQuotas | null>(cachedQuotas);
   const [billingNotice, setBillingNotice] = useState<{
     tone: 'info' | 'warning';
@@ -570,17 +584,10 @@ export default function ActiveSessionPage() {
   //  - live-refresh: 后端 RECORDING/PAUSED 且本地也在录 → 同标签刷新，恢复为 paused 展示、不自动开麦
   //  - resume-cold: 后端 RECORDING/PAUSED 但本地无录音态 → 冷设备/丢本地，从后端 draft 恢复
   //  - fresh      : 其它（新会话等）
-  const recoveryMode = useMemo(() => {
-    if (!sessionChecked) return 'pending' as const;
-    if (backendStatus === 'COMPLETED' || backendStatus === 'ARCHIVED') return 'terminal' as const;
-    if (backendStatus === 'FINALIZING') return 'finalizing' as const;
-    if (backendStatus === 'RECORDING' || backendStatus === 'PAUSED') {
-      return initialRecordingState === 'recording' || initialRecordingState === 'paused'
-        ? ('live-refresh' as const)
-        : ('resume-cold' as const);
-    }
-    return 'fresh' as const;
-  }, [sessionChecked, backendStatus, initialRecordingState]);
+  const recoveryMode = useMemo(
+    () => deriveRecoveryMode(sessionChecked, backendStatus, initialRecordingState),
+    [sessionChecked, backendStatus, initialRecordingState]
+  );
 
   // Service availability check on mount
   const [serviceAvailable, setServiceAvailable] = useState<boolean | null>(null);
@@ -607,19 +614,33 @@ export default function ActiveSessionPage() {
     void loadQuotaSnapshot();
   }, [loadQuotaSnapshot, token]);
 
-  // v2.1: Helper to sync session status with backend
-  const syncSessionStatus = useCallback(async (status: SessionStatus) => {
-    if (!token) return;
-    try {
-      await fetch(`/api/sessions/${sessionId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ status }),
-      });
-    } catch {
-      console.error(`Failed to sync session status to ${status}`);
-    }
-  }, [token, sessionId]);
+  // v2.1: Helper to sync session status with backend.
+  // 返回结果分类（见 classifyStatusSync）：调用方据此感知「会话已被服务端回收」——
+  // 4xx（Invalid status transition）说明会话已到 COMPLETED/ARCHIVED/FINALIZING，
+  // 继续录制的内容不会保存到原会话（审计 critical：回收后静默丢录音的一环）。
+  const syncSessionStatus = useCallback(
+    async (status: SessionStatus): Promise<StatusSyncResult> => {
+      if (!token) return 'network-error';
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ status }),
+        });
+        const result = classifyStatusSync({ ok: res.ok, status: res.status });
+        if (result === 'rejected') {
+          console.warn(
+            `Session status sync to ${status} rejected (${res.status}); session likely reclaimed`
+          );
+        }
+        return result;
+      } catch {
+        console.error(`Failed to sync session status to ${status}`);
+        return 'network-error';
+      }
+    },
+    [token, sessionId]
+  );
 
   const maxSessionDurationMs = user
     ? getMaxSessionDurationMs(user.role)
@@ -916,12 +937,27 @@ export default function ActiveSessionPage() {
   useEffect(() => {
     if (!sessionChecked) return;
     if (finalizingError) return;
-    if (recordingState === 'recording') {
-      syncSessionStatus('RECORDING');
-    } else if (recordingState === 'paused') {
-      syncSessionStatus('PAUSED');
-    }
-  }, [finalizingError, recordingState, sessionChecked, syncSessionStatus]);
+    if (recordingState !== 'recording' && recordingState !== 'paused') return;
+    // 只有本标签取得录音控制权（主动开始/继续），或是同标签刷新恢复（live-refresh，原录音
+    // 标签），才回写录制态。否则「另一标签打开正在录音的会话」(resume-cold 观察者，本地被
+    // 冷恢复设为 paused) 会 PATCH 后端 PAUSED、掐停另一标签正在进行的录音（审计 medium）。
+    if (!recordingControlRef.current && recoveryMode !== 'live-refresh') return;
+    const target: SessionStatus = recordingState === 'recording' ? 'RECORDING' : 'PAUSED';
+    void syncSessionStatus(target).then((result) => {
+      // 后端拒绝把会话置回录制态（4xx）→ 会话已被回收/收尾。仅提示，不做破坏性动作
+      // （网络瞬断归为 network-error，不会误触发）；真正防丢在停止时的 finalize 分支。
+      if (result === 'rejected') setSessionReclaimed(true);
+    });
+  }, [finalizingError, recordingState, sessionChecked, syncSessionStatus, recoveryMode]);
+
+  // 会话被回收的持久提示：从 false→true 只触发一次，让用户在录制途中就知情，而不是
+  // 等到停止时才发现续录内容没保存。
+  useEffect(() => {
+    if (!sessionReclaimed) return;
+    const message = t('session.notices.sessionReclaimed');
+    setBillingNotice({ tone: 'warning', message });
+    toast.error(message);
+  }, [sessionReclaimed, t]);
 
   // 录制期间每 15 秒自动上传转录稿草稿到服务器
   const transcriptDraftTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -940,44 +976,74 @@ export default function ActiveSessionPage() {
       return;
     }
 
+    const draftHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    };
+    const buildDraftBody = () => {
+      const tState = useTranscriptStore.getState();
+      const summaryState = useSummaryStore.getState();
+      return JSON.stringify({
+        segments: tState.segments,
+        summaries: summaryState.blocks,
+        translations: useTranslationStore.getState().translations,
+        clientTs: Date.now(),
+        recordingStartTime: tState.recordingStartTime,
+        pausedAt: tState.pausedAt,
+        totalPausedMs: tState.totalPausedMs,
+        totalDurationMs: tState.totalDurationMs,
+        summaryRunningContext: summaryState.runningContext,
+        currentSessionIndex: tState.currentSessionIndex,
+      });
+    };
+
     const uploadDraft = async () => {
       const currentSegments = useTranscriptStore.getState().segments;
       // 没有新 segment 时跳过
       if (currentSegments.length === 0 || currentSegments.length === lastDraftSegCountRef.current) {
         return;
       }
-      lastDraftSegCountRef.current = currentSegments.length;
-
-      const summaryState = useSummaryStore.getState();
-      const currentSummaries = summaryState.blocks;
-      const currentTranslations = useTranslationStore.getState().translations;
-      const tState = useTranscriptStore.getState();
+      const attemptedCount = currentSegments.length;
 
       try {
-        await fetch(`/api/sessions/${sessionId}/transcript/draft`, {
+        const res = await fetch(`/api/sessions/${sessionId}/transcript/draft`, {
           method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers: draftHeaders,
           keepalive: true,
-          body: JSON.stringify({
-            segments: currentSegments,
-            summaries: currentSummaries,
-            translations: currentTranslations,
-            clientTs: Date.now(),
-            recordingStartTime: tState.recordingStartTime,
-            pausedAt: tState.pausedAt,
-            totalPausedMs: tState.totalPausedMs,
-            totalDurationMs: tState.totalDurationMs,
-            summaryRunningContext: summaryState.runningContext,
-            currentSessionIndex: tState.currentSessionIndex,
-          }),
+          body: buildDraftBody(),
         });
+        // 只在成功后推进已上传段数：否则一次瞬时失败/非 2xx 会把这批段永久标记为「已传」，
+        // 该快照永不重传（审计 medium）。失败则保持不变，下个周期重试。
+        if (res.ok) {
+          lastDraftSegCountRef.current = attemptedCount;
+        }
       } catch {
-        // 静默失败，下次重试
+        // 静默失败，保持 lastDraftSegCountRef 不变，下次重试
       }
     };
+
+    // 关标签/切后台时立即冲刷最新转录 draft（keepalive 保证 unload 过程中也能送达），否则
+    // 最后 <15s 的转录段在真关标签时冷恢复丢失（审计 medium：unload 只冲音频不传转录 draft）。
+    const flushDraftForUnload = () => {
+      if (useTranscriptStore.getState().segments.length === 0) return;
+      try {
+        void fetch(`/api/sessions/${sessionId}/transcript/draft`, {
+          method: 'PUT',
+          headers: draftHeaders,
+          keepalive: true,
+          body: buildDraftBody(),
+        });
+      } catch {
+        /* best-effort on unload */
+      }
+    };
+    const handlePageHide = () => flushDraftForUnload();
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') flushDraftForUnload();
+    };
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('beforeunload', handlePageHide);
+    document.addEventListener('visibilitychange', handleVisibility);
 
     // 启动后立即上传一次，然后每 15 秒一次
     void uploadDraft();
@@ -988,6 +1054,9 @@ export default function ActiveSessionPage() {
         clearInterval(transcriptDraftTimerRef.current);
         transcriptDraftTimerRef.current = null;
       }
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('beforeunload', handlePageHide);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [recordingState, token, sessionId]);
 
@@ -1182,7 +1251,7 @@ export default function ActiveSessionPage() {
       const translationEntries = useTranslationStore.getState().translations;
 
       // 并行：上传最新转录 draft + 同步剩余音频 chunks
-      await Promise.allSettled([
+      const draftResults = await Promise.allSettled([
         fetch(`/api/sessions/${sessionId}/transcript/draft`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -1196,6 +1265,10 @@ export default function ActiveSessionPage() {
         }),
         finalizeRemoteDraft().catch(() => false),
       ]);
+      // 音频分片是否已完整补传到服务端 —— 决定停止后能否安全清本地 IndexedDB 音频。
+      // finalizeRemoteDraft 在补传不完整（持续 429/断网）时返回 false（审计 high）。
+      const audioDraftComplete =
+        draftResults[1].status === 'fulfilled' && draftResults[1].value === true;
 
       steps[1].status = 'done';
       steps[2].status = 'active';
@@ -1214,13 +1287,31 @@ export default function ActiveSessionPage() {
           title: sessionTitle,
         }),
       });
-      if (!finalizeRes.ok) {
-        const data = await finalizeRes.json().catch(() => ({}));
-        throw new Error(
-          typeof data.error === 'string' ? data.error : t('session.finalizing.failed')
-        );
+      const finalizeBody = await finalizeRes.json().catch(() => ({}));
+      const outcome = resolveFinalizeOutcome(finalizeRes.ok, finalizeBody);
+
+      if (outcome.kind === 'error') {
+        throw new Error(outcome.message ?? t('session.finalizing.failed'));
       }
 
+      if (outcome.kind === 'already-completed') {
+        // 会话已在本客户端之外被收尾（服务端 reclaimStaleSessions 回收 / 另一标签抢先）。
+        // 本次带上的 segments/音频未被服务端采纳 —— 本地缓存可能是唯一完整副本，绝不清空。
+        // 给出专门提示、保留 sessionStorage 与 IndexedDB 音频，不跳回放（避免用户以为正常）。
+        steps[2].status = 'done';
+        setFinalizingSteps([...steps]);
+        clearPendingSessionTerms();
+        const store = useTranscriptStore.getState();
+        store.setConnectionState('error');
+        store.setRecordingState('paused');
+        isFinalizingRef.current = false;
+        setIsFinalizing(false); // 收起收尾遮罩，否则会常驻盖住页面
+        setSessionReclaimed(true);
+        setFinalizingError(t('session.finalizing.staleCompleted'));
+        return;
+      }
+
+      // outcome.kind === 'ok'：服务端已采纳本地数据，清缓存安全。
       // 录制完成后自动停止分享，但保留链接供回放访问
       if (isSharing) {
         await stopSharing(sessionId, { keepForPlayback: true });
@@ -1230,17 +1321,25 @@ export default function ActiveSessionPage() {
       setFinalizingSteps([...steps]);
       clearPendingSessionTerms();
 
-      // 清除本地缓存（已由服务端持久化）
+      // 清除本地缓存（已由服务端持久化）。转录随 session finalize body 完整提交，可清；
+      // 音频只有在确认完整补传到服务端后才清 IndexedDB，否则保留本地完整副本防尾部丢失。
       try {
         sessionStorage.removeItem('lecture-live-transcript');
         sessionStorage.removeItem('lecture-live-translations');
         sessionStorage.removeItem('lecture-live-summary');
         sessionStorage.removeItem('lecture-live-archive-mime');
       } catch { /* silent */ }
-      try {
-        const { clearAudioChunks } = await import('@/lib/audio/audioChunkStore');
-        await clearAudioChunks(sessionId);
-      } catch { /* silent */ }
+      if (audioDraftComplete) {
+        try {
+          const { clearAudioChunks } = await import('@/lib/audio/audioChunkStore');
+          await clearAudioChunks(sessionId);
+        } catch { /* silent */ }
+      } else {
+        // 音频未完整补传（退避/断网）：保留本地 IndexedDB 完整副本，避免停止即丢尾部（审计 high）。
+        console.warn(
+          'Audio draft incomplete at stop; keeping local audio chunks for recovery'
+        );
+      }
 
       setTimeout(() => {
         router.push(`/session/${sessionId}/playback`);
@@ -1275,6 +1374,8 @@ export default function ActiveSessionPage() {
 
   const handleStartRecording = useCallback(async () => {
     setBillingNotice(null);
+    // 用户在本标签主动开始/继续 → 本标签取得录音控制权，此后才允许把录制态回写后端。
+    recordingControlRef.current = true;
 
     if (recordingState === 'paused') {
       await startRecording();
@@ -1399,12 +1500,15 @@ export default function ActiveSessionPage() {
     if (!token || !sessionChecked) return;
     if (recoveryMode !== 'live-refresh') return;
     if (!wasRecordingRef.current) return;
-    // Store 有录音状态但连接已断开 → 刷新恢复场景
+    // 只依赖单一权威 recoveryMode + 本地录音态。**不再查 connectionState** —— 它不进
+    // partialize 持久化，SPA 导航返回时内存里残留 'connected' 会使原条件恒假，
+    // reconnectAfterRefresh 永不触发 → 「返回后 UI 显示录音中但麦克风已死」的假录音僵尸
+    // （审计 high）。live-refresh 场景下连接必然已断（刷新销毁 / 卸载已 stop 硬件），
+    // 无需再用易残留的旧信号二次确认。
     const storeState = useTranscriptStore.getState();
-    if ((storeState.recordingState === 'recording' || storeState.recordingState === 'paused') &&
-        storeState.connectionState === 'disconnected') {
+    if (storeState.recordingState === 'recording' || storeState.recordingState === 'paused') {
       refreshReconnectFired.current = true;
-      console.log('Detected refresh during recording, restoring to paused (no auto mic)...');
+      console.log('Detected refresh/return during recording, restoring to paused (no auto mic)...');
       reconnectAfterRefresh();
     }
   }, [token, sessionChecked, recoveryMode, reconnectAfterRefresh]);

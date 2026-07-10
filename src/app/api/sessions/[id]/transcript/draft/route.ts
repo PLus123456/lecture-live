@@ -43,6 +43,16 @@ export async function PUT(
     return result.error;
   }
 
+  // 终态守卫：会话已 COMPLETED/ARCHIVED 后拒绝草稿写入，否则 finalize 删草稿之后迟到的
+  // keepalive PUT（unload 冲刷）会重新创建草稿目录、永不再被清理（磁盘泄漏 + 冷恢复误读）。
+  // 放行 FINALIZING —— 收尾流程在 finalize 前的最后一次 draft PUT 仍需落盘（审计 low）。
+  if (result.session.status === 'COMPLETED' || result.session.status === 'ARCHIVED') {
+    return NextResponse.json(
+      { error: 'Session already finalized; draft writes no longer accepted' },
+      { status: 409 }
+    );
+  }
+
   try {
     const body = await req.json();
 

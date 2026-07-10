@@ -241,6 +241,7 @@ export default {
       maxDurationReached: '本次录制已达时长上限 {duration}，系统正在自动结束并保存。',
       lowQuotaWarning: '剩余转写额度不足 {minutes} 分钟，额度耗尽后将自动结束本次录制。',
       quotaExhaustedStop: '本月转写额度已耗尽，系统正在自动结束并保存当前录制。',
+      sessionReclaimed: '本场录音已在服务器结束，继续录制的内容不会保存到原会话。请停止并导出本地录音。',
     },
     finalizing: {
       title: '正在保存会话',
@@ -250,6 +251,7 @@ export default {
       stepFinalize: '正在服务端完成保存',
       missingToken: '认证令牌缺失',
       failed: '保存失败',
+      staleCompleted: '本场录音已在服务器结束（可能因长时间暂停被系统回收），之后录制的内容未能保存到原会话。本地录音已保留，请导出留存或联系管理员恢复。',
     },
     status: {
       error: '错误',

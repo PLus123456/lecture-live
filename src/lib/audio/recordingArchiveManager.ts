@@ -177,6 +177,17 @@ export class RecordingArchiveManager {
     this.onChunkStored = handler;
   }
 
+  /**
+   * 把下一个分片序号推进到至少 minSeq，防止跨设备/清缓存续录时本地 seq 从 0 重启、
+   * 与服务端残留旧 draft 的 seq 撞号（撞号会被 uploadDraftChunk 误判「已上传」而跳过补传，
+   * 收尾合并出旧音频、新音频被丢）。仅前进不后退，保证 seq 单调。审计 high。
+   */
+  ensureSeqAbove(minSeq: number): void {
+    if (Number.isFinite(minSeq) && minSeq > this.nextSeq) {
+      this.nextSeq = minSeq;
+    }
+  }
+
   async stop(): Promise<void> {
     await this.ensureSessionRecord('finalizing');
 
@@ -285,6 +296,13 @@ export class RecordingArchiveManager {
       const write = Promise.all([persistChunk, notifyChunk])
         .then(async ([didPersist, didNotify]) => {
           if (!didPersist && !didNotify) {
+            // 本地 IndexedDB 写入与服务端上传双双失败：该分片既没落本地也没传服务端，
+            // nextSeq 已递增 → 归档将出现无法恢复的 seq 空洞。不再静默吞（旧行为直接 return），
+            // 至少告警使问题可诊断/上层可感知（审计 medium：IDB 写失败静默出洞）。
+            console.error(
+              `[archive] chunk seq=${seq} 本地写入与上传均失败，归档出现空洞，` +
+                `session=${this.sessionId}`
+            );
             return;
           }
           await this.ensureSessionRecord(archiveStatus);

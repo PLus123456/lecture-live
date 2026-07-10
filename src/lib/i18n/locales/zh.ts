@@ -236,6 +236,7 @@ export default {
       idleAutoPause: '已因 5 分钟无音频自动暂停，点击「继续」可恢复录制。',
       disconnectPaused: '连接中断，录制计时已暂停，恢复连接后将自动继续。',
       disconnectResumed: '连接已恢复，录制继续进行。',
+      transcriptionInterrupted: '网络中断，实时转录已暂停 —— 但录音仍在继续保存，恢复连接后会自动接续，断网期间的内容可稍后补全转录。',
       reconnectFailed: '连接已断开且自动重连失败，请点击「继续」手动重连。',
       quotaExhaustedStart: '本月转写额度已用尽，当前账号无法开始新的录制。',
       maxDurationReached: '本次录制已达时长上限 {duration}，系统正在自动结束并保存。',

@@ -97,6 +97,17 @@ model Session {
   asyncTranscribeError     String?   @db.Text
   asyncTranscribeStartedAt DateTime?
 
+  // 完整版补全转录：对已录制会话的完整音频（含断网续采段）重跑一次 Soniox 异步文件转录，
+  // 产出一份「独立并列」的完整转录（不覆盖实时 transcriptPath）。与上述 async-upload 状态机
+  // 完全分离，各自独立字段，避免 reclaimStaleAsyncUploads 等误处理。
+  // 状态机：pending → transcoding → transcribing → finalizing → completed / failed
+  fullTranscriptPath        String?   // e.g., "/{userId}/full-transcripts/{sessionId}.json"
+  fullTranscribeStatus      String?
+  fullTranscribeError       String?   @db.Text
+  fullTranscribeStartedAt   DateTime?
+  fullSonioxFileId          String?
+  fullSonioxTranscriptionId String?
+
   shareLinks      ShareLink[]
   folders         FolderSession[]
   conversations   Conversation[]
@@ -104,6 +115,7 @@ model Session {
 
   @@index([userId])
   @@index([asyncTranscribeStatus])
+  @@index([fullTranscribeStatus])
 }
 
 model Folder {

@@ -495,6 +495,15 @@ export default function ActiveSessionPage() {
     });
   }, [t]);
 
+  const handleTranscriptionInterrupted = useCallback(() => {
+    // 断网续采：网络断开但本地录音继续。提示用户「转录暂停但录音仍在保存」，
+    // 区别于会真正暂停录音的断网提示。
+    setBillingNotice({
+      tone: 'info',
+      message: t('session.notices.transcriptionInterrupted'),
+    });
+  }, [t]);
+
   // v2.1: Finalization state
   const [isFinalizing, setIsFinalizing] = useState(false);
   const isFinalizingRef = useRef(false);
@@ -675,6 +684,7 @@ export default function ActiveSessionPage() {
     onAutoPause: handleAutoPauseNotice,
     onAutoResume: handleAutoResumeNotice,
     onReconnectFailed: handleReconnectFailedNotice,
+    onTranscriptionInterrupted: handleTranscriptionInterrupted,
   });
   const { initLocal, translateSentence, destroy: destroyTranslator } = useLocalTranslation({
     // 本地模型加载失败自动回退云端时，重建活跃 Soniox 会话使云翻译真正生效（U81）。

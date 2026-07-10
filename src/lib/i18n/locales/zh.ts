@@ -157,6 +157,17 @@ export default {
     quota: '配额',
     interfaceLanguage: '界面语言',
     interfaceLanguageDesc: '选择应用界面的显示语言。',
+    email: '邮箱',
+    currentPasswordPlaceholder: '输入当前密码',
+    newPasswordPlaceholder: '至少 8 个字符',
+    confirmPasswordPlaceholder: '再次输入新密码',
+    summaryProviderDesc: '控制由哪个已配置的 LLM 生成增量摘要。',
+    providerLoadError: '暂时无法加载已配置的服务商。',
+    transcriptSegment: '转录段落',
+    segmentSplitThreshold: '段落切分阈值',
+    segmentSplitDesc:
+      '当某个段落的文本高度超过可视区域的该百分比时，会在下一句结束处自动切分为新段落。设为 OFF 则完全由 ASR 引擎决定段落边界。数值越小段落越短，推荐 20%–30%。',
+    off: 'OFF',
   },
 
   // 侧边栏

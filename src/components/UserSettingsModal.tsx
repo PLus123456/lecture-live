@@ -44,7 +44,7 @@ export default function UserSettingsModal() {
   const [termsInput, setTermsInput] = useState(settings.terms.join(', '));
   const [providerOptions, setProviderOptions] = useState<ChatModelOption[]>([]);
   const [providerLoading, setProviderLoading] = useState(false);
-  const [providerError, setProviderError] = useState<string | null>(null);
+  const [providerError, setProviderError] = useState(false);
 
   useEffect(() => {
     setTermsInput(settings.terms.join(', '));
@@ -57,7 +57,7 @@ export default function UserSettingsModal() {
 
     let cancelled = false;
     setProviderLoading(true);
-    setProviderError(null);
+    setProviderError(false);
 
     fetch('/api/llm/models', {
       headers: { Authorization: `Bearer ${token}` },
@@ -75,7 +75,7 @@ export default function UserSettingsModal() {
       })
       .catch(() => {
         if (cancelled) return;
-        setProviderError('Unable to load configured providers right now.');
+        setProviderError(true);
       })
       .finally(() => {
         if (!cancelled) setProviderLoading(false);
@@ -176,7 +176,7 @@ export default function UserSettingsModal() {
       <div className={`relative bg-cream-50 rounded-2xl shadow-2xl border border-cream-200 w-full max-w-2xl max-h-[85vh] overflow-hidden flex flex-col mx-4 ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
         {/* 标题栏 */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 bg-white flex-shrink-0">
-          <h2 className="font-serif text-lg font-bold text-charcoal-800">Settings</h2>
+          <h2 className="font-serif text-lg font-bold text-charcoal-800">{t('settings.title')}</h2>
           <button
             onClick={() => setOpen(false)}
             className="w-8 h-8 rounded-lg flex items-center justify-center text-charcoal-400 hover:bg-cream-100 hover:text-charcoal-600 transition-colors"
@@ -191,20 +191,20 @@ export default function UserSettingsModal() {
           <section className="bg-white rounded-xl border border-cream-200 p-5">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
               <Settings className="w-4 h-4" />
-              Account
+              {t('settings.account')}
             </h3>
             {user && (
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
-                  <span className="text-charcoal-400">Name</span>
+                  <span className="text-charcoal-400">{t('settings.name')}</span>
                   <span className="text-charcoal-700">{user.displayName}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-charcoal-400">Email</span>
+                  <span className="text-charcoal-400">{t('settings.email')}</span>
                   <span className="text-charcoal-700">{user.email}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-charcoal-400">Plan</span>
+                  <span className="text-charcoal-400">{t('settings.plan')}</span>
                   <span className="text-charcoal-700">{user.role}</span>
                 </div>
               </div>
@@ -239,39 +239,39 @@ export default function UserSettingsModal() {
           <section className="bg-white rounded-xl border border-cream-200 p-5">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
               <Lock className="w-4 h-4" />
-              Change Password
+              {t('auth.changePassword')}
             </h3>
             <div className="space-y-3">
               <div>
-                <label className="block text-xs text-charcoal-400 mb-1">Current Password</label>
+                <label className="block text-xs text-charcoal-400 mb-1">{t('auth.currentPassword')}</label>
                 <input
                   type="password"
                   value={currentPassword}
                   onChange={(e) => setCurrentPassword(e.target.value)}
                   className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm"
-                  placeholder="Enter current password"
+                  placeholder={t('settings.currentPasswordPlaceholder')}
                   autoComplete="current-password"
                 />
               </div>
               <div>
-                <label className="block text-xs text-charcoal-400 mb-1">New Password</label>
+                <label className="block text-xs text-charcoal-400 mb-1">{t('auth.newPassword')}</label>
                 <input
                   type="password"
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
                   className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm"
-                  placeholder="At least 8 characters"
+                  placeholder={t('settings.newPasswordPlaceholder')}
                   autoComplete="new-password"
                 />
               </div>
               <div>
-                <label className="block text-xs text-charcoal-400 mb-1">Confirm New Password</label>
+                <label className="block text-xs text-charcoal-400 mb-1">{t('auth.confirmPassword')}</label>
                 <input
                   type="password"
                   value={confirmPassword}
                   onChange={(e) => setConfirmPassword(e.target.value)}
                   className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm"
-                  placeholder="Re-enter new password"
+                  placeholder={t('settings.confirmPasswordPlaceholder')}
                   autoComplete="new-password"
                 />
               </div>
@@ -285,7 +285,7 @@ export default function UserSettingsModal() {
                 disabled={pwLoading}
                 className="px-4 py-2 rounded-lg text-xs font-medium bg-rust-500 text-white hover:bg-rust-600 transition-colors disabled:opacity-50"
               >
-                {pwLoading ? 'Saving...' : 'Update Password'}
+                {pwLoading ? t('common.saving') : t('auth.updatePassword')}
               </button>
             </div>
           </section>
@@ -294,11 +294,11 @@ export default function UserSettingsModal() {
           <section className="bg-white rounded-xl border border-cream-200 p-5">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
               <Globe className="w-4 h-4" />
-              Language
+              {t('settings.language')}
             </h3>
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               <div>
-                <label className="block text-xs text-charcoal-400 mb-1">Source Language</label>
+                <label className="block text-xs text-charcoal-400 mb-1">{t('settings.sourceLang')}</label>
                 <LanguageSelect
                   value={settings.sourceLang}
                   onChange={settings.setSourceLang}
@@ -306,12 +306,12 @@ export default function UserSettingsModal() {
                 />
               </div>
               <div>
-                <label className="block text-xs text-charcoal-400 mb-1">Target Language</label>
+                <label className="block text-xs text-charcoal-400 mb-1">{t('settings.targetLang')}</label>
                 <LanguageSelect
                   value={settings.targetLang}
                   onChange={settings.setTargetLang}
                   allowNone
-                  noneLabel="None (Transcription Only)"
+                  noneLabel={t('settings.noTranslation')}
                   excludeCodes={[settings.sourceLang]}
                   displayMode="label"
                 />
@@ -323,11 +323,11 @@ export default function UserSettingsModal() {
           <section className="bg-white rounded-xl border border-cream-200 p-5">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
               <Cpu className="w-4 h-4" />
-              LLM & Summary
+              {t('settings.llmSummary')}
             </h3>
             <div className="space-y-4">
               <div>
-                <label className="block text-xs text-charcoal-400 mb-1">Summary Provider</label>
+                <label className="block text-xs text-charcoal-400 mb-1">{t('settings.summaryProvider')}</label>
                 <select
                   value={selectedProviderValue}
                   onChange={(e) =>
@@ -338,7 +338,7 @@ export default function UserSettingsModal() {
                   className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm"
                   disabled={providerLoading}
                 >
-                  <option value="__default__">Use platform default provider</option>
+                  <option value="__default__">{t('settings.usePlatformDefault')}</option>
                   {providerOptions.map((provider) => (
                     <option key={provider.name} value={provider.name}>
                       {provider.displayName}
@@ -350,19 +350,19 @@ export default function UserSettingsModal() {
                     )}
                 </select>
                 <p className="mt-1 text-[11px] text-charcoal-400">
-                  Controls which configured LLM handles incremental summaries.
+                  {t('settings.summaryProviderDesc')}{' '}
                   {selectedProviderMeta?.supportsThinking
-                    ? ' This provider supports deep reasoning in chat.'
-                    : ' This provider uses standard reasoning depth.'}
+                    ? t('settings.supportsDeepReasoning')
+                    : t('settings.standardReasoning')}
                 </p>
                 {providerError && (
-                  <p className="mt-1 text-[11px] text-red-500">{providerError}</p>
+                  <p className="mt-1 text-[11px] text-red-500">{t('settings.providerLoadError')}</p>
                 )}
               </div>
 
               <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
                 <div>
-                  <label className="block text-xs text-charcoal-400 mb-1">Summary Language</label>
+                  <label className="block text-xs text-charcoal-400 mb-1">{t('settings.summaryLanguage')}</label>
                   <LanguageSelect
                     value={settings.summaryLanguage}
                     onChange={settings.setSummaryLanguage}
@@ -371,7 +371,7 @@ export default function UserSettingsModal() {
                 </div>
 
                 <div>
-                  <label className="block text-xs text-charcoal-400 mb-1">Trigger Every N Sentences</label>
+                  <label className="block text-xs text-charcoal-400 mb-1">{t('settings.triggerSentences')}</label>
                   <input
                     type="number"
                     min={4}
@@ -387,7 +387,7 @@ export default function UserSettingsModal() {
                 </div>
 
                 <div>
-                  <label className="block text-xs text-charcoal-400 mb-1">Trigger Every N Minutes</label>
+                  <label className="block text-xs text-charcoal-400 mb-1">{t('settings.triggerMinutes')}</label>
                   <input
                     type="number"
                     min={1}
@@ -404,8 +404,7 @@ export default function UserSettingsModal() {
               </div>
 
               <div className="rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-[11px] text-charcoal-500">
-                Incremental summaries are triggered by whichever threshold is reached first:
-                sentence count or elapsed minutes.
+                {t('settings.summaryTriggerDesc')}
               </div>
             </div>
           </section>
@@ -414,11 +413,11 @@ export default function UserSettingsModal() {
           <section className="bg-white rounded-xl border border-cream-200 p-5">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
               <Mic className="w-4 h-4" />
-              ASR Defaults
+              {t('settings.asrDefaults')}
             </h3>
             <div className="space-y-4">
               <div>
-                <label className="block text-xs text-charcoal-400 mb-1">Soniox Region</label>
+                <label className="block text-xs text-charcoal-400 mb-1">{t('settings.sonioxRegion')}</label>
                 <select
                   value={settings.sonioxRegionPreference}
                   onChange={(e) =>
@@ -435,13 +434,13 @@ export default function UserSettingsModal() {
                   ))}
                 </select>
                 <p className="mt-1 text-[11px] text-charcoal-400">
-                  Auto uses geo headers from your deployment platform to choose the nearest available Soniox region.
+                  {t('settings.autoRegionDesc')}
                 </p>
               </div>
 
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 <div>
-                  <label className="block text-xs text-charcoal-400 mb-1">Domain</label>
+                  <label className="block text-xs text-charcoal-400 mb-1">{t('settings.domain')}</label>
                   <input
                     type="text"
                     value={settings.domain}
@@ -450,7 +449,7 @@ export default function UserSettingsModal() {
                   />
                 </div>
                 <div>
-                  <label className="block text-xs text-charcoal-400 mb-1">Topic</label>
+                  <label className="block text-xs text-charcoal-400 mb-1">{t('settings.topic')}</label>
                   <input
                     type="text"
                     value={settings.topic}
@@ -463,7 +462,7 @@ export default function UserSettingsModal() {
               <div>
                 <label className="flex items-center gap-2 text-xs text-charcoal-400 mb-1">
                   <Tags className="w-3.5 h-3.5" />
-                  Manual Context Terms
+                  {t('settings.contextTerms')}
                 </label>
                 <textarea
                   value={termsInput}
@@ -471,10 +470,10 @@ export default function UserSettingsModal() {
                   onBlur={handleTermsBlur}
                   rows={4}
                   className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm resize-y"
-                  placeholder="Nyquist rate, Kalman filter, transformer decoder"
+                  placeholder={t('settings.contextTermsPlaceholder')}
                 />
                 <p className="mt-1 text-[11px] text-charcoal-400">
-                  Comma or line-separated terms are injected into Soniox context for future recordings.
+                  {t('settings.contextTermsDesc')}
                 </p>
               </div>
             </div>
@@ -484,12 +483,12 @@ export default function UserSettingsModal() {
           <section className="bg-white rounded-xl border border-cream-200 p-5">
             <h3 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">
               <Scissors className="w-4 h-4" />
-              Transcript Segment
+              {t('settings.transcriptSegment')}
             </h3>
             <div className="space-y-4">
               <div>
                 <label className="block text-xs text-charcoal-400 mb-1">
-                  Segment Split Threshold
+                  {t('settings.segmentSplitThreshold')}
                 </label>
                 <div className="flex items-center gap-4">
                   <input
@@ -505,13 +504,12 @@ export default function UserSettingsModal() {
                   />
                   <span className="text-sm font-mono text-charcoal-700 w-16 text-right">
                     {settings.segmentSplitRatio <= 0
-                      ? 'OFF'
+                      ? t('settings.off')
                       : `${Math.round(settings.segmentSplitRatio * 100)}%`}
                   </span>
                 </div>
                 <p className="mt-1 text-[11px] text-charcoal-400">
-                  当一个段落的文本高度超过可视区域的此百分比时，在下一个句子结束处自动截断为新段落。
-                  设为 OFF 则完全由 ASR 引擎决定段落边界。值越小段落越短，推荐 20%–30%。
+                  {t('settings.segmentSplitDesc')}
                 </p>
               </div>
             </div>

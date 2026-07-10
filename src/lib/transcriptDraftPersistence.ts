@@ -52,6 +52,25 @@ async function ensureDraftDir(session: DraftSessionSource) {
   await fs.mkdir(getDraftDir(session), { recursive: true });
 }
 
+/**
+ * 原子写文件：先写同目录临时文件，再 rename 覆盖目标（同分区 rename 是原子操作）。
+ * 直接 writeFile 覆写在进程被杀/磁盘满时会留下半截损坏的 JSON，后续 loadTranscriptDraft
+ * 解析失败→返回空→auto-reclaim 以空转录落库并删除残稿，草稿永久损毁（审计 medium）。
+ * rename 保证读到的永远是完整的旧版或完整的新版，绝不会是半截。
+ */
+async function writeFileAtomic(filePath: string, data: string): Promise<void> {
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    await fs.writeFile(tmpPath, data, 'utf-8');
+    await fs.rename(tmpPath, filePath);
+  } catch (error) {
+    await fs.rm(tmpPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 async function fileExists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
@@ -101,11 +120,11 @@ export async function persistTranscriptDraft(
     };
   }
 
-  // 写入完整数据
-  await fs.writeFile(
+  // 写入完整数据（原子：tmp+rename，避免半截损坏）。先写数据后写 manifest：即便崩在两者
+  // 之间，manifest 段数偏小（旧值），只会让单调守卫略保守，不会误导恢复读到不存在的段。
+  await writeFileAtomic(
     getDraftDataPath(session),
-    JSON.stringify(payload, null, 2),
-    'utf-8'
+    JSON.stringify(payload, null, 2)
   );
 
   // 写入 manifest
@@ -117,10 +136,9 @@ export async function persistTranscriptDraft(
     segmentCount: Array.isArray(payload.segments) ? payload.segments.length : 0,
   };
 
-  await fs.writeFile(
+  await writeFileAtomic(
     getDraftManifestPath(session),
-    JSON.stringify(manifest, null, 2),
-    'utf-8'
+    JSON.stringify(manifest, null, 2)
   );
 
   return manifest;

@@ -108,6 +108,24 @@ describe('recordingDraftPersistence', () => {
       'chunk-0000chunk-0001chunk-0002chunk-0003chunk-0004'
     );
     expect(merged!.manifest.receivedSeqs).toEqual([0, 1, 2, 3, 4]);
+    expect(merged!.hasGap).toBe(false);
+  });
+
+  it('seq 空洞时只合并连续前缀并标记 hasGap（不静默拼出损坏音频）', async () => {
+    const mod = await loadModule(tmpDir);
+    // 写入 0,1,3,4，缺中间的 seq 2
+    for (const seq of [0, 1, 3, 4]) {
+      await mod.persistRecordingDraftChunk(session, {
+        seq,
+        mimeType: 'audio/webm',
+        data: mkChunk(seq),
+      });
+    }
+    const merged = await mod.mergeRecordingDraftChunks(session);
+    expect(merged).not.toBeNull();
+    // 只拼接连续前缀 0,1（遇 seq 2 空洞即停），丢弃空洞后的 3,4
+    expect(merged!.buffer.toString('utf-8')).toBe('chunk-0000chunk-0001');
+    expect(merged!.hasGap).toBe(true);
   });
 
   it('deleteRecordingDraft 同时清掉 manifest 和全部 chunks', async () => {

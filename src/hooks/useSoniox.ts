@@ -34,6 +34,10 @@ const RECONNECT_BASE_DELAY_MS = 1500;
 const STABLE_CONNECTION_MS = 8000;
 // 分片上传撞 429 后，无 Retry-After 时的默认退避基值。
 const CHUNK_BACKOFF_BASE_MS = 3000;
+// 主动暂停保留的 Soniox 句柄的存活安全窗口。Soniox 实时连接在无音频/keepalive 约 20s 后被
+// 服务端关闭；暂停超过此窗口后，句柄多半已死，resume 复用会「假录音」（UI 在录、无数据流、
+// 转录静默丢），改为重建连接。取 15s 留余量。
+const PAUSE_HANDLE_STALE_MS = 15_000;
 
 interface UseSonioxOptions {
   idleTimeoutMs?: number;
@@ -276,6 +280,12 @@ export function useSoniox(
         }
 
         remoteDraftSeqsRef.current = remoteSeqs;
+        // 服务端已有这些 seq → 把归档的下一个分片号推到服务端最大值之上，避免续录/换设备时
+        // 新分片撞上服务端残留旧 seq 被误判「已上传」而跳过补传（审计 high）。仅前进不后退。
+        if (remoteSeqs.size > 0) {
+          const remoteMaxSeq = Math.max(...remoteSeqs);
+          archiveManagerRef.current?.ensureSeqAbove(remoteMaxSeq + 1);
+        }
         publishBackupMeta({
           localChunkCount,
           remoteChunkCount: remoteSeqs.size,
@@ -359,6 +369,13 @@ export function useSoniox(
 
     await syncRemoteDraft();
 
+    // 补传后完整性校验：本地仍有分片没传到服务端（持续 429 退避 / 断网），说明服务端 draft
+    // 缺尾。仍 best-effort POST finalize 持久化已到达的分片，但把「不完整」如实回报给上层
+    // ——调用方据此保留本地 IndexedDB 完整副本、不清库（审计 high：停止收尾丢尾部音频）。
+    const audioComplete = !(
+      localChunkCount > 0 && remoteDraftSeqsRef.current.size < localChunkCount
+    );
+
     try {
       const response = await fetch(
         `/api/sessions/${sessionId}/audio/draft/finalize`,
@@ -380,10 +397,11 @@ export function useSoniox(
 
       publishBackupMeta({
         localChunkCount,
-        remoteChunkCount: localChunkCount,
-        syncState: localChunkCount > 0 ? 'synced' : 'idle',
+        remoteChunkCount: remoteDraftSeqsRef.current.size,
+        syncState: audioComplete ? (localChunkCount > 0 ? 'synced' : 'idle') : 'pending',
+        lastError: audioComplete ? null : 'Some audio is not yet backed up to the server',
       });
-      return true;
+      return audioComplete;
     } catch (error) {
       publishBackupMeta({
         localChunkCount,
@@ -678,6 +696,10 @@ export function useSoniox(
       setConnectionState('reconnecting');
 
       reconnectTimerRef.current = setTimeout(async () => {
+        // 记录进入本次重连时的 runId 代际：ensureArchive / getSenderStream 等 await 之后据此
+        // 判断期间是否发生了 stop / 卸载（两者都会递增 runId），若是则放弃，避免在已停止/
+        // 已卸载的会话上复活一条录音流（审计 high）。
+        const genAtStart = runIdRef.current;
         const storeState = useTranscriptStore.getState();
         if (
           storeState.recordingState === 'idle' ||
@@ -732,6 +754,24 @@ export function useSoniox(
           });
           const managedStream = await archiveManager.getSenderStream();
           void syncRemoteDraft();
+
+          // await（ensureArchive / getSenderStream）期间用户可能已 stop 或组件已卸载 ——
+          // 建立新 Soniox 连接前再复查一次，否则会白建一条 WS 并把已停止的会话复活成录音态。
+          if (runIdRef.current !== genAtStart) {
+            shouldReconnectRef.current = false;
+            reconnectAttemptsRef.current = 0;
+            return;
+          }
+          const latestState = useTranscriptStore.getState().recordingState;
+          if (
+            latestState === 'idle' ||
+            latestState === 'stopped' ||
+            latestState === 'finalizing'
+          ) {
+            shouldReconnectRef.current = false;
+            reconnectAttemptsRef.current = 0;
+            return;
+          }
 
           const runId = runIdRef.current + 1;
           runIdRef.current = runId;
@@ -1243,8 +1283,13 @@ export function useSoniox(
           /* best-effort teardown on unmount */
         }
       }
+
+      // 硬件已停，连接确实死了 —— 让全局 store 的 connectionState 诚实反映。
+      // connectionState 不进 partialize，SPA 导航（store 内存单例不销毁）返回时若残留
+      // 'connected'，会导致连接指示器虚假常绿、且刷新恢复闸门误判（审计 high：假录音僵尸）。
+      setConnectionState('disconnected');
     };
-  }, []);
+  }, [setConnectionState]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -1275,6 +1320,32 @@ export function useSoniox(
   }, [sendFinalizeBeacon, syncRemoteDraft]);
 
   const start = useCallback(async () => {
+    // 手动开始/继续录音时接管连接生命周期：取消任何待触发/进行中的自动重连，否则它稍后
+    // 会再开出第二条 Soniox WS，与本次手动建立的连接并存 → 旧句柄被覆盖却不 stop，形成
+    // 双流、双计费（审计 high）。stop() 已有同款接管逻辑，这里对齐。
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    cancelStableConn();
+    reconnectAttemptsRef.current = 0;
+    shouldReconnectRef.current = false;
+
+    // 暂停时长超过句柄存活窗口 → 保留的 Soniox 句柄多半已被服务端关闭，复用会「假录音」
+    // （审计 high）。清掉旧句柄，落到下面重建一条新连接。
+    const pausedAtSnapshot = useTranscriptStore.getState().pausedAt;
+    const pausedForMs = pausedAtSnapshot ? Date.now() - pausedAtSnapshot : 0;
+    const handleLikelyStale = pausedForMs > PAUSE_HANDLE_STALE_MS;
+
+    if (recordingRef.current && recordingState === 'paused' && handleLikelyStale) {
+      try {
+        await recordingRef.current.recording.stop?.();
+      } catch {
+        /* best-effort：旧句柄可能已死，忽略 */
+      }
+      recordingRef.current = null;
+    }
+
     if (recordingRef.current && recordingState === 'paused') {
       autoPauseReasonRef.current = null;
       shouldReconnectRef.current = false;
@@ -1313,6 +1384,7 @@ export function useSoniox(
     });
   }, [
     accumulatePausedTime,
+    cancelStableConn,
     computeResumeOffset,
     markAudioActivity,
     recordingState,
@@ -1488,7 +1560,15 @@ export function useSoniox(
     // 恢复 overallStartTimeRef（刷新后 ref 丢失）
     overallStartTimeRef.current = storeState.recordingStartTime;
 
-    const offsetMs = Date.now() - storeState.recordingStartTime - storeState.totalPausedMs;
+    // 暂停态刷新：用暂停冻结点 pausedAt 算 offset，暂停空档不计入录音时长（与
+    // computeResumeOffset 一致）；录音态刷新（pausedAt 为空）等价于在刷新这一刻暂停，用 now。
+    // 加负值护栏。旧代码一律用 Date.now()，暂停挂机后刷新会把整段空档算进续录偏移，
+    // 导致后续段时间戳整体前移（审计 high）。
+    const freezePoint = storeState.pausedAt ?? Date.now();
+    const offsetMs = Math.max(
+      0,
+      freezePoint - storeState.recordingStartTime - storeState.totalPausedMs
+    );
 
     // 把刷新前残留的 preview 文本保存为一个 segment，防止丢失
     let segmentOffset = storeState.segments.length;
@@ -1555,7 +1635,13 @@ export function useSoniox(
     // 刷新恢复只把会话还原为「暂停展示」态，绝不自动开麦续录：
     // 已恢复 processor / 段号偏移 / overallStartTimeRef，用户点「继续」时 start() 的
     // 复用分支(Branch 3)会据此接上并续录。此处不建立 Soniox 连接、不抢麦。
-    setPausedAt(Date.now());
+    //
+    // 保留暂停冻结点：刷新前若已是暂停态，pausedAt 维持原值，否则刷新前的暂停空档会在
+    // 点「继续」时（accumulatePausedTime / computeResumeOffset）漏扣、被当作录音时长
+    // （审计 high）。刷新前是录音态（pausedAt 为空）才以刷新这一刻作为暂停起点。
+    if (storeState.pausedAt == null) {
+      setPausedAt(Date.now());
+    }
     setRecordingState('paused');
     setConnectionState('disconnected');
     shouldReconnectRef.current = false;

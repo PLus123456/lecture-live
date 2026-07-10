@@ -171,19 +171,48 @@ export async function persistRecordingDraftChunk(
 
 export async function mergeRecordingDraftChunks(
   session: DraftSessionSource
-): Promise<{ buffer: Buffer; manifest: RecordingDraftManifest } | null> {
+): Promise<{
+  buffer: Buffer;
+  manifest: RecordingDraftManifest;
+  hasGap: boolean;
+} | null> {
   const manifest = await loadRecordingDraftManifest(session);
   if (!manifest || manifest.receivedSeqs.length === 0) {
     return null;
   }
 
+  // seq 空洞检测：媒体容器（webm/mp4）的分片必须连续，缺中间块会让音频在空洞处起
+  // 解码损坏。只合并从最小 seq 起的最长连续前缀，保证产出的音频可完整播放，丢弃空洞
+  // 之后的段（它们因前面缺块本就无法正常解码）。有空洞时告警，供上层记录/后续补救，
+  // 而不是像旧代码那样静默拼出一段中途损坏、用户无从察觉的录音（审计 medium）。
+  const seqs = [...manifest.receivedSeqs].sort((a, b) => a - b);
+  const contiguous: number[] = [];
+  let expected = seqs[0];
+  for (const seq of seqs) {
+    if (seq === expected) {
+      contiguous.push(seq);
+      expected += 1;
+    } else {
+      break;
+    }
+  }
+  const hasGap = contiguous.length < seqs.length;
+  if (hasGap) {
+    console.warn(
+      `[recordingDraft] seq 空洞：共 ${seqs.length} 片但仅前 ${contiguous.length} 片连续` +
+        `（自 seq ${seqs[0]} 起，缺 seq ${expected}），session=${session.id}，` +
+        `只合并连续前缀以保证可播放`
+    );
+  }
+
   const buffers = await Promise.all(
-    manifest.receivedSeqs.map((seq) => fs.readFile(getChunkFilePath(session, seq)))
+    contiguous.map((seq) => fs.readFile(getChunkFilePath(session, seq)))
   );
 
   return {
     buffer: Buffer.concat(buffers),
     manifest,
+    hasGap,
   };
 }
 

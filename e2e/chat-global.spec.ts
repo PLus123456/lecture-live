@@ -1,33 +1,378 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page, type Route } from '@playwright/test';
 import path from 'path';
 import fs from 'fs';
+import { fulfillJson, fulfillSse, installBrowserStubs } from './helpers';
 
 /**
- * U15 — 全局对话端到端测试套件
+ * U15 — 全局对话（/chat）端到端，对齐 PR#169/#170「Claude 式聊天布局重构」。
  *
- * 覆盖 Wave 3（U10-U12）的关键路径：
- *   1. 主流程：登录 → /chat → 新建对话 → 附加录音 → 上传文件 → 发消息 → 持久化
- *   2. 空对话：无录音 / 无附件下纯对话发消息
+ * 重构后的关键流程（与旧「点新建对话按钮 → POST → 跳转」不同）：
+ *   · 首页 composer 输入首条消息 → POST /api/conversations 懒创建 → 文本存进
+ *     chatStore.pendingFirstMessage → router.push(/chat/<id>) → GlobalChat 加载完
+ *     自动发送首条 → POST /api/llm/chat（SSE 流）。
+ *   · 录音在首页 composer 用 RecordingPicker「预选」（onPickLocal，不发请求），
+ *     随创建对话的 recordingIds 一并挂载。
+ *   · 发送不再创建会话/不导航；conversationId 始终是已有的。
  *
- * Wave 3 防御：
- *   - 顶层 `beforeAll` 检查 `/chat` 是否已存在；若 404，则两个 case 都 skip
- *     并打印明确日志，CI 不会因 Wave 3 未合并而假阳性。
- *   - 一旦 `/chat` 存在，spec 内的断言失败必须暴露（不静默 catch）。
- *
- * 截图均输出到 artifacts/u15-step{N}.png 供 review。
+ * 全量 route mock（死 DB，必须全 mock；参考 recording-resilience.spec 的 harness）：
+ * 有状态地记录消息与附件，使「刷新后持久化」可断言。
  */
 
 const ADMIN_EMAIL = 'admin@lecturelive.com';
 const ADMIN_PASSWORD = 'admin123';
-
 const ART = path.join(process.cwd(), 'artifacts');
+
+const adminUser = {
+  id: 'user-1',
+  email: ADMIN_EMAIL,
+  displayName: 'Admin',
+  role: 'ADMIN',
+};
+
+const quotaPayload = {
+  quotas: {
+    id: 'user-1',
+    role: 'ADMIN',
+    transcriptionMinutesUsed: 0,
+    transcriptionMinutesLimit: 999999,
+    remainingTranscriptionMinutes: 999999,
+    remainingTranscriptionMs: 999999 * 60_000,
+    storageHoursUsed: 0,
+    storageHoursLimit: 999999,
+    storageBytesUsed: 0,
+    storageBytesLimit: 1_000_000_000,
+    remainingStorageBytes: 1_000_000_000,
+    allowedModels: 'local,claude',
+    quotaResetAt: null,
+  },
+};
+
+/** 助手固定回复（作为 SSE `text` 帧的 delta，也作为落库 assistant 消息的 content） */
+const ASSISTANT_REPLY = '这是助手的模拟回复。';
+
+interface StoredMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  transcriptOffsetMs: number | null;
+  degradationLevel: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  createdAt: string;
+}
+
+interface StoredAttachment {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  kind: 'image' | 'document' | 'text';
+  bytes: number;
+  createdAt: string;
+  cloudrevePath: string;
+}
+
+interface ChatMockState {
+  /** 每个 conversation 的消息（可跨刷新持久化） */
+  messagesById: Record<string, StoredMessage[]>;
+  /** 每个 conversation 的附件 chips（GET /api/chat-uploads 回填用） */
+  attachmentsById: Record<string, StoredAttachment[]>;
+  /** 记录所有 POST /api/conversations 的 body（断言 recordingIds） */
+  createBodies: Array<Record<string, unknown>>;
+  /** 记录所有 POST /api/llm/chat 的 body */
+  llmBodies: Array<Record<string, unknown>>;
+  /** 记录 generate-title 是否被触发 */
+  titleGenerated: boolean;
+  /** 未被显式 mock 命中的路径（调试用） */
+  unmocked: string[];
+  /** 自增序号，用于生成稳定 id */
+  seq: number;
+}
+
+function createState(): ChatMockState {
+  return {
+    messagesById: {},
+    attachmentsById: {},
+    createBodies: [],
+    llmBodies: [],
+    titleGenerated: false,
+    unmocked: [],
+    seq: 0,
+  };
+}
+
+function isoAt(offsetSec: number): string {
+  // 固定基准时间 + 偏移，保证 createdAt 稳定且单调（不用 Date.now 避免 flaky 排序）
+  return new Date(1_760_000_000_000 + offsetSec * 1000).toISOString();
+}
+
+function parseBody(route: Route): Record<string, unknown> {
+  try {
+    return JSON.parse(route.request().postData() ?? '{}') as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    return {};
+  }
+}
+
+/** 安装全量 chat API mock，返回可在断言中读取的 state。 */
+function installChatMocks(page: Page, state: ChatMockState) {
+  return page.route('**/api/**', async (route: Route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const p = url.pathname;
+    const method = request.method();
+
+    // ── 站点 / 鉴权 ──
+    if (p === '/api/site-config') {
+      return fulfillJson(route, {
+        site_name: 'LectureLive QA',
+        site_description: 'U15 global chat',
+        site_announcement: '',
+        footer_code: '',
+        allow_registration: true,
+      });
+    }
+    if (p === '/api/auth/login' && method === 'POST') {
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+    }
+    if (p === '/api/auth/refresh' && method === 'GET') {
+      // 整页导航 / 刷新后靠 cookie 恢复会话
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+    }
+
+    // ── dashboard 外壳杂项 ──
+    if (p === '/api/users/quota') return fulfillJson(route, quotaPayload);
+    if (p === '/api/folders') return fulfillJson(route, []);
+    if (p === '/api/soniox/ping') return fulfillJson(route, { ok: true });
+    if (p === '/api/sessions/active-async') {
+      return fulfillJson(route, { items: [] });
+    }
+
+    // RecordingPicker → GET /api/sessions?limit=100（过滤 status===COMPLETED）
+    if (p === '/api/sessions') {
+      return fulfillJson(route, {
+        items: [
+          {
+            id: 'rec-1',
+            title: '第一节课录音',
+            courseName: '物理导论',
+            createdAt: isoAt(0),
+            durationMs: 600_000,
+            status: 'COMPLETED',
+          },
+        ],
+        nextCursor: null,
+      });
+    }
+
+    // ComposerModelControls → GET /api/llm/models
+    if (p === '/api/llm/models') {
+      return fulfillJson(route, {
+        models: [
+          {
+            name: 'mock-model',
+            id: 'mock-model',
+            modelId: 'mock-model',
+            displayName: 'Mock Model',
+            supportsThinking: false,
+            thinkingMode: 'NONE',
+            supportsThinkingDepth: false,
+            allowedDepths: [],
+            supportsImage: false,
+            contextWindow: 128_000,
+            purpose: 'CHAT',
+          },
+        ],
+        defaultModel: 'mock-model',
+      });
+    }
+
+    // ── conversations 列表 / 创建 ──
+    if (p === '/api/conversations' && method === 'GET') {
+      const list = Object.keys(state.messagesById).map((id) => ({
+        id,
+        title: null,
+        startedAt: isoAt(0),
+        endedAt: null,
+        degradationLevel: 0,
+        archived: false,
+        messageCount: state.messagesById[id].length,
+        sessionIds: [],
+        sessionBound: false,
+      }));
+      return fulfillJson(route, { conversations: list });
+    }
+    if (p === '/api/conversations' && method === 'POST') {
+      const body = parseBody(route);
+      state.createBodies.push(body);
+      const id = `conv-e2e-${++state.seq}`;
+      state.messagesById[id] = [];
+      state.attachmentsById[id] = [];
+      const recordingIds = Array.isArray(body.recordingIds)
+        ? (body.recordingIds as string[])
+        : [];
+      return fulfillJson(route, {
+        conversation: {
+          id,
+          title: null,
+          startedAt: isoAt(0),
+          endedAt: null,
+          degradationLevel: 0,
+          archived: false,
+          messageCount: 0,
+          sessionIds: recordingIds,
+          sessionBound: false,
+        },
+      });
+    }
+
+    // ── 单对话子路由 ──
+    const convSub = p.match(/^\/api\/conversations\/([^/]+)\/([^/]+)$/);
+    if (convSub) {
+      const [, convId, sub] = convSub;
+
+      // GET messages → 加载历史（GlobalChat mount）
+      if (sub === 'messages' && method === 'GET') {
+        return fulfillJson(route, {
+          conversation: {
+            id: convId,
+            title: null,
+            startedAt: isoAt(0),
+            endedAt: null,
+            degradationLevel: 0,
+          },
+          messages: state.messagesById[convId] ?? [],
+        });
+      }
+
+      // 录音 pill 回填 / 附加
+      if (sub === 'recordings' && method === 'GET') {
+        return fulfillJson(route, { recordings: [] });
+      }
+      if (sub === 'recordings' && method === 'POST') {
+        return fulfillJson(route, { ok: true });
+      }
+
+      // 首轮完成后 fire-and-forget 生成标题
+      if (sub === 'generate-title' && method === 'POST') {
+        state.titleGenerated = true;
+        return fulfillJson(route, { ok: true, title: '自动标题' });
+      }
+    }
+
+    // DELETE /api/conversations/<id>
+    if (/^\/api\/conversations\/[^/]+$/.test(p) && method === 'DELETE') {
+      return fulfillJson(route, { ok: true });
+    }
+
+    // ── 文件附件 ──
+    if (p === '/api/chat-uploads' && method === 'GET') {
+      const convId = url.searchParams.get('conversationId') ?? '';
+      return fulfillJson(route, {
+        attachments: state.attachmentsById[convId] ?? [],
+      });
+    }
+    if (p === '/api/chat-uploads' && method === 'POST') {
+      // multipart body 里含 conversationId + file；用固定文件名回应（测试上传的就是它）。
+      const convId = extractMultipartField(
+        route.request().postData(),
+        'conversationId'
+      );
+      const att: StoredAttachment = {
+        id: `att-${++state.seq}`,
+        fileName: 'u15-sample.txt',
+        mimeType: 'text/plain',
+        kind: 'text',
+        bytes: 24,
+        createdAt: isoAt(state.seq),
+        cloudrevePath: `/mock/${state.seq}/u15-sample.txt`,
+      };
+      if (convId) {
+        (state.attachmentsById[convId] ||= []).push(att);
+      }
+      return fulfillJson(route, {
+        attachmentId: att.id,
+        cloudrevePath: att.cloudrevePath,
+        kind: att.kind,
+        bytes: att.bytes,
+        extractedTextPreview: 'hello e2e',
+        fileName: att.fileName,
+      });
+    }
+    if (/^\/api\/chat-uploads\/[^/]+$/.test(p) && method === 'DELETE') {
+      return fulfillJson(route, { ok: true });
+    }
+
+    // ── 发送消息：SSE 流 + 落库 user/assistant（供刷新持久化断言）──
+    if (p === '/api/llm/chat' && method === 'POST') {
+      const body = parseBody(route);
+      state.llmBodies.push(body);
+      const convId = String(body.conversationId ?? '');
+      const question = String(body.question ?? '');
+      const msgs = (state.messagesById[convId] ||= []);
+      msgs.push({
+        id: `m-${++state.seq}`,
+        role: 'user',
+        content: question,
+        transcriptOffsetMs: 0,
+        degradationLevel: null,
+        inputTokens: null,
+        outputTokens: null,
+        createdAt: isoAt(state.seq),
+      });
+      msgs.push({
+        id: `m-${++state.seq}`,
+        role: 'assistant',
+        content: ASSISTANT_REPLY,
+        transcriptOffsetMs: 0,
+        degradationLevel: 1,
+        inputTokens: 10,
+        outputTokens: 5,
+        createdAt: isoAt(state.seq),
+      });
+      return fulfillSse(route, [
+        { event: 'text', data: { delta: ASSISTANT_REPLY } },
+        {
+          event: 'done',
+          data: {
+            model: 'Mock Model',
+            thinkingDepth: 'medium',
+            level: 1,
+            budget: 100_000,
+            inputTokens: 10,
+            outputTokens: 5,
+          },
+        },
+      ]);
+    }
+
+    // 兜底：记录并回良性空对象（本套件不依赖的边角端点，不因 500 打断 UI）。
+    state.unmocked.push(`${method} ${p}`);
+    return fulfillJson(route, {});
+  });
+}
+
+/** 从 multipart/form-data 原文里粗取某个文本字段（够用于 conversationId）。 */
+function extractMultipartField(
+  raw: string | null,
+  field: string
+): string | null {
+  if (!raw) return null;
+  const re = new RegExp(
+    `name="${field}"\\r?\\n\\r?\\n([^\\r\\n]*)`,
+    'i'
+  );
+  const m = raw.match(re);
+  return m ? m[1] : null;
+}
 
 async function snap(page: Page, name: string) {
   try {
     await fs.promises.mkdir(ART, { recursive: true });
     await page.screenshot({ path: path.join(ART, `${name}.png`), fullPage: true });
   } catch (err) {
-    // 截图失败不应阻塞断言流程
     console.warn(`[u15] screenshot ${name} 失败:`, err);
   }
 }
@@ -36,436 +381,183 @@ async function loginAsAdmin(page: Page) {
   await page.goto('/login');
   await page.locator('input[type="email"]').fill(ADMIN_EMAIL);
   await page.locator('input[type="password"]').fill(ADMIN_PASSWORD);
-  // 兼容中英 i18n 的提交按钮
-  const submitBtn = page.locator('button[type="submit"]').first();
-  await submitBtn.click();
+  await page.locator('button[type="submit"]').first().click();
   await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
 }
 
-/**
- * 探测 Wave 3 是否合并。`/chat` 路由由 U10 引入；未合并时 Next.js 返回 404。
- * 由 beforeAll 调用，结果存到顶层闭包供两个 test 共享。
- */
-let waveThreeReady = false;
-let chatRouteSkipReason = '';
+let state: ChatMockState;
 
-test.describe.configure({ mode: 'serial' });
+test.beforeEach(async ({ page }) => {
+  state = createState();
+  await installBrowserStubs(page);
+  await installChatMocks(page, state);
+});
 
-test.describe('Global Chat (/chat) E2E', () => {
-  test.beforeAll(async ({ browser }) => {
-    const ctx = await browser.newContext();
-    const page = await ctx.newPage();
-    try {
-      // 先登录拿 cookie（中间件可能保护 /chat），再探测路由
-      await loginAsAdmin(page);
-      const resp = await page.goto('/chat', { waitUntil: 'domcontentloaded' });
-      const status = resp?.status() ?? 0;
-      const finalUrl = page.url();
+test('起聊主流程：首页 composer 预选录音 → 创建对话(带 recordingIds) → 自动发送 → SSE 流式回复', async ({
+  page,
+}) => {
+  await loginAsAdmin(page);
+  await page.goto('/chat');
 
-      // Next.js 对未注册路由返回 404；若被中间件重定向回登录就视为缺
-      if (status === 404) {
-        chatRouteSkipReason = 'U10 (/chat route) not yet merged — skipping';
-        waveThreeReady = false;
-      } else if (/\/login(\?|$)/.test(finalUrl)) {
-        chatRouteSkipReason =
-          '/chat redirected back to /login — Wave 3 (U10) route not exposed; skipping';
-        waveThreeReady = false;
-      } else if (status >= 200 && status < 400) {
-        // 进一步看页面是否真的渲染了 chat 内容（防止 200 但渲染了 not-found 页面）
-        const notFoundIndicator = await page
-          .getByText(/404|This page could not be found|找不到|Not Found/i)
-          .first()
-          .isVisible({ timeout: 1_500 })
-          .catch(() => false);
-        if (notFoundIndicator) {
-          chatRouteSkipReason =
-            '/chat returned 200 but rendered Not Found page — U10 not merged; skipping';
-          waveThreeReady = false;
-        } else {
-          waveThreeReady = true;
-        }
-      } else {
-        chatRouteSkipReason = `/chat returned HTTP ${status} — Wave 3 likely incomplete, skipping`;
-        waveThreeReady = false;
-      }
-    } catch (err) {
-      chatRouteSkipReason = `/chat probe failed (${(err as Error).message}) — skipping`;
-      waveThreeReady = false;
-    } finally {
-      await ctx.close();
-    }
+  // 首页 composer（唯一 textarea）
+  const composer = page.locator('textarea');
+  await expect(composer).toBeVisible({ timeout: 15_000 });
+  await snap(page, 'u15-step1');
 
-    if (!waveThreeReady) {
-      // 让结果在终端醒目
-      console.log(`[u15] ${chatRouteSkipReason}`);
-    } else {
-      console.log('[u15] /chat route detected — running full E2E suite');
-    }
+  // ---- 预选录音：打开 RecordingPicker → 选中 → 附加选中（本地模式，不发请求）
+  await page
+    .getByRole('button', { name: /添加录音|Attach recording/i })
+    .first()
+    .click();
+  const row = page.locator('[data-testid="recording-row-rec-1"]');
+  await expect(row).toBeVisible({ timeout: 10_000 });
+  await row.click();
+  await page
+    .getByRole('button', { name: /附加选中|Attach Selected/i })
+    .click();
+
+  // picker 关闭后，预选录音以 pill 形式出现在 composer 上方
+  await expect(page.getByText('第一节课录音').first()).toBeVisible({
+    timeout: 10_000,
+  });
+  await snap(page, 'u15-step2');
+
+  // ---- 输入首条消息并发送（→ POST /api/conversations 懒创建 → 跳 /chat/<id>）
+  const userMsg = '帮我总结这段录音';
+  await composer.fill(userMsg);
+
+  const createPromise = page.waitForResponse(
+    (res) =>
+      res.url().includes('/api/conversations') &&
+      res.request().method() === 'POST',
+    { timeout: 15_000 }
+  );
+  await page.getByRole('button', { name: /^(发送|Send)$/ }).click();
+  const createResp = await createPromise;
+  expect(createResp.ok(), 'POST /api/conversations 应 2xx').toBeTruthy();
+  const convBody = (await createResp.json()) as { conversation?: { id?: string } };
+  const conversationId = convBody.conversation?.id;
+  expect(conversationId, '创建响应应带新对话 id').toBeTruthy();
+
+  // 跳转到详情页
+  await page.waitForURL(new RegExp(`/chat/${conversationId}(\\?|$)`), {
+    timeout: 15_000,
   });
 
-  test.beforeEach(async ({ page }) => {
-    test.skip(!waveThreeReady, chatRouteSkipReason || 'Wave 3 not ready');
-    await loginAsAdmin(page);
+  // 创建请求应携带预选录音的 recordingIds
+  const lastCreate = state.createBodies.at(-1) ?? {};
+  expect(
+    Array.isArray(lastCreate.recordingIds) &&
+      (lastCreate.recordingIds as string[]).includes('rec-1'),
+    'POST /api/conversations 应带 recordingIds:[rec-1]'
+  ).toBeTruthy();
+
+  // ---- 自动发送首条：用户消息 + 助手流式回复都应出现
+  await expect(page.getByText(userMsg).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(ASSISTANT_REPLY).first()).toBeVisible({
+    timeout: 20_000,
   });
 
-  test('main flow: new conv → attach recording → upload file → send msg → persist', async ({
-    page,
-  }) => {
-    // ---- Step 1: 已登录 → 点侧栏「对话」入口
-    const chatLink = page.getByRole('link', { name: /^(对话|Chat)$/ }).first();
-    await expect(
-      chatLink,
-      'U8 sidebar Chat entry must be visible — 若失败说明 U8 未合并'
-    ).toBeVisible({ timeout: 10_000 });
-    await chatLink.click();
-    await page.waitForURL(/\/chat(\/.*)?$/, { timeout: 15_000 });
-    await snap(page, 'u15-step1');
+  // 发给 /api/llm/chat 的 body 应带正确 conversationId + question
+  const lastLlm = state.llmBodies.at(-1) ?? {};
+  expect(lastLlm.conversationId).toBe(conversationId);
+  expect(lastLlm.question).toBe(userMsg);
 
-    // ---- Step 2: 验证 /chat 入口空状态 + 「新建对话」按钮
-    const newConvBtn = page
-      .getByRole('button', { name: /新建对话|New Chat|New Conversation/i })
-      .first();
-    await expect(
-      newConvBtn,
-      'U10 「新建对话」 按钮必须可见 — 若失败说明 U10 未合并或按钮文案改了'
-    ).toBeVisible({ timeout: 10_000 });
-    await snap(page, 'u15-step2');
+  // 首轮完成 → 触发 generate-title
+  await expect
+    .poll(() => state.titleGenerated, { timeout: 10_000 })
+    .toBe(true);
+  await snap(page, 'u15-step3');
+});
 
-    // ---- Step 3: 监听 POST /api/conversations，点新建对话
-    const conversationPromise = page.waitForResponse(
-      (res) =>
-        res.url().includes('/api/conversations') &&
-        res.request().method() === 'POST' &&
-        res.status() < 400,
-      { timeout: 15_000 }
-    );
-    await newConvBtn.click();
-    const conversationResp = await conversationPromise;
-    expect(conversationResp.ok(), 'POST /api/conversations should succeed').toBeTruthy();
-    const convBody = await conversationResp.json().catch(() => ({}));
-    const conversationId: string | undefined =
-      convBody?.conversation?.id ?? convBody?.id ?? convBody?.conversationId;
-    expect(
-      conversationId,
-      'API response must include the new conversation id'
-    ).toBeTruthy();
+test('已有对话：加载历史 → 上传文件附件 → 手动发消息 → SSE 回复 → 刷新后持久化', async ({
+  page,
+}) => {
+  const convId = 'conv-existing';
+  // 预置一轮历史（1 user + 1 assistant）
+  state.messagesById[convId] = [
+    {
+      id: 'h-1',
+      role: 'user',
+      content: '历史问题一二三',
+      transcriptOffsetMs: 0,
+      degradationLevel: null,
+      inputTokens: null,
+      outputTokens: null,
+      createdAt: isoAt(1),
+    },
+    {
+      id: 'h-2',
+      role: 'assistant',
+      content: '历史回答四五六',
+      transcriptOffsetMs: 0,
+      degradationLevel: 1,
+      inputTokens: 8,
+      outputTokens: 4,
+      createdAt: isoAt(2),
+    },
+  ];
+  state.attachmentsById[convId] = [];
 
-    // 跳转到 /chat/<id>
-    await page.waitForURL(new RegExp(`/chat/${conversationId}(\\?|$)`), { timeout: 15_000 });
-    await snap(page, 'u15-step3');
+  await loginAsAdmin(page);
+  await page.goto(`/chat/${convId}`);
 
-    // ---- Step 4: 打开录音 picker（U11） → 搜索 → 选 1 → 附加选中
-    // picker 入口按钮文案兼容多种命名
-    const pickerOpenBtn = page
-      .getByRole('button', { name: /附加录音|选择录音|Attach Recording|Recordings/i })
-      .first();
-    await expect(
-      pickerOpenBtn,
-      'U11 录音 picker 触发按钮必须可见'
-    ).toBeVisible({ timeout: 10_000 });
-    await pickerOpenBtn.click();
-
-    // picker 内部应有搜索框 + 列表
-    const pickerSearch = page
-      .getByPlaceholder(/搜索|Search/i)
-      .or(page.getByRole('searchbox'))
-      .first();
-    await expect(pickerSearch, 'picker 搜索框应可见').toBeVisible({ timeout: 10_000 });
-    await pickerSearch.fill('');
-    // 给列表渲染时间
-    await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
-
-    // 选一个录音 — 用 checkbox 或 list item
-    const recordingItem = page
-      .locator('[role="dialog"], [role="listbox"], .recording-picker')
-      .locator('label, [role="option"], li, [role="listitem"]')
-      .first();
-    // 若 dialog 内没有可见录音，跳过这步但保留断言
-    if (await recordingItem.isVisible().catch(() => false)) {
-      await recordingItem.click();
-    } else {
-      // 兜底：直接点第一个 checkbox
-      const cb = page.locator('input[type="checkbox"]').first();
-      if (await cb.isVisible().catch(() => false)) {
-        await cb.check();
-      } else {
-        throw new Error(
-          'Recording picker 内未找到可选项 — U11 实现或数据库无录音'
-        );
-      }
-    }
-
-    // 监听 POST /api/conversations/.../recordings
-    const attachRecordingsPromise = page
-      .waitForResponse(
-        (res) =>
-          /\/api\/conversations\/[^/]+\/recordings/.test(res.url()) &&
-          res.request().method() === 'POST',
-        { timeout: 15_000 }
-      )
-      .catch(() => null);
-
-    const confirmAttachBtn = page
-      .getByRole('button', { name: /附加选中|附加|Attach Selected|Attach/i })
-      .first();
-    await confirmAttachBtn.click();
-    const attachResp = await attachRecordingsPromise;
-    if (attachResp) {
-      expect(
-        attachResp.status(),
-        'POST /api/conversations/[id]/recordings 应 2xx'
-      ).toBeLessThan(400);
-    }
-    // RecordingsBar 应展示已附加录音 — 用区域 / 类名匹配
-    const recordingsBar = page
-      .locator('[data-testid="recordings-bar"], .recordings-bar, [aria-label*="Recordings" i]')
-      .first();
-    // RecordingsBar 可见性是软断言 — 若 U10 用了不同的 testid 也不至于直接失败
-    const recordingsBarVisible = await recordingsBar
-      .isVisible({ timeout: 5_000 })
-      .catch(() => false);
-    if (!recordingsBarVisible) {
-      console.warn(
-        '[u15] RecordingsBar 未通过 default selector 找到 — U10 可能用了不同的 testid'
-      );
-    }
-    await snap(page, 'u15-step4');
-
-    // ---- Step 5: 文件附件 UI — 上传一个小文本文件
-    const fixturePath = path.join(process.cwd(), 'tests', 'fixtures', 'sample.txt');
-    let fileToUpload = fixturePath;
-    if (!fs.existsSync(fixturePath)) {
-      // 兜底：内联写一个临时文件
-      const tmpPath = path.join(ART, 'u15-sample.txt');
-      fs.writeFileSync(tmpPath, 'hello u15\nsecond line\n', 'utf8');
-      fileToUpload = tmpPath;
-    }
-
-    // 上传 input 通常隐藏在 button 后面 — 直接定位 file input
-    const fileInput = page.locator('input[type="file"]').first();
-    // 若 file input 不可见（被 styled），用 setInputFiles 仍可工作
-    await expect(
-      fileInput,
-      'U10 文件附件 input 应存在于 DOM — 否则附件 UI 缺失'
-    ).toHaveCount(1, { timeout: 10_000 });
-
-    const uploadResponsePromise = page.waitForResponse(
-      (res) =>
-        res.url().includes('/api/chat-uploads') &&
-        res.request().method() === 'POST',
-      { timeout: 30_000 }
-    );
-    await fileInput.setInputFiles(fileToUpload);
-    const uploadResp = await uploadResponsePromise;
-    expect(
-      uploadResp.status(),
-      'POST /api/chat-uploads 应 200 — 失败说明 U5/U12 集成问题'
-    ).toBe(200);
-
-    // 附件 chip 应可见 — 用文件名匹配
-    const fileName = path.basename(fileToUpload);
-    const attachmentChip = page
-      .getByText(new RegExp(fileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'))
-      .first();
-    await expect(
-      attachmentChip,
-      'attachment chip 应显示已上传文件名'
-    ).toBeVisible({ timeout: 10_000 });
-    await snap(page, 'u15-step5');
-
-    // ---- Step 6: 在 composer 输入并发送
-    const composer = page
-      .locator('textarea')
-      .filter({ hasNot: page.locator('[disabled]') })
-      .first();
-    await expect(composer, 'composer textarea 应可见').toBeVisible({ timeout: 10_000 });
-    const userMsg = '总结一下这次录音';
-    await composer.fill(userMsg);
-
-    // 监听 SSE 流式响应 — POST /api/llm/chat
-    const chatStreamPromise = page.waitForResponse(
-      (res) =>
-        res.url().includes('/api/llm/chat') &&
-        res.request().method() === 'POST',
-      { timeout: 30_000 }
-    );
-
-    // 优先 Enter，备选发送按钮
-    await composer.press('Enter');
-    let chatResp;
-    try {
-      chatResp = await chatStreamPromise;
-    } catch {
-      // Enter 没触发 — 找发送按钮
-      const sendBtn = page
-        .getByRole('button', { name: /发送|Send|送出/i })
-        .first();
-      await sendBtn.click();
-      chatResp = await page.waitForResponse(
-        (res) =>
-          res.url().includes('/api/llm/chat') &&
-          res.request().method() === 'POST',
-        { timeout: 30_000 }
-      );
-    }
-    expect(
-      chatResp.status(),
-      'POST /api/llm/chat 应 2xx — 失败说明 U12 流式端点出错'
-    ).toBeLessThan(400);
-
-    // 等待用户消息出现在历史
-    await expect(
-      page.getByText(userMsg).first(),
-      '用户消息应在对话历史中可见'
-    ).toBeVisible({ timeout: 15_000 });
-
-    // 等待 assistant 消息出现 — assistant message 通常有特殊 role 标记或 markdown 容器
-    const assistantMsg = page
-      .locator('[data-role="assistant"], [data-author="assistant"], .assistant-message')
-      .first();
-    // 不强制具体 selector — 兜底用「除用户消息外，新增了一个有内容的消息块」
-    const assistantVisible = await assistantMsg
-      .isVisible({ timeout: 60_000 })
-      .catch(() => false);
-    if (!assistantVisible) {
-      // 至少要等到流式响应里产生新文本（与用户消息不同的非空段落）
-      console.warn(
-        '[u15] assistant 消息 default selector 未命中 — 检查 prose 区域'
-      );
-      // 等待页面里出现一个长度 > 用户消息的 markdown 节点
-      await expect
-        .poll(
-          async () => {
-            const texts = await page.locator('article, .prose, [data-message]').allTextContents();
-            return texts.some((t) => t.trim().length > userMsg.length && !t.includes(userMsg));
-          },
-          {
-            message: 'expected an assistant reply to appear',
-            timeout: 60_000,
-          }
-        )
-        .toBe(true);
-    }
-    await snap(page, 'u15-step6');
-
-    // ---- Step 7: 刷新页面，验证持久化
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForURL(new RegExp(`/chat/${conversationId}(\\?|$)`), { timeout: 15_000 });
-
-    // 录音条还在
-    if (recordingsBarVisible) {
-      await expect(
-        page
-          .locator('[data-testid="recordings-bar"], .recordings-bar, [aria-label*="Recordings" i]')
-          .first()
-      ).toBeVisible({ timeout: 10_000 });
-    }
-    // 附件 chip 还在
-    await expect(
-      page
-        .getByText(new RegExp(fileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'))
-        .first(),
-      '刷新后 attachment 应仍展示'
-    ).toBeVisible({ timeout: 15_000 });
-    // 用户消息还在
-    await expect(
-      page.getByText(userMsg).first(),
-      '刷新后用户消息应仍展示'
-    ).toBeVisible({ timeout: 15_000 });
-    await snap(page, 'u15-step7');
+  // 历史渲染
+  await expect(page.getByText('历史问题一二三').first()).toBeVisible({
+    timeout: 15_000,
   });
+  await expect(page.getByText('历史回答四五六').first()).toBeVisible({
+    timeout: 15_000,
+  });
+  await snap(page, 'u15-existing-1');
 
-  test('empty chat: pure conversation with no recordings or files', async ({ page }) => {
-    // 走到 /chat 空状态
-    await page.goto('/chat');
-    await page.waitForLoadState('domcontentloaded');
-
-    // 空对话列表应有「新建对话」按钮 + 可能有空态文案
-    const newConvBtn = page
-      .getByRole('button', { name: /新建对话|New Chat|New Conversation/i })
-      .first();
-    await expect(newConvBtn, 'empty state 应展示新建对话按钮').toBeVisible({
-      timeout: 10_000,
+  // ---- 上传文件附件（paperclip → 隐藏的文档 file input → POST /api/chat-uploads）
+  const uploadPromise = page.waitForResponse(
+    (res) =>
+      res.url().includes('/api/chat-uploads') &&
+      res.request().method() === 'POST',
+    { timeout: 20_000 }
+  );
+  await page
+    .locator('input[type="file"][accept*=".txt"]')
+    .setInputFiles({
+      name: 'u15-sample.txt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('hello u15\nsecond line\n'),
     });
-    await snap(page, 'u15-empty-1');
+  const uploadResp = await uploadPromise;
+  expect(uploadResp.ok(), 'POST /api/chat-uploads 应 2xx').toBeTruthy();
 
-    // 新建一个对话
-    const conversationPromise = page.waitForResponse(
-      (res) =>
-        res.url().includes('/api/conversations') &&
-        res.request().method() === 'POST' &&
-        res.status() < 400,
-      { timeout: 15_000 }
-    );
-    await newConvBtn.click();
-    const conversationResp = await conversationPromise;
-    const convBody = await conversationResp.json().catch(() => ({}));
-    const conversationId: string | undefined =
-      convBody?.conversation?.id ?? convBody?.id ?? convBody?.conversationId;
-    expect(conversationId, '应返回新对话 id').toBeTruthy();
-
-    await page.waitForURL(new RegExp(`/chat/${conversationId}(\\?|$)`), { timeout: 15_000 });
-
-    // 直接发消息 — 无录音、无文件
-    const composer = page.locator('textarea').first();
-    await expect(composer, '空对话也应展示 composer').toBeVisible({
-      timeout: 10_000,
-    });
-    const userMsg = 'Hello, this is a pure global chat.';
-    await composer.fill(userMsg);
-
-    const chatStreamPromise = page.waitForResponse(
-      (res) =>
-        res.url().includes('/api/llm/chat') &&
-        res.request().method() === 'POST',
-      { timeout: 30_000 }
-    );
-    await composer.press('Enter');
-    let chatResp;
-    try {
-      chatResp = await chatStreamPromise;
-    } catch {
-      const sendBtn = page
-        .getByRole('button', { name: /发送|Send|送出/i })
-        .first();
-      await sendBtn.click();
-      chatResp = await page.waitForResponse(
-        (res) =>
-          res.url().includes('/api/llm/chat') &&
-          res.request().method() === 'POST',
-        { timeout: 30_000 }
-      );
-    }
-    expect(
-      chatResp.status(),
-      'POST /api/llm/chat 空对话也应 2xx'
-    ).toBeLessThan(400);
-
-    await expect(
-      page.getByText(userMsg).first(),
-      '用户消息应可见'
-    ).toBeVisible({ timeout: 15_000 });
-
-    // assistant 回复 — 与主流程同样的宽容兜底
-    const assistantVisible = await page
-      .locator('[data-role="assistant"], [data-author="assistant"], .assistant-message')
-      .first()
-      .isVisible({ timeout: 60_000 })
-      .catch(() => false);
-    if (!assistantVisible) {
-      await expect
-        .poll(
-          async () => {
-            const texts = await page.locator('article, .prose, [data-message]').allTextContents();
-            return texts.some((t) => t.trim().length > userMsg.length && !t.includes(userMsg));
-          },
-          {
-            message: 'expected assistant reply in pure global chat mode',
-            timeout: 60_000,
-          }
-        )
-        .toBe(true);
-    }
-    await snap(page, 'u15-empty-2');
+  // 附件 chip 出现
+  await expect(page.getByText(/u15-sample\.txt/).first()).toBeVisible({
+    timeout: 10_000,
   });
+
+  // ---- 手动发一条消息
+  const userMsg = '继续问一个新问题';
+  const composer = page.locator('textarea');
+  await composer.fill(userMsg);
+  await page.getByRole('button', { name: /^(发送|Send)$/ }).click();
+
+  await expect(page.getByText(userMsg).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(ASSISTANT_REPLY).first()).toBeVisible({
+    timeout: 20_000,
+  });
+  await snap(page, 'u15-existing-2');
+
+  // ---- 刷新页面：历史 + 新消息 + 附件都应持久化（从 mock 的有状态存储回读）
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForURL(new RegExp(`/chat/${convId}(\\?|$)`), { timeout: 15_000 });
+
+  await expect(page.getByText('历史问题一二三').first()).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(page.getByText(userMsg).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(ASSISTANT_REPLY).first()).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(page.getByText(/u15-sample\.txt/).first()).toBeVisible({
+    timeout: 15_000,
+  });
+  await snap(page, 'u15-existing-3');
 });

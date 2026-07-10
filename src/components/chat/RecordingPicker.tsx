@@ -46,9 +46,16 @@ interface RecordingItem {
 export interface RecordingPickerProps {
   open: boolean;
   onClose: () => void;
-  conversationId: string;
+  /** attach 模式必传：POST 到该对话的 recordings 子路由 */
+  conversationId?: string;
   alreadyAttached?: ReadonlyArray<string>;
-  onAttached: (newSessionIds: string[]) => void;
+  onAttached?: (newSessionIds: string[]) => void;
+  /**
+   * 本地选择模式（首页起聊 composer 用）：对话尚未创建，确认时不 POST，
+   * 直接把选中项（含标题，供 pill 展示）回传给父组件，由父组件在
+   * POST /api/conversations 时带上 recordingIds。传了它就忽略 conversationId/onAttached。
+   */
+  onPickLocal?: (picked: Array<{ id: string; title: string }>) => void;
 }
 
 /**
@@ -133,6 +140,7 @@ export default function RecordingPicker({
   conversationId,
   alreadyAttached = [],
   onAttached,
+  onPickLocal,
 }: RecordingPickerProps) {
   const { token } = useAuth();
   const { mounted, leaving } = useExitAnimation(open);
@@ -256,8 +264,26 @@ export default function RecordingPicker({
 
   const handleAttach = useCallback(async () => {
     if (selected.length === 0 || submitting) return;
+
+    // 本地选择模式：对话未创建，不发请求，直接把选中项回传
+    if (onPickLocal) {
+      const byId = new Map(items.map((r) => [r.id, r]));
+      onPickLocal(
+        selected.map((id) => ({
+          id,
+          title: byId.get(id)?.title || '未命名',
+        }))
+      );
+      onClose();
+      return;
+    }
+
     if (!token) {
       toast.error('未登录', '请先登录后再附加录音');
+      return;
+    }
+    if (!conversationId) {
+      toast.error('附加失败', '缺少对话上下文');
       return;
     }
     setSubmitting(true);
@@ -289,7 +315,7 @@ export default function RecordingPicker({
         setSubmitting(false);
         return;
       }
-      onAttached([...selected]);
+      onAttached?.([...selected]);
       setSubmitting(false);
       onClose();
     } catch (err) {
@@ -299,7 +325,7 @@ export default function RecordingPicker({
       );
       setSubmitting(false);
     }
-  }, [selected, submitting, token, conversationId, onAttached, onClose]);
+  }, [selected, submitting, token, conversationId, onAttached, onClose, onPickLocal, items]);
 
   useEffect(() => {
     if (!open) return;

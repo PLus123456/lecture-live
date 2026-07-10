@@ -25,6 +25,8 @@ import {
   type ConversationListItem,
 } from '@/stores/conversationListStore';
 import ConfirmDialog from '@/components/ConfirmDialog';
+import ComposerModelControls from '@/components/chat/ComposerModelControls';
+import RecordingPicker from '@/components/chat/RecordingPicker';
 
 /**
  * 「最近对话」时间格式：当天显示 HH:MM；7 天内显示 X 天前；更早显示 YYYY-MM-DD。
@@ -75,6 +77,11 @@ export default function ChatHomeClient() {
 
   const [draft, setDraft] = useState('');
   const [creating, setCreating] = useState(false);
+  /** 起聊前预选的录音（创建对话时随 recordingIds 一并挂载） */
+  const [pendingRecordings, setPendingRecordings] = useState<
+    Array<{ id: string; title: string }>
+  >([]);
+  const [pickerOpen, setPickerOpen] = useState(false);
   // IME 合成守卫（与 GlobalChat 同步，含 Safari compositionend→keydown 时间窗）
   const [composing, setComposing] = useState(false);
   const lastCompositionEndRef = useRef(0);
@@ -94,20 +101,23 @@ export default function ChatHomeClient() {
   }, [token, refresh]);
 
   /* ──────────────────────────────────────────────────────────────
-     发送首条消息：创建对话 → 暂存文本 → 跳详情页自动发送
+     发送首条消息：创建对话（带预选录音）→ 暂存文本 → 跳详情页自动发送
      ────────────────────────────────────────────────────────────── */
   const handleStart = useCallback(async () => {
     const text = draft.trim();
     if (!text || creating || !token) return;
     setCreating(true);
     try {
+      const recordingIds = pendingRecordings.map((r) => r.id);
       const res = await fetch('/api/conversations', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({}),
+        body: JSON.stringify(
+          recordingIds.length > 0 ? { recordingIds } : {}
+        ),
       });
       if (!res.ok) {
         toast.error(t('common.operationFailed'), `HTTP ${res.status}`);
@@ -137,7 +147,7 @@ export default function ChatHomeClient() {
     } finally {
       setCreating(false);
     }
-  }, [draft, creating, token, router, t]);
+  }, [draft, creating, token, pendingRecordings, router, t]);
 
   /* ──────────────────────────────────────────────────────────────
      删除对话：二次确认 → DELETE → 同步共享列表
@@ -221,6 +231,35 @@ export default function ChatHomeClient() {
                      focus-within:border-rust-400 focus-within:ring-1 focus-within:ring-rust-400
                      px-4 pt-3 pb-2.5 mb-10 animate-fade-in-up stagger-2 transition-colors"
         >
+          {/* 预选录音 pills（创建对话时一并挂载） */}
+          {pendingRecordings.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {pendingRecordings.map((r) => (
+                <span
+                  key={r.id}
+                  className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md
+                             text-[11px] border bg-white border-cream-300 text-charcoal-600"
+                  title={r.title}
+                >
+                  <Mic className="w-3 h-3 flex-shrink-0 text-rust-500" />
+                  <span className="truncate max-w-[200px]">{r.title}</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setPendingRecordings((prev) =>
+                        prev.filter((x) => x.id !== r.id)
+                      )
+                    }
+                    title={t('chat.removeRecording')}
+                    className="w-4 h-4 rounded hover:bg-charcoal-100 text-charcoal-400
+                               hover:text-charcoal-700 flex items-center justify-center"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <textarea
             ref={composerRef}
             rows={2}
@@ -254,25 +293,54 @@ export default function ChatHomeClient() {
                        focus:outline-none text-charcoal-700 placeholder:text-charcoal-300
                        disabled:cursor-not-allowed"
           />
-          <div className="flex items-center justify-end pt-1">
+          {/* 工具行：添加录音（左） —— 模型 · 思考 · 发送（右），与对话页 composer 一致 */}
+          <div className="flex items-center justify-between pt-1">
             <button
               type="button"
-              onClick={() => void handleStart()}
-              disabled={creating || !token || !draft.trim()}
-              aria-label={t('chat.send')}
-              title={t('chat.send')}
-              className="w-8 h-8 rounded-lg bg-rust-500 text-white hover:bg-rust-600
-                         flex items-center justify-center
-                         disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+              onClick={() => setPickerOpen(true)}
+              disabled={creating}
+              title={t('chat.attachRecording')}
+              className="inline-flex items-center gap-1.5 px-2 h-8 rounded-lg text-xs
+                         text-charcoal-400 hover:bg-cream-100 hover:text-charcoal-600
+                         transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              {creating ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <ArrowUp className="w-4 h-4" />
-              )}
+              <Mic className="w-4 h-4" />
+              {t('chat.attachRecording')}
             </button>
+
+            <div className="flex items-center gap-1.5">
+              <ComposerModelControls direction="down" disabled={creating} />
+              <button
+                type="button"
+                onClick={() => void handleStart()}
+                disabled={creating || !token || !draft.trim()}
+                aria-label={t('chat.send')}
+                title={t('chat.send')}
+                className="w-8 h-8 rounded-lg bg-rust-500 text-white hover:bg-rust-600
+                           flex items-center justify-center
+                           disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+              >
+                {creating ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <ArrowUp className="w-4 h-4" />
+                )}
+              </button>
+            </div>
           </div>
         </div>
+
+        <RecordingPicker
+          open={pickerOpen}
+          onClose={() => setPickerOpen(false)}
+          alreadyAttached={pendingRecordings.map((r) => r.id)}
+          onPickLocal={(picked) =>
+            setPendingRecordings((prev) => [
+              ...prev,
+              ...picked.filter((p) => !prev.some((x) => x.id === p.id)),
+            ])
+          }
+        />
 
         {/* 最近对话 */}
         <div className="animate-fade-in-up stagger-3">

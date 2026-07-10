@@ -23,6 +23,11 @@ import {
 import { deleteRecordingDraft } from '@/lib/recordingDraftPersistence';
 import { deleteConversationsCascade } from '@/lib/conversationCascade';
 import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
+import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
+import {
+  deleteSonioxFile,
+  deleteSonioxTranscription,
+} from '@/lib/soniox/asyncFile';
 
 export async function GET(
   req: Request,
@@ -262,6 +267,28 @@ export async function DELETE(
     session.asyncTranscribeStatus != null
   ) {
     await cancelAsyncUpload(session).catch(() => undefined);
+  }
+
+  // 完整版补全转录进行中时删会话：与异步上传同理，Soniox 上的 file + transcription 会随行消失而
+  // 永久泄漏（行一删便无 id→owner 关联，reclaim cron 也无从查起）。best-effort 清 Soniox 资源
+  // （本地/Cloudreve 转录产物由下方 deleteSessionArtifacts 的 'full-transcripts' 分支清）。
+  // 仅进行中态才可能持有未清的 Soniox 资源：finalize 成功会 null 掉这两个字段、失败/回收也会清；
+  // 故用「任一字段非空」精确判定，避免对终态多余请求。
+  if (session.fullSonioxFileId || session.fullSonioxTranscriptionId) {
+    const sonioxConfig = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);
+    if (sonioxConfig) {
+      if (session.fullSonioxFileId) {
+        await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(
+          () => undefined
+        );
+      }
+      if (session.fullSonioxTranscriptionId) {
+        await deleteSonioxTranscription(
+          sonioxConfig,
+          session.fullSonioxTranscriptionId
+        ).catch(() => undefined);
+      }
+    }
   }
 
   // U8：先把 legacy 单录音对话（Conversation.sessionId = 本 session）经

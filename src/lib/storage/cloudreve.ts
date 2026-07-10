@@ -19,6 +19,7 @@ const STORAGE_CATEGORIES = [
   'transcripts',
   'summaries',
   'reports',
+  'full-transcripts',
   'chat-uploads',
 ] as const;
 // Cloudreve V4 用 Files.Write 表示读写权限，请求 Files.Read + Files.Write 组合

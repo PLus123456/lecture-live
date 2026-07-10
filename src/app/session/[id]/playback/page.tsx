@@ -20,6 +20,7 @@ import { summaryBlocksToResponses } from '@/lib/summary';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useAuthStore } from '@/stores/authStore';
 import { useTranscriptStore } from '@/stores/transcriptStore';
+import { isActivelyRecording } from '@/lib/session/recordingLifecycle';
 import { useSummaryStore } from '@/stores/summaryStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import {
@@ -476,6 +477,12 @@ export default function PlaybackPage() {
 
   // Sync to stores (for ChatTab / ExportModal)
   useEffect(() => {
+    // 正在录音时让位：绝不清空、也绝不把回放页的历史 segments 灌进全局实时 store，
+    // 否则会抹掉/污染正在进行的录音（含刷新恢复所依赖的 sessionStorage 快照）——审计 high。
+    if (isActivelyRecording(useTranscriptStore.getState().recordingState)) {
+      return;
+    }
+
     clearTranscript();
     clearSummaries();
     clearTranslations();
@@ -489,6 +496,9 @@ export default function PlaybackPage() {
     summaries.forEach((summary) => addSummaryBlock(summary));
 
     return () => {
+      if (isActivelyRecording(useTranscriptStore.getState().recordingState)) {
+        return;
+      }
       clearTranscript();
       clearSummaries();
       clearTranslations();

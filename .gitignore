@@ -61,3 +61,7 @@ BILLING_FIXES.md
 CLAUDE.md
 ISSUES_REPORT.md
 LLM_CONTEXT_DESIGN.md
+
+# Playwright 运行产物
+/test-results/
+/playwright-report/

@@ -240,6 +240,8 @@ export default {
       disconnectPaused:
         'Connection interrupted. Recording time has been paused and will continue once reconnected.',
       disconnectResumed: 'Connection restored. Recording resumed.',
+      transcriptionInterrupted:
+        'Network interrupted — live transcription is paused, but recording is still being saved. It will resume automatically once reconnected, and the offline portion can be transcribed later.',
       reconnectFailed:
         'Connection lost and automatic reconnection failed. Click Resume to reconnect manually.',
       quotaExhaustedStart:

@@ -69,13 +69,15 @@ npm ci
 # 关键：裸调 `prisma db push` 对「有数据的表加必填自增列」等变更会要求 reset 整库（数据全失）；
 # 编排器先用幂等数据脚本把这类变更铺好，db push 便无需破坏，且自动回填历史 userId。
 info "同步数据库结构（数据感知迁移 → db push → 历史归属回填）..."
-npx prisma generate
 # 升级时 cwd 是源码目录（$APP_DIR/src），其中通常没有 .env，DATABASE_URL 也未导出；
-# ensure-database.mjs 在无 DATABASE_URL 且无 env 文件时会静默 exit 0 → schema 与代码漂移。
-# 用 node --env-file 载入真实生产配置（$APP_DIR/.env，与 systemd ExecStart 一致，能正确处理引号）。
+# 真实生产配置在 $APP_DIR/.env（与 systemd ExecStart 一致，能正确处理引号）。
+# 用 node --env-file 载入它，让 prisma generate（经 run-prisma 包装器）与 ensure-database.mjs
+# 都拿得到 DATABASE_URL —— 否则 generate 会在缺连接串时静默 exit 0、ensure-database 静默跳过，schema 漂移。
 if [[ -f "$APP_DIR/.env" ]]; then
+    node --env-file="$APP_DIR/.env" scripts/run-prisma.mjs generate
     node --env-file="$APP_DIR/.env" scripts/ensure-database.mjs
 else
+    node scripts/run-prisma.mjs generate
     node scripts/ensure-database.mjs
 fi
 

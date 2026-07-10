@@ -18,6 +18,7 @@
 import { existsSync } from 'fs';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import { loadEnvFileIfNeeded } from './load-env.mjs';
 
 // 各运维脚本与本文件同在 scripts/ 下；用本文件所在目录定位，不受 cwd 影响。
 const SCRIPT_DIR = import.meta.dirname;
@@ -29,22 +30,9 @@ function isAutoDbPushDisabled() {
   return value === '0' || value === 'false' || value === 'off';
 }
 
-// 把 .env / .env.local 载入 process.env，使后续子进程（数据脚本用 PrismaClient 读 DATABASE_URL）
-// 都能拿到连接串。若 DATABASE_URL 已由环境注入（Docker / systemd / --env-file）则不覆盖。
-function loadEnvFileIfNeeded() {
-  if (process.env.DATABASE_URL?.trim()) return;
-  for (const name of ['.env', '.env.local']) {
-    const file = path.join(ROOT, name);
-    if (existsSync(file)) {
-      try {
-        process.loadEnvFile(file);
-      } catch {
-        /* 解析失败时忽略，交由下方 DATABASE_URL 缺失检查兜底 */
-      }
-      if (process.env.DATABASE_URL?.trim()) return;
-    }
-  }
-}
+// 把 .env.local / .env 载入 process.env（见 scripts/load-env.mjs），使后续子进程
+// （数据脚本用 PrismaClient、prisma db push 读 DATABASE_URL）都能拿到连接串。
+// 若 DATABASE_URL 已由环境注入（Docker / systemd / --env-file）则不覆盖。
 
 function resolvePrismaBin() {
   const binName = process.platform === 'win32' ? 'prisma.cmd' : 'prisma';
@@ -74,7 +62,7 @@ if (isAutoDbPushDisabled()) {
   process.exit(0);
 }
 
-loadEnvFileIfNeeded();
+loadEnvFileIfNeeded(ROOT);
 
 const hasDatabaseUrl = Boolean(process.env.DATABASE_URL?.trim());
 const hasEnvFile =

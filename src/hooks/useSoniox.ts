@@ -34,6 +34,10 @@ const RECONNECT_BASE_DELAY_MS = 1500;
 const STABLE_CONNECTION_MS = 8000;
 // 分片上传撞 429 后，无 Retry-After 时的默认退避基值。
 const CHUNK_BACKOFF_BASE_MS = 3000;
+// 主动暂停保留的 Soniox 句柄的存活安全窗口。Soniox 实时连接在无音频/keepalive 约 20s 后被
+// 服务端关闭；暂停超过此窗口后，句柄多半已死，resume 复用会「假录音」（UI 在录、无数据流、
+// 转录静默丢），改为重建连接。取 15s 留余量。
+const PAUSE_HANDLE_STALE_MS = 15_000;
 
 interface UseSonioxOptions {
   idleTimeoutMs?: number;
@@ -276,6 +280,12 @@ export function useSoniox(
         }
 
         remoteDraftSeqsRef.current = remoteSeqs;
+        // 服务端已有这些 seq → 把归档的下一个分片号推到服务端最大值之上，避免续录/换设备时
+        // 新分片撞上服务端残留旧 seq 被误判「已上传」而跳过补传（审计 high）。仅前进不后退。
+        if (remoteSeqs.size > 0) {
+          const remoteMaxSeq = Math.max(...remoteSeqs);
+          archiveManagerRef.current?.ensureSeqAbove(remoteMaxSeq + 1);
+        }
         publishBackupMeta({
           localChunkCount,
           remoteChunkCount: remoteSeqs.size,
@@ -1320,6 +1330,21 @@ export function useSoniox(
     cancelStableConn();
     reconnectAttemptsRef.current = 0;
     shouldReconnectRef.current = false;
+
+    // 暂停时长超过句柄存活窗口 → 保留的 Soniox 句柄多半已被服务端关闭，复用会「假录音」
+    // （审计 high）。清掉旧句柄，落到下面重建一条新连接。
+    const pausedAtSnapshot = useTranscriptStore.getState().pausedAt;
+    const pausedForMs = pausedAtSnapshot ? Date.now() - pausedAtSnapshot : 0;
+    const handleLikelyStale = pausedForMs > PAUSE_HANDLE_STALE_MS;
+
+    if (recordingRef.current && recordingState === 'paused' && handleLikelyStale) {
+      try {
+        await recordingRef.current.recording.stop?.();
+      } catch {
+        /* best-effort：旧句柄可能已死，忽略 */
+      }
+      recordingRef.current = null;
+    }
 
     if (recordingRef.current && recordingState === 'paused') {
       autoPauseReasonRef.current = null;

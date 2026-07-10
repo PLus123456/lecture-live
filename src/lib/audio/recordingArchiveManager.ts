@@ -177,6 +177,17 @@ export class RecordingArchiveManager {
     this.onChunkStored = handler;
   }
 
+  /**
+   * 把下一个分片序号推进到至少 minSeq，防止跨设备/清缓存续录时本地 seq 从 0 重启、
+   * 与服务端残留旧 draft 的 seq 撞号（撞号会被 uploadDraftChunk 误判「已上传」而跳过补传，
+   * 收尾合并出旧音频、新音频被丢）。仅前进不后退，保证 seq 单调。审计 high。
+   */
+  ensureSeqAbove(minSeq: number): void {
+    if (Number.isFinite(minSeq) && minSeq > this.nextSeq) {
+      this.nextSeq = minSeq;
+    }
+  }
+
   async stop(): Promise<void> {
     await this.ensureSessionRecord('finalizing');
 

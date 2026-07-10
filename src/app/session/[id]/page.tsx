@@ -968,44 +968,74 @@ export default function ActiveSessionPage() {
       return;
     }
 
+    const draftHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    };
+    const buildDraftBody = () => {
+      const tState = useTranscriptStore.getState();
+      const summaryState = useSummaryStore.getState();
+      return JSON.stringify({
+        segments: tState.segments,
+        summaries: summaryState.blocks,
+        translations: useTranslationStore.getState().translations,
+        clientTs: Date.now(),
+        recordingStartTime: tState.recordingStartTime,
+        pausedAt: tState.pausedAt,
+        totalPausedMs: tState.totalPausedMs,
+        totalDurationMs: tState.totalDurationMs,
+        summaryRunningContext: summaryState.runningContext,
+        currentSessionIndex: tState.currentSessionIndex,
+      });
+    };
+
     const uploadDraft = async () => {
       const currentSegments = useTranscriptStore.getState().segments;
       // 没有新 segment 时跳过
       if (currentSegments.length === 0 || currentSegments.length === lastDraftSegCountRef.current) {
         return;
       }
-      lastDraftSegCountRef.current = currentSegments.length;
-
-      const summaryState = useSummaryStore.getState();
-      const currentSummaries = summaryState.blocks;
-      const currentTranslations = useTranslationStore.getState().translations;
-      const tState = useTranscriptStore.getState();
+      const attemptedCount = currentSegments.length;
 
       try {
-        await fetch(`/api/sessions/${sessionId}/transcript/draft`, {
+        const res = await fetch(`/api/sessions/${sessionId}/transcript/draft`, {
           method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers: draftHeaders,
           keepalive: true,
-          body: JSON.stringify({
-            segments: currentSegments,
-            summaries: currentSummaries,
-            translations: currentTranslations,
-            clientTs: Date.now(),
-            recordingStartTime: tState.recordingStartTime,
-            pausedAt: tState.pausedAt,
-            totalPausedMs: tState.totalPausedMs,
-            totalDurationMs: tState.totalDurationMs,
-            summaryRunningContext: summaryState.runningContext,
-            currentSessionIndex: tState.currentSessionIndex,
-          }),
+          body: buildDraftBody(),
         });
+        // 只在成功后推进已上传段数：否则一次瞬时失败/非 2xx 会把这批段永久标记为「已传」，
+        // 该快照永不重传（审计 medium）。失败则保持不变，下个周期重试。
+        if (res.ok) {
+          lastDraftSegCountRef.current = attemptedCount;
+        }
       } catch {
-        // 静默失败，下次重试
+        // 静默失败，保持 lastDraftSegCountRef 不变，下次重试
       }
     };
+
+    // 关标签/切后台时立即冲刷最新转录 draft（keepalive 保证 unload 过程中也能送达），否则
+    // 最后 <15s 的转录段在真关标签时冷恢复丢失（审计 medium：unload 只冲音频不传转录 draft）。
+    const flushDraftForUnload = () => {
+      if (useTranscriptStore.getState().segments.length === 0) return;
+      try {
+        void fetch(`/api/sessions/${sessionId}/transcript/draft`, {
+          method: 'PUT',
+          headers: draftHeaders,
+          keepalive: true,
+          body: buildDraftBody(),
+        });
+      } catch {
+        /* best-effort on unload */
+      }
+    };
+    const handlePageHide = () => flushDraftForUnload();
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') flushDraftForUnload();
+    };
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('beforeunload', handlePageHide);
+    document.addEventListener('visibilitychange', handleVisibility);
 
     // 启动后立即上传一次，然后每 15 秒一次
     void uploadDraft();
@@ -1016,6 +1046,9 @@ export default function ActiveSessionPage() {
         clearInterval(transcriptDraftTimerRef.current);
         transcriptDraftTimerRef.current = null;
       }
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('beforeunload', handlePageHide);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [recordingState, token, sessionId]);
 

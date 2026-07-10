@@ -493,3 +493,65 @@ describe('R1491：暂停态刷新恢复不把暂停空档算入续录偏移', ()
     nowSpy.mockRestore();
   });
 });
+
+describe('R1278：长暂停后继续应重建连接而非复用可能已死的句柄', () => {
+  it('暂停超过句柄存活窗口(15s)后 start 走重建，不静默复用死句柄', async () => {
+    const nowSpy = vi.spyOn(Date, 'now');
+    nowSpy.mockReturnValue(1_000_000);
+    const { result } = renderHook(() =>
+      useSoniox('sess-stale', { idleTimeoutMs: 999_999_999 })
+    );
+    await act(async () => {
+      await result.current.start();
+    });
+    act(() => {
+      capturedCallbacks[capturedCallbacks.length - 1].onConnectionChange('connected');
+    });
+    expect(useTranscriptStore.getState().recordingState).toBe('recording');
+    const callsAfterStart = startSonioxRecordingMock.mock.calls.length;
+
+    // 主动暂停（保留 Soniox 句柄）
+    act(() => {
+      result.current.pause();
+    });
+    expect(useTranscriptStore.getState().recordingState).toBe('paused');
+
+    // 长暂停 20s（> PAUSE_HANDLE_STALE_MS=15s）后点继续：句柄多半已死，应重建连接
+    nowSpy.mockReturnValue(1_020_000);
+    await act(async () => {
+      await result.current.start();
+    });
+    // 重建 = startSonioxRecording 再被调用一次；旧 bug 会复用死句柄、不重建（calls 不变）
+    expect(startSonioxRecordingMock.mock.calls.length).toBe(callsAfterStart + 1);
+
+    nowSpy.mockRestore();
+  });
+
+  it('短暂停(<15s)后继续复用现有句柄，不重建', async () => {
+    const nowSpy = vi.spyOn(Date, 'now');
+    nowSpy.mockReturnValue(2_000_000);
+    const { result } = renderHook(() =>
+      useSoniox('sess-fresh-resume', { idleTimeoutMs: 999_999_999 })
+    );
+    await act(async () => {
+      await result.current.start();
+    });
+    act(() => {
+      capturedCallbacks[capturedCallbacks.length - 1].onConnectionChange('connected');
+    });
+    const callsAfterStart = startSonioxRecordingMock.mock.calls.length;
+
+    act(() => {
+      result.current.pause();
+    });
+    // 仅暂停 5s 后继续：连接大概率仍活，复用句柄、不重建
+    nowSpy.mockReturnValue(2_005_000);
+    await act(async () => {
+      await result.current.start();
+    });
+    expect(startSonioxRecordingMock.mock.calls.length).toBe(callsAfterStart);
+    expect(useTranscriptStore.getState().recordingState).toBe('recording');
+
+    nowSpy.mockRestore();
+  });
+});

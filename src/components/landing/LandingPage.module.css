@@ -601,8 +601,9 @@
 .heroCopy {
   position: relative;
   z-index: 3;
-  transform: translate3d(0, var(--hero-copy-shift), 0);
-  opacity: var(--hero-fade);
+  transform: translate3d(var(--hero-enter-x, 0px), var(--hero-copy-shift), 0);
+  opacity: calc(var(--hero-fade) * var(--hero-enter-o, 1));
+  animation: heroEnterLeft 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
   will-change: transform, opacity;
 }
 
@@ -738,8 +739,9 @@
   width: 112%;
   margin-left: -2%;
   padding: 70px 0 85px;
-  transform: translate3d(0, var(--hero-visual-shift), 0);
-  opacity: calc(0.42 + var(--hero-fade) * 0.58);
+  transform: translate3d(var(--hero-enter-x, 0px), var(--hero-visual-shift), 0);
+  opacity: calc((0.42 + var(--hero-fade) * 0.58) * var(--hero-enter-o, 1));
+  animation: heroEnterRight 0.9s cubic-bezier(0.16, 1, 0.3, 1) 0.08s both;
   perspective: 1200px;
   will-change: transform, opacity;
 }
@@ -2907,6 +2909,30 @@
   color: rgba(var(--ll-ink-rgb), 0.24);
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 7px;
+}
+
+/* 首屏进入动画：左侧文案从左、右侧产品图从右滑入并淡入。
+   用可动画的自定义属性驱动，只吃 X 位移与不透明度倍率，
+   与滚动视差(--hero-copy-shift/--hero-fade)组合而互不打架。 */
+@property --hero-enter-x {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --hero-enter-o {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 1;
+}
+
+@keyframes heroEnterLeft {
+  from { --hero-enter-x: -60px; --hero-enter-o: 0; }
+  to { --hero-enter-x: 0px; --hero-enter-o: 1; }
+}
+
+@keyframes heroEnterRight {
+  from { --hero-enter-x: 60px; --hero-enter-o: 0; }
+  to { --hero-enter-x: 0px; --hero-enter-o: 1; }
 }
 
 @keyframes waveTalk {

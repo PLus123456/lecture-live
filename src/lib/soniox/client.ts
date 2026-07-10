@@ -187,6 +187,38 @@ export async function startSonioxRecording(
     onAudioLevel?: (level: number) => void;
   }
 ) {
+  // ── E2E 测试接缝 ──
+  // 真实 Soniox SDK 需要连 wss://stt-rt.soniox.com，无法在 e2e 环境运行。当页面显式设置
+  // window.__E2E_FAKE_SONIOX__ 时（仅测试注入，生产永不置位），返回一个假转录连接，并把
+  // 驱动接口挂到 window.__sonioxTest 供 e2e 触发「连上 / 断网 / 收到 token」，从而端到端验证
+  // 录音态与断网续采等整页行为。仍复用真实 archiveManager（配合 chromium 假麦克风真录音频）。
+  if (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__E2E_FAKE_SONIOX__) {
+    callbacks.onConnectionChange('connecting');
+    const fakeRecording = {
+      stop: async () => {},
+      pause: () => {},
+      resume: () => {},
+      on: () => {},
+    };
+    (window as unknown as Record<string, unknown>).__sonioxTest = {
+      connect: () => callbacks.onConnectionChange('connected'),
+      error: (msg?: string) => {
+        callbacks.onConnectionChange('error');
+        callbacks.onError(new Error(msg ?? 'e2e disconnect'));
+      },
+      token: (tokens: unknown[]) => callbacks.onPartialResult(tokens),
+      endpoint: () => callbacks.onEndpoint(),
+    };
+    // 不自动连上：连接/断网/token 全部由 e2e 通过 __sonioxTest 显式驱动，避免重连自动连上
+    // 把「转录中断」提示覆盖掉，测试可精确控制时序。
+    return {
+      recording: fakeRecording,
+      client: {},
+      source: {},
+      temporaryKey: { region: 'test', ws_base_url: 'wss://fake', api_key: 'fake' },
+    };
+  }
+
   // Dynamic import to ensure client-side only
   const { SonioxClient, BrowserPermissionResolver } = await import('@soniox/client');
 

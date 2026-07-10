@@ -157,6 +157,17 @@ export default {
     quota: 'Quota',
     interfaceLanguage: 'Interface Language',
     interfaceLanguageDesc: 'Choose the display language for the application interface.',
+    email: 'Email',
+    currentPasswordPlaceholder: 'Enter current password',
+    newPasswordPlaceholder: 'At least 8 characters',
+    confirmPasswordPlaceholder: 'Re-enter new password',
+    summaryProviderDesc: 'Controls which configured LLM handles incremental summaries.',
+    providerLoadError: 'Unable to load configured providers right now.',
+    transcriptSegment: 'Transcript Segment',
+    segmentSplitThreshold: 'Segment Split Threshold',
+    segmentSplitDesc:
+      'When a segment grows taller than this percentage of the visible area, it is automatically split into a new segment at the next sentence boundary. Set to OFF to let the ASR engine decide segment boundaries. Lower values produce shorter segments; 20%–30% is recommended.',
+    off: 'OFF',
   },
 
   // 侧边栏

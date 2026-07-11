@@ -68,6 +68,11 @@ model Session {
   serverPausedMs  Int       @default(0)
   serverPausedAt  DateTime?
   finalizeLockedAt DateTime?
+  // B7：本会话转录分钟被扣费的时刻（realtime/异步上传/完整版 finalize 时置）。对账按此归期，
+  // 而非 createdAt —— 跨月/延迟收尾/自动回收的会话，扣费落在 finalize 时的配额窗口，用 createdAt
+  // 归期会把它算错周期、虚报 drift。与 InterpretUsage.chargedAt 同一"按扣费时刻归期"口径。
+  // 多笔扣费(realtime + 完整版补全)时为最后一笔的时刻(last-write)；同周期常态无碍。
+  billedAt        DateTime?
 
   // v2.1: 音频源 & 区域
   audioSource     String    @default("microphone")  // "microphone" | "system_audio"

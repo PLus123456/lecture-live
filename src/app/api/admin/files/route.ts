@@ -8,7 +8,7 @@ import {
   invalidateShareLinksApiCache,
 } from '@/lib/apiResponseCache';
 import { logAction } from '@/lib/auditLog';
-import { releaseStorageBytes } from '@/lib/quota';
+import { releaseStorageBytes, settleAsyncReservation } from '@/lib/quota';
 import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
 
 type StatusFilter = '' | 'has-recording' | 'no-recording' | 'completed' | 'archived' | 'recording';
@@ -203,6 +203,13 @@ export async function DELETE(req: Request) {
       ) {
         await cancelAsyncUpload(session).catch(() => undefined);
       }
+    }
+
+    // B1：删行前原子结算每个会话遗留的异步上传预留（asyncReservedMinutes）。行一删，回收 cron
+    // 只扫现存 Session 行、再也找不到 → 预留永久占着 transcriptionMinutesUsed 泄漏。对齐用户侧
+    // DELETE；settleAsyncReservation 幂等、恰好释放一次（与并发结算/回收互斥）。
+    for (const id of targetIds) {
+      await settleAsyncReservation(id).catch(() => undefined);
     }
 
     // 删 session 会级联删 legacy 单录音对话(Conversation.sessionId 命中)及其 ChatAttachment

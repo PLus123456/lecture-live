@@ -33,7 +33,10 @@ import {
 } from '@/lib/soniox/asyncTranscriptConverter';
 import { persistSessionTranscriptArtifacts } from '@/lib/sessionPersistence';
 import { runBackgroundLLMTasks } from '@/lib/sessionFinalization';
-import { deductTranscriptionMinutes } from '@/lib/quota';
+import {
+  deductTranscriptionMinutes,
+  settleAsyncReservation,
+} from '@/lib/quota';
 import { getBillableMinutes } from '@/lib/billing';
 import { getSiteSettings } from '@/lib/siteSettings';
 
@@ -161,21 +164,31 @@ export async function finalizeAsyncTranscription(
     await options.onCompleted(session);
   }
 
-  // 异步上传转录计费（批2）：上方 claim + 此处 finalize 守卫共同保证每个 session 仅有一个路径
-  // 进到此分支且未被取消，故扣费恰好执行一次（幂等无须额外锁）。按 ceil(分钟)×倍率 扣减，
+  // 异步上传转录计费（批2 + B1）：上方 claim + 此处 finalize 守卫共同保证每个 session 仅有一个
+  // 路径进到此分支且未被取消，故结算恰好执行一次（幂等无须额外锁）。按 ceil(分钟)×倍率 扣减，
   // 倍率默认 0.8、可在 admin 设置；与对账侧口径一致。计费失败不影响转录完成，留给对账兜底。
+  //
+  // B1：把入口预留（session.asyncReservedMinutes，已计入 used）「转」为实扣——同一事务里
+  // deduct 实际 + release 预留 + 清预留列。used 净变化 = 实扣，且不残留预留。三步原子，避免
+  // finalize 与预留结算脱节；即便本事务整体失败，预留仍留在列上，由 cron 兜底释放。
   try {
     const { async_upload_billing_multiplier } = await getSiteSettings();
     const billableMinutes = Math.ceil(
       getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
     );
-    if (billableMinutes > 0) {
-      await deductTranscriptionMinutes(session.userId, billableMinutes);
-    }
+    await prisma.$transaction(async (tx) => {
+      if (billableMinutes > 0) {
+        await deductTranscriptionMinutes(session.userId, billableMinutes, tx);
+      }
+      // 把入口预留「转」为实扣：settleAsyncReservation 用 FOR UPDATE 读**当前**列并原子释放。
+      // deduct 内部 ensureQuotaWindow 若刚触发月度重置会顺带清列 → 此时 settle 读到 0、不重复释放，
+      // 杜绝跨周期把已被重置隐式清除的预留再减一次（审查 R1）。并发多路径经 settle 也仅释放一次。
+      await settleAsyncReservation(session.id, tx);
+    });
   } catch (billingErr) {
     logger.error(
       { err: billingErr, sessionId: session.id },
-      'async upload billing deduct failed (transcription already completed)'
+      'async upload billing settle failed (transcription already completed)'
     );
   }
 

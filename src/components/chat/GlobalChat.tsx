@@ -13,17 +13,15 @@ import { chatUrlTransform } from '@/components/chat/markdownUrlTransform';
 import {
   ArrowUp,
   Square,
-  Loader2,
   Bot,
   ChevronDown,
   ChevronUp,
   ChevronRight,
   Sparkles,
-  ImagePlus,
   X,
-  Paperclip,
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
+import { useIsMobile } from '@/hooks/useIsMobile';
 import { useAuthStore } from '@/stores/authStore';
 import { useConversationListStore } from '@/stores/conversationListStore';
 import {
@@ -42,6 +40,8 @@ import AttachmentChip, { type AttachmentChipData } from './AttachmentChip';
 import RecordingsBar, { type RecordingPill } from './RecordingsBar';
 import RecordingPicker from './RecordingPicker';
 import ComposerModelControls from './ComposerModelControls';
+import ComposerAttachMenu from './ComposerAttachMenu';
+import ChatContextIndicator from './ChatContextIndicator';
 
 /* ------------------------------------------------------------------ */
 /*  图片上传约束（与服务端 LLM_LIMITS 对齐 — 与 ChatTab 同步）              */
@@ -399,6 +399,7 @@ export default function GlobalChat({
   onAccessDenied?: () => void;
 }) {
   const { t } = useI18n();
+  const isMobile = useIsMobile();
   const router = useRouter();
   const token = useAuthStore((s) => s.token);
 
@@ -419,9 +420,9 @@ export default function GlobalChat({
     setContextFull,
   } = useChatStore();
 
-  // 本对话的运行时切片 —— messages/archivedMessages/isLoading/contextFull 全从这里取（不再读全局单例）
+  // 本对话的运行时切片 —— messages/archivedMessages/isLoading/contextFull/tokenUsage 全从这里取（不再读全局单例）
   // U19：此前漏读 archivedMessages，压缩过的对话里早期历史被永久隐藏、无展开入口。
-  const { messages, archivedMessages, isLoading, contextFull } =
+  const { messages, archivedMessages, isLoading, contextFull, tokenUsage } =
     byConversation[conversationId] ?? EMPTY_CONVERSATION_RUNTIME;
 
   /* ── 局部 UI state ── */
@@ -938,6 +939,99 @@ export default function GlobalChat({
   }, [token, conversationId]);
 
   /* ──────────────────────────────────────────────────────────────
+     重新拉取消息（主动压缩后刷新 archived/visible 切分 + tokenUsage 种子）
+     —— 与首次加载同口径，仅用于 /compress 成功后本地同步，不动 endedAt/pending。
+     ────────────────────────────────────────────────────────────── */
+  const reloadMessages = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(
+        `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      // 迟到的旧对话响应不允许写进已切换的新对话。
+      if (useChatStore.getState().activeConversationId !== conversationId) return;
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        messages: Array<{
+          id: string;
+          role: string;
+          content: string;
+          degradationLevel: number | null;
+          inputTokens: number | null;
+          createdAt: string;
+        }>;
+      };
+      const boundary = findCompressionBoundary(data.messages);
+      const toChatMessage = (raw: (typeof data.messages)[number]): ChatMessage => ({
+        id: raw.id,
+        role: raw.role === 'assistant' ? 'assistant' : 'user',
+        content: raw.content,
+        timestamp: new Date(raw.createdAt).getTime(),
+      });
+      const archived = data.messages
+        .slice(0, boundary.splitIndex + 1)
+        .filter((m) => m.role !== 'system')
+        .map(toChatMessage);
+      const visible = data.messages
+        .slice(boundary.splitIndex + 1)
+        .filter((m) => m.role !== 'system')
+        .map(toChatMessage);
+      setMessages(conversationId, visible, archived);
+
+      const lastAssistant = [...data.messages]
+        .reverse()
+        .find((m) => m.role === 'assistant' && m.inputTokens != null);
+      const budget = deriveBudgetFromModel(
+        useChatStore.getState().availableModels,
+        useChatStore.getState().selectedModel
+      );
+      if (lastAssistant?.inputTokens != null || budget > 0) {
+        const usedTok = lastAssistant?.inputTokens ?? 0;
+        setTokenUsage(conversationId, {
+          used: usedTok,
+          budget,
+          level: lastAssistant?.degradationLevel ?? 1,
+          breakdown: { systemPrompt: 0, transcript: 0, summary: 0, history: usedTok, userInput: 0 },
+        });
+      }
+    } catch {
+      /* best-effort：刷新失败保留旧消息 */
+    }
+  }, [token, conversationId, setMessages, setTokenUsage]);
+
+  /* ──────────────────────────────────────────────────────────────
+     主动压缩（/compress 命令）：POST /api/llm/chat/compress，成功后重拉消息。
+     —— 与 useChat.ts / ChatTab 同口径，让对话页也能在上下文吃紧前主动压缩历史。
+     ────────────────────────────────────────────────────────────── */
+  const compressActive = useCallback(
+    async (keepTurns = 3): Promise<{ ok: boolean; reason?: string }> => {
+      if (!token) return { ok: false, reason: 'no_token' };
+      try {
+        const res = await fetch('/api/llm/chat/compress', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ conversationId, keepTurns }),
+        });
+        if (!res.ok) {
+          const d = (await res.json().catch(() => null)) as { message?: string } | null;
+          return { ok: false, reason: d?.message ?? `压缩失败 (HTTP ${res.status})。建议新建对话。` };
+        }
+        const d = (await res.json()) as { compressed: boolean; reason?: string };
+        if (!d.compressed) return { ok: false, reason: d.reason ?? '历史太短，无需压缩' };
+        await reloadMessages();
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+      }
+    },
+    [token, conversationId, reloadMessages]
+  );
+
+  /* ──────────────────────────────────────────────────────────────
      新建对话（EOL 后引导）：带上当前录音另起一个全局对话并跳转
      ────────────────────────────────────────────────────────────── */
   const handleNewConversation = useCallback(async () => {
@@ -991,6 +1085,30 @@ export default function GlobalChat({
     if (textOverride === undefined) {
       setInput('');
       if (composerRef.current) composerRef.current.style.height = 'auto';
+    }
+
+    // /compress 命令：主动压缩历史，不发给 LLM（与 ChatTab 同步）。
+    if (value === '/compress' || value.startsWith('/compress ')) {
+      const arg = value.slice('/compress'.length).trim();
+      const keepTurns = /^\d+$/.test(arg)
+        ? Math.max(1, Math.min(10, parseInt(arg, 10)))
+        : 3;
+      addMessage(conversationId, {
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: value,
+        timestamp: Date.now(),
+      });
+      const result = await compressActive(keepTurns);
+      addMessage(conversationId, {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: result.ok
+          ? `已压缩对话历史，保留最近 ${keepTurns} 轮原文。早期消息已折叠（点击"已折叠"展开）。`
+          : `压缩失败：${result.reason ?? '未知原因'}。建议新建对话继续。`,
+        timestamp: Date.now(),
+      });
+      return;
     }
 
     const userMsg: ChatMessage = {
@@ -1101,10 +1219,30 @@ export default function GlobalChat({
                 ? thinkingLastAt - thinkingFirstAt
                 : undefined,
           });
+          // 用服务端回传的真实 used/budget/level 刷新上下文小圈（此前从不更新，
+          // 圈子进对话后恒为加载时的种子，发消息也不动 → 用户感知「上下文炸了」）。
+          const cur = useChatStore.getState().byConversation[conversationId]?.tokenUsage;
+          const usedTok =
+            typeof payload.inputTokens === 'number' ? payload.inputTokens : cur?.used ?? 0;
+          const budgetTok =
+            typeof payload.budget === 'number' && payload.budget > 0
+              ? payload.budget
+              : cur?.budget ?? 0;
+          const lvl = typeof payload.level === 'number' ? payload.level : cur?.level ?? 1;
+          setTokenUsage(conversationId, {
+            used: usedTok,
+            budget: budgetTok,
+            level: lvl,
+            breakdown: { systemPrompt: 0, transcript: 0, summary: 0, history: usedTok, userInput: 0 },
+          });
         } else if (event === 'error') {
           sawError = true;
-          // 上下文已满（EOL）：置位标志，禁用输入并引导新建对话。
-          if (payload.contextFull === true) setContextFull(conversationId, true);
+          // 上下文已满（EOL）：置位标志，禁用输入并引导新建对话；小圈转紫（L7）。
+          if (payload.contextFull === true) {
+            setContextFull(conversationId, true);
+            const cur = useChatStore.getState().byConversation[conversationId]?.tokenUsage;
+            if (cur) setTokenUsage(conversationId, { ...cur, level: 7 });
+          }
           const errText =
             typeof payload.error === 'string'
               ? payload.error
@@ -1292,7 +1430,7 @@ export default function GlobalChat({
             {pendingImages.map((url, i) => (
               <div
                 key={i}
-                className="relative w-14 h-14 rounded-md overflow-hidden border border-cream-300"
+                className="relative w-14 h-14 rounded-md overflow-hidden border border-cream-300 animate-tag-pop"
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -1305,7 +1443,7 @@ export default function GlobalChat({
                   onClick={() => removePendingImage(i)}
                   className="absolute top-0.5 right-0.5 w-4 h-4 rounded-full bg-charcoal-800/80
                              text-white flex items-center justify-center hover:bg-charcoal-900"
-                  title="移除图片"
+                  title={t('chat.removeAttachment')}
                 >
                   <X className="w-2.5 h-2.5" />
                 </button>
@@ -1375,41 +1513,32 @@ export default function GlobalChat({
             disabled={isLoading || contextFull || isEnded}
           />
 
-        {/* 工具行：图片/文件（左） —— 模型 · 思考 · 发送（右） */}
+        {/* 工具行：＋附件菜单（左） —— 模型（仅移动端）· 上下文小圈 · 发送（右） */}
         <div className="flex items-center justify-between mt-1">
-          <div className="flex items-center gap-0.5">
-            <button
-              type="button"
-              onClick={() => imageInputRef.current?.click()}
-              disabled={isLoading || !supportsImage || isEnded}
-              title={supportsImage ? '上传图片' : '当前模型不支持图片输入'}
-              className="w-8 h-8 rounded-lg text-charcoal-400
-                         hover:bg-cream-100 hover:text-charcoal-600 transition-colors
-                         flex items-center justify-center
-                         disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
-            >
-              <ImagePlus className="w-4 h-4" />
-            </button>
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isLoading || uploadingFile || isEnded}
-              title={t('chat.attachFile')}
-              className="w-8 h-8 rounded-lg text-charcoal-400
-                         hover:bg-cream-100 hover:text-charcoal-600 transition-colors
-                         flex items-center justify-center
-                         disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
-            >
-              {uploadingFile ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Paperclip className="w-4 h-4" />
-              )}
-            </button>
-          </div>
+          {/* ＋ 统一附件入口：上传文件 / 图片 / 添加录音 */}
+          <ComposerAttachMenu
+            onPickFile={() => fileInputRef.current?.click()}
+            onPickImage={() => imageInputRef.current?.click()}
+            onAttachRecording={() => {
+              if (!recordingsReady) {
+                toast.info(t('chat.recordingPickerComingSoon'));
+                return;
+              }
+              if (isEnded) {
+                toast.info(t('chat.endedReadonly'));
+                return;
+              }
+              setPickerOpen(true);
+            }}
+            supportsImage={supportsImage}
+            disabled={isLoading || isEnded}
+            uploadingFile={uploadingFile}
+          />
 
           <div className="flex items-center gap-1.5 min-w-0">
-            <ComposerModelControls />
+            {/* 桌面端模型选择器已移到对话侧栏底部；移动端无侧栏，保留在此 */}
+            {isMobile && <ComposerModelControls />}
+            <ChatContextIndicator tokenUsage={tokenUsage} contextFull={contextFull} />
 
             {isLoading ? (
               <button

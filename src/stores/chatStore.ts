@@ -232,15 +232,20 @@ export const useChatStore = create<ChatStore>()(
         set({ selectedThinkingPreference }),
 
       setAvailableModels: (availableModels, defaultModel) =>
-        set((state) => ({
-          availableModels,
-          modelsLoaded: true,
-          selectedModel:
-            state.selectedModel &&
-            availableModels.some((m) => m.name === state.selectedModel)
-              ? state.selectedModel
-              : defaultModel,
-        })),
+        set((state) => {
+          // 兜底为数组：某些页面（如 /api/llm/models 未 mock 的 admin e2e，或接口异常）
+          // 可能回传 undefined/非数组，直接落库会让 availableModels.find/.some 在渲染时抛错。
+          const models = Array.isArray(availableModels) ? availableModels : [];
+          return {
+            availableModels: models,
+            modelsLoaded: true,
+            selectedModel:
+              state.selectedModel &&
+              models.some((m) => m.name === state.selectedModel)
+                ? state.selectedModel
+                : defaultModel,
+          };
+        }),
 
       setActiveConversation: (activeConversationId) =>
         set({ activeConversationId }),

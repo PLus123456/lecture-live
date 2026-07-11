@@ -13,6 +13,7 @@ import {
 import { useAuth } from '@/hooks/useAuth';
 import { useAuthStore } from '@/stores/authStore';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { useI18n } from '@/lib/i18n';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
 import { useExitAnimation } from '@/hooks/useExitAnimation';
 
@@ -45,6 +46,7 @@ function getQuotaPercent(limit?: number, used?: number) {
 export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
   const drawerRef = useRef<HTMLDivElement>(null);
   const { mounted, leaving } = useExitAnimation(open, 250);
+  const { t } = useI18n();
   const router = useRouter();
   const { logout } = useAuth();
   const user = useAuthStore((state) => state.user);
@@ -76,7 +78,7 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
   );
   const quotaLabel = useMemo(() => {
     if (!quotas) {
-      return 'No quota data';
+      return t('mobile.noQuotaData');
     }
 
     const remaining = Math.max(
@@ -87,11 +89,11 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
     const minutes = remaining % 60;
 
     if (hours > 0) {
-      return `${hours}h ${minutes}m remaining`;
+      return t('sidebar.hoursMinutesLeft', { hours, minutes });
     }
 
-    return `${minutes}m remaining`;
-  }, [quotas]);
+    return t('sidebar.minutesLeft', { minutes });
+  }, [quotas, t]);
 
   if (!mounted) {
     return null;
@@ -100,7 +102,7 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
   return (
     <div className="fixed inset-0 z-[60]">
       <button
-        aria-label="Close profile drawer"
+        aria-label={t('mobile.closeProfileDrawer')}
         className={`absolute inset-0 bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}
         onClick={onClose}
       />
@@ -115,17 +117,17 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
             </div>
             <div className="min-w-0">
               <div className="truncate text-sm font-semibold text-charcoal-800">
-                {user?.displayName || 'Guest'}
+                {user?.displayName || t('mobile.guest')}
               </div>
               <div className="truncate text-xs text-charcoal-400">
-                {user?.email || 'Not signed in'}
+                {user?.email || t('mobile.notSignedIn')}
               </div>
             </div>
           </div>
           <button
             onClick={onClose}
             className="flex h-8 w-8 items-center justify-center rounded-full text-charcoal-400 transition-colors hover:bg-cream-100 hover:text-charcoal-700"
-            aria-label="Close"
+            aria-label={t('common.close')}
           >
             <X className="h-4 w-4" />
           </button>
@@ -135,10 +137,10 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
           <section className="rounded-2xl border border-cream-200 bg-cream-50 px-4 py-4">
             <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-charcoal-400">
               <User className="h-3.5 w-3.5" />
-              Usage
+              {t('mobile.usage')}
             </div>
             <div className="mb-2 flex items-center justify-between text-sm font-medium text-charcoal-700">
-              <span>Transcription quota</span>
+              <span>{t('mobile.transcriptionQuota')}</span>
               <span>{quotaPercent}%</span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-cream-200">
@@ -159,7 +161,7 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
               className="flex w-full items-center gap-3 rounded-2xl border border-cream-200 bg-white px-4 py-3 text-left text-sm font-medium text-charcoal-700 transition-colors hover:bg-cream-50"
             >
               <Settings className="h-4 w-4 text-rust-500" />
-              Account settings
+              {t('mobile.accountSettings')}
             </button>
 
             {isAdmin ? (
@@ -169,7 +171,7 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
                 className="flex items-center gap-3 rounded-2xl border border-cream-200 bg-white px-4 py-3 text-sm font-medium text-charcoal-700 transition-colors hover:bg-cream-50"
               >
                 <ShieldCheck className="h-4 w-4 text-rust-500" />
-                Admin panel
+                {t('nav.adminPanel')}
               </Link>
             ) : null}
           </div>
@@ -185,7 +187,7 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
             className="flex w-full items-center justify-center gap-2 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-700 transition-colors hover:bg-red-100"
           >
             <LogOut className="h-4 w-4" />
-            Sign out
+            {t('auth.signOut')}
           </button>
         </div>
       </div>

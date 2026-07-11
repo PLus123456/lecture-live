@@ -2,6 +2,7 @@
 
 import { FileText, ImageIcon, X } from 'lucide-react';
 import { formatBytes } from '@/lib/format';
+import { useI18n } from '@/lib/i18n';
 
 /**
  * Chat 输入区下方展示「已上传」附件的小芯片。
@@ -39,6 +40,7 @@ export default function AttachmentChip({
   attachment: AttachmentChipData;
   onRemove?: (id: string) => void;
 }) {
+  const { t } = useI18n();
   const Icon = attachment.kind === 'image' ? ImageIcon : FileText;
   const displayName = truncate(attachment.fileName, 20);
   const sizeLabel = formatBytes(attachment.bytes);
@@ -63,7 +65,7 @@ export default function AttachmentChip({
   return (
     <div
       className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-cream-300
-                 bg-cream-50 text-[11px] text-charcoal-600 max-w-[220px]"
+                 bg-cream-50 text-[11px] text-charcoal-600 max-w-[220px] animate-tag-pop"
     >
       <Icon className="w-3.5 h-3.5 text-charcoal-400 flex-shrink-0" />
       {NameNode}
@@ -74,7 +76,7 @@ export default function AttachmentChip({
           onClick={() => onRemove(attachment.id)}
           className="ml-0.5 w-4 h-4 rounded hover:bg-charcoal-100 text-charcoal-400
                      hover:text-charcoal-700 flex items-center justify-center flex-shrink-0"
-          title="Remove"
+          title={t('chat.removeAttachment')}
         >
           <X className="w-3 h-3" />
         </button>

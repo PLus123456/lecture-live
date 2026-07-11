@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
+import { useIsMobile } from '@/hooks/useIsMobile';
 import { toast } from '@/stores/toastStore';
 import { useChatStore } from '@/stores/chatStore';
 import {
@@ -67,6 +68,7 @@ export default function ChatHomeClient() {
   const router = useRouter();
   const { t } = useI18n();
   const { token } = useAuth();
+  const isMobile = useIsMobile();
 
   const items = useConversationListStore((s) => s.items);
   const listLoading = useConversationListStore((s) => s.loading);
@@ -238,7 +240,7 @@ export default function ChatHomeClient() {
                 <span
                   key={r.id}
                   className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md
-                             text-[11px] border bg-white border-cream-300 text-charcoal-600"
+                             text-[11px] border bg-white border-cream-300 text-charcoal-600 animate-tag-pop"
                   title={r.title}
                 >
                   <Mic className="w-3 h-3 flex-shrink-0 text-rust-500" />
@@ -309,7 +311,8 @@ export default function ChatHomeClient() {
             </button>
 
             <div className="flex items-center gap-1.5">
-              <ComposerModelControls direction="down" disabled={creating} />
+              {/* 桌面端模型选择器在对话侧栏底部；移动端无侧栏，保留在此 */}
+              {isMobile && <ComposerModelControls direction="down" disabled={creating} />}
               <button
                 type="button"
                 onClick={() => void handleStart()}
@@ -464,7 +467,7 @@ export default function ChatHomeClient() {
                               </span>
                               {c.endedAt && (
                                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-charcoal-100 text-charcoal-500 flex-shrink-0">
-                                  closed
+                                  {t('chat.closedShort')}
                                 </span>
                               )}
                             </div>
@@ -476,7 +479,7 @@ export default function ChatHomeClient() {
                                 </span>
                               )}
                               {typeof c.messageCount === 'number' && (
-                                <span>{c.messageCount} msgs</span>
+                                <span>{t('chat.msgCount', { n: c.messageCount })}</span>
                               )}
                             </div>
                           </div>

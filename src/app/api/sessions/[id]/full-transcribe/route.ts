@@ -99,7 +99,9 @@ export const POST = withRequestLogging(
         if (status && ACTIVE_STATES.includes(status)) {
           return 'already_running' as const;
         }
-        const prior = row.fullReservedMinutes ?? 0;
+        // Number() 归一：INT 列现返回 JS number，此处防御性归一（对齐 settleReservation），
+        // 即便未来列被拓宽为 BIGINT/字符串驱动返回，prior>0 判定与释放额仍正确、不静默泄漏。
+        const prior = Number(row.fullReservedMinutes ?? 0);
         await tx.session.update({
           where: { id },
           data: {

@@ -33,6 +33,8 @@ import {
   ArrowRightLeft,
   Coins,
   RotateCw,
+  Paperclip,
+  Sparkles,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
@@ -123,8 +125,15 @@ const ACTION_DEFS: Record<string, ActionDef> = {
   'admin.llm.provider.update':       { icon: Bot,            tone: 'violet', labelKey: 'auditLog.llmProviderUpdate' },
   'admin.llm.provider.delete':       { icon: Bot,            tone: 'red',    labelKey: 'auditLog.llmProviderDelete' },
 
+  // LLM 模型（供应商下的具体模型）
+  'admin.llm.model.create':          { icon: Sparkles,       tone: 'violet', labelKey: 'auditLog.llmModelCreate' },
+  'admin.llm.model.update':          { icon: Sparkles,       tone: 'violet', labelKey: 'auditLog.llmModelUpdate' },
+  'admin.llm.model.delete':          { icon: Sparkles,       tone: 'red',    labelKey: 'auditLog.llmModelDelete' },
+
   // 文件 / 分享 / 存储
   'admin.files.delete':              { icon: FileX2,         tone: 'red',    labelKey: 'auditLog.filesDelete' },
+  'admin.chat_files.delete':         { icon: Paperclip,      tone: 'red',    labelKey: 'auditLog.chatFilesDelete' },
+  'admin.chat_files.cleanup':        { icon: Paperclip,      tone: 'gray',   labelKey: 'auditLog.chatFilesCleanup' },
   'admin.share.delete':              { icon: Share2,         tone: 'red',    labelKey: 'auditLog.shareDelete' },
   'admin.cloudreve.revoke':          { icon: Cloud,          tone: 'red',    labelKey: 'auditLog.cloudreveRevoke' },
   'admin.cloudreve.refresh.success': { icon: Cloud,          tone: 'green',  labelKey: 'auditLog.cloudreveRefreshSuccess' },
@@ -159,6 +168,24 @@ function getActionDef(action: string): ActionDef {
   return ACTION_DEFS[action] ?? FALLBACK_DEF;
 }
 
+// 详情可能是纯文本，也可能是 JSON 字符串（如清理/删除操作）。
+// 若能解析为对象则美化缩进，便于在展开面板里阅读。
+function formatDetail(detail: string | null): { text: string; isJson: boolean } {
+  if (!detail) return { text: '', isJson: false };
+  const trimmed = detail.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object') {
+        return { text: JSON.stringify(parsed, null, 2), isJson: true };
+      }
+    } catch {
+      // 不是合法 JSON，按纯文本处理
+    }
+  }
+  return { text: detail, isJson: false };
+}
+
 // 操作类型筛选选项（按前缀分组，便于一次过滤同类操作）
 const ACTION_FILTERS = [
   { value: '', label: 'auditLog.allActions' },
@@ -173,6 +200,7 @@ const ACTION_FILTERS = [
   { value: 'admin.settings', label: 'auditLog.settingsChange' },
   { value: 'admin.llm', label: 'auditLog.llmManage' },
   { value: 'admin.files', label: 'auditLog.filesDelete' },
+  { value: 'admin.chat_files', label: 'auditLog.chatFilesManage' },
   { value: 'admin.share', label: 'auditLog.shareDelete' },
   { value: 'admin.cloudreve', label: 'auditLog.cloudreveRevoke' },
   { value: 'admin.storage', label: 'auditLog.storageManage' },
@@ -196,10 +224,12 @@ export default function AuditLogPanel() {
   const [actionFilter, setActionFilter] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [showCleanup, setShowCleanup] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const fetchLogs = useCallback(
     async (page = 1) => {
       setLoading(true);
+      setExpandedId(null);
       try {
         const params = new URLSearchParams({ page: String(page), pageSize: '50' });
         if (actionFilter) params.set('action', actionFilter);
@@ -258,6 +288,18 @@ export default function AuditLogPanel() {
   const getActionLabel = (action: string) => {
     const def = ACTION_DEFS[action];
     return def ? t(def.labelKey) : action;
+  };
+
+  // 展开/收起某行详情
+  const toggleExpand = (id: string) => {
+    setExpandedId((prev) => (prev === id ? null : id));
+  };
+
+  // 以某个关键词（用户名 / IP）快速筛选：同步输入框并立即查询
+  const filterByKeyword = (value: string) => {
+    setSearchInput(value);
+    setKeyword(value);
+    setExpandedId(null);
   };
 
   return (
@@ -332,7 +374,7 @@ export default function AuditLogPanel() {
       {/* 日志列表 */}
       <div className="bg-white dark:bg-charcoal-800 rounded-xl border border-cream-200 dark:border-charcoal-700 overflow-x-auto">
         {/* 表头 */}
-        <div className="grid grid-cols-[200px_1fr_160px_120px] gap-4 px-5 py-3 border-b border-cream-200 dark:border-charcoal-700 bg-cream-50 dark:bg-charcoal-750 min-w-[700px]">
+        <div className="grid grid-cols-[200px_1fr_150px_120px_28px] gap-4 px-5 py-3 border-b border-cream-200 dark:border-charcoal-700 bg-cream-50 dark:bg-charcoal-750 min-w-[720px]">
           <div className="text-xs font-semibold text-charcoal-500 uppercase tracking-wider">
             {t('auditLog.colAction')}
           </div>
@@ -345,6 +387,7 @@ export default function AuditLogPanel() {
           <div className="text-xs font-semibold text-charcoal-500 uppercase tracking-wider">
             {t('auditLog.colIp')}
           </div>
+          <div aria-hidden="true" />
         </div>
 
         {/* 日志行 */}
@@ -362,54 +405,154 @@ export default function AuditLogPanel() {
               const def = getActionDef(log.action);
               const meta = PALETTE[def.tone];
               const Icon = def.icon;
+              const isExpanded = expandedId === log.id;
+              const detail = formatDetail(log.detail);
               return (
                 <div
                   key={log.id}
                   style={{ animationDelay: `${Math.min(idx * 25, 250)}ms` }}
-                  className="grid grid-cols-[200px_1fr_160px_120px] gap-4 px-5 py-3.5
-                             hover:bg-cream-50/60 dark:hover:bg-charcoal-750/60
-                             transition-all duration-200 min-w-[700px]
-                             animate-fade-in-up"
+                  className="animate-fade-in-up"
                 >
-                  {/* 操作 + 用户 */}
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div
-                      className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0
-                                 transition-transform duration-200 group-hover:scale-110"
-                      style={{ backgroundColor: meta.bg }}
-                    >
-                      <Icon className="w-4 h-4" style={{ color: meta.color }} />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium text-charcoal-800 dark:text-cream-100 truncate">
-                        {getActionLabel(log.action)}
+                  {/* 主行（可点击展开） */}
+                  <button
+                    type="button"
+                    onClick={() => toggleExpand(log.id)}
+                    aria-expanded={isExpanded}
+                    className="group w-full text-left grid grid-cols-[200px_1fr_150px_120px_28px] gap-4 px-5 py-3.5
+                               hover:bg-cream-50/60 dark:hover:bg-charcoal-750/60
+                               transition-all duration-200 min-w-[720px]
+                               focus:outline-none focus-visible:bg-cream-50/60 dark:focus-visible:bg-charcoal-750/60"
+                  >
+                    {/* 操作 + 用户 */}
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div
+                        className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0
+                                   transition-transform duration-200 group-hover:scale-110"
+                        style={{ backgroundColor: meta.bg }}
+                      >
+                        <Icon className="w-4 h-4" style={{ color: meta.color }} />
                       </div>
-                      {log.userName && (
-                        <div className="text-xs text-charcoal-400 truncate">{log.userName}</div>
-                      )}
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-charcoal-800 dark:text-cream-100 truncate">
+                          {getActionLabel(log.action)}
+                        </div>
+                        {log.userName && (
+                          <div className="text-xs text-charcoal-400 truncate">{log.userName}</div>
+                        )}
+                      </div>
                     </div>
-                  </div>
 
-                  {/* 详情 */}
-                  <div className="flex items-center min-w-0">
-                    <span className="text-sm text-charcoal-600 dark:text-charcoal-300 truncate">
-                      {log.detail || '—'}
-                    </span>
-                  </div>
+                    {/* 详情 */}
+                    <div className="flex items-center min-w-0">
+                      <span className="text-sm text-charcoal-600 dark:text-charcoal-300 truncate">
+                        {log.detail || '—'}
+                      </span>
+                    </div>
 
-                  {/* 时间 */}
-                  <div className="flex items-center">
-                    <span className="text-sm text-charcoal-500 dark:text-charcoal-400 whitespace-nowrap">
-                      {formatTime(log.createdAt)}
-                    </span>
-                  </div>
+                    {/* 时间 */}
+                    <div className="flex items-center">
+                      <span className="text-sm text-charcoal-500 dark:text-charcoal-400 whitespace-nowrap">
+                        {formatTime(log.createdAt)}
+                      </span>
+                    </div>
 
-                  {/* IP */}
-                  <div className="flex items-center">
-                    <span className="text-sm text-charcoal-500 dark:text-charcoal-400 font-mono text-xs">
-                      {log.ip || '—'}
-                    </span>
-                  </div>
+                    {/* IP */}
+                    <div className="flex items-center">
+                      <span className="text-sm text-charcoal-500 dark:text-charcoal-400 font-mono text-xs">
+                        {log.ip || '—'}
+                      </span>
+                    </div>
+
+                    {/* 展开指示 */}
+                    <div className="flex items-center justify-center">
+                      <ChevronDown
+                        className={`w-4 h-4 text-charcoal-400 transition-transform duration-200 ${
+                          isExpanded ? 'rotate-180' : ''
+                        }`}
+                      />
+                    </div>
+                  </button>
+
+                  {/* 展开面板：完整详情 + 元数据 + 快速筛选 */}
+                  {isExpanded && (
+                    <div className="px-5 pb-4 pt-1 min-w-[720px] bg-cream-50/40 dark:bg-charcoal-750/40 animate-fade-in-up">
+                      <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+                        {/* 操作代码 */}
+                        <dt className="text-xs font-semibold text-charcoal-500 uppercase tracking-wider pt-0.5">
+                          {t('auditLog.detailActionCode')}
+                        </dt>
+                        <dd className="font-mono text-xs text-charcoal-600 dark:text-charcoal-300 break-all">
+                          {log.action}
+                        </dd>
+
+                        {/* 完整详情 */}
+                        <dt className="text-xs font-semibold text-charcoal-500 uppercase tracking-wider pt-0.5">
+                          {t('auditLog.detailFull')}
+                        </dt>
+                        <dd className="min-w-0">
+                          {log.detail ? (
+                            detail.isJson ? (
+                              <pre className="text-xs font-mono text-charcoal-700 dark:text-cream-200 whitespace-pre-wrap break-all bg-white dark:bg-charcoal-800 rounded-lg border border-cream-200 dark:border-charcoal-600 p-3 overflow-x-auto max-h-64">
+                                {detail.text}
+                              </pre>
+                            ) : (
+                              <span className="text-charcoal-700 dark:text-cream-200 break-words">
+                                {detail.text}
+                              </span>
+                            )
+                          ) : (
+                            <span className="text-charcoal-400">{t('auditLog.noDetail')}</span>
+                          )}
+                        </dd>
+
+                        {/* 用户 */}
+                        {log.userName && (
+                          <>
+                            <dt className="text-xs font-semibold text-charcoal-500 uppercase tracking-wider pt-0.5">
+                              {t('auditLog.detailUser')}
+                            </dt>
+                            <dd>
+                              <button
+                                type="button"
+                                onClick={() => filterByKeyword(log.userName!)}
+                                className="text-rust-500 hover:text-rust-600 hover:underline break-all"
+                                title={t('auditLog.filterByUser')}
+                              >
+                                {log.userName}
+                              </button>
+                            </dd>
+                          </>
+                        )}
+
+                        {/* IP */}
+                        {log.ip && (
+                          <>
+                            <dt className="text-xs font-semibold text-charcoal-500 uppercase tracking-wider pt-0.5">
+                              {t('auditLog.colIp')}
+                            </dt>
+                            <dd>
+                              <button
+                                type="button"
+                                onClick={() => filterByKeyword(log.ip!)}
+                                className="font-mono text-xs text-rust-500 hover:text-rust-600 hover:underline break-all"
+                                title={t('auditLog.filterByIp')}
+                              >
+                                {log.ip}
+                              </button>
+                            </dd>
+                          </>
+                        )}
+
+                        {/* 时间 */}
+                        <dt className="text-xs font-semibold text-charcoal-500 uppercase tracking-wider pt-0.5">
+                          {t('auditLog.colTime')}
+                        </dt>
+                        <dd className="text-charcoal-600 dark:text-charcoal-300">
+                          {new Date(log.createdAt).toLocaleString('zh-CN')}
+                        </dd>
+                      </dl>
+                    </div>
+                  )}
                 </div>
               );
             })}

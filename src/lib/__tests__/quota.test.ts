@@ -72,6 +72,7 @@ import {
   checkQuota,
   recordInterpretUsage,
   reconcileTranscriptionUsage,
+  reserveStorageMinutes,
 } from '@/lib/quota';
 
 const futureReset = new Date('2099-01-01T00:00:00.000Z');
@@ -105,6 +106,45 @@ function adminUser() {
     quotaResetAt: futureReset,
   };
 }
+
+describe('reserveStorageMinutes (P1-13 契约6：存储小时门禁)', () => {
+  beforeEach(() => {
+    userFindUniqueMock.mockReset();
+    sessionAggregateMock.mockReset();
+  });
+
+  it('▶ 负向：已用存储 + 预估将超 storageHoursLimit → ok:false（旧代码 async 上传入口完全不判存储上限）', async () => {
+    // FREE storageHoursLimit=10h。已用 9.9h（SUM durationMs），再传 30 分钟(0.5h) → 10.4h > 10h。
+    userFindUniqueMock.mockResolvedValueOnce(freeUser());
+    sessionAggregateMock.mockResolvedValueOnce({
+      _sum: { durationMs: Math.round(9.9 * 3_600_000) },
+    });
+
+    const res = await reserveStorageMinutes('user-free', 'sess-x', 30);
+    expect(res.ok).toBe(false);
+  });
+
+  it('正向：已用 + 预估仍在上限内 → ok:true', async () => {
+    // 已用 5h，再传 60 分钟(1h) → 6h <= 10h。
+    userFindUniqueMock.mockResolvedValueOnce(freeUser());
+    sessionAggregateMock.mockResolvedValueOnce({
+      _sum: { durationMs: 5 * 3_600_000 },
+    });
+
+    const res = await reserveStorageMinutes('user-free', 'sess-x', 60);
+    expect(res.ok).toBe(true);
+    // remaining ≈ (10-5)*60 = 300 分钟
+    expect(res.remaining).toBe(300);
+  });
+
+  it('ADMIN：视为无限，直接 ok:true（不查 aggregate）', async () => {
+    userFindUniqueMock.mockResolvedValueOnce(adminUser());
+
+    const res = await reserveStorageMinutes('user-admin', 'sess-x', 100_000);
+    expect(res.ok).toBe(true);
+    expect(sessionAggregateMock).not.toHaveBeenCalled();
+  });
+});
 
 describe('addStorageBytes', () => {
   beforeEach(() => {

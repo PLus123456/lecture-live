@@ -186,6 +186,12 @@ export async function DELETE(req: Request) {
         title: true,
         asyncTranscribeStatus: true,
         sonioxFileId: true,
+        // P1-16：补齐 region + transcriptionId，cancelAsyncUpload 才能按任务固定 region 解析配置、
+        // 且先删 transcription 再删 file。缺 sonioxRegion 会落回可变默认 region → 跨 region 任务向错误
+        // 区 API 删不存在的资源、真资源永久孤儿；缺 sonioxTranscriptionId 则整段跳过删 transcription。
+        // 与用户侧 sessions/[id] DELETE 的区域感知 + transcription-before-file 清理口径对齐。
+        sonioxRegion: true,
+        sonioxTranscriptionId: true,
       },
     });
 

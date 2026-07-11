@@ -39,6 +39,12 @@ vi.mock('@/lib/prisma', () => ({
 vi.mock('@/lib/audio/fullTranscribeFinalize', () => ({
   finalizeFullTranscription: finalizeMock,
 }));
+// R4：僵尸标 failed 后走 settleFullReservation 释放入口预留。保留真实 quota 其余导出（billingMaintenance
+// 在 import 期取多个绑定），仅把 settleFullReservation 覆写为桩，避免它内部自开 prisma 事务干扰本用例。
+vi.mock('@/lib/quota', async (importActual) => ({
+  ...(await importActual<typeof import('@/lib/quota')>()),
+  settleFullReservation: vi.fn(async () => 0),
+}));
 vi.mock('@/lib/soniox/asyncFile', () => ({
   getSonioxTranscription: getSonioxTranscriptionMock,
   deleteSonioxFile: deleteFileMock,
@@ -47,7 +53,8 @@ vi.mock('@/lib/soniox/asyncFile', () => ({
   getSonioxTranscript: vi.fn(),
 }));
 vi.mock('@/lib/soniox/env', () => ({
-  resolveSonioxRuntimeConfigAsync: resolveSonioxMock,
+  // P1-16：reclaim 改为 per-session 按固定 region 解析。
+  resolveSonioxConfigForSessionRegion: resolveSonioxMock,
 }));
 vi.mock('fs/promises', () => ({
   default: { rm: vi.fn(async () => undefined) },

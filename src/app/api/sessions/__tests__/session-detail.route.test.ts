@@ -5,6 +5,7 @@ const {
   verifyAuthMock,
   sessionFindUniqueMock,
   sessionUpdateMock,
+  sessionUpdateManyMock,
   sessionCountMock,
   folderSessionDeleteManyMock,
   shareLinkDeleteManyMock,
@@ -21,6 +22,7 @@ const {
   verifyAuthMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
   sessionUpdateMock: vi.fn(),
+  sessionUpdateManyMock: vi.fn(),
   sessionCountMock: vi.fn(),
   folderSessionDeleteManyMock: vi.fn(),
   shareLinkDeleteManyMock: vi.fn(),
@@ -44,6 +46,7 @@ vi.mock('@/lib/prisma', () => ({
     session: {
       findUnique: sessionFindUniqueMock,
       update: sessionUpdateMock,
+      updateMany: sessionUpdateManyMock,
       delete: sessionDeleteMock,
       count: sessionCountMock,
     },
@@ -110,6 +113,8 @@ describe('session detail route', () => {
     sessionDeleteMock.mockResolvedValue({ id: 'session-1' });
     // B4：并发在途录音计数默认 0（未达上限）；具体 cap 用例单独 override。
     sessionCountMock.mockReset().mockResolvedValue(0);
+    // P0-6：PATCH 走 updateMany CAS（where 带期望旧 status）；默认命中 1 行（无并发改动）。
+    sessionUpdateManyMock.mockReset().mockResolvedValue({ count: 1 });
     conversationFindManyMock.mockReset().mockResolvedValue([]);
     deleteSessionArtifactsMock.mockReset().mockResolvedValue(undefined);
     deleteRecordingDraftMock.mockReset().mockResolvedValue(undefined);
@@ -147,12 +152,11 @@ describe('session detail route', () => {
     await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
       error: 'Invalid status transition: CREATED → COMPLETED',
     });
-    expect(sessionUpdateMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
   it('B4：CREATED→RECORDING 且并发在途 < 上限 → 放行（按 RECORDING/PAUSED 计数）', async () => {
     sessionCountMock.mockResolvedValueOnce(2); // 未达上限(3)
-    sessionUpdateMock.mockResolvedValueOnce({ id: 'session-1', status: 'RECORDING' });
 
     const response = await PATCH(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {
@@ -166,7 +170,7 @@ describe('session detail route', () => {
     expect(sessionCountMock).toHaveBeenCalledWith({
       where: { userId: 'user-1', status: { in: ['RECORDING', 'PAUSED'] } },
     });
-    expect(sessionUpdateMock).toHaveBeenCalled();
+    expect(sessionUpdateManyMock).toHaveBeenCalled();
   });
 
   it('B4：CREATED→RECORDING 但并发在途已达上限 → 409，不写库', async () => {
@@ -181,7 +185,48 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(409);
-    expect(sessionUpdateMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+  });
+
+  it('P0-6：PATCH 走期望旧 status 的 CAS，并发改动致 0 行 → 409 + 最新状态', async () => {
+    sessionFindUniqueMock.mockReset();
+    // 首次加载读到 RECORDING（快照），最终读回已被并发 finalize 推到 COMPLETED。
+    sessionFindUniqueMock
+      .mockResolvedValueOnce({
+        id: 'session-1',
+        userId: 'user-1',
+        title: 'Lecture',
+        status: 'RECORDING',
+        serverStartedAt: new Date('2026-03-27T10:00:00.000Z'),
+        serverPausedAt: null,
+        serverPausedMs: 0,
+      })
+      .mockResolvedValueOnce({
+        id: 'session-1',
+        userId: 'user-1',
+        status: 'COMPLETED',
+      });
+    // CAS where{status:RECORDING} 落空：并发已改状态。
+    sessionUpdateManyMock.mockResolvedValueOnce({ count: 0 });
+
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { status: 'PAUSED' },
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(409);
+    await expect(readJson<Record<string, unknown>>(response)).resolves.toEqual({
+      error: 'Session was modified concurrently',
+      currentStatus: 'COMPLETED',
+    });
+    // CAS where 必须带期望旧 status（防裸 update 把终态回退）。
+    expect(sessionUpdateManyMock.mock.calls[0][0].where).toEqual({
+      id: 'session-1',
+      status: 'RECORDING',
+    });
   });
 
   it('B4：PAUSED→RECORDING（恢复暂停）不受并发上限限制（不计数）', async () => {
@@ -194,7 +239,6 @@ describe('session detail route', () => {
       serverPausedAt: null,
     });
     sessionCountMock.mockResolvedValue(99); // 即便很多在途，恢复也放行
-    sessionUpdateMock.mockResolvedValueOnce({ id: 'session-1', status: 'RECORDING' });
 
     const response = await PATCH(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {
@@ -230,7 +274,7 @@ describe('session detail route', () => {
     await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
       error: 'Invalid status transition: FINALIZING → COMPLETED',
     });
-    expect(sessionUpdateMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
   it('C2: 终态会话拒绝客户端 durationMs（防抹掉存储配额）', async () => {
@@ -256,7 +300,7 @@ describe('session detail route', () => {
     await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
       error: 'Cannot modify durationMs of a finalized session',
     });
-    expect(sessionUpdateMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
   it('C2: 非终态会话拒绝把 durationMs 调低', async () => {
@@ -282,7 +326,7 @@ describe('session detail route', () => {
     await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
       error: 'durationMs cannot be lowered',
     });
-    expect(sessionUpdateMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
   it('允许在终态会话上重命名（title PATCH 不受 durationMs 守卫影响）', async () => {
@@ -295,7 +339,6 @@ describe('session detail route', () => {
       serverPausedAt: null,
       durationMs: 7_200_000,
     });
-    sessionUpdateMock.mockResolvedValue({ id: 'session-1', title: 'Renamed' });
 
     const response = await PATCH(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {
@@ -306,8 +349,13 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(sessionUpdateMock).toHaveBeenCalledTimes(1);
-    expect(sessionUpdateMock.mock.calls[0][0].data.title).toBe('Renamed');
+    expect(sessionUpdateManyMock).toHaveBeenCalledTimes(1);
+    // CAS where 带期望旧 status（COMPLETED），仍允许改标题。
+    expect(sessionUpdateManyMock.mock.calls[0][0].where).toEqual({
+      id: 'session-1',
+      status: 'COMPLETED',
+    });
+    expect(sessionUpdateManyMock.mock.calls[0][0].data.title).toBe('Renamed');
   });
 
   it('PATCH status=FINALIZING 时记录录音结束时间到 serverPausedAt', async () => {
@@ -321,13 +369,6 @@ describe('session detail route', () => {
       serverPausedAt: null,
       serverPausedMs: 0,
     });
-    sessionUpdateMock.mockResolvedValue({
-      id: 'session-1',
-      userId: 'user-1',
-      status: 'FINALIZING',
-      serverStartedAt: startedAt,
-      serverPausedAt: new Date(),
-    });
 
     const before = Date.now();
     const response = await PATCH(
@@ -340,8 +381,8 @@ describe('session detail route', () => {
     const after = Date.now();
 
     expect(response.status).toBe(200);
-    expect(sessionUpdateMock).toHaveBeenCalledTimes(1);
-    const data = sessionUpdateMock.mock.calls[0][0].data;
+    expect(sessionUpdateManyMock).toHaveBeenCalledTimes(1);
+    const data = sessionUpdateManyMock.mock.calls[0][0].data;
     expect(data.status).toBe('FINALIZING');
     expect(data.serverPausedAt).toBeInstanceOf(Date);
     const pausedAtMs = (data.serverPausedAt as Date).getTime();
@@ -361,7 +402,6 @@ describe('session detail route', () => {
       serverPausedAt: pausedAt,
       serverPausedMs: 0,
     });
-    sessionUpdateMock.mockResolvedValue({ id: 'session-1' });
 
     const response = await PATCH(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {
@@ -372,7 +412,7 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(200);
-    const data = sessionUpdateMock.mock.calls[0][0].data;
+    const data = sessionUpdateManyMock.mock.calls[0][0].data;
     expect(data.status).toBe('FINALIZING');
     expect(data.serverPausedAt).toBeInstanceOf(Date);
     // 挂起的 ~30s 暂停时长应被累加到 serverPausedMs

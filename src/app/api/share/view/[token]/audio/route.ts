@@ -1,18 +1,14 @@
 import { prisma } from '@/lib/prisma';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { sanitizeToken } from '@/lib/security';
-import { loadSessionAudioArtifact } from '@/lib/sessionPersistence';
+import {
+  loadSessionAudioArtifact,
+  resolveSessionAudioLocation,
+  openLocalAudioRangeStream,
+} from '@/lib/sessionPersistence';
 import { CloudreveStorage } from '@/lib/storage/cloudreve';
 
 const PLAYBACK_STATUSES = new Set(['COMPLETED', 'ARCHIVED']);
-
-/** 从录音引用的扩展名推断音频 MIME（与 sessionPersistence 的推断保持一致）。 */
-function audioContentTypeFromPath(reference: string): string {
-  const normalized = reference.toLowerCase();
-  return normalized.endsWith('.mp4') || normalized.endsWith('.m4a')
-    ? 'audio/mp4'
-    : 'audio/webm';
-}
 
 // 公开 API：通过分享 token 获取已完成会话的音频（无需认证）
 // 严格限流防止流量滥用
@@ -86,46 +82,95 @@ export async function GET(
 
   const range = req.headers.get('range');
 
-  // Cloudreve 后端：直接流式透传远程文件体，不把整个录音读进内存（大录音会 OOM）。
-  // recordingPath 以 '/' 开头即为 Cloudreve 远程路径；本地文件（local: 前缀）走下方
-  // 缓冲分支（从磁盘读取，非 OOM 风险点）。
-  // 流式失败时不直接 404，而是落到下方缓冲分支 —— 后者还会尝试本地候选文件，
-  // 保持与原有 loadSessionAudioArtifact 回退行为一致。
-  const recordingPath = link.session.recordingPath;
-  if (recordingPath && recordingPath.startsWith('/')) {
-    try {
-      const storage = await CloudreveStorage.create();
-      const upstream = await storage.openDownloadStream(recordingPath, {
-        expectedUserId: link.session.userId,
-        range,
-      });
+  // P2-2/P2-3：解析录音物理位置后按位置类型流式取字节，均不把整段录音读进内存（长录音 + 并发
+  // Range 会放大内存直至 OOM）：Cloudreve 透传上游 range/stream；本地文件 createReadStream 按 range
+  // 流式读。MIME 一律按引用扩展名推断（含 mp3/wav/ogg），修 async 生成的 MP3 在旧代码里被一律标成
+  // audio/webm、在 nosniff 下无法播放的问题。流式失败/定位不到时回退到缓冲读取（保留旧候选回退语义）。
+  try {
+    const location = await resolveSessionAudioLocation(link.session);
 
-      const contentType = audioContentTypeFromPath(recordingPath);
-      const headers = new Headers({
-        'Content-Type': contentType,
-        'Accept-Ranges': 'bytes',
-        'X-Content-Type-Options': 'nosniff',
-        'Referrer-Policy': 'no-referrer',
-      });
-      // 透传上游长度 / 断点续传相关头
-      for (const name of ['content-length', 'content-range']) {
-        const value = upstream.headers.get(name);
-        if (value) {
-          headers.set(name, value);
+    if (location?.kind === 'cloudreve') {
+      try {
+        const storage = await CloudreveStorage.create();
+        const upstream = await storage.openDownloadStream(location.remotePath, {
+          expectedUserId: location.userId,
+          range,
+        });
+
+        const headers = new Headers({
+          'Content-Type': location.contentType,
+          'Accept-Ranges': 'bytes',
+          'X-Content-Type-Options': 'nosniff',
+          'Referrer-Policy': 'no-referrer',
+        });
+        // 透传上游长度 / 断点续传相关头
+        for (const name of ['content-length', 'content-range']) {
+          const value = upstream.headers.get(name);
+          if (value) {
+            headers.set(name, value);
+          }
+        }
+
+        return new Response(upstream.body, {
+          status: upstream.status === 206 ? 206 : 200,
+          headers,
+        });
+      } catch (error) {
+        // 流式失败（含 416 / 远程节点错误 / 配置缺失）：落到缓冲回退分支
+        console.error('Share audio stream error, falling back to buffered load:', error);
+      }
+    }
+
+    if (location?.kind === 'local') {
+      const totalSize = location.size;
+      if (range) {
+        const match = range.match(/bytes=(\d+)-(\d*)/);
+        if (match) {
+          const start = parseInt(match[1], 10);
+          const rawEnd = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+          const end = Math.min(rawEnd, totalSize - 1);
+          if (
+            Number.isNaN(start) ||
+            Number.isNaN(end) ||
+            start < 0 ||
+            end < start ||
+            start >= totalSize
+          ) {
+            return new Response(null, {
+              status: 416,
+              headers: { 'Content-Range': `bytes */${totalSize}` },
+            });
+          }
+
+          return new Response(
+            openLocalAudioRangeStream(location.filePath, { start, end }),
+            {
+              status: 206,
+              headers: {
+                'Content-Type': location.contentType,
+                'Content-Range': `bytes ${start}-${end}/${totalSize}`,
+                'Content-Length': String(end - start + 1),
+                'Accept-Ranges': 'bytes',
+                'X-Content-Type-Options': 'nosniff',
+                'Referrer-Policy': 'no-referrer',
+              },
+            }
+          );
         }
       }
 
-      return new Response(upstream.body, {
-        status: upstream.status === 206 ? 206 : 200,
-        headers,
+      return new Response(openLocalAudioRangeStream(location.filePath), {
+        headers: {
+          'Content-Type': location.contentType,
+          'Content-Length': String(totalSize),
+          'Accept-Ranges': 'bytes',
+          'X-Content-Type-Options': 'nosniff',
+          'Referrer-Policy': 'no-referrer',
+        },
       });
-    } catch (error) {
-      // 流式失败（含 416 / 远程节点错误 / 配置缺失）：落到缓冲回退分支
-      console.error('Share audio stream error, falling back to buffered load:', error);
     }
-  }
 
-  try {
+    // 回退：Cloudreve 流式失败或无法定位物理文件 → 缓冲读取（含旧候选文件回退语义）。
     const artifact = await loadSessionAudioArtifact(link.session);
     if (!artifact) {
       return Response.json(

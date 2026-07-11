@@ -24,7 +24,7 @@ import { deleteRecordingDraft } from '@/lib/recordingDraftPersistence';
 import { deleteConversationsCascade } from '@/lib/conversationCascade';
 import { settleAsyncReservation, settleFullReservation } from '@/lib/quota';
 import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
-import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
+import { resolveSonioxConfigForSessionRegion } from '@/lib/soniox/env';
 import {
   deleteSonioxFile,
   deleteSonioxTranscription,
@@ -241,8 +241,11 @@ export async function PATCH(
     }
   }
 
-  const updated = await prisma.session.update({
-    where: { id: id },
+  // P0-6 契约4：状态迁移用「期望旧 status」做 CAS（updateMany 判 count），杜绝旧代码裸
+  // update({where:{id}}) 把终态回退 —— 如 PAUSE/RESUME 请求读到 RECORDING 后 finalize 先完成，
+  // 该请求仍把 COMPLETED 覆盖回 PAUSED/RECORDING。0 行更新 → 会话已被并发改动 → 409 + 最新状态。
+  const casResult = await prisma.session.updateMany({
+    where: { id: id, status: session.status },
     data: buildSessionUpdateData({
       session,
       nextStatus,
@@ -253,6 +256,18 @@ export async function PATCH(
     }),
   });
 
+  if (casResult.count === 0) {
+    const latest = await prisma.session.findUnique({ where: { id: id } });
+    return NextResponse.json(
+      {
+        error: 'Session was modified concurrently',
+        currentStatus: latest?.status ?? null,
+      },
+      { status: 409 }
+    );
+  }
+
+  const updated = await prisma.session.findUnique({ where: { id: id } });
   await invalidateSessionsApiCache(user.id);
   return NextResponse.json(updated);
 }
@@ -312,18 +327,24 @@ export async function DELETE(
   // 仅进行中态才可能持有未清的 Soniox 资源：finalize 成功会 null 掉这两个字段、失败/回收也会清；
   // 故用「任一字段非空」精确判定，避免对终态多余请求。
   if (session.fullSonioxFileId || session.fullSonioxTranscriptionId) {
-    const sonioxConfig = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);
+    // P1-16：按任务开始时固定的 region 解析配置（session.sonioxRegion），绝不落回可变默认
+    // region —— 否则跨 region 任务会向错误区的 API 删不存在的资源、真正的资源仍泄漏。
+    const sonioxConfig = await resolveSonioxConfigForSessionRegion(
+      session.sonioxRegion
+    ).catch(() => null);
     if (sonioxConfig) {
-      if (session.fullSonioxFileId) {
-        await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(
-          () => undefined
-        );
-      }
+      // 删 transcription 再删 file（与 fullTranscribeFinalize / cancelAsyncUpload 同口径）：
+      // transcription 引用 file，先删 job 释放更紧的历史/pending 配额，再删底层文件。
       if (session.fullSonioxTranscriptionId) {
         await deleteSonioxTranscription(
           sonioxConfig,
           session.fullSonioxTranscriptionId
         ).catch(() => undefined);
+      }
+      if (session.fullSonioxFileId) {
+        await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(
+          () => undefined
+        );
       }
     }
   }

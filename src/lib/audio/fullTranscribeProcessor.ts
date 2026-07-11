@@ -9,14 +9,15 @@ import path from 'path';
 import fs from 'fs/promises';
 import { prisma } from '@/lib/prisma';
 import { logger } from '@/lib/logger';
-import { probeDurationSec, transcodeToMp3 } from '@/lib/audio/ffmpegTranscode';
+import { probeDurationSec, transcodeToMp3, validateMediaContainer } from '@/lib/audio/ffmpegTranscode';
 import { loadSessionAudioArtifact } from '@/lib/sessionPersistence';
-import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
+import { resolveAndPersistTaskRegion } from '@/lib/soniox/env';
 import {
   uploadSonioxFile,
   createSonioxTranscription,
   deleteSonioxFile,
 } from '@/lib/soniox/asyncFile';
+import { settleFullReservation } from '@/lib/quota';
 
 const SONIOX_MAX_DURATION_SEC = 300 * 60;
 const TMP_ROOT = path.join(process.cwd(), 'data', 'full-transcribe-tmp');
@@ -55,7 +56,7 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
 
   const tmpDir = path.join(TMP_ROOT, sessionId.replace(/[^a-zA-Z0-9_-]/g, ''));
   let uploadedFileId: string | null = null;
-  let sonioxConfig: Awaited<ReturnType<typeof resolveSonioxRuntimeConfigAsync>> | null = null;
+  let sonioxConfig: Awaited<ReturnType<typeof resolveAndPersistTaskRegion>> | null = null;
 
   try {
     // pending → transcoding
@@ -72,6 +73,10 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
     await fs.mkdir(tmpDir, { recursive: true });
     const inputPath = path.join(tmpDir, audio.fileName || 'input.webm');
     await fs.writeFile(inputPath, audio.data);
+
+    // 容器安全校验（P1-11）：交给 ffprobe/ffmpeg 前先做魔数 + demuxer 白名单，拒 playlist /
+    // 外部引用。会话音频虽由本系统产出，但引用可能来自 Cloudreve/历史数据，仍统一过闸。
+    await validateMediaContainer(inputPath);
 
     const inputDurationSec = await probeDurationSec(inputPath);
     if (inputDurationSec > SONIOX_MAX_DURATION_SEC) {
@@ -99,7 +104,9 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
       );
     }
 
-    sonioxConfig = await resolveSonioxRuntimeConfigAsync({});
+    // P1-16：任务开始时解析并**持久化实际 region** 到 session.sonioxRegion，之后 poll/finalize/
+    // cancel/maintenance 全部读该字段解析同一 region，绝不落回可变默认 region。
+    sonioxConfig = await resolveAndPersistTaskRegion(sessionId, session.sonioxRegion);
     if (!sonioxConfig) throw new Error('Soniox credentials not configured');
 
     const sonioxFile = await uploadSonioxFile(sonioxConfig, mp3Path, {
@@ -154,8 +161,14 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
     const message = err instanceof Error ? err.message : 'Full transcribe failed';
     logger.error({ err, sessionId }, 'full transcribe pipeline failed');
     // 仅当仍处于活动态时才标 failed（避免覆盖用户取消）。
-    await setFullStatus(sessionId, 'failed', ['pending', 'transcoding'], {
+    const marked = await setFullStatus(sessionId, 'failed', ['pending', 'transcoding'], {
       fullTranscribeError: message.slice(0, 500),
-    }).catch(() => undefined);
+    }).catch(() => false);
+    // R4：抢到 failed 终态（恰好一次）→ 释放入口持有的转录分钟预留（fullReservedMinutes）。
+    // settleFullReservation 用 FOR UPDATE 读当前列并原子释放，与 finalize 结算 / 删会话 / cron
+    // releaseOrphanFullReservations 互斥，恰好释放一次。
+    if (marked) {
+      await settleFullReservation(sessionId).catch(() => undefined);
+    }
   }
 }

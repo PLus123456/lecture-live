@@ -83,6 +83,7 @@ vi.mock('@/lib/soniox/client', () => ({
 vi.mock('@/lib/audio/recordingArchiveManager', () => ({
   RecordingArchiveManager: class {
     setChunkStoredHandler() {}
+    setCaptureEndedHandler() {}
     async ensureArchive() {}
     async getSenderStream() {
       return {} as MediaStream;

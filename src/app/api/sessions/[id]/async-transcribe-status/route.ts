@@ -18,7 +18,7 @@ import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership } from '@/lib/security';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { getTranscodingProgress } from '@/lib/audio/asyncUploadProcessor';
-import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
+import { resolveSonioxConfigForSessionRegion } from '@/lib/soniox/env';
 import {
   deleteSonioxFile,
   deleteSonioxTranscription,
@@ -91,7 +91,8 @@ export async function GET(
   }
 
   // ── poll Soniox ──
-  const sonioxConfig = await resolveSonioxRuntimeConfigAsync({});
+  // P1-16：按任务开始时固定的 region 解析配置，绝不落回可变默认 region（否则 poll/delete 去错 region）。
+  const sonioxConfig = await resolveSonioxConfigForSessionRegion(session.sonioxRegion);
   if (!sonioxConfig) {
     return NextResponse.json({ status: session.asyncTranscribeStatus });
   }

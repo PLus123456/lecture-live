@@ -46,6 +46,8 @@ interface MobileSessionLayoutProps {
   onStop: () => void;
   onRetry: () => void;
   onViewPlayback: () => void;
+  // P1-4：录音中连接错误时的「重新连接」操作，透传给 MobileControlBar（未提供时按钮不渲染）。
+  onReconnect?: () => void;
   onManualSummary: () => void;
   onInjectKeywords: (keywords: string[]) => Promise<void> | void;
 }
@@ -104,6 +106,7 @@ export default function MobileSessionLayout({
   onStop,
   onRetry,
   onViewPlayback,
+  onReconnect,
   onManualSummary,
   onInjectKeywords,
 }: MobileSessionLayoutProps) {
@@ -203,6 +206,7 @@ export default function MobileSessionLayout({
             onStop={onStop}
             onRetry={onRetry}
             onViewPlayback={onViewPlayback}
+            onReconnect={onReconnect}
           />
         ) : null}
       </div>

@@ -3,13 +3,14 @@ import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { assertOwnership } from '@/lib/security';
 import { logger } from '@/lib/logger';
-import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
+import { resolveSonioxConfigForSessionRegion } from '@/lib/soniox/env';
 import {
   getSonioxTranscription,
   deleteSonioxFile,
   deleteSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
+import { settleFullReservation } from '@/lib/quota';
 
 // 完整版补全转录状态轮询（前端 poll 驱动收尾，同 async-transcribe-status 模式）：
 //   - 终态(completed/failed/null) 直接返回
@@ -57,7 +58,8 @@ export async function GET(
   }
 
   // ── transcribing：poll Soniox 一次 ──
-  const sonioxConfig = await resolveSonioxRuntimeConfigAsync({});
+  // P1-16：按任务开始时固定的 region 解析配置，绝不落回可变默认 region。
+  const sonioxConfig = await resolveSonioxConfigForSessionRegion(session.sonioxRegion);
   if (!sonioxConfig) {
     return NextResponse.json({ status, error: null, hasFullTranscript: false });
   }
@@ -83,6 +85,12 @@ export async function GET(
         fullTranscribeError: 'Soniox transcription failed',
       },
     });
+    // R4：任务失败 → 释放入口持有的转录分钟预留（fullReservedMinutes）。抢到 failed 才释放。
+    // settleFullReservation 用 FOR UPDATE 读当前列并原子释放，与 finalize 结算 / 删会话 / cron
+    // releaseOrphanFullReservations 互斥，恰好释放一次。
+    if (failed.count === 1) {
+      await settleFullReservation(id).catch(() => undefined);
+    }
     // 抢到才清 Soniox 残留（file + errored transcription）：不让 error 态会话把 Soniox 侧配额
     // 泄漏到「删会话/重触发」才回收（与 cron mark-failed 同口径）。best-effort、幂等、失败不抛。
     // 此处 fullSonioxTranscriptionId 必非空（上方 status!=='transcribing' || 无 id 已提前返回）。

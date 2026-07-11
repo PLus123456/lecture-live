@@ -93,29 +93,37 @@ export async function resolveAuthorizedLlmSelection(
   // 能力开关按所属组解析（组配置为唯一真源），随选择一并返回给调用方
   const featureFlags = await resolveUserFeatureFlags(user);
 
+  // 回落到 CHAT 默认模型前的门禁：默认模型也必须在用户 allowedModels 内，否则受限组
+  // 只要「不传 model」或「传一个不存在的 model」就能绕过绑定拿到（通常更强的）默认模型。
+  // 空 id 分支与「非空但查无此模型」的 fall-through 分支都要走这道校验（此前只有空 id 分支有，
+  // 伪造一个不存在的 id 即可绕过 —— 见下方 return { user, featureFlags } 前的调用）。
+  const enforceDefaultModelAccess = opts?.enforceDefaultModelAccess ?? true;
+  const assertDefaultModelAllowedOrThrow = async () => {
+    if (
+      !enforceDefaultModelAccess ||
+      user.role === 'ADMIN' ||
+      user.allowedModels === '*'
+    ) {
+      return;
+    }
+    try {
+      const fallback = await getProviderForPurpose('CHAT');
+      const allowed = fallback.dbModelId
+        ? canUseDatabaseModel(user, fallback)
+        : canUseProviderName(user, fallback.name);
+      if (!allowed) {
+        throw new LLMAccessError('Requested model is not allowed');
+      }
+    } catch (error) {
+      if (error instanceof LLMAccessError) throw error;
+      // 默认模型解析失败（未配置任何模型）→ 交给下游按原有兜底逻辑处理
+    }
+  };
+
   const normalizedIdentifier = requestedIdentifier?.trim();
   if (!normalizedIdentifier) {
-    // 未指定模型 → 下游会回落到 CHAT 用途的默认模型。但默认模型也必须在用户 allowedModels 内，
-    // 否则受限组只要不传 model 就能绕过绑定拿到（通常更强的）默认模型。此处补齐这道校验。
-    const enforceDefaultModelAccess = opts?.enforceDefaultModelAccess ?? true;
-    if (
-      enforceDefaultModelAccess &&
-      user.role !== 'ADMIN' &&
-      user.allowedModels !== '*'
-    ) {
-      try {
-        const fallback = await getProviderForPurpose('CHAT');
-        const allowed = fallback.dbModelId
-          ? canUseDatabaseModel(user, fallback)
-          : canUseProviderName(user, fallback.name);
-        if (!allowed) {
-          throw new LLMAccessError('Requested model is not allowed');
-        }
-      } catch (error) {
-        if (error instanceof LLMAccessError) throw error;
-        // 默认模型解析失败（未配置任何模型）→ 交给下游按原有兜底逻辑处理
-      }
-    }
+    // 未指定模型 → 下游会回落到 CHAT 用途的默认模型，先校验默认模型是否被授权。
+    await assertDefaultModelAllowedOrThrow();
     return { user, featureFlags };
   }
 
@@ -156,6 +164,10 @@ export async function resolveAuthorizedLlmSelection(
     };
   }
 
+  // 非空但既不是已配置的 DB 模型、也不是已配置的 provider 名 —— 即「伪造 / 陈旧」的 id。
+  // 下游会回落到 CHAT 默认模型，这里必须像空 id 分支一样校验默认模型授权，否则受限用户
+  // 发一个 model:"does-not-exist" 就能拿到未授权的默认模型（绕过用户组模型绑定）。
+  await assertDefaultModelAllowedOrThrow();
   return { user, featureFlags };
 }
 

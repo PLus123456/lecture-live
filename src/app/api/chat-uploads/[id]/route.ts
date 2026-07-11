@@ -43,6 +43,7 @@ export async function DELETE(
       bytes: true,
       cloudrevePath: true,
       extractedTextPath: true,
+      conversation: { select: { endedAt: true } },
     },
   });
   if (!attachment) {
@@ -52,6 +53,15 @@ export async function DELETE(
   // owner 或 ADMIN 可删
   if (attachment.userId !== user.id && user.role !== 'ADMIN') {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
+  }
+
+  // 已关闭（endedAt 非空）的对话是只读的：不允许删除其附件（会真实删 Cloudreve 文件 +
+  // DB 行，破坏只读语义）。UI 也已隐藏删除入口，这里做服务端兜底（含直接打 API 的情况）。
+  if (attachment.conversation?.endedAt) {
+    return NextResponse.json(
+      { error: 'Conversation is closed (read-only)' },
+      { status: 409 }
+    );
   }
 
   // 物理文件 best-effort 删除（失败不阻塞 DB 清理）

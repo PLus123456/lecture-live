@@ -183,13 +183,9 @@ export async function performChatFileCleanup(input: {
   }
 
   const ZERO = BigInt(0);
-  const byUser = new Map<string, bigint>();
-  for (const row of toDelete) {
-    byUser.set(row.userId, (byUser.get(row.userId) ?? ZERO) + row.bytes);
-  }
-
   const ids = toDelete.map((r) => r.id);
   let totalReleased = ZERO;
+  let deletedCount = 0;
 
   // U6：事务外 best-effort 删 Cloudreve 物理文件（原文件 + 抽取的 .txt），再删 DB 行。
   // 顺序刻意放在删行前：一旦行删掉，cloudrevePath 就永久丢失、cron 也再扫不到。
@@ -197,16 +193,40 @@ export async function performChatFileCleanup(input: {
   await deleteCloudreveAttachmentFiles(toDelete);
 
   await prisma.$transaction(async (tx) => {
-    for (const [userId, bytes] of byUser) {
+    // B8（防重复退额度）：释放口径必须是「本事务实际删除的行」，而非删除前快照 toDelete。
+    // 用 FOR UPDATE 锁定并重读仍存在的行 —— 并发的单条 DELETE /api/chat-uploads/[id] 会被行锁
+    // 阻塞到本事务提交，其后 prisma.delete 命中不到行(P2025) → 跳过它自己的 release；反之若单删
+    // 先提交，则该行已不在锁定结果里、本处也不再退。故任一行的字节至多被释放一次，杜绝与并发
+    // 单删叠加造成的 over-release（此前按快照 byUser 无条件重复退，用户被多退一份直到次日字节对账才纠正）。
+    const lockedRows = await tx.$queryRaw<
+      Array<{ id: string; userId: string; bytes: bigint }>
+    >(Prisma.sql`
+      SELECT id, userId, bytes FROM ChatAttachment
+      WHERE id IN (${Prisma.join(ids)})
+      FOR UPDATE
+    `);
+
+    const releaseByUser = new Map<string, bigint>();
+    for (const row of lockedRows) {
+      releaseByUser.set(row.userId, (releaseByUser.get(row.userId) ?? ZERO) + row.bytes);
+    }
+    for (const [userId, bytes] of releaseByUser) {
       await releaseUserStorageBytesRaw(tx, userId, bytes);
       totalReleased += bytes;
     }
-    await tx.chatAttachment.deleteMany({ where: { id: { in: ids } } });
+
+    const existingIds = lockedRows.map((r) => r.id);
+    if (existingIds.length > 0) {
+      await tx.chatAttachment.deleteMany({ where: { id: { in: existingIds } } });
+    }
+    deletedCount = existingIds.length;
   });
 
   return {
-    deleted: toDelete.length,
+    // 实际删除并释放的行数（并发单删已删走的行不重复计入）。
+    deleted: deletedCount,
     releasedBytes: Number(totalReleased),
+    // 是否触达本次硬上限（用初始候选量判断，与并发无关）。
     truncated: toDelete.length === HARD_LIMIT,
   };
 }

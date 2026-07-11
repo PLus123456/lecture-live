@@ -96,6 +96,11 @@ model Session {
   asyncTranscribeStatus    String?
   asyncTranscribeError     String?   @db.Text
   asyncTranscribeStartedAt DateTime?
+  // B1：异步上传转录入口的原子配额预留分钟。init 预留成功后写入（同时已计入
+  // transcriptionMinutesUsed）；finalize 时转为实扣（release 预留 + deduct 实际）、
+  // cancel/删会话/失败回收时释放。非 0 即表示有一笔在途预留待结算——cron 会兜底释放
+  // 终态(failed/canceled/completed) 却仍残留预留的会话，防漏释放导致额度泄漏。
+  asyncReservedMinutes     Int       @default(0)
 
   // 完整版补全转录：对已录制会话的完整音频（含断网续采段）重跑一次 Soniox 异步文件转录，
   // 产出一份「独立并列」的完整转录（不覆盖实时 transcriptPath）。与上述 async-upload 状态机

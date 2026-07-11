@@ -56,6 +56,8 @@ describe('expireRoleDowngrades', () => {
           role: 'FREE',
           originalRole: null,
           roleExpiresAt: null,
+          // 到期同时清掉自定义组绑定，避免配额回落系统角色而 customGroupId 仍指向旧组的漂移
+          customGroupId: null,
           transcriptionMinutesLimit: 60,
           storageHoursLimit: 10,
           allowedModels: 'local',

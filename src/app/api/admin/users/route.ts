@@ -76,7 +76,32 @@ export async function GET(req: Request) {
       orderBy: { createdAt: 'desc' },
     });
 
-    const sortedUsers = [...users].sort((a, b) => {
+    // storageHoursUsed 列是死维度（从不 increment），真实占用由 SUM(session.durationMs)/3600000
+    // 实时聚合（与 quota.ts:getStorageHoursUsed 同口径）。一次 groupBy 覆盖全部列出的用户，
+    // 避免逐用户 N 次查询；否则 admin 面板的「存储空间」进度条恒显示 0。
+    const userIds = users.map((u) => u.id);
+    const durationByUser = userIds.length
+      ? await prisma.session.groupBy({
+          by: ['userId'],
+          where: { userId: { in: userIds } },
+          _sum: { durationMs: true },
+        })
+      : [];
+    const storageHoursByUser = new Map<string, number>();
+    for (const row of durationByUser) {
+      const ms = row._sum.durationMs ?? 0;
+      storageHoursByUser.set(
+        row.userId,
+        ms > 0 ? Math.round((ms / 3_600_000) * 100) / 100 : 0
+      );
+    }
+
+    const usersWithUsage = users.map((u) => ({
+      ...u,
+      storageHoursUsed: storageHoursByUser.get(u.id) ?? 0,
+    }));
+
+    const sortedUsers = usersWithUsage.sort((a, b) => {
       if (a.id === admin.id) return -1;
       if (b.id === admin.id) return 1;
       return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
@@ -390,6 +415,11 @@ export async function PATCH(req: Request) {
       originalRole?: string | null;
       roleExpiresAt?: string | null;
       customGroupId?: string | null;
+      // 单用户配额直接覆盖（独立于用户组）。用于「给某个用户单独加/减使用时长」。
+      transcriptionMinutesLimit?: number;
+      storageHoursLimit?: number;
+      // 一键重置该用户本月已用转录时长（transcriptionMinutesUsed → 0）。
+      resetTranscriptionUsage?: boolean;
     };
 
     if (!userId) {
@@ -543,6 +573,37 @@ export async function PATCH(req: Request) {
       data.transcriptionMinutesLimit = defaults.transcriptionMinutesLimit;
       data.storageHoursLimit = defaults.storageHoursLimit;
       data.storageBytesLimit = await resolveRoleStorageBytesLimit(newRole);
+    }
+
+    // 单用户配额直接覆盖（放在 group/role 分支之后，故显式传入的上限恒覆盖组/角色派生的默认值）。
+    // 注意：这是「脱离用户组」的个体覆盖——之后若再编辑该用户所属的系统组/自定义组，updateMany
+    // 会把此覆盖一并刷回组配置值（前端已就此提示 admin）。转录分钟取整、存储小时保留浮点。
+    if (fields.transcriptionMinutesLimit !== undefined) {
+      const raw = Number(fields.transcriptionMinutesLimit);
+      if (!Number.isFinite(raw) || raw < 0) {
+        return NextResponse.json(
+          { error: '转录时长上限必须为非负数值' },
+          { status: 400 }
+        );
+      }
+      data.transcriptionMinutesLimit = Math.floor(raw);
+    }
+
+    if (fields.storageHoursLimit !== undefined) {
+      const raw = Number(fields.storageHoursLimit);
+      if (!Number.isFinite(raw) || raw < 0) {
+        return NextResponse.json(
+          { error: '存储时长上限必须为非负数值' },
+          { status: 400 }
+        );
+      }
+      data.storageHoursLimit = raw;
+    }
+
+    // 一键重置本月已用转录时长。仅清零已用量列，不动 quotaResetAt（下次月度重置点不变）。
+    // 存储用量不可在此重置（它是 SUM(session.durationMs) 的实时占用，只随删录音回落）。
+    if (fields.resetTranscriptionUsage === true) {
+      data.transcriptionMinutesUsed = 0;
     }
 
     if (Object.keys(data).length === 0) {

@@ -103,6 +103,7 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         transcriptionMinutesLimit: 999999,
         storageHoursLimit: 999999,
         allowedModels: '*',
+        maxConcurrentSessions: 999,
         maxThinkingDepth: 'high',
         allowRealtimeSummary: true,
         allowFinalSummary: true,
@@ -112,6 +113,7 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         transcriptionMinutesLimit: 600,
         storageHoursLimit: 100,
         allowedModels: 'local,gpt,deepseek',
+        maxConcurrentSessions: 3,
         maxThinkingDepth: 'high',
         allowRealtimeSummary: true,
         allowFinalSummary: true,
@@ -121,6 +123,7 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         transcriptionMinutesLimit: 60,
         storageHoursLimit: 10,
         allowedModels: 'local',
+        maxConcurrentSessions: 1,
         // 保留 FREE 历史行为：思考深度封顶 medium（原 access.ts/models 里的硬编码 FREE 限制）。
         // 实时/总摘要默认允许，符合「未配置组默认全部允许、上线不改变现状」。
         maxThinkingDepth: 'medium',
@@ -128,6 +131,18 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         allowFinalSummary: true,
       };
   }
+}
+
+/** 并发录音上限的合理下限/兜底（任何组至少允许 1 个在途录音） */
+const MIN_CONCURRENT_SESSIONS = 1;
+
+/** 把任意值收敛成合法的并发上限（≥1 的整数），非法回落 fallback */
+function coerceConcurrentSessions(value: unknown, fallback: number): number {
+  const n = Number(value);
+  if (Number.isFinite(n) && n >= MIN_CONCURRENT_SESSIONS) {
+    return Math.floor(n);
+  }
+  return fallback;
 }
 
 /**
@@ -183,6 +198,10 @@ export async function resolveRoleQuotas(role: UserRole): Promise<GroupPermission
     transcriptionMinutesLimit,
     storageHoursLimit,
     allowedModels,
+    maxConcurrentSessions: coerceConcurrentSessions(
+      cfg.maxConcurrentSessions,
+      defaults.maxConcurrentSessions ?? MIN_CONCURRENT_SESSIONS
+    ),
     maxThinkingDepth: coerceThinkingDepthCap(
       cfg.maxThinkingDepth,
       defaults.maxThinkingDepth
@@ -294,6 +313,42 @@ export async function resolveUserFeatureFlags(user: {
     allowRealtimeSummary: roleQuotas.allowRealtimeSummary,
     allowFinalSummary: roleQuotas.allowFinalSummary,
   };
+}
+
+/**
+ * 解析某用户运行时生效的「最大并发在途录音数」。
+ *
+ * 与 resolveUserFeatureFlags 同口径：ADMIN 恒无限 → 有自定义组读 custom_groups →
+ * 否则读系统角色 group_config_<role>（默认见 getDefaultQuotasForRole）。组配置为唯一真源，
+ * 让 admin 在用户组面板配的「最大并发会话数」在录制启动准入处真正生效（此前是死设置）。
+ *
+ * 返回值恒 ≥1。ADMIN 返回一个足够大的哨兵（与配额哨兵、maxConcurrentSessions=999 同口径），
+ * 调用方对 ADMIN 也可直接跳过并发校验。
+ */
+export async function resolveUserMaxConcurrentSessions(user: {
+  role: UserRole;
+  customGroupId?: string | null;
+}): Promise<number> {
+  if (user.role === 'ADMIN') {
+    return 999;
+  }
+
+  if (user.customGroupId) {
+    const custom = await resolveCustomGroupPermissions(user.customGroupId);
+    if (custom) {
+      return coerceConcurrentSessions(
+        custom.maxConcurrentSessions,
+        MIN_CONCURRENT_SESSIONS
+      );
+    }
+    // 自定义组不存在 → 回落底层角色配置
+  }
+
+  const roleQuotas = await resolveRoleQuotas(user.role);
+  return coerceConcurrentSessions(
+    roleQuotas.maxConcurrentSessions,
+    MIN_CONCURRENT_SESSIONS
+  );
 }
 
 /**

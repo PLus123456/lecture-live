@@ -1,4 +1,4 @@
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import {
   getBillableMinutes,
@@ -130,6 +130,18 @@ async function ensureQuotaWindow(
   if (user.quotaResetAt > now) {
     return user;
   }
+
+  // B1（防跨周期二次释放，审查 R1）：**先清**该用户在途异步上传预留列，**再**把 used 归零。
+  // 顺序是关键——若先归零 used 再清列，两条非事务 updateMany 之间会出现「used=0 但 col=est」的
+  // 窗口，让并发 finalize 的 settleAsyncReservation 读到未清的 est 二次释放、把新周期真实扣费抹掉
+  // （用 GREATEST 截 0 → 完成的转录白扣 0）。先清列则该坏窗口不存在：settle 只会读到已清的 0、不释放。
+  // db 为事务客户端时两条本就同事务原子提交、顺序无碍；db 为普通 client 时靠此顺序消除坏窗口。
+  // 无条件清（本分支已确定 quotaResetAt<=now 过期）：即便随后乐观锁重置输给并发请求(count=0)，
+  // 对方也会同样重置 used→0，预留作废、清列正确且幂等。
+  await db.session.updateMany({
+    where: { userId, asyncReservedMinutes: { gt: 0 } },
+    data: { asyncReservedMinutes: 0 },
+  });
 
   // 已过期：用乐观锁重置，防止并发请求同时重置清零刚扣的配额
   const resetResult = await db.user.updateMany({
@@ -307,6 +319,26 @@ export async function resetExpiredTranscriptionQuotas(
   // 单条原子 updateMany 取代"先 findMany 再逐个无条件 update"。无条件 update 会与请求
   // 路径上的 ensureQuotaWindow / 扣费在毫秒级并发时互相覆写——把刚被重置并扣过费的窗口
   // 再次清零（白送额度）。以 updateMany 的 count 为返回值，且消除 findMany→update 的 TOCTOU。
+  // B1（防跨周期二次释放，审查 R1）：先记下将被重置的用户，**先清**其在途异步上传预留列，**再**
+  // 把 used 归零。顺序同 ensureQuotaWindow——先归零 used 再清列会留下「used=0 但 col=est」窗口，
+  // 让并发 finalize 的 settle 二次释放把新周期真实扣费抹掉。先清列则 settle 只会读到已清的 0。
+  // 残留的极窄 TOCTOU（findMany 与清列之间某用户新建预留被误清）只会让该新预留永久留在 used
+  // （过量计费、对用户不利、非白送），且会在下一周期重置自愈——远小于跨周期二次释放（漏收费）的危害，可接受。
+  const expiredUsers = await prisma.user.findMany({
+    where: { quotaResetAt: { lte: now } },
+    select: { id: true },
+  });
+
+  if (expiredUsers.length > 0) {
+    await prisma.session.updateMany({
+      where: {
+        userId: { in: expiredUsers.map((u) => u.id) },
+        asyncReservedMinutes: { gt: 0 },
+      },
+      data: { asyncReservedMinutes: 0 },
+    });
+  }
+
   const result = await prisma.user.updateMany({
     where: {
       quotaResetAt: { lte: now },
@@ -612,4 +644,50 @@ export async function releaseTranscriptionMinutes(
     SET transcriptionMinutesUsed = GREATEST(0, transcriptionMinutesUsed - ${normalized})
     WHERE id = ${userId}
   `;
+}
+
+/**
+ * 原子结算一笔在途异步上传预留（B1 的统一释放原语）。
+ *
+ * FOR UPDATE 锁住 Session 行 → 读当前 asyncReservedMinutes + userId → 若 >0 则清零该列并
+ * releaseTranscriptionMinutes(该额)。**恰好一次**：并发的多条释放路径（finalize 结算 / 删会话 /
+ * re-init 顶替 / cron 兜底）都经此原语时，只有第一个读到 >0 的能清零并释放，其余在行锁后读到 0 →
+ * 直接返回 0、不重复释放。杜绝审查发现的一切「按请求开头快照无条件裸减」造成的双释放/额度白送。
+ *
+ * 读的是**行上的当前值**（非调用方快照）：deduct 内部 ensureQuotaWindow 可能刚触发月度重置并顺带
+ * 清了本列，此时当前值=0 → 不再释放，避免跨周期把已被重置隐式清除的预留再减一次。
+ *
+ * @param db 可选事务客户端。finalize 结算传入其 $transaction 的 tx，使「deduct 实扣 ⟺ 释放预留」
+ *   在同一事务内一致提交。默认自开事务以保证 FOR UPDATE 行锁生效。
+ * @returns 实际释放的分钟（0 表示该预留已被别的路径结算或本就为 0）。
+ */
+export async function settleAsyncReservation(
+  sessionId: string,
+  db: QuotaDbClient = prisma
+): Promise<number> {
+  const run = async (tx: QuotaDbClient): Promise<number> => {
+    const rows = await tx.$queryRaw<
+      Array<{ userId: string; asyncReservedMinutes: number }>
+    >(
+      Prisma.sql`SELECT userId, asyncReservedMinutes FROM Session WHERE id = ${sessionId} FOR UPDATE`
+    );
+    const row = rows[0];
+    if (!row || row.asyncReservedMinutes <= 0) {
+      return 0;
+    }
+    const minutes = row.asyncReservedMinutes;
+    await tx.session.update({
+      where: { id: sessionId },
+      data: { asyncReservedMinutes: 0 },
+    });
+    await releaseTranscriptionMinutes(row.userId, minutes, tx);
+    return minutes;
+  };
+
+  // 已在外层事务里（db 是 tx，无 $transaction 方法）→ 直接跑；否则自开事务保证 FOR UPDATE 生效。
+  const maybeClient = db as unknown as { $transaction?: typeof prisma.$transaction };
+  if (typeof maybeClient.$transaction === 'function') {
+    return maybeClient.$transaction(run);
+  }
+  return run(db);
 }

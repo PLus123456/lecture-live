@@ -22,6 +22,7 @@ import {
 } from '@/lib/sessionPersistence';
 import { deleteRecordingDraft } from '@/lib/recordingDraftPersistence';
 import { deleteConversationsCascade } from '@/lib/conversationCascade';
+import { settleAsyncReservation } from '@/lib/quota';
 import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
 import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
 import {
@@ -268,6 +269,12 @@ export async function DELETE(
   ) {
     await cancelAsyncUpload(session).catch(() => undefined);
   }
+
+  // B1：删会话前原子结算该会话遗留的异步上传预留。行一删，cron 兜底扫描便再也找不到这行
+  // → 预留永久占着 transcriptionMinutesUsed 泄漏，故必须 inline 释放。用 settleAsyncReservation
+  // （FOR UPDATE 读当前列并释放）而非按请求开头快照裸减：与并发 finalize 结算 / cron 兜底 互斥、
+  // 恰好释放一次，杜绝审查发现的「快照双释放」（例如收尾已释放后本处按陈旧快照再退一次）。
+  await settleAsyncReservation(session.id).catch(() => undefined);
 
   // 完整版补全转录进行中时删会话：与异步上传同理，Soniox 上的 file + transcription 会随行消失而
   // 永久泄漏（行一删便无 id→owner 关联，reclaim cron 也无从查起）。best-effort 清 Soniox 资源

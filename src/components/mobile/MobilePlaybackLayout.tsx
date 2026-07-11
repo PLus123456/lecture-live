@@ -78,6 +78,9 @@ interface MobilePlaybackLayoutProps {
   // 标题重新生成
   onRegenerateTitle?: () => void;
   regeneratingTitle?: boolean;
+  // 报告重新生成（生成失败/缺失时的入口，分享模式隐藏）
+  onRegenerateReport?: () => void;
+  regeneratingReport?: boolean;
   /** 分享模式：隐藏 Chat tab 和重新生成标题 */
   isShareMode?: boolean;
   // 完整版补全转录（阶段C）：父级 owns 状态/轮询/收费确认弹窗，这里只渲染入口 + 切换。
@@ -127,11 +130,39 @@ function formatDate(dateStr: string): string {
 function ReportContent({
   reportData,
   reportLoading,
+  isShareMode,
+  onRegenerateReport,
+  regeneratingReport,
 }: {
   reportData: SessionReportData | null;
   reportLoading: boolean;
+  isShareMode?: boolean;
+  onRegenerateReport?: () => void;
+  regeneratingReport?: boolean;
 }) {
   const { t } = useI18n();
+
+  // 报告失败/缺失时的重新生成按钮（分享模式隐藏）。两处空态复用。
+  const regenButton =
+    !isShareMode && onRegenerateReport ? (
+      <button
+        onClick={onRegenerateReport}
+        disabled={regeneratingReport}
+        data-testid="report-regen-btn"
+        className="mt-4 inline-flex items-center gap-1.5 px-3 py-2 rounded-lg
+                   bg-rust-50 text-rust-600 text-xs font-medium
+                   active:bg-rust-100 disabled:opacity-50 disabled:cursor-not-allowed"
+      >
+        {regeneratingReport ? (
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+        ) : (
+          <RefreshCw className="w-3.5 h-3.5" />
+        )}
+        {regeneratingReport
+          ? t('playback.reportRegenerating')
+          : t('playback.reportRegenerate')}
+      </button>
+    ) : null;
 
   if (reportLoading) {
     return (
@@ -147,6 +178,7 @@ function ReportContent({
       <div className="text-center text-charcoal-400 text-sm py-12">
         <ClipboardList className="w-6 h-6 mx-auto mb-2 opacity-30" />
         <p>{t('playback.noReport')}</p>
+        {regenButton}
       </div>
     );
   }
@@ -171,6 +203,7 @@ function ReportContent({
       <div className="text-center text-charcoal-400 text-sm py-12">
         <AlertCircle className="w-6 h-6 mx-auto mb-2 opacity-30" />
         <p>{t('playback.reportFailed')}</p>
+        {regenButton}
       </div>
     );
   }
@@ -312,6 +345,8 @@ export default function MobilePlaybackLayout({
   onOpenExport,
   onRegenerateTitle,
   regeneratingTitle,
+  onRegenerateReport,
+  regeneratingReport,
   isShareMode,
   canGenerateFull,
   onGenerateFull,
@@ -435,7 +470,13 @@ export default function MobilePlaybackLayout({
         <div className="px-4 py-4">
           {/* Report */}
           {activeTab === 'report' && (
-            <ReportContent reportData={reportData} reportLoading={reportLoading} />
+            <ReportContent
+              reportData={reportData}
+              reportLoading={reportLoading}
+              isShareMode={isShareMode}
+              onRegenerateReport={onRegenerateReport}
+              regeneratingReport={regeneratingReport}
+            />
           )}
 
           {/* Transcript */}

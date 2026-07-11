@@ -23,6 +23,7 @@ import {
 import { deleteRecordingDraft } from '@/lib/recordingDraftPersistence';
 import { deleteConversationsCascade } from '@/lib/conversationCascade';
 import { settleAsyncReservation, settleFullReservation } from '@/lib/quota';
+import { resolveUserMaxConcurrentSessions } from '@/lib/userRoles';
 import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
 import { resolveSonioxConfigForSessionRegion } from '@/lib/soniox/env';
 import {
@@ -33,7 +34,9 @@ import {
 // B4：单用户并发在途录音（RECORDING/PAUSED）上限。实时录音事后扣费，无法在入口精确预留，
 // 用并发上限把「多标签并发开录叠加超额」的溢出封在 N×角色上限内（留足余量容忍崩溃残留的僵尸会话，
 // 4h 后由 reclaim cron 清）。彻底的按用量实时计费另见 /soniox/temporary-key 计量任务。
-const MAX_CONCURRENT_RECORDINGS = 3;
+//
+// 上限值由用户组配置解析（resolveUserMaxConcurrentSessions）：admin 在「用户组」面板配的
+// 「最大并发会话数」在此真正生效——此前是写死的 3，组配置形同虚设。
 
 export async function GET(
   req: Request,
@@ -139,13 +142,23 @@ export async function PATCH(
     // 计并发在途数（RECORDING/PAUSED），超上限即拒，把并发溢出封在 N×角色上限内。恢复暂停
     // (PAUSED→RECORDING) 不新增在途、不受此限。彻底的按用量实时计费见 /soniox/temporary-key 计量任务。
     if (nextStatus === 'RECORDING' && session.status === 'CREATED') {
+      // 按用户组解析并发上限（ADMIN 恒 999，视为不限）。customGroupId 不在 JWT payload 里，
+      // 单独取一次；这是「开新录音」的低频路径，一次轻量 select 可接受。
+      const owner = await prisma.user.findUnique({
+        where: { id: user.id },
+        select: { customGroupId: true },
+      });
+      const maxConcurrent = await resolveUserMaxConcurrentSessions({
+        role: user.role,
+        customGroupId: owner?.customGroupId ?? null,
+      });
       const inflight = await prisma.session.count({
         where: { userId: user.id, status: { in: ['RECORDING', 'PAUSED'] } },
       });
-      if (inflight >= MAX_CONCURRENT_RECORDINGS) {
+      if (inflight >= maxConcurrent) {
         return NextResponse.json(
           {
-            error: `Too many concurrent recordings in progress (max ${MAX_CONCURRENT_RECORDINGS}). Finish or discard an existing recording first.`,
+            error: `Too many concurrent recordings in progress (max ${maxConcurrent}). Finish or discard an existing recording first.`,
           },
           { status: 409 }
         );

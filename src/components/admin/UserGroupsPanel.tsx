@@ -396,11 +396,13 @@ function PermissionsForm({
         <label className="text-sm font-medium text-charcoal-700 mb-1 block">{t('admin.maxConcurrent')}</label>
         <input
           type="number"
+          min={1}
           value={concurrent}
           onChange={(e) => setConcurrent(e.target.value)}
           className="w-full px-3 py-2 text-sm border border-cream-200 rounded-lg
                      focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300"
         />
+        <p className="text-[11px] text-charcoal-400 mt-1">{t('admin.maxConcurrentHint')}</p>
       </div>
 
       {/* ── 能力开关 ── */}
@@ -1059,9 +1061,16 @@ export default function UserGroupsPanel() {
       {deleteModal.mounted && deleteGroupForRender && (
         <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm ${deleteModal.leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}>
           <div className={`bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-sm mx-4 p-6 ${deleteModal.leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
-            <p className="text-sm text-charcoal-700 mb-4">
-              {t('admin.deleteGroupConfirm', { name: deleteGroupForRender.name })}
-            </p>
+            <div className="mb-4">
+              <p className="text-sm text-charcoal-700">
+                {t('admin.deleteGroupConfirm', { name: deleteGroupForRender.name })}
+              </p>
+              {deleteGroupForRender.userCount > 0 && (
+                <p className="text-xs text-amber-600 mt-1.5">
+                  {t('admin.deleteGroupAffected', { n: deleteGroupForRender.userCount })}
+                </p>
+              )}
+            </div>
             <div className="flex items-center justify-end gap-3">
               <button
                 onClick={() => setDeleteConfirm(null)}

@@ -135,8 +135,20 @@ function UserDetailModal({
   const [roleExpiresAt, setRoleExpiresAt] = useState(
     user.roleExpiresAt ? toLocalDatetimeInput(user.roleExpiresAt) : '' // C20：UTC → 本地墙钟
   );
+  // 单用户配额上限覆盖（脱离用户组）+ 本月已用重置
+  const [minutesLimit, setMinutesLimit] = useState(String(user.transcriptionMinutesLimit));
+  const [storageLimit, setStorageLimit] = useState(String(user.storageHoursLimit));
+  const [pendingReset, setPendingReset] = useState(false);
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  // 到期快捷设置：now + N 天 → 本地墙钟输入串（复用与保存对称的 toLocalDatetimeInput）
+  const setExpiryInDays = (days: number) => {
+    const d = new Date(Date.now() + days * 86_400_000);
+    setRoleExpiresAt(toLocalDatetimeInput(d.toISOString()));
+  };
+  // 设了到期时间但没有原始用户组 → 到期不会自动降级（后端也会 400，这里前置提示）
+  const expiryNeedsOriginalRole = roleExpiresAt !== '' && !originalRole;
 
   // 统一用户组选择：内置组用 "FREE"/"PRO"/"ADMIN"，自定义组用组 ID
   const initGroupValue = user.customGroupId || user.role;
@@ -181,6 +193,27 @@ function UserDetailModal({
         : null;
       if (newExpiresAt !== oldExpiresAt) {
         body.roleExpiresAt = newExpiresAt;
+      }
+
+      // 单用户配额上限覆盖（仅在实际改动时发送）
+      const parsedMinutes = parseInt(minutesLimit, 10);
+      if (!Number.isNaN(parsedMinutes) && parsedMinutes !== user.transcriptionMinutesLimit) {
+        body.transcriptionMinutesLimit = Math.max(0, parsedMinutes);
+      }
+      const parsedStorage = parseFloat(storageLimit);
+      if (!Number.isNaN(parsedStorage) && parsedStorage !== user.storageHoursLimit) {
+        body.storageHoursLimit = Math.max(0, parsedStorage);
+      }
+      if (pendingReset) {
+        body.resetTranscriptionUsage = true;
+      }
+
+      // 前置校验：设了到期时间必须有原始用户组（否则到期回退永不触发；后端 U85 同样拦）
+      if (expiryNeedsOriginalRole) {
+        const msg = '设置到期时间前必须先指定原始用户组（到期回退目标）';
+        setError(msg);
+        toast.error(t('common.saveFailed'), msg);
+        return;
       }
 
       // 如果没有实际改变的字段（除 userId），不发请求
@@ -399,7 +432,95 @@ function UserDetailModal({
                   onChange={(e) => setRoleExpiresAt(e.target.value)}
                   className={inputClass}
                 />
+                {/* 快捷设置：常见时长一键计算到期时间 */}
+                <div className="flex flex-wrap items-center gap-1 mt-1.5">
+                  {[
+                    { label: '+7天', days: 7 },
+                    { label: '+30天', days: 30 },
+                    { label: '+90天', days: 90 },
+                  ].map((q) => (
+                    <button
+                      key={q.days}
+                      type="button"
+                      onClick={() => setExpiryInDays(q.days)}
+                      className="px-2 py-0.5 text-[11px] text-charcoal-500 bg-cream-100 rounded
+                                 hover:bg-cream-200 transition-colors"
+                    >
+                      {q.label}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setRoleExpiresAt('')}
+                    className="px-2 py-0.5 text-[11px] text-charcoal-500 bg-cream-100 rounded
+                               hover:bg-cream-200 transition-colors"
+                  >
+                    永久
+                  </button>
+                </div>
               </div>
+            </div>
+
+            {/* 到期回退依赖原始用户组：缺失时明确提示（否则到期永不触发） */}
+            {expiryNeedsOriginalRole && (
+              <div className="text-[11px] text-amber-600 bg-amber-50 px-2.5 py-1.5 rounded-lg border border-amber-100">
+                已设置到期时间，但未指定「原始用户组」——到期后不会自动降级。请先选择回退目标。
+              </div>
+            )}
+
+            {/* 配额上限（单用户覆盖，脱离用户组） */}
+            <div className="rounded-lg border border-cream-200 bg-cream-50/60 p-3 space-y-2.5">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-medium text-charcoal-600">使用时长 · 配额上限</span>
+                <span className="text-[10px] text-charcoal-400">(单用户覆盖)</span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                <div>
+                  <label className="text-[11px] text-charcoal-500 mb-1 flex items-center gap-1">
+                    <Clock className="w-3 h-3" /> 转录时长上限 (min/月)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={minutesLimit}
+                    onChange={(e) => setMinutesLimit(e.target.value)}
+                    className={inputClass}
+                  />
+                </div>
+                <div>
+                  <label className="text-[11px] text-charcoal-500 mb-1 flex items-center gap-1">
+                    <HardDrive className="w-3 h-3" /> 存储时长上限 (小时)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.5"
+                    value={storageLimit}
+                    onChange={(e) => setStorageLimit(e.target.value)}
+                    className={inputClass}
+                  />
+                </div>
+              </div>
+              {/* 重置本月已用转录时长 */}
+              <div className="flex items-center justify-between gap-2 pt-0.5">
+                <span className="text-[11px] text-charcoal-400">
+                  本月已用转录：{user.transcriptionMinutesUsed.toLocaleString()} min
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setPendingReset((v) => !v)}
+                  className={`px-2.5 py-1 text-[11px] rounded-lg border transition-colors ${
+                    pendingReset
+                      ? 'text-rust-600 bg-rust-50 border-rust-200'
+                      : 'text-charcoal-500 bg-white border-cream-200 hover:bg-cream-50'
+                  }`}
+                >
+                  {pendingReset ? '✓ 保存后重置本月已用' : '重置本月已用'}
+                </button>
+              </div>
+              <p className="text-[10px] text-charcoal-400 leading-relaxed">
+                单独修改上限会脱离用户组；之后再编辑该用户所属用户组时，会被组配置刷回。存储用量为实时占用，只能通过删除录音回落。
+              </p>
             </div>
 
             {/* 创建日期（只读） */}
@@ -429,7 +550,7 @@ function UserDetailModal({
           </button>
           <button
             onClick={handleSave}
-            disabled={submitting}
+            disabled={submitting || expiryNeedsOriginalRole}
             className="px-4 py-2 text-sm text-white bg-rust-500 rounded-lg hover:bg-rust-600
                        transition-colors shadow-sm disabled:opacity-50"
           >

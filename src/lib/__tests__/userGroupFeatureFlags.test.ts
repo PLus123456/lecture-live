@@ -28,6 +28,7 @@ import {
   resolveRoleQuotas,
   resolveCustomGroupPermissions,
   resolveUserFeatureFlags,
+  resolveUserMaxConcurrentSessions,
 } from '@/lib/userRoles';
 
 /** 让 mock 按 SiteSetting key 返回预置行 */
@@ -110,6 +111,64 @@ describe('resolveRoleQuotas 能力开关', () => {
       group_config_PRO: { maxThinkingDepth: 'bogus' },
     });
     expect((await resolveRoleQuotas('PRO')).maxThinkingDepth).toBe('high');
+  });
+
+  it('maxConcurrentSessions 无配置回落角色默认（FREE 1 / PRO 3 / ADMIN 999）', async () => {
+    expect((await resolveRoleQuotas('FREE')).maxConcurrentSessions).toBe(1);
+    expect((await resolveRoleQuotas('PRO')).maxConcurrentSessions).toBe(3);
+    expect((await resolveRoleQuotas('ADMIN')).maxConcurrentSessions).toBe(999);
+  });
+
+  it('group_config 显式 maxConcurrentSessions 被采纳；非法值回落默认', async () => {
+    setSiteSettings({
+      group_config_FREE: { maxConcurrentSessions: 5 },
+      group_config_PRO: { maxConcurrentSessions: 0 }, // <1 非法 → 回落 PRO 默认 3
+    });
+    expect((await resolveRoleQuotas('FREE')).maxConcurrentSessions).toBe(5);
+    expect((await resolveRoleQuotas('PRO')).maxConcurrentSessions).toBe(3);
+  });
+});
+
+describe('resolveUserMaxConcurrentSessions', () => {
+  it('ADMIN 恒 999，忽略所属自定义组', async () => {
+    setSiteSettings({
+      custom_groups: [{ id: 'g1', permissions: { maxConcurrentSessions: 1 } }],
+    });
+    expect(
+      await resolveUserMaxConcurrentSessions({ role: 'ADMIN', customGroupId: 'g1' })
+    ).toBe(999);
+  });
+
+  it('自定义组优先于角色', async () => {
+    setSiteSettings({
+      custom_groups: [{ id: 'g2', permissions: { maxConcurrentSessions: 7 } }],
+    });
+    expect(
+      await resolveUserMaxConcurrentSessions({ role: 'FREE', customGroupId: 'g2' })
+    ).toBe(7);
+  });
+
+  it('自定义组不存在 → 回落底层角色（PRO 默认 3）', async () => {
+    setSiteSettings({ custom_groups: [] });
+    expect(
+      await resolveUserMaxConcurrentSessions({ role: 'PRO', customGroupId: 'ghost' })
+    ).toBe(3);
+  });
+
+  it('无自定义组 → 按角色 group_config 解析', async () => {
+    setSiteSettings({ group_config_FREE: { maxConcurrentSessions: 4 } });
+    expect(
+      await resolveUserMaxConcurrentSessions({ role: 'FREE', customGroupId: null })
+    ).toBe(4);
+  });
+
+  it('返回值恒 ≥1（自定义组配 0 被兜底为 1）', async () => {
+    setSiteSettings({
+      custom_groups: [{ id: 'g3', permissions: { maxConcurrentSessions: 0 } }],
+    });
+    expect(
+      await resolveUserMaxConcurrentSessions({ role: 'FREE', customGroupId: 'g3' })
+    ).toBe(1);
   });
 });
 

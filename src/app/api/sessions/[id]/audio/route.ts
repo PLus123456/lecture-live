@@ -12,12 +12,21 @@ import {
   normalizeAudioMimeType,
 } from '@/lib/audio/uploadValidation';
 import { deleteRecordingDraft } from '@/lib/recordingDraftPersistence';
-import { persistSessionAudioArtifact, loadSessionAudioArtifact } from '@/lib/sessionPersistence';
+import {
+  stageSessionAudioArtifact,
+  finalizeStagedArtifactPublish,
+  rollbackStagedArtifact,
+  loadSessionAudioArtifact,
+  resolveSessionAudioLocation,
+  openLocalAudioRangeStream,
+} from '@/lib/sessionPersistence';
+import { CloudreveStorage } from '@/lib/storage/cloudreve';
 import {
   normalizeRecordedAudioDuration,
   resolveExpectedRecordingDurationMs,
 } from '@/lib/audio/recordingDuration';
 import { clampSessionDurationMs } from '@/lib/billing';
+import { checkQuota } from '@/lib/quota';
 
 // Save audio recording
 export async function POST(
@@ -59,6 +68,17 @@ export async function POST(
     return NextResponse.json(
       { error: 'Cannot overwrite recording of a finalized session' },
       { status: 409 }
+    );
+  }
+
+  // P1-13 契约6（录音入口存储配额准入）：整段录音直传入口按 storageHoursLimit 准入
+  //（SUM(durationMs)/3600000 < limit 的读时校验，契约6允许的非原子降级闸门），杜绝旧代码
+  // 生产录音入口从不校验存储配额。原子化 reserve/settle/release 待 quota.ts 导出后由集成层替换。
+  const withinStorageQuota = await checkQuota(user.id, 'storage_hours');
+  if (!withinStorageQuota) {
+    return NextResponse.json(
+      { error: 'Storage quota exceeded; cannot save recording', quota: 'storage_hours' },
+      { status: 402 }
     );
   }
 
@@ -109,7 +129,9 @@ export async function POST(
       durationMs,
     });
 
-    const stored = await persistSessionAudioArtifact(
+    // P0-6：先写版本化临时对象（绝不覆盖旧固定 key），DB CAS 成功后才发布（删旧）；
+    // CAS 失败则回滚删掉临时对象、绝不触碰已定稿的旧录音。
+    const staged = await stageSessionAudioArtifact(
       session,
       normalizedBuffer,
       normalizedMimeType
@@ -123,17 +145,19 @@ export async function POST(
         status: { notIn: ['COMPLETED', 'ARCHIVED'] },
       },
       data: {
-        recordingPath: stored.path,
+        recordingPath: staged.reference,
         ...(durationMs > 0 ? { durationMs } : {}),
       },
     });
 
     if (persisted.count === 0) {
+      await rollbackStagedArtifact(session, staged);
       return NextResponse.json(
         { error: 'Cannot overwrite recording of a finalized session' },
         { status: 409 }
       );
     }
+    const stored = await finalizeStagedArtifactPublish(session, staged);
     await invalidateSessionsApiCache(user.id);
     await deleteRecordingDraft(session).catch(() => undefined);
 
@@ -191,19 +215,98 @@ export async function GET(
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
+  const range = req.headers.get('range');
+
   try {
+    // P2-2：先解析录音物理位置，按 Cloudreve/本地分别流式读取，不再一次性 loadSessionAudioArtifact
+    // 把整段录音读进内存再 subarray（长录音 + 并发 Range 会放大进程内存直至 OOM）。
+    const location = await resolveSessionAudioLocation(session);
+
+    // Cloudreve 远程：透传上游 range/stream，失败落到下方本地/缓冲回退。
+    if (location?.kind === 'cloudreve') {
+      try {
+        const storage = await CloudreveStorage.create();
+        const upstream = await storage.openDownloadStream(location.remotePath, {
+          expectedUserId: location.userId,
+          range,
+        });
+        const headers = new Headers({
+          'Content-Type': location.contentType,
+          'Accept-Ranges': 'bytes',
+        });
+        for (const name of ['content-length', 'content-range']) {
+          const value = upstream.headers.get(name);
+          if (value) {
+            headers.set(name, value);
+          }
+        }
+        return new Response(upstream.body, {
+          status: upstream.status === 206 ? 206 : 200,
+          headers,
+        });
+      } catch (streamError) {
+        console.error(
+          'Audio stream error, falling back to buffered load:',
+          streamError
+        );
+      }
+    }
+
+    // 本地文件：按 [start,end] 用 createReadStream 流式读，不整包入内存。
+    if (location?.kind === 'local') {
+      const totalSize = location.size;
+      if (range) {
+        const match = range.match(/bytes=(\d+)-(\d*)/);
+        if (match) {
+          const start = parseInt(match[1], 10);
+          const rawEnd = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+          const end = Math.min(rawEnd, totalSize - 1);
+          if (
+            Number.isNaN(start) ||
+            Number.isNaN(end) ||
+            start < 0 ||
+            end < start ||
+            start >= totalSize
+          ) {
+            return new Response(null, {
+              status: 416,
+              headers: { 'Content-Range': `bytes */${totalSize}` },
+            });
+          }
+
+          return new Response(
+            openLocalAudioRangeStream(location.filePath, { start, end }),
+            {
+              status: 206,
+              headers: {
+                'Content-Type': location.contentType,
+                'Content-Range': `bytes ${start}-${end}/${totalSize}`,
+                'Content-Length': String(end - start + 1),
+                'Accept-Ranges': 'bytes',
+              },
+            }
+          );
+        }
+      }
+
+      return new Response(openLocalAudioRangeStream(location.filePath), {
+        headers: {
+          'Content-Type': location.contentType,
+          'Content-Length': String(totalSize),
+          'Accept-Ranges': 'bytes',
+        },
+      });
+    }
+
+    // 回退：Cloudreve 流式失败或无法定位物理文件时，退回缓冲读取（含旧候选文件回退语义）。
     const artifact = await loadSessionAudioArtifact(session);
     if (!artifact) {
-      return NextResponse.json(
-        { error: 'Audio not found' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'Audio not found' }, { status: 404 });
     }
 
     const data = artifact.data;
     const totalSize = data.length;
 
-    const range = req.headers.get('range');
     if (range) {
       const match = range.match(/bytes=(\d+)-(\d*)/);
       if (match) {

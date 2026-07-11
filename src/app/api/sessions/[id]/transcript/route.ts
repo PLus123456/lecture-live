@@ -14,7 +14,9 @@ import { validatePersistedTranscriptBundle } from '@/lib/sessionApi';
 import {
   extractTranscriptText,
   loadSessionTranscriptBundle,
-  persistSessionTranscriptArtifacts,
+  stageSessionTranscriptArtifacts,
+  finalizeStagedArtifactPublish,
+  rollbackStagedArtifact,
 } from '@/lib/sessionPersistence';
 import {
   deleteTranscriptDraft,
@@ -97,7 +99,8 @@ export async function POST(
       );
     }
 
-    const stored = await persistSessionTranscriptArtifacts(session, bundle);
+    // P0-6：先写版本化临时对象；DB CAS 成功后才发布，失败回滚删临时对象、绝不覆盖终态转录。
+    const staged = await stageSessionTranscriptArtifacts(session, bundle);
     const fullTranscript = extractTranscriptText(bundle);
     const folderIds = session.folders.map((entry) => entry.folderId);
 
@@ -118,13 +121,32 @@ export async function POST(
       })
     );
 
-    await prisma.session.update({
-      where: { id: id },
+    // G2：原子条件更新，仅在会话仍非终态时写入 transcriptPath/summaryPath。旧代码裸 update
+    // ({where:{id}}) 会在并发 finalize 已把会话推到 COMPLETED 后仍把转录写回，覆盖终态产物。
+    const persisted = await prisma.session.updateMany({
+      where: {
+        id: id,
+        status: { notIn: ['COMPLETED', 'ARCHIVED'] },
+      },
       data: {
-        transcriptPath: stored.transcript.path,
-        summaryPath: stored.summary.path,
+        transcriptPath: staged.transcript.reference,
+        summaryPath: staged.summary.reference,
       },
     });
+    if (persisted.count === 0) {
+      await Promise.all([
+        rollbackStagedArtifact(session, staged.transcript),
+        rollbackStagedArtifact(session, staged.summary),
+      ]);
+      return NextResponse.json(
+        { error: 'Cannot overwrite transcript of a finalized session' },
+        { status: 409 }
+      );
+    }
+    const stored = {
+      transcript: await finalizeStagedArtifactPublish(session, staged.transcript),
+      summary: await finalizeStagedArtifactPublish(session, staged.summary),
+    };
     await Promise.all([
       invalidateSessionsApiCache(user.id),
       invalidateFoldersApiCache(user.id),

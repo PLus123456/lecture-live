@@ -276,6 +276,8 @@ export default {
       failed: 'Failed to finalize session',
       staleCompleted:
         'This recording was already ended on the server (it may have been reclaimed after a long pause), so anything recorded afterward was not saved to the original session. Your local recording has been kept — please export it or contact an administrator to recover it.',
+      audioIncomplete:
+        'Some audio has not finished uploading to the server (network drop or rate limiting). Finalizing was paused to avoid losing the tail of your recording. Once your connection recovers, tap "Retry Save" to finalize again — your local recording is kept intact.',
     },
     status: {
       error: 'Error',
@@ -318,6 +320,8 @@ export default {
       resumeTitle: 'Resume Recording',
       retrySave: 'Retry Save',
       retrySaveTitle: 'Retry Saving Recording',
+      reconnect: 'Reconnect',
+      reconnectTitle: 'Reconnect live transcription (recording keeps saving)',
       stopTitle: 'Stop Recording',
       exportTitle: 'Export Transcript',
       pip: 'PiP',

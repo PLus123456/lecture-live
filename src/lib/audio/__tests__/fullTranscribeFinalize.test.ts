@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * finalizeFullTranscription 回归测试。
- * 覆盖：正常收尾(落 fullTranscriptPath + 扣费一次 + 不覆写实时转录)、claim 失败(不扣费)、
- * finalize 守卫失败(收尾期间被取消：不扣费、清 Soniox)。
+ *
+ * P1-12（不对称修复）：完整版补全转录的扣费=**入口持有的预留**，finalize **不再二次 deduct**。
+ * 本测试锁死「finalize 绝不再 increment 转录分钟」这一新口径（旧代码在预留之上再 deduct = 双扣）。
+ * P1-17：清 Soniox 资源改为**先删 transcription 再删 file**，且**只有确认删除(2xx/404)才清 DB 外部 ID**。
+ * P1-19：finalize 守卫抢不到时，**只有确认会话确实 canceled** 才删 Soniox；否则保留（转录仍需要）。
  */
 const {
   sessionUpdateManyMock,
@@ -31,7 +34,6 @@ const {
   persistArtifactMock: vi.fn(),
 }));
 
-// 阶段C：落盘走 sessionPersistence 的 persistArtifact（'full-transcripts' category）。
 vi.mock('@/lib/sessionPersistence', () => ({
   persistArtifact: persistArtifactMock,
   readArtifactFromReference: vi.fn(),
@@ -84,8 +86,9 @@ beforeEach(() => {
   transactionMock.mockImplementation(
     async (run: (tx: unknown) => Promise<unknown>) => run({})
   );
-  deleteFileMock.mockResolvedValue(undefined);
-  deleteTranscriptionMock.mockResolvedValue(undefined);
+  // P1-17：delete 帮助函数返回「是否确认删除」，默认确认成功。
+  deleteFileMock.mockResolvedValue(true);
+  deleteTranscriptionMock.mockResolvedValue(true);
   persistArtifactMock.mockResolvedValue({
     path: 'local:full-transcripts/sess-full.json',
     storage: 'local',
@@ -93,21 +96,13 @@ beforeEach(() => {
 });
 
 describe('finalizeFullTranscription', () => {
-  it('正常收尾：落 fullTranscriptPath、扣费恰好一次(ceil(3×0.8)=3)、且绝不覆写实时转录', async () => {
-    // claim(transcribing→finalizing) count=1；finalize(finalizing→completed) count=1
+  it('正常收尾：落 fullTranscriptPath、且 P1-12 绝不再 deduct（扣费=入口预留）、不覆写实时转录', async () => {
     sessionUpdateManyMock.mockResolvedValue({ count: 1 });
 
     const result = await finalizeFullTranscription(session as never, sonioxConfig);
 
     expect(result.outcome).toBe('completed');
-
-    // 阶段C：落盘走 sessionPersistence.persistArtifact('full-transcripts')，传 session（含 userId）
     expect(persistArtifactMock).toHaveBeenCalledTimes(1);
-    expect(persistArtifactMock).toHaveBeenCalledWith(
-      session,
-      'full-transcripts',
-      expect.any(String)
-    );
 
     // 扣费恰好一次，口径 = ceil(getBillableMinutes(125000)=3 × 0.8=2.4 → ceil 3)。R4：在事务内带 tx 调用。
     expect(deductMock).toHaveBeenCalledTimes(1);
@@ -116,18 +111,50 @@ describe('finalizeFullTranscription', () => {
     expect(settleFullMock).toHaveBeenCalledTimes(1);
     expect(settleFullMock).toHaveBeenCalledWith('sess-full', expect.anything());
 
-    // 关键：finalize 的 updateMany 只写 full* 字段，绝不含 transcriptPath / status / recordingPath
+    // finalize 的 updateMany 只写 full* 字段，绝不含 transcriptPath / status / recordingPath
     const finalizeCall = sessionUpdateManyMock.mock.calls[1][0];
     expect(finalizeCall.data.fullTranscribeStatus).toBe('completed');
     expect(finalizeCall.data.fullTranscriptPath).toBeTruthy();
     expect(finalizeCall.data).not.toHaveProperty('transcriptPath');
     expect(finalizeCall.data).not.toHaveProperty('status');
-    expect(finalizeCall.data).not.toHaveProperty('recordingPath');
-    expect(finalizeCall.data).not.toHaveProperty('summaryPath');
+    // P1-17：CAS 提交里**不再**预清 Soniox 外部 ID（改到确认删除后再清）。
+    expect(finalizeCall.data).not.toHaveProperty('fullSonioxFileId');
+    expect(finalizeCall.data).not.toHaveProperty('fullSonioxTranscriptionId');
   });
 
-  it('claim 失败(非 transcribing / 并发抢先)：不拉 transcript、不落盘、不扣费', async () => {
-    sessionUpdateManyMock.mockResolvedValueOnce({ count: 0 }); // claim 抢不到
+  it('P1-17：成功收尾先删 transcription 再删 file，确认删除后才清对应 DB 外部 ID', async () => {
+    sessionUpdateManyMock.mockResolvedValue({ count: 1 });
+
+    await finalizeFullTranscription(session as never, sonioxConfig);
+
+    // 删除顺序：transcription 先于 file
+    const txOrder = deleteTranscriptionMock.mock.invocationCallOrder[0];
+    const fileOrder = deleteFileMock.mock.invocationCallOrder[0];
+    expect(txOrder).toBeLessThan(fileOrder);
+
+    // 确认删除后清 ID：第 3 次 updateMany（claim / finalize / clear）清两个 ID。
+    const clearCall = sessionUpdateManyMock.mock.calls[2][0];
+    expect(clearCall.data).toMatchObject({
+      fullSonioxTranscriptionId: null,
+      fullSonioxFileId: null,
+    });
+  });
+
+  it('P1-17：删除未确认（返回 false）→ 不清对应 DB 外部 ID，留待兜底重试', async () => {
+    sessionUpdateManyMock.mockResolvedValue({ count: 1 });
+    deleteTranscriptionMock.mockResolvedValue(false); // 删 transcription 未确认
+    deleteFileMock.mockResolvedValue(true); // 删 file 确认
+
+    await finalizeFullTranscription(session as never, sonioxConfig);
+
+    const clearCall = sessionUpdateManyMock.mock.calls[2][0];
+    // 只清确认删除的 file ID；未确认的 transcription ID 保留（不出现在 data 里）。
+    expect(clearCall.data).toHaveProperty('fullSonioxFileId', null);
+    expect(clearCall.data).not.toHaveProperty('fullSonioxTranscriptionId');
+  });
+
+  it('claim 失败(并发抢先)：不拉 transcript、不落盘、不扣费', async () => {
+    sessionUpdateManyMock.mockResolvedValueOnce({ count: 0 });
 
     const result = await finalizeFullTranscription(session as never, sonioxConfig);
 
@@ -141,7 +168,8 @@ describe('finalizeFullTranscription', () => {
   it('finalize 守卫失败(收尾期间状态被改)：不扣费，且**绝不删 Soniox 资源**(留待重新 salvage)', async () => {
     sessionUpdateManyMock
       .mockResolvedValueOnce({ count: 1 }) // claim 成功
-      .mockResolvedValueOnce({ count: 0 }); // finalize 守卫抢不到（状态已非 finalizing）
+      .mockResolvedValueOnce({ count: 0 }); // finalize 守卫抢不到
+    // 完整版补全转录无「用户取消」路径，故守卫抢不到时**一律不删** Soniox（比 async 更保守）。
 
     const result = await finalizeFullTranscription(session as never, sonioxConfig);
 
@@ -161,6 +189,7 @@ describe('finalizeFullTranscription', () => {
     sessionUpdateManyMock
       .mockResolvedValueOnce({ count: 1 }) // A: claim 成功
       .mockResolvedValueOnce({ count: 1 }) // A: finalize 守卫成功
+      .mockResolvedValueOnce({ count: 1 }) // A: P1-17 确认删除 Soniox 后清外部 ID
       .mockResolvedValueOnce({ count: 0 }); // B: claim 抢不到（A 已在收尾/已完成）
 
     const a = await finalizeFullTranscription(session as never, sonioxConfig);

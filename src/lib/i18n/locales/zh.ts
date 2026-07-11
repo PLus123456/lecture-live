@@ -264,6 +264,7 @@ export default {
       missingToken: '认证令牌缺失',
       failed: '保存失败',
       staleCompleted: '本场录音已在服务器结束（可能因长时间暂停被系统回收），之后录制的内容未能保存到原会话。本地录音已保留，请导出留存或联系管理员恢复。',
+      audioIncomplete: '部分音频尚未完整上传到服务器（网络中断或限流），已暂停收尾以避免丢失结尾片段。请在网络恢复后点击「重试保存」重新收尾，本地录音已完整保留。',
     },
     status: {
       error: '错误',
@@ -304,6 +305,8 @@ export default {
       resumeTitle: '继续录制',
       retrySave: '重试保存',
       retrySaveTitle: '重试保存录制内容',
+      reconnect: '重新连接',
+      reconnectTitle: '重新连接实时转录（录音继续保存）',
       stopTitle: '停止录制',
       exportTitle: '导出转录内容',
       pip: '画中画',

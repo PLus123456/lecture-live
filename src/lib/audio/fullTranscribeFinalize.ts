@@ -159,15 +159,15 @@ export async function finalizeFullTranscription(
   // session 含 userId，Cloudreve 已配置时按 userId 归属上传远程。
   const fullPath = await persistFullTranscript(session, bundle);
 
-  // finalize 守卫：finalizing → completed，抢不到（收尾期间被取消/重置）则不扣费。
+  // finalize 守卫：finalizing → completed，抢不到（收尾期间被取消/重置）则不落地。
+  // P1-17：**不再**在此清空 fullSonioxFileId/fullSonioxTranscriptionId —— 改到确认 Soniox DELETE 成功
+  // （2xx/404）之后才清（见下方）。此前在 CAS 提交里就清了 ID，删失败即永久失去重试依据、资源孤儿。
   const finalized = await prisma.session.updateMany({
     where: { id: session.id, fullTranscribeStatus: 'finalizing' },
     data: {
       fullTranscribeStatus: 'completed',
       fullTranscriptPath: fullPath,
-      fullSonioxFileId: null,
-      fullSonioxTranscriptionId: null,
-      // B7：置扣费时刻（完整版补全的额外扣费紧随其后）。多笔扣费时为最后一笔(last-write)，同周期常态无碍。
+      // B7：置扣费时刻（仅记账时刻）。R4 下真正实扣在下方同一事务里 deduct + settleFullReservation。
       billedAt: new Date(),
     },
   });
@@ -211,11 +211,25 @@ export async function finalizeFullTranscription(
     );
   }
 
-  // 清 Soniox 资源（幂等，失败不抛）
-  if (session.fullSonioxFileId) {
-    await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(() => undefined);
+  // ── 清 Soniox 资源（P1-17：先删 transcription 再删 file；确认删除成功/404 才清 DB 外部 ID）──
+  // 确认删除才清 ID → 删失败保留 ID，交 cron 兜底重扫（reclaimOrphanSonioxResources）重试，绝不永久孤儿。
+  const txDeleted = await deleteSonioxTranscription(sonioxConfig, transcriptionId).catch(
+    () => false
+  );
+  const fileDeleted = session.fullSonioxFileId
+    ? await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(() => false)
+    : true;
+  if (txDeleted || fileDeleted) {
+    await prisma.session
+      .updateMany({
+        where: { id: session.id },
+        data: {
+          ...(txDeleted ? { fullSonioxTranscriptionId: null } : {}),
+          ...(fileDeleted ? { fullSonioxFileId: null } : {}),
+        },
+      })
+      .catch(() => undefined);
   }
-  await deleteSonioxTranscription(sonioxConfig, transcriptionId).catch(() => undefined);
 
   return { outcome: 'completed', fullTranscriptPath: fullPath, segmentCount: segments.length };
 }

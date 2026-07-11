@@ -20,7 +20,7 @@ import { summaryBlocksToResponses } from '@/lib/summary';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useAuthStore } from '@/stores/authStore';
 import { useTranscriptStore } from '@/stores/transcriptStore';
-import { isActivelyRecording } from '@/lib/session/recordingLifecycle';
+import { shouldPlaybackYieldToLiveStore } from '@/lib/session/recordingLifecycle';
 import { useSummaryStore } from '@/stores/summaryStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import {
@@ -517,9 +517,16 @@ export default function PlaybackPage() {
 
   // Sync to stores (for ChatTab / ExportModal)
   useEffect(() => {
-    // 正在录音时让位：绝不清空、也绝不把回放页的历史 segments 灌进全局实时 store，
-    // 否则会抹掉/污染正在进行的录音（含刷新恢复所依赖的 sessionStorage 快照）——审计 high。
-    if (isActivelyRecording(useTranscriptStore.getState().recordingState)) {
+    // 活跃录音上下文（recording/paused/finalizing）时让位：绝不清空、也绝不把回放页的历史
+    // segments 灌进全局实时 store，否则会抹掉/污染正在进行的录音（含刷新恢复所依赖的
+    // sessionStorage 快照，及尚未上传的最后一片音频）——审计 P1-8。按 sessionId 隔离。
+    if (
+      shouldPlaybackYieldToLiveStore(
+        useTranscriptStore.getState().activeSessionId,
+        sessionId,
+        useTranscriptStore.getState().recordingState
+      )
+    ) {
       return;
     }
 
@@ -536,7 +543,13 @@ export default function PlaybackPage() {
     summaries.forEach((summary) => addSummaryBlock(summary));
 
     return () => {
-      if (isActivelyRecording(useTranscriptStore.getState().recordingState)) {
+      if (
+        shouldPlaybackYieldToLiveStore(
+          useTranscriptStore.getState().activeSessionId,
+          sessionId,
+          useTranscriptStore.getState().recordingState
+        )
+      ) {
         return;
       }
       clearTranscript();
@@ -544,6 +557,7 @@ export default function PlaybackPage() {
       clearTranslations();
     };
   }, [
+    sessionId,
     segments,
     summaries,
     addFinalSegment,

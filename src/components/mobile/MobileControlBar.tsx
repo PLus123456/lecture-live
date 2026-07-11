@@ -24,6 +24,9 @@ interface MobileControlBarProps {
   onStop: () => void;
   onRetry: () => void;
   onViewPlayback: () => void;
+  // P1-4：录音中连接错误时的「重新连接」操作。归档继续采集，仅重建实时转录连接。
+  // 由上层（MobileSessionLayout → page）透传 useSoniox 的 reconnect；未提供时按钮不渲染。
+  onReconnect?: () => void;
 }
 
 function formatDuration(ms: number) {
@@ -103,6 +106,7 @@ export default function MobileControlBar({
   onStop,
   onRetry,
   onViewPlayback,
+  onReconnect,
 }: MobileControlBarProps) {
   const { t } = useI18n();
   const isRecording = recordingState === 'recording';
@@ -170,6 +174,15 @@ export default function MobileControlBar({
               onClick={onStart}
               variant="primary"
               disabled={showUnavailable}
+            />
+          ) : null}
+
+          {isRecording && connectionState === 'error' && onReconnect ? (
+            <ControlButton
+              label={t('session.actions.reconnect')}
+              icon={<RefreshCw className="h-4 w-4" />}
+              onClick={onReconnect}
+              variant="primary"
             />
           ) : null}
 

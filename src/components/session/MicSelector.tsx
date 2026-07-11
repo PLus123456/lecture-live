@@ -16,22 +16,39 @@ export default function MicSelector({
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
-    navigator.mediaDevices.enumerateDevices()
-      .then((devices) => {
-        const mics = normalizeMicrophoneDevices(devices, {
-          fallbackDeviceId: currentMicDeviceId,
+    let cancelled = false;
+
+    const refreshDevices = () => {
+      navigator.mediaDevices.enumerateDevices()
+        .then((devices) => {
+          if (cancelled) return;
+          const mics = normalizeMicrophoneDevices(devices, {
+            fallbackDeviceId: currentMicDeviceId,
+          });
+          setAvailableMics(mics);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setAvailableMics(
+            currentMicDeviceId
+              ? normalizeMicrophoneDevices([], {
+                  fallbackDeviceId: currentMicDeviceId,
+                })
+              : []
+          );
         });
-        setAvailableMics(mics);
-      })
-      .catch(() => {
-        setAvailableMics(
-          currentMicDeviceId
-            ? normalizeMicrophoneDevices([], {
-                fallbackDeviceId: currentMicDeviceId,
-              })
-            : []
-        );
-      });
+    };
+
+    refreshDevices();
+
+    // 设备插拔（麦克风拔出/接入）时重新枚举，使列表实时反映硬件变化，而不是停留在
+    // 挂载时的旧快照（P1-10）。
+    const mediaDevices = navigator.mediaDevices;
+    mediaDevices.addEventListener?.('devicechange', refreshDevices);
+    return () => {
+      cancelled = true;
+      mediaDevices.removeEventListener?.('devicechange', refreshDevices);
+    };
   }, [currentMicDeviceId, setAvailableMics]);
 
   const currentLabel =

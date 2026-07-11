@@ -11,6 +11,7 @@ const {
   reserveTranscriptionMinutesMock,
   releaseTranscriptionMinutesMock,
   settleAsyncReservationMock,
+  reserveStorageMinutesMock,
   initAsyncUploadMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
@@ -23,6 +24,7 @@ const {
   reserveTranscriptionMinutesMock: vi.fn(),
   releaseTranscriptionMinutesMock: vi.fn(),
   settleAsyncReservationMock: vi.fn(),
+  reserveStorageMinutesMock: vi.fn(),
   initAsyncUploadMock: vi.fn(),
 }));
 
@@ -44,6 +46,7 @@ vi.mock('@/lib/quota', () => ({
   reserveTranscriptionMinutes: reserveTranscriptionMinutesMock,
   releaseTranscriptionMinutes: releaseTranscriptionMinutesMock,
   settleAsyncReservation: settleAsyncReservationMock,
+  reserveStorageMinutes: reserveStorageMinutesMock,
 }));
 
 vi.mock('@/lib/audio/asyncUploadChunkPersistence', () => ({
@@ -95,7 +98,10 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
     reserveTranscriptionMinutesMock.mockReset();
     releaseTranscriptionMinutesMock.mockReset();
     settleAsyncReservationMock.mockReset();
+    reserveStorageMinutesMock.mockReset();
     initAsyncUploadMock.mockReset();
+    // P1-13：默认存储门禁放行（个别用例覆盖为超限）。
+    reserveStorageMinutesMock.mockResolvedValue({ ok: true, remaining: 999 });
 
     verifyAuthMock.mockResolvedValue({ id: 'user-1', role: 'FREE' });
     enforceRateLimitMock.mockResolvedValue(null);
@@ -252,6 +258,42 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
     expect(initAsyncUploadMock).not.toHaveBeenCalled();
     // 撤销本次预留（reserve 已发生）：release 一次，30 分钟
     expect(releaseTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 30);
+  });
+
+  it('P0-6：会话已收尾(COMPLETED)→409 session_finalized，绝不预留/建 manifest（防覆盖最终录音）', async () => {
+    sessionFindUniqueMock.mockResolvedValueOnce({
+      id: 's-1',
+      userId: 'user-1',
+      status: 'COMPLETED',
+      asyncTranscribeStatus: null,
+      asyncReservedMinutes: 0,
+    });
+
+    const res = await POST(makeReq(validBody()), { params });
+
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { code?: string };
+    expect(json.code).toBe('session_finalized');
+    // 终态即拒：在任何配额预留 / claim / 写盘之前短路，绝不触发 async 产物写盘覆盖 recordingPath。
+    expect(reserveStorageMinutesMock).not.toHaveBeenCalled();
+    expect(reserveTranscriptionMinutesMock).not.toHaveBeenCalled();
+    expect(transactionMock).not.toHaveBeenCalled();
+    expect(initAsyncUploadMock).not.toHaveBeenCalled();
+  });
+
+  it('P0-6：会话已归档(ARCHIVED)同样 409 拒绝', async () => {
+    sessionFindUniqueMock.mockResolvedValueOnce({
+      id: 's-1',
+      userId: 'user-1',
+      status: 'ARCHIVED',
+      asyncTranscribeStatus: null,
+      asyncReservedMinutes: 0,
+    });
+
+    const res = await POST(makeReq(validBody()), { params });
+
+    expect(res.status).toBe(409);
+    expect(initAsyncUploadMock).not.toHaveBeenCalled();
   });
 
   it('未授权 → 401，不触碰配额', async () => {

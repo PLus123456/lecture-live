@@ -113,7 +113,9 @@ export async function POST(
     );
   }
 
-  // 校验大小：非末片必须 = chunkSize；末片可以更小但不能超过 MAX_CHUNK_BYTES
+  // 校验大小（P1-15）：每片长度必须与声明布局精确一致，不能只判上界。
+  // 非末片 = chunkSize；末片 = originalSize 的余数（= originalSize-(totalChunks-1)*chunkSize，
+  // 落在 [1, chunkSize]）。杜绝「声明 1 字节、末片实传 20MB」绕过大小 / 配额估算。
   const isLastChunk = seq === manifest.totalChunks - 1;
   if (file.size <= 0 || file.size > MAX_CHUNK_BYTES) {
     return NextResponse.json(
@@ -121,9 +123,16 @@ export async function POST(
       { status: 400 }
     );
   }
-  if (!isLastChunk && file.size !== manifest.chunkSize) {
+  const expectedLen = isLastChunk
+    ? manifest.originalSize - (manifest.totalChunks - 1) * manifest.chunkSize
+    : manifest.chunkSize;
+  if (file.size !== expectedLen) {
     return NextResponse.json(
-      { error: `Non-final chunk must be exactly ${manifest.chunkSize} bytes` },
+      {
+        error: isLastChunk
+          ? `Final chunk must be exactly ${expectedLen} bytes`
+          : `Non-final chunk must be exactly ${manifest.chunkSize} bytes`,
+      },
       { status: 400 }
     );
   }

@@ -514,6 +514,76 @@ export async function reconcileStorageBytes(): Promise<{
   return { checked: users.length, corrected };
 }
 
+/**
+ * 契约6（P1-13）—— 录音存储小时（storageHoursLimit）的强约束原语。async-upload init /
+ * full-transcribe 入口（本 BACKEND track）与录音入口（ROUTES track：audio POST / draft 首次 /
+ * finalize 结算）**按同名同签**调用这三个函数，保证两边口径一致。
+ *
+ * 存储口径：storageHoursUsed 列是死维度（从不 increment），真实占用由 SUM(session.durationMs)/
+ * 3600000 实时算（getStorageHoursUsed）。删录音即删 Session 行、占用自动回落。于是「存储小时」天然
+ * 由 durationMs 这一**确定性台账**承载——settle 即调用方把真实 durationMs 落到 session（本就会做），
+ * release 即删 session（本就会做）。因此在**不改 schema** 的前提下无须新增独立预留列。
+ *
+ * 代价（契约6 明示允许的「非原子降级」）：没有独立预留列 → reserve 是**读时校验**（读当前 SUM 占用
+ * + 本次预估，判 <= limit），非完全原子。并发多个入口可能同时通过读检查、叠加后轻微超限；但存储小时
+ * 是累计成本护栏（非硬性安全边界），下一次入口/对账会读到真实占用而收敛，危害可接受。
+ */
+
+/**
+ * 读时校验预留存储分钟。超限返回 ok:false（**不抛**）。
+ *
+ * @param sessionId 保留在签名里以对齐契约6 固定签名、便于将来升级为持久 per-session 预留；当前降级实现
+ *   不按 session 落预留，仅按用户维度读时校验。
+ * @param estimatedMinutes 本次将新增占用的录音分钟（async 上传按声明时长投影；realtime 录音入口按预估）。
+ * @returns { ok, remaining } remaining 为当前剩余可用分钟（floor）。
+ */
+export async function reserveStorageMinutes(
+  userId: string,
+  sessionId: string,
+  estimatedMinutes: number
+): Promise<{ ok: boolean; remaining: number }> {
+  void sessionId; // 降级实现未按 session 持久化预留（见上方注释）；保留形参以对齐契约6 签名
+  const user = await getQuotaSnapshot(userId);
+  if (!user) {
+    return { ok: false, remaining: 0 };
+  }
+  if (user.role === 'ADMIN') {
+    return { ok: true, remaining: ADMIN_UNLIMITED_MINUTES };
+  }
+
+  const limitHours = user.storageHoursLimit;
+  const usedHours = await getStorageHoursUsed(userId);
+  const estMinutes = normalizeNonNegativeAmount(estimatedMinutes);
+  const estHours = estMinutes / 60;
+  const remainingMinutes = Math.max(0, Math.floor((limitHours - usedHours) * 60));
+  // 读时校验：当前真实占用 + 本次预估 <= 上限才放行。
+  const ok = usedHours + estHours <= limitHours;
+  return { ok, remaining: remainingMinutes };
+}
+
+/**
+ * 结算一笔存储预留（契约6）。SUM(durationMs) 口径下，调用方把真实 durationMs 落到 session 本身
+ * 即为结算——SUM 会自动反映真实占用。故此处为**有意的 no-op**（保留 API 以对齐契约6 签名、并给
+ * 将来升级为持久预留列留接缝）。参数仅作审计语义，不落库。
+ */
+export async function settleStorageMinutes(
+  sessionId: string,
+  actualMinutes: number
+): Promise<void> {
+  void sessionId;
+  void actualMinutes;
+  // SUM(durationMs) 模型下，durationMs 的写入（调用方负责）即结算，无独立预留列可清。
+}
+
+/**
+ * 释放一笔未落地的存储预留（契约6）。SUM(durationMs) 口径下，删 Session 行即释放占用；未写
+ * durationMs 的失败入口天然不计入 SUM。故此处为**有意的 no-op**（保留 API 以对齐契约6 签名）。
+ */
+export async function releaseStorageMinutes(sessionId: string): Promise<void> {
+  void sessionId;
+  // SUM(durationMs) 模型下，删 session / 未写 durationMs 即释放，无独立预留列可清。
+}
+
 export function isModelAllowed(
   user: { allowedModels: string; role: string },
   modelName: string

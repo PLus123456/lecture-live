@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { checkQuota } from '@/lib/quota';
 import { createInterpretAnchor } from '@/lib/interpret/anchor';
+import { createInterpretSession } from '@/lib/interpret/session';
 
 /**
  * POST /api/interpret/start
@@ -20,5 +21,8 @@ export async function POST(req: Request) {
   }
 
   const anchorId = await createInterpretAnchor(payload.id, Date.now());
+  // B3：落一行服务端持久化会话（settledAt=null）。若客户端始终不调 /deduct，cron 会按服务端墙钟
+  // 兜底扣费；deduct 正常结算时会原子认领它。best-effort：建行失败退化到旧行为（纯靠 deduct）。
+  await createInterpretSession(payload.id, anchorId);
   return NextResponse.json({ anchorId });
 }

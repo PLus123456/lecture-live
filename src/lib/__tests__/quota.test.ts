@@ -949,3 +949,41 @@ describe('reconcileTranscriptionUsage — 计入完整版补全转录（B6）', 
     expect(result).toEqual([]);
   });
 });
+
+describe('reconcileTranscriptionUsage — 按扣费时刻 billedAt 归期（B7）', () => {
+  beforeEach(() => {
+    userFindManyMock.mockReset();
+    sessionFindManyMock.mockReset();
+    interpretUsageAggregateMock.mockReset();
+  });
+
+  it('session 窗口按 billedAt 截断（billedAt 为空回退 createdAt）', async () => {
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-b7',
+        email: 'b7@x.com',
+        transcriptionMinutesUsed: 0,
+        quotaResetAt: futureReset,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([]);
+    interpretUsageAggregateMock.mockResolvedValueOnce({ _sum: { billedMinutes: null } });
+
+    await reconcileTranscriptionUsage();
+
+    // cycleStart = getQuotaCycleStartAt mock = 2026-01-01
+    const cycleStart = new Date('2026-01-01T00:00:00.000Z');
+    expect(sessionFindManyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          userId: 'u-b7',
+          status: 'COMPLETED',
+          OR: [
+            { billedAt: { gte: cycleStart } },
+            { billedAt: null, createdAt: { gte: cycleStart } },
+          ],
+        }),
+      })
+    );
+  });
+});

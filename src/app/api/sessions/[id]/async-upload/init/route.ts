@@ -14,6 +14,7 @@ import {
   reserveTranscriptionMinutes,
   releaseTranscriptionMinutes,
   settleAsyncReservation,
+  reserveStorageMinutes,
 } from '@/lib/quota';
 import { getBillableMinutes } from '@/lib/billing';
 import { initAsyncUpload } from '@/lib/audio/asyncUploadChunkPersistence';
@@ -82,6 +83,21 @@ export async function POST(
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
+  // P0-6：async 上传管线的产物写盘会**覆盖** session.recordingPath（asyncUploadProcessor 第 4 步
+  // persistSessionAudioArtifact → setStatus 落 recordingPath），故绝不能跑在已收尾的会话上——否则
+  // 会把已 COMPLETED/ARCHIVED 会话的最终录音覆盖/删除（固定 key 写盘直接冲掉原文件）。入口即拒终态
+  // 会话，机器可读 code 便于前端分支。（更深的加固——asyncUploadProcessor 侧 staging+CAS 写产物——
+  // 见 handoffs 延后；此状态门禁已堵住主要的录音损坏路径。）
+  if (session.status === 'COMPLETED' || session.status === 'ARCHIVED') {
+    return NextResponse.json(
+      {
+        error: 'Cannot start async upload on a finalized session',
+        code: 'session_finalized',
+      },
+      { status: 409 }
+    );
+  }
+
   let body: {
     originalFileName?: unknown;
     originalMimeType?: unknown;
@@ -89,6 +105,7 @@ export async function POST(
     totalChunks?: unknown;
     chunkSize?: unknown;
     estimatedDurationMs?: unknown;
+    expectedSha256?: unknown;
   };
   try {
     body = await req.json();
@@ -144,6 +161,10 @@ export async function POST(
     );
   }
 
+  // 前端可选声明的整文件 sha256（十六进制 64 位）。merge 时复算比对（P1-15）；格式不符则忽略。
+  const rawHash = typeof body.expectedSha256 === 'string' ? body.expectedSha256.trim().toLowerCase() : '';
+  const expectedSha256 = /^[a-f0-9]{64}$/.test(rawHash) ? rawHash : null;
+
   // 前端可选声明的媒体时长（拿不到时为 null，回落按文件大小粗估）。
   const rawDuration = Number(body.estimatedDurationMs);
   const estimatedDurationMs =
@@ -164,6 +185,18 @@ export async function POST(
   // 记入 session.asyncReservedMinutes（同时已计入 transcriptionMinutesUsed）；finalize 时把预留
   // 「转」为实扣（release 预留 + deduct 实际），cancel/删会话 inline 释放、其余终态由 cron 兜底。
   // 这样多个在途上传各自持有预留、真正叠加占额，杜绝超额准入。
+  // P1-13（契约6）：存储小时门禁。此前 async 上传入口只判转录分钟、完全不判 storageHoursLimit，
+  // 用户可借上传无限累积录音时长。这里按声明时长投影出的分钟做读时存储校验：超限直接拒，绝不进入
+  // 转录预留 / 建 manifest。storageHoursUsed 走 SUM(session.durationMs)——本次上传的 durationMs 尚未
+  // 写入（转码后才落库），故不会自我双计。降级为读时校验（非原子），并发轻微超限由后续入口/对账收敛。
+  const storage = await reserveStorageMinutes(user.id, id, estimatedMinutes);
+  if (!storage.ok) {
+    return NextResponse.json(
+      { error: 'Storage quota exceeded', remainingMinutes: storage.remaining },
+      { status: 403 }
+    );
+  }
+
   const reserved = await reserveTranscriptionMinutes(user.id, estimatedMinutes);
   if (!reserved) {
     return NextResponse.json({ error: 'Quota exceeded' }, { status: 403 });
@@ -249,6 +282,7 @@ export async function POST(
       originalSize,
       totalChunks,
       chunkSize,
+      expectedSha256,
     });
 
     return NextResponse.json({

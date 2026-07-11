@@ -20,9 +20,16 @@ import {
   loadAsyncUploadManifest,
   mergeAsyncUploadChunks,
 } from '@/lib/audio/asyncUploadChunkPersistence';
-import { probeDurationSec, transcodeToMp3 } from '@/lib/audio/ffmpegTranscode';
-import { persistSessionAudioArtifact } from '@/lib/sessionPersistence';
-import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
+import { probeDurationSec, transcodeToMp3, validateMediaContainer } from '@/lib/audio/ffmpegTranscode';
+import {
+  stageSessionAudioArtifact,
+  finalizeStagedArtifactPublish,
+  rollbackStagedArtifact,
+} from '@/lib/sessionPersistence';
+import {
+  resolveAndPersistTaskRegion,
+  resolveSonioxConfigForSessionRegion,
+} from '@/lib/soniox/env';
 import {
   createSonioxTranscription,
   deleteSonioxFile,
@@ -56,38 +63,10 @@ export function getTranscodingProgress(sessionId: string): number {
 }
 
 /**
- * 全局转码并发信号量。ffmpeg 转码是 CPU/内存密集操作，N 个并发上传会派生 N 个 ffmpeg
- * 进程线性放大资源占用，可拖垮整机。这里用进程内计数信号量把同时转码数封顶，超出排队。
- * 单 Next 进程部署足够（与 transcodingProgressMap 同口径）；多进程需换 Redis 分布式信号量。
+ * P1-20：转码并发信号量已下沉到 transcodeToMp3 本身（统一全局闸，见 ffmpegTranscode.ts），
+ * 异步上传与完整版补全共享同一把闸，这里不再单独维护本地信号量（否则双重计数、且完整版路径
+ * 绕过本地闸仍会超并发）。progress map 仍在本文件维护。
  */
-const MAX_CONCURRENT_TRANSCODES = Math.max(
-  1,
-  Number(process.env.MAX_CONCURRENT_TRANSCODES) || 2
-);
-
-let activeTranscodes = 0;
-const transcodeWaiters: Array<() => void> = [];
-
-function acquireTranscodeSlot(): Promise<void> {
-  return new Promise<void>((resolve) => {
-    if (activeTranscodes < MAX_CONCURRENT_TRANSCODES) {
-      activeTranscodes += 1;
-      resolve();
-    } else {
-      transcodeWaiters.push(resolve);
-    }
-  });
-}
-
-function releaseTranscodeSlot(): void {
-  const next = transcodeWaiters.shift();
-  if (next) {
-    // 名额直接转交下一个等待者，activeTranscodes 计数不变。
-    next();
-  } else {
-    activeTranscodes = Math.max(0, activeTranscodes - 1);
-  }
-}
 
 /**
  * 更新 session 状态。
@@ -95,6 +74,12 @@ function releaseTranscodeSlot(): void {
  * 用 updateMany WHERE asyncTranscribeStatus NOT IN ('canceled', 'failed', 'completed')
  * 而不是裸 update —— 一旦 session 已经被用户取消（cancelAsyncUpload 设了 canceled）
  * 或前序步骤标失败，后续 setStatus 不应再把状态打回去。
+ *
+ * P0-6r：`requireActiveSession` 额外要求 session.status 未被独立收尾到终态
+ * （COMPLETED/ARCHIVED）。发布录音产物（写 recordingPath）的那次 CAS 必须带此闸：
+ * async 上传合法地在 RECORDING/PAUSED 时启动，但 transcode 期间会话可能被 /finalize
+ * 独立收尾到 COMPLETED 并写入自己的 recordingPath——此时本管线绝不能再覆写。仅 asyncTranscribeStatus
+ * 闸拦不住（/finalize 不动 asyncTranscribeStatus），故按 session.status 补一道。
  */
 async function setStatus(
   sessionId: string,
@@ -105,12 +90,16 @@ async function setStatus(
     recordingPath: string | null;
     durationMs: number;
     asyncTranscribeError: string | null;
-  }> = {}
+  }> = {},
+  options: { requireActiveSession?: boolean } = {}
 ): Promise<boolean> {
   const result = await prisma.session.updateMany({
     where: {
       id: sessionId,
       asyncTranscribeStatus: { notIn: ['canceled', 'failed', 'completed'] },
+      ...(options.requireActiveSession
+        ? { status: { notIn: ['COMPLETED', 'ARCHIVED'] } }
+        : {}),
     },
     data: {
       asyncTranscribeStatus: status,
@@ -146,7 +135,8 @@ class PipelineHaltError extends Error {
   }
 }
 
-async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
+// 导出供测试直接驱动（fire-and-forget 的 startAsyncUploadProcessing 无法等待完成）。
+export async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
   const session = await prisma.session.findUnique({ where: { id: opts.sessionId } });
   if (!session) throw new Error('Session not found');
 
@@ -163,6 +153,11 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     const merged = await mergeAsyncUploadChunks(session);
     const mergedPath = merged.filePath;
 
+    // ── 1b. 容器安全校验（P1-11）──
+    // 合并出的文件在交给 ffprobe/ffmpeg 前先做魔数 + demuxer 白名单校验，拒 playlist /
+    // 外部引用（m3u8/concat/dash/rtsp…），杜绝伪装媒体触发 SSRF / 任意文件读取。
+    await validateMediaContainer(mergedPath);
+
     // ── 2. probe duration ──
     // 流式录制的 WebM（浏览器 MediaRecorder / OBS 等的产物）容器头不写时长，
     // ffprobe format.duration 为 N/A → probeDurationSec 返回 0。这类文件 ffmpeg
@@ -178,8 +173,7 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     // ── 3. ffmpeg → mp3 ──
     const mp3Path = path.join(path.dirname(mergedPath), 'audio.mp3');
     transcodingProgressMap.set(session.id, 0);
-    // 安全：全局并发信号量，防 N 个并发上传同时派生 N 个 ffmpeg 进程致资源放大。
-    await acquireTranscodeSlot();
+    // 并发闸在 transcodeToMp3 内部（统一全局信号量，P1-20）。
     try {
       await transcodeToMp3({
         inputPath: mergedPath,
@@ -192,7 +186,6 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
         },
       });
     } finally {
-      releaseTranscodeSlot();
       transcodingProgressMap.delete(session.id);
     }
 
@@ -209,22 +202,40 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     }
 
     // ── 4. persist mp3 → session storage (for playback) ──
+    // P0-6r：与录音路由一致改「stage → CAS → publish/rollback」两阶段写盘。旧实现直接
+    // persistSessionAudioArtifact 覆盖固定 key `{sessionId}.mp3` 并删旧文件——若本管线在
+    // transcode 期间会话已被 /finalize 独立收尾（COMPLETED + 自己的 recordingPath），这一步会
+    // 把已定稿录音覆盖/删除。现改为：先写版本化临时对象（绝不覆盖旧固定 key），仅当 CAS
+    // （requireActiveSession：会话未被收尾到终态 + asyncTranscribeStatus 仍活跃）通过才发布
+    // （删旧引用）；CAS 失败则回滚临时对象、绝不触碰已定稿的 recordingPath，随后 halt。
     const mp3Buffer = await fs.readFile(mp3Path);
-    const stored = await persistSessionAudioArtifact(session, mp3Buffer, 'audio/mpeg');
+    const staged = await stageSessionAudioArtifact(session, mp3Buffer, 'audio/mpeg');
 
     const durationMs = Math.round(durationSec * 1000);
     if (
-      !(await setStatus(session.id, 'uploading_to_soniox', {
-        recordingPath: stored.path,
-        durationMs,
-      }))
+      !(await setStatus(
+        session.id,
+        'uploading_to_soniox',
+        {
+          recordingPath: staged.reference,
+          durationMs,
+        },
+        { requireActiveSession: true }
+      ))
     ) {
+      // CAS 未通过（会话已被并发 /finalize 收尾 / 取消 / 失败）——只删刚 stage 的版本化临时对象，
+      // 绝不触碰已定稿的 recordingPath；随后抛 PipelineHaltError 由外层按「非错误提前退出」处理。
+      await rollbackStagedArtifact(session, staged).catch(() => undefined);
       throw new PipelineHaltError();
     }
+    // CAS 通过：recordingPath 已原子指向 staged.reference；发布（best-effort 删旧 previousReference）。
+    await finalizeStagedArtifactPublish(session, staged).catch(() => undefined);
     await invalidateSessionsApiCache(session.userId);
 
     // ── 5. upload to Soniox ──
-    const sonioxConfig = await resolveSonioxRuntimeConfigAsync({});
+    // P1-16：任务开始时按 session 选择的 region 解析并**持久化实际 region** 到 session.sonioxRegion，
+    // 之后 poll/finalize/cancel/maintenance 全部读该字段解析同一 region，绝不再落回可变默认 region。
+    const sonioxConfig = await resolveAndPersistTaskRegion(session.id, session.sonioxRegion);
     if (!sonioxConfig) throw new Error('Soniox credentials not configured');
 
     const sonioxFile = await uploadSonioxFile(sonioxConfig, mp3Path, {
@@ -303,9 +314,18 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     // 如果已经上传到 Soniox 但后续步骤失败，尽力清理；失败留给后续 cron
     const refreshed = await prisma.session.findUnique({ where: { id: session.id } });
     if (refreshed?.sonioxFileId) {
-      const config = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);
+      // P1-16：按任务已固定的 region 清理，绝不落回默认 region（否则去错 region 删不到、资源孤儿）。
+      const config = await resolveSonioxConfigForSessionRegion(
+        refreshed.sonioxRegion
+      ).catch(() => null);
       if (config) {
-        await deleteSonioxFile(config, refreshed.sonioxFileId).catch(() => undefined);
+        // P1-17：确认删除成功才清 DB 外部 ID；失败则保留，交 cron 兜底重试。
+        const deleted = await deleteSonioxFile(config, refreshed.sonioxFileId).catch(() => false);
+        if (deleted) {
+          await prisma.session
+            .updateMany({ where: { id: session.id }, data: { sonioxFileId: null } })
+            .catch(() => undefined);
+        }
       }
     }
     throw error;
@@ -317,26 +337,52 @@ async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
 /**
  * 取消正在进行的 async 上传。
  *
- * - session.asyncTranscribeStatus → 'canceled'
- * - sonioxFileId / sonioxTranscriptionId 清空（避免 cron 误删已被回收的资源，
- *   也避免 status route 在终态后还试图 poll Soniox）
+ * - session.asyncTranscribeStatus → 'canceled'（终态，status route 读到即不再 poll Soniox）
  * - 本地 chunks/merged/mp3 立刻删
  * - 内存中的 transcoding progress 立刻清
- * - Soniox 上的文件也尽力删
+ * - Soniox 上的资源：**先删 transcription 再删 file**（P1-17）——反序会先删掉 file 的引用，
+ *   留 transcription 变成不易回收的孤儿。**只有确认删除（2xx/404）才清对应 DB 外部 ID**；未确认删除
+ *   则保留 ID，由 cron 兜底重试（此前实现在删之前就无条件清了两个 ID，删失败即永久失去重试依据）。
+ *
+ * P1-16：按任务已固定的 region 解析配置删外部资源，绝不落回默认 region。
  */
 export async function cancelAsyncUpload(
-  session: Pick<Session, 'id' | 'sonioxFileId'>
+  session: Pick<Session, 'id' | 'sonioxFileId'> &
+    // 新增字段设为可选：窄 select 的既有调用方（如 admin 批量删）无需立刻改 select 也能类型通过；
+    // 缺 sonioxTranscriptionId → 跳过删 transcription；缺 sonioxRegion → 退化默认 region 解析。
+    // （建议这些调用方补齐 select 以获得正确的 region + transcription 清理，见 handoffs。）
+    Partial<Pick<Session, 'sonioxTranscriptionId' | 'sonioxRegion'>>
 ): Promise<void> {
-  await setStatus(session.id, 'canceled', {
-    sonioxFileId: null,
-    sonioxTranscriptionId: null,
-  });
+  // 先置终态（不清 ID）：status route 读到 canceled 即提前返回，不会再 poll Soniox。
+  await setStatus(session.id, 'canceled');
   transcodingProgressMap.delete(session.id);
   await deleteAsyncUpload({ id: session.id }).catch(() => undefined);
-  if (session.sonioxFileId) {
-    const config = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);
-    if (config) {
-      await deleteSonioxFile(config, session.sonioxFileId).catch(() => undefined);
+
+  const config = session.sonioxFileId || session.sonioxTranscriptionId
+    ? await resolveSonioxConfigForSessionRegion(session.sonioxRegion).catch(() => null)
+    : null;
+
+  if (config) {
+    // 先删 transcription（P1-17）：确认删除才清 ID，否则保留待 cron 重试。
+    if (session.sonioxTranscriptionId) {
+      const deleted = await deleteSonioxTranscription(
+        config,
+        session.sonioxTranscriptionId
+      ).catch(() => false);
+      if (deleted) {
+        await prisma.session
+          .updateMany({ where: { id: session.id }, data: { sonioxTranscriptionId: null } })
+          .catch(() => undefined);
+      }
+    }
+    // 再删 file。
+    if (session.sonioxFileId) {
+      const deleted = await deleteSonioxFile(config, session.sonioxFileId).catch(() => false);
+      if (deleted) {
+        await prisma.session
+          .updateMany({ where: { id: session.id }, data: { sonioxFileId: null } })
+          .catch(() => undefined);
+      }
     }
   }
 }

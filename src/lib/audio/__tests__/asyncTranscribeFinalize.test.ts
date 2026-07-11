@@ -12,6 +12,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
   sessionUpdateManyMock,
+  sessionFindUniqueMock,
   sessionTxUpdateMock,
   transactionMock,
   getSonioxTranscriptMock,
@@ -26,6 +27,7 @@ const {
   extractMock,
 } = vi.hoisted(() => ({
   sessionUpdateManyMock: vi.fn(),
+  sessionFindUniqueMock: vi.fn(),
   sessionTxUpdateMock: vi.fn(),
   transactionMock: vi.fn(),
   getSonioxTranscriptMock: vi.fn(),
@@ -42,7 +44,7 @@ const {
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
-    session: { updateMany: sessionUpdateManyMock },
+    session: { updateMany: sessionUpdateManyMock, findUnique: sessionFindUniqueMock },
     // B1：finalize 结算走 $transaction(deduct + release + 清预留列)。默认实现直接执行回调，
     // 传入带 session.update 的 tx（deduct/release 由 @/lib/quota mock 拦截，忽略第三参 tx）。
     $transaction: (...a: unknown[]) => transactionMock(...a),
@@ -120,8 +122,13 @@ describe('finalizeAsyncTranscription', () => {
       async (cb: (tx: unknown) => Promise<unknown>) =>
         cb({ session: { update: sessionTxUpdateMock } })
     );
-    deleteSonioxFileMock.mockResolvedValue(undefined);
-    deleteSonioxTranscriptionMock.mockResolvedValue(undefined);
+    // P1-17：delete 帮助函数返回「是否确认删除」，默认确认成功。
+    deleteSonioxFileMock.mockResolvedValue(true);
+    deleteSonioxTranscriptionMock.mockResolvedValue(true);
+    sessionFindUniqueMock.mockResolvedValue({ asyncTranscribeStatus: 'canceled' });
+    // 默认 updateMany 返回 count:1（claim/guard 用 mockResolvedValueOnce 覆盖前两次；
+    // 第 3 次「确认删除后清 ID」的 updateMany 落到此默认值）。
+    sessionUpdateManyMock.mockResolvedValue({ count: 1 });
   });
 
   it('抢锁成功：落盘 + 按 ceil(10×0.8)=8 分钟扣费恰好一次 + 触发后台 LLM + 清 Soniox', async () => {
@@ -147,26 +154,32 @@ describe('finalizeAsyncTranscription', () => {
       data: { asyncTranscribeStatus: 'finalizing' },
     });
     // finalize 守卫 WHERE asyncTranscribeStatus='finalizing' → 'completed'
-    expect(sessionUpdateManyMock).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        where: { id: 's1', asyncTranscribeStatus: 'finalizing' },
-        data: expect.objectContaining({
-          asyncTranscribeStatus: 'completed',
-          status: 'COMPLETED',
-          sonioxFileId: null,
-          sonioxTranscriptionId: null,
-        }),
-      })
-    );
+    // P1-17：CAS 提交里**不再**预清 Soniox 外部 ID（改到确认删除后再清）。
+    const guardCall = sessionUpdateManyMock.mock.calls[1][0];
+    expect(guardCall.where).toEqual({ id: 's1', asyncTranscribeStatus: 'finalizing' });
+    expect(guardCall.data).toMatchObject({
+      asyncTranscribeStatus: 'completed',
+      status: 'COMPLETED',
+    });
+    expect(guardCall.data).not.toHaveProperty('sonioxFileId');
+    expect(guardCall.data).not.toHaveProperty('sonioxTranscriptionId');
 
     // 计费恰好一次，口径 = ceil(ceil(600000/60000) × 0.8) = ceil(8) = 8（第三参为事务 tx）
     expect(deductMock).toHaveBeenCalledTimes(1);
     expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything());
 
     expect(runBackgroundLLMTasksMock).toHaveBeenCalledTimes(1);
-    expect(deleteSonioxFileMock).toHaveBeenCalledWith(CONFIG, 'file-1');
+    // P1-17：先删 transcription 再删 file，确认删除后清对应 DB 外部 ID（第 3 次 updateMany）。
     expect(deleteSonioxTranscriptionMock).toHaveBeenCalledWith(CONFIG, 'tx-1');
+    expect(deleteSonioxFileMock).toHaveBeenCalledWith(CONFIG, 'file-1');
+    expect(
+      deleteSonioxTranscriptionMock.mock.invocationCallOrder[0]
+    ).toBeLessThan(deleteSonioxFileMock.mock.invocationCallOrder[0]);
+    const clearCall = sessionUpdateManyMock.mock.calls[2][0];
+    expect(clearCall.data).toMatchObject({
+      sonioxTranscriptionId: null,
+      sonioxFileId: null,
+    });
   });
 
   it('抢锁失败（并发对方已 claim，count!==1）：不落盘、不扣费、不删 Soniox', async () => {
@@ -185,10 +198,12 @@ describe('finalizeAsyncTranscription', () => {
     expect(deleteSonioxTranscriptionMock).not.toHaveBeenCalled();
   });
 
-  it('收尾守卫失败（finalizing 期间被 cancel）：不扣费、不跑 LLM，但仍清 Soniox 资源', async () => {
+  it('收尾守卫失败 + 确认已 canceled：不扣费、不跑 LLM，但清 Soniox 资源（先 transcription 后 file）', async () => {
     sessionUpdateManyMock
       .mockResolvedValueOnce({ count: 1 }) // claim 抢到
       .mockResolvedValueOnce({ count: 0 }); // finalize 守卫失败（已被 cancel）
+    // P1-19：读到确实 canceled 才删 Soniox。
+    sessionFindUniqueMock.mockResolvedValue({ asyncTranscribeStatus: 'canceled' });
 
     const result = await finalizeAsyncTranscription(makeSession(), CONFIG, {
       allowClaimFrom: ['transcribing'],
@@ -197,9 +212,12 @@ describe('finalizeAsyncTranscription', () => {
     expect(result).toEqual({ outcome: 'canceled_during_finalize' });
     expect(deductMock).not.toHaveBeenCalled();
     expect(runBackgroundLLMTasksMock).not.toHaveBeenCalled();
-    // 资源仍要清（避免 Soniox 泄漏）
-    expect(deleteSonioxFileMock).toHaveBeenCalledWith(CONFIG, 'file-1');
+    // 确认取消 → 清资源（避免 Soniox 泄漏），且 transcription 先于 file。
     expect(deleteSonioxTranscriptionMock).toHaveBeenCalledWith(CONFIG, 'tx-1');
+    expect(deleteSonioxFileMock).toHaveBeenCalledWith(CONFIG, 'file-1');
+    expect(
+      deleteSonioxTranscriptionMock.mock.invocationCallOrder[0]
+    ).toBeLessThan(deleteSonioxFileMock.mock.invocationCallOrder[0]);
   });
 
   it('onCompleted 钩子在 finalize 守卫成功后、扣费前调用', async () => {
@@ -284,11 +302,14 @@ describe('finalizeAsyncTranscription', () => {
     expect(settleMock).toHaveBeenCalledWith('s1', expect.anything());
   });
 
-  it('并发另一方抢先完成：finalize 守卫 count=0 → 本次不扣费（防双扣）', async () => {
-    // 两个路径都进了 finalize 体（都从 finalizing claim 到），但守卫只放行一个：本次 count=0
+  it('P1-19：守卫失败但会话未取消（并发 revert/另一方抢先）→ **绝不删 Soniox**（否则销毁仍需要的转录）', async () => {
+    // 两个路径都进了 finalize 体，但守卫只放行一个：本次 count=0。此时状态并非 canceled——
+    // 可能是并发 finalizer 的失败回退把状态改回 transcribing（转录仍需要）。旧代码在守卫失败时
+    // 无条件删 Soniox file+transcription，会让后续 salvage getSoniox 404、会话永久卡死（回归红线）。
     sessionUpdateManyMock
       .mockResolvedValueOnce({ count: 1 }) // claim 命中
-      .mockResolvedValueOnce({ count: 0 }); // finalize 守卫 —— 对方已抢先置 completed
+      .mockResolvedValueOnce({ count: 0 }); // finalize 守卫 —— 对方抢先/被回退
+    sessionFindUniqueMock.mockResolvedValue({ asyncTranscribeStatus: 'transcribing' });
 
     const result = await finalizeAsyncTranscription(makeSession(), CONFIG, {
       allowClaimFrom: ['transcribing', 'finalizing'],
@@ -297,5 +318,8 @@ describe('finalizeAsyncTranscription', () => {
     expect(result.outcome).toBe('canceled_during_finalize');
     expect(deductMock).not.toHaveBeenCalled();
     expect(runBackgroundLLMTasksMock).not.toHaveBeenCalled();
+    // ▶ 负向断言（P1-19）：未确认 canceled → 一律不删 Soniox 资源。
+    expect(deleteSonioxTranscriptionMock).not.toHaveBeenCalled();
+    expect(deleteSonioxFileMock).not.toHaveBeenCalled();
   });
 });

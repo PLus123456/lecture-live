@@ -27,7 +27,7 @@ import {
   cleanupOrphanChatImageDirs,
 } from '@/lib/jobs/chatFilesCleanupJob';
 import { deleteAsyncUpload } from '@/lib/audio/asyncUploadChunkPersistence';
-import { resolveSonioxRuntimeConfigAsync } from '@/lib/soniox/env';
+import { resolveSonioxConfigForSessionRegion } from '@/lib/soniox/env';
 import {
   deleteSonioxFile,
   deleteSonioxTranscription,
@@ -84,6 +84,7 @@ export interface BillingMaintenanceSummary {
   reclaimedStaleJobs: number;
   releasedOrphanReservations: number;
   releasedOrphanFullReservations: number;
+  cleanedOrphanSoniox: number;
   reclaimedInterpretSessions: number;
   storageBytesReconciled: number;
   reconciliationRunId: string | null;
@@ -261,6 +262,19 @@ export async function runBillingMaintenance(options?: {
     // 不 rethrow —— 其他维护任务结果仍要返回
   }
 
+  // P1-17 兜底：重试删除终态会话上仍残留的 Soniox 外部资源（收尾/取消时 DELETE 未确认成功的孤儿）。
+  // 用会话行 ID 列本身当 outbox，确认删除才清 ID。失败仅 log 不 rethrow。
+  let cleanedOrphanSoniox = 0;
+  try {
+    cleanedOrphanSoniox = await reclaimOrphanSonioxResources(now);
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'reclaim orphan soniox resources failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
   // B3 兜底：对超时仍未结算的同声传译会话按服务端墙钟兜底扣费（防「客户端不调 /deduct 白嫖」）。
   // 与 /deduct 经 settledAt 条件认领互斥，恰好扣一次。失败仅 log 不 rethrow。
   let reclaimedInterpretSessions = 0;
@@ -365,6 +379,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedStaleJobs > 0 ||
     releasedOrphanReservations > 0 ||
     releasedOrphanFullReservations > 0 ||
+    cleanedOrphanSoniox > 0 ||
     reclaimedInterpretSessions > 0 ||
     storageBytesReconciled > 0 ||
     reconciliationRunId ||
@@ -384,6 +399,7 @@ export async function runBillingMaintenance(options?: {
         reclaimedStaleJobs,
         releasedOrphanReservations,
         releasedOrphanFullReservations,
+        cleanedOrphanSoniox,
         reclaimedInterpretSessions,
         storageBytesReconciled,
         reconciliationRunId,
@@ -401,6 +417,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedStaleJobs,
     releasedOrphanReservations,
     releasedOrphanFullReservations,
+    cleanedOrphanSoniox,
     reclaimedInterpretSessions,
     storageBytesReconciled,
     reconciliationRunId,
@@ -514,6 +531,8 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
       asyncTranscribeStatus: true,
       sonioxFileId: true,
       sonioxTranscriptionId: true,
+      // P1-16：按任务已固定的 region 解析 Soniox 配置（poll/delete 都用它），绝不落回可变默认 region。
+      sonioxRegion: true,
       // 以下字段供「Soniox 已完成」时的共享 finalize 自动收尾 + 扣费复用
       targetLang: true,
       durationMs: true,
@@ -530,10 +549,11 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
   let reclaimedCount = 0;
   const thresholdHours = Math.round(STALE_ASYNC_THRESHOLD_MS / 3_600_000);
 
-  // Soniox 配置只解析一次（可能未配置：为 null 时退化到旧行为，仅标 failed + 清本地）
-  const sonioxConfig = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);
-
   for (const session of stuck) {
+    // P1-16：per-session 按其固定 region 解析配置（未配置 → null 退化到「仅标 failed + 清本地」）。
+    const sonioxConfig = await resolveSonioxConfigForSessionRegion(
+      session.sonioxRegion
+    ).catch(() => null);
     // U23 + v3-R6：transcribing / finalizing + 有 transcriptionId → 先查 Soniox，salvage 还没
     // 坏的转录。finalizing 也纳入：前端 poll 或上一轮回收在收尾中途崩溃/抛错（拉 transcript 前）
     // 会把会话留在 finalizing，而 Soniox 侧转录可能早已 completed；若只救 transcribing，这类会
@@ -786,6 +806,101 @@ export async function releaseOrphanFullReservations(now: Date): Promise<number> 
   return releasedCount;
 }
 
+// P1-17 cleanup outbox 的陈旧门槛：只重试「已终态一段时间」仍残留外部 ID 的会话，避开刚收尾的在途结算。
+const ORPHAN_SONIOX_SWEEP_STALE_MS = 30 * 60_000;
+
+/**
+ * P1-17 cleanup outbox（兜底重试）：终态会话若仍残留 Soniox 外部 ID（async 的 sonioxFileId/
+ * sonioxTranscriptionId 或完整版的 fullSonioxFileId/fullSonioxTranscriptionId），说明收尾/取消时
+ * DELETE 未确认成功（网络故障 / 非 2xx）。收尾/取消侧已改为「确认删除才清 ID」，故残留 ID 本身即
+ * tombstone/outbox（无须新表）。这里按 per-session 固定 region 重试删除（**先 transcription 再
+ * file**，P1-17），确认删除(2xx/404)才清对应 ID。updatedAt 超 30min 才扫，避开刚收尾的在途结算。
+ */
+export async function reclaimOrphanSonioxResources(now: Date): Promise<number> {
+  const staleBefore = new Date(now.getTime() - ORPHAN_SONIOX_SWEEP_STALE_MS);
+  let cleaned = 0;
+
+  const clearOne = async (
+    sessionId: string,
+    region: string | null,
+    transcriptionId: string | null,
+    fileId: string | null,
+    idFields: { tx: string; file: string }
+  ): Promise<boolean> => {
+    const config = await resolveSonioxConfigForSessionRegion(region).catch(() => null);
+    if (!config) return false;
+    let didClear = false;
+    // 先删 transcription 再删 file（P1-17）。
+    if (transcriptionId) {
+      const ok = await deleteSonioxTranscription(config, transcriptionId).catch(() => false);
+      if (ok) {
+        await prisma.session
+          .updateMany({ where: { id: sessionId }, data: { [idFields.tx]: null } })
+          .catch(() => undefined);
+        didClear = true;
+      }
+    }
+    if (fileId) {
+      const ok = await deleteSonioxFile(config, fileId).catch(() => false);
+      if (ok) {
+        await prisma.session
+          .updateMany({ where: { id: sessionId }, data: { [idFields.file]: null } })
+          .catch(() => undefined);
+        didClear = true;
+      }
+    }
+    return didClear;
+  };
+
+  // ── async 上传：终态 + 残留 async Soniox ID ──
+  const asyncStuck = await prisma.session.findMany({
+    where: {
+      asyncTranscribeStatus: { in: ['completed', 'canceled', 'failed'] },
+      OR: [{ sonioxFileId: { not: null } }, { sonioxTranscriptionId: { not: null } }],
+      updatedAt: { lte: staleBefore },
+    },
+    select: { id: true, sonioxFileId: true, sonioxTranscriptionId: true, sonioxRegion: true },
+    take: 200,
+    orderBy: { updatedAt: 'asc' },
+  });
+  for (const s of asyncStuck) {
+    const did = await clearOne(s.id, s.sonioxRegion, s.sonioxTranscriptionId, s.sonioxFileId, {
+      tx: 'sonioxTranscriptionId',
+      file: 'sonioxFileId',
+    });
+    if (did) cleaned += 1;
+  }
+
+  // ── 完整版补全：终态 + 残留 full Soniox ID ──
+  const fullStuck = await prisma.session.findMany({
+    where: {
+      fullTranscribeStatus: { in: ['completed', 'failed'] },
+      OR: [{ fullSonioxFileId: { not: null } }, { fullSonioxTranscriptionId: { not: null } }],
+      updatedAt: { lte: staleBefore },
+    },
+    select: {
+      id: true,
+      fullSonioxFileId: true,
+      fullSonioxTranscriptionId: true,
+      sonioxRegion: true,
+    },
+    take: 200,
+    orderBy: { updatedAt: 'asc' },
+  });
+  for (const s of fullStuck) {
+    const did = await clearOne(
+      s.id,
+      s.sonioxRegion,
+      s.fullSonioxTranscriptionId,
+      s.fullSonioxFileId,
+      { tx: 'fullSonioxTranscriptionId', file: 'fullSonioxFileId' }
+    );
+    if (did) cleaned += 1;
+  }
+
+  return cleaned;
+}
+
 /**
  * 回收停滞的完整版补全转录（cron 兜底，防僵尸）。
  *
@@ -826,6 +941,8 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
       fullTranscribeStatus: true,
       fullSonioxFileId: true,
       fullSonioxTranscriptionId: true,
+      // P1-16：按任务已固定的 region 解析 Soniox 配置。
+      sonioxRegion: true,
       // 以下字段供「Soniox 已完成」时的共享 finalize 自动收尾 + 扣费复用
       targetLang: true,
       durationMs: true,
@@ -837,11 +954,12 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
   let reclaimedCount = 0;
   const thresholdHours = Math.round(STALE_FULL_TRANSCRIBE_THRESHOLD_MS / 3_600_000);
 
-  // Soniox 配置只解析一次（可能未配置：为 null 时退化到「仅标僵尸 failed」）
-  const sonioxConfig = await resolveSonioxRuntimeConfigAsync({}).catch(() => null);
-
   for (const session of stuck) {
     const status = session.fullTranscribeStatus;
+    // P1-16：per-session 按其固定 region 解析配置（未配置 → null 退化到「仅标僵尸 failed」）。
+    const sonioxConfig = await resolveSonioxConfigForSessionRegion(
+      session.sonioxRegion
+    ).catch(() => null);
 
     // transcribing / finalizing：持有（或曾持有）Soniox 转录任务，可能已完成 → 查 Soniox 真实状态
     // 后 salvage。finalizing 僵尸不再盲目回退 transcribing（会与在途 finalize 赛跑），而是与
@@ -964,6 +1082,10 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
       { sessionId: session.id, userId: session.userId },
       'reclaimed stuck full transcription'
     );
+    // R4：僵尸标 failed（抢到，恰好一次）→ 释放入口持有的转录分钟预留，避免额度泄漏。
+    // settleFullReservation（FOR UPDATE 读 fullReservedMinutes 当前列并原子释放）与 finalize 结算 /
+    // 删会话 / cron releaseOrphanFullReservations 互斥，恰好释放一次。
+    await settleFullReservation(session.id).catch(() => undefined);
 
     // best-effort 清本地转码临时目录（processFullTranscribe 正常自清，此处兜底硬崩残留）。
     await fs

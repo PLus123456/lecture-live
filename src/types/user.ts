@@ -6,6 +6,16 @@ export interface User {
   createdAt: string;
 }
 
+/** 用户组绑定的能力开关（前端据此隐藏未开通功能；服务端才是权威门禁） */
+export interface UserFeatureFlags {
+  /** 最大思考深度上限，'off' 表示禁止思考 */
+  maxThinkingDepth: 'off' | 'low' | 'medium' | 'high';
+  /** 是否允许实时摘要 */
+  allowRealtimeSummary: boolean;
+  /** 是否允许总摘要（结束时结构化报告） */
+  allowFinalSummary: boolean;
+}
+
 export interface UserQuotas {
   transcriptionMinutesUsed: number;
   transcriptionMinutesLimit: number;
@@ -23,6 +33,8 @@ export interface UserQuotas {
   allowedModels: string;
   role?: 'ADMIN' | 'PRO' | 'FREE';
   quotaResetAt?: string | null;
+  /** 用户组能力开关（由 /api/users/quota 附带返回，可能缺省 → UI 默认放行） */
+  featureFlags?: UserFeatureFlags;
 }
 
 export interface AuthResponse {

@@ -159,4 +159,25 @@ describe('chatStore — 按 conversationId 隔离的运行时切片', () => {
     expect(after.availableModels).toHaveLength(1);
     expect(after.modelsLoaded).toBe(true);
   });
+
+  it('resetForAccountSwitch 额外清空模型列表并复位 modelsLoaded（M2 换账号）', () => {
+    const s = useChatStore.getState();
+    s.setAvailableModels([fakeModel('m1'), fakeModel('m2')], 'm1');
+    s.addMessage('A', msg('a1'));
+    s.setActiveConversation('A');
+
+    // 前置：resetSession 保留模型列表（对照）
+    expect(useChatStore.getState().modelsLoaded).toBe(true);
+    expect(useChatStore.getState().availableModels).toHaveLength(2);
+
+    useChatStore.getState().resetForAccountSwitch();
+    const after = useChatStore.getState();
+    // 对话切片 + 导航态清空
+    expect(after.byConversation).toEqual({});
+    expect(after.conversations).toEqual([]);
+    expect(after.activeConversationId).toBeNull();
+    // 关键：模型列表被清、modelsLoaded 复位 false → 新账号会重新拉取自己（按组授权）的模型
+    expect(after.availableModels).toEqual([]);
+    expect(after.modelsLoaded).toBe(false);
+  });
 });

@@ -153,6 +153,12 @@ interface ChatStore {
    * 保留模型列表（全局、跨 session）与用户偏好（持久化）。
    */
   resetSession: () => void;
+  /**
+   * 换账号 / 登出时调用：在 resetSession 基础上**额外**清空模型列表并把 modelsLoaded
+   * 复位为 false。模型列表是按用户组授权解析的，跨账号并不通用；不清则新账号会短暂沿用
+   * 上一账号的模型列表（modelsLoaded 一次性去重，永不复位），直到整页刷新。
+   */
+  resetForAccountSwitch: () => void;
 }
 
 const INITIAL_RUNTIME = {
@@ -341,6 +347,19 @@ export const useChatStore = create<ChatStore>()(
           conversations: [],
           byConversation: {},
           pendingFirstMessage: null,
+        }),
+
+      resetForAccountSwitch: () =>
+        set({
+          activeConversationId: null,
+          conversations: [],
+          byConversation: {},
+          pendingFirstMessage: null,
+          // 模型列表按账号所属组授权解析 → 换账号必须清掉，让新账号重新拉取自己的模型。
+          availableModels: [],
+          modelsLoaded: false,
+          // selectedModel 是持久化偏好；若新账号不含该模型，setAvailableModels 拉到新列表时
+          // 会自动回落到 defaultModel（见其内的 some(...) 校验），此处无需强清。
         }),
     }),
     {

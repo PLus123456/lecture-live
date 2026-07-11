@@ -27,9 +27,21 @@ const LLM_STREAM_HEADERS_TIMEOUT_MS = 60_000;
 async function fetchStreamWithHeadersTimeout(
   url: string,
   init: RequestInit,
-  headersTimeoutMs = LLM_STREAM_HEADERS_TIMEOUT_MS
+  headersTimeoutMs = LLM_STREAM_HEADERS_TIMEOUT_MS,
+  externalSignal?: AbortSignal
 ): Promise<Response> {
   const controller = new AbortController();
+  // 外部取消（客户端断开）联动到同一个 controller：注意「响应头到达后」不能解除这条联动，
+  // 否则 abort 就无法中断仍在进行的 SSE body read。只清 headers 超时定时器。
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener('abort', () => controller.abort(), {
+        once: true,
+      });
+    }
+  }
   const timer = setTimeout(() => controller.abort(), headersTimeoutMs);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
@@ -566,6 +578,11 @@ interface CallOptions {
   streamCallback?: (chunk: string) => void;
   purpose?: LlmPurpose;
   modelId?: string;
+  /**
+   * 外部取消信号（如客户端断开时由路由层 abort）。透传到出站 provider fetch：一旦 abort，
+   * 进行中的响应体 read 会立即中断，停止继续拉流 / 继续计费 / 长时间占用连接。
+   */
+  signal?: AbortSignal;
 }
 
 /** 解析调用方传入的 options 找到 provider + thinkingPref */
@@ -731,14 +748,16 @@ export async function callLLMWithHistoryStream(
           systemPrompt,
           messages,
           thinkingParams,
-          onEvent
+          onEvent,
+          options.signal
         )
       : await streamOpenAICompatibleWithHistory(
           provider,
           systemPrompt,
           messages,
           thinkingParams,
-          onEvent
+          onEvent,
+          options.signal
         );
     llmLogger.info(
       {
@@ -966,7 +985,8 @@ async function streamAnthropicWithHistory(
   system: string,
   messages: ReadonlyArray<ChatHistoryMessage>,
   params: ThinkingParams,
-  onEvent: (ev: LLMStreamEvent) => void
+  onEvent: (ev: LLMStreamEvent) => void,
+  signal?: AbortSignal
 ): Promise<LLMStreamResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
@@ -997,7 +1017,9 @@ async function streamAnthropicWithHistory(
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify(body),
-    }
+    },
+    LLM_STREAM_HEADERS_TIMEOUT_MS,
+    signal
   );
 
   if (!res.ok) {
@@ -1015,6 +1037,11 @@ async function streamAnthropicWithHistory(
   // 再关流。若不捕获，截断的半句正文会被当成功返回并永久落库。读完流后统一抛出，
   // 让路由把它当失败处理（不落库 assistant 消息）。
   let streamError: string | undefined;
+  // 是否收到终止事件（message_stop，或带 stop_reason 的 message_delta）。Anthropic 正常
+  // 完成必以 message_delta(stop_reason) + message_stop 收尾；若连接在正文中途被截断
+  // （代理/网络切断、上游未发终止事件即 EOF），这里会保持 false —— 读完流后据此抛错，
+  // 避免把「半句正文 + EOF」当成功落库。
+  let sawTerminal = false;
 
   await readSseLines(res, (data) => {
     if (!data || data === '[DONE]') return;
@@ -1025,6 +1052,11 @@ async function streamAnthropicWithHistory(
       return;
     }
     const eventType = parsed.type;
+
+    if (eventType === 'message_stop') {
+      sawTerminal = true;
+      return;
+    }
 
     if (eventType === 'error') {
       const errObj = parsed.error as Record<string, unknown> | undefined;
@@ -1058,6 +1090,11 @@ async function streamAnthropicWithHistory(
         onEvent({ type: 'usage', inputTokens });
       }
     } else if (eventType === 'message_delta') {
+      const delta = parsed.delta as Record<string, unknown> | undefined;
+      // 带 stop_reason 的 message_delta 也标志本条消息已收尾（message_stop 若被代理吞掉时兜底）。
+      if (delta?.stop_reason != null) {
+        sawTerminal = true;
+      }
       const usage = parsed.usage as Record<string, unknown> | undefined;
       if (typeof usage?.output_tokens === 'number') {
         outputTokens = usage.output_tokens;
@@ -1068,6 +1105,10 @@ async function streamAnthropicWithHistory(
 
   if (streamError) {
     throw new Error(`Anthropic streaming error: ${streamError}`);
+  }
+  if (!sawTerminal) {
+    // 未收到终止事件即 EOF —— 流被截断，正文不完整。抛错让路由按失败处理（不落库半截答案）。
+    throw new Error('Anthropic streaming ended prematurely (no message_stop)');
   }
 
   return {
@@ -1227,7 +1268,8 @@ async function streamOpenAICompatibleWithHistory(
   system: string,
   messages: ReadonlyArray<ChatHistoryMessage>,
   params: ThinkingParams,
-  onEvent: (ev: LLMStreamEvent) => void
+  onEvent: (ev: LLMStreamEvent) => void,
+  signal?: AbortSignal
 ): Promise<LLMStreamResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
@@ -1260,7 +1302,9 @@ async function streamOpenAICompatibleWithHistory(
         Authorization: `Bearer ${provider.apiKey}`,
       },
       body: JSON.stringify(body),
-    }
+    },
+    LLM_STREAM_HEADERS_TIMEOUT_MS,
+    signal
   );
 
   if (!res.ok) {
@@ -1277,9 +1321,16 @@ async function streamOpenAICompatibleWithHistory(
   // mid-stream error 兜底（部分 OpenAI 兼容 provider 会在 data 行里塞 {"error":{...}}
   // 后关流）——读完流后统一抛出，避免把截断正文当成功持久化。
   let streamError: string | undefined;
+  // 是否收到终止标记：`data: [DONE]`、finish_reason 非空、或（include_usage 保证的）
+  // 末尾 usage chunk。三者任一即视为干净收尾；都没有就说明流在正文中途被截断。
+  let sawTerminal = false;
 
   await readSseLines(res, (data) => {
-    if (!data || data === '[DONE]') return;
+    if (!data) return;
+    if (data === '[DONE]') {
+      sawTerminal = true;
+      return;
+    }
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(data) as Record<string, unknown>;
@@ -1317,6 +1368,10 @@ async function streamOpenAICompatibleWithHistory(
         onEvent({ type: 'thinking', delta: reasoning });
       }
     }
+    // finish_reason 非空 = 本条 choice 已收尾（stop / length / content_filter…）。
+    if (choices?.[0]?.finish_reason != null) {
+      sawTerminal = true;
+    }
 
     const usage = parsed.usage as Record<string, unknown> | undefined;
     if (usage) {
@@ -1325,6 +1380,8 @@ async function streamOpenAICompatibleWithHistory(
       }
       if (typeof usage.completion_tokens === 'number') {
         outputTokens = usage.completion_tokens;
+        // include_usage 的末尾 usage chunk：即便 [DONE] 被代理吞掉，收到它也说明流已正常收尾。
+        sawTerminal = true;
       }
       onEvent({ type: 'usage', inputTokens, outputTokens });
     }
@@ -1332,6 +1389,10 @@ async function streamOpenAICompatibleWithHistory(
 
   if (streamError) {
     throw new Error(`OpenAI-compatible streaming error: ${streamError}`);
+  }
+  if (!sawTerminal) {
+    // 未收到任何终止标记即 EOF —— 流被截断，正文不完整。抛错让路由按失败处理。
+    throw new Error('OpenAI-compatible streaming ended prematurely (truncated)');
   }
 
   return {

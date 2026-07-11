@@ -3,6 +3,7 @@
 import { useCallback } from 'react';
 import { useAuthStore } from '@/stores/authStore';
 import { useConversationListStore } from '@/stores/conversationListStore';
+import { useChatStore } from '@/stores/chatStore';
 
 export function useAuth() {
   const { user, token, quotas, sessionChecked, setAuth, setQuotas, setSessionChecked, logout: clearStore } = useAuthStore();
@@ -75,6 +76,9 @@ export function useAuth() {
     clearStore();
     // 同步清掉全局会话列表缓存，防止换账号后残留上一个用户的对话列表
     useConversationListStore.getState().clear();
+    // 清空聊天运行时 + 模型列表：否则新账号会短暂看到旧账号的消息切片，且因 modelsLoaded
+    // 常驻 true 而继续沿用旧账号的（按组授权的）模型列表，直到整页刷新。
+    useChatStore.getState().resetForAccountSwitch();
 
     // 2. 显式清除 localStorage 中 persist 的数据，防止刷新后恢复
     try {

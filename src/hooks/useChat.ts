@@ -105,6 +105,18 @@ export function useChat(sessionId: string | null) {
   const token = useAuthStore((s) => s.token);
   const lastLoadedSessionRef = useRef<string | null>(null);
   const sendAbortRef = useRef<AbortController | null>(null);
+  /**
+   * 初始化 epoch：每次 session 初始化自增。init 的异步 IIFE 没有 AbortController，
+   * 快速从录音 A 切到 B 时，A 的迟到响应会用 setActiveConversation(A) 把活跃对话改回 A，
+   * 导致 B 的转录被发进 A。每步 await 后比对 epoch，过期的旧 init 直接放弃写入。
+   */
+  const initEpochRef = useRef(0);
+  /**
+   * 历史是否加载完成：在 setActiveConversation 之后、loadConversationMessages 完成之前，
+   * 输入框已可用；此时发送会插入乐观消息，随后迟到的 setMessages(全量覆盖)会把它清掉。
+   * 用这个门闩在历史加载完成前禁止发送（与 GlobalChat 的 historyLoadedRef 一致）。
+   */
+  const historyLoadedRef = useRef(false);
 
   /* ──────────────────────────────────────────────────────────────
      拉取模型列表（一次性）
@@ -133,6 +145,11 @@ export function useChat(sessionId: string | null) {
     if (lastLoadedSessionRef.current === sessionId) return;
     lastLoadedSessionRef.current = sessionId;
 
+    // 本次初始化的 epoch；切到别的 session 会自增，旧 IIFE 每步 await 后据此放弃写入。
+    const myEpoch = ++initEpochRef.current;
+    // 新一轮初始化：历史尚未就绪，先锁住发送。
+    historyLoadedRef.current = false;
+
     resetSession();
 
     const headers = { Authorization: `Bearer ${token}` };
@@ -144,6 +161,8 @@ export function useChat(sessionId: string | null) {
         );
         if (!listRes.ok) throw new Error(`list ${listRes.status}`);
         const listData = (await listRes.json()) as { conversations: ConversationMeta[] };
+        // 已被更晚的初始化取代 → 放弃，避免把旧 session 的对话写成活跃。
+        if (initEpochRef.current !== myEpoch) return;
         let list = listData.conversations;
         let active = list.find((c) => c.endedAt === null);
 
@@ -156,17 +175,21 @@ export function useChat(sessionId: string | null) {
           });
           if (!createRes.ok) throw new Error(`create ${createRes.status}`);
           const created = (await createRes.json()) as { conversation: ConversationMeta };
+          if (initEpochRef.current !== myEpoch) return;
           active = created.conversation;
           list = [...list, active];
         }
 
+        if (initEpochRef.current !== myEpoch) return;
         setConversations(list);
         setActiveConversation(active.id);
 
-        // 拉取活跃 conversation 的消息
-        await loadConversationMessages(active.id);
+        // 拉取活跃 conversation 的消息（loadConversationMessages 完成后会解锁发送门闩）
+        await loadConversationMessages(active.id, myEpoch);
       } catch (err) {
         console.error('Failed to init conversations:', err);
+        // 加载失败也解锁，避免用户永远发不出消息（与 GlobalChat 一致）
+        if (initEpochRef.current === myEpoch) historyLoadedRef.current = true;
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -183,8 +206,12 @@ export function useChat(sessionId: string | null) {
      加载某个 conversation 的消息（含 system 摘要切割）
      ────────────────────────────────────────────────────────────── */
   const loadConversationMessages = useCallback(
-    async (conversationId: string) => {
+    async (conversationId: string, epoch?: number) => {
       if (!token) return;
+      // epoch 由 init 传入：过期（已切到别的 session）就不写入、也不解锁门闩，交给新一轮 init。
+      // 用户主动切对话/重试时不传 epoch，总是应用。
+      const isCurrent = () =>
+        epoch === undefined || initEpochRef.current === epoch;
       try {
         const res = await fetch(
           `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
@@ -203,6 +230,8 @@ export function useChat(sessionId: string | null) {
             createdAt: string;
           }>;
         };
+        // 迟到的旧 init：不要用旧 session 的历史覆盖当前活跃对话（会清掉乐观消息）。
+        if (!isCurrent()) return;
 
         // 找最近一条压缩边界 → 分割成 archivedMessages + messages
         const compressionBoundary = findCompressionBoundary(data.messages);
@@ -251,6 +280,10 @@ export function useChat(sessionId: string | null) {
         }
       } catch (err) {
         console.error('Failed to load conversation messages:', err);
+      } finally {
+        // 历史加载完成（成功或失败）→ 解锁发送门闩。过期的旧 init 不解锁，避免抢在
+        // 新一轮 init 之前误解锁。
+        if (isCurrent()) historyLoadedRef.current = true;
       }
     },
     [token, setMessages, setTokenUsage]
@@ -268,6 +301,8 @@ export function useChat(sessionId: string | null) {
       images: ReadonlyArray<string> = []
     ) => {
       if (!token || !activeConversationId || contextFull) return;
+      // 历史加载完成前不发：否则迟到的 setMessages（全量覆盖）会清掉这条乐观消息与流式占位。
+      if (!historyLoadedRef.current) return;
 
       // 捕获本次发送绑定的 conversationId —— SSE 流的所有写入都打到这一片，
       // 即使用户流式途中切到别的对话/录音，旧流也只写回已非活跃的切片。
@@ -416,12 +451,16 @@ export function useChat(sessionId: string | null) {
               setContextFull(conversationId, true);
               setTokenUsage(conversationId, { ...preEstimate, level: 7 });
             }
+            const errText =
+              typeof payload.error === 'string'
+                ? payload.error
+                : '对话失败，请重试。';
             updateMessage(conversationId, assistantId, {
-              content:
-                accumulatedText ||
-                (typeof payload.error === 'string'
-                  ? payload.error
-                  : '对话失败，请重试。'),
+              // 半截正文后必须显式追加失败提示：不能「有部分正文就只显示部分」把失败静默掉，
+              // 否则用户看到半句话却当成正常回答（服务端也不会落库这半截，刷新即消失）。
+              content: accumulatedText
+                ? `${accumulatedText}\n\n⚠️ ${errText}`
+                : errText,
               streaming: false,
             });
           }
@@ -501,6 +540,8 @@ export function useChat(sessionId: string | null) {
      ────────────────────────────────────────────────────────────── */
   const switchConversation = useCallback(
     async (id: string) => {
+      // 切换目标对话时先锁住发送，加载完成后 loadConversationMessages 的 finally 会解锁。
+      historyLoadedRef.current = false;
       setActiveConversation(id);
       await loadConversationMessages(id);
     },

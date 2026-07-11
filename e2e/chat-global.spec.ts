@@ -84,6 +84,10 @@ interface ChatMockState {
   titleGenerated: boolean;
   /** 未被显式 mock 命中的路径（调试用） */
   unmocked: string[];
+  /** 已关闭（只读）的 conversation：messages 端点回 endedAt 非空 */
+  endedById: Record<string, boolean>;
+  /** 这些 conversation 的 /api/llm/chat 返回「半截正文 + error」且不落库 assistant（H4） */
+  errorConvIds: string[];
   /** 自增序号，用于生成稳定 id */
   seq: number;
 }
@@ -96,6 +100,8 @@ function createState(): ChatMockState {
     llmBodies: [],
     titleGenerated: false,
     unmocked: [],
+    endedById: {},
+    errorConvIds: [],
     seq: 0,
   };
 }
@@ -240,7 +246,7 @@ function installChatMocks(page: Page, state: ChatMockState) {
             id: convId,
             title: null,
             startedAt: isoAt(0),
-            endedAt: null,
+            endedAt: state.endedById[convId] ? isoAt(5) : null,
             degradationLevel: 0,
           },
           messages: state.messagesById[convId] ?? [],
@@ -312,6 +318,7 @@ function installChatMocks(page: Page, state: ChatMockState) {
       const convId = String(body.conversationId ?? '');
       const question = String(body.question ?? '');
       const msgs = (state.messagesById[convId] ||= []);
+      // 落库 user 消息（与真实后端一致：user 在调 LLM 前先落库）
       msgs.push({
         id: `m-${++state.seq}`,
         role: 'user',
@@ -322,6 +329,13 @@ function installChatMocks(page: Page, state: ChatMockState) {
         outputTokens: null,
         createdAt: isoAt(state.seq),
       });
+      // H4：模拟「先流出半截正文，再报错」——服务端不落库 assistant（半截答案不持久化）。
+      if (state.errorConvIds.includes(convId)) {
+        return fulfillSse(route, [
+          { event: 'text', data: { delta: '这是半截答案……' } },
+          { event: 'error', data: { error: '生成失败，请重试。', contextFull: false } },
+        ]);
+      }
       msgs.push({
         id: `m-${++state.seq}`,
         role: 'assistant',
@@ -560,4 +574,84 @@ test('已有对话：加载历史 → 上传文件附件 → 手动发消息 →
     timeout: 15_000,
   });
   await snap(page, 'u15-existing-3');
+});
+
+test('M5：已关闭对话（只读）→ 附件 chip 可见但删除入口被隐藏', async ({
+  page,
+}) => {
+  const convId = 'conv-closed';
+  state.endedById[convId] = true;
+  state.messagesById[convId] = [
+    {
+      id: 'h-1',
+      role: 'user',
+      content: '关闭前的问题',
+      transcriptOffsetMs: 0,
+      degradationLevel: null,
+      inputTokens: null,
+      outputTokens: null,
+      createdAt: isoAt(1),
+    },
+  ];
+  state.attachmentsById[convId] = [
+    {
+      id: 'att-closed-1',
+      fileName: 'closed-doc.txt',
+      mimeType: 'text/plain',
+      kind: 'text',
+      bytes: 42,
+      createdAt: isoAt(2),
+      cloudrevePath: '/mock/closed/closed-doc.txt',
+    },
+  ];
+
+  await loginAsAdmin(page);
+  await page.goto(`/chat/${convId}`);
+
+  // 历史 + 附件 chip 都应渲染
+  await expect(page.getByText('关闭前的问题').first()).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(page.getByText(/closed-doc\.txt/).first()).toBeVisible({
+    timeout: 15_000,
+  });
+
+  // 只读语义：附件删除入口（title="Remove" 的按钮）必须不存在
+  await expect(page.getByRole('button', { name: 'Remove' })).toHaveCount(0);
+  await snap(page, 'm5-closed-readonly');
+});
+
+test('H4：半截正文后报错 → 显式失败提示、且刷新后半截答案不作为历史留存', async ({
+  page,
+}) => {
+  const convId = 'conv-h4';
+  state.messagesById[convId] = [];
+  state.errorConvIds.push(convId);
+
+  await loginAsAdmin(page);
+  await page.goto(`/chat/${convId}`);
+
+  const composer = page.locator('textarea');
+  await expect(composer).toBeVisible({ timeout: 15_000 });
+
+  const userMsg = '触发失败的问题';
+  await composer.fill(userMsg);
+  await page.getByRole('button', { name: /^(发送|Send)$/ }).click();
+
+  // 用户消息可见
+  await expect(page.getByText(userMsg).first()).toBeVisible({ timeout: 15_000 });
+  // 关键：失败必须显式呈现（不能只留半句话让用户以为成功）
+  await expect(page.getByText(/生成失败/).first()).toBeVisible({
+    timeout: 15_000,
+  });
+  await snap(page, 'h4-error-surfaced');
+
+  // 刷新：半截答案没有落库（服务端 mock 未 push assistant）→ 历史里既无半截正文也无失败提示
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForURL(new RegExp(`/chat/${convId}(\\?|$)`), { timeout: 15_000 });
+
+  await expect(page.getByText(userMsg).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/这是半截答案/)).toHaveCount(0);
+  await expect(page.getByText(/生成失败/)).toHaveCount(0);
+  await snap(page, 'h4-after-reload');
 });

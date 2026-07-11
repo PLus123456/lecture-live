@@ -23,8 +23,11 @@ const sessionLogger = logger.child({ component: 'interpret-session' });
 export const INTERPRET_RECLAIM_STALE_MS = 7 * 60 * 60_000;
 
 // R1-C：deduct 回退认领 mint 锚点时，允许 B.startedAt 略早于 anchorStartedAt 的时钟容差。B 建于 mint、
-// 必晚于 /start 的锚点起点，理论上 B.startedAt >= anchorStartedAt；给几秒容差纯为防毫秒级时钟抖动，
-// 同时仍足够小以排除上一场/更早的残留锚点（它们起点通常早数分钟以上）。
+// 必晚于 /start 的锚点起点，理论上 B.startedAt >= anchorStartedAt；给几秒容差纯为防毫秒级抖动，同时仍
+// 足够小以排除上一场/更早的残留锚点（它们起点通常早数分钟以上）。
+// 前提：本项目自托管单进程（/start 与 mint 同一服务器同一时钟，见部署文档），故此容差绰绰有余。若将来
+// 横向扩成多实例、实例间时钟偏差可能 >5s，需改用「前端把 anchorId 传给 mint、令 mint 建的行直接带该
+// anchorId」的精确键控（届时 deduct 按 anchorId 命中即可、无需本墙钟启发式）。
 const FALLBACK_ANCHOR_SKEW_MS = 5_000;
 
 /**

@@ -34,6 +34,7 @@ import {
 } from '@/lib/soniox/asyncFile';
 import { finalizeAsyncTranscription } from '@/lib/audio/asyncTranscribeFinalize';
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
+import { reclaimStaleInterpretSessions } from '@/lib/interpret/session';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
 // FINALIZING 专项：已发起收尾但卡住的会话（前端崩/断网/服务端重启导致 finalize 没跑完）
@@ -81,6 +82,7 @@ export interface BillingMaintenanceSummary {
   reclaimedFullTranscribes: number;
   reclaimedStaleJobs: number;
   releasedOrphanReservations: number;
+  reclaimedInterpretSessions: number;
   storageBytesReconciled: number;
   reconciliationRunId: string | null;
   chatFilesCleanup: {
@@ -244,6 +246,19 @@ export async function runBillingMaintenance(options?: {
     // 不 rethrow —— 其他维护任务结果仍要返回
   }
 
+  // B3 兜底：对超时仍未结算的同声传译会话按服务端墙钟兜底扣费（防「客户端不调 /deduct 白嫖」）。
+  // 与 /deduct 经 settledAt 条件认领互斥，恰好扣一次。失败仅 log 不 rethrow。
+  let reclaimedInterpretSessions = 0;
+  try {
+    reclaimedInterpretSessions = await reclaimStaleInterpretSessions(now);
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'reclaim stale interpret sessions failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
   // 僵尸任务回收：把卡在 PROCESSING 超时的 JobQueue 记录标失败（解锁前端指示器、可被 retryJob 重试）。
   // 不为本步骤单独建 job —— 它是对 job 表自身的清道夫，建 job 反而引入"清道夫卡住谁来清"的递归。
   let reclaimedStaleJobs = 0;
@@ -334,6 +349,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedFullTranscribes > 0 ||
     reclaimedStaleJobs > 0 ||
     releasedOrphanReservations > 0 ||
+    reclaimedInterpretSessions > 0 ||
     storageBytesReconciled > 0 ||
     reconciliationRunId ||
     (chatFilesCleanup &&
@@ -351,6 +367,7 @@ export async function runBillingMaintenance(options?: {
         reclaimedFullTranscribes,
         reclaimedStaleJobs,
         releasedOrphanReservations,
+        reclaimedInterpretSessions,
         storageBytesReconciled,
         reconciliationRunId,
         chatFilesCleanup,
@@ -366,6 +383,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedFullTranscribes,
     reclaimedStaleJobs,
     releasedOrphanReservations,
+    reclaimedInterpretSessions,
     storageBytesReconciled,
     reconciliationRunId,
     chatFilesCleanup,

@@ -245,6 +245,25 @@ model InterpretUsage {
   @@index([userId, chargedAt])
 }
 
+// B3：同声传译的服务端持久化会话。interpret 是浏览器直连 Soniox，服务端只在 /start 与 /deduct
+// 观测；旧实现若客户端不调 /deduct（改装/掉线/故意）则整场免费、无任何兜底。此表在 /start 落一行
+// (settledAt=null=未结算)，/deduct 成功扣费时**原子认领**它(settledAt 置非空)，cron 对超时仍未结算
+// 的会话按服务端墙钟(startedAt→now，封顶 MAX_INTERPRET_DURATION)兜底扣费并结算。deduct 与 cron 经
+// settledAt 的条件原子认领互斥 → 每场恰好扣一次，杜绝「不调 deduct 白嫖」与「deduct+cron 双扣」。
+model InterpretSession {
+  id            String    @id @default(cuid())
+  userId        String                              // 冗余列，便于 cron 扫描 + 按用户结算
+  anchorId      String?                             // /start 建立的 Redis 锚点 id，供 deduct 精确认领
+  startedAt     DateTime  @default(now())           // 服务端会话开始时刻（cron 兜底计费的权威墙钟起点）
+  settledAt     DateTime?                            // 非空=已结算(deduct 或 cron)；认领闸门
+  billedMinutes Int?                                // 结算实扣分钟（审计）
+  settledBy     String?                             // 'deduct' | 'cron_reclaim'（审计）
+
+  @@index([settledAt, startedAt])
+  @@index([userId, settledAt])
+  @@index([anchorId])
+}
+
 // ─── 站点设置（Key-Value 存储） ───
 model SiteSetting {
   key       String   @id          // 如 "site_name", "site_url", "logo_path" 等

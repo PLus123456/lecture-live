@@ -6,6 +6,7 @@ import SummaryTab from './SummaryTab';
 import ChatTab from './ChatTab';
 import KeywordTab from './KeywordTab';
 import { useAuthStore } from '@/stores/authStore';
+import { useI18n } from '@/lib/i18n';
 
 type Tab = 'summary' | 'chat' | 'keyword';
 
@@ -16,6 +17,7 @@ export default function AiPanel({
   onManualSummary?: () => void;
   onInjectKeywords?: (keywords: string[]) => Promise<void> | void;
 }) {
+  const { t } = useI18n();
   // 用户组是否开通实时摘要（缺省 → 放行；服务端才是权威门禁）。未开通则隐藏 Summary 标签页。
   const realtimeSummaryEnabled = useAuthStore(
     (s) => s.quotas?.featureFlags?.allowRealtimeSummary !== false
@@ -37,13 +39,13 @@ export default function AiPanel({
       ? [
           {
             key: 'summary' as const,
-            label: 'Summary',
+            label: t('aiPanel.summary'),
             icon: <Sparkles className="w-3.5 h-3.5" />,
           },
         ]
       : []),
-    { key: 'chat', label: 'Chat', icon: <MessageSquare className="w-3.5 h-3.5" /> },
-    { key: 'keyword', label: 'Keywords', icon: <Tag className="w-3.5 h-3.5" /> },
+    { key: 'chat', label: t('aiPanel.chat'), icon: <MessageSquare className="w-3.5 h-3.5" /> },
+    { key: 'keyword', label: t('aiPanel.keywords'), icon: <Tag className="w-3.5 h-3.5" /> },
   ];
 
   return (

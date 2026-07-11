@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { useExitAnimation } from '@/hooks/useExitAnimation';
+import { useI18n } from '@/lib/i18n';
 import ActionSheet, { type ActionSheetItem } from '@/components/mobile/ActionSheet';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -99,6 +100,7 @@ export default function FoldersPage() {
   const { token } = useAuth();
   const router = useRouter();
   const isMobile = useIsMobile();
+  const { t } = useI18n();
 
   /* ─── Data state ─── */
   const [folders, setFolders] = useState<FolderListItem[]>([]);
@@ -174,14 +176,14 @@ export default function FoldersPage() {
     try {
       const res = await fetch('/api/folders', { headers: authHeaders });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Failed to load folders');
+      if (!res.ok) throw new Error(data.error || t('foldersPage.loadFoldersFailed'));
       setFolders(Array.isArray(data) ? (data as FolderListItem[]) : []);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load folders');
+      setError(e instanceof Error ? e.message : t('foldersPage.loadFoldersFailed'));
     } finally {
       setLoading(false);
     }
-  }, [authHeaders, token]);
+  }, [authHeaders, token, t]);
 
   const loadUnarchivedSessions = useCallback(async () => {
     if (!token) return;
@@ -282,16 +284,16 @@ export default function FoldersPage() {
         body: JSON.stringify({ name: newFolderName, parentId: null }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Failed to create folder');
+      if (!res.ok) throw new Error(data.error || t('foldersPage.createFolderFailed'));
       setNewFolderName('');
       setShowCreateModal(false);
-      setSuccess('Folder created');
-      toast.success('Folder created');
+      setSuccess(t('foldersPage.folderCreated'));
+      toast.success(t('foldersPage.folderCreated'));
       await loadFolders();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to create folder';
+      const msg = e instanceof Error ? e.message : t('foldersPage.createFolderFailed');
       setError(msg);
-      toast.error('Failed to create folder', e instanceof Error ? e.message : undefined);
+      toast.error(t('foldersPage.createFolderFailed'), e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -323,13 +325,13 @@ export default function FoldersPage() {
         body: JSON.stringify({ name: trimmed }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Rename failed');
-      setSuccess('Renamed successfully');
-      toast.success('Renamed successfully');
+      if (!res.ok) throw new Error(data.error || t('foldersPage.renameFailed'));
+      setSuccess(t('foldersPage.renamedSuccessfully'));
+      toast.success(t('foldersPage.renamedSuccessfully'));
       await loadFolders();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Rename failed');
-      toast.error('Rename failed', e instanceof Error ? e.message : undefined);
+      setError(e instanceof Error ? e.message : t('foldersPage.renameFailed'));
+      toast.error(t('foldersPage.renameFailed'), e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
       setRenamingId(null);
@@ -361,17 +363,21 @@ export default function FoldersPage() {
         body: JSON.stringify({ ids }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Delete failed');
+      if (!res.ok) throw new Error(data.error || t('foldersPage.deleteFailed'));
       const msg = data.blocked?.length
-        ? `Deleted ${data.deleted}, ${data.blocked.length} non-empty folder(s) skipped: ${data.blocked.join(', ')}`
-        : `Deleted ${data.deleted} folder${data.deleted > 1 ? 's' : ''}`;
+        ? t('foldersPage.deletedFoldersPartial', {
+            deleted: data.deleted,
+            blocked: data.blocked.length,
+            names: data.blocked.join(', '),
+          })
+        : t('foldersPage.deletedFolders', { count: data.deleted });
       setSuccess(msg);
       toast.success(msg);
       clearSelection();
       await loadFolders();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Delete failed');
-      toast.error('Delete failed', e instanceof Error ? e.message : undefined);
+      setError(e instanceof Error ? e.message : t('foldersPage.deleteFailed'));
+      toast.error(t('foldersPage.deleteFailed'), e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -386,14 +392,14 @@ export default function FoldersPage() {
         headers: authHeaders,
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Delete failed');
-      setSuccess('Folder deleted');
-      toast.success('Folder deleted');
+      if (!res.ok) throw new Error(data.error || t('foldersPage.deleteFailed'));
+      setSuccess(t('foldersPage.folderDeleted'));
+      toast.success(t('foldersPage.folderDeleted'));
       clearSelection();
       await loadFolders();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Delete failed');
-      toast.error('Delete failed', e instanceof Error ? e.message : undefined);
+      setError(e instanceof Error ? e.message : t('foldersPage.deleteFailed'));
+      toast.error(t('foldersPage.deleteFailed'), e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -413,7 +419,7 @@ export default function FoldersPage() {
   const handleRenameFolderMobile = useCallback(async (id: string) => {
     if (!token) return;
     const folder = folders.find((item) => item.id === id);
-    const nextName = window.prompt('Rename folder', folder?.name || '');
+    const nextName = window.prompt(t('foldersPage.renameFolder'), folder?.name || '');
     const trimmed = nextName?.trim();
     if (!trimmed) {
       return;
@@ -428,29 +434,29 @@ export default function FoldersPage() {
         body: JSON.stringify({ name: trimmed }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Rename failed');
-      setSuccess('Renamed successfully');
-      toast.success('Renamed successfully');
+      if (!res.ok) throw new Error(data.error || t('foldersPage.renameFailed'));
+      setSuccess(t('foldersPage.renamedSuccessfully'));
+      toast.success(t('foldersPage.renamedSuccessfully'));
       await loadFolders();
     } catch (error) {
-      setError(error instanceof Error ? error.message : 'Rename failed');
-      toast.error('Rename failed', error instanceof Error ? error.message : undefined);
+      setError(error instanceof Error ? error.message : t('foldersPage.renameFailed'));
+      toast.error(t('foldersPage.renameFailed'), error instanceof Error ? error.message : undefined);
     } finally {
       setSaving(false);
     }
-  }, [authHeaders, folders, loadFolders, token]);
+  }, [authHeaders, folders, loadFolders, token, t]);
 
   /* ─── Clipboard operations ─── */
   const handleCopy = (ids: string[]) => {
     setClipboard({ ids: ids.filter((id) => id !== UNARCHIVED_ID), mode: 'copy' });
     setCtxMenu(null);
-    setSuccess('Copied');
+    setSuccess(t('foldersPage.copiedToast'));
   };
 
   const handleCut = (ids: string[]) => {
     setClipboard({ ids: ids.filter((id) => id !== UNARCHIVED_ID), mode: 'cut' });
     setCtxMenu(null);
-    setSuccess('Cut');
+    setSuccess(t('foldersPage.cutToast'));
   };
 
   const handlePaste = async (targetParentId: string | null) => {
@@ -467,17 +473,17 @@ export default function FoldersPage() {
         });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          throw new Error(data.error || `Failed to move ${id}`);
+          throw new Error(data.error || t('foldersPage.moveFailed'));
         }
       }
-      const msg = `Moved ${clipboard.ids.length} folder${clipboard.ids.length > 1 ? 's' : ''}`;
+      const msg = t('foldersPage.movedFolders', { count: clipboard.ids.length });
       setSuccess(msg);
       toast.success(msg);
       if (clipboard.mode === 'cut') setClipboard(null);
       await loadFolders();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Paste failed');
-      toast.error('Paste failed', e instanceof Error ? e.message : undefined);
+      setError(e instanceof Error ? e.message : t('foldersPage.pasteFailed'));
+      toast.error(t('foldersPage.pasteFailed'), e instanceof Error ? e.message : undefined);
     } finally {
       setSaving(false);
     }
@@ -489,8 +495,8 @@ export default function FoldersPage() {
     if (!id) return;
     const url = `${window.location.origin}/folders/${id}`;
     navigator.clipboard.writeText(url).then(() => {
-      setSuccess('Folder link copied!');
-      toast.success('Folder link copied!');
+      setSuccess(t('foldersPage.folderLinkCopied'));
+      toast.success(t('foldersPage.folderLinkCopied'));
     });
   };
 
@@ -645,7 +651,7 @@ export default function FoldersPage() {
         : [ctxMenu.folderId];
 
       items.push({
-        label: 'Open Folder',
+        label: t('foldersPage.openFolder'),
         icon: <FolderOpen className="h-3.5 w-3.5" />,
         action: () => {
           router.push(`/folders/${ctxMenu.folderId}`);
@@ -653,35 +659,35 @@ export default function FoldersPage() {
         },
       });
       items.push({
-        label: 'Rename',
+        label: t('foldersPage.rename'),
         icon: <Pencil className="h-3.5 w-3.5" />,
         action: () => startRename(ctxMenu.folderId!),
         disabled: targetIds.length > 1,
       });
       items.push({
-        label: 'Copy',
+        label: t('common.copy'),
         icon: <Copy className="h-3.5 w-3.5" />,
         action: () => handleCopy(targetIds),
       });
       items.push({
-        label: 'Cut',
+        label: t('foldersPage.cutAction'),
         icon: <Clipboard className="h-3.5 w-3.5" />,
         action: () => handleCut(targetIds),
       });
       if (clipboard && clipboard.ids.length > 0) {
         items.push({
-          label: `Paste into folder (${clipboard.ids.length})`,
+          label: t('foldersPage.pasteIntoFolder', { count: clipboard.ids.length }),
           icon: <ClipboardPaste className="h-3.5 w-3.5" />,
           action: () => void handlePaste(ctxMenu.folderId),
         });
       }
       items.push({
-        label: 'Share',
+        label: t('foldersPage.share'),
         icon: <Share2 className="h-3.5 w-3.5" />,
         action: () => {
           if (ctxMenu.folderId) {
             const url = `${window.location.origin}/folders/${ctxMenu.folderId}`;
-            navigator.clipboard.writeText(url).then(() => setSuccess('Folder link copied!'));
+            navigator.clipboard.writeText(url).then(() => setSuccess(t('foldersPage.folderLinkCopied')));
           }
           setCtxMenu(null);
         },
@@ -689,7 +695,7 @@ export default function FoldersPage() {
       });
       // 属性（仅单选时可用）
       items.push({
-        label: 'Properties',
+        label: t('foldersPage.properties'),
         icon: <Info className="h-3.5 w-3.5" />,
         action: () => {
           const f = folders.find((f) => f.id === ctxMenu.folderId);
@@ -699,7 +705,7 @@ export default function FoldersPage() {
         disabled: targetIds.length > 1,
       });
       items.push({
-        label: targetIds.length > 1 ? `Delete ${targetIds.length} items` : 'Delete',
+        label: targetIds.length > 1 ? t('foldersPage.deleteItems', { count: targetIds.length }) : t('common.delete'),
         icon: <Trash2 className="h-3.5 w-3.5" />,
         action: () => {
           setCtxMenu(null);
@@ -713,7 +719,7 @@ export default function FoldersPage() {
       });
     } else {
       items.push({
-        label: 'New Folder',
+        label: t('foldersPage.newFolder'),
         icon: <Plus className="h-3.5 w-3.5" />,
         action: () => {
           setCtxMenu(null);
@@ -722,7 +728,7 @@ export default function FoldersPage() {
       });
       if (clipboard && clipboard.ids.length > 0) {
         items.push({
-          label: `Paste to root (${clipboard.ids.length})`,
+          label: t('foldersPage.pasteToRoot', { count: clipboard.ids.length }),
           icon: <ClipboardPaste className="h-3.5 w-3.5" />,
           action: () => void handlePaste(null),
         });
@@ -731,7 +737,7 @@ export default function FoldersPage() {
 
     return items;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ctxMenu, selectedIds, clipboard, folders]);
+  }, [ctxMenu, selectedIds, clipboard, folders, t]);
 
   // Retain the last non-empty menu items so the menu stays populated during the leave animation.
   const lastCtxMenuItemsRef = useRef<typeof ctxMenuItems>([]);
@@ -743,7 +749,7 @@ export default function FoldersPage() {
       ? [
           {
             key: 'open-unarchived',
-            label: 'Open unarchived recordings',
+            label: t('foldersPage.openUnarchived'),
             icon: <Inbox className="h-4 w-4" />,
             onSelect: () => router.push('/folders/unarchived'),
           },
@@ -751,28 +757,28 @@ export default function FoldersPage() {
       : [
           {
             key: 'open',
-            label: 'Open folder',
+            label: t('foldersPage.openFolder'),
             icon: <FolderOpen className="h-4 w-4" />,
             onSelect: () => router.push(`/folders/${mobileActionFolderId}`),
           },
           {
             key: 'rename',
-            label: 'Rename',
+            label: t('foldersPage.rename'),
             icon: <Pencil className="h-4 w-4" />,
             onSelect: () => void handleRenameFolderMobile(mobileActionFolderId),
           },
           {
             key: 'share',
-            label: 'Copy folder link',
+            label: t('foldersPage.copyFolderLink'),
             icon: <Share2 className="h-4 w-4" />,
             onSelect: () => {
               const url = `${window.location.origin}/folders/${mobileActionFolderId}`;
-              void navigator.clipboard.writeText(url).then(() => setSuccess('Folder link copied!'));
+              void navigator.clipboard.writeText(url).then(() => setSuccess(t('foldersPage.folderLinkCopied')));
             },
           },
           {
             key: 'properties',
-            label: 'Properties',
+            label: t('foldersPage.properties'),
             icon: <Info className="h-4 w-4" />,
             onSelect: () => {
               const folder = folders.find((item) => item.id === mobileActionFolderId);
@@ -783,7 +789,7 @@ export default function FoldersPage() {
           },
           {
             key: 'delete',
-            label: 'Delete',
+            label: t('common.delete'),
             icon: <Trash2 className="h-4 w-4" />,
             danger: true,
             onSelect: () => void handleDeleteSingle(mobileActionFolderId),
@@ -813,9 +819,9 @@ export default function FoldersPage() {
         <header className="sticky top-0 z-20 border-b border-cream-200 bg-white/95 px-4 py-4 backdrop-blur-md">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <h1 className="font-serif text-xl font-bold text-charcoal-800">Folders</h1>
+              <h1 className="font-serif text-xl font-bold text-charcoal-800">{t('nav.folders')}</h1>
               <p className="text-xs text-charcoal-400">
-                {folders.length} folder{folders.length !== 1 ? 's' : ''}
+                {t('foldersPage.folderCount', { count: folders.length })}
               </p>
             </div>
             <button
@@ -823,7 +829,7 @@ export default function FoldersPage() {
               className="inline-flex items-center gap-2 rounded-full bg-rust-500 px-4 py-2 text-sm font-semibold text-white shadow-sm shadow-rust-500/20"
             >
               <Plus className="h-4 w-4" />
-              New
+              {t('foldersPage.newShort')}
             </button>
           </div>
         </header>
@@ -847,9 +853,9 @@ export default function FoldersPage() {
           {rootFolders.length === 0 && unarchivedSessions.length === 0 ? (
             <div className="rounded-3xl border border-dashed border-cream-300 bg-white px-6 py-16 text-center animate-fade-in-up">
               <FolderOpen className="mx-auto mb-3 h-10 w-10 text-charcoal-200 animate-breathe" />
-              <p className="text-sm font-medium text-charcoal-500">No folders yet</p>
+              <p className="text-sm font-medium text-charcoal-500">{t('foldersPage.noFoldersYet')}</p>
               <p className="mt-1 text-xs text-charcoal-400">
-                Create your first folder to organize recordings by course or topic.
+                {t('foldersPage.noFoldersDesc')}
               </p>
             </div>
           ) : (
@@ -875,7 +881,11 @@ export default function FoldersPage() {
                       </span>
                     </div>
                     <p className="mt-1 text-xs text-charcoal-400">
-                      {folder.sessionCount} recordings · {folder.childCount} subfolders · {folder.keywordCount} keywords
+                      {t('foldersPage.mobileFolderSummary', {
+                        recordings: folder.sessionCount,
+                        subfolders: folder.childCount,
+                        keywords: folder.keywordCount,
+                      })}
                     </p>
                   </div>
                   <ChevronRight className="h-4 w-4 flex-shrink-0 text-charcoal-300" />
@@ -894,11 +904,11 @@ export default function FoldersPage() {
                     <div className="flex items-center gap-2">
                       <Inbox className="h-5 w-5 text-amber-600" />
                       <span className="truncate text-base font-semibold text-charcoal-800">
-                        Unarchived Recordings
+                        {t('foldersPage.unarchivedTitle')}
                       </span>
                     </div>
                     <p className="mt-1 text-xs text-charcoal-500">
-                      {unarchivedSessions.length} recordings not assigned to a folder
+                      {t('foldersPage.unarchivedNotAssigned', { count: unarchivedSessions.length })}
                     </p>
                   </div>
                   <ChevronRight className="h-4 w-4 flex-shrink-0 text-charcoal-300" />
@@ -911,7 +921,7 @@ export default function FoldersPage() {
         <ActionSheet
           open={mobileActionFolderId !== null}
           onClose={() => setMobileActionFolderId(null)}
-          title="Folder actions"
+          title={t('foldersPage.folderActions')}
           items={mobileActionItems}
         />
 
@@ -927,28 +937,28 @@ export default function FoldersPage() {
               <div className="mb-4 flex items-center gap-2">
                 <FolderOpen className="h-5 w-5 text-rust-500" />
                 <h2 className="font-serif text-base font-bold text-charcoal-800">
-                  Folder Properties
+                  {t('foldersPage.folderProperties')}
                 </h2>
               </div>
               <div className="space-y-3 text-sm">
                 <div className="flex justify-between border-b border-cream-100 pb-2">
-                  <span className="text-charcoal-400">Name</span>
+                  <span className="text-charcoal-400">{t('foldersPage.name')}</span>
                   <span className="font-medium text-charcoal-800">{propsFolder.name}</span>
                 </div>
                 <div className="flex justify-between border-b border-cream-100 pb-2">
-                  <span className="text-charcoal-400">Recordings</span>
+                  <span className="text-charcoal-400">{t('foldersPage.recordings')}</span>
                   <span className="font-medium text-charcoal-800">{propsFolder.sessionCount}</span>
                 </div>
                 <div className="flex justify-between border-b border-cream-100 pb-2">
-                  <span className="text-charcoal-400">Keywords</span>
+                  <span className="text-charcoal-400">{t('foldersPage.keywords')}</span>
                   <span className="font-medium text-charcoal-800">{propsFolder.keywordCount}</span>
                 </div>
                 <div className="flex justify-between border-b border-cream-100 pb-2">
-                  <span className="text-charcoal-400">Subfolders</span>
+                  <span className="text-charcoal-400">{t('foldersPage.subfolders')}</span>
                   <span className="font-medium text-charcoal-800">{propsFolder.childCount}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-charcoal-400">Created</span>
+                  <span className="text-charcoal-400">{t('foldersPage.created')}</span>
                   <span className="font-medium text-charcoal-800">{formatDate(propsFolder.createdAt)}</span>
                 </div>
               </div>
@@ -957,7 +967,7 @@ export default function FoldersPage() {
                   onClick={() => setPropertiesFolder(null)}
                   className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 transition-colors hover:bg-cream-100"
                 >
-                  Close
+                  {t('common.close')}
                 </button>
               </div>
             </div>
@@ -974,7 +984,7 @@ export default function FoldersPage() {
               onClick={(e) => e.stopPropagation()}
             >
               <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">
-                New Folder
+                {t('foldersPage.newFolder')}
               </h2>
               <input
                 type="text"
@@ -984,7 +994,7 @@ export default function FoldersPage() {
                   if (e.key === 'Enter' && newFolderName.trim()) void handleCreateFolder();
                   if (e.key === 'Escape') setShowCreateModal(false);
                 }}
-                placeholder="Folder name..."
+                placeholder={t('foldersPage.folderNamePlaceholder')}
                 autoFocus
                 className="w-full rounded-lg border border-cream-300 px-3 py-2 text-sm text-charcoal-700 outline-none transition-colors focus:border-rust-300 focus:ring-1 focus:ring-rust-200"
               />
@@ -993,7 +1003,7 @@ export default function FoldersPage() {
                   onClick={() => setShowCreateModal(false)}
                   className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 transition-colors hover:bg-cream-100"
                 >
-                  Cancel
+                  {t('common.cancel')}
                 </button>
                 <button
                   onClick={() => void handleCreateFolder()}
@@ -1005,7 +1015,7 @@ export default function FoldersPage() {
                   ) : (
                     <Plus className="h-3.5 w-3.5" />
                   )}
-                  Create
+                  {t('common.create')}
                 </button>
               </div>
             </div>
@@ -1021,9 +1031,9 @@ export default function FoldersPage() {
       <header className="flex flex-shrink-0 items-center justify-between border-b border-cream-200 bg-white px-6 py-3">
         <div className="flex items-center gap-3">
           <Folders className="h-5 w-5 text-rust-500" />
-          <h1 className="font-serif text-lg font-bold text-charcoal-800">Folders</h1>
+          <h1 className="font-serif text-lg font-bold text-charcoal-800">{t('nav.folders')}</h1>
           <span className="text-xs text-charcoal-400">
-            {folders.length} folder{folders.length !== 1 ? 's' : ''}
+            {t('foldersPage.folderCount', { count: folders.length })}
           </span>
         </div>
 
@@ -1031,18 +1041,18 @@ export default function FoldersPage() {
           {/* 选中文件夹时显示的操作按钮 */}
           {hasDeletableSelection && (
             <>
-              <FolderExpandBtn icon={<Pencil className="w-3.5 h-3.5" />} label="Rename" title="Rename" variant="default"
+              <FolderExpandBtn icon={<Pencil className="w-3.5 h-3.5" />} label={t('foldersPage.rename')} title={t('foldersPage.rename')} variant="default"
                 onClick={() => { if (singleDeletableId) startRename(singleDeletableId); }} disabled={!singleDeletableId} />
-              <FolderExpandBtn icon={<Share2 className="w-3.5 h-3.5" />} label="Share" title="Share link" variant="default"
+              <FolderExpandBtn icon={<Share2 className="w-3.5 h-3.5" />} label={t('foldersPage.share')} title={t('foldersPage.shareLink')} variant="default"
                 onClick={handleShareFolder} disabled={!singleDeletableId} />
-              <FolderExpandBtn icon={<EllipsisVertical className="w-3.5 h-3.5" />} label="" title="More" variant="default"
+              <FolderExpandBtn icon={<EllipsisVertical className="w-3.5 h-3.5" />} label="" title={t('foldersPage.more')} variant="default"
                 onClick={handleMoreFolderClick} disabled={!singleDeletableId} noExpand />
-              <FolderExpandBtn icon={<Trash2 className="w-3.5 h-3.5" />} label={`Delete (${deletableIds.length})`} title="Delete" variant="danger"
+              <FolderExpandBtn icon={<Trash2 className="w-3.5 h-3.5" />} label={t('foldersPage.deleteWithCount', { count: deletableIds.length })} title={t('common.delete')} variant="danger"
                 onClick={() => void handleDeleteSelected()} disabled={saving} />
             </>
           )}
 
-          <FolderExpandBtn icon={<Plus className="w-3.5 h-3.5" />} label="New Folder" title="New Folder" variant="primary"
+          <FolderExpandBtn icon={<Plus className="w-3.5 h-3.5" />} label={t('foldersPage.newFolder')} title={t('foldersPage.newFolder')} variant="primary"
             onClick={() => setShowCreateModal(true)} />
         </div>
       </header>
@@ -1075,14 +1085,14 @@ export default function FoldersPage() {
         {loading ? (
           <div className="flex h-full items-center justify-center text-sm text-charcoal-400">
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            Loading...
+            {t('common.loading')}
           </div>
         ) : rootFolders.length === 0 && unarchivedSessions.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center text-center animate-fade-in-up">
             <FolderOpen className="mb-3 h-12 w-12 text-charcoal-200 animate-breathe" />
-            <p className="text-sm text-charcoal-500">No folders yet</p>
+            <p className="text-sm text-charcoal-500">{t('foldersPage.noFoldersYet')}</p>
             <p className="mt-1 text-xs text-charcoal-300">
-              Create your first folder to organize recordings by course or topic.
+              {t('foldersPage.noFoldersDesc')}
             </p>
           </div>
         ) : (
@@ -1145,7 +1155,7 @@ export default function FoldersPage() {
                       />
                     </button>
                     <span className="truncate text-sm font-medium text-charcoal-800">
-                      Unarchived Recordings
+                      {t('foldersPage.unarchivedTitle')}
                     </span>
                     <span className="rounded-full bg-amber-200 px-2 py-0.5 text-[11px] font-medium text-amber-700">
                       {unarchivedSessions.length}
@@ -1199,38 +1209,38 @@ export default function FoldersPage() {
             <div className="mb-4 flex items-center gap-2">
               <FolderOpen className="h-5 w-5 text-rust-500" />
               <h2 className="font-serif text-base font-bold text-charcoal-800">
-                Folder Properties
+                {t('foldersPage.folderProperties')}
               </h2>
             </div>
             <div className="space-y-3 text-sm">
               <div className="flex justify-between border-b border-cream-100 pb-2">
-                <span className="text-charcoal-400">Name</span>
+                <span className="text-charcoal-400">{t('foldersPage.name')}</span>
                 <span className="font-medium text-charcoal-800">{propsFolder.name}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
-                <span className="text-charcoal-400">Recordings</span>
+                <span className="text-charcoal-400">{t('foldersPage.recordings')}</span>
                 <span className="font-medium text-charcoal-800">{propsFolder.sessionCount}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
-                <span className="text-charcoal-400">Keywords</span>
+                <span className="text-charcoal-400">{t('foldersPage.keywords')}</span>
                 <span className="font-medium text-charcoal-800">{propsFolder.keywordCount}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
-                <span className="text-charcoal-400">Subfolders</span>
+                <span className="text-charcoal-400">{t('foldersPage.subfolders')}</span>
                 <span className="font-medium text-charcoal-800">{propsFolder.childCount}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
-                <span className="text-charcoal-400">Depth</span>
+                <span className="text-charcoal-400">{t('foldersPage.depth')}</span>
                 <span className="font-medium text-charcoal-800">{propsFolder.depth}</span>
               </div>
               <div className="flex justify-between border-b border-cream-100 pb-2">
-                <span className="text-charcoal-400">Path</span>
+                <span className="text-charcoal-400">{t('foldersPage.path')}</span>
                 <span className="font-medium text-charcoal-800 text-right max-w-[200px] truncate">
                   {propsFolder.path.join(' / ') || '/'}
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-charcoal-400">Created</span>
+                <span className="text-charcoal-400">{t('foldersPage.created')}</span>
                 <span className="font-medium text-charcoal-800">{formatDate(propsFolder.createdAt)}</span>
               </div>
             </div>
@@ -1239,7 +1249,7 @@ export default function FoldersPage() {
                 onClick={() => setPropertiesFolder(null)}
                 className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 transition-colors hover:bg-cream-100"
               >
-                Close
+                {t('common.close')}
               </button>
             </div>
           </div>
@@ -1257,7 +1267,7 @@ export default function FoldersPage() {
             onClick={(e) => e.stopPropagation()}
           >
             <h2 className="mb-4 font-serif text-base font-bold text-charcoal-800">
-              New Folder
+              {t('foldersPage.newFolder')}
             </h2>
             <input
               type="text"
@@ -1267,7 +1277,7 @@ export default function FoldersPage() {
                 if (e.key === 'Enter' && newFolderName.trim()) void handleCreateFolder();
                 if (e.key === 'Escape') setShowCreateModal(false);
               }}
-              placeholder="Folder name..."
+              placeholder={t('foldersPage.folderNamePlaceholder')}
               autoFocus
               className="w-full rounded-lg border border-cream-300 px-3 py-2 text-sm text-charcoal-700 outline-none transition-colors focus:border-rust-300 focus:ring-1 focus:ring-rust-200"
             />
@@ -1276,7 +1286,7 @@ export default function FoldersPage() {
                 onClick={() => setShowCreateModal(false)}
                 className="rounded-lg border border-cream-300 px-4 py-1.5 text-sm text-charcoal-500 transition-colors hover:bg-cream-100"
               >
-                Cancel
+                {t('common.cancel')}
               </button>
               <button
                 onClick={() => void handleCreateFolder()}
@@ -1288,7 +1298,7 @@ export default function FoldersPage() {
                 ) : (
                   <Plus className="h-3.5 w-3.5" />
                 )}
-                Create
+                {t('common.create')}
               </button>
             </div>
           </div>
@@ -1297,15 +1307,15 @@ export default function FoldersPage() {
 
       <ConfirmDialog
         open={!!pendingDelete}
-        title="Delete folder"
+        title={t('foldersPage.deleteFolder')}
         message={
           pendingDelete?.kind === 'batch'
-            ? `Delete ${pendingDelete.ids.length} folder${pendingDelete.ids.length > 1 ? 's' : ''}? Only empty folders can be deleted.`
+            ? t('foldersPage.deleteFoldersConfirm', { count: pendingDelete.ids.length })
             : pendingDelete?.kind === 'single'
-              ? `Delete "${pendingDelete.name}"? (Must be empty)`
+              ? t('foldersPage.deleteFolderConfirmSingle', { name: pendingDelete.name })
               : undefined
         }
-        confirmText="Delete"
+        confirmText={t('common.delete')}
         danger
         loading={saving}
         onConfirm={handleDeleteConfirm}

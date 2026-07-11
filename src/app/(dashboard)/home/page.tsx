@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/hooks/useAuth';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useI18n, type Locale } from '@/lib/i18n';
 import NewSessionModal from '@/components/NewSessionModal';
 import BackgroundTasksIndicator from '@/components/BackgroundTasksIndicator';
 import {
@@ -37,56 +38,77 @@ interface FolderItem {
   id: string;
 }
 
-/* ───────── 时间段问候语系统 ───────── */
+/* ───────── 时间段问候语系统（按语言切换） ─────────
+   中文：应景古诗，每个时段 3 套；英文：意境相近的短句 3 套。
+   每个时段用「日期×24＋小时」作伪随机种子选一句，每小时轮换。 */
 interface Greeting {
   title: string;
   subtitle: string;
 }
 
-const greetings: Record<string, Greeting[]> = {
-  // 6:00 - 11:59
-  morning: [
-    { title: 'Good morning, early bird', subtitle: 'The best ideas come with the morning light.' },
-    { title: 'Rise and learn', subtitle: 'A fresh day, a fresh page of notes.' },
-    { title: 'Morning momentum', subtitle: 'Start capturing knowledge while the mind is sharp.' },
-    { title: 'Dawn of discovery', subtitle: 'Every lecture is a new adventure waiting to begin.' },
-    { title: 'Sunrise scholar', subtitle: 'The world is quiet — perfect time to focus.' },
-  ],
-  // 12:00 - 13:59
-  midday: [
-    { title: 'Afternoon plus', subtitle: 'Keep the momentum going through the midday sun.' },
-    { title: 'Lunch break learner', subtitle: 'Fuel the body, feed the mind.' },
-    { title: 'Noon notes', subtitle: 'Half the day down, twice the knowledge gained.' },
-    { title: 'Midday mind', subtitle: 'A quick review before the afternoon rush.' },
-  ],
-  // 14:00 - 17:59
-  afternoon: [
-    { title: 'Golden hour study', subtitle: 'The afternoon light pairs well with deep thinking.' },
-    { title: 'Afternoon flow', subtitle: 'You\'re in the zone — don\'t stop now.' },
-    { title: 'Late day scholar', subtitle: 'The best conversations happen after 2 PM.' },
-    { title: 'Sunset prep', subtitle: 'Capture today\'s lessons before the day fades.' },
-    { title: 'Tea time transcripts', subtitle: 'Sip, listen, and let the words flow.' },
-  ],
-  // 18:00 - 21:59
-  evening: [
-    { title: 'Evening reflections', subtitle: 'Review the day\'s discoveries while they\'re still warm.' },
-    { title: 'Twilight thinker', subtitle: 'The quiet evening is perfect for deep learning.' },
-    { title: 'Night school vibes', subtitle: 'Some of the best insights come after dark.' },
-    { title: 'Moonlit studies', subtitle: 'Let the calm of evening sharpen your focus.' },
-    { title: 'Dusk & documents', subtitle: 'Wind down the day, but keep the curiosity alive.' },
-  ],
-  // 22:00 - 5:59
-  lateNight: [
-    { title: 'Night owl mode', subtitle: 'The city sleeps, but your mind is wide awake.' },
-    { title: 'Midnight scholar', subtitle: 'Great minds work while the world dreams.' },
-    { title: 'Burning the midnight oil', subtitle: 'Dedication has no curfew.' },
-    { title: 'After hours genius', subtitle: 'Silence is the best classroom.' },
-    { title: 'Stars & syllables', subtitle: 'Under the night sky, every word counts more.' },
-    { title: 'Nocturnal notes', subtitle: 'The late-night study hits different.' },
-  ],
+const greetingsByLocale: Record<Locale, Record<string, Greeting[]>> = {
+  zh: {
+    // 6:00 - 11:59 晨
+    morning: [
+      { title: '晨光熹微', subtitle: '春眠不觉晓，处处闻啼鸟。——孟浩然' },
+      { title: '初日高林', subtitle: '清晨入古寺，初日照高林。——常建' },
+      { title: '朝辞彩云', subtitle: '朝辞白帝彩云间，千里江陵一日还。——李白' },
+    ],
+    // 12:00 - 13:59 午
+    midday: [
+      { title: '日正当午', subtitle: '锄禾日当午，汗滴禾下土。——李绅' },
+      { title: '绿树夏长', subtitle: '绿树阴浓夏日长，楼台倒影入池塘。——高骈' },
+      { title: '篱落无人', subtitle: '日长篱落无人过，惟有蜻蜓蛱蝶飞。——范成大' },
+    ],
+    // 14:00 - 17:59 午后 · 斜阳
+    afternoon: [
+      { title: '半江瑟瑟', subtitle: '一道残阳铺水中，半江瑟瑟半江红。——白居易' },
+      { title: '枫林晚照', subtitle: '停车坐爱枫林晚，霜叶红于二月花。——杜牧' },
+      { title: '夕阳无限', subtitle: '夕阳无限好，只是近黄昏。——李商隐' },
+    ],
+    // 18:00 - 21:59 暮
+    evening: [
+      { title: '空山新雨', subtitle: '空山新雨后，天气晚来秋。——王维' },
+      { title: '日暮客愁', subtitle: '移舟泊烟渚，日暮客愁新。——孟浩然' },
+      { title: '江枫渔火', subtitle: '月落乌啼霜满天，江枫渔火对愁眠。——张继' },
+    ],
+    // 22:00 - 5:59 深夜
+    lateNight: [
+      { title: '床前明月', subtitle: '床前明月光，疑是地上霜。——李白' },
+      { title: '西窗夜雨', subtitle: '何当共剪西窗烛，却话巴山夜雨时。——李商隐' },
+      { title: '银烛秋光', subtitle: '银烛秋光冷画屏，轻罗小扇扑流萤。——杜牧' },
+    ],
+  },
+  en: {
+    morning: [
+      { title: 'Good morning, early bird', subtitle: 'The best ideas come with the morning light.' },
+      { title: 'Dawn of discovery', subtitle: 'Every lecture is a new adventure waiting to begin.' },
+      { title: 'Sunrise scholar', subtitle: 'The world is quiet — perfect time to focus.' },
+    ],
+    midday: [
+      { title: 'Afternoon plus', subtitle: 'Keep the momentum going through the midday sun.' },
+      { title: 'Noon notes', subtitle: 'Half the day down, twice the knowledge gained.' },
+      { title: 'Midday mind', subtitle: 'A quick review before the afternoon rush.' },
+    ],
+    afternoon: [
+      { title: 'Golden hour study', subtitle: 'The afternoon light pairs well with deep thinking.' },
+      { title: 'Afternoon flow', subtitle: 'You\'re in the zone — don\'t stop now.' },
+      { title: 'Tea time transcripts', subtitle: 'Sip, listen, and let the words flow.' },
+    ],
+    evening: [
+      { title: 'Evening reflections', subtitle: 'Review the day\'s discoveries while they\'re still warm.' },
+      { title: 'Twilight thinker', subtitle: 'The quiet evening is perfect for deep learning.' },
+      { title: 'Moonlit studies', subtitle: 'Let the calm of evening sharpen your focus.' },
+    ],
+    lateNight: [
+      { title: 'Night owl mode', subtitle: 'The city sleeps, but your mind is wide awake.' },
+      { title: 'Midnight scholar', subtitle: 'Great minds work while the world dreams.' },
+      { title: 'Stars & syllables', subtitle: 'Under the night sky, every word counts more.' },
+    ],
+  },
 };
 
-function getGreeting(): Greeting {
+function getGreeting(locale: Locale): Greeting {
   const hour = new Date().getHours();
   let period: string;
   if (hour >= 6 && hour < 12) period = 'morning';
@@ -95,7 +117,7 @@ function getGreeting(): Greeting {
   else if (hour >= 18 && hour < 22) period = 'evening';
   else period = 'lateNight';
 
-  const pool = greetings[period];
+  const pool = (greetingsByLocale[locale] ?? greetingsByLocale.en)[period];
   // 使用日期 + 小时作为伪随机种子，每小时变一次
   const seed = new Date().getDate() * 24 + hour;
   return pool[seed % pool.length];
@@ -104,6 +126,7 @@ function getGreeting(): Greeting {
 export default function HomePage() {
   const router = useRouter();
   const isMobile = useIsMobile();
+  const { t, locale } = useI18n();
   const { token, fetchQuotas } = useAuth();
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [stats, setStats] = useState<{ totalCount: number; totalDurationMs: number } | null>(null);
@@ -115,7 +138,7 @@ export default function HomePage() {
   const listContainerRef = useRef<HTMLDivElement>(null);
   const [listLayout, setListLayout] = useState({ visibleCount: 100, paddingY: 14 });
 
-  const greeting = useMemo(() => getGreeting(), []);
+  const greeting = useMemo(() => getGreeting(locale), [locale]);
 
   useEffect(() => {
     if (!token) return;
@@ -166,22 +189,25 @@ export default function HomePage() {
 
   const formatDuration = (ms: number) => {
     const min = Math.floor(ms / 60000);
-    if (min < 1) return '< 1 min';
+    if (min < 1) return locale === 'zh' ? '< 1 分钟' : '< 1 min';
     if (min >= 60) {
       const h = Math.floor(min / 60);
       const m = min % 60;
+      if (locale === 'zh') return m > 0 ? `${h} 小时 ${m} 分` : `${h} 小时`;
       return m > 0 ? `${h}h ${m}m` : `${h}h`;
     }
-    return `${min} min`;
+    return locale === 'zh' ? `${min} 分钟` : `${min} min`;
   };
 
   const formatDate = (dateStr: string) => {
     const d = new Date(dateStr);
-    return d.toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-    }).toUpperCase();
+    return d
+      .toLocaleDateString(locale === 'zh' ? 'zh-CN' : 'en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      })
+      .toUpperCase();
   };
 
   const formatRelativeDate = (dateStr: string) => {
@@ -191,9 +217,9 @@ export default function HomePage() {
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const target = new Date(d.getFullYear(), d.getMonth(), d.getDate());
     const diffDays = Math.round((today.getTime() - target.getTime()) / (1000 * 60 * 60 * 24));
-    if (diffDays === 0) return 'Today';
-    if (diffDays === 1) return 'Yesterday';
-    if (diffDays < 7) return `${diffDays} days ago`;
+    if (diffDays === 0) return t('home.today');
+    if (diffDays === 1) return t('home.yesterday');
+    if (diffDays < 7) return t('home.daysAgo', { n: diffDays });
     return formatDate(dateStr);
   };
 
@@ -297,7 +323,7 @@ export default function HomePage() {
               <div className="flex items-center gap-2 mb-1">
                 <Sparkles className="w-5 h-5 text-rust-400" />
                 <span className="text-xs font-medium text-rust-400 tracking-wider uppercase">
-                  {new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}
+                  {new Date().toLocaleDateString(locale === 'zh' ? 'zh-CN' : 'en-US', { weekday: 'long', month: 'long', day: 'numeric' })}
                 </span>
               </div>
               <h1 className="font-serif text-3xl lg:text-4xl font-bold text-charcoal-800 mb-1.5 tracking-tight">
@@ -331,8 +357,8 @@ export default function HomePage() {
                   <Mic className="w-4 h-4" />
                 </div>
                 <div className="text-left">
-                  <div className="text-sm font-semibold leading-tight">New Session</div>
-                  <div className="text-[10px] text-white/70">Start recording</div>
+                  <div className="text-sm font-semibold leading-tight">{t('home.newSession')}</div>
+                  <div className="text-[10px] text-white/70">{t('home.startRecording')}</div>
                 </div>
               </button>
               <BackgroundTasksIndicator />
@@ -344,7 +370,7 @@ export default function HomePage() {
             <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-charcoal-300" />
             <input
               type="text"
-              placeholder="Search sessions, courses, or notes..."
+              placeholder={t('home.searchPlaceholder')}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-11 pr-4 py-2.5 rounded-xl border border-cream-300 bg-white/80 backdrop-blur-sm
@@ -357,14 +383,14 @@ export default function HomePage() {
           {/* Sessions 标题 */}
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-semibold text-charcoal-400 tracking-wider uppercase">
-              Recent Sessions
+              {t('home.recentSessions')}
             </h2>
             {filteredSessions.length > listLayout.visibleCount && (
               <Link
                 href="/folders"
                 className="text-xs font-medium text-rust-400 hover:text-rust-600 transition-colors"
               >
-                View all &rarr;
+                {t('home.viewAll')} &rarr;
               </Link>
             )}
           </div>
@@ -391,9 +417,9 @@ export default function HomePage() {
               <div className="w-16 h-16 rounded-2xl bg-cream-200/50 flex items-center justify-center mb-4 animate-breathe">
                 <FileText className="w-7 h-7 text-charcoal-300" />
               </div>
-              <p className="text-sm font-medium text-charcoal-500 mb-1">No sessions yet</p>
+              <p className="text-sm font-medium text-charcoal-500 mb-1">{t('home.noSessions')}</p>
               <p className="text-xs text-charcoal-400">
-                Start a new recording to see your sessions here
+                {t('home.noSessionsDesc')}
               </p>
             </div>
           ) : (
@@ -459,7 +485,7 @@ export default function HomePage() {
               </div>
               <div>
                 <div className="text-[10px] font-medium text-charcoal-400 tracking-wider uppercase">
-                  Sessions
+                  {t('home.sessions')}
                 </div>
                 <div className="text-lg font-bold text-charcoal-800 leading-tight">
                   {totalSessionsCount}
@@ -472,7 +498,7 @@ export default function HomePage() {
               </div>
               <div>
                 <div className="text-[10px] font-medium text-charcoal-400 tracking-wider uppercase">
-                  Recorded
+                  {t('home.recorded')}
                 </div>
                 <div className="text-lg font-bold text-charcoal-800 leading-tight">
                   {recordingTimeStr}
@@ -485,7 +511,7 @@ export default function HomePage() {
               </div>
               <div>
                 <div className="text-[10px] font-medium text-charcoal-400 tracking-wider uppercase">
-                  Folders
+                  {t('nav.folders')}
                 </div>
                 <div className="text-lg font-bold text-charcoal-800 leading-tight">
                   {folders.length}

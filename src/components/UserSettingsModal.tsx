@@ -46,6 +46,30 @@ export default function UserSettingsModal() {
   const [providerLoading, setProviderLoading] = useState(false);
   const [providerError, setProviderError] = useState(false);
 
+  // 摘要触发阈值：用本地字符串缓冲允许自由输入，失焦时才做「整数 + 最小值」收敛。
+  // 直接在 onChange 里 clamp 会在输入中途把小于下限的首位数字顶到下限（如给「20」打
+  // 「2」→ 立即变 4，永远打不出 20），故改为输入期只保留数字、失焦统一取整并夹到区间。
+  const [sentencesInput, setSentencesInput] = useState(String(settings.summaryTriggerSentences));
+  const [minutesInput, setMinutesInput] = useState(String(settings.summaryTriggerMinutes));
+
+  useEffect(() => {
+    setSentencesInput(String(settings.summaryTriggerSentences));
+  }, [settings.summaryTriggerSentences]);
+  useEffect(() => {
+    setMinutesInput(String(settings.summaryTriggerMinutes));
+  }, [settings.summaryTriggerMinutes]);
+
+  const commitSentences = () => {
+    const clamped = clampNumber(sentencesInput, settings.summaryTriggerSentences, 4, 40);
+    settings.setSummaryTriggerSentences(clamped);
+    setSentencesInput(String(clamped));
+  };
+  const commitMinutes = () => {
+    const clamped = clampNumber(minutesInput, settings.summaryTriggerMinutes, 1, 15);
+    settings.setSummaryTriggerMinutes(clamped);
+    setMinutesInput(String(clamped));
+  };
+
   useEffect(() => {
     setTermsInput(settings.terms.join(', '));
   }, [settings.terms]);
@@ -374,14 +398,16 @@ export default function UserSettingsModal() {
                   <label className="block text-xs text-charcoal-400 mb-1">{t('settings.triggerSentences')}</label>
                   <input
                     type="number"
+                    inputMode="numeric"
                     min={4}
                     max={40}
-                    value={settings.summaryTriggerSentences}
-                    onChange={(e) =>
-                      settings.setSummaryTriggerSentences(
-                        clampNumber(e.target.value, settings.summaryTriggerSentences, 4, 40)
-                      )
-                    }
+                    step={1}
+                    value={sentencesInput}
+                    onChange={(e) => setSentencesInput(e.target.value.replace(/[^\d]/g, ''))}
+                    onBlur={commitSentences}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') e.currentTarget.blur();
+                    }}
                     className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm"
                   />
                 </div>
@@ -390,14 +416,16 @@ export default function UserSettingsModal() {
                   <label className="block text-xs text-charcoal-400 mb-1">{t('settings.triggerMinutes')}</label>
                   <input
                     type="number"
+                    inputMode="numeric"
                     min={1}
                     max={15}
-                    value={settings.summaryTriggerMinutes}
-                    onChange={(e) =>
-                      settings.setSummaryTriggerMinutes(
-                        clampNumber(e.target.value, settings.summaryTriggerMinutes, 1, 15)
-                      )
-                    }
+                    step={1}
+                    value={minutesInput}
+                    onChange={(e) => setMinutesInput(e.target.value.replace(/[^\d]/g, ''))}
+                    onBlur={commitMinutes}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') e.currentTarget.blur();
+                    }}
                     className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm"
                   />
                 </div>

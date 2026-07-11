@@ -744,6 +744,15 @@ export default {
     finalSummary: 'Final summary:',
     allowRealtimeSummary: 'Allow realtime summary',
     allowFinalSummary: 'Allow final summary',
+    // Section titles + summary models (bound to the group; linked to the model catalog / global defaults in Settings > LLM)
+    sectionQuota: 'Quota',
+    allowedModelsHint: 'Only controls which models users can pick in chat; it does not affect which model does summaries/reports.',
+    realtimeSummaryModel: 'Realtime summary model',
+    finalSummaryModel: 'Final summary model',
+    followGlobal: 'Follow global default',
+    followGlobalWith: 'Follow global default ({name})',
+    staleModel: '(model unavailable)',
+    summaryModelHint: 'Sets which model actually does summaries/reports: blank = follow the global default for that purpose in Settings > LLM; this only overrides for this group.',
     enabled: 'On',
     disabled: 'Off',
     depth: {

@@ -52,6 +52,13 @@ export interface GroupPermissions {
   allowRealtimeSummary: boolean;
   /** 是否允许使用总摘要（结束时的结构化报告） */
   allowFinalSummary: boolean;
+  // ── 摘要专用模型（与用户组绑定）──
+  // 存的是 LlmModel 的 DB id；空串/缺省 = 「跟随全局默认」（该用途 isDefault 的模型）。
+  // 与 allowedModels 不同：allowedModels 只作用于聊天选择器，这两个才决定摘要/报告实际用哪个模型。
+  /** 该组实时摘要使用的模型 id（空 = 跟随全局 REALTIME_SUMMARY 默认） */
+  realtimeSummaryModelId?: string;
+  /** 该组总摘要使用的模型 id（空 = 跟随全局 FINAL_SUMMARY 默认） */
+  finalSummaryModelId?: string;
 }
 
 /** 某用户在运行时生效的能力开关（由所属组解析而来，组配置为唯一真源） */
@@ -59,6 +66,23 @@ export interface EffectiveFeatureFlags {
   maxThinkingDepth: ThinkingDepthCap;
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
+}
+
+/** 某用户在运行时生效的摘要模型（由所属组解析而来）；null = 跟随全局该用途默认 */
+export interface EffectiveSummaryModels {
+  realtimeSummaryModelId: string | null;
+  finalSummaryModelId: string | null;
+}
+
+/**
+ * 清洗「摘要模型 id」。存的是 LlmModel 的 DB 主键（cuid/uuid 形态，字符集
+ * `[A-Za-z0-9_-]`）。空串或非法值一律回落 '' —— 表示「跟随全局默认」。
+ */
+export function coerceSummaryModelId(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  return /^[A-Za-z0-9_-]{1,64}$/.test(trimmed) ? trimmed : '';
 }
 
 /** 把任意值强制成合法的 ThinkingDepthCap，非法时回落 fallback */
@@ -214,6 +238,8 @@ export async function resolveRoleQuotas(role: UserRole): Promise<GroupPermission
       cfg.allowFinalSummary,
       defaults.allowFinalSummary
     ),
+    realtimeSummaryModelId: coerceSummaryModelId(cfg.realtimeSummaryModelId),
+    finalSummaryModelId: coerceSummaryModelId(cfg.finalSummaryModelId),
   };
 }
 
@@ -272,6 +298,8 @@ export async function resolveCustomGroupPermissions(
     maxThinkingDepth: coerceThinkingDepthCap(cfg.maxThinkingDepth, 'high'),
     allowRealtimeSummary: coerceBool(cfg.allowRealtimeSummary, true),
     allowFinalSummary: coerceBool(cfg.allowFinalSummary, true),
+    realtimeSummaryModelId: coerceSummaryModelId(cfg.realtimeSummaryModelId),
+    finalSummaryModelId: coerceSummaryModelId(cfg.finalSummaryModelId),
   };
 }
 
@@ -312,6 +340,40 @@ export async function resolveUserFeatureFlags(user: {
     maxThinkingDepth: roleQuotas.maxThinkingDepth,
     allowRealtimeSummary: roleQuotas.allowRealtimeSummary,
     allowFinalSummary: roleQuotas.allowFinalSummary,
+  };
+}
+
+/**
+ * 解析某用户运行时生效的「摘要专用模型」（实时摘要 / 总摘要各一个 DB model id）。
+ *
+ * 与 resolveUserFeatureFlags 同解析链：ADMIN 不绑定（跟随全局默认）→ 有自定义组读
+ * custom_groups → 否则读系统角色 group_config_<role>。组配置为唯一真源，不落 User 行。
+ * 返回 null 表示该用途「跟随全局默认」（gateway 按 purpose 取 isDefault 模型）。
+ *
+ * 注意：这里只解析出组配置的模型 id，不校验其是否仍存在；调用方经 resolveSummaryModel
+ * 做存在性校验并在失效时回落全局默认，避免残留 id 拖垮摘要。
+ */
+export async function resolveUserSummaryModels(user: {
+  role: UserRole;
+  customGroupId?: string | null;
+}): Promise<EffectiveSummaryModels> {
+  // ADMIN 不绑定组摘要模型，一律跟随全局默认
+  if (user.role === 'ADMIN') {
+    return { realtimeSummaryModelId: null, finalSummaryModelId: null };
+  }
+
+  let perms: GroupPermissions | null = null;
+  if (user.customGroupId) {
+    perms = await resolveCustomGroupPermissions(user.customGroupId);
+    // 自定义组不存在 → 回落底层角色配置
+  }
+  if (!perms) {
+    perms = await resolveRoleQuotas(user.role);
+  }
+
+  return {
+    realtimeSummaryModelId: perms.realtimeSummaryModelId?.trim() || null,
+    finalSummaryModelId: perms.finalSummaryModelId?.trim() || null,
   };
 }
 

@@ -70,7 +70,16 @@ function canUseProviderName(user: LLMAccessUser, providerName: string): boolean 
 
 export async function resolveAuthorizedLlmSelection(
   userId: string,
-  requestedIdentifier?: string
+  requestedIdentifier?: string,
+  opts?: {
+    /**
+     * 未指定模型时是否强制「CHAT 用途默认模型必须在 allowedModels 内」。默认 true（聊天路径用）。
+     * 摘要路径应传 false：摘要模型是管理员/用户组的决策（走 REALTIME_SUMMARY 用途默认或组绑定模型），
+     * 与用户可选的聊天模型无关，用 CHAT 默认模型是否被允许来门禁摘要属于「判错了用途」，
+     * 会把受限组的摘要误判成 403。
+     */
+    enforceDefaultModelAccess?: boolean;
+  }
 ): Promise<AuthorizedLlmSelection> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -88,7 +97,12 @@ export async function resolveAuthorizedLlmSelection(
   if (!normalizedIdentifier) {
     // 未指定模型 → 下游会回落到 CHAT 用途的默认模型。但默认模型也必须在用户 allowedModels 内，
     // 否则受限组只要不传 model 就能绕过绑定拿到（通常更强的）默认模型。此处补齐这道校验。
-    if (user.role !== 'ADMIN' && user.allowedModels !== '*') {
+    const enforceDefaultModelAccess = opts?.enforceDefaultModelAccess ?? true;
+    if (
+      enforceDefaultModelAccess &&
+      user.role !== 'ADMIN' &&
+      user.allowedModels !== '*'
+    ) {
       try {
         const fallback = await getProviderForPurpose('CHAT');
         const allowed = fallback.dbModelId

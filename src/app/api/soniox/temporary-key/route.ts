@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { checkQuota } from '@/lib/quota';
 import { enforceRateLimit } from '@/lib/rateLimit';
+import { ensureActiveInterpretSession } from '@/lib/interpret/session';
 import {
   parseSonioxRegionPreference,
   resolveRequestedRegionAsync,
@@ -39,6 +40,7 @@ export async function POST(req: Request) {
     typeof body.clientReferenceId === 'string'
       ? body.clientReferenceId.trim().slice(0, 256)
       : undefined;
+
   const resolvedRegion = await resolveRequestedRegionAsync(requestedRegion, req.headers);
   const sonioxConfig = await resolveSonioxRuntimeConfigAsync({
     requestedRegion,
@@ -79,6 +81,18 @@ export async function POST(req: Request) {
     }
 
     const data = await response.json();
+
+    // R1-C：key 成功签发后，为同传（interpret）流保证有一条「活的」未结算 InterpretSession 锚点，
+    // 使跳过 /interpret/start 的改装/懒惰客户端也能被 cron 兜底扣费（否则 B3 兜底无对象、整场免费）。
+    // 用 clientReferenceId 前缀 'interpret:' 判定（前端 useInterpret 恒发此格式；realtime 发 sessionId）。
+    // 放在成功签发之后，避免为「签发失败、根本没串流」的尝试建锚点误兜底。best-effort：内部吞错，
+    // 不阻塞返回 key。realtime 流不走此路（时长由 Session.serverStartedAt 锚定、finalize/reclaim 兜底）。
+    // 注：**堵不住**「/start 后立刻 /deduct(≈0) 早结算再继续单连接串流」与「realtime 假 sessionId 无
+    // Session 串流」——单连接不再 re-mint（实测 Soniox 连接可存活远超 60s key），服务端再无观测点，需 WS 代理(A)。
+    if (clientReferenceId?.startsWith('interpret:')) {
+      await ensureActiveInterpretSession(user.id);
+    }
+
     return NextResponse.json({
       ...data,
       ws_url: sonioxConfig.wsBaseUrl,

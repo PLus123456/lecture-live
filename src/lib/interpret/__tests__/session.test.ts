@@ -53,8 +53,11 @@ import {
   createInterpretSession,
   claimInterpretSessionForDeduct,
   reclaimStaleInterpretSessions,
+  ensureActiveInterpretSession,
   INTERPRET_RECLAIM_STALE_MS,
 } from '@/lib/interpret/session';
+
+const MAX_INTERPRET_MS = 6 * 60 * 60_000;
 
 const NOW = new Date('2026-07-11T12:00:00.000Z');
 
@@ -197,5 +200,67 @@ describe('reclaimStaleInterpretSessions', () => {
     expect(n).toBe(1);
     expect(deductMock).toHaveBeenCalled();
     expect(recordUsageMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('ensureActiveInterpretSession（R1-C：mint 时保证有活锚点，堵 skip /start）', () => {
+  it('存在最近未结算锚点（honest /start 已建）→ 复用、不新建', async () => {
+    findFirstMock.mockResolvedValueOnce({ id: 's-existing' });
+
+    const r = await ensureActiveInterpretSession('u1', NOW);
+
+    expect(r).toEqual({ id: 's-existing', created: false });
+    expect(createMock).not.toHaveBeenCalled();
+    // 查询按 userId + 未结算 + startedAt 在 MAX_INTERPRET 窗口内，取最近一条
+    expect(findFirstMock).toHaveBeenCalledWith({
+      where: {
+        userId: 'u1',
+        settledAt: null,
+        startedAt: { gte: new Date(NOW.getTime() - MAX_INTERPRET_MS) },
+      },
+      orderBy: { startedAt: 'desc' },
+      select: { id: true },
+    });
+  });
+
+  it('无活锚点（skip /start）→ 新建 {userId, anchorId:null, startedAt:now}', async () => {
+    findFirstMock.mockResolvedValueOnce(null);
+    createMock.mockResolvedValueOnce({ id: 's-new' });
+
+    const r = await ensureActiveInterpretSession('u1', NOW);
+
+    expect(r).toEqual({ id: 's-new', created: true });
+    expect(createMock).toHaveBeenCalledWith({
+      data: { userId: 'u1', anchorId: null, startedAt: NOW },
+      select: { id: true },
+    });
+  });
+
+  it('陈旧未结算锚点（窗口外，上一场崩溃残留）不复用 → 新建独立锚点', async () => {
+    // findFirst 的 where 已带 startedAt>=now-MAX，故窗口外的返回 null（模拟查不到）→ 新建
+    findFirstMock.mockResolvedValueOnce(null);
+    createMock.mockResolvedValueOnce({ id: 's-fresh' });
+
+    const r = await ensureActiveInterpretSession('u1', NOW);
+
+    expect(r.created).toBe(true);
+    expect(r.id).toBe('s-fresh');
+  });
+
+  it('DB 故障 → 吞错、返回 {id:null, created:false}（绝不阻塞发 key）', async () => {
+    findFirstMock.mockRejectedValueOnce(new Error('db down'));
+
+    const r = await ensureActiveInterpretSession('u1', NOW);
+
+    expect(r).toEqual({ id: null, created: false });
+  });
+
+  it('create 抛错也被吞', async () => {
+    findFirstMock.mockResolvedValueOnce(null);
+    createMock.mockRejectedValueOnce(new Error('create failed'));
+
+    const r = await ensureActiveInterpretSession('u1', NOW);
+
+    expect(r).toEqual({ id: null, created: false });
   });
 });

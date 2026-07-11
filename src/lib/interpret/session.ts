@@ -40,6 +40,60 @@ export async function createInterpretSession(
   }
 }
 
+export interface EnsureInterpretResult {
+  /** 复用/新建的锚点 id；创建失败（DB 故障）时为 null（best-effort，不阻塞发 key）。 */
+  id: string | null;
+  /** 是否本次新建（true=补建了缺失锚点，即客户端跳过了 /start）。 */
+  created: boolean;
+}
+
+/**
+ * R1-C：在 temporary-key 签发（唯一必经的服务端点）时，保证该用户有一条「活的」未结算
+ * InterpretSession 锚点。
+ *
+ * 堵 skip /start 白嫖①：改装客户端跳过 /interpret/start 直接反复取 key 串流时，B3 的 cron 兜底
+ * （reclaimStaleInterpretSessions）没有对象可结算 → 整场免费。这里在 mint 时为其补建锚点，使
+ * cron 能按服务端墙钟兜底扣费（未结算超时按 startedAt→now 封顶 MAX_INTERPRET 扣）。
+ *
+ * 语义：找该用户最近一条 settledAt=null 且 startedAt 在 MAX_INTERPRET 窗口内的锚点 —— 有则复用
+ * （honest 客户端 /start 建的锚点，或本串流早前 mint 补建的锚点；避免每次 mint 都建新行），无则
+ * 新建（startedAt=now、anchorId=null）。best-effort：任何失败都不抛（绝不阻塞发 key）。
+ *
+ * **堵不住**「/start 后立刻 /deduct(≈0) 早结算再继续单连接串流」②：早结算把锚点 settledAt 置非空、
+ * 移出 cron，而单连接串流不再 re-mint（实测 Soniox 连接可存活远超 60s key、无需续 key），服务端再
+ * 无观测点。② 与「realtime 用假 sessionId 无 Session 串流」都需服务端 WS 代理(A)才能彻底解 —— 见
+ * 计费审计说明。本函数只把「懒惰/意外跳过 /start」从免费降级为 cron 兜底计费。
+ */
+export async function ensureActiveInterpretSession(
+  userId: string,
+  now: Date = new Date()
+): Promise<EnsureInterpretResult> {
+  try {
+    const recentThreshold = new Date(now.getTime() - MAX_INTERPRET_DURATION_MS);
+    // 复用最近的活锚点（honest 客户端 /start 已建；本串流早前 mint 已补建）。窗口外的陈旧未结算
+    // 锚点不复用——那是上一场崩溃残留、交给 cron 兜底，新场补建独立锚点，避免把新场并进旧 startedAt。
+    const existing = await prisma.interpretSession.findFirst({
+      where: { userId, settledAt: null, startedAt: { gte: recentThreshold } },
+      orderBy: { startedAt: 'desc' },
+      select: { id: true },
+    });
+    if (existing) {
+      return { id: existing.id, created: false };
+    }
+    const created = await prisma.interpretSession.create({
+      data: { userId, anchorId: null, startedAt: now },
+      select: { id: true },
+    });
+    return { id: created.id, created: true };
+  } catch (err) {
+    sessionLogger.warn(
+      { userId, message: err instanceof Error ? err.message : String(err) },
+      'ensureActiveInterpretSession failed (non-blocking; key mint proceeds)'
+    );
+    return { id: null, created: false };
+  }
+}
+
 export type InterpretClaimOutcome = 'claimed' | 'already_settled' | 'no_record';
 
 export interface InterpretClaimResult {

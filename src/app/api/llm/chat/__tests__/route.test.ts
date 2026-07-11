@@ -259,6 +259,11 @@ describe('POST /api/llm/chat (mode routing)', () => {
       user: { role: 'PRO' },
       providerConfig: { contextWindow: 200_000, displayName: 'mock' },
       providerName: 'mock',
+      featureFlags: {
+        maxThinkingDepth: 'high',
+        allowRealtimeSummary: true,
+        allowFinalSummary: true,
+      },
     });
     resolveEffectiveThinkingDepthMock.mockReturnValue('medium');
     getProviderForPurposeMock.mockResolvedValue({ contextWindow: 200_000 });

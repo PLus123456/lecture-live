@@ -30,6 +30,7 @@ import {
 } from '@/lib/audio/recordingDuration';
 import { clampSessionDurationMs, getBillableMinutes } from '@/lib/billing';
 import { deductTranscriptionMinutes } from '@/lib/quota';
+import { resolveUserFeatureFlags } from '@/lib/userRoles';
 import { callLLM, getProviderForPurpose } from '@/lib/llm/gateway';
 import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
 import { generateSessionReport, generateSessionTitle } from '@/lib/llm/reportManager';
@@ -713,43 +714,60 @@ export async function runBackgroundLLMTasks(params: BackgroundTaskParams) {
     const summaryBlocks = (bundle.summaries ?? []) as SummaryBlock[];
 
     const reportAndTitlePromise = (async () => {
-      // 步骤 1: 报告生成
-      await trackJob(
-        {
-          type: JOB_TYPE.REPORT_GENERATION,
-          sessionId: params.sessionId,
-          userId: params.userId,
-          triggeredBy: 'system',
-          params: { title: params.title, courseName: params.courseName },
-        },
-        async () => {
-          // 拿 FINAL_SUMMARY 模型的 contextWindow 喂给 reportManager 决定 map-reduce 阈值
-          const finalSummaryProvider = await getProviderForPurpose('FINAL_SUMMARY').catch(
-            () => null
-          );
+      // 总摘要（结构化报告）受用户组「允许总摘要」开关控制；组配置为唯一真源，按会话拥有者解析。
+      // 标题生成不受此限（轻量、非付费能力），组禁用总摘要时仍会生成标题。
+      const owner = await prisma.user.findUnique({
+        where: { id: params.userId },
+        select: { role: true, customGroupId: true },
+      });
+      const allowFinalSummary = owner
+        ? (await resolveUserFeatureFlags(owner)).allowFinalSummary
+        : true;
 
-          const reportData = await generateSessionReport({
+      // 步骤 1: 报告生成（仅当组允许总摘要）
+      if (!allowFinalSummary) {
+        logger.info(
+          { sessionId: params.sessionId },
+          '[finalize-bg] group disallows final summary, skip report'
+        );
+      } else {
+        await trackJob(
+          {
+            type: JOB_TYPE.REPORT_GENERATION,
             sessionId: params.sessionId,
-            transcript: fullTranscript,
-            sessionTitle: params.title,
-            courseName: params.courseName,
-            durationMs: params.durationMs ?? 0,
-            date: params.createdAt.toISOString().split('T')[0],
-            summaryBlocks,
-            language: params.targetLang,
-            callLLM: (system: string, userMessage: string) =>
-              callLLM(system, userMessage, { purpose: 'FINAL_SUMMARY' }),
-            contextWindow: finalSummaryProvider?.contextWindow,
-          });
+            userId: params.userId,
+            triggeredBy: 'system',
+            params: { title: params.title, courseName: params.courseName },
+          },
+          async () => {
+            // 拿 FINAL_SUMMARY 模型的 contextWindow 喂给 reportManager 决定 map-reduce 阈值
+            const finalSummaryProvider = await getProviderForPurpose('FINAL_SUMMARY').catch(
+              () => null
+            );
 
-          const stored = await persistSessionReport(sessionForLoad, reportData);
-          await prisma.session.update({
-            where: { id: params.sessionId },
-            data: { reportPath: stored.path },
-          });
-          return { reportPath: stored.path };
-        }
-      );
+            const reportData = await generateSessionReport({
+              sessionId: params.sessionId,
+              transcript: fullTranscript,
+              sessionTitle: params.title,
+              courseName: params.courseName,
+              durationMs: params.durationMs ?? 0,
+              date: params.createdAt.toISOString().split('T')[0],
+              summaryBlocks,
+              language: params.targetLang,
+              callLLM: (system: string, userMessage: string) =>
+                callLLM(system, userMessage, { purpose: 'FINAL_SUMMARY' }),
+              contextWindow: finalSummaryProvider?.contextWindow,
+            });
+
+            const stored = await persistSessionReport(sessionForLoad, reportData);
+            await prisma.session.update({
+              where: { id: params.sessionId },
+              data: { reportPath: stored.path },
+            });
+            return { reportPath: stored.path };
+          }
+        );
+      }
 
       // 步骤 2: 标题生成（仅覆盖默认标题）
       const DEFAULT_TITLES = ['新建讲座会话', 'New Lecture Session'];

@@ -2,7 +2,11 @@ import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
 import { logAction } from '@/lib/auditLog';
-import { resolveRoleQuotas } from '@/lib/userRoles';
+import {
+  resolveRoleQuotas,
+  coerceThinkingDepthCap,
+  type ThinkingDepthCap,
+} from '@/lib/userRoles';
 
 // 系统内置角色
 const SYSTEM_ROLES = ['FREE', 'PRO', 'ADMIN'] as const;
@@ -12,6 +16,10 @@ interface GroupPermissions {
   storageHoursLimit: number;
   allowedModels: string;
   maxConcurrentSessions: number;
+  // ── 能力开关（与用户组绑定）──
+  maxThinkingDepth: ThinkingDepthCap; // 'off' 表示禁止思考
+  allowRealtimeSummary: boolean;
+  allowFinalSummary: boolean;
 }
 
 interface CustomGroupEntry {
@@ -22,26 +30,87 @@ interface CustomGroupEntry {
   permissions: GroupPermissions;
 }
 
-// 默认组权限配置
+// 默认组权限配置（能力开关默认「全部允许」；FREE 思考深度沿用历史封顶 medium）
 const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
   FREE: {
     transcriptionMinutesLimit: 60,
     storageHoursLimit: 10,
     allowedModels: 'local',
     maxConcurrentSessions: 1,
+    maxThinkingDepth: 'medium',
+    allowRealtimeSummary: true,
+    allowFinalSummary: true,
   },
   PRO: {
     transcriptionMinutesLimit: 600,
     storageHoursLimit: 100,
     allowedModels: 'local,gpt,deepseek',
     maxConcurrentSessions: 3,
+    maxThinkingDepth: 'high',
+    allowRealtimeSummary: true,
+    allowFinalSummary: true,
   },
   ADMIN: {
     transcriptionMinutesLimit: 999999,
     storageHoursLimit: 999999,
     allowedModels: '*',
     maxConcurrentSessions: 999,
+    maxThinkingDepth: 'high',
+    allowRealtimeSummary: true,
+    allowFinalSummary: true,
   },
+};
+
+/**
+ * 把持久化里可能缺失能力开关的旧配置补全为完整 GroupPermissions（GET 返回给 UI 用）。
+ * 系统组缺失时回落对应角色默认；自定义组缺失时默认「全部允许」。
+ */
+function normalizePermissions(
+  raw: Partial<GroupPermissions> | undefined,
+  fallback: GroupPermissions
+): GroupPermissions {
+  const p = raw ?? {};
+  return {
+    transcriptionMinutesLimit:
+      typeof p.transcriptionMinutesLimit === 'number'
+        ? p.transcriptionMinutesLimit
+        : fallback.transcriptionMinutesLimit,
+    storageHoursLimit:
+      typeof p.storageHoursLimit === 'number'
+        ? p.storageHoursLimit
+        : fallback.storageHoursLimit,
+    allowedModels:
+      typeof p.allowedModels === 'string' && p.allowedModels.trim()
+        ? p.allowedModels
+        : fallback.allowedModels,
+    maxConcurrentSessions:
+      typeof p.maxConcurrentSessions === 'number'
+        ? p.maxConcurrentSessions
+        : fallback.maxConcurrentSessions,
+    maxThinkingDepth: coerceThinkingDepthCap(
+      p.maxThinkingDepth,
+      fallback.maxThinkingDepth
+    ),
+    allowRealtimeSummary:
+      typeof p.allowRealtimeSummary === 'boolean'
+        ? p.allowRealtimeSummary
+        : fallback.allowRealtimeSummary,
+    allowFinalSummary:
+      typeof p.allowFinalSummary === 'boolean'
+        ? p.allowFinalSummary
+        : fallback.allowFinalSummary,
+  };
+}
+
+/** 自定义组能力开关默认「全部允许」的兜底（配额字段用组自身值，缺失才回落） */
+const CUSTOM_GROUP_FALLBACK: GroupPermissions = {
+  transcriptionMinutesLimit: 60,
+  storageHoursLimit: 10,
+  allowedModels: 'local',
+  maxConcurrentSessions: 1,
+  maxThinkingDepth: 'high',
+  allowRealtimeSummary: true,
+  allowFinalSummary: true,
 };
 
 // Prisma 事务客户端类型
@@ -70,10 +139,40 @@ async function saveCustomGroups(groups: CustomGroupEntry[], tx?: TxClient) {
   });
 }
 
-/** 校验 allowedModels 格式 */
+/**
+ * 校验 allowedModels 格式。
+ * `*` 表示全部；否则为逗号分隔的标识符（供应商名 或 具体模型 id）。
+ * 升级为「按具体模型」后，token 可能是形如 `gpt-4o`、`claude-sonnet-4-6`、`deepseek/r1`
+ * 之类的模型 id，可能含 `. - _ : / @ +` 等字符，故只要求每段非空、无空白、无逗号、长度 ≤200。
+ */
 function validateAllowedModels(raw: string): boolean {
   if (raw === '*') return true;
-  return /^[a-zA-Z0-9_.\-]+(,[a-zA-Z0-9_.\-]+)*$/.test(raw);
+  const tokens = raw.split(',');
+  if (tokens.length === 0) return false;
+  return tokens.every((t) => /^[^\s,]{1,200}$/.test(t));
+}
+
+/** 从请求体清洗能力开关字段（非法值回落默认：思考=medium、两摘要=true） */
+function sanitizeFeatureFlags(
+  permissions: Partial<GroupPermissions> | undefined
+): Pick<
+  GroupPermissions,
+  'maxThinkingDepth' | 'allowRealtimeSummary' | 'allowFinalSummary'
+> {
+  return {
+    maxThinkingDepth: coerceThinkingDepthCap(
+      permissions?.maxThinkingDepth,
+      'medium'
+    ),
+    allowRealtimeSummary:
+      typeof permissions?.allowRealtimeSummary === 'boolean'
+        ? permissions.allowRealtimeSummary
+        : true,
+    allowFinalSummary:
+      typeof permissions?.allowFinalSummary === 'boolean'
+        ? permissions.allowFinalSummary
+        : true,
+  };
 }
 
 /** 系统保留组名（小写） */
@@ -133,22 +232,25 @@ export async function GET(req: Request) {
       }
     }
 
-    // 合并系统组数据
+    // 合并系统组数据（补全缺失的能力开关字段，回落该角色默认）
     const systemGroups = SYSTEM_ROLES.map((role) => ({
       id: role,
       name: role === 'FREE' ? 'Free' : role === 'PRO' ? 'Pro' : 'Admin',
-      permissions: configMap[role] ?? DEFAULT_GROUP_PERMISSIONS[role],
+      permissions: normalizePermissions(
+        configMap[role],
+        DEFAULT_GROUP_PERMISSIONS[role]
+      ),
       userCount: countMap[role] ?? 0,
       isSystem: true,
     }));
 
-    // 自定义组数据
+    // 自定义组数据（补全缺失的能力开关字段，缺失默认「全部允许」）
     const customGroupsOut = customGroups.map((g) => ({
       id: g.id,
       name: g.name,
       description: g.description,
       color: g.color,
-      permissions: g.permissions,
+      permissions: normalizePermissions(g.permissions, CUSTOM_GROUP_FALLBACK),
       userCount: customCountMap[g.id] ?? 0,
       isSystem: false,
     }));
@@ -207,6 +309,7 @@ export async function POST(req: Request) {
       storageHoursLimit: Math.max(0, Number.isFinite(rawStorageHours) ? rawStorageHours : 10),
       allowedModels: rawModels,
       maxConcurrentSessions: Math.max(1, Math.floor(Number(permissions?.maxConcurrentSessions) || 1)),
+      ...sanitizeFeatureFlags(permissions),
     };
 
     const newGroup: CustomGroupEntry = {
@@ -283,6 +386,7 @@ export async function PUT(req: Request) {
       storageHoursLimit: Math.max(0, Number(permissions.storageHoursLimit) || 0),
       allowedModels: rawModels,
       maxConcurrentSessions: Math.max(1, Math.floor(Number(permissions.maxConcurrentSessions) || 1)),
+      ...sanitizeFeatureFlags(permissions),
     };
 
     const isSystemRole = (SYSTEM_ROLES as readonly string[]).includes(groupId);

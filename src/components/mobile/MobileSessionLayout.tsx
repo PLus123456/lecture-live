@@ -1,6 +1,7 @@
 'use client';
 
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useAuthStore } from '@/stores/authStore';
 import TranscriptPanel from '@/components/TranscriptPanel';
 import TranslationPanel from '@/components/TranslationPanel';
 import SummaryTab from '@/components/session/SummaryTab';
@@ -60,8 +61,17 @@ const TAB_SEQUENCE: MobileTab[] = [
   'keywords',
 ];
 
-function getNextTab(current: MobileTab, hasTranslation: boolean, direction: 'left' | 'right') {
-  const tabs = TAB_SEQUENCE.filter((tab) => hasTranslation || tab !== 'translation');
+function getNextTab(
+  current: MobileTab,
+  hasTranslation: boolean,
+  allowSummary: boolean,
+  direction: 'left' | 'right'
+) {
+  const tabs = TAB_SEQUENCE.filter(
+    (tab) =>
+      (hasTranslation || tab !== 'translation') &&
+      (allowSummary || tab !== 'summary')
+  );
   const currentIndex = tabs.indexOf(current);
   if (currentIndex === -1) {
     return tabs[0] ?? 'transcript';
@@ -114,9 +124,27 @@ export default function MobileSessionLayout({
   const keyboardHeight = useKeyboardHeight();
   const contentRef = useRef<HTMLDivElement>(null);
 
+  // 用户组是否开通实时摘要（缺省 → 放行；服务端才是权威门禁）
+  const realtimeSummaryEnabled = useAuthStore(
+    (s) => s.quotas?.featureFlags?.allowRealtimeSummary !== false
+  );
+
+  // 摘要被关闭且当前正停在 Summary 标签页时，切回转录
+  useEffect(() => {
+    if (!realtimeSummaryEnabled && activeTab === 'summary') {
+      setActiveTab('transcript');
+    }
+  }, [realtimeSummaryEnabled, activeTab]);
+
   useSwipeGesture(contentRef, {
-    onSwipeLeft: () => setActiveTab((current) => getNextTab(current, hasTranslation, 'left')),
-    onSwipeRight: () => setActiveTab((current) => getNextTab(current, hasTranslation, 'right')),
+    onSwipeLeft: () =>
+      setActiveTab((current) =>
+        getNextTab(current, hasTranslation, realtimeSummaryEnabled, 'left')
+      ),
+    onSwipeRight: () =>
+      setActiveTab((current) =>
+        getNextTab(current, hasTranslation, realtimeSummaryEnabled, 'right')
+      ),
     threshold: 60,
   });
 
@@ -170,7 +198,7 @@ export default function MobileSessionLayout({
             showHeader={false}
           />
         ) : null}
-        {activeTab === 'summary' ? (
+        {activeTab === 'summary' && realtimeSummaryEnabled ? (
           <div className="h-full bg-white">
             <SummaryTab onManualTrigger={onManualSummary} />
           </div>
@@ -192,6 +220,7 @@ export default function MobileSessionLayout({
           activeTab={activeTab}
           onChange={setActiveTab}
           hasTranslation={hasTranslation}
+          allowSummary={realtimeSummaryEnabled}
         />
         {!hideControlBar ? (
           <MobileControlBar

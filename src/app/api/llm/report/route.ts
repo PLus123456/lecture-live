@@ -7,6 +7,7 @@ import { prisma } from '@/lib/prisma';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { logAction } from '@/lib/auditLog';
+import { resolveUserFeatureFlags } from '@/lib/userRoles';
 import { callLLM, getProviderForPurpose } from '@/lib/llm/gateway';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { generateSessionReport } from '@/lib/llm/reportManager';
@@ -48,6 +49,21 @@ export async function POST(req: Request) {
       assertOwnership(user.id, session.userId);
     } catch {
       return NextResponse.json({ error: 'Access denied' }, { status: 403 });
+    }
+
+    // 用户组门禁：未开通总摘要则拒绝生成结构化报告（按会话拥有者的组解析）
+    const owner = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { role: true, customGroupId: true },
+    });
+    const allowFinalSummary = owner
+      ? (await resolveUserFeatureFlags(owner)).allowFinalSummary
+      : true;
+    if (!allowFinalSummary) {
+      return NextResponse.json(
+        { error: '当前用户组未开通总摘要功能' },
+        { status: 403 }
+      );
     }
 
     // 加载转录数据

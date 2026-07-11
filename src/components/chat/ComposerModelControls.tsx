@@ -17,7 +17,9 @@ import {
   type ThinkingPreference,
 } from '@/stores/chatStore';
 import type {
+  ChatModelOption,
   ChatModelsResponse,
+  ThinkingDepth,
   ThinkingMode,
 } from '@/types/llm';
 
@@ -54,6 +56,26 @@ function thinkingOptionsForMode(mode: ThinkingMode): Array<{
     { pref: 'auto', label: '自动', description: '让模型自己决定' },
     { pref: 'forced', label: '强制思考', description: '尽可能启用深度思考' },
   ];
+}
+
+/**
+ * 按用户组的思考能力收敛可选项：
+ *  - DEPTH 模型只保留服务端下发的 allowedDepths（组深度上限内的档位）+ 恒定的「不思考」。
+ *    组上限 medium 时 high 直接从菜单消失，避免「UI 让选 high、服务端静默降级到 medium」的
+ *    设置与实际不一致（服务端仍会 clamp，这里是把 UI 对齐真实可执行档位）。
+ *  - 非 DEPTH 模型：档位与深度无关，原样返回。
+ */
+function thinkingOptionsForModel(
+  model: ChatModelOption | undefined
+): ReturnType<typeof thinkingOptionsForMode> {
+  const mode = model?.thinkingMode ?? 'NONE';
+  const all = thinkingOptionsForMode(mode);
+  if (mode !== 'DEPTH') return all;
+  const allowed = model?.allowedDepths ?? [];
+  return all.filter(
+    (opt) =>
+      opt.pref === 'off' || allowed.includes(opt.pref as ThinkingDepth)
+  );
 }
 
 export default function ComposerModelControls({
@@ -128,30 +150,37 @@ export default function ComposerModelControls({
   const currentModelInfo = availableModels.find((m) => m.name === selectedModel);
   const currentModelLabel =
     currentModelInfo?.displayName || selectedModel || 'Default';
-  const currentThinkingMode: ThinkingMode =
-    currentModelInfo?.thinkingMode ?? 'NONE';
 
-  /* 切模型时收敛 thinking 偏好 —— 与 ChatTab 同步 */
+  /* 切模型时收敛 thinking 偏好 —— 与 ChatTab 同步；同时尊重用户组深度上限 */
   const handleSelectModel = (modelName: string) => {
     const model = availableModels.find((m) => m.name === modelName);
     setSelectedModel(modelName);
     if (model) {
-      const validPrefs = thinkingOptionsForMode(model.thinkingMode)
+      const validPrefs = thinkingOptionsForModel(model)
         .filter((opt) => !opt.disabled)
         .map((opt) => opt.pref);
-      if (model.thinkingMode === 'NONE') {
+      if (model.thinkingMode === 'NONE' || !model.supportsThinking) {
         setSelectedThinkingPreference('auto');
       } else if (!validPrefs.includes(selectedThinkingPreference)) {
-        setSelectedThinkingPreference(
-          model.thinkingMode === 'DEPTH' ? 'medium' : 'auto'
-        );
+        if (model.thinkingMode === 'DEPTH') {
+          // 落到组允许集合里最高的档位（优先 medium），组禁思考时 allowedDepths 为空 → off
+          const allowed = model.allowedDepths ?? [];
+          const fallback: ThinkingPreference = allowed.includes('medium')
+            ? 'medium'
+            : (allowed[allowed.length - 1] as ThinkingPreference) ?? 'off';
+          setSelectedThinkingPreference(fallback);
+        } else {
+          setSelectedThinkingPreference('auto');
+        }
       }
     }
     setShowModelMenu(false);
   };
 
-  const thinkingDisabled = currentThinkingMode === 'NONE';
-  const thinkingOptions = thinkingOptionsForMode(currentThinkingMode);
+  // 组禁思考（supportsThinking=false，含 cap='off'）或模型本身 NONE → 禁用思考入口，
+  // 让 UI 与「组是否允许思考」一致，而不是仅看模型的 thinkingMode。
+  const thinkingDisabled = !(currentModelInfo?.supportsThinking ?? false);
+  const thinkingOptions = thinkingOptionsForModel(currentModelInfo);
   const isThinkingActive =
     !thinkingDisabled && selectedThinkingPreference !== 'off';
   const thinkingLabel = (() => {

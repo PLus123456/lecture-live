@@ -19,6 +19,7 @@ import {
   resolveAuthorizedLlmSelection,
   resolveEffectiveThinkingDepth,
 } from '@/lib/llm/access';
+import { tryAcquireConversationTurn } from '@/lib/llm/conversationTurnLock';
 import { clampDepthToCap, type ThinkingDepthCap } from '@/lib/userRoles';
 import {
   LLM_LIMITS,
@@ -77,10 +78,14 @@ const chatLogger = logger.child({ component: 'chat-api' });
 function dropTrailingOrphanUser(
   history: ConversationTurn[]
 ): ConversationTurn[] {
-  if (history.length > 0 && history[history.length - 1]?.role === 'user') {
-    return history.slice(0, -1);
+  // 剥离**所有**尾部未配对的 user 轮，而不仅是最后一条：若 U1、U2 连续在首 token 前
+  // 失败（各自落库 user 但没有 assistant），只删一条会把 U1 连同新的 U3 一起发给模型，
+  // 导致旧问题复活或两个问题被混答。循环剥到最后一条非 user 为止。
+  let end = history.length;
+  while (end > 0 && history[end - 1]?.role === 'user') {
+    end -= 1;
   }
-  return history;
+  return end === history.length ? history : history.slice(0, end);
 }
 
 /**
@@ -286,6 +291,8 @@ interface StreamChatArgs {
   forceMinLevel?: DegradationLevel;
   /** Attachments 抽文本拼好的整段，将作为最前置的 system 段拼到 systemPrompt 头部 */
   attachmentsSystemMessage?: string;
+  /** 释放「每对话单飞行中回复」锁；流结束/失败/取消时调用（幂等） */
+  releaseTurn?: () => void;
 }
 
 /**
@@ -296,6 +303,10 @@ function streamChatResponse(
   args: StreamChatArgs
 ): Response {
   const encoder = new TextEncoder();
+
+  // 上游取消信号：客户端断开（点「停止」/关页面）时，ReadableStream 的 cancel() 会触发，
+  // abort 掉正在进行的 provider fetch —— 停止继续拉流 / 继续计费 / 长时间占用连接。
+  const upstreamAbort = new AbortController();
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -391,6 +402,7 @@ function streamChatResponse(
               {
                 ...args.routingOptions,
                 thinkingPreference: args.thinkingPreference,
+                signal: upstreamAbort.signal,
               },
               (ev: LLMStreamEvent) => {
                 if (ev.type === 'thinking' && ev.delta) {
@@ -485,14 +497,16 @@ function streamChatResponse(
 
         await prisma.$transaction([
           persistAssistantMessage(),
-          prisma.conversation.update({
-            where: { id: args.conversationId },
-            data: {
-              degradationLevel: Math.max(
-                args.conversationDegradationLevel,
-                effectiveLevel
-              ),
+          // 只在 DB 里现存值更低时才抬高 degradationLevel（DB 侧条件更新 = 原子读改写）。
+          // 此前用 Math.max(内存快照, effectiveLevel) 落库：并发两轮各读到同一旧快照，后写的
+          // 较低档会覆盖先写的较高档（lost update）。改成 updateMany + where degradationLevel<X
+          // 让行锁在写时重新比较当前值，只升不降，杜绝丢更新。
+          prisma.conversation.updateMany({
+            where: {
+              id: args.conversationId,
+              degradationLevel: { lt: effectiveLevel },
             },
+            data: { degradationLevel: effectiveLevel },
           }),
         ]);
         persisted = true;
@@ -511,19 +525,37 @@ function streamChatResponse(
           { conversationId: args.conversationId, err: serializeError(err) },
           'chat 流式生成失败'
         );
-        // 仅在尚未落库时兜底插入：done 帧因客户端断开抛错跳进来时 persisted 已为 true，
-        // 避免二次插入产生重复 assistant 消息。
-        if (!persisted && accumulatedText.trim()) {
+        // 只在「流已成功跑完但落库/收尾阶段才抛错」时兜底插入（succeeded=true 的安全网，
+        // 如 done 帧因客户端断开、或 $transaction 因偶发 DB 错误失败）。
+        // 若失败发生在流成功之前（上游 mid-stream error / 截断 EOF / abort），succeeded 仍为
+        // false —— 此时 accumulatedText 是半截正文，绝不能当正常 assistant 消息落库
+        // （否则用户看到半句话却无失败提示，刷新后还会作为历史参与下一轮）。
+        if (!persisted && succeeded && accumulatedText.trim()) {
           await persistAssistantMessage().catch(() => {});
         }
+        // 客户端断开触发的 abort：对端已不在，controller 已被 cancel，再 enqueue/close 会抛错。
+        // 此时只需静默收尾（succeeded=false，上面也不会落库半截正文）。
+        if (upstreamAbort.signal.aborted) return;
         // 安全：原始错误（可能含上游 provider 错误措辞/内部模型名）只进日志，
         // 客户端只回固定文案。
-        send('error', {
-          error: 'Chat generation failed',
-          contextFull: false,
-        });
-        controller.close();
+        try {
+          send('error', {
+            error: 'Chat generation failed',
+            contextFull: false,
+          });
+          controller.close();
+        } catch {
+          // 对端已断开，忽略。
+        }
+      } finally {
+        // 无论成功/失败/中途 return，本轮结束都释放对话锁，放行后续轮次（幂等）。
+        args.releaseTurn?.();
       }
+    },
+    cancel() {
+      // 客户端断开（点「停止」/关闭页面/切走）→ 取消上游 provider 请求，并释放对话锁。
+      upstreamAbort.abort();
+      args.releaseTurn?.();
     },
   });
 
@@ -633,6 +665,10 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
   });
   if (rateLimited) return rateLimited;
 
+  // 每对话回复锁：正常路径在流结束时由 streamChatResponse 释放；若在流开始前抛错，
+  // 由下方 catch 兜底释放（幂等）。
+  let releaseTurn: (() => void) | null = null;
+
   try {
     const parsed = await parseRequest(req);
 
@@ -707,6 +743,16 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
       );
     }
 
+    // 每对话「单飞行中回复」锁：同一对话已有进行中回复时 fail-fast 回 409，避免并发轮次
+    // 交错落库成问答错配（U1→U2→A2→A1）。放行的这一轮持锁直到流结束/取消才释放。
+    releaseTurn = tryAcquireConversationTurn(conversation.id);
+    if (!releaseTurn) {
+      return NextResponse.json(
+        { error: '该对话正在生成回复，请稍候再发送。' },
+        { status: 409 }
+      );
+    }
+
     const isLegacy = conversation.session !== null;
 
     // legacy 会话分两条路：
@@ -733,6 +779,7 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
           messages: conversation.messages,
         },
         userId: payload.id,
+        releaseTurn,
       });
     }
 
@@ -764,8 +811,12 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
         ownedSessions,
       },
       userId: payload.id,
+      releaseTurn,
     });
   } catch (error) {
+    // 流开始前抛错 → 释放已获取的对话锁（正常路径由 streamChatResponse 的 finally 释放）。
+    releaseTurn?.();
+
     if (error instanceof LLMValidationError) {
       return NextResponse.json({ error: error.message }, { status: 400 });
     }
@@ -801,6 +852,8 @@ interface HandleSessionChatArgs {
     }>;
   };
   userId: string;
+  /** 每对话回复锁的释放函数（由 POST 获取后透传），流结束时释放 */
+  releaseTurn: () => void;
 }
 
 async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response> {
@@ -951,6 +1004,7 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
     userTranscriptOffset,
     ragRetriever,
     forceMinLevel,
+    releaseTurn: args.releaseTurn,
   });
 }
 
@@ -980,6 +1034,8 @@ interface HandleGlobalChatArgs {
     }>;
   };
   userId: string;
+  /** 每对话回复锁的释放函数（由 POST 获取后透传），流结束时释放 */
+  releaseTurn: () => void;
 }
 
 async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
@@ -1271,6 +1327,7 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
     reportText: combinedReportText,
     forceMinLevel,
     attachmentsSystemMessage: attachmentsBlock,
+    releaseTurn: args.releaseTurn,
   });
 }
 

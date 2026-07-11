@@ -12,10 +12,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
   sessionUpdateManyMock,
+  sessionTxUpdateMock,
+  transactionMock,
   getSonioxTranscriptMock,
   persistMock,
   runBackgroundLLMTasksMock,
   deductMock,
+  settleMock,
   getSiteSettingsMock,
   deleteSonioxFileMock,
   deleteSonioxTranscriptionMock,
@@ -23,10 +26,13 @@ const {
   extractMock,
 } = vi.hoisted(() => ({
   sessionUpdateManyMock: vi.fn(),
+  sessionTxUpdateMock: vi.fn(),
+  transactionMock: vi.fn(),
   getSonioxTranscriptMock: vi.fn(),
   persistMock: vi.fn(),
   runBackgroundLLMTasksMock: vi.fn(),
   deductMock: vi.fn(),
+  settleMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
   deleteSonioxFileMock: vi.fn(),
   deleteSonioxTranscriptionMock: vi.fn(),
@@ -35,7 +41,12 @@ const {
 }));
 
 vi.mock('@/lib/prisma', () => ({
-  prisma: { session: { updateMany: sessionUpdateManyMock } },
+  prisma: {
+    session: { updateMany: sessionUpdateManyMock },
+    // B1：finalize 结算走 $transaction(deduct + release + 清预留列)。默认实现直接执行回调，
+    // 传入带 session.update 的 tx（deduct/release 由 @/lib/quota mock 拦截，忽略第三参 tx）。
+    $transaction: (...a: unknown[]) => transactionMock(...a),
+  },
 }));
 
 vi.mock('@/lib/soniox/asyncFile', () => ({
@@ -59,6 +70,7 @@ vi.mock('@/lib/sessionFinalization', () => ({
 
 vi.mock('@/lib/quota', () => ({
   deductTranscriptionMinutes: deductMock,
+  settleAsyncReservation: settleMock,
 }));
 
 vi.mock('@/lib/siteSettings', () => ({
@@ -83,6 +95,7 @@ function makeSession(overrides: Record<string, unknown> = {}) {
     title: 'T',
     courseName: 'C',
     createdAt: new Date('2026-07-01T00:00:00.000Z'),
+    asyncReservedMinutes: 0,
     folderIds: ['f1', 'f2'],
     ...overrides,
   } as Parameters<typeof finalizeAsyncTranscription>[0];
@@ -100,6 +113,13 @@ describe('finalizeAsyncTranscription', () => {
     });
     getSiteSettingsMock.mockResolvedValue({ async_upload_billing_multiplier: 0.8 });
     deductMock.mockResolvedValue(undefined);
+    settleMock.mockResolvedValue(0);
+    sessionTxUpdateMock.mockResolvedValue(undefined);
+    // 默认 $transaction 实现：执行回调并注入带 session.update 的 tx
+    transactionMock.mockImplementation(
+      async (cb: (tx: unknown) => Promise<unknown>) =>
+        cb({ session: { update: sessionTxUpdateMock } })
+    );
     deleteSonioxFileMock.mockResolvedValue(undefined);
     deleteSonioxTranscriptionMock.mockResolvedValue(undefined);
   });
@@ -140,9 +160,9 @@ describe('finalizeAsyncTranscription', () => {
       })
     );
 
-    // 计费恰好一次，口径 = ceil(ceil(600000/60000) × 0.8) = ceil(8) = 8
+    // 计费恰好一次，口径 = ceil(ceil(600000/60000) × 0.8) = ceil(8) = 8（第三参为事务 tx）
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('u1', 8);
+    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything());
 
     expect(runBackgroundLLMTasksMock).toHaveBeenCalledTimes(1);
     expect(deleteSonioxFileMock).toHaveBeenCalledWith(CONFIG, 'file-1');
@@ -244,7 +264,24 @@ describe('finalizeAsyncTranscription', () => {
       })
     );
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('u1', 8);
+    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything());
+  });
+
+  it('B1 结算：同一事务内 deduct 实扣(8) + settleAsyncReservation 原子转/清入口预留', async () => {
+    sessionUpdateManyMock
+      .mockResolvedValueOnce({ count: 1 }) // claim
+      .mockResolvedValueOnce({ count: 1 }); // finalize 守卫
+
+    await finalizeAsyncTranscription(makeSession(), CONFIG, {
+      allowClaimFrom: ['transcribing'],
+    });
+
+    // deduct 实扣 8（ceil(10×0.8)）+ settleAsyncReservation(sessionId, tx)：读当前列并原子释放，
+    // 二者同一事务 tx。预留的具体释放/清列逻辑在 settleAsyncReservation 内（其自有单测）。
+    expect(deductMock).toHaveBeenCalledTimes(1);
+    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything());
+    expect(settleMock).toHaveBeenCalledTimes(1);
+    expect(settleMock).toHaveBeenCalledWith('s1', expect.anything());
   });
 
   it('并发另一方抢先完成：finalize 守卫 count=0 → 本次不扣费（防双扣）', async () => {

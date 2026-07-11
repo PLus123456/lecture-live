@@ -9,6 +9,7 @@ const {
   chatAttachmentGroupByMock,
   sessionAggregateMock,
   sessionFindManyMock,
+  sessionUpdateManyMock,
   interpretUsageCreateMock,
   interpretUsageAggregateMock,
 } = vi.hoisted(() => ({
@@ -20,6 +21,7 @@ const {
   chatAttachmentGroupByMock: vi.fn(),
   sessionAggregateMock: vi.fn(),
   sessionFindManyMock: vi.fn(),
+  sessionUpdateManyMock: vi.fn(),
   interpretUsageCreateMock: vi.fn(),
   interpretUsageAggregateMock: vi.fn(),
 }));
@@ -38,6 +40,7 @@ vi.mock('@/lib/prisma', () => ({
     session: {
       aggregate: sessionAggregateMock,
       findMany: sessionFindManyMock,
+      updateMany: sessionUpdateManyMock,
     },
     interpretUsage: {
       create: interpretUsageCreateMock,
@@ -386,6 +389,9 @@ describe('deductTranscriptionMinutes', () => {
     userFindUniqueMock.mockReset();
     userUpdateMock.mockReset();
     userUpdateManyMock.mockReset();
+    // ensureQuotaWindow 重置分支会 db.session.updateMany 清预留（B1），给个默认返回避免抛错。
+    sessionUpdateManyMock.mockReset();
+    sessionUpdateManyMock.mockResolvedValue({ count: 0 });
   });
 
   it('窗口未过期：直接 increment 扣减，不触发重置', async () => {
@@ -489,6 +495,9 @@ describe('reserveTranscriptionMinutes', () => {
     userFindUniqueMock.mockReset();
     userUpdateManyMock.mockReset();
     executeRawMock.mockReset();
+    // ensureQuotaWindow 重置分支会 db.session.updateMany 清预留（B1），给个默认返回避免抛错。
+    sessionUpdateManyMock.mockReset();
+    sessionUpdateManyMock.mockResolvedValue({ count: 0 });
   });
 
   it('正向：额度足够时条件原子预扣成功返回 true', async () => {
@@ -637,17 +646,24 @@ describe('resetExpiredTranscriptionQuotas', () => {
   beforeEach(() => {
     userUpdateManyMock.mockReset();
     userFindManyMock.mockReset();
+    sessionUpdateManyMock.mockReset();
+    sessionUpdateManyMock.mockResolvedValue({ count: 0 });
   });
 
-  it('用乐观锁 updateMany WHERE quotaResetAt<=now 条件重置，返回 count', async () => {
+  it('单条原子 updateMany 重置 used，返回 count；并按到期用户清其在途预留（B1）', async () => {
+    // 先 findMany 到期用户（供清预留用），再 updateMany 重置 used
+    userFindManyMock.mockResolvedValueOnce([
+      { id: 'u1' },
+      { id: 'u2' },
+      { id: 'u3' },
+    ]);
     userUpdateManyMock.mockResolvedValueOnce({ count: 3 });
 
     const now = new Date('2026-02-01T00:00:00.000Z');
     const count = await resetExpiredTranscriptionQuotas(now);
 
     expect(count).toBe(3);
-    // 不再先 findMany 再逐个 update —— 单条原子 updateMany
-    expect(userFindManyMock).not.toHaveBeenCalled();
+    // used 重置仍是单条原子 updateMany
     expect(userUpdateManyMock).toHaveBeenCalledWith({
       where: { quotaResetAt: { lte: now } },
       data: {
@@ -655,12 +671,22 @@ describe('resetExpiredTranscriptionQuotas', () => {
         quotaResetAt: new Date('2099-01-01T00:00:00.000Z'),
       },
     });
+    // B1：到期用户的在途异步上传预留同步清零（used 归零则预留作废）
+    expect(sessionUpdateManyMock).toHaveBeenCalledWith({
+      where: {
+        userId: { in: ['u1', 'u2', 'u3'] },
+        asyncReservedMinutes: { gt: 0 },
+      },
+      data: { asyncReservedMinutes: 0 },
+    });
   });
 
-  it('无过期窗口：updateMany count=0 → 返回 0', async () => {
+  it('无过期窗口：findMany 空 → 不清预留；返回 updateMany count=0', async () => {
+    userFindManyMock.mockResolvedValueOnce([]);
     userUpdateManyMock.mockResolvedValueOnce({ count: 0 });
 
     expect(await resetExpiredTranscriptionQuotas(new Date())).toBe(0);
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 });
 

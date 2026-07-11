@@ -13,6 +13,7 @@ import {
 import {
   resetExpiredTranscriptionQuotas,
   reconcileStorageBytes,
+  settleAsyncReservation,
 } from '@/lib/quota';
 import {
   resolveRoleQuotas,
@@ -79,6 +80,7 @@ export interface BillingMaintenanceSummary {
   reclaimedAsyncUploads: number;
   reclaimedFullTranscribes: number;
   reclaimedStaleJobs: number;
+  releasedOrphanReservations: number;
   storageBytesReconciled: number;
   reconciliationRunId: string | null;
   chatFilesCleanup: {
@@ -229,6 +231,19 @@ export async function runBillingMaintenance(options?: {
     }
   }
 
+  // B1 兜底：释放已终态却仍残留在途预留的异步上传会话（防漏释放导致 transcriptionMinutesUsed 泄漏）。
+  // 失败仅 log 不 rethrow，避免拖垮其余维护步骤。
+  let releasedOrphanReservations = 0;
+  try {
+    releasedOrphanReservations = await releaseOrphanAsyncReservations(now);
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'release orphan async reservations failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
   // 僵尸任务回收：把卡在 PROCESSING 超时的 JobQueue 记录标失败（解锁前端指示器、可被 retryJob 重试）。
   // 不为本步骤单独建 job —— 它是对 job 表自身的清道夫，建 job 反而引入"清道夫卡住谁来清"的递归。
   let reclaimedStaleJobs = 0;
@@ -318,6 +333,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedAsyncUploads > 0 ||
     reclaimedFullTranscribes > 0 ||
     reclaimedStaleJobs > 0 ||
+    releasedOrphanReservations > 0 ||
     storageBytesReconciled > 0 ||
     reconciliationRunId ||
     (chatFilesCleanup &&
@@ -334,6 +350,7 @@ export async function runBillingMaintenance(options?: {
         reclaimedAsyncUploads,
         reclaimedFullTranscribes,
         reclaimedStaleJobs,
+        releasedOrphanReservations,
         storageBytesReconciled,
         reconciliationRunId,
         chatFilesCleanup,
@@ -348,6 +365,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedAsyncUploads,
     reclaimedFullTranscribes,
     reclaimedStaleJobs,
+    releasedOrphanReservations,
     storageBytesReconciled,
     reconciliationRunId,
     chatFilesCleanup,
@@ -640,6 +658,50 @@ async function reclaimStaleAsyncUploads(now: Date): Promise<number> {
   }
 
   return reclaimedCount;
+}
+
+// B1 兜底扫描的陈旧门槛：只清「已终态一段时间」的残留预留，避免与刚 completed 的在途
+// finalize 结算(release 预留)赛跑重复释放。用 updatedAt 判定（finalize 结算会 bump updatedAt）。
+const ASYNC_RESERVATION_SWEEP_STALE_MS = 30 * 60_000;
+
+/**
+ * B1 兜底：释放「已终态却仍残留在途预留（asyncReservedMinutes>0）」的异步上传会话。
+ *
+ * 正常路径：finalize 把预留「转」为实扣并清列；cancel/删会话 inline 释放。但若某终态转移未清
+ * 预留（failed 由 status-route / reclaim / processor 标记时不 inline 释放、或 finalize 结算事务
+ * 整体失败留下残留），预留会永久占着 transcriptionMinutesUsed → 额度泄漏。这里扫
+ * 「asyncReservedMinutes>0 且已终态(failed/canceled/completed) 且 updatedAt 超 30min」的会话，
+ * 条件原子认领后释放，兜住所有未 inline 释放的路径。30min 陈旧门槛避免与刚 completed 的
+ * finalize 结算(同样 release 预留)赛跑重复释放。
+ */
+export async function releaseOrphanAsyncReservations(now: Date): Promise<number> {
+  const staleBefore = new Date(now.getTime() - ASYNC_RESERVATION_SWEEP_STALE_MS);
+  const TERMINAL = ['failed', 'canceled', 'completed'];
+  const stuck = await prisma.session.findMany({
+    where: {
+      asyncReservedMinutes: { gt: 0 },
+      asyncTranscribeStatus: { in: TERMINAL },
+      updatedAt: { lte: staleBefore },
+    },
+    select: { id: true, userId: true, asyncReservedMinutes: true },
+    take: 500,
+    orderBy: { updatedAt: 'asc' },
+  });
+
+  let releasedCount = 0;
+  for (const s of stuck) {
+    // 统一走 settleAsyncReservation（FOR UPDATE 读当前列 → 清零 + 释放，同一事务原子、恰好一次）。
+    // 与 finalize 结算 / 删会话 / re-init 顶替 的释放互斥：并发多路径只有一个读到 >0 并释放。
+    const released = await settleAsyncReservation(s.id).catch(() => 0);
+    if (released > 0) {
+      releasedCount += 1;
+      billingLogger.info(
+        { sessionId: s.id, userId: s.userId, minutes: released },
+        'released orphan async upload reservation'
+      );
+    }
+  }
+  return releasedCount;
 }
 
 /**

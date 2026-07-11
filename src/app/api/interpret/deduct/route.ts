@@ -103,6 +103,9 @@ export async function POST(req: Request) {
       const claim = await claimInterpretSessionForDeduct(
         payload.id,
         anchorIdForClaim,
+        // R1-C Finding 1：传入本流锚点起点（Redis 消费得到），供 anchorId 落空时精确回退认领 mint 补建的
+        // 本流 null-anchor 锚点、且只认 startedAt >= 本起点者，杜绝误结算并发/上一场锚点。
+        anchorStartedAt,
         tx
       );
 

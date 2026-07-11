@@ -1164,6 +1164,10 @@ export async function expireRoleDowngrades(now: Date): Promise<number> {
         role: targetRole,
         originalRole: null,
         roleExpiresAt: null,
+        // 到期同时清掉自定义组绑定：否则用户 role/配额已回落系统角色，customGroupId 却仍指向
+        // 旧自定义组 → resolveUserFeatureFlags 仍读组的能力开关、UI 徽章仍显示组名，与已重置的
+        // 配额列不一致（漂移）。回落目标是系统角色，本就不应保留自定义组归属。
+        customGroupId: null,
         transcriptionMinutesLimit: quotas.transcriptionMinutesLimit,
         storageHoursLimit: quotas.storageHoursLimit,
         allowedModels: quotas.allowedModels,

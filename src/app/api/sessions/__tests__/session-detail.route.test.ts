@@ -79,10 +79,11 @@ vi.mock('@/lib/audio/asyncUploadProcessor', () => ({
   cancelAsyncUpload: cancelAsyncUploadMock,
 }));
 
-// B1：DELETE 删会话前用 settleAsyncReservation 原子结算异步上传预留。桩为 no-op，避免它内部
-// 自开 prisma.$transaction 干扰本用例对删除级联事务次数的断言。
+// B1/R4：DELETE 删会话前用 settleAsyncReservation / settleFullReservation 原子结算在途预留。桩为
+// no-op，避免它内部自开 prisma.$transaction 干扰本用例对删除级联事务次数的断言。
 vi.mock('@/lib/quota', () => ({
   settleAsyncReservation: vi.fn().mockResolvedValue(0),
+  settleFullReservation: vi.fn().mockResolvedValue(0),
 }));
 
 import { DELETE, GET, PATCH } from '@/app/api/sessions/[id]/route';

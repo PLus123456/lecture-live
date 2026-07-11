@@ -45,8 +45,9 @@ vi.mock('@/lib/apiResponseCache', () => ({
 
 vi.mock('@/lib/quota', () => ({
   releaseStorageBytes: releaseStorageBytesMock,
-  // B1：批量删会话前用 settleAsyncReservation 原子结算异步上传预留。桩为 no-op。
+  // B1/R4：批量删会话前用 settleAsyncReservation / settleFullReservation 原子结算在途预留。桩为 no-op。
   settleAsyncReservation: vi.fn().mockResolvedValue(0),
+  settleFullReservation: vi.fn().mockResolvedValue(0),
 }));
 
 vi.mock('@/lib/prisma', () => ({

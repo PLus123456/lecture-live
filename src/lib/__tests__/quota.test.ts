@@ -650,7 +650,7 @@ describe('resetExpiredTranscriptionQuotas', () => {
     sessionUpdateManyMock.mockResolvedValue({ count: 0 });
   });
 
-  it('单条原子 updateMany 重置 used，返回 count；并按到期用户清其在途预留（B1）', async () => {
+  it('单条原子 updateMany 重置 used，返回 count；并按到期用户清其在途预留（B1/R4）', async () => {
     // 先 findMany 到期用户（供清预留用），再 updateMany 重置 used
     userFindManyMock.mockResolvedValueOnce([
       { id: 'u1' },
@@ -671,13 +671,17 @@ describe('resetExpiredTranscriptionQuotas', () => {
         quotaResetAt: new Date('2099-01-01T00:00:00.000Z'),
       },
     });
-    // B1：到期用户的在途异步上传预留同步清零（used 归零则预留作废）
+    // B1/R4：到期用户的在途预留（异步上传 + 完整版补全两列）一并清零（used 归零则预留作废），
+    // 且**先清列再归零 used**（顺序在 resetExpiredTranscriptionQuotas 内保证）。
     expect(sessionUpdateManyMock).toHaveBeenCalledWith({
       where: {
         userId: { in: ['u1', 'u2', 'u3'] },
-        asyncReservedMinutes: { gt: 0 },
+        OR: [
+          { asyncReservedMinutes: { gt: 0 } },
+          { fullReservedMinutes: { gt: 0 } },
+        ],
       },
-      data: { asyncReservedMinutes: 0 },
+      data: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
     });
   });
 

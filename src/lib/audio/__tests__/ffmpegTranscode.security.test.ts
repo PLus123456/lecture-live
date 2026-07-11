@@ -130,6 +130,26 @@ describe('transcodeToMp3 ffmpeg 参数硬化', () => {
   });
 });
 
+describe('runProbe ffprobe 参数（回归：-nostdin 破坏 ffprobe 8.x）', () => {
+  it('ffprobe 调用带 -protocol_whitelist file,pipe 但绝不带 -nostdin', async () => {
+    fsState.head = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0]);
+    spawnState.nextProbeStdout = 'matroska,webm\n';
+    await validateMediaContainer('/tmp/ok.webm');
+    // validateMediaContainer 会派生 ffprobe（-show_entries format=format_name）。
+    const probeCalls = spawnState.allArgs.filter((a) => a.includes('-show_entries'));
+    expect(probeCalls.length).toBeGreaterThan(0);
+    for (const args of probeCalls) {
+      // 回归防护：`-nostdin` 是 ffmpeg 的全局选项，ffprobe 不认识——ffmpeg 7+/8.x 会把它
+      // 当成需要取值的未知选项、吞掉下一个参数并 rc=1 stdout 全空，导致 probeFormatName
+      // 返回空 →「ffprobe could not determine container format」。绝不能再出现在 probe 参数里。
+      expect(args).not.toContain('-nostdin');
+      const pwIdx = args.indexOf('-protocol_whitelist');
+      expect(pwIdx).toBeGreaterThanOrEqual(0);
+      expect(args[pwIdx + 1]).toBe('file,pipe');
+    }
+  });
+});
+
 describe('validateMediaContainer', () => {
   it('playlist 文本输入（魔数不过）→ 抛 MediaValidationError', async () => {
     fsState.head = Buffer.from('#EXTM3U\n#EXT-X-STREAM-INF');

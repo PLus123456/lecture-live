@@ -265,6 +265,7 @@ export default function PlaybackPage() {
   const [exportOpen, setExportOpen] = useState(false);
   const [reportData, setReportData] = useState<SessionReportData | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
+  const [regeneratingReport, setRegeneratingReport] = useState(false);
   const [regeneratingTitle, setRegeneratingTitle] = useState(false);
   const [regenerateConfirmOpen, setRegenerateConfirmOpen] = useState(false);
 
@@ -1000,6 +1001,42 @@ export default function PlaybackPage() {
     }
   }, [sessionId, token, session, t]);
 
+  // 报告生成失败 / 缺失时的重新生成入口（POST 生成 + 重新拉取 GET）。分享模式不提供。
+  const handleRegenerateReport = useCallback(async () => {
+    if (!sessionId || !token || regeneratingReport) return;
+    setRegeneratingReport(true);
+    setReportLoading(true);
+    try {
+      const res = await fetch('/api/llm/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ sessionId }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        toast.error(t('playback.reportRegenFailed'), body.error || undefined);
+        return;
+      }
+      // 重新拉取已持久化的完整报告对象（与首屏加载同口径）。
+      const rRes = await fetch(`/api/llm/report?sessionId=${sessionId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (rRes.ok) {
+        const rData = await rRes.json();
+        setReportData(rData.report ?? null);
+      }
+      toast.success(t('playback.reportRegenDone'));
+    } catch {
+      toast.error(t('playback.reportRegenFailed'));
+    } finally {
+      setRegeneratingReport(false);
+      setReportLoading(false);
+    }
+  }, [sessionId, token, regeneratingReport, t]);
+
   const fetchRecordingForExport = useCallback(async (): Promise<Blob | null> => {
     if (recordingBlobRef.current) {
       return recordingBlobRef.current;
@@ -1234,6 +1271,8 @@ export default function PlaybackPage() {
           onOpenExport={() => setExportOpen(true)}
           onRegenerateTitle={handleRegenerateTitle}
           regeneratingTitle={regeneratingTitle}
+          onRegenerateReport={handleRegenerateReport}
+          regeneratingReport={regeneratingReport}
           isShareMode={isShareMode}
           canGenerateFull={canGenerateFull}
           onGenerateFull={handleGenerateFull}
@@ -1592,6 +1631,25 @@ export default function PlaybackPage() {
                     <div className="text-center text-charcoal-400 text-sm py-8">
                       <ClipboardList className="w-6 h-6 mx-auto mb-2 opacity-30" />
                       <p>{t('playback.noReport')}</p>
+                      {!isShareMode && (
+                        <button
+                          onClick={handleRegenerateReport}
+                          disabled={regeneratingReport}
+                          data-testid="report-regen-btn"
+                          className="mt-4 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg
+                                     bg-rust-50 text-rust-600 text-xs font-medium
+                                     hover:bg-rust-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {regeneratingReport ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <RefreshCw className="w-3.5 h-3.5" />
+                          )}
+                          {regeneratingReport
+                            ? t('playback.reportRegenerating')
+                            : t('playback.reportRegenerate')}
+                        </button>
+                      )}
                     </div>
                   ) : !reportData.significance.isWorthSummarizing ? (
                     <div className="text-center py-8">
@@ -1716,6 +1774,25 @@ export default function PlaybackPage() {
                     <div className="text-center text-charcoal-400 text-sm py-8">
                       <AlertCircle className="w-6 h-6 mx-auto mb-2 opacity-30" />
                       <p>{t('playback.reportFailed')}</p>
+                      {!isShareMode && (
+                        <button
+                          onClick={handleRegenerateReport}
+                          disabled={regeneratingReport}
+                          data-testid="report-regen-btn"
+                          className="mt-4 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg
+                                     bg-rust-50 text-rust-600 text-xs font-medium
+                                     hover:bg-rust-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {regeneratingReport ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <RefreshCw className="w-3.5 h-3.5" />
+                          )}
+                          {regeneratingReport
+                            ? t('playback.reportRegenerating')
+                            : t('playback.reportRegenerate')}
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>

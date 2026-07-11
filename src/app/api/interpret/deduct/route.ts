@@ -1,6 +1,12 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
-import { deductTranscriptionMinutes, recordInterpretUsage } from '@/lib/quota';
+import { prisma } from '@/lib/prisma';
+import {
+  deductTranscriptionMinutes,
+  recordInterpretUsage,
+  getQuotaSnapshot,
+} from '@/lib/quota';
+import { claimInterpretSessionForDeduct } from '@/lib/interpret/session';
 import { getBillableMinutes } from '@/lib/billing';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger } from '@/lib/logger';
@@ -81,33 +87,70 @@ export async function POST(req: Request) {
   }
 
   const billableMinutes = getBillableMinutes(effectiveMs);
-  if (billableMinutes <= 0) {
-    return NextResponse.json({ quotas: null, deducted: 0 });
-  }
+  const anchorIdForClaim =
+    typeof body.anchorId === 'string' ? body.anchorId : null;
 
-  const snapshot = await deductTranscriptionMinutes(payload.id, billableMinutes);
-  if (!snapshot) {
-    return NextResponse.json({ error: 'User not found' }, { status: 404 });
-  }
-
-  // 已成功扣费 → 记一笔同传用量台账，让对账把 interpret 分钟计入 expected（消除虚报 drift）。
-  // billedMinutes 与本次实扣分钟（billableMinutes）一字一致；口径与 deduct 侧完全相同。
-  // ADMIN 恒不扣费（snapshot.role==='ADMIN' 即 deduct 短路未 increment），故不记账。
-  // 台账失败不回滚扣费、也不阻塞响应：扣费已成功落库是权威；台账仅为对账辅助，best-effort 记录。
-  if (snapshot.role !== 'ADMIN') {
-    try {
-      await recordInterpretUsage(payload.id, billableMinutes, effectiveMs);
-    } catch (err) {
-      interpretLogger.warn(
-        {
-          userId: payload.id,
-          billedMinutes: billableMinutes,
-          message: err instanceof Error ? err.message : String(err),
-        },
-        'failed to record interpret usage ledger; deduction already applied'
+  // B3：把「认领会话 + 扣费 + 记台账 + 回填实扣」放进**一个事务**原子提交。任一步失败整体回滚 →
+  // 会话保持未结算(settledAt=null)、由 cron 兜底，杜绝「已结算却没扣费」的静默免单（审查 R2/R7）。
+  // 认领分支（与 cron 兜底经 settledAt 条件认领互斥，恰好扣一次）：
+  //  - already_settled：cron 已兜底扣费并结算 → 跳过扣费（防双扣）。
+  //  - no_record 且**降级(无 anchorId)**：无法可靠匹配本场、cron 可能已兜底 → 跳过扣费，避免
+  //    「cron 已扣 + 这里再扣」双扣（审查 R4）。锚点存在时的 no_record（会话早于部署/边缘）仍正常扣费兜底。
+  //  - claimed / no_record(有 anchorId)：正常扣费；claimed 情形回填 billedMinutes（审计）。
+  let result: { charged: boolean; snapshot: Awaited<ReturnType<typeof deductTranscriptionMinutes>> };
+  try {
+    result = await prisma.$transaction(async (tx) => {
+      const claim = await claimInterpretSessionForDeduct(
+        payload.id,
+        anchorIdForClaim,
+        tx
       );
-    }
+
+      const skip =
+        claim.outcome === 'already_settled' ||
+        (claim.outcome === 'no_record' && anchorIdForClaim === null) ||
+        billableMinutes <= 0;
+      if (skip) {
+        return { charged: false, snapshot: null };
+      }
+
+      const snapshot = await deductTranscriptionMinutes(
+        payload.id,
+        billableMinutes,
+        tx
+      );
+      if (!snapshot) {
+        // 用户不存在：回滚整个事务（含认领），会话留给 cron。
+        throw new Error('interpret deduct: user not found');
+      }
+      // ADMIN 恒不扣费（snapshot.role==='ADMIN' 即 deduct 短路未 increment），不记台账。
+      // 台账与扣费同事务：口径 billedMinutes 与实扣一字一致，供对账计入 expected。
+      if (snapshot.role !== 'ADMIN') {
+        await recordInterpretUsage(payload.id, billableMinutes, effectiveMs, tx);
+      }
+      if (claim.sessionId) {
+        await tx.interpretSession.update({
+          where: { id: claim.sessionId },
+          data: { billedMinutes: billableMinutes },
+        });
+      }
+      return { charged: true, snapshot };
+    });
+  } catch (err) {
+    interpretLogger.error(
+      {
+        userId: payload.id,
+        message: err instanceof Error ? err.message : String(err),
+      },
+      'interpret deduct transaction failed; session left unsettled for cron'
+    );
+    return NextResponse.json({ error: 'Deduct failed' }, { status: 500 });
   }
 
-  return NextResponse.json({ quotas: snapshot, deducted: billableMinutes });
+  if (!result.charged) {
+    // 未扣费（已结算 / 降级无记录 / 不足 1 分钟）：返回当前配额快照。
+    const snap = await getQuotaSnapshot(payload.id);
+    return NextResponse.json({ quotas: snap, deducted: 0 });
+  }
+  return NextResponse.json({ quotas: result.snapshot, deducted: billableMinutes });
 }

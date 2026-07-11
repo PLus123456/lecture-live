@@ -143,6 +143,8 @@ export async function finalizeAsyncTranscription(
       sonioxFileId: null,
       sonioxTranscriptionId: null,
       status: 'COMPLETED',
+      // B7：置扣费时刻，供对账按扣费周期归期（异步上传的权威扣费紧随其后）。
+      billedAt: new Date(),
     },
   });
   if (finalized.count !== 1) {

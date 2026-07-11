@@ -90,7 +90,10 @@ export async function POST(req: Request) {
     // 注：**堵不住**「/start 后立刻 /deduct(≈0) 早结算再继续单连接串流」与「realtime 假 sessionId 无
     // Session 串流」——单连接不再 re-mint（实测 Soniox 连接可存活远超 60s key），服务端再无观测点，需 WS 代理(A)。
     if (clientReferenceId?.startsWith('interpret:')) {
-      await ensureActiveInterpretSession(user.id);
+      // 纵深防御：ensureActiveInterpretSession 内部已吞错，此处再包一层 .catch —— 保证「已成功签发的
+      // key」绝不因这条 best-effort 兜底记账（在响应关键路径的外层 try 内）被转成 500 / 浪费已签发的 key，
+      // 即便将来重构去掉了内部 try/catch 也稳。
+      await ensureActiveInterpretSession(user.id).catch(() => undefined);
     }
 
     return NextResponse.json({

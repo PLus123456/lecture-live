@@ -107,13 +107,15 @@ export interface InterpretClaimResult {
  *   - 目标会话已被 cron 结算 → 'already_settled'（调用方**跳过扣费**，避免双扣）。
  *   - 查无记录（会话早于 B3 部署 / Redis 曾不可用没建行 / 边缘）→ 'no_record'（调用方按旧行为扣费兜底）。
  * 无 anchorId（降级）时认领该用户**最旧**的未结算会话。
+ * R1-C（审查 Finding 1）：anchorId 命中失败时回退认领该用户**最近一条**未结算会话（temporary-key 在
+ * mint 时补建的 null-anchor 锚点），结算它以杜绝 cron 幽灵双扣（详见函数体内注释）。
  */
 export async function claimInterpretSessionForDeduct(
   userId: string,
   anchorId: string | null,
   db: InterpretDbClient = prisma
 ): Promise<InterpretClaimResult> {
-  const target = anchorId
+  let target = anchorId
     ? await db.interpretSession.findFirst({
         where: { anchorId, userId },
         orderBy: { startedAt: 'desc' },
@@ -124,6 +126,21 @@ export async function claimInterpretSessionForDeduct(
         orderBy: { startedAt: 'asc' },
         select: { id: true, settledAt: true },
       });
+
+  // R1-C 审查 Finding 1 修复：anchorId 提供但查无对应 DB 行 —— 典型成因是 /start 的 Redis 锚点建成、
+  // 但其 InterpretSession 行 create 失败（DB 抖动，被 createInterpretSession 吞掉），/start 仍把
+  // anchorId 返给客户端。此时 temporary-key 在 mint 时补建了一条 null-anchor 锚点(B)；若 deduct 只按
+  // anchorId 找不到就走 no_record，会按 X1 墙钟正常扣费却**不结算 B** → B 残留被 cron 二次兜底扣 ~6h，
+  // honest 用户 DB 一抖就被双扣（15min + 360min）。故 anchorId 落空时回退认领该用户**最近一条**未结算
+  // 会话（即当前流的 B），使这次 deduct 在正常扣费的同时结算它，杜绝 cron 幽灵双扣。取"最近"(desc)而非
+  // "最旧"，避免误结算上一场遗留的更早未结算锚点。仅在 anchorId 命中失败时触发，不改动正常命中/降级路径。
+  if (!target && anchorId) {
+    target = await db.interpretSession.findFirst({
+      where: { userId, settledAt: null },
+      orderBy: { startedAt: 'desc' },
+      select: { id: true, settledAt: true },
+    });
+  }
 
   if (!target) {
     return { outcome: 'no_record', sessionId: null };

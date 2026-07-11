@@ -125,15 +125,40 @@ describe('claimInterpretSessionForDeduct', () => {
     expect(r).toEqual({ outcome: 'already_settled', sessionId: 's1' });
   });
 
-  it('查无记录 → no_record（调用方按旧行为扣费兜底）', async () => {
-    findFirstMock.mockResolvedValueOnce(null);
+  it('anchorId 命中失败 + 无任何未结算会话 → no_record（anchorId 查空 + 回退也查空）', async () => {
+    // R1-C：anchorId 落空会回退查最近未结算；两处都查空才 no_record。
+    findFirstMock.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
 
     const r = await claimInterpretSessionForDeduct('u1', 'a1');
 
     expect(r).toEqual({ outcome: 'no_record', sessionId: null });
+    expect(findFirstMock).toHaveBeenCalledTimes(2);
   });
 
-  it('无 anchorId（降级）→ 认领该用户最旧的未结算会话', async () => {
+  it('R1-C Finding 1：anchorId 查无 DB 行（/start DB 建行失败）→ 回退认领最近未结算(mint 补建的 B) → claimed', async () => {
+    // 1) 按 anchorId 查无（X1 的 DB 行没建成）；2) 回退按 userId+未结算+最近 → 命中 B。
+    findFirstMock
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: 's-mint-B', settledAt: null });
+    updateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    const r = await claimInterpretSessionForDeduct('u1', 'a1');
+
+    expect(r).toEqual({ outcome: 'claimed', sessionId: 's-mint-B' });
+    // 回退查询按 userId+未结算，取最近(desc)——避免误结算上一场更早的残留锚点
+    expect(findFirstMock).toHaveBeenNthCalledWith(2, {
+      where: { userId: 'u1', settledAt: null },
+      orderBy: { startedAt: 'desc' },
+      select: { id: true, settledAt: true },
+    });
+    // 认领的是回退命中的 B
+    expect(updateManyMock).toHaveBeenCalledWith({
+      where: { id: 's-mint-B', settledAt: null },
+      data: { settledAt: expect.any(Date), settledBy: 'deduct' },
+    });
+  });
+
+  it('无 anchorId（降级）→ 认领该用户最旧的未结算会话（回退路径仅对 anchorId 命中失败触发，此路径不变）', async () => {
     findFirstMock.mockResolvedValueOnce({ id: 's-old', settledAt: null });
     updateManyMock.mockResolvedValueOnce({ count: 1 });
 
@@ -234,17 +259,6 @@ describe('ensureActiveInterpretSession（R1-C：mint 时保证有活锚点，堵
       data: { userId: 'u1', anchorId: null, startedAt: NOW },
       select: { id: true },
     });
-  });
-
-  it('陈旧未结算锚点（窗口外，上一场崩溃残留）不复用 → 新建独立锚点', async () => {
-    // findFirst 的 where 已带 startedAt>=now-MAX，故窗口外的返回 null（模拟查不到）→ 新建
-    findFirstMock.mockResolvedValueOnce(null);
-    createMock.mockResolvedValueOnce({ id: 's-fresh' });
-
-    const r = await ensureActiveInterpretSession('u1', NOW);
-
-    expect(r.created).toBe(true);
-    expect(r.id).toBe('s-fresh');
   });
 
   it('DB 故障 → 吞错、返回 {id:null, created:false}（绝不阻塞发 key）', async () => {

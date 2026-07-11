@@ -22,6 +22,14 @@ const sessionLogger = logger.child({ component: 'interpret-session' });
 // 兜底阈值：> MAX_INTERPRET_DURATION_MS(6h) 留足余量，避免误扫「合法长会话、稍后会正常 deduct」的在途会话。
 export const INTERPRET_RECLAIM_STALE_MS = 7 * 60 * 60_000;
 
+// R1-C：deduct 回退认领 mint 锚点时，允许 B.startedAt 略早于 anchorStartedAt 的时钟容差。B 建于 mint、
+// 必晚于 /start 的锚点起点，理论上 B.startedAt >= anchorStartedAt；给几秒容差纯为防毫秒级抖动，同时仍
+// 足够小以排除上一场/更早的残留锚点（它们起点通常早数分钟以上）。
+// 前提：本项目自托管单进程（/start 与 mint 同一服务器同一时钟，见部署文档），故此容差绰绰有余。若将来
+// 横向扩成多实例、实例间时钟偏差可能 >5s，需改用「前端把 anchorId 传给 mint、令 mint 建的行直接带该
+// anchorId」的精确键控（届时 deduct 按 anchorId 命中即可、无需本墙钟启发式）。
+const FALLBACK_ANCHOR_SKEW_MS = 5_000;
+
 /**
  * /start：为一次同传会话落一行未结算记录。anchorId 供 /deduct 精确认领（Redis 不可用时为 null）。
  * best-effort：建行失败不阻塞 interpret 启动（退化到旧行为——纯靠 /deduct 计费、无 cron 兜底）。
@@ -40,6 +48,60 @@ export async function createInterpretSession(
   }
 }
 
+export interface EnsureInterpretResult {
+  /** 复用/新建的锚点 id；创建失败（DB 故障）时为 null（best-effort，不阻塞发 key）。 */
+  id: string | null;
+  /** 是否本次新建（true=补建了缺失锚点，即客户端跳过了 /start）。 */
+  created: boolean;
+}
+
+/**
+ * R1-C：在 temporary-key 签发（唯一必经的服务端点）时，保证该用户有一条「活的」未结算
+ * InterpretSession 锚点。
+ *
+ * 堵 skip /start 白嫖①：改装客户端跳过 /interpret/start 直接反复取 key 串流时，B3 的 cron 兜底
+ * （reclaimStaleInterpretSessions）没有对象可结算 → 整场免费。这里在 mint 时为其补建锚点，使
+ * cron 能按服务端墙钟兜底扣费（未结算超时按 startedAt→now 封顶 MAX_INTERPRET 扣）。
+ *
+ * 语义：找该用户最近一条 settledAt=null 且 startedAt 在 MAX_INTERPRET 窗口内的锚点 —— 有则复用
+ * （honest 客户端 /start 建的锚点，或本串流早前 mint 补建的锚点；避免每次 mint 都建新行），无则
+ * 新建（startedAt=now、anchorId=null）。best-effort：任何失败都不抛（绝不阻塞发 key）。
+ *
+ * **堵不住**「/start 后立刻 /deduct(≈0) 早结算再继续单连接串流」②：早结算把锚点 settledAt 置非空、
+ * 移出 cron，而单连接串流不再 re-mint（实测 Soniox 连接可存活远超 60s key、无需续 key），服务端再
+ * 无观测点。② 与「realtime 用假 sessionId 无 Session 串流」都需服务端 WS 代理(A)才能彻底解 —— 见
+ * 计费审计说明。本函数只把「懒惰/意外跳过 /start」从免费降级为 cron 兜底计费。
+ */
+export async function ensureActiveInterpretSession(
+  userId: string,
+  now: Date = new Date()
+): Promise<EnsureInterpretResult> {
+  try {
+    const recentThreshold = new Date(now.getTime() - MAX_INTERPRET_DURATION_MS);
+    // 复用最近的活锚点（honest 客户端 /start 已建；本串流早前 mint 已补建）。窗口外的陈旧未结算
+    // 锚点不复用——那是上一场崩溃残留、交给 cron 兜底，新场补建独立锚点，避免把新场并进旧 startedAt。
+    const existing = await prisma.interpretSession.findFirst({
+      where: { userId, settledAt: null, startedAt: { gte: recentThreshold } },
+      orderBy: { startedAt: 'desc' },
+      select: { id: true },
+    });
+    if (existing) {
+      return { id: existing.id, created: false };
+    }
+    const created = await prisma.interpretSession.create({
+      data: { userId, anchorId: null, startedAt: now },
+      select: { id: true },
+    });
+    return { id: created.id, created: true };
+  } catch (err) {
+    sessionLogger.warn(
+      { userId, message: err instanceof Error ? err.message : String(err) },
+      'ensureActiveInterpretSession failed (non-blocking; key mint proceeds)'
+    );
+    return { id: null, created: false };
+  }
+}
+
 export type InterpretClaimOutcome = 'claimed' | 'already_settled' | 'no_record';
 
 export interface InterpretClaimResult {
@@ -53,13 +115,17 @@ export interface InterpretClaimResult {
  *   - 目标会话已被 cron 结算 → 'already_settled'（调用方**跳过扣费**，避免双扣）。
  *   - 查无记录（会话早于 B3 部署 / Redis 曾不可用没建行 / 边缘）→ 'no_record'（调用方按旧行为扣费兜底）。
  * 无 anchorId（降级）时认领该用户**最旧**的未结算会话。
+ * R1-C（审查 Finding 1 + 二审收窄）：anchorId 命中失败时回退认领**本流** mint 补建的 null-anchor 锚点
+ * （精确锁定：anchorId:null 且 startedAt >= anchorStartedAt），结算它以杜绝 cron 幽灵双扣，同时不误结算
+ * 并发/上一场的锚点（详见函数体内注释）。需传入本流锚点起点 anchorStartedAt（deduct 消费 Redis 锚点得到）。
  */
 export async function claimInterpretSessionForDeduct(
   userId: string,
   anchorId: string | null,
+  anchorStartedAt: number | null,
   db: InterpretDbClient = prisma
 ): Promise<InterpretClaimResult> {
-  const target = anchorId
+  let target = anchorId
     ? await db.interpretSession.findFirst({
         where: { anchorId, userId },
         orderBy: { startedAt: 'desc' },
@@ -70,6 +136,29 @@ export async function claimInterpretSessionForDeduct(
         orderBy: { startedAt: 'asc' },
         select: { id: true, settledAt: true },
       });
+
+  // R1-C 审查 Finding 1 修复（+ 二审收窄）：anchorId 提供但查无对应 DB 行 —— 典型成因是 /start 的 Redis
+  // 锚点建成、但其 InterpretSession 行 create 失败（DB 抖动，被 createInterpretSession 吞掉），/start 仍把
+  // anchorId 返给客户端。此时 temporary-key 在 mint 时补建了一条 null-anchor 锚点(B)；若 deduct 只按
+  // anchorId 找不到就走 no_record，会按墙钟正常扣费却**不结算 B** → B 残留被 cron 二次兜底扣 ~6h（honest
+  // 用户 DB 一抖就被双扣）。故 anchorId 落空时回退认领当前流的 mint 锚点 B —— 但**必须精确锁定本流**，否则
+  // 误结算并发标签页/上一场的未结算锚点会让那条流白嫖（二审 Finding：宽泛"最近未结算"是新的漏扣洞）。
+  // 精确锁定用两把锁：(1) anchorId:null —— 只认 mint 补建的锚点，绝不动别的流经 /start 建的 anchorId 非空
+  // 行；(2) startedAt >= 本流锚点起点(anchorStartedAt) —— B 建于 mint、必晚于 /start 的锚点起点，故 >= 起点；
+  // 上一场/更早的残留锚点起点更早、被排除（留给 cron 按其真实时长兜底）。仅当 anchorStartedAt 已知（Redis
+  // 命中）才回退——stale/伪造 anchorId 消费不到 Redis 锚点(anchorStartedAt=null)时不回退，避免误结算。
+  if (!target && anchorId && anchorStartedAt != null) {
+    target = await db.interpretSession.findFirst({
+      where: {
+        userId,
+        settledAt: null,
+        anchorId: null,
+        startedAt: { gte: new Date(anchorStartedAt - FALLBACK_ANCHOR_SKEW_MS) },
+      },
+      orderBy: { startedAt: 'desc' },
+      select: { id: true, settledAt: true },
+    });
+  }
 
   if (!target) {
     return { outcome: 'no_record', sessionId: null };

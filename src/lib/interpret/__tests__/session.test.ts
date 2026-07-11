@@ -98,7 +98,8 @@ describe('claimInterpretSessionForDeduct', () => {
     findFirstMock.mockResolvedValueOnce({ id: 's1', settledAt: null });
     updateManyMock.mockResolvedValueOnce({ count: 1 });
 
-    const r = await claimInterpretSessionForDeduct('u1', 'a1');
+    // anchorId 命中即返回（不到回退路径），anchorStartedAt 取值无关，传 null。
+    const r = await claimInterpretSessionForDeduct('u1', 'a1', null);
 
     expect(r).toEqual({ outcome: 'claimed', sessionId: 's1' });
     expect(updateManyMock).toHaveBeenCalledWith({
@@ -110,7 +111,7 @@ describe('claimInterpretSessionForDeduct', () => {
   it('目标会话已被 cron 结算(settledAt 非空) → already_settled，不再认领', async () => {
     findFirstMock.mockResolvedValueOnce({ id: 's1', settledAt: NOW });
 
-    const r = await claimInterpretSessionForDeduct('u1', 'a1');
+    const r = await claimInterpretSessionForDeduct('u1', 'a1', null);
 
     expect(r).toEqual({ outcome: 'already_settled', sessionId: 's1' });
     expect(updateManyMock).not.toHaveBeenCalled();
@@ -120,49 +121,65 @@ describe('claimInterpretSessionForDeduct', () => {
     findFirstMock.mockResolvedValueOnce({ id: 's1', settledAt: null });
     updateManyMock.mockResolvedValueOnce({ count: 0 });
 
-    const r = await claimInterpretSessionForDeduct('u1', 'a1');
+    const r = await claimInterpretSessionForDeduct('u1', 'a1', null);
 
     expect(r).toEqual({ outcome: 'already_settled', sessionId: 's1' });
   });
 
-  it('anchorId 命中失败 + 无任何未结算会话 → no_record（anchorId 查空 + 回退也查空）', async () => {
-    // R1-C：anchorId 落空会回退查最近未结算；两处都查空才 no_record。
+  const ANCHOR_TS = NOW.getTime() - 60_000; // 本流锚点起点：1 分钟前
+
+  it('anchorId 命中失败 + 无本流 mint 锚点 → no_record（anchorId 查空 + 精确回退也查空）', async () => {
+    // R1-C：anchorId 落空会精确回退查本流的 null-anchor 锚点；两处都查空才 no_record。
     findFirstMock.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
 
-    const r = await claimInterpretSessionForDeduct('u1', 'a1');
+    const r = await claimInterpretSessionForDeduct('u1', 'a1', ANCHOR_TS);
 
     expect(r).toEqual({ outcome: 'no_record', sessionId: null });
     expect(findFirstMock).toHaveBeenCalledTimes(2);
   });
 
-  it('R1-C Finding 1：anchorId 查无 DB 行（/start DB 建行失败）→ 回退认领最近未结算(mint 补建的 B) → claimed', async () => {
-    // 1) 按 anchorId 查无（X1 的 DB 行没建成）；2) 回退按 userId+未结算+最近 → 命中 B。
+  it('R1-C Finding 1：anchorId 查无 DB 行（/start DB 建行失败）→ 精确回退认领本流 mint 锚点 B → claimed', async () => {
+    // 1) 按 anchorId 查无（X1 的 DB 行没建成）；2) 精确回退：userId+未结算+anchorId:null+startedAt>=锚点起点 → 命中 B。
     findFirstMock
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ id: 's-mint-B', settledAt: null });
     updateManyMock.mockResolvedValueOnce({ count: 1 });
 
-    const r = await claimInterpretSessionForDeduct('u1', 'a1');
+    const r = await claimInterpretSessionForDeduct('u1', 'a1', ANCHOR_TS);
 
     expect(r).toEqual({ outcome: 'claimed', sessionId: 's-mint-B' });
-    // 回退查询按 userId+未结算，取最近(desc)——避免误结算上一场更早的残留锚点
+    // 精确回退：只认 null-anchor(不动别流的 anchorId 非空行) 且 startedAt >= 本流锚点起点(排除上一场残留)
     expect(findFirstMock).toHaveBeenNthCalledWith(2, {
-      where: { userId: 'u1', settledAt: null },
+      where: {
+        userId: 'u1',
+        settledAt: null,
+        anchorId: null,
+        startedAt: { gte: new Date(ANCHOR_TS - 5_000) },
+      },
       orderBy: { startedAt: 'desc' },
       select: { id: true, settledAt: true },
     });
-    // 认领的是回退命中的 B
     expect(updateManyMock).toHaveBeenCalledWith({
       where: { id: 's-mint-B', settledAt: null },
       data: { settledAt: expect.any(Date), settledBy: 'deduct' },
     });
   });
 
-  it('无 anchorId（降级）→ 认领该用户最旧的未结算会话（回退路径仅对 anchorId 命中失败触发，此路径不变）', async () => {
+  it('anchorStartedAt 为 null（stale/伪造 anchorId 消费不到 Redis 锚点）→ 不回退（避免误结算并发/上一场）', async () => {
+    findFirstMock.mockResolvedValueOnce(null); // anchorId 查无
+
+    const r = await claimInterpretSessionForDeduct('u1', 'a1', null);
+
+    // anchorStartedAt=null → 不触发回退 → no_record（deduct 侧据此按墙钟扣费、不结算任何行）
+    expect(r).toEqual({ outcome: 'no_record', sessionId: null });
+    expect(findFirstMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('无 anchorId（降级）→ 认领该用户最旧的未结算会话（精确回退仅对 anchorId 命中失败触发，此路径不变）', async () => {
     findFirstMock.mockResolvedValueOnce({ id: 's-old', settledAt: null });
     updateManyMock.mockResolvedValueOnce({ count: 1 });
 
-    const r = await claimInterpretSessionForDeduct('u1', null);
+    const r = await claimInterpretSessionForDeduct('u1', null, null);
 
     expect(findFirstMock).toHaveBeenCalledWith({
       where: { userId: 'u1', settledAt: null },

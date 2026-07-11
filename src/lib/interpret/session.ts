@@ -22,6 +22,11 @@ const sessionLogger = logger.child({ component: 'interpret-session' });
 // 兜底阈值：> MAX_INTERPRET_DURATION_MS(6h) 留足余量，避免误扫「合法长会话、稍后会正常 deduct」的在途会话。
 export const INTERPRET_RECLAIM_STALE_MS = 7 * 60 * 60_000;
 
+// R1-C：deduct 回退认领 mint 锚点时，允许 B.startedAt 略早于 anchorStartedAt 的时钟容差。B 建于 mint、
+// 必晚于 /start 的锚点起点，理论上 B.startedAt >= anchorStartedAt；给几秒容差纯为防毫秒级时钟抖动，
+// 同时仍足够小以排除上一场/更早的残留锚点（它们起点通常早数分钟以上）。
+const FALLBACK_ANCHOR_SKEW_MS = 5_000;
+
 /**
  * /start：为一次同传会话落一行未结算记录。anchorId 供 /deduct 精确认领（Redis 不可用时为 null）。
  * best-effort：建行失败不阻塞 interpret 启动（退化到旧行为——纯靠 /deduct 计费、无 cron 兜底）。
@@ -107,12 +112,14 @@ export interface InterpretClaimResult {
  *   - 目标会话已被 cron 结算 → 'already_settled'（调用方**跳过扣费**，避免双扣）。
  *   - 查无记录（会话早于 B3 部署 / Redis 曾不可用没建行 / 边缘）→ 'no_record'（调用方按旧行为扣费兜底）。
  * 无 anchorId（降级）时认领该用户**最旧**的未结算会话。
- * R1-C（审查 Finding 1）：anchorId 命中失败时回退认领该用户**最近一条**未结算会话（temporary-key 在
- * mint 时补建的 null-anchor 锚点），结算它以杜绝 cron 幽灵双扣（详见函数体内注释）。
+ * R1-C（审查 Finding 1 + 二审收窄）：anchorId 命中失败时回退认领**本流** mint 补建的 null-anchor 锚点
+ * （精确锁定：anchorId:null 且 startedAt >= anchorStartedAt），结算它以杜绝 cron 幽灵双扣，同时不误结算
+ * 并发/上一场的锚点（详见函数体内注释）。需传入本流锚点起点 anchorStartedAt（deduct 消费 Redis 锚点得到）。
  */
 export async function claimInterpretSessionForDeduct(
   userId: string,
   anchorId: string | null,
+  anchorStartedAt: number | null,
   db: InterpretDbClient = prisma
 ): Promise<InterpretClaimResult> {
   let target = anchorId
@@ -127,16 +134,24 @@ export async function claimInterpretSessionForDeduct(
         select: { id: true, settledAt: true },
       });
 
-  // R1-C 审查 Finding 1 修复：anchorId 提供但查无对应 DB 行 —— 典型成因是 /start 的 Redis 锚点建成、
-  // 但其 InterpretSession 行 create 失败（DB 抖动，被 createInterpretSession 吞掉），/start 仍把
+  // R1-C 审查 Finding 1 修复（+ 二审收窄）：anchorId 提供但查无对应 DB 行 —— 典型成因是 /start 的 Redis
+  // 锚点建成、但其 InterpretSession 行 create 失败（DB 抖动，被 createInterpretSession 吞掉），/start 仍把
   // anchorId 返给客户端。此时 temporary-key 在 mint 时补建了一条 null-anchor 锚点(B)；若 deduct 只按
-  // anchorId 找不到就走 no_record，会按 X1 墙钟正常扣费却**不结算 B** → B 残留被 cron 二次兜底扣 ~6h，
-  // honest 用户 DB 一抖就被双扣（15min + 360min）。故 anchorId 落空时回退认领该用户**最近一条**未结算
-  // 会话（即当前流的 B），使这次 deduct 在正常扣费的同时结算它，杜绝 cron 幽灵双扣。取"最近"(desc)而非
-  // "最旧"，避免误结算上一场遗留的更早未结算锚点。仅在 anchorId 命中失败时触发，不改动正常命中/降级路径。
-  if (!target && anchorId) {
+  // anchorId 找不到就走 no_record，会按墙钟正常扣费却**不结算 B** → B 残留被 cron 二次兜底扣 ~6h（honest
+  // 用户 DB 一抖就被双扣）。故 anchorId 落空时回退认领当前流的 mint 锚点 B —— 但**必须精确锁定本流**，否则
+  // 误结算并发标签页/上一场的未结算锚点会让那条流白嫖（二审 Finding：宽泛"最近未结算"是新的漏扣洞）。
+  // 精确锁定用两把锁：(1) anchorId:null —— 只认 mint 补建的锚点，绝不动别的流经 /start 建的 anchorId 非空
+  // 行；(2) startedAt >= 本流锚点起点(anchorStartedAt) —— B 建于 mint、必晚于 /start 的锚点起点，故 >= 起点；
+  // 上一场/更早的残留锚点起点更早、被排除（留给 cron 按其真实时长兜底）。仅当 anchorStartedAt 已知（Redis
+  // 命中）才回退——stale/伪造 anchorId 消费不到 Redis 锚点(anchorStartedAt=null)时不回退，避免误结算。
+  if (!target && anchorId && anchorStartedAt != null) {
     target = await db.interpretSession.findFirst({
-      where: { userId, settledAt: null },
+      where: {
+        userId,
+        settledAt: null,
+        anchorId: null,
+        startedAt: { gte: new Date(anchorStartedAt - FALLBACK_ANCHOR_SKEW_MS) },
+      },
       orderBy: { startedAt: 'desc' },
       select: { id: true, settledAt: true },
     });

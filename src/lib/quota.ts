@@ -401,7 +401,13 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
         where: {
           userId: user.id,
           status: 'COMPLETED',
-          createdAt: { gte: cycleStart },
+          // B7：按扣费时刻(billedAt)归期，而非 createdAt。跨月/延迟收尾/自动回收的会话，扣费落在
+          // finalize 时的配额窗口(ensureQuotaWindow 按 quotaResetAt)，用 createdAt 归期会把它算错周期、
+          // 虚报 drift。billedAt 为空(未扣费/ADMIN/pre-B7 老数据)时回退 createdAt，保持旧行为。
+          OR: [
+            { billedAt: { gte: cycleStart } },
+            { billedAt: null, createdAt: { gte: cycleStart } },
+          ],
         },
         select: {
           durationMs: true,

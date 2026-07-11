@@ -164,6 +164,8 @@ export async function finalizeFullTranscription(
       fullTranscriptPath: fullPath,
       fullSonioxFileId: null,
       fullSonioxTranscriptionId: null,
+      // B7：置扣费时刻（完整版补全的额外扣费紧随其后）。多笔扣费时为最后一笔(last-write)，同周期常态无碍。
+      billedAt: new Date(),
     },
   });
   if (finalized.count !== 1) {

@@ -335,6 +335,8 @@ export async function finalizeSession(
           finalizeLockedAt: null,
           serverPausedAt: null,
           durationMs: finalDurationMs,
+          // B7：真正扣费时置 billedAt（扣费时刻），供对账按扣费周期归期而非 createdAt（修跨月/延迟收尾虚报）。
+          ...(shouldDeduct ? { billedAt: new Date() } : {}),
           ...(normalizedTitle ? { title: normalizedTitle } : {}),
         },
       });

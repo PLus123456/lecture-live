@@ -68,6 +68,11 @@ model Session {
   serverPausedMs  Int       @default(0)
   serverPausedAt  DateTime?
   finalizeLockedAt DateTime?
+  // B7：本会话转录分钟被扣费的时刻（realtime/异步上传/完整版 finalize 时置）。对账按此归期，
+  // 而非 createdAt —— 跨月/延迟收尾/自动回收的会话，扣费落在 finalize 时的配额窗口，用 createdAt
+  // 归期会把它算错周期、虚报 drift。与 InterpretUsage.chargedAt 同一"按扣费时刻归期"口径。
+  // 多笔扣费(realtime + 完整版补全)时为最后一笔的时刻(last-write)；同周期常态无碍。
+  billedAt        DateTime?
 
   // v2.1: 音频源 & 区域
   audioSource     String    @default("microphone")  // "microphone" | "system_audio"
@@ -243,6 +248,25 @@ model InterpretUsage {
   chargedAt     DateTime @default(now())            // 扣费时刻，对账按 quotaResetAt 周期窗口截断
 
   @@index([userId, chargedAt])
+}
+
+// B3：同声传译的服务端持久化会话。interpret 是浏览器直连 Soniox，服务端只在 /start 与 /deduct
+// 观测；旧实现若客户端不调 /deduct（改装/掉线/故意）则整场免费、无任何兜底。此表在 /start 落一行
+// (settledAt=null=未结算)，/deduct 成功扣费时**原子认领**它(settledAt 置非空)，cron 对超时仍未结算
+// 的会话按服务端墙钟(startedAt→now，封顶 MAX_INTERPRET_DURATION)兜底扣费并结算。deduct 与 cron 经
+// settledAt 的条件原子认领互斥 → 每场恰好扣一次，杜绝「不调 deduct 白嫖」与「deduct+cron 双扣」。
+model InterpretSession {
+  id            String    @id @default(cuid())
+  userId        String                              // 冗余列，便于 cron 扫描 + 按用户结算
+  anchorId      String?                             // /start 建立的 Redis 锚点 id，供 deduct 精确认领
+  startedAt     DateTime  @default(now())           // 服务端会话开始时刻（cron 兜底计费的权威墙钟起点）
+  settledAt     DateTime?                            // 非空=已结算(deduct 或 cron)；认领闸门
+  billedMinutes Int?                                // 结算实扣分钟（审计）
+  settledBy     String?                             // 'deduct' | 'cron_reclaim'（审计）
+
+  @@index([settledAt, startedAt])
+  @@index([userId, settledAt])
+  @@index([anchorId])
 }
 
 // ─── 站点设置（Key-Value 存储） ───

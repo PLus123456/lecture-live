@@ -5,6 +5,7 @@ const {
   verifyAuthMock,
   sessionFindUniqueMock,
   sessionUpdateMock,
+  sessionCountMock,
   folderSessionDeleteManyMock,
   shareLinkDeleteManyMock,
   sessionDeleteMock,
@@ -20,6 +21,7 @@ const {
   verifyAuthMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
   sessionUpdateMock: vi.fn(),
+  sessionCountMock: vi.fn(),
   folderSessionDeleteManyMock: vi.fn(),
   shareLinkDeleteManyMock: vi.fn(),
   sessionDeleteMock: vi.fn(),
@@ -43,6 +45,7 @@ vi.mock('@/lib/prisma', () => ({
       findUnique: sessionFindUniqueMock,
       update: sessionUpdateMock,
       delete: sessionDeleteMock,
+      count: sessionCountMock,
     },
     folderSession: {
       deleteMany: folderSessionDeleteManyMock,
@@ -104,6 +107,8 @@ describe('session detail route', () => {
     folderSessionDeleteManyMock.mockResolvedValue({ count: 1 });
     shareLinkDeleteManyMock.mockResolvedValue({ count: 1 });
     sessionDeleteMock.mockResolvedValue({ id: 'session-1' });
+    // B4：并发在途录音计数默认 0（未达上限）；具体 cap 用例单独 override。
+    sessionCountMock.mockReset().mockResolvedValue(0);
     conversationFindManyMock.mockReset().mockResolvedValue([]);
     deleteSessionArtifactsMock.mockReset().mockResolvedValue(undefined);
     deleteRecordingDraftMock.mockReset().mockResolvedValue(undefined);
@@ -142,6 +147,64 @@ describe('session detail route', () => {
       error: 'Invalid status transition: CREATED → COMPLETED',
     });
     expect(sessionUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('B4：CREATED→RECORDING 且并发在途 < 上限 → 放行（按 RECORDING/PAUSED 计数）', async () => {
+    sessionCountMock.mockResolvedValueOnce(2); // 未达上限(3)
+    sessionUpdateMock.mockResolvedValueOnce({ id: 'session-1', status: 'RECORDING' });
+
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { status: 'RECORDING' },
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(200);
+    expect(sessionCountMock).toHaveBeenCalledWith({
+      where: { userId: 'user-1', status: { in: ['RECORDING', 'PAUSED'] } },
+    });
+    expect(sessionUpdateMock).toHaveBeenCalled();
+  });
+
+  it('B4：CREATED→RECORDING 但并发在途已达上限 → 409，不写库', async () => {
+    sessionCountMock.mockResolvedValueOnce(3); // 已达上限
+
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { status: 'RECORDING' },
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(409);
+    expect(sessionUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('B4：PAUSED→RECORDING（恢复暂停）不受并发上限限制（不计数）', async () => {
+    sessionFindUniqueMock.mockResolvedValueOnce({
+      id: 'session-1',
+      userId: 'user-1',
+      title: 'L',
+      status: 'PAUSED',
+      serverStartedAt: new Date('2026-07-11T00:00:00.000Z'),
+      serverPausedAt: null,
+    });
+    sessionCountMock.mockResolvedValue(99); // 即便很多在途，恢复也放行
+    sessionUpdateMock.mockResolvedValueOnce({ id: 'session-1', status: 'RECORDING' });
+
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { status: 'RECORDING' },
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(200);
+    expect(sessionCountMock).not.toHaveBeenCalled();
   });
 
   it('C4: PATCH 无法把 FINALIZING 推到 COMPLETED（只能经 finalize 端点）', async () => {

@@ -81,17 +81,27 @@ function thinkingOptionsForModel(
 export default function ComposerModelControls({
   disabled = false,
   direction = 'up',
+  layout = 'inline',
 }: {
   /** 发送中等场景下置灰两个入口 */
   disabled?: boolean;
   /** 弹层展开方向：底部 composer 用 up（默认），页面上方的 composer 用 down */
   direction?: 'up' | 'down';
+  /**
+   * 排版：
+   * - inline（默认）：紧凑一行，弹层定宽右对齐（composer 工具行用）。
+   * - block：占满整行、弹层与容器同宽向上展开（对话侧栏底部用；侧栏 overflow-hidden，
+   *   定宽右对齐的弹层会被裁切，故这里改为 left-0 right-0 撑满、恒向上）。
+   */
+  layout?: 'inline' | 'block';
 }) {
   const token = useAuthStore((s) => s.token);
   const {
     selectedModel,
     selectedThinkingPreference,
-    availableModels,
+    // 兜底 []：任何页面上 availableModels 若为 undefined（接口异常/未 mock），
+    // 下面的 .find/.length/.map 都不应抛错（本组件如今也挂在对话侧栏，会随每个面板渲染）。
+    availableModels = [],
     modelsLoaded,
     setSelectedModel,
     setSelectedThinkingPreference,
@@ -202,25 +212,38 @@ export default function ComposerModelControls({
 
   const popoverPlacement =
     direction === 'up' ? 'bottom-full mb-2' : 'top-full mt-2';
+  const isBlock = layout === 'block';
+  const modelMenuClass = isBlock
+    ? 'absolute bottom-full mb-2 left-0 right-0 max-h-64 overflow-y-auto bg-white border border-cream-300 rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale'
+    : `absolute ${popoverPlacement} right-0 w-56 bg-white border border-cream-300 rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale`;
+  const thinkingMenuClass = isBlock
+    ? 'absolute bottom-full mb-2 left-0 right-0 bg-white border border-cream-300 rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale'
+    : `absolute ${popoverPlacement} right-0 w-44 bg-white border border-cream-300 rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale`;
 
   return (
-    <div className="flex items-center gap-1.5 text-[11px] min-w-0">
-      <div ref={modelMenuRef} className="relative">
+    <div
+      className={
+        isBlock
+          ? 'flex items-center gap-2 w-full text-[11px] min-w-0'
+          : 'flex items-center gap-1.5 text-[11px] min-w-0'
+      }
+    >
+      <div ref={modelMenuRef} className={isBlock ? 'relative flex-1 min-w-0' : 'relative'}>
         <button
           type="button"
           disabled={disabled}
           onClick={() => setShowModelMenu((v) => !v)}
           title={`模型: ${currentModelLabel}`}
-          className="font-medium text-rust-600 hover:text-rust-700 transition-colors
-                     truncate max-w-[120px] disabled:opacity-40 disabled:cursor-not-allowed"
+          className={
+            isBlock
+              ? 'w-full text-left font-medium text-rust-600 hover:text-rust-700 transition-colors truncate disabled:opacity-40 disabled:cursor-not-allowed'
+              : 'font-medium text-rust-600 hover:text-rust-700 transition-colors truncate max-w-[120px] disabled:opacity-40 disabled:cursor-not-allowed'
+          }
         >
           {currentModelLabel}
         </button>
         {showModelMenu && (
-          <div
-            className={`absolute ${popoverPlacement} right-0 w-56 bg-white border border-cream-300
-                        rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale`}
-          >
+          <div className={modelMenuClass}>
             {availableModels.length === 0 ? (
               <div className="px-3 py-2 text-xs text-charcoal-400">
                 暂无可用模型
@@ -280,10 +303,7 @@ export default function ComposerModelControls({
         </button>
 
         {showThinkingMenu && !thinkingDisabled && (
-          <div
-            className={`absolute ${popoverPlacement} right-0 w-44 bg-white border border-cream-300
-                        rounded-lg shadow-lg z-50 py-1 animate-fade-in-scale`}
-          >
+          <div className={thinkingMenuClass}>
             {thinkingOptions.map((opt) => {
               const isSelected = selectedThinkingPreference === opt.pref;
               return (

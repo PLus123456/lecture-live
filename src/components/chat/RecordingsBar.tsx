@@ -80,7 +80,7 @@ export default function RecordingsBar({
           recordings.map((r) => {
             const isOpen = openId === r.sessionId;
             return (
-              <div key={r.sessionId} className="relative">
+              <div key={r.sessionId} className="relative animate-tag-pop">
                 <div
                   className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md
                               text-[11px] border transition-colors
@@ -124,7 +124,7 @@ export default function RecordingsBar({
                       href={`/session/${r.sessionId}/playback`}
                       className="text-rust-500 hover:text-rust-700 underline"
                     >
-                      Open recording →
+                      {t('chat.openRecording')} →
                     </Link>
                   </div>
                 )}

@@ -1,6 +1,7 @@
 'use client';
 
 import { useSummaryStore } from '@/stores/summaryStore';
+import { useI18n } from '@/lib/i18n';
 import {
   Sparkles,
   Lock,
@@ -25,6 +26,7 @@ export default function SummaryTab({
 }: {
   onManualTrigger?: () => void;
 }) {
+  const { t } = useI18n();
   const blocks = useSummaryStore((s) => s.blocks);
   const isLoading = useSummaryStore((s) => s.isLoading);
   const currentBatchSentences = useSummaryStore((s) => s.currentBatchSentences);
@@ -35,7 +37,7 @@ export default function SummaryTab({
       <div className="flex items-center justify-between px-4 py-2 border-b border-cream-100">
         {currentBatchSentences > 0 && (
           <span className="text-[11px] text-charcoal-400">
-            {currentBatchSentences} sentences buffered
+            {t('summaryTab.sentencesBuffered', { count: currentBatchSentences })}
           </span>
         )}
         <div className="ml-auto">
@@ -49,7 +51,7 @@ export default function SummaryTab({
             ) : (
               <RefreshCw className="w-3.5 h-3.5" />
             )}
-            Summarize
+            {t('summaryTab.summarize')}
           </button>
         </div>
       </div>
@@ -59,7 +61,7 @@ export default function SummaryTab({
         {isLoading && blocks.length === 0 && (
           <div className="flex items-center gap-2 px-4 py-3 bg-rust-50 border-b border-rust-100">
             <Loader2 className="w-4 h-4 text-rust-500 animate-spin" />
-            <span className="text-xs text-rust-600">Analyzing transcript...</span>
+            <span className="text-xs text-rust-600">{t('summaryTab.analyzing')}</span>
           </div>
         )}
 
@@ -81,7 +83,7 @@ export default function SummaryTab({
                 Block #{block.blockIndex + 1} ({formatTimeRange(block.timeRange.startMs, block.timeRange.endMs)})
               </span>
               {!block.frozen && (
-                <span className="text-[10px] text-rust-500 ml-auto">active</span>
+                <span className="text-[10px] text-rust-500 ml-auto">{t('summaryTab.active')}</span>
               )}
             </div>
 
@@ -102,7 +104,7 @@ export default function SummaryTab({
               <div className="mb-2">
                 <div className="flex items-center gap-1 mb-1">
                   <BookOpen className="w-3 h-3 text-charcoal-400" />
-                  <span className="text-[10px] text-charcoal-400 uppercase">Terms</span>
+                  <span className="text-[10px] text-charcoal-400 uppercase">{t('summaryTab.terms')}</span>
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {Object.entries(block.definitions).map(([term, def]) => (
@@ -124,7 +126,7 @@ export default function SummaryTab({
               <div>
                 <div className="flex items-center gap-1 mb-1">
                   <HelpCircle className="w-3 h-3 text-charcoal-400" />
-                  <span className="text-[10px] text-charcoal-400 uppercase">Review</span>
+                  <span className="text-[10px] text-charcoal-400 uppercase">{t('summaryTab.review')}</span>
                 </div>
                 <ol className="space-y-0.5 list-decimal list-inside">
                   {block.suggestedQuestions.map((q, i) => (
@@ -142,8 +144,8 @@ export default function SummaryTab({
         {blocks.length === 0 && !isLoading && (
           <div className="flex flex-col items-center justify-center py-8 text-charcoal-300">
             <Sparkles className="w-8 h-8 mb-2 opacity-50" />
-            <p className="text-xs">AI summaries will appear here</p>
-            <p className="text-[11px] mt-1">Auto-generated every ~12 sentences</p>
+            <p className="text-xs">{t('summaryTab.emptyTitle')}</p>
+            <p className="text-[11px] mt-1">{t('summaryTab.emptyDesc')}</p>
           </div>
         )}
       </div>

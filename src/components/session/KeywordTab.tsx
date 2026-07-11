@@ -2,6 +2,7 @@
 
 import { useState, useCallback } from 'react';
 import { useKeywords } from '@/hooks/useKeywords';
+import { useI18n } from '@/lib/i18n';
 import {
   Tag,
   Plus,
@@ -16,6 +17,7 @@ export default function KeywordTab({
 }: {
   onInjectKeywords?: (keywords: string[]) => Promise<void> | void;
 }) {
+  const { t } = useI18n();
   const {
     keywords,
     isExtracting,
@@ -93,7 +95,7 @@ export default function KeywordTab({
             value={manualInput}
             onChange={(e) => setManualInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleAddManual()}
-            placeholder="Add keywords (comma-separated)"
+            placeholder={t('keywordTab.addPlaceholder')}
             className="flex-1 px-3 py-1.5 rounded-lg border border-cream-300 text-xs
                        focus:outline-none focus:ring-1 focus:ring-rust-400"
           />
@@ -120,16 +122,16 @@ export default function KeywordTab({
         {isExtracting ? (
           <div className="flex items-center justify-center gap-2">
             <Loader2 className="w-4 h-4 text-rust-500 animate-spin" />
-            <span className="text-xs text-rust-600">Extracting keywords...</span>
+            <span className="text-xs text-rust-600">{t('keywordTab.extracting')}</span>
           </div>
         ) : (
           <>
             <Upload className="w-5 h-5 mx-auto mb-1.5 text-charcoal-300" />
             <p className="text-[11px] text-charcoal-400">
-              Drop PPT/Word/PDF/TXT here
+              {t('keywordTab.dropFiles')}
             </p>
             <label className="text-[11px] text-rust-500 cursor-pointer hover:underline">
-              or browse
+              {t('keywordTab.orBrowse')}
               <input
                 type="file"
                 className="hidden"
@@ -146,9 +148,9 @@ export default function KeywordTab({
         {keywords.length === 0 ? (
           <div className="text-center py-6 text-charcoal-300 animate-fade-in-up">
             <Tag className="w-6 h-6 mx-auto mb-2 opacity-50 animate-breathe" />
-            <p className="text-[11px]">No keywords yet</p>
+            <p className="text-[11px]">{t('keywordTab.noKeywords')}</p>
             <p className="text-[10px] mt-1">
-              Add manually or upload a file to extract
+              {t('keywordTab.noKeywordsDesc')}
             </p>
           </div>
         ) : (
@@ -199,8 +201,10 @@ export default function KeywordTab({
               <Zap className="w-3.5 h-3.5" />
             )}
             {isInjecting
-              ? 'Updating ASR context...'
-              : `Inject ${keywords.filter((k) => k.active).length} keywords into ASR`}
+              ? t('keywordTab.updatingContext')
+              : t('keywordTab.injectKeywords', {
+                  count: keywords.filter((k) => k.active).length,
+                })}
           </button>
         </div>
       )}

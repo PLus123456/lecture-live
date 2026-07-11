@@ -14,6 +14,7 @@ const {
   invalidateSessionsApiCacheMock,
   invalidateFoldersApiCacheMock,
   invalidateShareLinksApiCacheMock,
+  cancelAsyncUploadMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   sessionFindManyMock: vi.fn(),
@@ -27,6 +28,7 @@ const {
   invalidateSessionsApiCacheMock: vi.fn(),
   invalidateFoldersApiCacheMock: vi.fn(),
   invalidateShareLinksApiCacheMock: vi.fn(),
+  cancelAsyncUploadMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({
@@ -48,6 +50,10 @@ vi.mock('@/lib/quota', () => ({
   // B1/R4：批量删会话前用 settleAsyncReservation / settleFullReservation 原子结算在途预留。桩为 no-op。
   settleAsyncReservation: vi.fn().mockResolvedValue(0),
   settleFullReservation: vi.fn().mockResolvedValue(0),
+}));
+
+vi.mock('@/lib/audio/asyncUploadProcessor', () => ({
+  cancelAsyncUpload: cancelAsyncUploadMock,
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -89,6 +95,7 @@ beforeEach(() => {
     .mockReset()
     .mockImplementation(async (operations: unknown[]) => Promise.all(operations));
   releaseStorageBytesMock.mockReset().mockResolvedValue(null);
+  cancelAsyncUploadMock.mockReset().mockResolvedValue(undefined);
   logActionMock.mockReset();
   invalidateSessionsApiCacheMock.mockReset().mockResolvedValue(undefined);
   invalidateFoldersApiCacheMock.mockReset().mockResolvedValue(undefined);
@@ -130,6 +137,38 @@ describe('DELETE /api/admin/files — 释放附件字节', () => {
     expect(releaseStorageBytesMock).toHaveBeenCalledTimes(2);
     expect(releaseStorageBytesMock).toHaveBeenCalledWith('u1', 1000);
     expect(releaseStorageBytesMock).toHaveBeenCalledWith('u2', 2500);
+  });
+
+  it('P1-16：批量删进行中异步上传 → cancelAsyncUpload 拿到 region + transcriptionId 做区域感知清理', async () => {
+    sessionFindManyMock.mockResolvedValue([
+      {
+        id: 's1',
+        userId: 'u1',
+        title: 'A',
+        asyncTranscribeStatus: 'transcribing',
+        sonioxFileId: 'sf-1',
+        sonioxTranscriptionId: 'st-1',
+        sonioxRegion: 'eu',
+      },
+    ]);
+
+    const res = await DELETE(deleteReq(['s1']));
+
+    expect(res.status).toBe(200);
+    // select 必须带 sonioxRegion + sonioxTranscriptionId，否则 cancelAsyncUpload 落回默认 region、
+    // 跨 region 任务删错区资源致孤儿，且整段跳过删 transcription。
+    const selectArg = sessionFindManyMock.mock.calls[0][0].select;
+    expect(selectArg).toMatchObject({
+      sonioxRegion: true,
+      sonioxTranscriptionId: true,
+    });
+    expect(cancelAsyncUploadMock).toHaveBeenCalledTimes(1);
+    expect(cancelAsyncUploadMock.mock.calls[0][0]).toMatchObject({
+      id: 's1',
+      sonioxFileId: 'sf-1',
+      sonioxTranscriptionId: 'st-1',
+      sonioxRegion: 'eu',
+    });
   });
 
   it('无 legacy 附件时不调用 release', async () => {

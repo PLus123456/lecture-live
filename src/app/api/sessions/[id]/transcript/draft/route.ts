@@ -9,6 +9,7 @@ import {
   persistTranscriptDraft,
   type TranscriptDraftPayload,
 } from '@/lib/transcriptDraftPersistence';
+import { isRecordingDraftSealed } from '@/lib/recordingDraftPersistence';
 
 async function loadOwnedSession(req: Request, sessionId: string) {
   const user = await verifyAuth(req);
@@ -49,6 +50,15 @@ export async function PUT(
   if (result.session.status === 'COMPLETED' || result.session.status === 'ARCHIVED') {
     return NextResponse.json(
       { error: 'Session already finalized; draft writes no longer accepted' },
+      { status: 409 }
+    );
+  }
+
+  // P1-7 契约3：收尾 seal 阶段之后到达的迟到转录草稿写入一律 409（与 audio 分片同栅栏），
+  // 否则 finalize 读取快照后写入的段会在删草稿时丢失。sealed 标记落在录音草稿 manifest 上。
+  if (await isRecordingDraftSealed(result.session)) {
+    return NextResponse.json(
+      { error: 'Recording draft is sealed; transcript draft writes no longer accepted', sealed: true },
       { status: 409 }
     );
   }

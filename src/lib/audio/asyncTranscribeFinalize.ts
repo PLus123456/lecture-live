@@ -139,25 +139,41 @@ export async function finalizeAsyncTranscription(
       asyncTranscribeStatus: 'completed',
       transcriptPath: persisted.transcript.path,
       summaryPath: persisted.summary.path,
-      // 清掉 Soniox 引用 —— 文件已经删了/即将删
-      sonioxFileId: null,
-      sonioxTranscriptionId: null,
+      // P1-17：**不再**在 CAS 提交里清 Soniox 引用 —— 改到确认 DELETE 成功/404 之后才清（见文末）。
+      // 此前先清 ID 再 best-effort 删，删失败即永久失去重试依据、Soniox 侧文件/转录孤儿泄漏。
       status: 'COMPLETED',
       // B7：置扣费时刻，供对账按扣费周期归期（异步上传的权威扣费紧随其后）。
       billedAt: new Date(),
     },
   });
   if (finalized.count !== 1) {
-    // 收尾期间会话已被取消/改状态：不扣费、不跑后续 LLM，但仍尽力清 Soniox 资源，
-    // 避免上传到 Soniox 的文件/transcription 泄漏。
-    if (session.sonioxFileId) {
-      await deleteSonioxFile(sonioxConfig, session.sonioxFileId).catch(
-        () => undefined
+    // 收尾守卫抢不到（finalizing 期间状态已变）。P1-19：**只有确认会话确实被取消（canceled）**才删
+    // Soniox 资源——否则可能是并发 finalizer 的失败回退把状态改回 transcribing（转录仍需要），此时删
+    // 外部资源会让后续 salvage getSoniox 404、会话永久卡死（回归红线）。非 canceled → 保留资源交对方/重试。
+    const fresh = await prisma.session.findUnique({
+      where: { id: session.id },
+      select: { asyncTranscribeStatus: true },
+    });
+    if (fresh?.asyncTranscribeStatus === 'canceled') {
+      // 确认取消：先删 transcription 再删 file（P1-17），确认删除才清 DB 外部 ID。
+      const txDeleted = await deleteSonioxTranscription(sonioxConfig, transcriptionId).catch(
+        () => false
       );
+      const fileDeleted = session.sonioxFileId
+        ? await deleteSonioxFile(sonioxConfig, session.sonioxFileId).catch(() => false)
+        : true;
+      if (txDeleted || fileDeleted) {
+        await prisma.session
+          .updateMany({
+            where: { id: session.id },
+            data: {
+              ...(txDeleted ? { sonioxTranscriptionId: null } : {}),
+              ...(fileDeleted ? { sonioxFileId: null } : {}),
+            },
+          })
+          .catch(() => undefined);
+      }
     }
-    await deleteSonioxTranscription(sonioxConfig, transcriptionId).catch(
-      () => undefined
-    );
     return { outcome: 'canceled_during_finalize' };
   }
 
@@ -210,15 +226,25 @@ export async function finalizeAsyncTranscription(
     bundle,
   });
 
-  // 删 Soniox 上的资源（幂等，失败不抛）
-  if (session.sonioxFileId) {
-    await deleteSonioxFile(sonioxConfig, session.sonioxFileId).catch(
-      () => undefined
-    );
-  }
-  await deleteSonioxTranscription(sonioxConfig, transcriptionId).catch(
-    () => undefined
+  // 删 Soniox 上的资源（P1-17：先删 transcription 再删 file；确认删除成功/404 才清 DB 外部 ID，
+  // 删失败保留 ID 交 cron reclaimOrphanSonioxResources 兜底重试，绝不永久孤儿）。幂等、失败不抛。
+  const txDeleted = await deleteSonioxTranscription(sonioxConfig, transcriptionId).catch(
+    () => false
   );
+  const fileDeleted = session.sonioxFileId
+    ? await deleteSonioxFile(sonioxConfig, session.sonioxFileId).catch(() => false)
+    : true;
+  if (txDeleted || fileDeleted) {
+    await prisma.session
+      .updateMany({
+        where: { id: session.id },
+        data: {
+          ...(txDeleted ? { sonioxTranscriptionId: null } : {}),
+          ...(fileDeleted ? { sonioxFileId: null } : {}),
+        },
+      })
+      .catch(() => undefined);
+  }
 
   return {
     outcome: 'completed',

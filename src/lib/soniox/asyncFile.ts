@@ -313,44 +313,64 @@ export async function getSonioxTranscript(
 
 /**
  * 删除 Soniox 上的文件。404 当成已删除（幂等）。
+ *
+ * P1-17：返回**是否确认删除**（2xx 或 404 → true；其它非 2xx / 网络异常 → false）。调用方据此决定
+ * 是否清 DB 里的外部 ID —— **只有确认删除（true）才可清 ID**，否则保留 ID 让 cleanup outbox / cron
+ * 兜底重试。仍不抛错（transcript 已拿到，删失败不该拖垮收尾），改由返回值传达失败。
  */
 export async function deleteSonioxFile(
   config: SonioxRuntimeConfig,
   fileId: string
-): Promise<void> {
-  const res = await fetch(`${config.restBaseUrl}/v1/files/${fileId}`, {
-    method: 'DELETE',
-    headers: authHeader(config),
-    signal: AbortSignal.timeout(SONIOX_API_TIMEOUT_MS),
-  });
+): Promise<boolean> {
+  let res: Response;
+  try {
+    res = await fetch(`${config.restBaseUrl}/v1/files/${fileId}`, {
+      method: 'DELETE',
+      headers: authHeader(config),
+      signal: AbortSignal.timeout(SONIOX_API_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // 网络异常 / 超时：未确认删除，交由兜底重试。
+    logger.warn({ err, fileId }, 'Soniox delete file network failure (unconfirmed)');
+    return false;
+  }
 
-  if (res.status === 404 || res.ok) return;
+  if (res.status === 404 || res.ok) return true;
 
   const errText = await res.text().catch(() => '');
   logger.warn(
     { status: res.status, errSnippet: errText.slice(0, 200), fileId },
     'Soniox delete file non-fatal failure'
   );
-  // 不抛错 —— transcript 已经拿到，删失败由 cron 兜底
+  return false;
 }
 
 /**
  * 删除 Soniox 上的 transcription job 记录（释放历史配额）。
+ *
+ * P1-17：返回是否确认删除（2xx / 404 → true；否则 false），语义同 deleteSonioxFile。
  */
 export async function deleteSonioxTranscription(
   config: SonioxRuntimeConfig,
   transcriptionId: string
-): Promise<void> {
-  const res = await fetch(`${config.restBaseUrl}/v1/transcriptions/${transcriptionId}`, {
-    method: 'DELETE',
-    headers: authHeader(config),
-    signal: AbortSignal.timeout(SONIOX_API_TIMEOUT_MS),
-  });
-  if (res.status === 404 || res.ok) return;
+): Promise<boolean> {
+  let res: Response;
+  try {
+    res = await fetch(`${config.restBaseUrl}/v1/transcriptions/${transcriptionId}`, {
+      method: 'DELETE',
+      headers: authHeader(config),
+      signal: AbortSignal.timeout(SONIOX_API_TIMEOUT_MS),
+    });
+  } catch (err) {
+    logger.warn({ err, transcriptionId }, 'Soniox delete transcription network failure (unconfirmed)');
+    return false;
+  }
+  if (res.status === 404 || res.ok) return true;
 
   const errText = await res.text().catch(() => '');
   logger.warn(
     { status: res.status, errSnippet: errText.slice(0, 200), transcriptionId },
     'Soniox delete transcription non-fatal failure'
   );
+  return false;
 }

@@ -232,6 +232,47 @@ export function parseSonioxRegionPreference(
   return normalizePreference(value);
 }
 
+/**
+ * P1-16：按 session 存储的 region 偏好解析运行配置。传入 session.sonioxRegion（'auto' | 具体 region |
+ * 空）。用于**任务开始之后**的所有 poll / finalize / cancel / maintenance —— 它们必须按任务已固定的
+ * region 字段解析，绝不再落回可变默认 region（默认中途变更会让 poll/delete 去错 region，致任务卡死 +
+ * 外部资源孤儿）。'auto'/空 时退化为默认解析（与旧行为一致），但正常任务开始时已被 persist 成具体值。
+ */
+export async function resolveSonioxConfigForSessionRegion(
+  region: string | null | undefined
+): Promise<SonioxRuntimeConfig | null> {
+  return resolveSonioxRuntimeConfigAsync({
+    requestedRegion: parseSonioxRegionPreference(region),
+  });
+}
+
+/**
+ * P1-16：任务开始时解析出「实际使用的 region」并持久化到 session.sonioxRegion，返回其运行配置。
+ *
+ * 入参 preference 为 session.sonioxRegion（可能 'auto' 或具体 region）。解析为具体 region（含凭据
+ * 回退——若首选 region 无 key 会回退到实际可用的 region）后，把该**具体值**写回 session.sonioxRegion，
+ * 固定本任务 region；之后所有 poll/finalize/cancel/maintenance 用 resolveSonioxConfigForSessionRegion
+ * 读同一字段，全链路同 region。拿不到任何凭据 → 返回 null（不写库，调用方按缺凭据处理）。
+ */
+export async function resolveAndPersistTaskRegion(
+  sessionId: string,
+  preference: string | null | undefined
+): Promise<SonioxRuntimeConfig | null> {
+  const config = await resolveSonioxRuntimeConfigAsync({
+    requestedRegion: parseSonioxRegionPreference(preference),
+  });
+  if (!config) {
+    return null;
+  }
+  // 仅当持久化的具体 region 与解析出的实际 region 不同才写库（'auto'→'us'、或凭据回退换 region）。
+  if (normalizeRegion(preference) !== config.region) {
+    await prisma.session
+      .updateMany({ where: { id: sessionId }, data: { sonioxRegion: config.region } })
+      .catch(() => undefined);
+  }
+  return config;
+}
+
 function getRegionConfig(region: SonioxRegion): SonioxRuntimeConfig | null {
   const upper = region.toUpperCase();
   const apiKey = process.env[`SONIOX_${upper}_API_KEY`];

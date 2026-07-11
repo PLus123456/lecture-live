@@ -15,6 +15,7 @@ import {
   hasAudioChunks,
 } from '@/lib/audio/audioChunkStore';
 import { RecordingArchiveManager } from '@/lib/audio/recordingArchiveManager';
+import { isRecordingDraftComplete } from '@/lib/session/recordingLifecycle';
 import {
   DEFAULT_AUDIO_ACTIVITY_LEVEL_THRESHOLD,
   DEFAULT_IDLE_TIMEOUT_MS,
@@ -76,6 +77,9 @@ export function useSoniox(
   const autoPauseReasonRef = useRef<'idle' | 'disconnect' | null>(null);
   const shouldReconnectRef = useRef(false);
   const finalizeOnUnloadSentRef = useRef(false);
+  // 单飞闸：手动 start() 的在途 Promise。双击/并发开始时，第二次直接复用同一 Promise，
+  // 杜绝并发建立两条 Soniox WS / 两把 temporary key / 双计费（P0-2 #2）。
+  const startInFlightRef = useRef<Promise<void> | null>(null);
 
   // 出字延迟追踪
   const sessionStartWallClockRef = useRef<number | null>(null);
@@ -95,6 +99,7 @@ export function useSoniox(
   const resetBackupMeta = useTranscriptStore((s) => s.resetBackupMeta);
   const setRecordingState = useTranscriptStore((s) => s.setRecordingState);
   const setRecordingStartTime = useTranscriptStore((s) => s.setRecordingStartTime);
+  const setActiveSessionId = useTranscriptStore((s) => s.setActiveSessionId);
   const setCurrentMicDeviceId = useTranscriptStore((s) => s.setCurrentMicDeviceId);
   const setTranslation = useTranslationStore((s) => s.setTranslation);
   const setTranslationEntry = useTranslationStore((s) => s.setTranslationEntry);
@@ -353,19 +358,55 @@ export function useSoniox(
     }
   }, [publishBackupMeta, sessionId, token, uploadDraftChunk]);
 
+  // P0-4 契约1：冷启动/续录 recorder.start() 之前先 GET 服务端草稿清单，拿到 nextSeq
+  // （= 服务端 maxSeq+1），据此设定归档起始 seq，杜绝从 0 起覆盖服务端已有录音开头。
+  // 无草稿 / 请求失败时返回 undefined，由 ensureArchive 退回本地推导（全新会话从 0）。
+  const negotiateStartSeq = useCallback(async (): Promise<number | undefined> => {
+    if (!sessionId || !token) {
+      return undefined;
+    }
+    try {
+      const response = await fetch(
+        `/api/sessions/${sessionId}/audio/draft/chunks`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!response.ok) {
+        return undefined;
+      }
+      const data = (await response.json()) as {
+        nextSeq?: number;
+        maxSeq?: number;
+      };
+      if (
+        typeof data.nextSeq === 'number' &&
+        Number.isFinite(data.nextSeq) &&
+        data.nextSeq >= 0
+      ) {
+        return Math.floor(data.nextSeq);
+      }
+      return undefined;
+    } catch {
+      // 网络异常：不阻塞开录，退回本地推导（syncRemoteDraft 仍会在开录后二次校准 seq）。
+      return undefined;
+    }
+  }, [sessionId, token]);
+
   const finalizeRemoteDraft = useCallback(async () => {
     if (!sessionId || !token) {
       return false;
     }
 
-    let localChunkCount = useTranscriptStore.getState().backupMeta.localChunkCount;
+    let localSeqs: number[] = [];
     try {
-      localChunkCount = sessionId
-        ? (await getAudioChunkEntries(sessionId)).length
-        : 0;
+      localSeqs = sessionId
+        ? (await getAudioChunkEntries(sessionId)).map((entry) => entry.seq)
+        : [];
     } catch {
-      // Fall back to the latest known local count so stop can still continue.
+      // 读本地失败：退回已知计数，用连续 [0..count-1] 近似本地 seq，保证 stop 仍能推进。
+      const knownCount = useTranscriptStore.getState().backupMeta.localChunkCount;
+      localSeqs = Array.from({ length: Math.max(0, knownCount) }, (_, i) => i);
     }
+    const localChunkCount = localSeqs.length;
 
     publishBackupMeta({
       localChunkCount,
@@ -375,14 +416,57 @@ export function useSoniox(
 
     await syncRemoteDraft();
 
-    // 补传后完整性校验：本地仍有分片没传到服务端（持续 429 退避 / 断网），说明服务端 draft
-    // 缺尾。仍 best-effort POST finalize 持久化已到达的分片，但把「不完整」如实回报给上层
-    // ——调用方据此保留本地 IndexedDB 完整副本、不清库（审计 high：停止收尾丢尾部音频）。
-    const audioComplete = !(
-      localChunkCount > 0 && remoteDraftSeqsRef.current.size < localChunkCount
+    // P0-5 契约2：完整性用「集合包含」判定 —— 期望区间 [0..maxSeq] 每个 seq 都必须已在远端
+    // （含首块 seq 0）。旧的数量判断会把 local=[0,1]/remote=[0,9] 误判完整而清掉唯一副本。
+    const audioComplete = isRecordingDraftComplete(
+      localSeqs,
+      remoteDraftSeqsRef.current
     );
 
+    // 不完整（补传缺尾：持续 429 退避 / 断网 / leading gap）：绝不 seal、绝不 POST finalize、
+    // 绝不置会话终态。保留服务端草稿与本地 IndexedDB 完整副本，如实回报 false 供上层保留数据、
+    // 走重试/恢复路径（审计 P0-5 critical：停止收尾丢尾部音频 / 清掉唯一完整副本）。
+    if (!audioComplete) {
+      publishBackupMeta({
+        localChunkCount,
+        remoteChunkCount: remoteDraftSeqsRef.current.size,
+        syncState: 'pending',
+        lastError: 'Some audio is not yet backed up to the server',
+      });
+      return false;
+    }
+
     try {
+      // P1-7 契约3 阶段①（SEAL）：先封存草稿再收尾。封存后服务端对迟到的 audio-chunk /
+      // transcript-draft 写入一律 409，杜绝「merge 读快照 → 删草稿」之间的丢尾窗口。
+      const sealResponse = await fetch(
+        `/api/sessions/${sessionId}/audio/draft/finalize?phase=seal`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      // 409：会话已被并发收尾/回收（终态）——视为需重试，绝不吞数据、绝不清库。
+      if (sealResponse.status === 409) {
+        publishBackupMeta({
+          localChunkCount,
+          remoteChunkCount: remoteDraftSeqsRef.current.size,
+          syncState: 'pending',
+          lastError: 'Recording draft is sealed or already finalized; retry needed',
+        });
+        return false;
+      }
+      if (!sealResponse.ok) {
+        publishBackupMeta({
+          localChunkCount,
+          remoteChunkCount: remoteDraftSeqsRef.current.size,
+          syncState: 'pending',
+          lastError: 'Failed to seal server backup',
+        });
+        return false;
+      }
+
+      // 阶段②：正式收尾（合并 + 服务端二次完整性校验 + CAS 提交）。
       const response = await fetch(
         `/api/sessions/${sessionId}/audio/draft/finalize`,
         {
@@ -391,6 +475,16 @@ export function useSoniox(
         }
       );
 
+      // 409：服务端合并阶段发现缺口（hasGap / leading gap）或会话已终态 —— 需重试，保留数据。
+      if (response.status === 409) {
+        publishBackupMeta({
+          localChunkCount,
+          remoteChunkCount: remoteDraftSeqsRef.current.size,
+          syncState: 'pending',
+          lastError: 'Server detected missing chunks; retry needed',
+        });
+        return false;
+      }
       if (!response.ok) {
         publishBackupMeta({
           localChunkCount,
@@ -404,10 +498,10 @@ export function useSoniox(
       publishBackupMeta({
         localChunkCount,
         remoteChunkCount: remoteDraftSeqsRef.current.size,
-        syncState: audioComplete ? (localChunkCount > 0 ? 'synced' : 'idle') : 'pending',
-        lastError: audioComplete ? null : 'Some audio is not yet backed up to the server',
+        syncState: localChunkCount > 0 ? 'synced' : 'idle',
+        lastError: null,
       });
-      return audioComplete;
+      return true;
     } catch (error) {
       publishBackupMeta({
         localChunkCount,
@@ -987,6 +1081,11 @@ export function useSoniox(
 
       overallStartTimeRef.current = startedAt;
       setRecordingStartTime(startedAt);
+      // 绑定全局 store 到本会话：后续别的会话页挂载时据 activeSessionId 判定这些
+      // segments/计时/recordingState 不属于它，杜绝跨会话串数据（P0-3）。
+      if (sessionId) {
+        setActiveSessionId(sessionId);
+      }
       setRecordingState(keepPausedUntilConnected ? 'paused' : 'recording');
       setCurrentMicDeviceId(sourceType === 'mic' ? selectedMicDeviceId ?? null : null);
       reconnectAttemptsRef.current = 0;
@@ -1021,12 +1120,31 @@ export function useSoniox(
         archiveManager.setChunkStoredHandler(({ seq, blob, mimeType }) => {
           return uploadDraftChunk(seq, blob, mimeType);
         });
+        // P1-10：硬件掉线（麦克风拔出 / 系统共享停止，源 track ended）时，若归档已无实时
+        // 采集，UI 不应继续显示 recording。反映为 paused + 断连，让用户看到明确信号。
+        archiveManager.setCaptureEndedHandler(() => {
+          if (archiveManagerRef.current !== archiveManager) {
+            return;
+          }
+          if (archiveManager.hasLiveCapture()) {
+            return;
+          }
+          setConnectionState('disconnected');
+          if (useTranscriptStore.getState().recordingState === 'recording') {
+            setPausedAt(Date.now());
+            setRecordingState('paused');
+          }
+        });
+        // P0-4：recorder.start() 之前先与服务端协商起始 seq（nextSeq = 服务端 maxSeq+1），
+        // 冷启动/续录都据此设定归档起点，杜绝从 0 起覆盖服务端已有录音开头。
+        const negotiatedStartSeq = await negotiateStartSeq();
         await archiveManager.ensureArchive({
           sourceType,
           deviceId: sourceType === 'mic' ? selectedMicDeviceId : undefined,
           preAcquiredStream,
           preserveData: startOptions?.preserveStartTime,
           startedAt,
+          initialSeq: negotiatedStartSeq,
         });
         const localChunkCount = (await getAudioChunkEntries(sessionId)).length;
         publishBackupMeta({
@@ -1138,13 +1256,34 @@ export function useSoniox(
         }
 
         recordingRef.current = result as { recording: RecordingHandle; client: unknown };
+
+        // 晚到的 start 结果对齐用户最新意图（P0-2 #1）：async 建连期间用户若手动暂停，
+        // store.recordingState 已是 'paused'，但刚发布的句柄默认在 recording，会继续写
+        // segment 造成「UI 暂停却仍出字」。此处立即暂停句柄与归档。
+        // 刻意排除 keepPausedUntilConnected：那是「暂停态切麦/重建，连上后自动 resume」的
+        // 既有流程，其 resume 由 onConnectionChange('connected') 分支负责，不能在此干预。
+        if (
+          !keepPausedUntilConnected &&
+          useTranscriptStore.getState().recordingState === 'paused'
+        ) {
+          try {
+            result.recording.pause?.();
+          } catch (error) {
+            console.error('Failed to pause late start handle:', error);
+          }
+          void archiveManagerRef.current?.pause();
+        }
       } catch (error) {
         if (runId !== runIdRef.current) {
           return;
         }
 
         console.error('Failed to start recording:', error);
-        const recoverable = await canRecoverLocally();
+        // P1-2：区分「仍有实时采集(hasLiveCapture)」与「仅有可恢复历史块」。只有前者才可
+        // 保持 recording；后者归档已停/句柄为空，继续显示 recording 会形成「计时继续但无音频」
+        // 的假录音，应落到 paused（靠 resume-cold / 手动继续兜底）。
+        const hasLive = Boolean(archiveManagerRef.current?.hasLiveCapture());
+        const recoverable = hasLive || (await canRecoverLocally());
         if (!startOptions?.reuseProcessor && !recoverable) {
           processorRef.current = null;
         }
@@ -1153,7 +1292,16 @@ export function useSoniox(
           setRecordingState('idle');
           return;
         }
-        setRecordingState(previousRecordingState === 'paused' ? 'paused' : 'recording');
+        const keepRecording = hasLive && previousRecordingState !== 'paused';
+        setRecordingState(keepRecording ? 'recording' : 'paused');
+        // P1-5：初始 temporary-key/WS 建连失败，但本地归档已在采集(hasLive)、且非暂停续录：
+        // 与运行中断线走同一条自动重连状态机（attemptReconnect），而不是静默停在
+        // recording/error 让实时转录永不自行恢复（审计 P1-5）。归档不受影响，仅重建转录连接。
+        if (keepRecording) {
+          shouldReconnectRef.current = true;
+          onTranscriptionInterrupted?.();
+          attemptReconnect();
+        }
       }
     },
     [
@@ -1165,6 +1313,7 @@ export function useSoniox(
       ensureProcessor,
       markAudioActivity,
       onAutoResume,
+      onTranscriptionInterrupted,
       pauseForInterruption,
       setConnectionState,
       setCurrentMicDeviceId,
@@ -1172,7 +1321,10 @@ export function useSoniox(
       publishBackupMeta,
       resetBackupMeta,
       setRecordingStartTime,
+      setActiveSessionId,
+      setPausedAt,
       setRecordingState,
+      negotiateStartSeq,
       syncRemoteDraft,
       updateTranscriptionLatency,
       token,
@@ -1306,6 +1458,18 @@ export function useSoniox(
       // 使在途录音回调失效，防止孤儿实例继续写 store / 上传 chunk
       runIdRef.current += 1;
 
+      // P1-3：停硬件的同一时刻冻结暂停点。SPA 导航离开会卸载本 hook 并停止硬件，但 store
+      // 内存单例不销毁、recordingState 保留为 recording。若此刻不冻结 pausedAt，返回页面时
+      // reconnectAfterRefresh / computeResumeOffset 会以「返回那一刻」(now) 作为冻结点，把整段
+      // 离页无音频空档算进 processor offset、elapsed 与服务端 duration（审计 P1-3）。以卸载
+      // 这一刻作为暂停起点后，离页空档被正确排除。仅在录音态且尚未冻结时设置，不覆盖既有暂停点。
+      {
+        const store = useTranscriptStore.getState();
+        if (store.recordingState === 'recording' && store.pausedAt == null) {
+          store.setPausedAt(Date.now());
+        }
+      }
+
       const orphanRecording = recordingRef.current;
       const orphanArchiveManager = archiveManagerRef.current;
       recordingRef.current = null;
@@ -1361,7 +1525,7 @@ export function useSoniox(
     };
   }, [sendFinalizeBeacon, syncRemoteDraft]);
 
-  const start = useCallback(async () => {
+  const startImpl = useCallback(async () => {
     // 手动开始/继续录音时接管连接生命周期：取消任何待触发/进行中的自动重连，否则它稍后
     // 会再开出第二条 Soniox WS，与本次手动建立的连接并存 → 旧句柄被覆盖却不 stop，形成
     // 双流、双计费（审计 high）。stop() 已有同款接管逻辑，这里对齐。
@@ -1434,6 +1598,19 @@ export function useSoniox(
     setRecordingState,
     startNewRecording,
   ]);
+
+  // 对外的 start：单飞包装。并发/双击时复用同一在途 Promise，保证 startImpl（进而
+  // startSonioxRecording）在一次 start 生命周期内只跑一次，杜绝双 WS / 双计费（P0-2 #2）。
+  const start = useCallback(async () => {
+    if (startInFlightRef.current) {
+      return startInFlightRef.current;
+    }
+    const run = startImpl().finally(() => {
+      startInFlightRef.current = null;
+    });
+    startInFlightRef.current = run;
+    return run;
+  }, [startImpl]);
 
   const stop = useCallback(async () => {
     // 取消任何正在进行的重连
@@ -1530,10 +1707,25 @@ export function useSoniox(
       recordingRef.current = null;
       setConnectionState('connecting');
 
+      // P0-2：捕获停旧录音这一步之前的代次。stop?.() 的 await 期间用户若点了『停止』，
+      // stop() 会 bump runId 并把 recordingState 迁到 finalizing/stopped——续录必须中止。
+      const genBeforeStop = runIdRef.current;
       try {
         await activeRecording.stop?.();
       } catch (error) {
         console.error('Error while switching microphone:', error);
+      }
+
+      // P0-2 residual：await 期间若录音已被停止（recordingState=stopped/idle），或代次已越过
+      // 捕获值（stop()/断网都会 bump runId），说明这条切麦克风的续录已经作废——绝不能再
+      // startNewRecording「停止后又复活录音」。此处尚未获取新流，无残留流需释放。
+      const stateAfterStop = useTranscriptStore.getState().recordingState;
+      if (
+        stateAfterStop === 'stopped' ||
+        stateAfterStop === 'idle' ||
+        runIdRef.current !== genBeforeStop
+      ) {
+        return;
       }
 
       processorRef.current?.onEndpoint();
@@ -1567,10 +1759,23 @@ export function useSoniox(
     recordingRef.current = null;
     setConnectionState('connecting');
 
+    // P0-2：捕获停旧录音这一步之前的代次（同 switchMicrophone）。
+    const genBeforeStop = runIdRef.current;
     try {
       await activeRecording.stop?.();
     } catch (error) {
       console.error('Error while rebuilding session:', error);
+    }
+
+    // P0-2 residual：await 期间录音被停止（stopped/idle）或代次已越过捕获值 → 中止重建，
+    // 绝不 startNewRecording 复活录音。此处尚未获取新流，无残留流需释放。
+    const stateAfterStop = useTranscriptStore.getState().recordingState;
+    if (
+      stateAfterStop === 'stopped' ||
+      stateAfterStop === 'idle' ||
+      runIdRef.current !== genBeforeStop
+    ) {
+      return;
     }
 
     processorRef.current?.onEndpoint();
@@ -1698,6 +1903,23 @@ export function useSoniox(
     updatePreviewTranslation,
   ]);
 
+  // P1-4：录音中连接错误（自动重连已达上限、connectionState='error'）时，供 UI 提供独立的
+  // 「重新连接」操作。归档 recorder 仍在采集，故不中断本地录音，仅重置重连计数并重新进入
+  // 自动重连状态机（attemptReconnect），让实时转录重新连上。
+  const reconnect = useCallback(() => {
+    const state = useTranscriptStore.getState().recordingState;
+    if (state !== 'recording' && state !== 'paused') {
+      return;
+    }
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    reconnectAttemptsRef.current = 0;
+    shouldReconnectRef.current = true;
+    void attemptReconnect();
+  }, [attemptReconnect]);
+
   const getAudioBlob = useCallback(() => lastAudioBlobRef.current, []);
 
   return {
@@ -1707,6 +1929,7 @@ export function useSoniox(
     switchMicrophone,
     rebuildSession,
     reconnectAfterRefresh,
+    reconnect,
     getAudioBlob,
     syncRemoteDraft,
     finalizeRemoteDraft,

@@ -46,16 +46,27 @@ export class BrowserAudioInputSource implements AudioSource {
   }
 
   async start(handlers: AudioSourceHandlers): Promise<void> {
+    // 先把待消费的预取流快照到局部，再 stop()——stop() 会清理未消费的预取流，
+    // 若不先快照，start() 自己调用的 stop() 会把本次要用的流也停掉（P0-1）。
+    const managed = this.managedStream;
+    this.managedStream = null;
+    const preAcquired = this.preAcquiredStream;
+    this.preAcquiredStream = null;
+
     this.stop();
 
     if (
       typeof navigator === 'undefined' ||
       !navigator.mediaDevices?.getUserMedia
     ) {
+      if (managed) managed.getTracks().forEach((track) => track.stop());
+      if (preAcquired) preAcquired.getTracks().forEach((track) => track.stop());
       throw new Error('当前环境不支持音频采集。');
     }
 
     if (typeof MediaRecorder === 'undefined') {
+      if (managed) managed.getTracks().forEach((track) => track.stop());
+      if (preAcquired) preAcquired.getTracks().forEach((track) => track.stop());
       throw new Error('当前浏览器不支持 MediaRecorder。');
     }
 
@@ -63,12 +74,10 @@ export class BrowserAudioInputSource implements AudioSource {
 
     try {
       let stream: MediaStream;
-      if (this.managedStream) {
-        stream = this.managedStream;
-        this.managedStream = null;
-      } else if (this.preAcquiredStream) {
-        stream = this.preAcquiredStream;
-        this.preAcquiredStream = null;
+      if (managed) {
+        stream = managed;
+      } else if (preAcquired) {
+        stream = preAcquired;
       } else {
         stream =
           this.sourceType === 'system'
@@ -76,6 +85,8 @@ export class BrowserAudioInputSource implements AudioSource {
             : await acquireMicrophoneStream(this.deviceId);
       }
 
+      // stop()/再次 start() 会递增 startGeneration；授权在此期间返回则本次已过期，
+      // 立即停掉刚拿到的 track，绝不发布 stream/启动 recorder，杜绝孤儿录音（P0-1）。
       if (generation !== this.startGeneration) {
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -136,7 +147,21 @@ export class BrowserAudioInputSource implements AudioSource {
   }
 
   stop() {
+    // 递增代际：任何在途 start()（正等待 getUserMedia 授权）在授权返回后校验代际即失效，
+    // 立即停掉刚拿到的 track。这是「stop 后授权返回复活孤儿录音」的根治点（P0-1）。
+    this.startGeneration += 1;
+
     this.stopLevelMonitor();
+
+    // 停掉尚未被 start() 消费的预取流，避免换页/取消时残留常亮的孤儿轨。
+    if (this.managedStream) {
+      this.managedStream.getTracks().forEach((track) => track.stop());
+      this.managedStream = null;
+    }
+    if (this.preAcquiredStream) {
+      this.preAcquiredStream.getTracks().forEach((track) => track.stop());
+      this.preAcquiredStream = null;
+    }
 
     if (this.mediaRecorder) {
       if (this.mediaRecorder.state !== 'inactive') {

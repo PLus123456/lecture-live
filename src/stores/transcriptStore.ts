@@ -50,6 +50,9 @@ interface TranscriptStore {
   currentSessionIndex: number;
   currentMicDeviceId: string | null;
   availableMics: MediaDeviceInfo[];
+  // 全局实时 store 归属的会话 id。SPA 内单例不销毁，导航到别的会话时据此判定
+  // segments/计时/recordingState 是否属于本会话，杜绝跨会话串数据（P0-3）。
+  activeSessionId: string | null;
 
   addFinalSegment: (segment: TranscriptSegment) => void;
   updatePreview: (preview: string | StreamingPreviewText) => void;
@@ -66,6 +69,7 @@ interface TranscriptStore {
   setCurrentSessionIndex: (index: number) => void;
   setCurrentMicDeviceId: (deviceId: string | null) => void;
   setAvailableMics: (mics: MediaDeviceInfo[]) => void;
+  setActiveSessionId: (sessionId: string | null) => void;
   clearAll: () => void;
 }
 
@@ -105,6 +109,7 @@ export const useTranscriptStore = create<TranscriptStore>()(
       currentSessionIndex: 0,
       currentMicDeviceId: null,
       availableMics: [],
+      activeSessionId: null,
 
       addFinalSegment: (segment) =>
         set((state) => ({ segments: [...state.segments, segment] })),
@@ -171,6 +176,8 @@ export const useTranscriptStore = create<TranscriptStore>()(
 
       setAvailableMics: (mics) => set({ availableMics: mics }),
 
+      setActiveSessionId: (sessionId) => set({ activeSessionId: sessionId }),
+
       clearAll: () =>
         set({
           segments: [],
@@ -195,6 +202,7 @@ export const useTranscriptStore = create<TranscriptStore>()(
           currentSessionIndex: 0,
           currentMicDeviceId: null,
           availableMics: [],
+          activeSessionId: null,
         }),
     }),
     {
@@ -213,6 +221,7 @@ export const useTranscriptStore = create<TranscriptStore>()(
         totalPausedMs: state.totalPausedMs,
         totalDurationMs: state.totalDurationMs,
         currentSessionIndex: state.currentSessionIndex,
+        activeSessionId: state.activeSessionId,
       }),
       onRehydrateStorage: () => () => {
         _hydrated = true;

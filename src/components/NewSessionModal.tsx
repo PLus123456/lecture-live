@@ -80,6 +80,9 @@ export default function NewSessionModal({ onClose, defaultFolderId }: NewSession
   >('idle');
   const [systemAudioError, setSystemAudioError] = useState<string | null>(null);
   const systemStreamRef = useRef<MediaStream | null>(null);
+  // 系统音频授权的请求代际。每次发起/取消/卸载都递增，getDisplayMedia 授权返回后校验代际，
+  // 过期（连点两次、切走、关弹窗）则立即停掉晚到的流，绝不发布（P1-9）。
+  const systemAudioRequestGenRef = useRef(0);
 
   const {
     activeDeviceId,
@@ -114,18 +117,28 @@ export default function NewSessionModal({ onClose, defaultFolderId }: NewSession
 
   // System audio cleanup
   useEffect(() => {
-    if (audioSource !== 'system' && systemStreamRef.current) {
-      systemStreamRef.current.getTracks().forEach((t) => t.stop());
-      systemStreamRef.current = null;
-      setSystemAudioStatus('idle');
-      setSystemAudioError(null);
+    if (audioSource !== 'system') {
+      // 切走系统音频：递增代际，作废任何在途 getDisplayMedia，避免晚到的流被发布（P1-9）。
+      systemAudioRequestGenRef.current += 1;
+      if (systemStreamRef.current) {
+        systemStreamRef.current.getTracks().forEach((t) => t.stop());
+        systemStreamRef.current = null;
+        setSystemAudioStatus('idle');
+        setSystemAudioError(null);
+      }
     }
   }, [audioSource]);
 
-  useEffect(() => () => { systemStreamRef.current?.getTracks().forEach((t) => t.stop()); }, []);
+  useEffect(() => () => {
+    // 卸载/关弹窗时递增代际：在途 getDisplayMedia 授权返回后会因代际不符被丢弃并停流（P1-9）。
+    systemAudioRequestGenRef.current += 1;
+    systemStreamRef.current?.getTracks().forEach((t) => t.stop());
+  }, []);
 
   // Request system audio
   const requestSystemAudio = useCallback(async () => {
+    // 进入新一代请求：连点两次时前一次的授权返回会因代际不符被丢弃（P1-9）。
+    const requestGen = ++systemAudioRequestGenRef.current;
     if (systemStreamRef.current) {
       systemStreamRef.current.getTracks().forEach((t) => t.stop());
       systemStreamRef.current = null;
@@ -139,6 +152,11 @@ export default function NewSessionModal({ onClose, defaultFolderId }: NewSession
     setSystemAudioError(null);
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+      // 授权期间又发起新请求 / 切走 / 关弹窗 → 本次已过期，立即停掉整条流，绝不发布（P1-9）。
+      if (requestGen !== systemAudioRequestGenRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       const audioTracks = stream.getAudioTracks();
       if (audioTracks.length === 0) {
         stream.getTracks().forEach((t) => t.stop());
@@ -147,13 +165,23 @@ export default function NewSessionModal({ onClose, defaultFolderId }: NewSession
         return;
       }
       stream.getVideoTracks().forEach((t) => t.stop());
-      systemStreamRef.current = new MediaStream(audioTracks);
+      const managedStream = new MediaStream(audioTracks);
+      systemStreamRef.current = managedStream;
       setSystemAudioStatus('granted');
-      audioTracks[0]?.addEventListener('ended', () => {
-        setSystemAudioStatus('idle');
-        systemStreamRef.current = null;
+      const activeAudioTrack = audioTracks[0];
+      activeAudioTrack?.addEventListener('ended', () => {
+        // 校验 track 身份：只有当前 ref 里仍是这条 track 才清，避免旧 track 的 ended 晚到
+        // 把新一代 stream 误清（P1-9）。
+        if (systemStreamRef.current?.getAudioTracks()[0] === activeAudioTrack) {
+          setSystemAudioStatus('idle');
+          systemStreamRef.current = null;
+        }
       });
     } catch (err) {
+      // 授权失败但期间已进入新一代请求 → 忽略本次过期错误，不覆盖新请求的状态（P1-9）。
+      if (requestGen !== systemAudioRequestGenRef.current) {
+        return;
+      }
       if (err instanceof DOMException && err.name === 'NotAllowedError') {
         setSystemAudioStatus('idle');
         setAudioSource('mic');

@@ -5,18 +5,23 @@ import { assertOwnership } from '@/lib/security';
 import {
   mergeRecordingDraftChunks,
   deleteRecordingDraft,
+  sealRecordingDraft,
+  unsealRecordingDraft,
 } from '@/lib/recordingDraftPersistence';
 import {
   loadTranscriptDraft,
   deleteTranscriptDraft,
 } from '@/lib/transcriptDraftPersistence';
 import {
-  persistSessionAudioArtifact,
+  stageSessionAudioArtifact,
+  finalizeStagedArtifactPublish,
+  rollbackStagedArtifact,
   persistSessionTranscriptArtifacts,
   extractTranscriptText,
   loadSessionTranscriptBundle,
   persistSessionReport,
   type PersistedTranscriptBundle,
+  type StagedArtifact,
 } from '@/lib/sessionPersistence';
 import {
   resolveServerRecordingDurationMs,
@@ -201,6 +206,10 @@ export async function finalizeSession(
   }
 
   try {
+    // P1-7 契约3：持锁后先封存草稿，阻断收尾期间迟到的 audio 分片 / transcript 草稿写入
+    // （seal 后两者一律 409），杜绝在「读取草稿快照 → 合并 → 删草稿」窗口内到达的写丢数据。
+    await sealRecordingDraft(session).catch(() => undefined);
+
     let transcriptPath = session.transcriptPath;
     let summaryPath = session.summaryPath;
     let bundle: PersistedTranscriptBundle | null = null;
@@ -278,21 +287,33 @@ export async function finalizeSession(
     // 刚写入的更新录音路径（审计 medium：竞态覆盖已定稿录音）。
     let recordingPathResolvedHere = false;
 
+    // P0-6：草稿音频改走「版本化临时对象 + CAS 发布」。stage 出的引用先写进最终事务，
+    // 事务提交（CAS 成功）后 publish，锁被接管(lockLost)则 rollback 删掉临时对象，绝不残留孤儿。
+    let stagedAudio: StagedArtifact | null = null;
     if (!recordingPath) {
       const merged = await mergeRecordingDraftChunks(session);
       if (merged) {
+        // P0-5：草稿有缺口（含 leading gap，首块非 seq 0）时不得用残缺前缀静默定稿。用户主动
+        // 收尾一律 409、保留草稿、维持 FINALIZING（客户端补传后重试）；仅自动回收(reclaim)为
+        // 避免会话永久卡死，best-effort 用已连续前缀落盘（宁可残缺也要能收尾）。
+        if (merged.hasGap && !isAutoReclaim) {
+          throw new FinalizeSessionError(409, {
+            error: 'Recording draft has missing chunks; cannot finalize',
+            hasGap: true,
+          });
+        }
         const normalizedBuffer = await normalizeRecordedAudioDuration({
           buffer: merged.buffer,
           mimeType: merged.manifest.mimeType,
           durationMs: finalDurationMs,
         });
 
-        const storedAudio = await persistSessionAudioArtifact(
+        stagedAudio = await stageSessionAudioArtifact(
           session,
           normalizedBuffer,
           merged.manifest.mimeType
         );
-        recordingPath = storedAudio.path;
+        recordingPath = stagedAudio.reference;
         recordingPathResolvedHere = true;
         shouldDeleteRecordingDraft = true;
       } else {
@@ -361,6 +382,11 @@ export async function finalizeSession(
     // U43：锁在处理期间被接管/会话已被对方 COMPLETED —— 本次不做任何写入/扣费/后台任务，
     // 按"已完成"返回当前库中真实状态，避免重复收尾。
     if (commit.lockLost) {
+      // P0-6：锁被接管/对方已 COMPLETED —— 本次 CAS 未生效，删掉刚 stage 的版本化临时对象，
+      // 绝不残留孤儿，也绝不动对方已发布的终态录音。
+      if (stagedAudio) {
+        await rollbackStagedArtifact(session, stagedAudio).catch(() => undefined);
+      }
       const latest = await prisma.session.findUnique({
         where: { id: options.sessionId },
         select: {
@@ -381,6 +407,11 @@ export async function finalizeSession(
     }
 
     const updatedSession = commit.updated!;
+
+    // P0-6：CAS 成功，recordingPath 已落库；发布 staged 录音（删旧 previousReference，此路径通常无旧值）。
+    if (stagedAudio) {
+      await finalizeStagedArtifactPublish(session, stagedAudio).catch(() => undefined);
+    }
 
     // C14：事务已成功提交，永久 artifact 的 path 与 COMPLETED 状态已落库，此时才删草稿。
     if (shouldDeleteRecordingDraft) {
@@ -456,6 +487,9 @@ export async function finalizeSession(
       recordingMissing,
     };
   } catch (error) {
+    // P1-7：本次收尾未提交（含草稿缺片抛 409 / 其它错误）—— 释放草稿封存，让客户端补传缺失
+    // 分片后重试收尾，避免 seal 后永久 409 挡住补传的死锁。best-effort，不影响错误上抛。
+    await unsealRecordingDraft(session).catch(() => undefined);
     // U43：仅在仍持本次锁时释放（条件匹配 finalizeLockedAt=lockTimestamp），
     // 避免误清另一 finalizer 接管后写入的锁。
     await releaseFinalizeLock(options.sessionId, lockTimestamp);

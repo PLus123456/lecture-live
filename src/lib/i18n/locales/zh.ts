@@ -726,6 +726,15 @@ export default {
     finalSummary: '总摘要：',
     allowRealtimeSummary: '允许实时摘要',
     allowFinalSummary: '允许总摘要',
+    // 分区标题 + 摘要模型（用户组绑定；与「设置 > LLM」的模型目录/全局默认联动）
+    sectionQuota: '配额',
+    allowedModelsHint: '仅决定用户在对话里能选哪些模型；不影响摘要与报告用哪个模型。',
+    realtimeSummaryModel: '实时摘要模型',
+    finalSummaryModel: '总摘要模型',
+    followGlobal: '跟随全局默认',
+    followGlobalWith: '跟随全局默认（{name}）',
+    staleModel: '（模型已失效）',
+    summaryModelHint: '摘要 / 报告实际用哪个模型由此决定：留空＝跟随「设置 > LLM」里该用途的全局默认，此处只覆盖本组。',
     enabled: '开',
     disabled: '关',
     depth: {

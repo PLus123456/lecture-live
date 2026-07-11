@@ -8,6 +8,8 @@ import { assertOwnership } from '@/lib/security';
 import { callLLM } from '@/lib/llm/gateway';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { generateSessionTitle } from '@/lib/llm/reportManager';
+import { resolveUserSummaryModels } from '@/lib/userRoles';
+import { resolveSummaryModel } from '@/lib/llm/summaryModel';
 import { trackJob, JOB_TYPE } from '@/lib/jobQueue';
 import {
   extractTranscriptText,
@@ -69,6 +71,19 @@ export async function POST(
 
     const summaryBlocks = (bundle.summaries ?? []) as SummaryBlock[];
 
+    // 标题借用总摘要模型（与后台自动标题一致）：按会话拥有者所属组解析，组绑定 > 全局默认
+    const owner = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { role: true, customGroupId: true },
+    });
+    const { finalSummaryModelId } = owner
+      ? await resolveUserSummaryModels(owner)
+      : { finalSummaryModelId: null };
+    const { routing: finalRouting } = await resolveSummaryModel(
+      finalSummaryModelId,
+      'FINAL_SUMMARY'
+    );
+
     // 通过 trackJob 追踪，队列面板可见
     const result = await trackJob(
       {
@@ -85,7 +100,7 @@ export async function POST(
           courseName: session.courseName ?? '',
           language: session.targetLang || 'zh',
           callLLM: (system: string, userMsg: string) =>
-            callLLM(system, userMsg, { purpose: 'FINAL_SUMMARY' }),
+            callLLM(system, userMsg, finalRouting),
         });
 
         if (!generated) {

@@ -5,6 +5,7 @@ import { logAction } from '@/lib/auditLog';
 import {
   resolveRoleQuotas,
   coerceThinkingDepthCap,
+  coerceSummaryModelId,
   type ThinkingDepthCap,
 } from '@/lib/userRoles';
 
@@ -20,6 +21,9 @@ interface GroupPermissions {
   maxThinkingDepth: ThinkingDepthCap; // 'off' 表示禁止思考
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
+  // ── 摘要专用模型（DB model id；空 = 跟随全局该用途默认）──
+  realtimeSummaryModelId: string;
+  finalSummaryModelId: string;
 }
 
 interface CustomGroupEntry {
@@ -40,6 +44,8 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     maxThinkingDepth: 'medium',
     allowRealtimeSummary: true,
     allowFinalSummary: true,
+    realtimeSummaryModelId: '',
+    finalSummaryModelId: '',
   },
   PRO: {
     transcriptionMinutesLimit: 600,
@@ -49,6 +55,8 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     maxThinkingDepth: 'high',
     allowRealtimeSummary: true,
     allowFinalSummary: true,
+    realtimeSummaryModelId: '',
+    finalSummaryModelId: '',
   },
   ADMIN: {
     transcriptionMinutesLimit: 999999,
@@ -58,6 +66,8 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     maxThinkingDepth: 'high',
     allowRealtimeSummary: true,
     allowFinalSummary: true,
+    realtimeSummaryModelId: '',
+    finalSummaryModelId: '',
   },
 };
 
@@ -99,6 +109,8 @@ function normalizePermissions(
       typeof p.allowFinalSummary === 'boolean'
         ? p.allowFinalSummary
         : fallback.allowFinalSummary,
+    realtimeSummaryModelId: coerceSummaryModelId(p.realtimeSummaryModelId),
+    finalSummaryModelId: coerceSummaryModelId(p.finalSummaryModelId),
   };
 }
 
@@ -111,6 +123,8 @@ const CUSTOM_GROUP_FALLBACK: GroupPermissions = {
   maxThinkingDepth: 'high',
   allowRealtimeSummary: true,
   allowFinalSummary: true,
+  realtimeSummaryModelId: '',
+  finalSummaryModelId: '',
 };
 
 // Prisma 事务客户端类型
@@ -152,12 +166,19 @@ function validateAllowedModels(raw: string): boolean {
   return tokens.every((t) => /^[^\s,]{1,200}$/.test(t));
 }
 
-/** 从请求体清洗能力开关字段（非法值回落默认：思考=medium、两摘要=true） */
+/**
+ * 从请求体清洗能力开关 + 摘要模型字段。
+ * 非法值回落默认：思考=medium、两摘要=true、摘要模型='' （空 = 跟随全局默认）。
+ */
 function sanitizeFeatureFlags(
   permissions: Partial<GroupPermissions> | undefined
 ): Pick<
   GroupPermissions,
-  'maxThinkingDepth' | 'allowRealtimeSummary' | 'allowFinalSummary'
+  | 'maxThinkingDepth'
+  | 'allowRealtimeSummary'
+  | 'allowFinalSummary'
+  | 'realtimeSummaryModelId'
+  | 'finalSummaryModelId'
 > {
   return {
     maxThinkingDepth: coerceThinkingDepthCap(
@@ -172,6 +193,10 @@ function sanitizeFeatureFlags(
       typeof permissions?.allowFinalSummary === 'boolean'
         ? permissions.allowFinalSummary
         : true,
+    realtimeSummaryModelId: coerceSummaryModelId(
+      permissions?.realtimeSummaryModelId
+    ),
+    finalSummaryModelId: coerceSummaryModelId(permissions?.finalSummaryModelId),
   };
 }
 

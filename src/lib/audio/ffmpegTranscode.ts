@@ -204,14 +204,20 @@ interface ProbeRunResult {
 }
 
 /**
- * 统一的 ffprobe 执行器：强制 `-protocol_whitelist file,pipe`、`-nostdin`，忽略 stdin，
- * drain stdout/stderr，并带空转 + 绝对超时看门狗，命中即 SIGKILL。所有 probe 走这里，
- * 杜绝旧代码 ffprobe 无超时、不消费 stderr 导致的永久挂起（P1-11）。
+ * 统一的 ffprobe 执行器：强制 `-protocol_whitelist file,pipe`，用 `stdio:['ignore',…]`
+ * 彻底断开 stdin，drain stdout/stderr，并带空转 + 绝对超时看门狗，命中即 SIGKILL。所有
+ * probe 走这里，杜绝旧代码 ffprobe 无超时、不消费 stderr 导致的永久挂起（P1-11）。
+ *
+ * 注意：**绝不给 ffprobe 传 `-nostdin`**。`-nostdin` 是 ffmpeg 的全局选项，ffprobe 并不
+ * 认识它——ffmpeg 7+/8.x 的 ffprobe 遇到 `-nostdin` 会把它当成需要取值的未知选项，吞掉
+ * 紧跟的下一个参数并以 rc=1 直接失败、stdout 全空。此前这里把 `-nostdin` 放在最前，导致
+ * **每一次 probe 都失败**：probeFormatName 返回空 → validateMediaContainer 抛
+ * 「ffprobe could not determine container format」，完整版补全转录与异步上传全线报错。
+ * 断开 stdin 已由 spawn 的 `stdio:['ignore',…]` 保证，无需该选项。
  */
 function runProbe(args: string[]): Promise<ProbeRunResult> {
   const probeBin = process.env.FFPROBE_PATH || 'ffprobe';
   const fullArgs = [
-    '-nostdin',
     '-protocol_whitelist', PROTOCOL_WHITELIST,
     ...args,
   ];

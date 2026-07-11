@@ -7,6 +7,7 @@ const {
   sessionUpdateMock,
   sessionUpdateManyMock,
   sessionCountMock,
+  userFindUniqueMock,
   folderSessionDeleteManyMock,
   shareLinkDeleteManyMock,
   sessionDeleteMock,
@@ -18,12 +19,14 @@ const {
   deleteRecordingDraftMock,
   deleteConversationsCascadeMock,
   cancelAsyncUploadMock,
+  resolveMaxConcurrentMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
   sessionUpdateMock: vi.fn(),
   sessionUpdateManyMock: vi.fn(),
   sessionCountMock: vi.fn(),
+  userFindUniqueMock: vi.fn(),
   folderSessionDeleteManyMock: vi.fn(),
   shareLinkDeleteManyMock: vi.fn(),
   sessionDeleteMock: vi.fn(),
@@ -35,6 +38,7 @@ const {
   deleteRecordingDraftMock: vi.fn(),
   deleteConversationsCascadeMock: vi.fn(),
   cancelAsyncUploadMock: vi.fn(),
+  resolveMaxConcurrentMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({
@@ -49,6 +53,10 @@ vi.mock('@/lib/prisma', () => ({
       updateMany: sessionUpdateManyMock,
       delete: sessionDeleteMock,
       count: sessionCountMock,
+    },
+    // B4：并发上限校验前会取一次 owner.customGroupId 以解析用户组 cap。
+    user: {
+      findUnique: userFindUniqueMock,
     },
     folderSession: {
       deleteMany: folderSessionDeleteManyMock,
@@ -89,6 +97,12 @@ vi.mock('@/lib/quota', () => ({
   settleFullReservation: vi.fn().mockResolvedValue(0),
 }));
 
+// B4：并发上限由用户组解析。桩返回固定 3，让这些用例的数值假设（<3 放行 / =3 拒）稳定，
+// 与「按 role/组解析真实上限」的逻辑解耦（该逻辑由 userRoles 单测覆盖）。
+vi.mock('@/lib/userRoles', () => ({
+  resolveUserMaxConcurrentSessions: resolveMaxConcurrentMock,
+}));
+
 import { DELETE, GET, PATCH } from '@/app/api/sessions/[id]/route';
 
 const params = Promise.resolve({ id: 'session-1' });
@@ -113,6 +127,9 @@ describe('session detail route', () => {
     sessionDeleteMock.mockResolvedValue({ id: 'session-1' });
     // B4：并发在途录音计数默认 0（未达上限）；具体 cap 用例单独 override。
     sessionCountMock.mockReset().mockResolvedValue(0);
+    // B4：owner.customGroupId 默认 null（走系统角色 cap）；组 cap 桩默认 3（与旧硬编码上限一致）。
+    userFindUniqueMock.mockReset().mockResolvedValue({ customGroupId: null });
+    resolveMaxConcurrentMock.mockReset().mockResolvedValue(3);
     // P0-6：PATCH 走 updateMany CAS（where 带期望旧 status）；默认命中 1 行（无并发改动）。
     sessionUpdateManyMock.mockReset().mockResolvedValue({ count: 1 });
     conversationFindManyMock.mockReset().mockResolvedValue([]);

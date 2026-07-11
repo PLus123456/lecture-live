@@ -10,17 +10,23 @@ import type {
   LlmPurpose,
 } from '@/types/llm';
 import { jsonWithCache } from '@/lib/httpCache';
+import {
+  clampDepthToCap,
+  resolveUserFeatureFlags,
+  type ThinkingDepthCap,
+} from '@/lib/userRoles';
 
 /**
- * 给定模型 thinkingMode + 用户角色，算出 UI 可选的深度档位。
- * 非 DEPTH 模型返回空数组，UI 自行渲染 auto/forced。
+ * 给定模型 thinkingMode + 所属组的思考深度上限 cap，算出 UI 可选的深度档位。
+ * 非 DEPTH 模型或 cap='off'（组禁止思考）返回空数组；否则返回不超过 cap 的档位。
  */
 function allowedDepthsFor(
   mode: ThinkingMode,
-  role: 'ADMIN' | 'PRO' | 'FREE'
+  cap: ThinkingDepthCap
 ): ThinkingDepth[] {
-  if (mode !== 'DEPTH') return [];
-  return role === 'FREE' ? ['low', 'medium'] : ['low', 'medium', 'high'];
+  if (mode !== 'DEPTH' || cap === 'off') return [];
+  const order: ThinkingDepth[] = ['low', 'medium', 'high'];
+  return order.filter((d) => clampDepthToCap(d, cap) === d);
 }
 
 /**
@@ -37,12 +43,15 @@ export async function GET(req: Request) {
 
   const user = await prisma.user.findUnique({
     where: { id: payload.id },
-    select: { allowedModels: true, role: true },
+    select: { allowedModels: true, role: true, customGroupId: true },
   });
 
   if (!user) {
     return NextResponse.json({ error: 'User not found' }, { status: 404 });
   }
+
+  // 所属组的思考深度上限（cap='off' 表示该组禁止思考 → UI 隐藏思考控件）
+  const thinkingCap = (await resolveUserFeatureFlags(user)).maxThinkingDepth;
 
   // 尝试从数据库读取模型配置
   const dbModels = await listAvailableModels();
@@ -77,16 +86,16 @@ export async function GET(req: Request) {
       }
 
       const mode = cfg.thinkingMode;
-      const allowedDepths = allowedDepthsFor(mode, user.role);
+      const allowedDepths = allowedDepthsFor(mode, thinkingCap);
 
       const buildOption = (purpose: LlmPurpose): ChatModelOption => ({
         name: cfg.dbModelId!,
         id: cfg.dbModelId!,
         modelId: cfg.model,
         displayName: cfg.displayName || cfg.model,
-        supportsThinking: mode !== 'NONE',
+        supportsThinking: mode !== 'NONE' && thinkingCap !== 'off',
         thinkingMode: mode,
-        supportsThinkingDepth: mode === 'DEPTH',
+        supportsThinkingDepth: mode === 'DEPTH' && thinkingCap !== 'off',
         supportsImage: cfg.supportsImage,
         contextWindow: cfg.contextWindow,
         allowedDepths,
@@ -152,12 +161,12 @@ export async function GET(req: Request) {
       id: name,
       modelId: provider.model,
       displayName: provider.displayName || name,
-      supportsThinking: mode !== 'NONE',
+      supportsThinking: mode !== 'NONE' && thinkingCap !== 'off',
       thinkingMode: mode,
-      supportsThinkingDepth: mode === 'DEPTH',
+      supportsThinkingDepth: mode === 'DEPTH' && thinkingCap !== 'off',
       supportsImage: provider.supportsImage,
       contextWindow: provider.contextWindow,
-      allowedDepths: allowedDepthsFor(mode, user.role),
+      allowedDepths: allowedDepthsFor(mode, thinkingCap),
       purpose: 'CHAT',
     });
   }

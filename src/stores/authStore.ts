@@ -28,7 +28,15 @@ export const useAuthStore = create<AuthStore>()(
 
       setAuth: (user, token) => set({ user, token, sessionChecked: true }),
 
-      setQuotas: (quotas) => set({ quotas }),
+      // featureFlags 仅由 /api/users/quota 附带；其他来源（如同传扣费）更新配额时不带此字段，
+      // 合并时保留上一次的 featureFlags，避免功能开关被临时清空导致 UI 闪烁。
+      setQuotas: (quotas) =>
+        set((state) => ({
+          quotas: {
+            ...quotas,
+            featureFlags: quotas.featureFlags ?? state.quotas?.featureFlags,
+          },
+        })),
 
       setSessionChecked: (checked) => set({ sessionChecked: checked }),
 

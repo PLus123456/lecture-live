@@ -379,6 +379,10 @@ export default function ActiveSessionPage() {
   const user = useAuthStore((s) => s.user);
   const token = useAuthStore((s) => s.token);
   const cachedQuotas = useAuthStore((s) => s.quotas);
+  // 用户组是否开通实时摘要（缺省 → 放行；服务端 /api/llm/summarize 才是权威门禁）。
+  // 未开通时不自动触发增量摘要，避免持续打到已 403 的端点。
+  const realtimeSummaryEnabled =
+    cachedQuotas?.featureFlags?.allowRealtimeSummary !== false;
   const sidebarCollapsed = useSettingsStore((s) => s.sidebarCollapsed);
   const pendingAutoStart = useSettingsStore((s) => s.pendingAutoStart);
   const setPendingAutoStart = useSettingsStore((s) => s.setPendingAutoStart);
@@ -956,7 +960,10 @@ export default function ActiveSessionPage() {
   useEffect(() => {
     if (segments.length === 0) return;
     const latestSegment = segments[segments.length - 1];
-    onNewSentence(latestSegment.text);
+    // 仅在用户组开通实时摘要时喂给摘要管理器
+    if (realtimeSummaryEnabled) {
+      onNewSentence(latestSegment.text);
+    }
     if (translationMode === 'local' || translationMode === 'both') {
       translateSentence(latestSegment.id, latestSegment.text, latestSegment.language);
     }

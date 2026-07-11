@@ -1,10 +1,11 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Sparkles, MessageSquare, Tag } from 'lucide-react';
 import SummaryTab from './SummaryTab';
 import ChatTab from './ChatTab';
 import KeywordTab from './KeywordTab';
+import { useAuthStore } from '@/stores/authStore';
 
 type Tab = 'summary' | 'chat' | 'keyword';
 
@@ -15,10 +16,32 @@ export default function AiPanel({
   onManualSummary?: () => void;
   onInjectKeywords?: (keywords: string[]) => Promise<void> | void;
 }) {
-  const [activeTab, setActiveTab] = useState<Tab>('summary');
+  // 用户组是否开通实时摘要（缺省 → 放行；服务端才是权威门禁）。未开通则隐藏 Summary 标签页。
+  const realtimeSummaryEnabled = useAuthStore(
+    (s) => s.quotas?.featureFlags?.allowRealtimeSummary !== false
+  );
+
+  const [activeTab, setActiveTab] = useState<Tab>(
+    realtimeSummaryEnabled ? 'summary' : 'chat'
+  );
+
+  // 摘要功能被关闭且当前正停在 Summary 标签页时，切到 Chat
+  useEffect(() => {
+    if (!realtimeSummaryEnabled && activeTab === 'summary') {
+      setActiveTab('chat');
+    }
+  }, [realtimeSummaryEnabled, activeTab]);
 
   const tabs: { key: Tab; label: string; icon: React.ReactNode }[] = [
-    { key: 'summary', label: 'Summary', icon: <Sparkles className="w-3.5 h-3.5" /> },
+    ...(realtimeSummaryEnabled
+      ? [
+          {
+            key: 'summary' as const,
+            label: 'Summary',
+            icon: <Sparkles className="w-3.5 h-3.5" />,
+          },
+        ]
+      : []),
     { key: 'chat', label: 'Chat', icon: <MessageSquare className="w-3.5 h-3.5" /> },
     { key: 'keyword', label: 'Keywords', icon: <Tag className="w-3.5 h-3.5" /> },
   ];

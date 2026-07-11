@@ -90,6 +90,7 @@ test.beforeEach(async ({ page }) => {
 
     // 供应商 + 模型：故意让 gpt-4o 同时挂在两个供应商/用途下，验证去重只出现一次；
     // 另含一个 EMBEDDING 模型（应被过滤，不进可选列表）。
+    // 摘要用途各配一个模型并标 isDefault，验证摘要模型下拉的「跟随全局默认（X）」展示。
     if (p === '/api/admin/llm-providers' && method === 'GET') {
       return fulfillJson(route, {
         providers: [
@@ -98,8 +99,9 @@ test.beforeEach(async ({ page }) => {
             name: 'OpenAI 主力',
             models: [
               { id: 'm1', modelId: 'gpt-4o', displayName: 'GPT-4o', purpose: 'CHAT' },
-              { id: 'm2', modelId: 'gpt-4o', displayName: 'GPT-4o (摘要)', purpose: 'REALTIME_SUMMARY' },
+              { id: 'm2', modelId: 'doubao-mini', displayName: '豆包mini实时', purpose: 'REALTIME_SUMMARY', isDefault: true },
               { id: 'm3', modelId: 'text-embed-3', displayName: 'Embed', purpose: 'EMBEDDING' },
+              { id: 'm6', modelId: 'doubao-pro', displayName: '豆包pro总摘要', purpose: 'FINAL_SUMMARY', isDefault: true },
             ],
           },
           {
@@ -108,6 +110,7 @@ test.beforeEach(async ({ page }) => {
             models: [
               { id: 'm4', modelId: 'gpt-4o', displayName: 'GPT-4o', purpose: 'CHAT' },
               { id: 'm5', modelId: 'claude-x', displayName: 'Claude X', purpose: 'CHAT' },
+              { id: 'm7', modelId: 'doubao-lite', displayName: '豆包lite总摘要', purpose: 'FINAL_SUMMARY' },
             ],
           },
         ],
@@ -187,8 +190,59 @@ test('组编辑面板渲染能力绑定控件且模型去重', async ({ page }) 
   // claude-x 作为另一个 CHAT 模型出现
   await expect(page.locator('label', { hasText: 'claude-x' })).toHaveCount(1);
 
+  // 摘要模型控件：实时摘要模型 / 总摘要模型 两个下拉都渲染
+  await expect(
+    page.getByText(/实时摘要模型|Realtime summary model/).first()
+  ).toBeVisible();
+  await expect(
+    page.getByText(/总摘要模型|Final summary model/).first()
+  ).toBeVisible();
+
+  // 受限组 allowFinalSummary=true → 总摘要下拉可用，且首项是「跟随全局默认（豆包pro总摘要）」
+  await expect(
+    page.getByRole('option', { name: /跟随全局默认（豆包pro总摘要）|Follow global default \(豆包pro总摘要\)/ })
+  ).toHaveCount(1);
+  // 具体可选的总摘要模型也在选项里
+  await expect(page.getByRole('option', { name: /豆包lite总摘要/ })).toHaveCount(1);
+
   await page.screenshot({
     path: 'artifacts/admin-group-bindings.png',
     fullPage: true,
   });
+});
+
+test('编辑弹窗挂到 body 且铺满视口（不再错位）', async ({ page }) => {
+  await page.goto('/login');
+  await page.locator('input[type="email"]').fill('admin@lecturelive.com');
+  await page.locator('input[type="password"]').fill('admin123');
+  await page.locator('button[type="submit"]').first().click();
+  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+
+  await page.goto('/admin?tab=groups');
+  await page.waitForLoadState('networkidle');
+
+  const card = page.getByText('QA Restricted').first();
+  await expect(card).toBeVisible({ timeout: 15_000 });
+  await card.click();
+  await page.getByRole('button', { name: /编辑|Edit/ }).first().click();
+
+  // 弹窗标题可见（弹窗已挂载）
+  const title = page.getByText(/编辑用户组|Edit User Group/).first();
+  await expect(title).toBeVisible({ timeout: 10_000 });
+
+  // 回归「错位」：弹窗遮罩（fixed inset-0，含标题）必须铺满整个视口 ——
+  // 若被祖先 transform 困住（未 portal），其盒子会被内容壳偏移/缩小。
+  const backdrop = page
+    .locator('div.fixed.inset-0')
+    .filter({ has: page.getByText(/编辑用户组|Edit User Group/) })
+    .first();
+  const box = await backdrop.boundingBox();
+  const vp = page.viewportSize();
+  expect(box).toBeTruthy();
+  expect(vp).toBeTruthy();
+  // 左上角贴合视口 (0,0)，宽高≈视口
+  expect(box!.x).toBeLessThan(4);
+  expect(box!.y).toBeLessThan(4);
+  expect(Math.abs(box!.width - vp!.width)).toBeLessThan(4);
+  expect(Math.abs(box!.height - vp!.height)).toBeLessThan(4);
 });

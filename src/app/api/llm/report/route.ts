@@ -7,8 +7,9 @@ import { prisma } from '@/lib/prisma';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { logAction } from '@/lib/auditLog';
-import { resolveUserFeatureFlags } from '@/lib/userRoles';
-import { callLLM, getProviderForPurpose } from '@/lib/llm/gateway';
+import { resolveUserFeatureFlags, resolveUserSummaryModels } from '@/lib/userRoles';
+import { callLLM } from '@/lib/llm/gateway';
+import { resolveSummaryModel } from '@/lib/llm/summaryModel';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { generateSessionReport } from '@/lib/llm/reportManager';
 import {
@@ -66,6 +67,11 @@ export async function POST(req: Request) {
       );
     }
 
+    // 总摘要模型由会话拥有者所属组决定（组绑定 > 全局 FINAL_SUMMARY 默认）。
+    const { finalSummaryModelId } = owner
+      ? await resolveUserSummaryModels(owner)
+      : { finalSummaryModelId: null };
+
     // 加载转录数据
     const bundle = await loadSessionTranscriptBundle(session);
     if (!bundle || bundle.segments.length === 0) {
@@ -78,11 +84,10 @@ export async function POST(req: Request) {
     const fullTranscript = extractTranscriptText(bundle);
     const summaryBlocks = (bundle.summaries ?? []) as SummaryBlock[];
 
-    // 预解析 FINAL_SUMMARY 模型，拿到 contextWindow 喂给 reportManager 决定是否
-    // 走 map-reduce。即使解析失败也用 DEFAULT_CONTEXT_WINDOW 兜底（reportManager 内部默认）。
-    const finalSummaryProvider = await getProviderForPurpose('FINAL_SUMMARY').catch(
-      () => null
-    );
+    // 预解析总摘要模型（组绑定或全局用途默认），拿到 contextWindow 喂给 reportManager
+    // 决定是否走 map-reduce。即使解析失败也用 DEFAULT_CONTEXT_WINDOW 兜底（reportManager 内部默认）。
+    const { routing: finalRouting, provider: finalSummaryProvider } =
+      await resolveSummaryModel(finalSummaryModelId, 'FINAL_SUMMARY');
 
     // 生成报告（包含意义评估）
     const reportData = await generateSessionReport({
@@ -95,7 +100,7 @@ export async function POST(req: Request) {
       summaryBlocks,
       language: session.targetLang || 'zh',
       callLLM: (system: string, userMsg: string) =>
-        callLLM(system, userMsg, { purpose: 'FINAL_SUMMARY' }),
+        callLLM(system, userMsg, finalRouting),
       contextWindow: finalSummaryProvider?.contextWindow,
     });
 

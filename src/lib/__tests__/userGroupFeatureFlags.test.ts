@@ -24,11 +24,13 @@ vi.mock('@/lib/siteSettings', () => ({
 
 import {
   coerceThinkingDepthCap,
+  coerceSummaryModelId,
   clampDepthToCap,
   resolveRoleQuotas,
   resolveCustomGroupPermissions,
   resolveUserFeatureFlags,
   resolveUserMaxConcurrentSessions,
+  resolveUserSummaryModels,
 } from '@/lib/userRoles';
 
 /** 让 mock 按 SiteSetting key 返回预置行 */
@@ -56,6 +58,25 @@ describe('coerceThinkingDepthCap', () => {
     expect(coerceThinkingDepthCap('ultra', 'medium')).toBe('medium');
     expect(coerceThinkingDepthCap(undefined, 'high')).toBe('high');
     expect(coerceThinkingDepthCap(3, 'low')).toBe('low');
+  });
+});
+
+describe('coerceSummaryModelId', () => {
+  it('合法 id（cuid/uuid 形态）原样返回', () => {
+    expect(coerceSummaryModelId('clx123abc')).toBe('clx123abc');
+    expect(coerceSummaryModelId('a1b2-c3d4_e5')).toBe('a1b2-c3d4_e5');
+  });
+  it('空/空白 → ""', () => {
+    expect(coerceSummaryModelId('')).toBe('');
+    expect(coerceSummaryModelId('   ')).toBe('');
+    expect(coerceSummaryModelId(undefined)).toBe('');
+    expect(coerceSummaryModelId(null)).toBe('');
+  });
+  it('非法字符 / 超长 → ""（视作跟随全局）', () => {
+    expect(coerceSummaryModelId('has space')).toBe('');
+    expect(coerceSummaryModelId('a,b')).toBe('');
+    expect(coerceSummaryModelId('x'.repeat(65))).toBe('');
+    expect(coerceSummaryModelId(123)).toBe('');
   });
 });
 
@@ -287,5 +308,82 @@ describe('resolveUserFeatureFlags', () => {
     expect(f.allowRealtimeSummary).toBe(false);
     // allowFinalSummary 未在配置中 → 回落 FREE 默认 true
     expect(f.allowFinalSummary).toBe(true);
+  });
+});
+
+describe('resolveUserSummaryModels', () => {
+  it('ADMIN 不绑定组摘要模型 → 两者 null（跟随全局默认）', async () => {
+    setSiteSettings({
+      custom_groups: [
+        {
+          id: 'g_admin',
+          permissions: {
+            realtimeSummaryModelId: 'm-rt',
+            finalSummaryModelId: 'm-final',
+          },
+        },
+      ],
+    });
+    expect(
+      await resolveUserSummaryModels({ role: 'ADMIN', customGroupId: 'g_admin' })
+    ).toEqual({ realtimeSummaryModelId: null, finalSummaryModelId: null });
+  });
+
+  it('自定义组配了摘要模型 → 原样返回', async () => {
+    setSiteSettings({
+      custom_groups: [
+        {
+          id: 'g_sum',
+          permissions: {
+            allowedModels: '*',
+            realtimeSummaryModelId: 'rt-mini',
+            finalSummaryModelId: 'final-mini',
+          },
+        },
+      ],
+    });
+    expect(
+      await resolveUserSummaryModels({ role: 'FREE', customGroupId: 'g_sum' })
+    ).toEqual({ realtimeSummaryModelId: 'rt-mini', finalSummaryModelId: 'final-mini' });
+  });
+
+  it('自定义组未配摘要模型 → 两者 null', async () => {
+    setSiteSettings({
+      custom_groups: [{ id: 'g_none', permissions: { allowedModels: 'gpt-4o' } }],
+    });
+    expect(
+      await resolveUserSummaryModels({ role: 'FREE', customGroupId: 'g_none' })
+    ).toEqual({ realtimeSummaryModelId: null, finalSummaryModelId: null });
+  });
+
+  it('无自定义组 → 按系统角色 group_config 解析摘要模型', async () => {
+    setSiteSettings({
+      group_config_FREE: {
+        realtimeSummaryModelId: 'doubao-mini-rt',
+        finalSummaryModelId: 'doubao-mini-final',
+      },
+    });
+    expect(
+      await resolveUserSummaryModels({ role: 'FREE', customGroupId: null })
+    ).toEqual({
+      realtimeSummaryModelId: 'doubao-mini-rt',
+      finalSummaryModelId: 'doubao-mini-final',
+    });
+  });
+
+  it('自定义组不存在 → 回落底层角色（无配置 → null）', async () => {
+    setSiteSettings({ custom_groups: [] });
+    expect(
+      await resolveUserSummaryModels({ role: 'FREE', customGroupId: 'ghost' })
+    ).toEqual({ realtimeSummaryModelId: null, finalSummaryModelId: null });
+  });
+
+  it('非法 model id 经 coerce 变空 → null', async () => {
+    setSiteSettings({
+      group_config_PRO: { realtimeSummaryModelId: 'bad id with space' },
+    });
+    expect(
+      await resolveUserSummaryModels({ role: 'PRO', customGroupId: null })
+    ).toEqual({ realtimeSummaryModelId: null, finalSummaryModelId: null });
   });
 });

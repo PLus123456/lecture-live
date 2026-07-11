@@ -20,6 +20,7 @@ import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
 import { useExitAnimation } from '@/hooks/useExitAnimation';
+import ModalPortal from '@/components/ModalPortal';
 
 /** 思考深度上限档位（'off' 表示禁止思考） */
 type ThinkingDepthCap = 'off' | 'low' | 'medium' | 'high';
@@ -33,6 +34,10 @@ interface GroupPermissions {
   maxThinkingDepth: ThinkingDepthCap;
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
+  /** 该组实时摘要模型（DB model id；'' = 跟随全局默认） */
+  realtimeSummaryModelId?: string;
+  /** 该组总摘要模型（DB model id；'' = 跟随全局默认） */
+  finalSummaryModelId?: string;
 }
 
 interface UserGroup {
@@ -63,12 +68,14 @@ function getGroupDescription(t: (key: string) => string, id: string): string {
 
 function GroupCard({
   group,
+  catalog,
   onEdit,
   onDelete,
   expanded,
   onToggle,
 }: {
   group: UserGroup;
+  catalog: ModelCatalog;
   onEdit: () => void;
   onDelete?: () => void;
   expanded: boolean;
@@ -183,6 +190,34 @@ function GroupCard({
                   : t('admin.disabled')}
               </span>
             </div>
+            {group.permissions.allowRealtimeSummary && (
+              <div className="flex items-center gap-2 text-sm text-charcoal-600 min-w-0">
+                <Sparkles className="w-3.5 h-3.5 text-charcoal-400 shrink-0" />
+                <span className="shrink-0">{t('admin.realtimeSummaryModel')}</span>
+                <span className="font-medium truncate">
+                  {summaryModelDisplay(
+                    t,
+                    group.permissions.realtimeSummaryModelId,
+                    catalog.realtimeSummary,
+                    catalog.realtimeDefault,
+                  )}
+                </span>
+              </div>
+            )}
+            {group.permissions.allowFinalSummary && (
+              <div className="flex items-center gap-2 text-sm text-charcoal-600 min-w-0">
+                <FileText className="w-3.5 h-3.5 text-charcoal-400 shrink-0" />
+                <span className="shrink-0">{t('admin.finalSummaryModel')}</span>
+                <span className="font-medium truncate">
+                  {summaryModelDisplay(
+                    t,
+                    group.permissions.finalSummaryModelId,
+                    catalog.finalSummary,
+                    catalog.finalDefault,
+                  )}
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center gap-2 mt-4 pt-3 border-t border-cream-100">
@@ -217,6 +252,50 @@ interface ModelInfo {
   modelId: string;      // 作为 allowedModels 存储的 token
   displayName: string;  // 展示名
   providerName: string; // 所属供应商（消歧展示）
+}
+
+/** 某个摘要用途下的一个可选模型（token = DB model id；与后端摘要模型字段口径一致） */
+interface SummaryModelOption {
+  id: string;           // DB model id —— 作为 realtime/finalSummaryModelId 存储的 token
+  displayName: string;
+  providerName: string;
+  modelId: string;      // 供应商模型串（消歧展示）
+}
+
+/**
+ * 编辑面板需要的全部模型目录（一次从 /api/admin/llm-providers 拉取后按用途拆分）。
+ * chat 用于「可用模型」勾选；realtime/final 用于摘要模型下拉；xxxDefault 是该用途在
+ * 「设置 > LLM」里被标记 isDefault 的全局默认模型（用于下拉里的「跟随全局默认（X）」展示）。
+ */
+interface ModelCatalog {
+  chat: ModelInfo[];
+  realtimeSummary: SummaryModelOption[];
+  finalSummary: SummaryModelOption[];
+  realtimeDefault?: SummaryModelOption;
+  finalDefault?: SummaryModelOption;
+}
+
+const EMPTY_CATALOG: ModelCatalog = {
+  chat: [],
+  realtimeSummary: [],
+  finalSummary: [],
+};
+
+/** 在某用途的选项列表里解析一个已保存的 model id 的展示名（用于卡片/下拉回显） */
+function summaryModelDisplay(
+  t: (key: string, vars?: Record<string, string | number>) => string,
+  id: string | undefined,
+  options: SummaryModelOption[],
+  globalDefault?: SummaryModelOption,
+): string {
+  if (!id) {
+    return globalDefault
+      ? t('admin.followGlobalWith', { name: globalDefault.displayName })
+      : t('admin.followGlobal');
+  }
+  const found = options.find((o) => o.id === id);
+  if (found) return found.displayName;
+  return t('admin.staleModel');
 }
 
 function ModelCheckboxList({
@@ -281,28 +360,23 @@ const COLOR_OPTIONS = [
   { value: 'bg-teal-50 text-teal-600', dot: 'bg-teal-500' },
 ];
 
-/** 一个「开/关」行内开关（用于实时摘要 / 总摘要 / 允许思考） */
-function ToggleRow({
+/** 能力卡片顶部的「开/关」行（图标 + 标签 + 复选框），外层边框由所在卡片提供 */
+function CapabilityToggle({
   icon,
   label,
-  hint,
   checked,
   onChange,
 }: {
   icon: React.ReactNode;
   label: string;
-  hint?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
 }) {
   return (
-    <label className="flex items-center justify-between gap-3 cursor-pointer rounded-lg border border-cream-200 px-3 py-2.5">
+    <label className="flex items-center justify-between gap-3 cursor-pointer">
       <span className="flex items-center gap-2 text-sm text-charcoal-700">
         {icon}
-        <span>
-          {label}
-          {hint ? <span className="ml-2 text-[11px] text-charcoal-400">{hint}</span> : null}
-        </span>
+        {label}
       </span>
       <input
         type="checkbox"
@@ -314,6 +388,61 @@ function ToggleRow({
   );
 }
 
+/**
+ * 摘要模型下拉：value='' → 「跟随全局默认（X）」（X 为该用途在 设置>LLM 里 isDefault 的模型）；
+ * 否则选某个具体模型（存 DB id）。已保存但选项里不存在（模型被删）时保留一个「已失效」项，
+ * 避免静默回落成「跟随全局」误导管理员。
+ */
+function SummaryModelSelect({
+  label,
+  value,
+  onChange,
+  options,
+  globalDefault,
+  disabled,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: SummaryModelOption[];
+  globalDefault?: SummaryModelOption;
+  disabled: boolean;
+}) {
+  const { t } = useI18n();
+  const hasCurrent = !value || options.some((o) => o.id === value);
+  return (
+    <div className="flex flex-wrap items-center gap-2 pl-6">
+      <span className="shrink-0 text-xs text-charcoal-500">{label}</span>
+      <select
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+        className="min-w-0 flex-1 px-2 py-1 text-sm border border-cream-200 rounded-md bg-white
+                   focus:outline-none focus:ring-2 focus:ring-rust-200 disabled:opacity-50"
+      >
+        <option value="">
+          {globalDefault
+            ? t('admin.followGlobalWith', { name: globalDefault.displayName })
+            : t('admin.followGlobal')}
+        </option>
+        {options.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.displayName} · {o.providerName}
+          </option>
+        ))}
+        {!hasCurrent && <option value={value}>{t('admin.staleModel')}</option>}
+      </select>
+    </div>
+  );
+}
+
+/** 小节标题（配额 / 可用模型 / 能力开关） */
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <label className="text-sm font-semibold text-charcoal-700 block">{children}</label>
+  );
+}
+
 function PermissionsForm({
   minutesLimit,
   setMinutesLimit,
@@ -322,6 +451,7 @@ function PermissionsForm({
   concurrent,
   setConcurrent,
   models,
+  catalog,
   selected,
   selectAll,
   onToggle,
@@ -334,6 +464,10 @@ function PermissionsForm({
   setAllowRealtime,
   allowFinal,
   setAllowFinal,
+  realtimeSummaryModelId,
+  setRealtimeSummaryModelId,
+  finalSummaryModelId,
+  setFinalSummaryModelId,
 }: {
   minutesLimit: string;
   setMinutesLimit: (v: string) => void;
@@ -342,6 +476,7 @@ function PermissionsForm({
   concurrent: string;
   setConcurrent: (v: string) => void;
   models: ModelInfo[];
+  catalog: ModelCatalog;
   selected: Set<string>;
   selectAll: boolean;
   onToggle: (modelId: string) => void;
@@ -354,36 +489,40 @@ function PermissionsForm({
   setAllowRealtime: (v: boolean) => void;
   allowFinal: boolean;
   setAllowFinal: (v: boolean) => void;
+  realtimeSummaryModelId: string;
+  setRealtimeSummaryModelId: (v: string) => void;
+  finalSummaryModelId: string;
+  setFinalSummaryModelId: (v: string) => void;
 }) {
   const { t } = useI18n();
+  const inputCls =
+    'w-full px-3 py-2 text-sm border border-cream-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300';
   return (
     <>
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="text-sm font-medium text-charcoal-700 mb-1 block">{t('admin.transcriptionMinMonth')}</label>
-          <input
-            type="number"
-            value={minutesLimit}
-            onChange={(e) => setMinutesLimit(e.target.value)}
-            className="w-full px-3 py-2 text-sm border border-cream-200 rounded-lg
-                       focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300"
-          />
+      {/* ── 配额 ── */}
+      <div className="space-y-3">
+        <SectionLabel>{t('admin.sectionQuota')}</SectionLabel>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className="text-xs text-charcoal-500 mb-1 block">{t('admin.transcriptionMinMonth')}</label>
+            <input type="number" value={minutesLimit} onChange={(e) => setMinutesLimit(e.target.value)} className={inputCls} />
+          </div>
+          <div>
+            <label className="text-xs text-charcoal-500 mb-1 block">{t('admin.storageHours')}</label>
+            <input type="number" step="0.5" min="0" value={storageLimit} onChange={(e) => setStorageLimit(e.target.value)} className={inputCls} />
+          </div>
         </div>
         <div>
-          <label className="text-sm font-medium text-charcoal-700 mb-1 block">{t('admin.storageHours')}</label>
-          <input
-            type="number"
-            step="0.5"
-            min="0"
-            value={storageLimit}
-            onChange={(e) => setStorageLimit(e.target.value)}
-            className="w-full px-3 py-2 text-sm border border-cream-200 rounded-lg
-                       focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300"
-          />
+          <label className="text-xs text-charcoal-500 mb-1 block">{t('admin.maxConcurrent')}</label>
+          <input type="number" min={1} value={concurrent} onChange={(e) => setConcurrent(e.target.value)} className={inputCls} />
+          <p className="text-[11px] text-charcoal-400 mt-1">{t('admin.maxConcurrentHint')}</p>
         </div>
       </div>
-      <div>
-        <label className="text-sm font-medium text-charcoal-700 mb-1.5 block">{t('admin.allowedLlmModels')}</label>
+
+      {/* ── 可用模型（仅作用于聊天选择器）── */}
+      <div className="space-y-1.5 pt-1">
+        <SectionLabel>{t('admin.allowedLlmModels')}</SectionLabel>
+        <p className="text-[11px] text-charcoal-400">{t('admin.allowedModelsHint')}</p>
         <ModelCheckboxList
           models={models}
           selected={selected}
@@ -392,37 +531,19 @@ function PermissionsForm({
           onToggleAll={onToggleAll}
         />
       </div>
-      <div>
-        <label className="text-sm font-medium text-charcoal-700 mb-1 block">{t('admin.maxConcurrent')}</label>
-        <input
-          type="number"
-          min={1}
-          value={concurrent}
-          onChange={(e) => setConcurrent(e.target.value)}
-          className="w-full px-3 py-2 text-sm border border-cream-200 rounded-lg
-                     focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300"
-        />
-        <p className="text-[11px] text-charcoal-400 mt-1">{t('admin.maxConcurrentHint')}</p>
-      </div>
 
-      {/* ── 能力开关 ── */}
+      {/* ── 能力开关 + 摘要模型（每个能力与它的模型选择就近放一起）── */}
       <div className="space-y-2 pt-1">
-        <label className="text-sm font-medium text-charcoal-700 block">{t('admin.capabilities')}</label>
+        <SectionLabel>{t('admin.capabilities')}</SectionLabel>
 
         {/* 思考：开关 + 最大深度 */}
         <div className="rounded-lg border border-cream-200 px-3 py-2.5 space-y-2.5">
-          <label className="flex items-center justify-between gap-3 cursor-pointer">
-            <span className="flex items-center gap-2 text-sm text-charcoal-700">
-              <Brain className="w-3.5 h-3.5 text-charcoal-400" />
-              {t('admin.allowThinking')}
-            </span>
-            <input
-              type="checkbox"
-              checked={thinkingEnabled}
-              onChange={(e) => setThinkingEnabled(e.target.checked)}
-              className="rounded border-cream-300 text-rust-500 focus:ring-rust-200"
-            />
-          </label>
+          <CapabilityToggle
+            icon={<Brain className="w-3.5 h-3.5 text-charcoal-400" />}
+            label={t('admin.allowThinking')}
+            checked={thinkingEnabled}
+            onChange={setThinkingEnabled}
+          />
           <div className="flex items-center gap-2 pl-6">
             <span className="text-xs text-charcoal-500">{t('admin.maxThinkingDepth')}</span>
             <select
@@ -441,18 +562,43 @@ function PermissionsForm({
           </div>
         </div>
 
-        <ToggleRow
-          icon={<Sparkles className="w-3.5 h-3.5 text-charcoal-400" />}
-          label={t('admin.allowRealtimeSummary')}
-          checked={allowRealtime}
-          onChange={setAllowRealtime}
-        />
-        <ToggleRow
-          icon={<FileText className="w-3.5 h-3.5 text-charcoal-400" />}
-          label={t('admin.allowFinalSummary')}
-          checked={allowFinal}
-          onChange={setAllowFinal}
-        />
+        {/* 实时摘要：开关 + 摘要模型 */}
+        <div className="rounded-lg border border-cream-200 px-3 py-2.5 space-y-2.5">
+          <CapabilityToggle
+            icon={<Sparkles className="w-3.5 h-3.5 text-charcoal-400" />}
+            label={t('admin.allowRealtimeSummary')}
+            checked={allowRealtime}
+            onChange={setAllowRealtime}
+          />
+          <SummaryModelSelect
+            label={t('admin.realtimeSummaryModel')}
+            value={realtimeSummaryModelId}
+            onChange={setRealtimeSummaryModelId}
+            options={catalog.realtimeSummary}
+            globalDefault={catalog.realtimeDefault}
+            disabled={!allowRealtime}
+          />
+        </div>
+
+        {/* 总摘要：开关 + 摘要模型 */}
+        <div className="rounded-lg border border-cream-200 px-3 py-2.5 space-y-2.5">
+          <CapabilityToggle
+            icon={<FileText className="w-3.5 h-3.5 text-charcoal-400" />}
+            label={t('admin.allowFinalSummary')}
+            checked={allowFinal}
+            onChange={setAllowFinal}
+          />
+          <SummaryModelSelect
+            label={t('admin.finalSummaryModel')}
+            value={finalSummaryModelId}
+            onChange={setFinalSummaryModelId}
+            options={catalog.finalSummary}
+            globalDefault={catalog.finalDefault}
+            disabled={!allowFinal}
+          />
+        </div>
+
+        <p className="text-[11px] text-charcoal-400">{t('admin.summaryModelHint')}</p>
       </div>
     </>
   );
@@ -473,6 +619,14 @@ function usePermissionsForm(
   );
   const [allowRealtime, setAllowRealtime] = useState(initPermissions.allowRealtimeSummary);
   const [allowFinal, setAllowFinal] = useState(initPermissions.allowFinalSummary);
+
+  // 摘要模型（DB id；'' = 跟随全局默认）
+  const [realtimeSummaryModelId, setRealtimeSummaryModelId] = useState(
+    initPermissions.realtimeSummaryModelId ?? '',
+  );
+  const [finalSummaryModelId, setFinalSummaryModelId] = useState(
+    initPermissions.finalSummaryModelId ?? '',
+  );
 
   const isAllInit = initPermissions.allowedModels === '*';
   const [selectAll, setSelectAll] = useState(isAllInit);
@@ -530,6 +684,9 @@ function usePermissionsForm(
       maxThinkingDepth: thinkingEnabled ? maxDepth : 'off',
       allowRealtimeSummary: allowRealtime,
       allowFinalSummary: allowFinal,
+      // 能力关掉时把对应摘要模型一并清空（跟随全局）——关了还留个具体模型 id 是无意义的死配置
+      realtimeSummaryModelId: allowRealtime ? realtimeSummaryModelId : '',
+      finalSummaryModelId: allowFinal ? finalSummaryModelId : '',
     };
   };
 
@@ -541,6 +698,8 @@ function usePermissionsForm(
     maxDepth, setMaxDepth,
     allowRealtime, setAllowRealtime,
     allowFinal, setAllowFinal,
+    realtimeSummaryModelId, setRealtimeSummaryModelId,
+    finalSummaryModelId, setFinalSummaryModelId,
     selected, selectAll,
     handleToggle, handleToggleAll,
     buildPermissions,
@@ -552,17 +711,18 @@ function GroupModal({
   onClose,
   onSave,
   saving,
-  models,
+  catalog,
   leaving,
 }: {
   group: UserGroup;
   onClose: () => void;
   onSave: (data: { permissions: GroupPermissions; name?: string; description?: string; color?: string }) => void;
   saving: boolean;
-  models: ModelInfo[];
+  catalog: ModelCatalog;
   leaving: boolean;
 }) {
   const { t } = useI18n();
+  const models = catalog.chat;
   const [groupName, setGroupName] = useState(group.name);
   const [groupDesc, setGroupDesc] = useState(group.description);
   const [groupColor, setGroupColor] = useState(group.color);
@@ -576,6 +736,7 @@ function GroupModal({
   };
 
   return (
+    <ModalPortal>
     <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}>
       <div className={`bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">
@@ -631,6 +792,7 @@ function GroupModal({
           <PermissionsForm
             {...pf}
             models={models}
+            catalog={catalog}
             onToggle={pf.handleToggle}
             onToggleAll={pf.handleToggleAll}
           />
@@ -654,6 +816,7 @@ function GroupModal({
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }
 
@@ -661,20 +824,21 @@ function CreateGroupModal({
   onClose,
   onCreate,
   saving,
-  models,
+  catalog,
   leaving,
 }: {
   onClose: () => void;
   onCreate: (data: { name: string; description: string; color: string; permissions: GroupPermissions }) => void;
   saving: boolean;
-  models: ModelInfo[];
+  catalog: ModelCatalog;
   leaving: boolean;
 }) {
   const { t } = useI18n();
+  const models = catalog.chat;
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [color, setColor] = useState(COLOR_OPTIONS[0].value);
-  // 新建自定义组默认「全部允许」（思考 high、两摘要开），管理员按需收紧
+  // 新建自定义组默认「全部允许」（思考 high、两摘要开、摘要模型跟随全局），管理员按需收紧
   const defaultPermissions: GroupPermissions = {
     transcriptionMinutesLimit: 60,
     storageHoursLimit: 10,
@@ -683,6 +847,8 @@ function CreateGroupModal({
     maxThinkingDepth: 'high',
     allowRealtimeSummary: true,
     allowFinalSummary: true,
+    realtimeSummaryModelId: '',
+    finalSummaryModelId: '',
   };
   const pf = usePermissionsForm(defaultPermissions, models);
 
@@ -697,6 +863,7 @@ function CreateGroupModal({
   };
 
   return (
+    <ModalPortal>
     <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm ${leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}>
       <div className={`bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto ${leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-cream-200 sticky top-0 bg-white z-10">
@@ -748,6 +915,7 @@ function CreateGroupModal({
           <PermissionsForm
             {...pf}
             models={models}
+            catalog={catalog}
             onToggle={pf.handleToggle}
             onToggleAll={pf.handleToggleAll}
           />
@@ -771,6 +939,7 @@ function CreateGroupModal({
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }
 
@@ -784,39 +953,64 @@ export default function UserGroupsPanel() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [editingGroup, setEditingGroup] = useState<UserGroup | undefined>(undefined);
-  const [models, setModels] = useState<ModelInfo[]>([]);
+  const [catalog, setCatalog] = useState<ModelCatalog>(EMPTY_CATALOG);
 
-  // 从后端加载可选的 LLM 模型（CHAT 用途，按底层 modelId 去重——同一模型配在多个供应商/用途下
-  // 只出现一次，修复历史上「一个模型出现很多次」的问题）。allowedModels 存的就是这些 modelId。
-  const fetchModels = useCallback(async () => {
+  // 从后端一次性加载模型目录并按用途拆分：
+  //  - chat：CHAT 用途、按 modelId 去重（allowedModels 存的就是这些 modelId；仅作用于聊天选择器）
+  //  - realtimeSummary / finalSummary：对应用途的具体模型（摘要模型下拉，存 DB id）
+  //  - realtimeDefault / finalDefault：该用途在「设置 > LLM」里 isDefault 的全局默认（下拉「跟随全局默认（X）」展示）
+  const fetchCatalog = useCallback(async () => {
     try {
       const res = await fetch('/api/admin/llm-providers', {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
-      if (res.ok) {
-        const data = await res.json();
-        const seen = new Set<string>();
-        const list: ModelInfo[] = [];
-        for (const p of (data.providers ?? []) as {
-          name: string;
-          models?: { modelId?: string; displayName?: string; purpose?: string }[];
-        }[]) {
-          for (const m of p.models ?? []) {
-            const modelId = (m.modelId ?? '').trim();
-            // 只列对话可选的 CHAT 模型（allowedModels 仅作用于聊天选择器）
-            if (!modelId || m.purpose !== 'CHAT' || seen.has(modelId)) continue;
-            seen.add(modelId);
-            list.push({
-              modelId,
-              displayName: (m.displayName || modelId).trim(),
-              providerName: p.name,
-            });
+      if (!res.ok) return;
+      const data = await res.json();
+
+      const seenChat = new Set<string>();
+      const chat: ModelInfo[] = [];
+      const realtimeSummary: SummaryModelOption[] = [];
+      const finalSummary: SummaryModelOption[] = [];
+      let realtimeDefault: SummaryModelOption | undefined;
+      let finalDefault: SummaryModelOption | undefined;
+
+      for (const p of (data.providers ?? []) as {
+        name: string;
+        models?: {
+          id?: string;
+          modelId?: string;
+          displayName?: string;
+          purpose?: string;
+          isDefault?: boolean;
+        }[];
+      }[]) {
+        for (const m of p.models ?? []) {
+          const modelId = (m.modelId ?? '').trim();
+          const id = (m.id ?? '').trim();
+          const displayName = (m.displayName || modelId).trim();
+          if (m.purpose === 'CHAT') {
+            // allowedModels 按 modelId 去重
+            if (!modelId || seenChat.has(modelId)) continue;
+            seenChat.add(modelId);
+            chat.push({ modelId, displayName, providerName: p.name });
+          } else if (m.purpose === 'REALTIME_SUMMARY' || m.purpose === 'FINAL_SUMMARY') {
+            // 摘要模型以 DB id 为准（同一 modelId 在两个供应商下是两个不同的可选项）
+            if (!id) continue;
+            const opt: SummaryModelOption = { id, displayName, providerName: p.name, modelId };
+            if (m.purpose === 'REALTIME_SUMMARY') {
+              realtimeSummary.push(opt);
+              if (m.isDefault) realtimeDefault = opt;
+            } else {
+              finalSummary.push(opt);
+              if (m.isDefault) finalDefault = opt;
+            }
           }
         }
-        setModels(list);
       }
+
+      setCatalog({ chat, realtimeSummary, finalSummary, realtimeDefault, finalDefault });
     } catch (err) {
-      console.error('加载模型失败:', err);
+      console.error('加载模型目录失败:', err);
     }
   }, [token]);
 
@@ -847,8 +1041,8 @@ export default function UserGroupsPanel() {
 
   useEffect(() => {
     fetchGroups();
-    fetchModels();
-  }, [fetchGroups, fetchModels]);
+    fetchCatalog();
+  }, [fetchGroups, fetchCatalog]);
 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<UserGroup | null>(null);
@@ -1028,6 +1222,7 @@ export default function UserGroupsPanel() {
             <GroupCard
               key={group.id}
               group={group}
+              catalog={catalog}
               expanded={expandedId === group.id}
               onToggle={() => setExpandedId(expandedId === group.id ? null : group.id)}
               onEdit={() => handleEdit(group)}
@@ -1043,7 +1238,7 @@ export default function UserGroupsPanel() {
           onClose={() => setShowModal(false)}
           onSave={handleSave}
           saving={saving}
-          models={models}
+          catalog={catalog}
           leaving={editModal.leaving}
         />
       )}
@@ -1053,12 +1248,13 @@ export default function UserGroupsPanel() {
           onClose={() => setShowCreateModal(false)}
           onCreate={handleCreate}
           saving={saving}
-          models={models}
+          catalog={catalog}
           leaving={createModal.leaving}
         />
       )}
 
       {deleteModal.mounted && deleteGroupForRender && (
+        <ModalPortal>
         <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm ${deleteModal.leaving ? 'animate-backdrop-leave' : 'animate-backdrop-enter'}`}>
           <div className={`bg-white rounded-2xl border border-cream-200 shadow-xl w-full max-w-sm mx-4 p-6 ${deleteModal.leaving ? 'animate-modal-leave' : 'animate-modal-enter'}`}>
             <div className="mb-4">
@@ -1089,6 +1285,7 @@ export default function UserGroupsPanel() {
             </div>
           </div>
         </div>
+        </ModalPortal>
       )}
     </div>
   );

@@ -68,6 +68,14 @@ export async function POST(req: Request) {
 
     const selection = await resolveAuthorizedLlmSelection(user.id, providerOverride);
 
+    // 用户组门禁：未开通实时摘要则拒绝（组配置为唯一真源，随 selection 一并解析）
+    if (!selection.featureFlags.allowRealtimeSummary) {
+      return NextResponse.json(
+        { error: '当前用户组未开通实时摘要功能' },
+        { status: 403 }
+      );
+    }
+
     const result = await callLLM(
       system,
       userMsg,

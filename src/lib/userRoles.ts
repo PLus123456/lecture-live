@@ -16,11 +16,74 @@ export function resolvePublicRegistrationRole(value: unknown): UserRole {
   return value === 'PRO' ? 'PRO' : 'FREE';
 }
 
+/**
+ * 用户组"最大思考深度"上限。
+ *  'off'    - 该组禁止使用思考（DEPTH 模型的思考档位全部隐藏；服务端强制 thinkingPreference='off'）
+ *  'low'/'medium'/'high' - 允许思考，但深度不超过此档
+ * 说明：FORCED 模式的模型（模型自带思考、无法关闭）不受深度上限约束，只能通过 allowedModels
+ *       不授权该模型来阻止；深度上限仅作用于 DEPTH 模型的可选档位。
+ */
+export type ThinkingDepthCap = 'off' | 'low' | 'medium' | 'high';
+
+export const THINKING_DEPTH_CAPS: readonly ThinkingDepthCap[] = [
+  'off',
+  'low',
+  'medium',
+  'high',
+];
+
+/** 各思考深度档的排序权重，用于「不超过上限」的比较 */
+const THINKING_DEPTH_RANK: Record<ThinkingDepthCap, number> = {
+  off: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+};
+
 export interface GroupPermissions {
   transcriptionMinutesLimit: number;
   storageHoursLimit: number;
   allowedModels: string;
   maxConcurrentSessions?: number;
+  // ── 能力开关（与用户组绑定）──
+  /** 最大思考深度上限，'off' 表示该组禁止思考 */
+  maxThinkingDepth: ThinkingDepthCap;
+  /** 是否允许使用实时摘要 */
+  allowRealtimeSummary: boolean;
+  /** 是否允许使用总摘要（结束时的结构化报告） */
+  allowFinalSummary: boolean;
+}
+
+/** 某用户在运行时生效的能力开关（由所属组解析而来，组配置为唯一真源） */
+export interface EffectiveFeatureFlags {
+  maxThinkingDepth: ThinkingDepthCap;
+  allowRealtimeSummary: boolean;
+  allowFinalSummary: boolean;
+}
+
+/** 把任意值强制成合法的 ThinkingDepthCap，非法时回落 fallback */
+export function coerceThinkingDepthCap(
+  value: unknown,
+  fallback: ThinkingDepthCap
+): ThinkingDepthCap {
+  return typeof value === 'string' &&
+    (THINKING_DEPTH_CAPS as readonly string[]).includes(value)
+    ? (value as ThinkingDepthCap)
+    : fallback;
+}
+
+/** 把请求的思考深度按组上限收紧（返回不超过 cap 的档位）。cap='off' 恒返回 'off' */
+export function clampDepthToCap(
+  requested: ThinkingDepthCap,
+  cap: ThinkingDepthCap
+): ThinkingDepthCap {
+  return THINKING_DEPTH_RANK[requested] <= THINKING_DEPTH_RANK[cap]
+    ? requested
+    : cap;
+}
+
+function coerceBool(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
 }
 
 /** 各角色 chat 字节配额的静态兜底（MB）——与 siteSettings 的 chat_files_quota_*_mb 默认一致。
@@ -40,18 +103,29 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         transcriptionMinutesLimit: 999999,
         storageHoursLimit: 999999,
         allowedModels: '*',
+        maxThinkingDepth: 'high',
+        allowRealtimeSummary: true,
+        allowFinalSummary: true,
       };
     case 'PRO':
       return {
         transcriptionMinutesLimit: 600,
         storageHoursLimit: 100,
         allowedModels: 'local,gpt,deepseek',
+        maxThinkingDepth: 'high',
+        allowRealtimeSummary: true,
+        allowFinalSummary: true,
       };
     default:
       return {
         transcriptionMinutesLimit: 60,
         storageHoursLimit: 10,
         allowedModels: 'local',
+        // 保留 FREE 历史行为：思考深度封顶 medium（原 access.ts/models 里的硬编码 FREE 限制）。
+        // 实时/总摘要默认允许，符合「未配置组默认全部允许、上线不改变现状」。
+        maxThinkingDepth: 'medium',
+        allowRealtimeSummary: true,
+        allowFinalSummary: true,
       };
   }
 }
@@ -105,7 +179,121 @@ export async function resolveRoleQuotas(role: UserRole): Promise<GroupPermission
       ? cfg.allowedModels.trim()
       : defaults.allowedModels;
 
-  return { transcriptionMinutesLimit, storageHoursLimit, allowedModels };
+  return {
+    transcriptionMinutesLimit,
+    storageHoursLimit,
+    allowedModels,
+    maxThinkingDepth: coerceThinkingDepthCap(
+      cfg.maxThinkingDepth,
+      defaults.maxThinkingDepth
+    ),
+    allowRealtimeSummary: coerceBool(
+      cfg.allowRealtimeSummary,
+      defaults.allowRealtimeSummary
+    ),
+    allowFinalSummary: coerceBool(
+      cfg.allowFinalSummary,
+      defaults.allowFinalSummary
+    ),
+  };
+}
+
+/**
+ * 读取某自定义用户组的权限配置（从 SiteSetting.custom_groups 数组按 id 查找）。
+ * 未找到（组不存在/已删除）返回 null，由调用方回落底层角色。
+ *
+ * 能力开关缺失时默认「全部允许」（maxThinkingDepth='high'、两摘要=true），符合
+ * 「未配置的组默认全部允许，上线不改变现状」。配额字段沿用与 groups 路由一致的兜底。
+ */
+export async function resolveCustomGroupPermissions(
+  groupId: string
+): Promise<GroupPermissions | null> {
+  const row = await prisma.siteSetting.findUnique({
+    where: { key: 'custom_groups' },
+  });
+  if (!row) return null;
+  let arr: unknown;
+  try {
+    arr = JSON.parse(row.value);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(arr)) return null;
+  const entry = arr.find(
+    (g): g is { id: string; permissions?: unknown } =>
+      Boolean(g) &&
+      typeof g === 'object' &&
+      (g as { id?: unknown }).id === groupId
+  );
+  if (!entry || !entry.permissions || typeof entry.permissions !== 'object') {
+    return null;
+  }
+  const cfg = entry.permissions as Record<string, unknown>;
+
+  const rawMinutes = Number(cfg.transcriptionMinutesLimit);
+  const rawStorageHours = Number(cfg.storageHoursLimit);
+  const rawConcurrent = Number(cfg.maxConcurrentSessions);
+  return {
+    transcriptionMinutesLimit: Math.max(
+      0,
+      Math.floor(Number.isFinite(rawMinutes) ? rawMinutes : 60)
+    ),
+    storageHoursLimit: Math.max(
+      0,
+      Number.isFinite(rawStorageHours) ? rawStorageHours : 10
+    ),
+    allowedModels:
+      typeof cfg.allowedModels === 'string' && cfg.allowedModels.trim()
+        ? cfg.allowedModels.trim()
+        : 'local',
+    maxConcurrentSessions: Math.max(
+      1,
+      Math.floor(Number.isFinite(rawConcurrent) ? rawConcurrent : 1)
+    ),
+    maxThinkingDepth: coerceThinkingDepthCap(cfg.maxThinkingDepth, 'high'),
+    allowRealtimeSummary: coerceBool(cfg.allowRealtimeSummary, true),
+    allowFinalSummary: coerceBool(cfg.allowFinalSummary, true),
+  };
+}
+
+/**
+ * 解析某用户运行时生效的能力开关（思考深度上限 / 实时摘要 / 总摘要）。
+ *
+ * 解析顺序：ADMIN 恒全开 → 有自定义组则读 custom_groups → 否则读系统角色 group_config_<role>
+ * （其默认见 getDefaultQuotasForRole）。组配置是唯一真源，不落 User 行，避免"改组后用户行
+ * 仍是旧值"的漂移。SiteSetting 有 60s 内存缓存，此处开销很低。
+ */
+export async function resolveUserFeatureFlags(user: {
+  role: UserRole;
+  customGroupId?: string | null;
+}): Promise<EffectiveFeatureFlags> {
+  // ADMIN 视为无限（与配额哨兵、allowedModels='*' 同口径）
+  if (user.role === 'ADMIN') {
+    return {
+      maxThinkingDepth: 'high',
+      allowRealtimeSummary: true,
+      allowFinalSummary: true,
+    };
+  }
+
+  if (user.customGroupId) {
+    const custom = await resolveCustomGroupPermissions(user.customGroupId);
+    if (custom) {
+      return {
+        maxThinkingDepth: custom.maxThinkingDepth,
+        allowRealtimeSummary: custom.allowRealtimeSummary,
+        allowFinalSummary: custom.allowFinalSummary,
+      };
+    }
+    // 自定义组不存在 → 回落底层角色配置
+  }
+
+  const roleQuotas = await resolveRoleQuotas(user.role);
+  return {
+    maxThinkingDepth: roleQuotas.maxThinkingDepth,
+    allowRealtimeSummary: roleQuotas.allowRealtimeSummary,
+    allowFinalSummary: roleQuotas.allowFinalSummary,
+  };
 }
 
 /**

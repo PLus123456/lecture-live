@@ -19,6 +19,7 @@ import {
   resolveAuthorizedLlmSelection,
   resolveEffectiveThinkingDepth,
 } from '@/lib/llm/access';
+import { clampDepthToCap, type ThinkingDepthCap } from '@/lib/userRoles';
 import {
   LLM_LIMITS,
   LLMValidationError,
@@ -83,21 +84,25 @@ function dropTrailingOrphanUser(
 }
 
 /**
- * 把解析出的 thinkingPreference 归一为「实际发给 gateway 的偏好」，并对 FREE 用户施加
- * high→medium 的角色 clamp。
+ * 把解析出的 thinkingPreference 归一为「实际发给 gateway 的偏好」，并按所属组的思考深度
+ * 上限 cap 收紧（cap 由用户组绑定，替代原来对 FREE 硬编码的 high→medium）。
  *
- *  - 显式 low/medium/high：用 access.ts 已 clamp 过的 finalDepth（FREE high 已降 medium）。
- *  - forced/auto：此前直接透传，会让 gateway 取 provider.thinkingDepth；当模型默认深度为
- *    high 时 FREE 用户绕过 clamp 按 high 档消耗思考 token（见 v3 finding U52）。这里对
- *    DEPTH 模型上默认深度=high 的情况显式降到 medium。
- *  - off：透传（不启用思考）。
+ *  - cap='off'：组禁止思考 → 强制 off（DEPTH/AUTO 模型不带思考参数；FORCED 模型模型自带
+ *    思考无法关闭，需靠 allowedModels 不授权该模型来阻止）。
+ *  - 显式 low/medium/high：用 access.ts 已按 cap clamp 过的 finalDepth。
+ *  - forced/auto：透传让 gateway 取 provider.thinkingDepth；但当模型默认深度超过组上限时
+ *    （如默认 high、组上限 medium）显式收紧到 cap，避免绕过上限按更高档消耗思考 token
+ *    （原 v3 finding U52 的一般化）。
  */
 function resolveEffectivePreference(
   parsedPreference: ThinkingPreference,
   finalDepth: ThinkingDepth,
-  role: 'ADMIN' | 'PRO' | 'FREE',
+  cap: ThinkingDepthCap,
   providerConfig?: { thinkingMode?: string; thinkingDepth?: ThinkingDepth }
 ): ThinkingPreference {
+  if (cap === 'off') {
+    return 'off';
+  }
   if (
     parsedPreference === 'low' ||
     parsedPreference === 'medium' ||
@@ -105,15 +110,19 @@ function resolveEffectivePreference(
   ) {
     return finalDepth;
   }
-  // forced / auto：仅当 FREE + DEPTH 模型 + 模型默认深度=high 时才 clamp 到 medium，
-  // 其余情况保持原语义透传（让 gateway 用 provider.thinkingDepth）。
+  // forced / auto：模型默认深度超过组上限时收紧到 cap，否则保持原语义透传
   if (
     (parsedPreference === 'forced' || parsedPreference === 'auto') &&
-    role === 'FREE' &&
     providerConfig?.thinkingMode === 'DEPTH' &&
-    providerConfig?.thinkingDepth === 'high'
+    providerConfig?.thinkingDepth
   ) {
-    return 'medium';
+    const capped = clampDepthToCap(
+      providerConfig.thinkingDepth as ThinkingDepthCap,
+      cap
+    );
+    if (capped !== providerConfig.thinkingDepth) {
+      return capped;
+    }
   }
   return parsedPreference;
 }
@@ -811,8 +820,9 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
     userId,
     parsed.requestedModel || undefined
   );
+  const thinkingCap = selection.featureFlags.maxThinkingDepth;
   const finalDepth = resolveEffectiveThinkingDepth(
-    selection.user.role,
+    thinkingCap,
     parsed.depth,
     selection.providerConfig
   );
@@ -820,7 +830,7 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
   const effectivePreference = resolveEffectivePreference(
     parsed.thinkingPreference,
     finalDepth,
-    selection.user.role,
+    thinkingCap,
     selection.providerConfig
   );
 
@@ -985,15 +995,16 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
     userId,
     parsed.requestedModel || undefined
   );
+  const thinkingCap = selection.featureFlags.maxThinkingDepth;
   const finalDepth = resolveEffectiveThinkingDepth(
-    selection.user.role,
+    thinkingCap,
     parsed.depth,
     selection.providerConfig
   );
   const effectivePreference = resolveEffectivePreference(
     parsed.thinkingPreference,
     finalDepth,
-    selection.user.role,
+    thinkingCap,
     selection.providerConfig
   );
 

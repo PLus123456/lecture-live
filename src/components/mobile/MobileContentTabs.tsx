@@ -9,12 +9,15 @@ interface MobileContentTabsProps {
   activeTab: MobileTab;
   onChange: (tab: MobileTab) => void;
   hasTranslation: boolean;
+  /** 用户组是否开通实时摘要（false 时隐藏 Summary 标签，默认显示） */
+  allowSummary?: boolean;
 }
 
 export default function MobileContentTabs({
   activeTab,
   onChange,
   hasTranslation,
+  allowSummary = true,
 }: MobileContentTabsProps) {
   const { t } = useI18n();
   const tabs: Array<{ key: MobileTab; label: string; icon: React.ReactNode }> = [
@@ -28,7 +31,10 @@ export default function MobileContentTabs({
   return (
     <div className="border-t border-cream-200 bg-white/95 backdrop-blur-md">
       <div className="mobile-scroll flex items-stretch overflow-x-auto px-2">
-        {tabs.filter((tab) => hasTranslation || tab.key !== 'translation').map((tab) => {
+        {tabs
+          .filter((tab) => hasTranslation || tab.key !== 'translation')
+          .filter((tab) => allowSummary || tab.key !== 'summary')
+          .map((tab) => {
           const active = activeTab === tab.key;
           return (
             <button

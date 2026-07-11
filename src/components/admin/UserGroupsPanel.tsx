@@ -12,23 +12,35 @@ import {
   RefreshCw,
   Plus,
   Trash2,
+  Brain,
+  Sparkles,
+  FileText,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
 import { useExitAnimation } from '@/hooks/useExitAnimation';
 
+/** 思考深度上限档位（'off' 表示禁止思考） */
+type ThinkingDepthCap = 'off' | 'low' | 'medium' | 'high';
+const DEPTH_CHOICES: Exclude<ThinkingDepthCap, 'off'>[] = ['low', 'medium', 'high'];
+
+interface GroupPermissions {
+  transcriptionMinutesLimit: number;
+  storageHoursLimit: number;
+  allowedModels: string;
+  maxConcurrentSessions: number;
+  maxThinkingDepth: ThinkingDepthCap;
+  allowRealtimeSummary: boolean;
+  allowFinalSummary: boolean;
+}
+
 interface UserGroup {
   id: string;
   name: string;
   description: string;
   color: string;
-  permissions: {
-    transcriptionMinutesLimit: number;
-    storageHoursLimit: number;
-    allowedModels: string;
-    maxConcurrentSessions: number;
-  };
+  permissions: GroupPermissions;
   userCount: number;
   isSystem: boolean;
 }
@@ -144,6 +156,33 @@ function GroupCard({
                   : group.permissions.maxConcurrentSessions}
               </span>
             </div>
+            <div className="flex items-center gap-2 text-sm text-charcoal-600">
+              <Brain className="w-3.5 h-3.5 text-charcoal-400" />
+              <span>{t('admin.thinking')}</span>
+              <span className="font-medium">
+                {group.permissions.maxThinkingDepth === 'off'
+                  ? t('admin.disabled')
+                  : t(`admin.depth.${group.permissions.maxThinkingDepth}`)}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-sm text-charcoal-600">
+              <Sparkles className="w-3.5 h-3.5 text-charcoal-400" />
+              <span>{t('admin.realtimeSummary')}</span>
+              <span className="font-medium">
+                {group.permissions.allowRealtimeSummary
+                  ? t('admin.enabled')
+                  : t('admin.disabled')}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-sm text-charcoal-600">
+              <FileText className="w-3.5 h-3.5 text-charcoal-400" />
+              <span>{t('admin.finalSummary')}</span>
+              <span className="font-medium">
+                {group.permissions.allowFinalSummary
+                  ? t('admin.enabled')
+                  : t('admin.disabled')}
+              </span>
+            </div>
           </div>
 
           <div className="flex items-center gap-2 mt-4 pt-3 border-t border-cream-100">
@@ -173,37 +212,38 @@ function GroupCard({
   );
 }
 
-interface ProviderInfo {
-  id: string;
-  name: string;
-  modelCount: number;
+/** 去重后的可选模型（token = 底层 modelId；与后端 allowedModels 的匹配口径一致） */
+interface ModelInfo {
+  modelId: string;      // 作为 allowedModels 存储的 token
+  displayName: string;  // 展示名
+  providerName: string; // 所属供应商（消歧展示）
 }
 
-function ProviderCheckboxList({
-  providers,
+function ModelCheckboxList({
+  models,
   selected,
   selectAll,
   onToggle,
   onToggleAll,
 }: {
-  providers: ProviderInfo[];
+  models: ModelInfo[];
   selected: Set<string>;
   selectAll: boolean;
-  onToggle: (name: string) => void;
+  onToggle: (modelId: string) => void;
   onToggleAll: () => void;
 }) {
   const { t } = useI18n();
 
-  if (providers.length === 0) {
+  if (models.length === 0) {
     return (
       <div className="text-xs text-charcoal-400 py-2">
-        {t('admin.noProvidersHint')}
+        {t('admin.noModelsHint')}
       </div>
     );
   }
 
   return (
-    <div className="space-y-1.5 rounded-lg border border-cream-200 bg-cream-50/50 p-3 max-h-48 overflow-y-auto">
+    <div className="space-y-1.5 rounded-lg border border-cream-200 bg-cream-50/50 p-3 max-h-56 overflow-y-auto">
       <label className="flex items-center gap-2 cursor-pointer pb-1.5 border-b border-cream-200">
         <input
           type="checkbox"
@@ -211,19 +251,21 @@ function ProviderCheckboxList({
           onChange={onToggleAll}
           className="rounded border-cream-300 text-rust-500 focus:ring-rust-200"
         />
-        <span className="text-sm font-medium text-charcoal-700">{t('admin.selectAllProviders')}</span>
+        <span className="text-sm font-medium text-charcoal-700">{t('admin.selectAllModels')}</span>
       </label>
-      {providers.map((p) => (
-        <label key={p.id} className="flex items-center gap-2 cursor-pointer">
+      {models.map((m) => (
+        <label key={m.modelId} className="flex items-center gap-2 cursor-pointer">
           <input
             type="checkbox"
-            checked={selectAll || selected.has(p.name)}
+            checked={selectAll || selected.has(m.modelId)}
             disabled={selectAll}
-            onChange={() => onToggle(p.name)}
+            onChange={() => onToggle(m.modelId)}
             className="rounded border-cream-300 text-rust-500 focus:ring-rust-200 disabled:opacity-50"
           />
-          <span className="text-sm text-charcoal-600">{p.name}</span>
-          <span className="text-[10px] text-charcoal-400">({p.modelCount} models)</span>
+          <span className="text-sm text-charcoal-600">{m.displayName}</span>
+          <span className="text-[10px] text-charcoal-400">
+            {m.providerName} · {m.modelId}
+          </span>
         </label>
       ))}
     </div>
@@ -239,6 +281,39 @@ const COLOR_OPTIONS = [
   { value: 'bg-teal-50 text-teal-600', dot: 'bg-teal-500' },
 ];
 
+/** 一个「开/关」行内开关（用于实时摘要 / 总摘要 / 允许思考） */
+function ToggleRow({
+  icon,
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  hint?: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex items-center justify-between gap-3 cursor-pointer rounded-lg border border-cream-200 px-3 py-2.5">
+      <span className="flex items-center gap-2 text-sm text-charcoal-700">
+        {icon}
+        <span>
+          {label}
+          {hint ? <span className="ml-2 text-[11px] text-charcoal-400">{hint}</span> : null}
+        </span>
+      </span>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="rounded border-cream-300 text-rust-500 focus:ring-rust-200"
+      />
+    </label>
+  );
+}
+
 function PermissionsForm({
   minutesLimit,
   setMinutesLimit,
@@ -246,11 +321,19 @@ function PermissionsForm({
   setStorageLimit,
   concurrent,
   setConcurrent,
-  providers,
+  models,
   selected,
   selectAll,
   onToggle,
   onToggleAll,
+  thinkingEnabled,
+  setThinkingEnabled,
+  maxDepth,
+  setMaxDepth,
+  allowRealtime,
+  setAllowRealtime,
+  allowFinal,
+  setAllowFinal,
 }: {
   minutesLimit: string;
   setMinutesLimit: (v: string) => void;
@@ -258,11 +341,19 @@ function PermissionsForm({
   setStorageLimit: (v: string) => void;
   concurrent: string;
   setConcurrent: (v: string) => void;
-  providers: ProviderInfo[];
+  models: ModelInfo[];
   selected: Set<string>;
   selectAll: boolean;
-  onToggle: (name: string) => void;
+  onToggle: (modelId: string) => void;
   onToggleAll: () => void;
+  thinkingEnabled: boolean;
+  setThinkingEnabled: (v: boolean) => void;
+  maxDepth: Exclude<ThinkingDepthCap, 'off'>;
+  setMaxDepth: (v: Exclude<ThinkingDepthCap, 'off'>) => void;
+  allowRealtime: boolean;
+  setAllowRealtime: (v: boolean) => void;
+  allowFinal: boolean;
+  setAllowFinal: (v: boolean) => void;
 }) {
   const { t } = useI18n();
   return (
@@ -293,8 +384,8 @@ function PermissionsForm({
       </div>
       <div>
         <label className="text-sm font-medium text-charcoal-700 mb-1.5 block">{t('admin.allowedLlmModels')}</label>
-        <ProviderCheckboxList
-          providers={providers}
+        <ModelCheckboxList
+          models={models}
           selected={selected}
           selectAll={selectAll}
           onToggle={onToggle}
@@ -311,37 +402,104 @@ function PermissionsForm({
                      focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300"
         />
       </div>
+
+      {/* ── 能力开关 ── */}
+      <div className="space-y-2 pt-1">
+        <label className="text-sm font-medium text-charcoal-700 block">{t('admin.capabilities')}</label>
+
+        {/* 思考：开关 + 最大深度 */}
+        <div className="rounded-lg border border-cream-200 px-3 py-2.5 space-y-2.5">
+          <label className="flex items-center justify-between gap-3 cursor-pointer">
+            <span className="flex items-center gap-2 text-sm text-charcoal-700">
+              <Brain className="w-3.5 h-3.5 text-charcoal-400" />
+              {t('admin.allowThinking')}
+            </span>
+            <input
+              type="checkbox"
+              checked={thinkingEnabled}
+              onChange={(e) => setThinkingEnabled(e.target.checked)}
+              className="rounded border-cream-300 text-rust-500 focus:ring-rust-200"
+            />
+          </label>
+          <div className="flex items-center gap-2 pl-6">
+            <span className="text-xs text-charcoal-500">{t('admin.maxThinkingDepth')}</span>
+            <select
+              value={maxDepth}
+              disabled={!thinkingEnabled}
+              onChange={(e) => setMaxDepth(e.target.value as Exclude<ThinkingDepthCap, 'off'>)}
+              className="px-2 py-1 text-sm border border-cream-200 rounded-md bg-white
+                         focus:outline-none focus:ring-2 focus:ring-rust-200 disabled:opacity-50"
+            >
+              {DEPTH_CHOICES.map((d) => (
+                <option key={d} value={d}>
+                  {t(`admin.depth.${d}`)}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <ToggleRow
+          icon={<Sparkles className="w-3.5 h-3.5 text-charcoal-400" />}
+          label={t('admin.allowRealtimeSummary')}
+          checked={allowRealtime}
+          onChange={setAllowRealtime}
+        />
+        <ToggleRow
+          icon={<FileText className="w-3.5 h-3.5 text-charcoal-400" />}
+          label={t('admin.allowFinalSummary')}
+          checked={allowFinal}
+          onChange={setAllowFinal}
+        />
+      </div>
     </>
   );
 }
 
 function usePermissionsForm(
-  initPermissions: UserGroup['permissions'],
-  providers: ProviderInfo[],
+  initPermissions: GroupPermissions,
+  models: ModelInfo[],
 ) {
   const [minutesLimit, setMinutesLimit] = useState(String(initPermissions.transcriptionMinutesLimit));
   const [storageLimit, setStorageLimit] = useState(String(initPermissions.storageHoursLimit));
   const [concurrent, setConcurrent] = useState(String(initPermissions.maxConcurrentSessions));
 
+  // 能力开关状态
+  const [thinkingEnabled, setThinkingEnabled] = useState(initPermissions.maxThinkingDepth !== 'off');
+  const [maxDepth, setMaxDepth] = useState<Exclude<ThinkingDepthCap, 'off'>>(
+    initPermissions.maxThinkingDepth === 'off' ? 'medium' : initPermissions.maxThinkingDepth,
+  );
+  const [allowRealtime, setAllowRealtime] = useState(initPermissions.allowRealtimeSummary);
+  const [allowFinal, setAllowFinal] = useState(initPermissions.allowFinalSummary);
+
   const isAllInit = initPermissions.allowedModels === '*';
   const [selectAll, setSelectAll] = useState(isAllInit);
   const [selected, setSelected] = useState<Set<string>>(() => {
-    if (isAllInit) return new Set(providers.map((p) => p.name));
-    return new Set(initPermissions.allowedModels.split(',').map((s) => s.trim()).filter(Boolean));
+    if (isAllInit) return new Set(models.map((m) => m.modelId));
+    // 兼容旧数据：token 可能是具体 modelId，也可能是历史遗留的供应商名 → 两者命中都勾上，
+    // 保存时统一写回具体 modelId（自然完成一次「供应商→具体模型」的迁移）。
+    const tokens = new Set(
+      initPermissions.allowedModels.split(',').map((s) => s.trim()).filter(Boolean),
+    );
+    return new Set(
+      models
+        .filter((m) => tokens.has(m.modelId) || tokens.has(m.providerName))
+        .map((m) => m.modelId),
+    );
   });
 
-  // Bug 8: providers 异步加载完成时，若处于全选模式则更新 selected
+  // models 异步加载完成时，若处于全选模式则同步 selected
   useEffect(() => {
-    if (selectAll && providers.length > 0) {
-      setSelected(new Set(providers.map((p) => p.name)));
+    if (selectAll && models.length > 0) {
+      setSelected(new Set(models.map((m) => m.modelId)));
     }
-  }, [providers, selectAll]);
+  }, [models, selectAll]);
 
-  const handleToggle = (name: string) => {
+  const handleToggle = (modelId: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
+      if (next.has(modelId)) next.delete(modelId);
+      else next.add(modelId);
       return next;
     });
   };
@@ -349,16 +507,16 @@ function usePermissionsForm(
   const handleToggleAll = () => {
     if (selectAll) {
       setSelectAll(false);
-      // 取消全选时预填为当前全部 provider，让用户在全集基础上逐个取消；
+      // 取消全选时预填为当前全部模型，让用户在全集基础上逐个取消；
       // 若清空成空集，buildPermissions 会塌缩成 'local'（原 Bug：全选→取消全选→保存丢成 local）。
-      setSelected(new Set(providers.map((p) => p.name)));
+      setSelected(new Set(models.map((m) => m.modelId)));
     } else {
       setSelectAll(true);
-      setSelected(new Set(providers.map((p) => p.name)));
+      setSelected(new Set(models.map((m) => m.modelId)));
     }
   };
 
-  const buildPermissions = (): UserGroup['permissions'] => {
+  const buildPermissions = (): GroupPermissions => {
     const allowedModels = selectAll ? '*' : Array.from(selected).filter(Boolean).join(',') || 'local';
     return {
       transcriptionMinutesLimit: parseInt(minutesLimit) || 60,
@@ -367,6 +525,9 @@ function usePermissionsForm(
       storageHoursLimit: Math.max(0, parseFloat(storageLimit) || 10),
       allowedModels,
       maxConcurrentSessions: parseInt(concurrent) || 1,
+      maxThinkingDepth: thinkingEnabled ? maxDepth : 'off',
+      allowRealtimeSummary: allowRealtime,
+      allowFinalSummary: allowFinal,
     };
   };
 
@@ -374,6 +535,10 @@ function usePermissionsForm(
     minutesLimit, setMinutesLimit,
     storageLimit, setStorageLimit,
     concurrent, setConcurrent,
+    thinkingEnabled, setThinkingEnabled,
+    maxDepth, setMaxDepth,
+    allowRealtime, setAllowRealtime,
+    allowFinal, setAllowFinal,
     selected, selectAll,
     handleToggle, handleToggleAll,
     buildPermissions,
@@ -385,21 +550,21 @@ function GroupModal({
   onClose,
   onSave,
   saving,
-  providers,
+  models,
   leaving,
 }: {
   group: UserGroup;
   onClose: () => void;
-  onSave: (data: { permissions: UserGroup['permissions']; name?: string; description?: string; color?: string }) => void;
+  onSave: (data: { permissions: GroupPermissions; name?: string; description?: string; color?: string }) => void;
   saving: boolean;
-  providers: ProviderInfo[];
+  models: ModelInfo[];
   leaving: boolean;
 }) {
   const { t } = useI18n();
   const [groupName, setGroupName] = useState(group.name);
   const [groupDesc, setGroupDesc] = useState(group.description);
   const [groupColor, setGroupColor] = useState(group.color);
-  const pf = usePermissionsForm(group.permissions, providers);
+  const pf = usePermissionsForm(group.permissions, models);
 
   const handleSave = () => {
     onSave({
@@ -463,7 +628,7 @@ function GroupModal({
           )}
           <PermissionsForm
             {...pf}
-            providers={providers}
+            models={models}
             onToggle={pf.handleToggle}
             onToggleAll={pf.handleToggleAll}
           />
@@ -494,26 +659,30 @@ function CreateGroupModal({
   onClose,
   onCreate,
   saving,
-  providers,
+  models,
   leaving,
 }: {
   onClose: () => void;
-  onCreate: (data: { name: string; description: string; color: string; permissions: UserGroup['permissions'] }) => void;
+  onCreate: (data: { name: string; description: string; color: string; permissions: GroupPermissions }) => void;
   saving: boolean;
-  providers: ProviderInfo[];
+  models: ModelInfo[];
   leaving: boolean;
 }) {
   const { t } = useI18n();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [color, setColor] = useState(COLOR_OPTIONS[0].value);
-  const defaultPermissions = {
+  // 新建自定义组默认「全部允许」（思考 high、两摘要开），管理员按需收紧
+  const defaultPermissions: GroupPermissions = {
     transcriptionMinutesLimit: 60,
     storageHoursLimit: 10,
     allowedModels: 'local',
     maxConcurrentSessions: 1,
+    maxThinkingDepth: 'high',
+    allowRealtimeSummary: true,
+    allowFinalSummary: true,
   };
-  const pf = usePermissionsForm(defaultPermissions, providers);
+  const pf = usePermissionsForm(defaultPermissions, models);
 
   const handleCreate = () => {
     if (!name.trim()) return;
@@ -576,7 +745,7 @@ function CreateGroupModal({
           </div>
           <PermissionsForm
             {...pf}
-            providers={providers}
+            models={models}
             onToggle={pf.handleToggle}
             onToggleAll={pf.handleToggleAll}
           />
@@ -613,27 +782,39 @@ export default function UserGroupsPanel() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [editingGroup, setEditingGroup] = useState<UserGroup | undefined>(undefined);
-  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [models, setModels] = useState<ModelInfo[]>([]);
 
-  // 从后端加载 LLM 供应商列表
-  const fetchProviders = useCallback(async () => {
+  // 从后端加载可选的 LLM 模型（CHAT 用途，按底层 modelId 去重——同一模型配在多个供应商/用途下
+  // 只出现一次，修复历史上「一个模型出现很多次」的问题）。allowedModels 存的就是这些 modelId。
+  const fetchModels = useCallback(async () => {
     try {
       const res = await fetch('/api/admin/llm-providers', {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (res.ok) {
         const data = await res.json();
-        const list: ProviderInfo[] = (data.providers ?? []).map(
-          (p: { id: string; name: string; models?: unknown[] }) => ({
-            id: p.id,
-            name: p.name,
-            modelCount: Array.isArray(p.models) ? p.models.length : 0,
-          }),
-        );
-        setProviders(list);
+        const seen = new Set<string>();
+        const list: ModelInfo[] = [];
+        for (const p of (data.providers ?? []) as {
+          name: string;
+          models?: { modelId?: string; displayName?: string; purpose?: string }[];
+        }[]) {
+          for (const m of p.models ?? []) {
+            const modelId = (m.modelId ?? '').trim();
+            // 只列对话可选的 CHAT 模型（allowedModels 仅作用于聊天选择器）
+            if (!modelId || m.purpose !== 'CHAT' || seen.has(modelId)) continue;
+            seen.add(modelId);
+            list.push({
+              modelId,
+              displayName: (m.displayName || modelId).trim(),
+              providerName: p.name,
+            });
+          }
+        }
+        setModels(list);
       }
     } catch (err) {
-      console.error('加载供应商失败:', err);
+      console.error('加载模型失败:', err);
     }
   }, [token]);
 
@@ -664,8 +845,8 @@ export default function UserGroupsPanel() {
 
   useEffect(() => {
     fetchGroups();
-    fetchProviders();
-  }, [fetchGroups, fetchProviders]);
+    fetchModels();
+  }, [fetchGroups, fetchModels]);
 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<UserGroup | null>(null);
@@ -691,7 +872,7 @@ export default function UserGroupsPanel() {
   };
 
   // 保存用户组权限到后端
-  const handleSave = async (data: { permissions: UserGroup['permissions']; name?: string; description?: string; color?: string }) => {
+  const handleSave = async (data: { permissions: GroupPermissions; name?: string; description?: string; color?: string }) => {
     if (!editingGroup) return;
     setSaving(true);
     try {
@@ -741,7 +922,7 @@ export default function UserGroupsPanel() {
   };
 
   // 新建自定义用户组
-  const handleCreate = async (data: { name: string; description: string; color: string; permissions: UserGroup['permissions'] }) => {
+  const handleCreate = async (data: { name: string; description: string; color: string; permissions: GroupPermissions }) => {
     setSaving(true);
     try {
       const res = await fetch('/api/admin/groups', {
@@ -860,7 +1041,7 @@ export default function UserGroupsPanel() {
           onClose={() => setShowModal(false)}
           onSave={handleSave}
           saving={saving}
-          providers={providers}
+          models={models}
           leaving={editModal.leaving}
         />
       )}
@@ -870,7 +1051,7 @@ export default function UserGroupsPanel() {
           onClose={() => setShowCreateModal(false)}
           onCreate={handleCreate}
           saving={saving}
-          providers={providers}
+          models={models}
           leaving={createModal.leaving}
         />
       )}

@@ -29,7 +29,10 @@ import {
   persistArtifact,
   readArtifactFromReference,
 } from '@/lib/sessionPersistence';
-import { deductTranscriptionMinutes } from '@/lib/quota';
+import {
+  deductTranscriptionMinutes,
+  settleFullReservation,
+} from '@/lib/quota';
 import { getBillableMinutes } from '@/lib/billing';
 import { getSiteSettings } from '@/lib/siteSettings';
 
@@ -183,18 +186,28 @@ export async function finalizeFullTranscription(
   // ── 计费（额外按异步倍率扣，与异步上传转录同口径）──
   // claim + finalize 守卫共同保证仅一个路径进到此分支且未被取消，故恰好扣一次。
   // 计费失败不影响转录完成，留给对账兜底。
+  //
+  // R4：把入口预留（session.fullReservedMinutes，已计入 used）「转」为实扣——同一事务里 deduct 实际
+  // + settleFullReservation 释放预留 + 清预留列。net used = +预留(reserve) +实扣(deduct) −释放(settle)
+  // = 实扣一笔，且不残留预留。settleFullReservation 用 FOR UPDATE 读**当前**列并原子释放：deduct 内部
+  // ensureQuotaWindow 若刚触发月度重置会顺带清列 → 此时 settle 读到 0、不重复释放，杜绝跨周期把已被
+  // 重置隐式清除的预留再减一次（B1 审查 R1）。并发多路径经 settle 也仅释放一次。即便本事务整体失败，
+  // 预留仍留在列上，由 cron releaseOrphanFullReservations 兜底释放。
   try {
     const { async_upload_billing_multiplier } = await getSiteSettings();
     const billableMinutes = Math.ceil(
       getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
     );
-    if (billableMinutes > 0) {
-      await deductTranscriptionMinutes(session.userId, billableMinutes);
-    }
+    await prisma.$transaction(async (tx) => {
+      if (billableMinutes > 0) {
+        await deductTranscriptionMinutes(session.userId, billableMinutes, tx);
+      }
+      await settleFullReservation(session.id, tx);
+    });
   } catch (billingErr) {
     logger.error(
       { err: billingErr, sessionId: session.id },
-      'full transcribe billing deduct failed (transcription already completed)'
+      'full transcribe billing settle failed (transcription already completed)'
     );
   }
 

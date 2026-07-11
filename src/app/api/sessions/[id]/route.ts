@@ -30,6 +30,11 @@ import {
   deleteSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
 
+// B4：单用户并发在途录音（RECORDING/PAUSED）上限。实时录音事后扣费，无法在入口精确预留，
+// 用并发上限把「多标签并发开录叠加超额」的溢出封在 N×角色上限内（留足余量容忍崩溃残留的僵尸会话，
+// 4h 后由 reclaim cron 清）。彻底的按用量实时计费另见 /soniox/temporary-key 计量任务。
+const MAX_CONCURRENT_RECORDINGS = 3;
+
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -124,6 +129,25 @@ export async function PATCH(
         return NextResponse.json(
           { error: `Invalid status transition: ${session.status} → ${nextStatus}` },
           { status: 400 }
+        );
+      }
+    }
+
+    // B4：限制单用户并发在途录音数。实时录音是事后扣费（finalize 才 deduct，clamp 至角色上限），
+    // 入口 checkQuota 只非原子判 used<limit，故并发开多个录音（多标签/脚本）会各自通过准入、各自
+    // 录满后叠加扣费，used 静默大幅超 limit（审计 C6/B4）。这里对「新开录音」(CREATED→RECORDING)
+    // 计并发在途数（RECORDING/PAUSED），超上限即拒，把并发溢出封在 N×角色上限内。恢复暂停
+    // (PAUSED→RECORDING) 不新增在途、不受此限。彻底的按用量实时计费见 /soniox/temporary-key 计量任务。
+    if (nextStatus === 'RECORDING' && session.status === 'CREATED') {
+      const inflight = await prisma.session.count({
+        where: { userId: user.id, status: { in: ['RECORDING', 'PAUSED'] } },
+      });
+      if (inflight >= MAX_CONCURRENT_RECORDINGS) {
+        return NextResponse.json(
+          {
+            error: `Too many concurrent recordings in progress (max ${MAX_CONCURRENT_RECORDINGS}). Finish or discard an existing recording first.`,
+          },
+          { status: 409 }
         );
       }
     }

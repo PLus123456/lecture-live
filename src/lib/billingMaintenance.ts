@@ -14,6 +14,7 @@ import {
   resetExpiredTranscriptionQuotas,
   reconcileStorageBytes,
   settleAsyncReservation,
+  settleFullReservation,
 } from '@/lib/quota';
 import {
   resolveRoleQuotas,
@@ -82,6 +83,7 @@ export interface BillingMaintenanceSummary {
   reclaimedFullTranscribes: number;
   reclaimedStaleJobs: number;
   releasedOrphanReservations: number;
+  releasedOrphanFullReservations: number;
   reclaimedInterpretSessions: number;
   storageBytesReconciled: number;
   reconciliationRunId: string | null;
@@ -246,6 +248,19 @@ export async function runBillingMaintenance(options?: {
     // 不 rethrow —— 其他维护任务结果仍要返回
   }
 
+  // R4 兜底：释放已终态(completed/failed)却仍残留在途预留的完整版补全转录会话（与 async 平行）。
+  // 失败仅 log 不 rethrow，避免拖垮其余维护步骤。
+  let releasedOrphanFullReservations = 0;
+  try {
+    releasedOrphanFullReservations = await releaseOrphanFullReservations(now);
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'release orphan full-transcribe reservations failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
   // B3 兜底：对超时仍未结算的同声传译会话按服务端墙钟兜底扣费（防「客户端不调 /deduct 白嫖」）。
   // 与 /deduct 经 settledAt 条件认领互斥，恰好扣一次。失败仅 log 不 rethrow。
   let reclaimedInterpretSessions = 0;
@@ -349,6 +364,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedFullTranscribes > 0 ||
     reclaimedStaleJobs > 0 ||
     releasedOrphanReservations > 0 ||
+    releasedOrphanFullReservations > 0 ||
     reclaimedInterpretSessions > 0 ||
     storageBytesReconciled > 0 ||
     reconciliationRunId ||
@@ -367,6 +383,7 @@ export async function runBillingMaintenance(options?: {
         reclaimedFullTranscribes,
         reclaimedStaleJobs,
         releasedOrphanReservations,
+        releasedOrphanFullReservations,
         reclaimedInterpretSessions,
         storageBytesReconciled,
         reconciliationRunId,
@@ -383,6 +400,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedFullTranscribes,
     reclaimedStaleJobs,
     releasedOrphanReservations,
+    releasedOrphanFullReservations,
     reclaimedInterpretSessions,
     storageBytesReconciled,
     reconciliationRunId,
@@ -716,6 +734,52 @@ export async function releaseOrphanAsyncReservations(now: Date): Promise<number>
       billingLogger.info(
         { sessionId: s.id, userId: s.userId, minutes: released },
         'released orphan async upload reservation'
+      );
+    }
+  }
+  return releasedCount;
+}
+
+// R4 兜底扫描的陈旧门槛：与 async 同口径——只清「已终态一段时间」的残留预留，避免与刚 completed 的
+// 在途 finalize 结算(release 预留)赛跑重复释放。用 updatedAt 判定（finalize 结算会 bump updatedAt）。
+const FULL_RESERVATION_SWEEP_STALE_MS = 30 * 60_000;
+
+/**
+ * R4 兜底：释放「已终态却仍残留在途预留（fullReservedMinutes>0）」的完整版补全转录会话（与 B1 的
+ * releaseOrphanAsyncReservations 平行）。
+ *
+ * 正常路径：finalize 把预留「转」为实扣并清列；删会话 inline 释放。但若某终态转移未清预留（processor/
+ * reclaim 标 failed 时不 inline 释放、或 finalize 结算事务整体失败留下残留），预留会永久占着
+ * transcriptionMinutesUsed → 额度泄漏。这里扫「fullReservedMinutes>0 且已终态(failed/completed)
+ * 且 updatedAt 超 30min」的会话，统一走 settleFullReservation 条件原子认领后释放，兜住所有未 inline
+ * 释放的路径。30min 陈旧门槛避免与刚 completed 的 finalize 结算(同样 release 预留)赛跑重复释放。
+ *
+ * 完整版状态机的终态是 completed / failed（无 canceled，无用户取消路径）。
+ */
+export async function releaseOrphanFullReservations(now: Date): Promise<number> {
+  const staleBefore = new Date(now.getTime() - FULL_RESERVATION_SWEEP_STALE_MS);
+  const TERMINAL = ['failed', 'completed'];
+  const stuck = await prisma.session.findMany({
+    where: {
+      fullReservedMinutes: { gt: 0 },
+      fullTranscribeStatus: { in: TERMINAL },
+      updatedAt: { lte: staleBefore },
+    },
+    select: { id: true, userId: true, fullReservedMinutes: true },
+    take: 500,
+    orderBy: { updatedAt: 'asc' },
+  });
+
+  let releasedCount = 0;
+  for (const s of stuck) {
+    // settleFullReservation（FOR UPDATE 读当前列 → 清零 + 释放，恰好一次），与 finalize 结算 / 删会话 /
+    // 并发触发顶替 的释放互斥：并发多路径只有一个读到 >0 并释放。
+    const released = await settleFullReservation(s.id).catch(() => 0);
+    if (released > 0) {
+      releasedCount += 1;
+      billingLogger.info(
+        { sessionId: s.id, userId: s.userId, minutes: released },
+        'released orphan full-transcribe reservation'
       );
     }
   }

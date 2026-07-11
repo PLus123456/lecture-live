@@ -117,6 +117,11 @@ model Session {
   fullTranscribeStartedAt   DateTime?
   fullSonioxFileId          String?
   fullSonioxTranscriptionId String?
+  // R4：完整版补全转录入口的原子配额预留分钟（与 B1 的 asyncReservedMinutes 平行）。
+  // 触发时预留成功后写入（同时已计入 transcriptionMinutesUsed）；finalize 时转为实扣
+  //（settleFullReservation 释放预留 + deduct 实际）、删会话/失败回收时释放。非 0 即表示有一笔
+  // 在途预留待结算——cron releaseOrphanFullReservations 兜底释放终态(completed/failed)却仍残留的会话。
+  fullReservedMinutes       Int       @default(0)
 
   shareLinks      ShareLink[]
   folders         FolderSession[]

@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from 'react';
 import { useParams } from 'next/navigation';
+import { useI18n } from '@/lib/i18n';
 import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useChat } from '@/hooks/useChat';
 import { useKeywords } from '@/hooks/useKeywords';
@@ -489,8 +490,8 @@ function ContextPopover({
       {breakdown && (
         <div className="space-y-0.5 text-[10px] mt-2">
           <BreakdownRow label="系统提示" value={breakdown.systemPrompt} />
-          <BreakdownRow label="Transcript" value={breakdown.transcript} />
-          <BreakdownRow label="Summary" value={breakdown.summary} />
+          <BreakdownRow label="转录稿" value={breakdown.transcript} />
+          <BreakdownRow label="摘要" value={breakdown.summary} />
           <BreakdownRow label="历史对话" value={breakdown.history} />
           <BreakdownRow label="当前输入" value={breakdown.userInput} />
         </div>
@@ -633,6 +634,7 @@ export default function ChatTab({
     addMessage,
   } = useChat(sessionId);
   const { extractFromText, addManualKeyword } = useKeywords();
+  const { t } = useI18n();
 
   // U55：当前活跃对话是否已关闭（endedAt 非空）。已关闭对话服务端会 409 拒绝发送，
   // 前端据此把输入框置只读，避免"本地回显 → 服务端 409 → 切换对话后本地消息消失"。
@@ -1108,9 +1110,9 @@ export default function ChatTab({
         {messages.length === 0 && archivedMessages.length === 0 && (
           <div className="text-center py-8 text-charcoal-300 animate-fade-in-up">
             <Bot className="w-8 h-8 mx-auto mb-2 opacity-50 animate-breathe" />
-            <p className="text-xs">Ask questions about the lecture</p>
+            <p className="text-xs">{t('chat.sessionAsk')}</p>
             <p className="text-[11px] mt-1 text-charcoal-400">
-              Try: &quot;Explain the main concept&quot; or /keyword
+              {t('chat.sessionAskHint')}
             </p>
           </div>
         )}
@@ -1174,7 +1176,7 @@ export default function ChatTab({
             {pendingImages.map((url, i) => (
               <div
                 key={i}
-                className="relative w-14 h-14 rounded-md overflow-hidden border border-cream-300"
+                className="relative w-14 h-14 rounded-md overflow-hidden border border-cream-300 animate-tag-pop"
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -1187,7 +1189,7 @@ export default function ChatTab({
                   onClick={() => removePendingImage(i)}
                   className="absolute top-0.5 right-0.5 w-4 h-4 rounded-full bg-charcoal-800/80
                              text-white flex items-center justify-center hover:bg-charcoal-900"
-                  title="移除图片"
+                  title={t('chat.removeAttachment')}
                 >
                   <X className="w-2.5 h-2.5" />
                 </button>
@@ -1210,11 +1212,7 @@ export default function ChatTab({
             type="button"
             onClick={() => fileInputRef.current?.click()}
             disabled={isLoading || !supportsImage || composerBlocked}
-            title={
-              supportsImage
-                ? '上传图片'
-                : '当前模型不支持图片输入'
-            }
+            title={supportsImage ? t('chat.attachImage') : t('chat.imageNotSupported')}
             className="w-9 h-9 rounded-lg border border-cream-300 bg-white text-charcoal-500
                        hover:border-cream-400 transition-colors flex items-center justify-center
                        disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
@@ -1256,8 +1254,8 @@ export default function ChatTab({
             onPaste={handlePaste}
             placeholder={
               isActiveConvEnded
-                ? '此对话已关闭（只读）'
-                : 'Ask about the lecture...'
+                ? t('chat.endedReadonly')
+                : t('chat.sessionComposerPlaceholder')
             }
             className="flex-1 px-3 py-2 rounded-lg border border-cream-300 text-xs resize-none
                        max-h-32 overflow-y-auto

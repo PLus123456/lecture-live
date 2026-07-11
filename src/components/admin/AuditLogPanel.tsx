@@ -35,6 +35,9 @@ import {
   RotateCw,
   Paperclip,
   Sparkles,
+  Wrench,
+  AlertTriangle,
+  Languages,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
@@ -154,6 +157,21 @@ const ACTION_DEFS: Record<string, ActionDef> = {
   // 审计日志清理
   'admin.auditlog.cleanup':          { icon: Trash2,         tone: 'gray',   labelKey: 'auditLog.auditLogCleanup' },
 
+  // 结束/回收时的系统事件（logSystemEvent 写入，非用户直接触发）
+  'session.finalize.transcript_missing': { icon: FileX2,     tone: 'amber',  labelKey: 'auditLog.sessionFinalizeTranscriptMissing' },
+  'session.finalize.recording_missing':  { icon: MicOff,     tone: 'amber',  labelKey: 'auditLog.sessionFinalizeRecordingMissing' },
+  'session.auto_reclaimed':          { icon: RotateCw,       tone: 'amber',  labelKey: 'auditLog.sessionAutoReclaimed' },
+
+  // 即时口译
+  'interpret.duration_mismatch':     { icon: Languages,      tone: 'amber',  labelKey: 'auditLog.interpretDurationMismatch' },
+
+  // 计费维护 / 对账（后台任务系统事件）
+  'billing.reconciliation.completed': { icon: Coins,         tone: 'green',  labelKey: 'auditLog.billingReconciliationCompleted' },
+  'billing.reconciliation.failed':   { icon: Coins,          tone: 'red',    labelKey: 'auditLog.billingReconciliationFailed' },
+  'billing.maintenance.completed':   { icon: Wrench,         tone: 'green',  labelKey: 'auditLog.billingMaintenanceCompleted' },
+  'billing.maintenance.failed':      { icon: Wrench,         tone: 'red',    labelKey: 'auditLog.billingMaintenanceFailed' },
+  'billing.auto_reclaim.failed':     { icon: AlertTriangle,  tone: 'red',    labelKey: 'auditLog.billingAutoReclaimFailed' },
+
   // 系统
   'system.start':                    { icon: Server,         tone: 'slate',  labelKey: 'auditLog.systemStart' },
 };
@@ -206,6 +224,7 @@ const ACTION_FILTERS = [
   { value: 'admin.storage', label: 'auditLog.storageManage' },
   { value: 'admin.reconciliation', label: 'auditLog.reconciliationManage' },
   { value: 'admin.job', label: 'auditLog.jobRetry' },
+  { value: 'billing', label: 'auditLog.billing' },
   { value: 'system', label: 'auditLog.system' },
 ];
 

@@ -66,3 +66,4 @@ LLM_CONTEXT_DESIGN.md
 # Playwright 运行产物
 /test-results/
 /playwright-report/
+/artifacts/

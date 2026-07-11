@@ -645,6 +645,14 @@ export default function ChatTab({
   const [input, setInput] = useState('');
   /** IME 合成中（中文/日文输入法）—— 合成期间回车不应发送 */
   const [composing, setComposing] = useState(false);
+  /**
+   * 最近一次 compositionend 的时间戳。Safari 的事件顺序是 compositionend → keydown
+   * （Chrome 相反），确认 IME 候选词的那次 Enter 到达 keydown 时 composing 已被重置、
+   * e.nativeEvent.isComposing 也已是 false，两道守卫双双失效，导致「回车确认候选词」
+   * 被误当成发送。用时间戳窗口把紧随 compositionend 的 Enter 视为合成确认而非发送
+   * （与 GlobalChat 的 U79 修复保持一致）。
+   */
+  const lastCompositionEndRef = useRef(0);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [showThinkingMenu, setShowThinkingMenu] = useState(false);
@@ -1229,14 +1237,22 @@ export default function ChatTab({
                 e.key === 'Enter' &&
                 !e.shiftKey &&
                 !composing &&
-                !e.nativeEvent.isComposing
+                !e.nativeEvent.isComposing &&
+                // Safari 在 compositionend 之后才派发确认候选词的 keydown，此时上面两道守卫
+                // 都已失效；用时间窗口把紧随 compositionend（<50ms）的 Enter 视为合成确认。
+                // keyCode 229 是部分浏览器对 IME 进行中 keydown 的标记，一并挡掉。
+                e.nativeEvent.keyCode !== 229 &&
+                Date.now() - lastCompositionEndRef.current > 50
               ) {
                 e.preventDefault();
                 void handleSend();
               }
             }}
             onCompositionStart={() => setComposing(true)}
-            onCompositionEnd={() => setComposing(false)}
+            onCompositionEnd={() => {
+              setComposing(false);
+              lastCompositionEndRef.current = Date.now();
+            }}
             onPaste={handlePaste}
             placeholder={
               isActiveConvEnded

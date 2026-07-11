@@ -20,6 +20,7 @@ const {
   conversationFindUniqueMock,
   conversationMessageCreateMock,
   conversationUpdateMock,
+  conversationUpdateManyMock,
   prismaTransactionMock,
   resolveAuthorizedLlmSelectionMock,
   resolveEffectiveThinkingDepthMock,
@@ -45,6 +46,7 @@ const {
   conversationFindUniqueMock: vi.fn(),
   conversationMessageCreateMock: vi.fn(),
   conversationUpdateMock: vi.fn(),
+  conversationUpdateManyMock: vi.fn(),
   prismaTransactionMock: vi.fn(),
   resolveAuthorizedLlmSelectionMock: vi.fn(),
   resolveEffectiveThinkingDepthMock: vi.fn(),
@@ -80,6 +82,7 @@ vi.mock('@/lib/prisma', () => ({
     conversation: {
       findUnique: conversationFindUniqueMock,
       update: conversationUpdateMock,
+      updateMany: conversationUpdateManyMock,
     },
     conversationMessage: {
       create: conversationMessageCreateMock,
@@ -195,6 +198,7 @@ vi.mock('@/lib/llm/chatImageStorage', async () => {
 });
 
 import { POST } from '@/app/api/llm/chat/route';
+import { __resetConversationTurnLocks } from '@/lib/llm/conversationTurnLock';
 
 interface DoneEvent {
   level: number;
@@ -248,6 +252,8 @@ function makeDefaultBuildChatContextResult(level = 1) {
 describe('POST /api/llm/chat (mode routing)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // 每对话回复锁是模块级进程内状态：测试间清空，避免上一个用例漏放的锁误伤下一个用例。
+    __resetConversationTurnLocks();
     verifyAuthMock.mockResolvedValue({
       id: 'user-1',
       email: 'a@example.com',
@@ -311,6 +317,7 @@ describe('POST /api/llm/chat (mode routing)', () => {
     persistChatImageMock.mockResolvedValue('/img/x.png');
     conversationMessageCreateMock.mockResolvedValue({ id: 'm-new' });
     conversationUpdateMock.mockResolvedValue({});
+    conversationUpdateManyMock.mockReturnValue({}); // 作为 $transaction 数组项，返回值形态无关
     prismaTransactionMock.mockResolvedValue([{ id: 'm-new' }, {}]);
   });
 
@@ -787,6 +794,203 @@ describe('POST /api/llm/chat (mode routing)', () => {
       });
       const res = await POST(req, {} as never);
       expect(res.status).toBe(400);
+    });
+  });
+
+  // ── H5：连续失败留下的多条尾部孤儿 user 全部剥离（防旧问题复活）──
+  describe('dropTrailingOrphanUser（H5）', () => {
+    it('历史尾部有连续两条未配对 user → 全部从发给模型的 history 中剥离', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-orphans',
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        endedAt: null,
+        degradationLevel: 1,
+        session: { id: 'sess-1', userId: 'user-1', targetLang: 'zh' },
+        // A0(assistant) → U1(user) → U2(user)：U1、U2 都是首 token 前失败留下的孤儿
+        messages: [
+          { role: 'assistant', content: 'A0', transcriptOffsetMs: 0 },
+          { role: 'user', content: 'U1', transcriptOffsetMs: 0 },
+          { role: 'user', content: 'U2', transcriptOffsetMs: 0 },
+        ],
+        sessions: [],
+        attachments: [],
+      });
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-orphans',
+          question: 'U3',
+          transcript: [{ text: 'live', startMs: 0 }],
+        },
+      });
+      const res = await POST(req, {} as never);
+      expect(res.status).toBe(200);
+      await consumeSseEvents(res);
+
+      // 传给 buildChatContext 的 history 必须只剩 A0，U1/U2 均被剥离（否则旧问题复活）
+      const historyArg = buildChatContextMock.mock.calls[0][0].history as Array<{
+        role: string;
+        content: string;
+      }>;
+      expect(historyArg).toHaveLength(1);
+      expect(historyArg[0]).toMatchObject({ role: 'assistant', content: 'A0' });
+      expect(historyArg.some((m) => m.content === 'U1')).toBe(false);
+      expect(historyArg.some((m) => m.content === 'U2')).toBe(false);
+    });
+  });
+
+  // ── H3：degradationLevel 条件更新（只升不降，防 lost update）+ 每对话回复锁 ──
+  describe('并发与降级（H3）', () => {
+    it('落库用 updateMany + where degradationLevel<effectiveLevel（条件更新，非 Math.max 快照覆盖）', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-deg',
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        endedAt: null,
+        degradationLevel: 1,
+        session: { id: 'sess-1', userId: 'user-1', targetLang: 'zh' },
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+      // 本轮 effectiveLevel = 3
+      buildChatContextMock.mockResolvedValue(
+        makeDefaultBuildChatContextResult(3)
+      );
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-deg',
+          question: 'q',
+          transcript: [{ text: 'live', startMs: 0 }],
+        },
+      });
+      const res = await POST(req, {} as never);
+      expect(res.status).toBe(200);
+      await consumeSseEvents(res);
+
+      expect(conversationUpdateManyMock).toHaveBeenCalledWith({
+        where: { id: 'conv-deg', degradationLevel: { lt: 3 } },
+        data: { degradationLevel: 3 },
+      });
+    });
+
+    it('同一对话已有进行中回复时，第二个并发请求 fail-fast 返回 409', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-busy',
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        endedAt: null,
+        degradationLevel: 1,
+        session: { id: 'sess-1', userId: 'user-1', targetLang: 'zh' },
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+
+      // 让第一轮的流式调用挂起，把锁一直握住，直到我们手动放行。
+      let releaseUpstream!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseUpstream = resolve;
+      });
+      callLLMWithHistoryStreamMock.mockImplementationOnce(
+        async (
+          _sys: string,
+          _msgs: unknown,
+          _opts: unknown,
+          onEvent: (ev: { type: string; delta?: string }) => void
+        ) => {
+          onEvent({ type: 'text', delta: 'partial' });
+          await gate;
+          return { text: 'done', usage: { inputTokens: 1, outputTokens: 1 } };
+        }
+      );
+
+      const body = {
+        conversationId: 'conv-busy',
+        question: 'q',
+        transcript: [{ text: 'live', startMs: 0 }],
+      };
+      // 第一轮：拿到 Response（流仍在进行，锁被持有），先不 drain
+      const res1 = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body,
+        }),
+        {} as never
+      );
+      expect(res1.status).toBe(200);
+
+      // 第二轮并发：同一对话仍在生成 → 409
+      const res2 = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body,
+        }),
+        {} as never
+      );
+      expect(res2.status).toBe(409);
+
+      // 放行第一轮并 drain，锁释放
+      releaseUpstream();
+      await consumeSseEvents(res1);
+    });
+  });
+
+  // ── H4：半截/失败的流不得当正常 assistant 消息落库 ──
+  describe('半截流不落库（H4）', () => {
+    it('上游发出正文后中途报错 → 不落库 assistant 消息，回 error 帧', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-partial',
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        endedAt: null,
+        degradationLevel: 1,
+        session: { id: 'sess-1', userId: 'user-1', targetLang: 'zh' },
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+
+      // 先发一段正文（emittedBytes=true），再抛错模拟 mid-stream error / 截断。
+      callLLMWithHistoryStreamMock.mockImplementationOnce(
+        async (
+          _sys: string,
+          _msgs: unknown,
+          _opts: unknown,
+          onEvent: (ev: { type: string; delta?: string }) => void
+        ) => {
+          onEvent({ type: 'text', delta: '半截正文' });
+          throw new Error('Anthropic streaming error: overloaded');
+        }
+      );
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-partial',
+          question: 'q',
+          transcript: [{ text: 'live', startMs: 0 }],
+        },
+      });
+      const res = await POST(req, {} as never);
+      expect(res.status).toBe(200);
+      const { events } = await consumeSseEvents(res);
+
+      // 客户端收到 error 帧
+      expect(events.some((e) => e.event === 'error')).toBe(true);
+      // 落库 assistant 的 $transaction 绝不能被调用（succeeded=false）
+      expect(prismaTransactionMock).not.toHaveBeenCalled();
+      // conversationMessage.create 只应为 user 消息调用一次（不含 assistant 兜底插入）
+      expect(conversationMessageCreateMock).toHaveBeenCalledTimes(1);
+      expect(conversationMessageCreateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ role: 'user' }),
+        })
+      );
     });
   });
 });

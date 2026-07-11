@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
+import { chatUrlTransform } from '@/components/chat/markdownUrlTransform';
 import {
   ArrowUp,
   Square,
@@ -147,6 +148,9 @@ function safeHref(href: unknown): string | undefined {
 function Md({ children }: { children: string }) {
   return (
     <ReactMarkdown
+      // 放行 data:image/ 让刚发送的 base64 图片立即可见（react-markdown 10 默认会清空 data: URL）。
+      // 详见 chatUrlTransform。
+      urlTransform={chatUrlTransform}
       components={{
         p: ({ children: c }) => <p className="mb-2 last:mb-0">{c}</p>,
         strong: ({ children: c }) => (
@@ -475,6 +479,11 @@ export default function GlobalChat({
     setActiveConversation(conversationId);
     setAttachments([]);
     setEndedAt(null);
+    // 切换对话时清掉上一对话残留的草稿 / 待发图片 / 图片错误，否则 A 的输入和图片会串到 B
+    // 并在 B 里被发送出去。（下面 pending-first-message 流会在加载完成后再把首页暂存文本放回。）
+    setInput('');
+    setPendingImages([]);
+    setImageError(null);
     historyLoadedRef.current = false;
     setHistoryLoaded(false);
 
@@ -814,6 +823,11 @@ export default function GlobalChat({
             : data.bytes ?? file.size,
         kind: data.kind ?? 'document',
       };
+      // 上传返回时用户可能已切到别的对话（组件实例常驻，仅 prop 变化）——
+      // 迟到的旧对话上传结果不允许写进新对话的 attachments（否则 chip 串台）。
+      if (useChatStore.getState().activeConversationId !== conversationId) {
+        return;
+      }
       setAttachments((prev) => [...prev, newChip]);
     } catch {
       toast.error(t('chat.uploadFailed'));
@@ -830,6 +844,9 @@ export default function GlobalChat({
   const removeAttachment = useCallback(
     async (id: string) => {
       if (!token) return;
+      // 记录发起删除时的活跃对话：DELETE 返回时用户可能已切走，迟到的失败回滚不能把
+      // 旧对话的 attachments 写进新对话（否则会“凭空”出现别的对话的附件 chip）。
+      const startConv = useChatStore.getState().activeConversationId;
       const prev = attachments;
       setAttachments((cur) => cur.filter((a) => a.id !== id));
       try {
@@ -839,8 +856,10 @@ export default function GlobalChat({
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       } catch {
-        setAttachments(prev); // 回滚
-        toast.error(t('common.operationFailed'));
+        if (useChatStore.getState().activeConversationId === startConv) {
+          setAttachments(prev); // 回滚（仅当仍停留在同一对话）
+          toast.error(t('common.operationFailed'));
+        }
       }
     },
     [attachments, token, t]
@@ -1086,12 +1105,16 @@ export default function GlobalChat({
           sawError = true;
           // 上下文已满（EOL）：置位标志，禁用输入并引导新建对话。
           if (payload.contextFull === true) setContextFull(conversationId, true);
+          const errText =
+            typeof payload.error === 'string'
+              ? payload.error
+              : '对话失败，请重试。';
           updateMessage(conversationId, assistantId, {
-            content:
-              accumulatedText ||
-              (typeof payload.error === 'string'
-                ? payload.error
-                : '对话失败，请重试。'),
+            // 半截正文后必须显式追加失败提示：不能「有部分正文就只显示部分」把失败静默掉，
+            // 否则用户看到半句话却当成正常回答（服务端也不会落库这半截，刷新即消失）。
+            content: accumulatedText
+              ? `${accumulatedText}\n\n⚠️ ${errText}`
+              : errText,
             streaming: false,
           });
         }
@@ -1256,7 +1279,8 @@ export default function GlobalChat({
               <AttachmentChip
                 key={a.id}
                 attachment={a}
-                onRemove={removeAttachment}
+                // 已关闭对话只读：隐藏删除入口（服务端也会拒绝，双保险）
+                onRemove={isEnded ? undefined : removeAttachment}
               />
             ))}
           </div>

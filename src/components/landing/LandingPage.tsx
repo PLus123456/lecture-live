@@ -461,22 +461,24 @@ export default function LandingPage({
       <section id="landing-content" className={styles.hero} aria-labelledby="landing-title">
         <div className={styles.heroGrid}>
           <div className={styles.heroCopy}>
-            <div className={styles.eyebrow} data-reveal data-visible="true">
+            {/* 首屏元素不走 data-reveal（IntersectionObserver 是给折叠线以下
+                的区块用的）；入场由 module.css 的「首屏入场编排」统一定时。 */}
+            <div className={styles.eyebrow}>
               <span><Radio size={13} /></span>
               {tl('hero.eyebrow')}
             </div>
 
-            <h1 id="landing-title" data-reveal data-visible="true">
+            <h1 id="landing-title">
               {tl('hero.h1.lead')}
               <span>{tl('hero.h1.accent')}</span>
               {tl('hero.h1.tail')}
             </h1>
 
-            <p className={styles.heroDescription} data-reveal data-visible="true">
+            <p className={styles.heroDescription}>
               {heroDescription}
             </p>
 
-            <div className={styles.heroActions} data-reveal data-visible="true">
+            <div className={styles.heroActions}>
               <Link href={primaryHref} className={styles.heroPrimary}>
                 <span>{primaryLabel}</span>
                 <ArrowRight size={18} />
@@ -487,7 +489,7 @@ export default function LandingPage({
               </a>
             </div>
 
-            <div className={styles.heroSignals} data-reveal data-visible="true">
+            <div className={styles.heroSignals}>
               <span><Captions size={15} /> {tl('hero.signals.0')}</span>
               <span><Languages size={15} /> {tl('hero.signals.1')}</span>
               <span><Play size={15} /> {tl('hero.signals.2')}</span>
@@ -593,8 +595,8 @@ export default function LandingPage({
           <div className={styles.storyAtmosphere} aria-hidden="true"><span /><span /><span /></div>
           <div className={styles.storyGrid}>
             <div className={styles.storyCopy}>
-              <div className={styles.sectionKicker}>{tl('story.kicker')}</div>
-              <h2 id="workflow-title">{tl('story.h2')}</h2>
+              <div className={styles.sectionKicker} data-reveal>{tl('story.kicker')}</div>
+              <h2 id="workflow-title" data-reveal>{tl('story.h2')}</h2>
 
               <div className={styles.storyStepCopy}>
                 {storySteps.map((step, index) => (
@@ -624,7 +626,7 @@ export default function LandingPage({
             </div>
 
             <div className={styles.storyVisual} aria-hidden="true">
-              <div className={styles.storyDevice}>
+              <div className={styles.storyDevice} data-reveal>
                 <div className={styles.deviceBar}>
                   <div className={styles.deviceBrand}><span><AudioLines size={14} /></span>{siteName}</div>
                   <div className={styles.deviceCenter}>Biology 204</div>
@@ -648,7 +650,7 @@ export default function LandingPage({
               </div>
 
               <div className={styles.deviceShadow} aria-hidden="true" />
-              <div className={styles.deviceCaption}>
+              <div className={styles.deviceCaption} data-reveal>
                 <span>{storySteps[activeStep].index}</span>
                 {storySteps[activeStep].label}
               </div>
@@ -657,7 +659,7 @@ export default function LandingPage({
 
           <div className={styles.mobileStoryList}>
             {storySteps.map((step, index) => (
-              <article key={step.index} className={styles.mobileStoryCard}>
+              <article key={step.index} className={styles.mobileStoryCard} data-reveal>
                 <div className={styles.stepLabel}>{step.index} / {step.label}</div>
                 <h3>{step.title}</h3>
                 <p>{step.description}</p>
@@ -793,7 +795,9 @@ export default function LandingPage({
       </section>
 
       <section className={styles.finalCta} aria-labelledby="final-cta-title">
-        <div className={styles.ctaOrbit} aria-hidden="true">
+        {/* 轨道环的 transform 始终被 orbitBreathe 动画占用（掩蔽 reveal 的
+            位移），data-reveal 对它只有 opacity 淡入生效 */}
+        <div className={styles.ctaOrbit} aria-hidden="true" data-reveal>
           <span className={styles.orbitOne}>{tl('finalCta.orbit.0')}</span>
           <span className={styles.orbitTwo}>{tl('finalCta.orbit.1')}</span>
           <span className={styles.orbitThree}>{tl('finalCta.orbit.2')}</span>

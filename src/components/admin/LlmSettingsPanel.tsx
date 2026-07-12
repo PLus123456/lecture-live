@@ -98,6 +98,32 @@ interface GroupBinding {
   chatModelId: string;
   realtimeSummaryModelId: string;
   finalSummaryModelId: string;
+  /** 该组聊天可用模型（'*' 或逗号分隔 token）；与「用户组」面板/运行时同源 */
+  allowedModels: string;
+  /** 组能力开关：关了则对应摘要绑定是死配置，选择器按禁用渲染 */
+  allowRealtimeSummary: boolean;
+  allowFinalSummary: boolean;
+}
+
+/**
+ * 某条 CHAT 路由是否在该组「可用模型」集合内。
+ * 与运行时 access.ts 的 canUseDatabaseModel 同口径：'*' 全允许；
+ * 否则 token 命中 路由行 id / 底层 modelId / 网关名 任一即算允许。
+ */
+function isRouteAllowedForGroup(
+  route: RouteRow & { providerName: string },
+  group: GroupBinding
+): boolean {
+  if (group.allowedModels === '*') return true;
+  const tokens = new Set(
+    group.allowedModels
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+  return (
+    tokens.has(route.id) || tokens.has(route.modelId) || tokens.has(route.providerName)
+  );
 }
 
 /* ────────────────────────── 常量 / 工具 ────────────────────────── */
@@ -205,7 +231,21 @@ export default function LlmSettingsPanel() {
       }
       if (groupRes.ok) {
         const data = await groupRes.json();
-        setGroups((data.groups ?? []) as GroupBinding[]);
+        setGroups(
+          ((data.groups ?? []) as Partial<GroupBinding>[]).map((g) => ({
+            key: g.key ?? '',
+            name: g.name ?? '',
+            isCustom: Boolean(g.isCustom),
+            color: g.color,
+            chatModelId: g.chatModelId ?? '',
+            realtimeSummaryModelId: g.realtimeSummaryModelId ?? '',
+            finalSummaryModelId: g.finalSummaryModelId ?? '',
+            // 兜底按「不产生虚假警告」取向：可用模型缺省视作全允许、能力缺省视作开启
+            allowedModels: g.allowedModels ?? '*',
+            allowRealtimeSummary: g.allowRealtimeSummary ?? true,
+            allowFinalSummary: g.allowFinalSummary ?? true,
+          }))
+        );
       }
     } catch (err) {
       console.error('加载 LLM 设置失败:', err);
@@ -708,51 +748,99 @@ function PurposeBlock({
             </div>
           )}
 
-          {/* 按会员组：每组默认模型 */}
+          {/* 按会员组：每组默认模型（口径与「用户组」编辑弹窗一致：体现可用模型集 + 能力开关） */}
           {tierMode && GROUP_BINDABLE.has(purpose) && (
-            <div className="flex flex-wrap gap-2.5 mt-3 p-3 rounded-lg bg-cream-50 dark:bg-charcoal-750 border border-dashed border-cream-300 dark:border-charcoal-600">
-              {groups.map((g) => {
-                const field = GROUP_BINDING_FIELD[purpose] as
-                  | 'chatModelId'
-                  | 'realtimeSummaryModelId'
-                  | 'finalSummaryModelId';
-                const value = g[field];
-                const stale = Boolean(value) && !routes.some((r) => r.id === value);
-                return (
-                  <div key={g.key} className="flex items-center gap-2">
-                    <span
-                      className={`px-2 py-1 rounded-md text-[10px] font-bold tracking-wide ${
-                        g.isCustom
-                          ? g.color ||
-                            'bg-cream-100 text-charcoal-500 dark:bg-charcoal-700 dark:text-charcoal-300'
-                          : g.key === 'PRO'
-                            ? 'bg-amber-50 text-amber-600 dark:bg-amber-900/25 dark:text-amber-400'
-                            : 'bg-cream-100 text-charcoal-500 dark:bg-charcoal-700 dark:text-charcoal-300'
-                      }`}
-                    >
-                      {g.name}
-                    </span>
-                    <select
-                      value={stale ? '' : value}
-                      onChange={(e) => onSetGroupBinding(g.key, purpose, e.target.value)}
-                      className="px-2 py-1.5 text-xs border border-cream-200 dark:border-charcoal-600 rounded-md bg-white dark:bg-charcoal-700 text-charcoal-700 dark:text-cream-100 focus:outline-none focus:ring-2 focus:ring-rust-200"
-                    >
-                      <option value="">
-                        {defaultRoute
-                          ? t('adminSettings.llmFollowGlobalWith', {
-                              name: defaultRoute.displayName,
-                            })
-                          : t('adminSettings.llmFollowGlobal')}
-                      </option>
-                      {routes.map((r) => (
-                        <option key={r.id} value={r.id}>
-                          {r.displayName} · {r.providerName}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                );
-              })}
+            <div className="mt-3 p-3 rounded-lg bg-cream-50 dark:bg-charcoal-750 border border-dashed border-cream-300 dark:border-charcoal-600 space-y-2">
+              <div className="flex flex-wrap gap-x-5 gap-y-2">
+                {groups.map((g) => {
+                  const field = GROUP_BINDING_FIELD[purpose] as
+                    | 'chatModelId'
+                    | 'realtimeSummaryModelId'
+                    | 'finalSummaryModelId';
+                  const value = g[field];
+                  const stale = Boolean(value) && !routes.some((r) => r.id === value);
+                  const isChat = purpose === 'CHAT';
+                  // 组能力开关关闭 → 该绑定是死配置，禁用展示（与组编辑弹窗行为一致）
+                  const capabilityOff =
+                    (purpose === 'REALTIME_SUMMARY' && !g.allowRealtimeSummary) ||
+                    (purpose === 'FINAL_SUMMARY' && !g.allowFinalSummary);
+                  // 聊天：全局默认不在该组可用模型内且未绑定 → 该组实际无可用聊天模型，显式警告
+                  const globalDefaultUsable =
+                    !defaultRoute || isRouteAllowedForGroup(defaultRoute, g);
+                  const chatNoUsable =
+                    isChat && (!value || stale) && !globalDefaultUsable;
+
+                  return (
+                    <div key={g.key} className="flex flex-col gap-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`px-2 py-1 rounded-md text-[10px] font-bold tracking-wide shrink-0 ${
+                            g.isCustom
+                              ? g.color ||
+                                'bg-cream-100 text-charcoal-500 dark:bg-charcoal-700 dark:text-charcoal-300'
+                              : g.key === 'PRO'
+                                ? 'bg-amber-50 text-amber-600 dark:bg-amber-900/25 dark:text-amber-400'
+                                : 'bg-cream-100 text-charcoal-500 dark:bg-charcoal-700 dark:text-charcoal-300'
+                          }`}
+                        >
+                          {g.name}
+                        </span>
+                        {capabilityOff ? (
+                          <select
+                            disabled
+                            className="px-2 py-1.5 text-xs border border-cream-200 dark:border-charcoal-600 rounded-md bg-cream-100 dark:bg-charcoal-750 text-charcoal-300 dark:text-charcoal-500 cursor-not-allowed"
+                          >
+                            <option>{t('adminSettings.llmGroupCapabilityOff')}</option>
+                          </select>
+                        ) : (
+                          <select
+                            value={value}
+                            onChange={(e) =>
+                              onSetGroupBinding(g.key, purpose, e.target.value)
+                            }
+                            className="px-2 py-1.5 text-xs border border-cream-200 dark:border-charcoal-600 rounded-md bg-white dark:bg-charcoal-700 text-charcoal-700 dark:text-cream-100 focus:outline-none focus:ring-2 focus:ring-rust-200 max-w-[280px]"
+                          >
+                            <option value="">
+                              {defaultRoute
+                                ? t(
+                                    isChat && !globalDefaultUsable
+                                      ? 'adminSettings.llmFollowGlobalUnusable'
+                                      : 'adminSettings.llmFollowGlobalWith',
+                                    { name: defaultRoute.displayName }
+                                  )
+                                : t('adminSettings.llmFollowGlobal')}
+                            </option>
+                            {routes.map((r) => (
+                              <option key={r.id} value={r.id}>
+                                {r.displayName} · {r.providerName}
+                                {isChat && !isRouteAllowedForGroup(r, g)
+                                  ? t('adminSettings.llmNotInAllowedSuffix')
+                                  : ''}
+                              </option>
+                            ))}
+                            {stale && (
+                              <option value={value}>
+                                {t('adminSettings.llmStaleBinding')}
+                              </option>
+                            )}
+                          </select>
+                        )}
+                      </div>
+                      {chatNoUsable && (
+                        <span className="flex items-center gap-1 text-[10px] text-amber-600 dark:text-amber-400">
+                          <AlertTriangle className="w-3 h-3 shrink-0" />
+                          {t('adminSettings.llmGroupNoUsableChat')}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {purpose === 'CHAT' && (
+                <p className="text-[10px] text-charcoal-300 dark:text-charcoal-500 pt-1 border-t border-cream-200/70 dark:border-charcoal-700">
+                  {t('adminSettings.llmTierChatHint')}
+                </p>
+              )}
             </div>
           )}
           {tierMode && !GROUP_BINDABLE.has(purpose) && (

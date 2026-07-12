@@ -330,6 +330,18 @@ export default {
     },
   },
 
+  pipTool: {
+    title: 'Reference Tool',
+    windowTitle: 'Reference Tool — Translation',
+    waiting: 'Waiting for transcript...',
+    translating: 'Translating...',
+    copy: 'Copy',
+    listen: 'Listen',
+    pin: 'Pin on top',
+    unpin: 'Unpin',
+    close: 'Close',
+  },
+
   transcriptPanel: {
     title: 'Live Transcript',
     segmentCount: '{n} segments',

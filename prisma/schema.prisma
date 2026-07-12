@@ -123,6 +123,14 @@ model Session {
   // 在途预留待结算——cron releaseOrphanFullReservations 兜底释放终态(completed/failed)却仍残留的会话。
   fullReservedMinutes       Int       @default(0)
 
+  // 录音音频增强（后处理）：录音结束后送外部 worker 做响度归一化 + 降噪，产出一份
+  // 「并列」的增强版音频（不覆盖 recordingPath），回放时可在原始/增强间切换。
+  // 状态机：pending → processing → completed / failed；任务真源在 JobQueue(type=audio_enhance)，
+  // 这里的状态仅供回放页/列表快速展示。
+  enhancedAudioPath   String?   // e.g., "/{userId}/recordings/{sessionId}-{stamp}.mp4" 或 local: 引用
+  audioEnhanceStatus  String?
+  audioEnhanceError   String?   @db.Text
+
   shareLinks      ShareLink[]
   folders         FolderSession[]
   conversations   Conversation[]
@@ -131,6 +139,7 @@ model Session {
   @@index([userId])
   @@index([asyncTranscribeStatus])
   @@index([fullTranscribeStatus])
+  @@index([audioEnhanceStatus])
 }
 
 model Folder {

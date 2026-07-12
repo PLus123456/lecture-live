@@ -109,6 +109,7 @@ export async function GET(req: Request) {
               maxThinkingDepth: 'high' as const,
               allowRealtimeSummary: true,
               allowFinalSummary: true,
+              allowAudioEnhance: false,
             };
             groups.push({
               key: `custom:${entry.id}`,

@@ -21,6 +21,8 @@ interface GroupPermissions {
   maxThinkingDepth: ThinkingDepthCap; // 'off' 表示禁止思考
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
+  /** 录音音频增强（外部 worker 后处理）；新重资源功能，缺省禁止 */
+  allowAudioEnhance: boolean;
   // ── 用途专用模型（DB model id；空 = 跟随全局该用途默认）──
   realtimeSummaryModelId: string;
   finalSummaryModelId: string;
@@ -46,6 +48,7 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     maxThinkingDepth: 'medium',
     allowRealtimeSummary: true,
     allowFinalSummary: true,
+    allowAudioEnhance: false,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
     chatModelId: '',
@@ -58,6 +61,7 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     maxThinkingDepth: 'high',
     allowRealtimeSummary: true,
     allowFinalSummary: true,
+    allowAudioEnhance: false,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
     chatModelId: '',
@@ -70,6 +74,7 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     maxThinkingDepth: 'high',
     allowRealtimeSummary: true,
     allowFinalSummary: true,
+    allowAudioEnhance: true,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
     chatModelId: '',
@@ -114,6 +119,10 @@ function normalizePermissions(
       typeof p.allowFinalSummary === 'boolean'
         ? p.allowFinalSummary
         : fallback.allowFinalSummary,
+    allowAudioEnhance:
+      typeof p.allowAudioEnhance === 'boolean'
+        ? p.allowAudioEnhance
+        : fallback.allowAudioEnhance,
     realtimeSummaryModelId: coerceSummaryModelId(p.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(p.finalSummaryModelId),
     chatModelId: coerceSummaryModelId(p.chatModelId),
@@ -129,6 +138,8 @@ const CUSTOM_GROUP_FALLBACK: GroupPermissions = {
   maxThinkingDepth: 'high',
   allowRealtimeSummary: true,
   allowFinalSummary: true,
+  // 音频增强与「缺省全开」相反：新重资源功能，缺省禁止（与 userRoles 解析口径一致）
+  allowAudioEnhance: false,
   realtimeSummaryModelId: '',
   finalSummaryModelId: '',
   chatModelId: '',
@@ -184,6 +195,7 @@ function sanitizeFeatureFlags(
   | 'maxThinkingDepth'
   | 'allowRealtimeSummary'
   | 'allowFinalSummary'
+  | 'allowAudioEnhance'
   | 'realtimeSummaryModelId'
   | 'finalSummaryModelId'
   | 'chatModelId'
@@ -201,6 +213,11 @@ function sanitizeFeatureFlags(
       typeof permissions?.allowFinalSummary === 'boolean'
         ? permissions.allowFinalSummary
         : true,
+    // 缺省禁止（新重资源功能），与 userRoles 解析、CUSTOM_GROUP_FALLBACK 同口径
+    allowAudioEnhance:
+      typeof permissions?.allowAudioEnhance === 'boolean'
+        ? permissions.allowAudioEnhance
+        : false,
     realtimeSummaryModelId: coerceSummaryModelId(
       permissions?.realtimeSummaryModelId
     ),

@@ -55,6 +55,7 @@ const JOB_TYPES = [
   'storage_cleanup',
   'storage_migration',
   'billing_maintenance',
+  'audio_enhance',
 ] as const;
 
 const JOB_STATUSES = ['SUBMITTED', 'PENDING', 'PROCESSING', 'SUCCESS', 'FAILED'] as const;
@@ -69,6 +70,7 @@ const TYPE_I18N_MAP: Record<string, string> = {
   storage_cleanup: 'jobQueue.typeStorageCleanup',
   storage_migration: 'jobQueue.typeStorageMigration',
   billing_maintenance: 'jobQueue.typeBillingMaintenance',
+  audio_enhance: 'jobQueue.typeAudioEnhance',
 };
 
 export default function JobQueuePanel() {

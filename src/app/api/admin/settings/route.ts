@@ -18,6 +18,7 @@ import { migrateLocalToCloudreve } from '@/lib/storage/migration';
 import {
   clearPersistedTokens as clearCloudreveTokens,
   invalidateCloudreveConfigCache,
+  validateCloudreveBaseUrl,
 } from '@/lib/storage/cloudreve';
 
 // 获取所有站点设置
@@ -118,6 +119,13 @@ export async function PUT(req: Request) {
       'chat_files_quota_admin_mb',
       // 异步上传转录计费倍率（批2）
       'async_upload_billing_multiplier',
+      // 录音音频增强（外部 worker 后处理）
+      'audio_enhance_enabled',
+      'audio_enhance_worker_url',
+      'audio_enhance_worker_token',
+      'audio_enhance_target_lufs',
+      'audio_enhance_atten_lim_db',
+      'audio_enhance_concurrency',
     ]);
 
     // 过滤非法键
@@ -184,6 +192,34 @@ export async function PUT(req: Request) {
 
       // 替换 entries 中的原值，后续 flatMap 统一处理
       entries[backupsIdx] = ['site_url_backups', JSON.stringify(cleaned)];
+    }
+
+    // 音频增强 worker 地址：格式 + 私网过滤（防 SSRF，与 Soniox/Cloudreve 同口径），
+    // 空串 = 清除配置放行；合法值去掉尾部斜杠后落库。
+    const workerUrlIdx = entries.findIndex(
+      ([key]) => key === 'audio_enhance_worker_url'
+    );
+    if (workerUrlIdx >= 0) {
+      const rawUrl = entries[workerUrlIdx][1];
+      const trimmedUrl = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+      if (trimmedUrl) {
+        try {
+          validateCloudreveBaseUrl(trimmedUrl);
+        } catch (error) {
+          return NextResponse.json(
+            {
+              error: `音频增强 worker 地址不合法: ${
+                error instanceof Error ? error.message : 'invalid URL'
+              }`,
+            },
+            { status: 400 }
+          );
+        }
+      }
+      entries[workerUrlIdx] = [
+        'audio_enhance_worker_url',
+        trimmedUrl.replace(/\/+$/, ''),
+      ];
     }
 
     // 记录切换前的存储模式，用于检测是否需要迁移

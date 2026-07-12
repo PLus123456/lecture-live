@@ -48,6 +48,7 @@ import {
   Loader2,
   RefreshCw,
   Layers,
+  AudioLines,
 } from 'lucide-react';
 import {
   triggerFullTranscribe,
@@ -74,6 +75,8 @@ interface SessionData {
   recordingPath?: string | null;
   fullTranscribeStatus?: string | null;
   fullTranscriptPath?: string | null;
+  audioEnhanceStatus?: string | null;
+  enhancedAudioPath?: string | null;
 }
 
 // 完整版补全转录的默认计费倍率（异步文件转录，admin 可在站点设置里调整）。
@@ -279,6 +282,18 @@ export default function PlaybackPage() {
   const fullPollAbortRef = useRef<AbortController | null>(null);
   const fullInitializedRef = useRef(false);
 
+  // 音频增强（响度归一化+降噪，外部 worker）：触发 → 轮询 → 「原声/增强」音源切换
+  const [enhanceStatus, setEnhanceStatus] = useState<string | null>(null);
+  const [enhanceReady, setEnhanceReady] = useState(false);
+  const [enhanceAvailable, setEnhanceAvailable] = useState(false);
+  const [enhanceTriggering, setEnhanceTriggering] = useState(false);
+  // null = 尚未决定（等 session 加载完，增强就绪则默认增强），音频加载 effect 据此等待
+  const [audioVariant, setAudioVariant] = useState<'original' | 'enhanced' | null>(null);
+  const enhancePollAbortRef = useRef<AbortController | null>(null);
+  const enhanceInitializedRef = useRef(false);
+  // 切换音源时带着当前播放进度恢复（音频重新加载后 seek 回原位置）
+  const pendingVariantResumeMsRef = useRef<number | null>(null);
+
   // Audio player state
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTimeMs, setCurrentTimeMs] = useState(0);
@@ -293,6 +308,8 @@ export default function PlaybackPage() {
   const recordingBlobRef = useRef<Blob | null>(null);
   const activeAudioIndexRef = useRef(0);
   const isPlayingRef = useRef(false);
+  // currentTimeMs 的 ref 镜像：切音源等低频回调里读进度，避免把秒级变化的 state 挂进依赖
+  const currentTimeMsRef = useRef(0);
   const playbackClockRef = useRef<number | null>(null);
   const playbackClockStateRef = useRef<PlaybackClockState | null>(null);
   const shouldResumePlaybackRef = useRef(false);
@@ -413,13 +430,17 @@ export default function PlaybackPage() {
   useEffect(() => {
     if (!isShareMode && (!token || !sessionId)) return;
     if (isShareMode && !shareToken) return;
+    // 音源未决定（等 session 加载判断增强版是否就绪）时先不加载，避免白下载一遍原始音频
+    if (audioVariant === null) return;
     let disposed = false;
     const createdUrls: string[] = [];
     const abortController = new AbortController();
 
     const audioUrl = isShareMode
       ? `/api/share/view/${encodeURIComponent(shareToken!)}/audio`
-      : `/api/sessions/${sessionId}/audio`;
+      : `/api/sessions/${sessionId}/audio${
+          audioVariant === 'enhanced' ? '?variant=enhanced' : ''
+        }`;
 
     fetch(audioUrl, {
       ...(token && !isShareMode ? { headers: { Authorization: `Bearer ${token}` } } : {}),
@@ -498,8 +519,25 @@ export default function PlaybackPage() {
         });
 
         setAudioSegments(nextSegments);
-        setActiveAudioIndex(0);
-        setCurrentTimeMs(0);
+
+        // 切换音源：恢复切换前的播放进度（找到所属段 + 段内偏移，交给 onLoadedMetadata 消费）
+        const resumeMs = pendingVariantResumeMsRef.current;
+        pendingVariantResumeMsRef.current = null;
+        if (resumeMs !== null && resumeMs > 0 && nextSegments.length > 0) {
+          const idx = nextSegments.findIndex(
+            (seg) => resumeMs < seg.startOffsetMs + seg.durationMs
+          );
+          const target = idx >= 0 ? idx : nextSegments.length - 1;
+          setActiveAudioIndex(target);
+          setCurrentTimeMs(resumeMs);
+          pendingSeekMsRef.current = Math.max(
+            0,
+            resumeMs - nextSegments[target].startOffsetMs
+          );
+        } else {
+          setActiveAudioIndex(0);
+          setCurrentTimeMs(0);
+        }
         setIsPlaying(false);
       })
       .catch((err) => {
@@ -514,7 +552,7 @@ export default function PlaybackPage() {
       setAudioSegments([]);
       setActiveAudioIndex(0);
     };
-  }, [token, sessionId, isShareMode, shareToken]);
+  }, [token, sessionId, isShareMode, shareToken, audioVariant]);
 
   // Sync to stores (for ChatTab / ExportModal)
   useEffect(() => {
@@ -586,6 +624,10 @@ export default function PlaybackPage() {
   useEffect(() => {
     isPlayingRef.current = isPlaying;
   }, [isPlaying]);
+
+  useEffect(() => {
+    currentTimeMsRef.current = currentTimeMs;
+  }, [currentTimeMs]);
 
   // 从 localStorage 恢复音量（仅初始化时执行一次，先于持久化）
   const volumeRestoredRef = useRef(false);
@@ -926,6 +968,15 @@ export default function PlaybackPage() {
       ? t('playback.fullTranscribe.regenerate')
       : t('playback.fullTranscribe.button');
 
+  // 音频增强：进行中（排队/处理中）与入口门控（与完整版转录同口径）
+  const enhanceInProgress =
+    enhanceStatus === 'pending' || enhanceStatus === 'processing';
+  const canEnhanceAudio =
+    !isShareMode &&
+    !!session &&
+    (session.status === 'COMPLETED' || session.status === 'ARCHIVED') &&
+    Boolean(session.recordingPath);
+
   // Determine which segment is "active" based on current playback time
   const activeSegmentId = displaySegments.find(
     (s) => s.globalStartMs <= currentTimeMs && s.globalEndMs >= currentTimeMs
@@ -1191,6 +1242,128 @@ export default function PlaybackPage() {
     [fullLoaded, loadFullTranscriptData]
   );
 
+  // ── 音频增强：状态轮询 / 手动触发 / 音源切换 ──
+
+  // 轮询 enhance-status（5s 间隔；该端点会顺便驱动服务端状态机推进）。
+  // 终态即停：completed 提示可切换增强版，failed 提示错误（按钮变重试）。
+  const startEnhancePoll = useCallback(() => {
+    if (!token || !sessionId) return;
+    enhancePollAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    enhancePollAbortRef.current = ctrl;
+    const tick = async () => {
+      if (ctrl.signal.aborted) return;
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}/enhance-status`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: ctrl.signal,
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (ctrl.signal.aborted) return;
+          setEnhanceStatus(data.status ?? null);
+          setEnhanceAvailable(Boolean(data.available));
+          setEnhanceReady(Boolean(data.enhancedAudioReady));
+          if (data.status === 'completed') {
+            // 不自动切换音源（可能正在听原声），toast 引导用户手动切
+            toast.success(t('playback.audioEnhance.doneToast'));
+            return;
+          }
+          if (data.status === 'failed') {
+            toast.error(
+              t('playback.audioEnhance.failToast'),
+              data.error || undefined
+            );
+            return;
+          }
+        }
+      } catch {
+        // 网络抖动：继续下一轮
+      }
+      if (!ctrl.signal.aborted) {
+        setTimeout(() => void tick(), 5000);
+      }
+    };
+    void tick();
+  }, [token, sessionId, t]);
+
+  // 手动触发增强（免费路径无确认弹窗；已在途时服务端幂等返回现状）
+  const handleTriggerEnhance = useCallback(async () => {
+    if (!sessionId || !token) return;
+    setEnhanceTriggering(true);
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/enhance-audio`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        toast.error(
+          t('playback.audioEnhance.triggerFail'),
+          data?.error || undefined
+        );
+        return;
+      }
+      setEnhanceStatus(data?.status ?? 'pending');
+      startEnhancePoll();
+    } catch {
+      toast.error(t('playback.audioEnhance.triggerFail'));
+    } finally {
+      setEnhanceTriggering(false);
+    }
+  }, [sessionId, token, startEnhancePoll, t]);
+
+  // 切换「原声 / 增强」音源：带着当前进度重新加载（audioVariant 变化触发音频 effect）
+  const handleSwitchAudioVariant = useCallback(
+    (variant: 'original' | 'enhanced') => {
+      setAudioVariant((prev) => {
+        if (prev === variant) return prev;
+        pendingVariantResumeMsRef.current = currentTimeMsRef.current;
+        return variant;
+      });
+    },
+    []
+  );
+
+  // 初始化：会话加载后决定初始音源（增强版就绪则默认增强），进行中则接管轮询（刷新恢复）。
+  // 分享模式不查状态：分享音频端点在服务端就已优先返回增强版。
+  useEffect(() => {
+    if (!session || enhanceInitializedRef.current) return;
+    enhanceInitializedRef.current = true;
+    if (isShareMode) {
+      setAudioVariant('original');
+      return;
+    }
+    const initial = session.audioEnhanceStatus ?? null;
+    const ready = Boolean(session.enhancedAudioPath);
+    setEnhanceStatus(initial);
+    setEnhanceReady(ready);
+    setAudioVariant(ready ? 'enhanced' : 'original');
+    if (initial === 'pending' || initial === 'processing') {
+      startEnhancePoll();
+    } else {
+      // 非进行中也拉一次：拿 available（按钮显隐）并对账最新状态
+      void fetch(`/api/sessions/${sessionId}/enhance-status`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (!data) return;
+          setEnhanceAvailable(Boolean(data.available));
+          setEnhanceStatus(data.status ?? null);
+          setEnhanceReady(Boolean(data.enhancedAudioReady));
+        })
+        .catch(() => undefined);
+    }
+  }, [session, isShareMode, sessionId, token, startEnhancePoll]);
+
+  // 卸载时中止在途轮询
+  useEffect(() => {
+    return () => {
+      enhancePollAbortRef.current?.abort();
+    };
+  }, []);
+
   if (!isShareMode && (!user || !token)) {
     return (
         <div className="h-screen flex items-center justify-center bg-cream-50">
@@ -1421,6 +1594,74 @@ export default function PlaybackPage() {
             </div>
 
             <div className="flex items-center gap-2">
+              {/* 音频增强：就绪→「原声/增强」切换；进行中→加载态；可用未生成→触发按钮 */}
+              {canEnhanceAudio && enhanceReady && (
+                <div
+                  className="inline-flex items-center rounded-lg bg-cream-100 p-0.5"
+                  role="tablist"
+                  aria-label={t('playback.audioEnhance.toggleLabel')}
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={audioVariant === 'original'}
+                    data-testid="audio-original"
+                    onClick={() => handleSwitchAudioVariant('original')}
+                    className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                      audioVariant === 'original'
+                        ? 'bg-white text-charcoal-700 shadow-sm'
+                        : 'text-charcoal-400 hover:text-charcoal-600'
+                    }`}
+                  >
+                    {t('playback.audioEnhance.original')}
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={audioVariant === 'enhanced'}
+                    data-testid="audio-enhanced"
+                    onClick={() => handleSwitchAudioVariant('enhanced')}
+                    className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors flex items-center gap-1 ${
+                      audioVariant === 'enhanced'
+                        ? 'bg-white text-rust-600 shadow-sm'
+                        : 'text-charcoal-400 hover:text-charcoal-600'
+                    }`}
+                  >
+                    <AudioLines className="w-3 h-3" />
+                    {t('playback.audioEnhance.enhanced')}
+                  </button>
+                </div>
+              )}
+              {canEnhanceAudio && !enhanceReady && enhanceInProgress && (
+                <span
+                  className="text-xs text-charcoal-400 flex items-center gap-1.5"
+                  data-testid="enhance-processing"
+                >
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  {t('playback.audioEnhance.processing')}
+                </span>
+              )}
+              {canEnhanceAudio &&
+                !enhanceReady &&
+                !enhanceInProgress &&
+                enhanceAvailable && (
+                  <button
+                    className="btn-ghost text-xs flex items-center gap-1.5"
+                    onClick={handleTriggerEnhance}
+                    disabled={enhanceTriggering}
+                    data-testid="enhance-audio-btn"
+                    title={t('playback.audioEnhance.hint')}
+                  >
+                    {enhanceTriggering ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <AudioLines className="w-3.5 h-3.5" />
+                    )}
+                    {enhanceStatus === 'failed'
+                      ? t('playback.audioEnhance.retry')
+                      : t('playback.audioEnhance.button')}
+                  </button>
+                )}
               {!isShareMode &&
                 (session.status === 'COMPLETED' || session.status === 'ARCHIVED') &&
                 Boolean(session.recordingPath) && (

@@ -14,6 +14,8 @@ export interface UserFeatureFlags {
   allowRealtimeSummary: boolean;
   /** 是否允许总摘要（结束时结构化报告） */
   allowFinalSummary: boolean;
+  /** 是否允许录音音频增强（注意：与其它开关相反，缺省禁止 → UI 用 === true 判断） */
+  allowAudioEnhance?: boolean;
 }
 
 export interface UserQuotas {

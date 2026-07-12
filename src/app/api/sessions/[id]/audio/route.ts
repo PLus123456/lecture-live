@@ -217,10 +217,18 @@ export async function GET(
 
   const range = req.headers.get('range');
 
+  // 音频增强：?variant=enhanced 且增强版已就绪时，把读取引用换成 enhancedAudioPath，
+  // 复用下方全部 Range/流式/回退逻辑；未就绪回落原始录音（前端先查 enhance-status 再切）。
+  const variant = new URL(req.url).searchParams.get('variant');
+  const audioSession =
+    variant === 'enhanced' && session.enhancedAudioPath
+      ? { ...session, recordingPath: session.enhancedAudioPath }
+      : session;
+
   try {
     // P2-2：先解析录音物理位置，按 Cloudreve/本地分别流式读取，不再一次性 loadSessionAudioArtifact
     // 把整段录音读进内存再 subarray（长录音 + 并发 Range 会放大进程内存直至 OOM）。
-    const location = await resolveSessionAudioLocation(session);
+    const location = await resolveSessionAudioLocation(audioSession);
 
     // Cloudreve 远程：透传上游 range/stream，失败落到下方本地/缓冲回退。
     if (location?.kind === 'cloudreve') {
@@ -299,7 +307,7 @@ export async function GET(
     }
 
     // 回退：Cloudreve 流式失败或无法定位物理文件时，退回缓冲读取（含旧候选文件回退语义）。
-    const artifact = await loadSessionAudioArtifact(session);
+    const artifact = await loadSessionAudioArtifact(audioSession);
     if (!artifact) {
       return NextResponse.json({ error: 'Audio not found' }, { status: 404 });
     }

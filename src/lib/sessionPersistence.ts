@@ -56,7 +56,11 @@ export interface LoadedBinaryArtifact {
 type SessionArtifactsSource = Pick<
   Session,
   'id' | 'userId' | 'recordingPath' | 'transcriptPath' | 'summaryPath'
-> & { reportPath?: string | null; fullTranscriptPath?: string | null };
+> & {
+  reportPath?: string | null;
+  fullTranscriptPath?: string | null;
+  enhancedAudioPath?: string | null;
+};
 
 function normalizeSessionId(sessionId: string): string {
   return sessionId.replace(/[^a-zA-Z0-9_-]/g, '');
@@ -495,6 +499,8 @@ export async function deleteSessionArtifacts(
   const ctx = await loadCloudreveContext();
   const targets: Array<[SessionArtifactCategory, string | null | undefined]> = [
     ['recordings', session.recordingPath],
+    // 音频增强产物与原录音同在 recordings 类别下（版本化文件名），需单独一条清理
+    ['recordings', session.enhancedAudioPath],
     ['transcripts', session.transcriptPath],
     ['summaries', session.summaryPath],
     ['reports', session.reportPath],

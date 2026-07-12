@@ -1,0 +1,36 @@
+# LectureLive 音频增强 worker 的 systemd 单元
+# 用法：填好 AUDIO_WORKER_TOKEN 后
+#   sudo cp lecturelive-enhance-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now lecturelive-enhance-worker
+[Unit]
+Description=LectureLive Audio Enhance Worker
+After=network.target
+
+[Service]
+Type=simple
+User=llworker
+Group=llworker
+WorkingDirectory=/opt/lecturelive-worker
+ExecStart=/usr/bin/node /opt/lecturelive-worker/audio-enhance-worker.mjs
+Restart=always
+RestartSec=5
+
+# ==== 必改：与主服务器管理后台里配置的 token 保持一致（≥32 字符）====
+Environment=AUDIO_WORKER_TOKEN=change-me-to-a-64-char-random-hex-string
+Environment=AUDIO_WORKER_PORT=8790
+Environment=AUDIO_WORKER_HOST=127.0.0.1
+Environment=AUDIO_WORKER_DATA_DIR=/opt/lecturelive-worker/data
+Environment=AUDIO_WORKER_CONCURRENCY=1
+
+# 安全加固（与主项目 deploy/ 下单元保持同风格）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/lecturelive-worker/data
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

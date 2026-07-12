@@ -81,6 +81,12 @@ function createSiteSettings(overrides: Partial<SiteSettings> = {}): SiteSettings
     chat_files_quota_pro_mb: 1024,
     chat_files_quota_admin_mb: 10240,
   async_upload_billing_multiplier: 0.8,
+    audio_enhance_enabled: false,
+    audio_enhance_worker_url: '',
+    audio_enhance_worker_token: '',
+    audio_enhance_target_lufs: -14,
+    audio_enhance_atten_lim_db: 30,
+    audio_enhance_concurrency: 1,
     ...overrides,
   };
 }

@@ -1445,15 +1445,21 @@ function AudioEnhancePanel({
 }) {
   const { t } = useI18n();
   const [verifying, setVerifying] = useState(false);
-  const [verifyResult, setVerifyResult] = useState<{
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+  const [verifyWorkers, setVerifyWorkers] = useState<Array<{
+    url: string;
     ok: boolean;
-    message: string;
-  } | null>(null);
+    version?: string;
+    engines?: { ffmpeg: boolean; deepFilter: boolean };
+    queue?: { running: number; queued: number };
+    error?: string;
+  }> | null>(null);
 
-  // 测试连接：带上表单当前值（token 是掩码时后端自动回落已保存值）
+  // 测试连接：带上表单当前值（token 是掩码时后端自动回落已保存值），多台逐一展示
   const handleVerify = async () => {
     setVerifying(true);
-    setVerifyResult(null);
+    setVerifyError(null);
+    setVerifyWorkers(null);
     try {
       const res = await fetch('/api/admin/audio-enhance/verify', {
         method: 'POST',
@@ -1464,22 +1470,13 @@ function AudioEnhancePanel({
         }),
       });
       const data = await res.json().catch(() => null);
-      if (data?.ok) {
-        const deepFilter = data.engines?.deepFilter
-          ? t('adminSettings.audioEnhanceVerifyDeepFilter')
-          : t('adminSettings.audioEnhanceVerifyAfftdnOnly');
-        setVerifyResult({
-          ok: true,
-          message: `${t('adminSettings.audioEnhanceVerifyOk')} (v${data.version ?? '?'}, ${deepFilter})`,
-        });
+      if (Array.isArray(data?.workers)) {
+        setVerifyWorkers(data.workers);
       } else {
-        setVerifyResult({
-          ok: false,
-          message: data?.error ?? t('common.networkError'),
-        });
+        setVerifyError(data?.error ?? t('common.networkError'));
       }
     } catch {
-      setVerifyResult({ ok: false, message: t('common.networkError') });
+      setVerifyError(t('common.networkError'));
     } finally {
       setVerifying(false);
     }
@@ -1503,10 +1500,11 @@ function AudioEnhancePanel({
         label={t('adminSettings.audioEnhanceWorkerUrl')}
         description={t('adminSettings.audioEnhanceWorkerUrlDesc')}
       >
-        <TextInput
+        <TextAreaInput
           value={settings.audio_enhance_worker_url}
           onChange={(v) => onChange('audio_enhance_worker_url', v)}
-          placeholder="https://enhance.example.com"
+          placeholder={'https://enhance-1.example.com\nhttps://enhance-2.example.com'}
+          rows={2}
         />
       </SettingField>
       <SettingField
@@ -1533,14 +1531,41 @@ function AudioEnhancePanel({
                 ? t('common.loading')
                 : t('adminSettings.audioEnhanceVerify')}
             </button>
-            {verifyResult && (
-              <span
-                className={`text-xs ${verifyResult.ok ? 'text-green-600' : 'text-rust-500'}`}
-              >
-                {verifyResult.message}
-              </span>
+            {verifyError && (
+              <span className="text-xs text-rust-500">{verifyError}</span>
             )}
           </div>
+          {/* 逐台探测结果（多机负载均衡：每台各自的可达性/引擎/队列） */}
+          {verifyWorkers && (
+            <ul className="space-y-1">
+              {verifyWorkers.map((w) => (
+                <li
+                  key={w.url}
+                  className="text-xs flex items-center gap-2 min-w-0"
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                      w.ok ? 'bg-green-500' : 'bg-rust-500'
+                    }`}
+                  />
+                  <span className="text-charcoal-600 dark:text-cream-200 truncate">
+                    {w.url}
+                  </span>
+                  {w.ok ? (
+                    <span className="text-green-600 flex-shrink-0">
+                      {t('adminSettings.audioEnhanceVerifyOk')} (v{w.version ?? '?'},{' '}
+                      {w.engines?.deepFilter
+                        ? t('adminSettings.audioEnhanceVerifyDeepFilter')
+                        : t('adminSettings.audioEnhanceVerifyAfftdnOnly')}
+                      {w.queue ? `, ${w.queue.running + w.queue.queued} in queue` : ''})
+                    </span>
+                  ) : (
+                    <span className="text-rust-500 flex-shrink-0">{w.error}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       </SettingField>
       <SettingField

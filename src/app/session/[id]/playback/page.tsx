@@ -287,6 +287,8 @@ export default function PlaybackPage() {
   const [enhanceReady, setEnhanceReady] = useState(false);
   const [enhanceAvailable, setEnhanceAvailable] = useState(false);
   const [enhanceTriggering, setEnhanceTriggering] = useState(false);
+  // worker 实时进度（0-100；enhance-status 透传，拿不到时为 null 只显示"处理中"）
+  const [enhanceProgress, setEnhanceProgress] = useState<number | null>(null);
   // null = 尚未决定（等 session 加载完，增强就绪则默认增强），音频加载 effect 据此等待
   const [audioVariant, setAudioVariant] = useState<'original' | 'enhanced' | null>(null);
   const enhancePollAbortRef = useRef<AbortController | null>(null);
@@ -1264,6 +1266,9 @@ export default function PlaybackPage() {
           setEnhanceStatus(data.status ?? null);
           setEnhanceAvailable(Boolean(data.available));
           setEnhanceReady(Boolean(data.enhancedAudioReady));
+          setEnhanceProgress(
+            typeof data.workerProgress === 'number' ? data.workerProgress : null
+          );
           if (data.status === 'completed') {
             // 不自动切换音源（可能正在听原声），toast 引导用户手动切
             toast.success(t('playback.audioEnhance.doneToast'));
@@ -1457,6 +1462,16 @@ export default function PlaybackPage() {
           onSwitchTranscriptView={handleSwitchTranscriptView}
           displaySegments={displaySegments}
           fullLoaded={fullLoaded}
+          canEnhanceAudio={canEnhanceAudio}
+          enhanceAvailable={enhanceAvailable}
+          enhanceReady={enhanceReady}
+          enhanceInProgress={enhanceInProgress}
+          enhanceTriggering={enhanceTriggering}
+          enhanceStatus={enhanceStatus}
+          enhanceProgress={enhanceProgress}
+          onTriggerEnhance={handleTriggerEnhance}
+          audioVariant={audioVariant}
+          onSwitchAudioVariant={handleSwitchAudioVariant}
         />
 
         {/* 音频元素 — 移动端也需要 */}
@@ -1639,6 +1654,9 @@ export default function PlaybackPage() {
                 >
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   {t('playback.audioEnhance.processing')}
+                  {enhanceProgress !== null && enhanceProgress > 0 && (
+                    <span className="tabular-nums">{Math.round(enhanceProgress)}%</span>
+                  )}
                 </span>
               )}
               {canEnhanceAudio &&

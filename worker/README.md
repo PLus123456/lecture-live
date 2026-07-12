@@ -72,6 +72,9 @@ curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:8790/healthz
 # → {"ok":true,"version":...,"engines":{"ffmpeg":true,"deepFilter":true},...}
 ```
 
+nginx 配好后用浏览器直接打开 `https://你的域名/`，看到「✅ OK」页面即部署成功
+（根路径与 /healthz 无需鉴权，方便自检；任务端点仍全部要求 Bearer token）。
+
 装好后配 nginx TLS 反代（见下），在 LectureLive 管理后台 → 设置 → 音频增强里填 `https://你的域名` 和 token，点"测试连接"，最后在「用户组」里为需要的组打开音频增强能力。
 
 ## nginx 反代示例
@@ -115,6 +118,14 @@ server {
 | `AUDIO_WORKER_JOB_TIMEOUT_MINUTES` | `150` | 单步处理超时 |
 | `FFMPEG_BIN` / `FFPROBE_BIN` | `ffmpeg` / `ffprobe` | 可执行文件路径 |
 | `DEEP_FILTER_BIN` | （PATH 查找） | deep-filter 路径；不配则找 `deep-filter`/`deepFilter` |
+
+## 多台 worker（负载均衡）
+
+有多台机器时，把每台各自装好（`install.sh` 重复即可，**token 手动改成同一个值**），然后在管理后台
+的 Worker 地址里一行一个填入全部 HTTPS 地址。主服务器派发任务时会并行探活、把任务派给
+「实际队列 + 在途任务」最少的可达节点，并把任务与节点绑定（后续轮询/取回都走同一台）；
+某台宕机/队列满时任务自动改派其它节点，全部不可达则在主服务器队列里等待。
+「派发并发数」语义是**每台**的并发（总在途 = 台数 × 该值）。
 
 ## 处理管线与耗时预期
 

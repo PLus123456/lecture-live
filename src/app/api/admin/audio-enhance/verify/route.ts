@@ -2,13 +2,13 @@ import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { getSiteSettings, SETTING_SECRET_MASK } from '@/lib/siteSettings';
 import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
-import { pingEnhanceWorker } from '@/lib/audio/enhanceWorkerClient';
+import { pingEnhanceWorker, parseWorkerUrls } from '@/lib/audio/enhanceWorkerClient';
 
 /**
- * POST /api/admin/audio-enhance/verify — 音频增强 worker 连通性测试。
- * body 可带 { workerUrl, workerToken }（表单里未保存的值优先）；token 为空或脱敏占位
- * 时回落已保存的值，与设置 PUT 的「掩码=保持原值」语义一致。
- * 返回 worker 的引擎可用性（ffmpeg / deep-filter）与队列状态，供管理后台展示。
+ * POST /api/admin/audio-enhance/verify — 音频增强 worker 连通性测试（支持多台）。
+ * body 可带 { workerUrl, workerToken }（表单里未保存的值优先）；workerUrl 支持逗号/换行
+ * 分隔多台，逐台并行探测。token 为空或脱敏占位时回落已保存的值，与设置 PUT 的
+ * 「掩码=保持原值」语义一致。返回 { ok（全部可达）, workers: [逐台结果] }。
  */
 export async function POST(req: Request) {
   const { response } = await requireAdminAccess(req, {
@@ -26,9 +26,9 @@ export async function POST(req: Request) {
   }
 
   const settings = await getSiteSettings({ fresh: true });
-  const rawUrl =
+  const rawUrls =
     typeof body.workerUrl === 'string' && body.workerUrl.trim()
-      ? body.workerUrl.trim()
+      ? body.workerUrl
       : settings.audio_enhance_worker_url;
   const rawToken =
     typeof body.workerToken === 'string' &&
@@ -37,49 +37,53 @@ export async function POST(req: Request) {
       ? body.workerToken.trim()
       : settings.audio_enhance_worker_token;
 
-  if (!rawUrl) {
+  const urls = parseWorkerUrls(rawUrls);
+  if (urls.length === 0) {
     return NextResponse.json({ ok: false, error: 'worker 地址未配置' }, { status: 400 });
   }
   if (!rawToken) {
     return NextResponse.json({ ok: false, error: 'worker token 未配置' }, { status: 400 });
   }
-  try {
-    validateCloudreveBaseUrl(rawUrl);
-  } catch (error) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: `worker 地址不合法: ${error instanceof Error ? error.message : 'invalid URL'}`,
-      },
-      { status: 400 }
-    );
-  }
-
-  try {
-    const health = await pingEnhanceWorker({
-      baseUrl: rawUrl.replace(/\/+$/, ''),
-      token: rawToken,
-    });
-    // 未带鉴权详情（token 错也会拿到 {ok:true} 裸响应）：engines 缺失即视为鉴权失败
-    if (!health.engines) {
+  for (const url of urls) {
+    try {
+      validateCloudreveBaseUrl(url);
+    } catch (error) {
       return NextResponse.json(
-        { ok: false, error: 'worker 可达但 token 鉴权失败' },
-        { status: 200 }
+        {
+          ok: false,
+          error: `worker 地址不合法 (${url}): ${
+            error instanceof Error ? error.message : 'invalid URL'
+          }`,
+        },
+        { status: 400 }
       );
     }
-    return NextResponse.json({
-      ok: true,
-      version: health.version,
-      engines: health.engines,
-      queue: health.queue,
-    });
-  } catch (error) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: `无法连接 worker: ${error instanceof Error ? error.message : 'unknown error'}`,
-      },
-      { status: 200 }
-    );
   }
+
+  const workers = await Promise.all(
+    urls.map(async (url) => {
+      try {
+        const health = await pingEnhanceWorker({ baseUrl: url, token: rawToken });
+        // 未带鉴权详情（token 错也会拿到 {ok:true} 裸响应）：engines 缺失即视为鉴权失败
+        if (!health.engines) {
+          return { url, ok: false, error: 'worker 可达但 token 鉴权失败' };
+        }
+        return {
+          url,
+          ok: true,
+          version: health.version,
+          engines: health.engines,
+          queue: health.queue,
+        };
+      } catch (error) {
+        return {
+          url,
+          ok: false,
+          error: `无法连接: ${error instanceof Error ? error.message : 'unknown error'}`,
+        };
+      }
+    })
+  );
+
+  return NextResponse.json({ ok: workers.every((w) => w.ok), workers });
 }

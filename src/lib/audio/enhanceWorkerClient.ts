@@ -67,22 +67,56 @@ export class EnhanceWorkerError extends Error {
   }
 }
 
-/** 读站点设置组装 worker 配置；未启用或未配置返回 null（调用方据此短路）。 */
-export async function getEnhanceWorkerConfig(): Promise<
-  (EnhanceWorkerConfig & { targetLufs: number; attenLimDb: number; concurrency: number }) | null
-> {
+/** 多台 worker 的整体配置（负载均衡的单位）。所有台共用同一 token。 */
+export interface EnhanceFleetConfig {
+  /** 1..N 台 worker 的基址（已去尾斜杠、去重，保持配置顺序） */
+  workerUrls: string[];
+  token: string;
+  targetLufs: number;
+  attenLimDb: number;
+  /** 每台 worker 的并发上限（总在途 = 台数 × 此值） */
+  concurrency: number;
+}
+
+/** 把 `audio_enhance_worker_url` 的值解析成 URL 列表（逗号/换行/空白分隔，去重去尾斜杠）。 */
+export function parseWorkerUrls(raw: string): string[] {
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const piece of raw.split(/[\s,]+/)) {
+    const url = piece.trim().replace(/\/+$/, '');
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    urls.push(url);
+  }
+  return urls;
+}
+
+/** 读站点设置组装 worker 集群配置；未启用或未配置返回 null（调用方据此短路）。 */
+export async function getEnhanceFleetConfig(): Promise<EnhanceFleetConfig | null> {
   const settings = await getSiteSettings();
-  const baseUrl = settings.audio_enhance_worker_url.trim().replace(/\/+$/, '');
-  if (!settings.audio_enhance_enabled || !baseUrl || !settings.audio_enhance_worker_token) {
+  const workerUrls = parseWorkerUrls(settings.audio_enhance_worker_url);
+  if (
+    !settings.audio_enhance_enabled ||
+    workerUrls.length === 0 ||
+    !settings.audio_enhance_worker_token
+  ) {
     return null;
   }
   return {
-    baseUrl,
+    workerUrls,
     token: settings.audio_enhance_worker_token,
     targetLufs: settings.audio_enhance_target_lufs,
     attenLimDb: settings.audio_enhance_atten_lim_db,
     concurrency: settings.audio_enhance_concurrency,
   };
+}
+
+/** 取集群中某一台的单机连接配置（客户端各函数的入参单位仍是单台）。 */
+export function workerConfigFor(
+  fleet: Pick<EnhanceFleetConfig, 'token'>,
+  baseUrl: string
+): EnhanceWorkerConfig {
+  return { baseUrl, token: fleet.token };
 }
 
 function authHeaders(config: EnhanceWorkerConfig): Record<string, string> {
@@ -117,11 +151,14 @@ async function requestJson<T>(
   return (await res.json()) as T;
 }
 
-/** 探活 + 引擎/队列详情（admin「测试连接」与派发前预检共用）。 */
+/** 探活 + 引擎/队列详情（admin「测试连接」与派发前选台共用）。 */
 export async function pingEnhanceWorker(
-  config: EnhanceWorkerConfig
+  config: EnhanceWorkerConfig,
+  options?: { timeoutMs?: number }
 ): Promise<EnhanceWorkerHealth> {
-  return requestJson<EnhanceWorkerHealth>(config, '/healthz', { timeoutMs: 10_000 });
+  return requestJson<EnhanceWorkerHealth>(config, '/healthz', {
+    timeoutMs: options?.timeoutMs ?? 10_000,
+  });
 }
 
 /** 上传原始音频（整包 Buffer；录音已按现有链路整包读出，此处不再重复流式化）。 */

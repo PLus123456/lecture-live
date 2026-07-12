@@ -7,10 +7,11 @@ import {
   pickDefaultModelIdsByPurpose,
 } from '@/lib/llm/defaults';
 import { serializeProviderForAdmin } from '@/lib/llm/providerAdmin';
+import { ensureLlmRegistry } from '@/lib/llm/registry';
 import { logAction } from '@/lib/auditLog';
 import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
 
-// 获取所有 LLM 供应商及其模型
+// 获取所有 LLM 供应商及其模型（模型库条目 + 用途路由行）
 export async function GET(req: Request) {
   const { response } = await requireAdminAccess(req, {
     scope: 'admin:llm-providers:list',
@@ -21,10 +22,21 @@ export async function GET(req: Request) {
   }
 
   try {
+    // 惰性迁移：把历史「无 registry」的路由行归并出模型库条目（幂等，无待迁移行时只花一次 count）
+    await ensureLlmRegistry();
+
     const providers = await prisma.llmProvider.findMany({
       include: {
         models: {
           orderBy: { sortOrder: 'asc' },
+        },
+        registryModels: {
+          orderBy: { sortOrder: 'asc' },
+          include: {
+            routes: {
+              select: { id: true, purpose: true, isDefault: true },
+            },
+          },
         },
       },
       orderBy: { sortOrder: 'asc' },

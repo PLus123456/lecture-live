@@ -356,16 +356,37 @@ async function handleConfigureLlm(body: {
       },
     });
 
-    // 创建模型配置
+    // 创建模型配置：先登记模型库条目（规格真源），再按用途建路由行（同一模型多用途共用条目）
     if (p.models && p.models.length > 0) {
+      const registryByKey = new Map<string, string>(); // modelId::displayName → registryId
       for (let j = 0; j < p.models.length; j++) {
         const m = p.models[j];
+        const purpose =
+          (m.purpose as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING') ||
+          'CHAT';
+        const registryKey = `${m.modelId}::${m.displayName}`;
+        let registryId = registryByKey.get(registryKey);
+        if (!registryId) {
+          const registry = await prisma.llmRegistryModel.create({
+            data: {
+              providerId: provider.id,
+              modelId: m.modelId,
+              displayName: m.displayName,
+              kind: purpose === 'EMBEDDING' ? 'EMBEDDING' : 'TEXT',
+              maxTokens: m.maxTokens ?? 4096,
+              sortOrder: j,
+            },
+          });
+          registryId = registry.id;
+          registryByKey.set(registryKey, registryId);
+        }
         await prisma.llmModel.create({
           data: {
             providerId: provider.id,
+            registryId,
             modelId: m.modelId,
             displayName: m.displayName,
-            purpose: (m.purpose as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION') || 'CHAT',
+            purpose,
             isDefault: m.isDefault ?? (j === 0),
             maxTokens: m.maxTokens ?? 4096,
             temperature: m.temperature ?? 0.3,

@@ -21,9 +21,11 @@ interface GroupPermissions {
   maxThinkingDepth: ThinkingDepthCap; // 'off' 表示禁止思考
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
-  // ── 摘要专用模型（DB model id；空 = 跟随全局该用途默认）──
+  // ── 用途专用模型（DB model id；空 = 跟随全局该用途默认）──
   realtimeSummaryModelId: string;
   finalSummaryModelId: string;
+  /** 组默认聊天模型（用户未显式选模型时用；空 = 跟随全局 CHAT 默认） */
+  chatModelId: string;
 }
 
 interface CustomGroupEntry {
@@ -46,6 +48,7 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     allowFinalSummary: true,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
+    chatModelId: '',
   },
   PRO: {
     transcriptionMinutesLimit: 600,
@@ -57,6 +60,7 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     allowFinalSummary: true,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
+    chatModelId: '',
   },
   ADMIN: {
     transcriptionMinutesLimit: 999999,
@@ -68,6 +72,7 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     allowFinalSummary: true,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
+    chatModelId: '',
   },
 };
 
@@ -111,6 +116,7 @@ function normalizePermissions(
         : fallback.allowFinalSummary,
     realtimeSummaryModelId: coerceSummaryModelId(p.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(p.finalSummaryModelId),
+    chatModelId: coerceSummaryModelId(p.chatModelId),
   };
 }
 
@@ -125,6 +131,7 @@ const CUSTOM_GROUP_FALLBACK: GroupPermissions = {
   allowFinalSummary: true,
   realtimeSummaryModelId: '',
   finalSummaryModelId: '',
+  chatModelId: '',
 };
 
 // Prisma 事务客户端类型
@@ -179,6 +186,7 @@ function sanitizeFeatureFlags(
   | 'allowFinalSummary'
   | 'realtimeSummaryModelId'
   | 'finalSummaryModelId'
+  | 'chatModelId'
 > {
   return {
     maxThinkingDepth: coerceThinkingDepthCap(
@@ -197,6 +205,7 @@ function sanitizeFeatureFlags(
       permissions?.realtimeSummaryModelId
     ),
     finalSummaryModelId: coerceSummaryModelId(permissions?.finalSummaryModelId),
+    chatModelId: coerceSummaryModelId(permissions?.chatModelId),
   };
 }
 

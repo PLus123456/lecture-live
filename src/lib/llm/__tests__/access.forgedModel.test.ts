@@ -33,6 +33,8 @@ vi.mock('@/lib/userRoles', () => ({
     allowRealtimeSummary: true,
     allowFinalSummary: true,
   }),
+  // 组默认聊天模型：这些用例都验证「无组绑定」下的 allowedModels 门禁，恒返回 null
+  resolveUserDefaultChatModelId: async () => null,
   clampDepthToCap: (d: string) => d,
 }));
 

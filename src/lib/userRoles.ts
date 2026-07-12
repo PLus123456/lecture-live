@@ -52,13 +52,15 @@ export interface GroupPermissions {
   allowRealtimeSummary: boolean;
   /** 是否允许使用总摘要（结束时的结构化报告） */
   allowFinalSummary: boolean;
-  // ── 摘要专用模型（与用户组绑定）──
-  // 存的是 LlmModel 的 DB id；空串/缺省 = 「跟随全局默认」（该用途 isDefault 的模型）。
-  // 与 allowedModels 不同：allowedModels 只作用于聊天选择器，这两个才决定摘要/报告实际用哪个模型。
+  // ── 用途专用模型（与用户组绑定）──
+  // 存的是 LlmModel 的 DB id（路由行）；空串/缺省 = 「跟随全局默认」（该用途 isDefault 的模型）。
+  // 与 allowedModels 不同：allowedModels 只作用于聊天选择器，这几个才决定各用途实际用哪个模型。
   /** 该组实时摘要使用的模型 id（空 = 跟随全局 REALTIME_SUMMARY 默认） */
   realtimeSummaryModelId?: string;
   /** 该组总摘要使用的模型 id（空 = 跟随全局 FINAL_SUMMARY 默认） */
   finalSummaryModelId?: string;
+  /** 该组聊天的默认模型 id（用户未显式选模型时用；空 = 跟随全局 CHAT 默认） */
+  chatModelId?: string;
 }
 
 /** 某用户在运行时生效的能力开关（由所属组解析而来，组配置为唯一真源） */
@@ -240,6 +242,7 @@ export async function resolveRoleQuotas(role: UserRole): Promise<GroupPermission
     ),
     realtimeSummaryModelId: coerceSummaryModelId(cfg.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(cfg.finalSummaryModelId),
+    chatModelId: coerceSummaryModelId(cfg.chatModelId),
   };
 }
 
@@ -300,6 +303,7 @@ export async function resolveCustomGroupPermissions(
     allowFinalSummary: coerceBool(cfg.allowFinalSummary, true),
     realtimeSummaryModelId: coerceSummaryModelId(cfg.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(cfg.finalSummaryModelId),
+    chatModelId: coerceSummaryModelId(cfg.chatModelId),
   };
 }
 
@@ -375,6 +379,34 @@ export async function resolveUserSummaryModels(user: {
     realtimeSummaryModelId: perms.realtimeSummaryModelId?.trim() || null,
     finalSummaryModelId: perms.finalSummaryModelId?.trim() || null,
   };
+}
+
+/**
+ * 解析某用户运行时生效的「组默认聊天模型」id（用户未显式选模型时用）。
+ *
+ * 与 resolveUserSummaryModels 同解析链：ADMIN 不绑定（跟随全局 CHAT 默认）→ 有自定义组读
+ * custom_groups → 否则读系统角色 group_config_<role>。返回 null = 跟随全局默认。
+ * 同样只解析 id、不校验存在性；调用方（access.ts）经 getModelById 校验，失效即回落全局默认。
+ * 组绑定属于管理员决策，生效时绕过该用户 allowedModels 的门禁（与摘要模型同哲学）。
+ */
+export async function resolveUserDefaultChatModelId(user: {
+  role: UserRole;
+  customGroupId?: string | null;
+}): Promise<string | null> {
+  if (user.role === 'ADMIN') {
+    return null;
+  }
+
+  let perms: GroupPermissions | null = null;
+  if (user.customGroupId) {
+    perms = await resolveCustomGroupPermissions(user.customGroupId);
+    // 自定义组不存在 → 回落底层角色配置
+  }
+  if (!perms) {
+    perms = await resolveRoleQuotas(user.role);
+  }
+
+  return perms.chatModelId?.trim() || null;
 }
 
 /**

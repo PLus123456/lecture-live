@@ -281,20 +281,47 @@ model SiteSetting {
   updatedAt DateTime @updatedAt
 }
 
-// ─── LLM 供应商配置 ───
+// ─── LLM 供应商（网关）配置 ───
 model LlmProvider {
-  id          String     @id @default(cuid())
-  name        String                           // 显示名称，如 "OpenAI 主力"
-  apiKey      String     @db.Text              // API 密钥
-  apiBase     String                           // API 地址，如 "https://api.openai.com"
-  isAnthropic Boolean    @default(false)       // 是否使用 Anthropic 原生 API
-  sortOrder   Int        @default(0)           // 排序
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
-  models      LlmModel[]
+  id             String             @id @default(cuid())
+  name           String                           // 显示名称，如 "OpenAI 主力"
+  apiKey         String             @db.Text      // API 密钥
+  apiBase        String                           // API 地址，如 "https://api.openai.com"
+  isAnthropic    Boolean            @default(false) // 是否使用 Anthropic 原生 API
+  sortOrder      Int                @default(0)   // 排序
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  models         LlmModel[]
+  registryModels LlmRegistryModel[]
 }
 
-// ─── LLM 模型配置（一个供应商可有多个模型） ───
+// ─── LLM 模型库（网关下登记的模型规格；「用哪个模型做什么、怎么调参」在 LlmModel 路由行上） ───
+// 规格类字段（上下文/最大输出/输入能力）的唯一真源。admin 保存注册模型时把规格写穿到
+// 其下所有路由行（LlmModel），gateway 运行时仍只读路由行 —— 保证旧 id 引用与解析逻辑零变化。
+model LlmRegistryModel {
+  id            String      @id @default(cuid())
+  providerId    String
+  provider      LlmProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  modelId       String                          // 模型标识，如 "gpt-4o", "doubao-seed-2-0-pro"
+  displayName   String                          // 显示名称
+  kind          String      @default("TEXT")    // "TEXT" | "EMBEDDING"（嵌入模型无思考/温度参数）
+  supportsImage Boolean     @default(false)     // 是否接受图片输入（多模态）
+  maxTokens     Int         @default(4096)      // 单次输出 max_tokens
+  contextWindow Int         @default(8192)      // 输入上下文窗口（token）
+  embeddingDimensions Int?                      // 嵌入向量维度（仅 kind=EMBEDDING，展示用）
+  // 连通性验证（admin 面板「验证」按钮写入）
+  status        String      @default("UNVERIFIED") // "UNVERIFIED" | "OK" | "FAILED"
+  lastCheckedAt DateTime?
+  lastError     String?     @db.Text
+  sortOrder     Int         @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  routes        LlmModel[]
+
+  @@index([providerId])
+}
+
+// ─── LLM 用途枚举 ───
 enum LlmPurpose {
   CHAT                // 对话
   REALTIME_SUMMARY    // 实时摘要
@@ -303,29 +330,37 @@ enum LlmPurpose {
   EMBEDDING           // 嵌入向量（用于 chat L6 RAG 检索）
 }
 
+// ─── LLM 用途路由行（用途 × 模型，一行一个绑定） ───
+// 历史上这张表叫「模型配置」，每个 (模型, 用途) 一行、参数全在行上。模型库拆出后语义收窄为
+// 「路由行」：purpose/isDefault/thinkingMode/thinkingDepth/temperature 是路由层参数（同一模型
+// 在不同用途可配不同思考与温度）；modelId/displayName/supportsImage/maxTokens/contextWindow
+// 保留为 registry 的写穿副本（gateway/客户端继续读这里，旧部署未迁移时也能独立工作）。
 model LlmModel {
   id            String      @id @default(cuid())
   providerId    String
   provider      LlmProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  // 所属模型库条目；空 = 尚未迁移的历史行（ensureLlmRegistry 会补建并回填）。
+  // 删除模型库条目级联删除其所有路由行。
+  registryId    String?
+  registry      LlmRegistryModel? @relation(fields: [registryId], references: [id], onDelete: Cascade)
   modelId       String                          // 模型标识，如 "gpt-4o", "claude-sonnet-4-6"
   displayName   String                          // 显示名称
-  // 思考能力控制：
+  // 思考能力控制（路由层参数，按用途独立）：
   //  thinkingMode:
-  //    NONE   - 不支持思考（GPT-3.5、文本生成模型）
+  //    NONE   - 不思考（请求不带 thinking/reasoning 参数）
   //    AUTO   - 模型自己决定是否思考，请求不带任何 thinking/reasoning 参数（GLM-4.5/DeepSeek-V3 等）
-  //    FORCED - 模型自带思考无法关闭（OpenAI o-series、DeepSeek R1）；UI 仍允许 auto/forced
-  //    DEPTH  - 支持深度思考（Claude Extended Thinking、OpenAI gpt-5 系列 reasoning_effort）；
-  //             允许用户选 off/low/medium/high
+  //    FORCED - 强制思考（o-series/R1 自带；Anthropic 按 thinkingDepth 强制启用）
+  //    DEPTH  - 带深度思考（Claude Extended Thinking、reasoning_effort）；允许用户选 off/low/medium/high
   //  supportsThinkingDepth - DEPRECATED：被 thinkingMode='DEPTH' 取代，保留字段用于向后兼容
-  //  thinkingDepth - 默认深度（DEPTH 模式下作为 fallback；AUTO/FORCED 模式下作为请求的 effort 默认值）
+  //  thinkingDepth - 默认深度（DEPTH 模式下作为 fallback；FORCED 模式下作为强制思考的深度）
   thinkingMode          String  @default("NONE")     // "NONE" | "AUTO" | "FORCED" | "DEPTH"
   supportsThinkingDepth Boolean @default(false)
   thinkingDepth         String  @default("medium")   // "low" | "medium" | "high"
-  // 输入能力：是否接受图片输入（多模态）
+  // ↓ 规格字段：registry 的写穿副本（admin 改模型库时同步），运行时读取处保持不变
   supportsImage Boolean @default(false)
   maxTokens     Int         @default(4096)      // 单次输出 max_tokens（传给 API 的 max_tokens 字段）
   contextWindow Int         @default(8192)      // 模型输入上下文窗口大小（token），用于 LectureLive 内部预算/降级判断
-  temperature   Float       @default(0.3)
+  temperature   Float       @default(0.3)       // 路由层参数：该用途下的采样温度
   purpose       LlmPurpose  @default(CHAT)      // 用途
   isDefault     Boolean     @default(false)      // 该用途下的默认模型
   sortOrder     Int         @default(0)
@@ -334,6 +369,7 @@ model LlmModel {
 
   @@index([providerId])
   @@index([purpose])
+  @@index([registryId])
 }
 
 // ─── 后台任务队列 ───

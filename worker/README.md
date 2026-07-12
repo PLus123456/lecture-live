@@ -39,6 +39,18 @@ sudo ln -s ~/.cargo/bin/deep-filter /usr/local/bin/deep-filter
 
 ## 部署步骤
 
+### 一键安装（推荐，Ubuntu/Debian）
+
+```bash
+sudo bash install.sh
+```
+
+脚本会自动：检查 Node ≥20 / 安装 ffmpeg / 尝试下载对应架构的 deep-filter 预编译二进制、
+创建系统用户与目录、生成通信 token（重复执行升级时保留原 token）、装好 systemd 服务并做健康检查，
+最后打印 nginx 反代配置和要填进管理后台的 token。
+
+### 手动安装
+
 ```bash
 # 1. 建目录与用户
 sudo useradd --system --home /opt/lecturelive-worker --shell /usr/sbin/nologin llworker
@@ -60,7 +72,7 @@ curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:8790/healthz
 # → {"ok":true,"version":...,"engines":{"ffmpeg":true,"deepFilter":true},...}
 ```
 
-然后配 nginx TLS 反代（见下），在 LectureLive 管理后台 → 系统设置 → 录音音频增强里填 `https://你的域名` 和 token，点"测试连接"。
+装好后配 nginx TLS 反代（见下），在 LectureLive 管理后台 → 设置 → 音频增强里填 `https://你的域名` 和 token，点"测试连接"，最后在「用户组」里为需要的组打开音频增强能力。
 
 ## nginx 反代示例
 

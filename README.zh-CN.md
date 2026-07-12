@@ -58,8 +58,8 @@ LectureLive 是一个面向直播授课与课堂记录的全栈 Web 应用。它
   </tr>
   <tr>
     <td width="50%">
-      <strong>录音与回放</strong><br />
-      音频与转录数据保持关联，便于课后复盘、纠错和二次整理。
+      <strong>录音、回放与音频增强</strong><br />
+      音频与转录数据保持关联，便于课后复盘；可选将录音卸载到独立 worker 做响度归一化 + AI 降噪，麦克风离讲者很远也能听清。
     </td>
     <td width="50%">
       <strong>自托管部署</strong><br />
@@ -112,6 +112,8 @@ flowchart LR
 │  (Prisma)  │                  │         │      │ 文件存储    │
 └────────────┘                  └─────────┘      └─────────────┘
 ```
+
+另有可选的**音频增强 worker**（[`worker/`](worker/)），部署在独立的低成本机器上（如甲骨文免费 ARM 实例）。录音结束后主服务器经 HTTPS 把音频推给它做两遍响度归一化（EBU R128）+ DeepFilterNet 降噪，增强版与原始录音并列存储，回放时可自由切换。worker 完全被动——从不反向连接主服务器，可随时重启。
 
 ## 技术栈
 
@@ -179,6 +181,19 @@ curl http://localhost:3000/api/health
 
 Docker 栈包含应用服务、WebSocket 服务、MySQL 8.4、Redis 7 与 Cloudreve。
 
+### 可选：音频增强 Worker
+
+把录音后处理（响度归一化 + 降噪）卸载到独立机器——甲骨文免费 ARM 实例（2 核 / 12G）绰绰有余：
+
+```bash
+# 在 worker 机器上（Ubuntu/Debian）：
+sudo bash worker/install.sh          # 一键安装服务并生成通信 token
+# 把脚本输出的 HTTPS 反代配置贴进 nginx，然后在 LectureLive 管理后台：
+# 设置 → 音频增强 → 填入地址与 token → 测试连接 → 启用，并在用户组里按组放开。
+```
+
+手动部署、nginx 细节与参数调优见 [`worker/README.md`](worker/README.md)。
+
 ## 仓库结构
 
 ```text
@@ -205,7 +220,8 @@ lecture-live/
 ├── public/                 # 图标与静态资源
 ├── docker-compose.yml
 ├── Dockerfile
-└── deploy/                 # 部署辅助文件与运行时兼容层
+├── deploy/                 # 部署辅助文件与运行时兼容层
+└── worker/                 # 可选的音频增强 worker（独立机器部署）
 ```
 
 ## 配置与安全

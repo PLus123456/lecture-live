@@ -618,6 +618,28 @@ async function handleRequest(req, res) {
   const url = new URL(req.url, 'http://localhost')
   const segments = url.pathname.split('/').filter(Boolean)
 
+  // 根路径：无鉴权的部署自检页（浏览器直接访问能看到 OK；不泄露版本/队列等细节）
+  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
+    const html = [
+      '<!doctype html><html lang="zh"><head><meta charset="utf-8">',
+      '<meta name="viewport" content="width=device-width, initial-scale=1">',
+      '<title>LectureLive Audio Enhance Worker</title>',
+      '<style>body{font-family:system-ui,sans-serif;display:flex;min-height:100vh;margin:0;',
+      'align-items:center;justify-content:center;background:#faf7f2;color:#3d3a34}',
+      'main{text-align:center}h1{font-size:3rem;margin:0 0 .5rem}p{color:#8a857c}</style>',
+      '</head><body><main><h1>✅ OK</h1>',
+      '<p>LectureLive audio enhance worker is running.</p>',
+      '<p>在 LectureLive 管理后台「设置 → 音频增强」中配置本地址与 token 即可使用。</p>',
+      '</main></body></html>',
+    ].join('')
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+    })
+    res.end(html)
+    return
+  }
+
   // /healthz：未鉴权只回 ok，鉴权后附带引擎与队列详情（供 admin"测试连接"）
   if (req.method === 'GET' && url.pathname === '/healthz') {
     if (!checkAuth(req)) return sendJson(res, 200, { ok: true })

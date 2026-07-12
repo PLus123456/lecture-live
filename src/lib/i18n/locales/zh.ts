@@ -315,6 +315,18 @@ export default {
     },
   },
 
+  pipTool: {
+    title: '参考工具',
+    windowTitle: '参考工具 — 实时翻译',
+    waiting: '等待转录内容…',
+    translating: '翻译中...',
+    copy: '复制',
+    listen: '朗读',
+    pin: '置顶',
+    unpin: '取消置顶',
+    close: '关闭',
+  },
+
   transcriptPanel: {
     title: '实时转录',
     segmentCount: '{n} 段',

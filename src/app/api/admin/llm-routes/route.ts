@@ -9,6 +9,7 @@ import {
   DEFAULT_TEMPERATURE,
   coerceTemperature,
 } from '@/lib/llm/routeParams';
+import { createRouteForRegistry, purposeMatchesKind } from '@/lib/llm/attachRoute';
 
 /**
  * POST /api/admin/llm-routes
@@ -47,7 +48,7 @@ export async function POST(req: Request) {
     }
 
     // 嵌入用途只能挂嵌入模型，文本用途只能挂文本模型
-    if ((purpose === 'EMBEDDING') !== (registry.kind === 'EMBEDDING')) {
+    if (!purposeMatchesKind(purpose, registry.kind)) {
       return NextResponse.json(
         {
           error:
@@ -94,41 +95,14 @@ export async function POST(req: Request) {
       );
     }
 
-    const route = await prisma.$transaction(async (tx) => {
-      const purposeCount = await tx.llmModel.count({ where: { purpose } });
-      const maxSort = await tx.llmModel.aggregate({
-        where: { purpose },
-        _max: { sortOrder: true },
-      });
-      // 显式要求默认，或该用途首个模型 → 设为默认
-      const makeDefault = Boolean(body.isDefault) || purposeCount === 0;
-      if (makeDefault) {
-        await tx.llmModel.updateMany({
-          where: { purpose, isDefault: true },
-          data: { isDefault: false },
-        });
-      }
-      return tx.llmModel.create({
-        data: {
-          providerId: registry.providerId,
-          registryId: registry.id,
-          // 规格：模型库写穿副本
-          modelId: registry.modelId,
-          displayName: registry.displayName,
-          supportsImage: registry.supportsImage,
-          maxTokens: registry.maxTokens,
-          contextWindow: registry.contextWindow,
-          // 路由层参数
-          purpose,
-          thinkingMode,
-          supportsThinkingDepth: thinkingMode === 'DEPTH',
-          thinkingDepth,
-          temperature,
-          isDefault: makeDefault,
-          sortOrder: (maxSort._max.sortOrder ?? -1) + 1,
-        },
-      });
-    });
+    const route = await prisma.$transaction((tx) =>
+      createRouteForRegistry(tx, registry, purpose, {
+        thinkingMode,
+        thinkingDepth,
+        temperature,
+        isDefault: Boolean(body.isDefault),
+      })
+    );
 
     logAction(req, 'admin.llm.route.create', {
       user: admin,

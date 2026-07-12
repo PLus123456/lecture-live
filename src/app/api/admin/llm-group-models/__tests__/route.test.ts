@@ -83,6 +83,62 @@ describe('GET /api/admin/llm-group-models', () => {
     expect(data.groups[2].finalSummaryModelId).toBe('model-9');
     expect(keys).not.toContain('ADMIN');
   });
+
+  it('走运行时解析器：附带可用模型 + 能力开关（与用户组面板/access 同一口径）', async () => {
+    siteSettingFindUniqueMock.mockImplementation(async ({ where }) => {
+      if (where.key === 'group_config_FREE') {
+        // 只存了绑定字段的部分配置：allowedModels/能力开关按角色默认字段级回落
+        return { key: where.key, value: JSON.stringify({ chatModelId: 'model-1' }) };
+      }
+      if (where.key === 'group_config_PRO') {
+        return {
+          key: where.key,
+          value: JSON.stringify({ allowedModels: 'gpt-4o,claude-x' }),
+        };
+      }
+      if (where.key === 'custom_groups') {
+        return {
+          key: where.key,
+          value: JSON.stringify([
+            {
+              id: 'restricted',
+              name: '受限组',
+              permissions: {
+                allowedModels: 'local',
+                allowRealtimeSummary: false,
+                allowFinalSummary: true,
+                realtimeSummaryModelId: 'model-dead', // 能力已关，绑定是死配置（原样返回，由 UI 禁用展示）
+              },
+            },
+          ]),
+        };
+      }
+      return null;
+    });
+
+    const res = await GET(new Request('http://localhost/api/admin/llm-group-models'));
+    const data = await res.json();
+    const [free, pro, restricted] = data.groups;
+
+    // FREE：缺省字段回落角色默认（allowedModels='local'、能力全开）
+    expect(free.allowedModels).toBe('local');
+    expect(free.allowRealtimeSummary).toBe(true);
+    expect(free.allowFinalSummary).toBe(true);
+    // PRO：显式配置生效
+    expect(pro.allowedModels).toBe('gpt-4o,claude-x');
+    // 自定义组：能力开关如实返回，供 UI 按「已禁用」渲染
+    expect(restricted.key).toBe('custom:restricted');
+    expect(restricted.allowRealtimeSummary).toBe(false);
+    expect(restricted.allowFinalSummary).toBe(true);
+    expect(restricted.allowedModels).toBe('local');
+  });
+
+  it('系统组名与 /api/admin/groups 一致（Free/Pro）', async () => {
+    const res = await GET(new Request('http://localhost/api/admin/llm-group-models'));
+    const data = await res.json();
+    expect(data.groups[0].name).toBe('Free');
+    expect(data.groups[1].name).toBe('Pro');
+  });
 });
 
 describe('PUT /api/admin/llm-group-models', () => {

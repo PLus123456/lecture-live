@@ -200,7 +200,7 @@ function GroupCard({
                 <span className="font-medium truncate">
                   {summaryModelDisplay(
                     t,
-                    group.permissions.realtimeSummaryModelId,
+                    group.id === 'ADMIN' ? '' : group.permissions.realtimeSummaryModelId,
                     catalog.realtimeSummary,
                     catalog.realtimeDefault,
                   )}
@@ -214,7 +214,7 @@ function GroupCard({
                 <span className="font-medium truncate">
                   {summaryModelDisplay(
                     t,
-                    group.permissions.finalSummaryModelId,
+                    group.id === 'ADMIN' ? '' : group.permissions.finalSummaryModelId,
                     catalog.finalSummary,
                     catalog.finalDefault,
                   )}
@@ -227,7 +227,7 @@ function GroupCard({
               <span className="font-medium truncate">
                 {summaryModelDisplay(
                   t,
-                  group.permissions.chatModelId,
+                  group.id === 'ADMIN' ? '' : group.permissions.chatModelId,
                   catalog.chatOptions,
                   catalog.chatDefault,
                 )}
@@ -323,12 +323,14 @@ function ModelCheckboxList({
   selectAll,
   onToggle,
   onToggleAll,
+  disabled,
 }: {
   models: ModelInfo[];
   selected: Set<string>;
   selectAll: boolean;
   onToggle: (modelId: string) => void;
   onToggleAll: () => void;
+  disabled?: boolean;
 }) {
   const { t } = useI18n();
 
@@ -342,21 +344,22 @@ function ModelCheckboxList({
 
   return (
     <div className="space-y-1.5 rounded-lg border border-cream-200 bg-cream-50/50 p-3 max-h-56 overflow-y-auto">
-      <label className="flex items-center gap-2 cursor-pointer pb-1.5 border-b border-cream-200">
+      <label className={`flex items-center gap-2 pb-1.5 border-b border-cream-200 ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}>
         <input
           type="checkbox"
           checked={selectAll}
+          disabled={disabled}
           onChange={onToggleAll}
-          className="rounded border-cream-300 text-rust-500 focus:ring-rust-200"
+          className="rounded border-cream-300 text-rust-500 focus:ring-rust-200 disabled:opacity-50"
         />
         <span className="text-sm font-medium text-charcoal-700">{t('admin.selectAllModels')}</span>
       </label>
       {models.map((m) => (
-        <label key={m.modelId} className="flex items-center gap-2 cursor-pointer">
+        <label key={m.modelId} className={`flex items-center gap-2 ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}>
           <input
             type="checkbox"
             checked={selectAll || selected.has(m.modelId)}
-            disabled={selectAll}
+            disabled={disabled || selectAll}
             onChange={() => onToggle(m.modelId)}
             className="rounded border-cream-300 text-rust-500 focus:ring-rust-200 disabled:opacity-50"
           />
@@ -385,14 +388,18 @@ function CapabilityToggle({
   label,
   checked,
   onChange,
+  disabled,
 }: {
   icon: React.ReactNode;
   label: string;
   checked: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
-    <label className="flex items-center justify-between gap-3 cursor-pointer">
+    <label
+      className={`flex items-center justify-between gap-3 ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
+    >
       <span className="flex items-center gap-2 text-sm text-charcoal-700">
         {icon}
         {label}
@@ -400,8 +407,9 @@ function CapabilityToggle({
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
-        className="rounded border-cream-300 text-rust-500 focus:ring-rust-200"
+        className="rounded border-cream-300 text-rust-500 focus:ring-rust-200 disabled:opacity-50"
       />
     </label>
   );
@@ -489,6 +497,7 @@ function PermissionsForm({
   setFinalSummaryModelId,
   chatModelId,
   setChatModelId,
+  adminLocked = false,
 }: {
   minutesLimit: string;
   setMinutesLimit: (v: string) => void;
@@ -516,6 +525,8 @@ function PermissionsForm({
   setFinalSummaryModelId: (v: string) => void;
   chatModelId: string;
   setChatModelId: (v: string) => void;
+  /** ADMIN 系统组：能力开关与模型绑定在运行时恒被短路（全量能力/跟随全局默认），控件只读展示 */
+  adminLocked?: boolean;
 }) {
   const { t } = useI18n();
   const inputCls =
@@ -542,48 +553,59 @@ function PermissionsForm({
         </div>
       </div>
 
-      {/* ── 可用模型（仅作用于聊天选择器）── */}
+      {/* ── 可用模型（仅作用于聊天选择器；ADMIN 恒全量可用，控件只读）── */}
       <div className="space-y-1.5 pt-1">
         <SectionLabel>{t('admin.allowedLlmModels')}</SectionLabel>
-        <p className="text-[11px] text-charcoal-400">{t('admin.allowedModelsHint')}</p>
+        <p className="text-[11px] text-charcoal-400">
+          {adminLocked ? t('admin.adminGroupLockedHint') : t('admin.allowedModelsHint')}
+        </p>
         <ModelCheckboxList
           models={models}
           selected={selected}
-          selectAll={selectAll}
+          selectAll={adminLocked ? true : selectAll}
           onToggle={onToggle}
           onToggleAll={onToggleAll}
+          disabled={adminLocked}
         />
         {/* 默认聊天模型：用户未显式选模型时该组用哪个（组绑定=管理员决策，可越过勾选集）*/}
         <div className="pt-1.5">
           <SummaryModelSelect
             label={t('admin.defaultChatModel')}
-            value={chatModelId}
+            value={adminLocked ? '' : chatModelId}
             onChange={setChatModelId}
             options={catalog.chatOptions}
             globalDefault={catalog.chatDefault}
-            disabled={false}
+            disabled={adminLocked}
           />
-          <p className="text-[11px] text-charcoal-400 mt-1 pl-6">{t('admin.defaultChatModelHint')}</p>
+          <p className="text-[11px] text-charcoal-400 mt-1 pl-6">
+            {adminLocked ? t('admin.adminGroupLockedHint') : t('admin.defaultChatModelHint')}
+          </p>
         </div>
       </div>
 
       {/* ── 能力开关 + 摘要模型（每个能力与它的模型选择就近放一起）── */}
       <div className="space-y-2 pt-1">
         <SectionLabel>{t('admin.capabilities')}</SectionLabel>
+        {adminLocked && (
+          <p className="text-[11px] text-amber-600 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">
+            {t('admin.adminGroupLockedHint')}
+          </p>
+        )}
 
         {/* 思考：开关 + 最大深度 */}
         <div className="rounded-lg border border-cream-200 px-3 py-2.5 space-y-2.5">
           <CapabilityToggle
             icon={<Brain className="w-3.5 h-3.5 text-charcoal-400" />}
             label={t('admin.allowThinking')}
-            checked={thinkingEnabled}
+            checked={adminLocked ? true : thinkingEnabled}
             onChange={setThinkingEnabled}
+            disabled={adminLocked}
           />
           <div className="flex items-center gap-2 pl-6">
             <span className="text-xs text-charcoal-500">{t('admin.maxThinkingDepth')}</span>
             <select
-              value={maxDepth}
-              disabled={!thinkingEnabled}
+              value={adminLocked ? 'high' : maxDepth}
+              disabled={adminLocked || !thinkingEnabled}
               onChange={(e) => setMaxDepth(e.target.value as Exclude<ThinkingDepthCap, 'off'>)}
               className="px-2 py-1 text-sm border border-cream-200 rounded-md bg-white
                          focus:outline-none focus:ring-2 focus:ring-rust-200 disabled:opacity-50"
@@ -602,16 +624,17 @@ function PermissionsForm({
           <CapabilityToggle
             icon={<Sparkles className="w-3.5 h-3.5 text-charcoal-400" />}
             label={t('admin.allowRealtimeSummary')}
-            checked={allowRealtime}
+            checked={adminLocked ? true : allowRealtime}
             onChange={setAllowRealtime}
+            disabled={adminLocked}
           />
           <SummaryModelSelect
             label={t('admin.realtimeSummaryModel')}
-            value={realtimeSummaryModelId}
+            value={adminLocked ? '' : realtimeSummaryModelId}
             onChange={setRealtimeSummaryModelId}
             options={catalog.realtimeSummary}
             globalDefault={catalog.realtimeDefault}
-            disabled={!allowRealtime}
+            disabled={adminLocked || !allowRealtime}
           />
         </div>
 
@@ -620,20 +643,23 @@ function PermissionsForm({
           <CapabilityToggle
             icon={<FileText className="w-3.5 h-3.5 text-charcoal-400" />}
             label={t('admin.allowFinalSummary')}
-            checked={allowFinal}
+            checked={adminLocked ? true : allowFinal}
             onChange={setAllowFinal}
+            disabled={adminLocked}
           />
           <SummaryModelSelect
             label={t('admin.finalSummaryModel')}
-            value={finalSummaryModelId}
+            value={adminLocked ? '' : finalSummaryModelId}
             onChange={setFinalSummaryModelId}
             options={catalog.finalSummary}
             globalDefault={catalog.finalDefault}
-            disabled={!allowFinal}
+            disabled={adminLocked || !allowFinal}
           />
         </div>
 
-        <p className="text-[11px] text-charcoal-400">{t('admin.summaryModelHint')}</p>
+        <p className="text-[11px] text-charcoal-400">
+          {adminLocked ? t('admin.adminGroupLockedHint') : t('admin.summaryModelHint')}
+        </p>
       </div>
     </>
   );
@@ -833,6 +859,7 @@ function GroupModal({
             catalog={catalog}
             onToggle={pf.handleToggle}
             onToggleAll={pf.handleToggleAll}
+            adminLocked={group.isSystem && group.id === 'ADMIN'}
           />
         </div>
 

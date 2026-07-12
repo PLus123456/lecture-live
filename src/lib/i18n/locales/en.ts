@@ -834,6 +834,8 @@ export default {
     defaultChatModel: 'Default chat model',
     defaultChatModelHint:
       'Model used when a group member has not picked one in chat. Blank = follow the global CHAT default. Group binding is an admin decision and works even if the model is not in the checklist above.',
+    adminGroupLockedHint:
+      'The ADMIN group always has full capabilities and follows global default models — these settings have no effect for ADMIN.',
     followGlobal: 'Follow global default',
     followGlobalWith: 'Follow global default ({name})',
     staleModel: '(model unavailable)',
@@ -1089,6 +1091,14 @@ export default {
     llmFollowGlobal: 'Follow global default',
     llmFollowGlobalWith: 'Follow global default ({name})',
     llmTierNotBindable: 'This purpose is unified across all groups and follows the global default.',
+    llmTierChatHint:
+      'A bound default model works even if it is outside the group\'s allowed models (treated as admin authorization); the allowed-model set is maintained in the User Groups panel.',
+    llmGroupCapabilityOff: 'Disabled for this group',
+    llmFollowGlobalUnusable: 'Follow global default ({name} · not usable by this group)',
+    llmNotInAllowedSuffix: ' (not in allowed models)',
+    llmStaleBinding: '(bound model unavailable — falls back to global default)',
+    llmGroupNoUsableChat:
+      'No binding and the global default is outside this group\'s allowed models — members will have no usable chat model',
     llmGatewayOnline: 'Online',
     llmGatewayUnverified: 'Unverified',
     llmGatewayFailed: 'Issues detected',

@@ -816,6 +816,8 @@ export default {
     defaultChatModel: '默认聊天模型',
     defaultChatModelHint:
       '组内用户未在聊天里显式选模型时用这个。留空 = 跟随全局 CHAT 默认。组绑定属于管理员决策，即使不在上方勾选集内也生效。',
+    adminGroupLockedHint:
+      'ADMIN 组恒为全量能力并跟随全局默认模型，这些设置对 ADMIN 不生效。',
     followGlobal: '跟随全局默认',
     followGlobalWith: '跟随全局默认（{name}）',
     staleModel: '（模型已失效）',
@@ -1070,6 +1072,13 @@ export default {
     llmFollowGlobal: '跟随全局默认',
     llmFollowGlobalWith: '跟随全局默认（{name}）',
     llmTierNotBindable: '该用途全部组统一，跟随全局默认模型。',
+    llmTierChatHint:
+      '绑定的默认模型即使不在该组「可用模型」内也会生效（视作管理员授权）；可用模型集在「用户组」面板维护。',
+    llmGroupCapabilityOff: '该组已禁用此功能',
+    llmFollowGlobalUnusable: '跟随全局默认（{name} · 该组不可用）',
+    llmNotInAllowedSuffix: '（不在可用模型内）',
+    llmStaleBinding: '（已绑定模型失效，回落全局默认）',
+    llmGroupNoUsableChat: '未绑定且全局默认不在该组可用模型内，该组将无可用聊天模型',
     llmGatewayOnline: '在线',
     llmGatewayUnverified: '待验证',
     llmGatewayFailed: '有异常',

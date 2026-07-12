@@ -2,7 +2,12 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { logAction } from '@/lib/auditLog';
-import { coerceSummaryModelId } from '@/lib/userRoles';
+import {
+  coerceSummaryModelId,
+  resolveRoleQuotas,
+  resolveCustomGroupPermissions,
+  type GroupPermissions,
+} from '@/lib/userRoles';
 
 // 支持按组绑定模型的用途（关键词/嵌入全局统一，不按组）
 const GROUP_BINDABLE_PURPOSES = [
@@ -31,23 +36,34 @@ interface GroupModelBinding {
   chatModelId: string;
   realtimeSummaryModelId: string;
   finalSummaryModelId: string;
+  // ── 与用户组编辑弹窗同源的上下文（决定绑定项在按组视图里怎么展示）──
+  /** 该组聊天可用模型（'*' 或逗号分隔 token；与运行时 access.ts 同一匹配口径） */
+  allowedModels: string;
+  /** 组能力开关：关了则对应摘要绑定是死配置，UI 必须禁用 */
+  allowRealtimeSummary: boolean;
+  allowFinalSummary: boolean;
 }
 
-function pickBindings(cfg: Record<string, unknown>): {
-  chatModelId: string;
-  realtimeSummaryModelId: string;
-  finalSummaryModelId: string;
-} {
+/** 从运行时解析器的结果抽出按组视图需要的字段（绑定 + 可用模型 + 能力开关） */
+function fromPermissions(perms: GroupPermissions) {
   return {
-    chatModelId: coerceSummaryModelId(cfg.chatModelId),
-    realtimeSummaryModelId: coerceSummaryModelId(cfg.realtimeSummaryModelId),
-    finalSummaryModelId: coerceSummaryModelId(cfg.finalSummaryModelId),
+    chatModelId: coerceSummaryModelId(perms.chatModelId),
+    realtimeSummaryModelId: coerceSummaryModelId(perms.realtimeSummaryModelId),
+    finalSummaryModelId: coerceSummaryModelId(perms.finalSummaryModelId),
+    allowedModels: perms.allowedModels,
+    allowRealtimeSummary: perms.allowRealtimeSummary,
+    allowFinalSummary: perms.allowFinalSummary,
   };
 }
 
 /**
  * GET /api/admin/llm-group-models
- * 返回每个用户组（系统 FREE/PRO + 自定义组）的用途模型绑定，供 LLM 设置页「按会员组」视图用。
+ * 返回每个用户组（系统 FREE/PRO + 自定义组）的用途模型绑定 + 生效上下文（可用模型/能力开关），
+ * 供 LLM 设置页「按会员组」视图用。
+ *
+ * 组配置一律经 userRoles 的运行时解析器（resolveRoleQuotas / resolveCustomGroupPermissions）取，
+ * 与 access.ts / 摘要门禁看到的完全同一份语义 —— 保证这页展示的就是运行时真正生效的值，
+ * 不与「用户组」面板产生两套口径。ADMIN 恒跟随全局（解析器对 ADMIN 短路），不出现在列表里。
  */
 export async function GET(req: Request) {
   const { response } = await requireAdminAccess(req, {
@@ -62,25 +78,13 @@ export async function GET(req: Request) {
     const groups: GroupModelBinding[] = [];
 
     for (const role of BINDABLE_ROLES) {
-      const row = await prisma.siteSetting.findUnique({
-        where: { key: `group_config_${role}` },
-      });
-      let cfg: Record<string, unknown> = {};
-      if (row) {
-        try {
-          const parsed = JSON.parse(row.value);
-          if (parsed && typeof parsed === 'object') {
-            cfg = parsed as Record<string, unknown>;
-          }
-        } catch {
-          // 脏配置按空处理（与 resolveRoleQuotas 的字段级回落一致）
-        }
-      }
+      const perms = await resolveRoleQuotas(role);
       groups.push({
         key: role,
-        name: role,
+        // 与 /api/admin/groups 的系统组命名一致（Free/Pro），两个面板显示同名
+        name: role === 'FREE' ? 'Free' : 'Pro',
         isCustom: false,
-        ...pickBindings(cfg),
+        ...fromPermissions(perms),
       });
     }
 
@@ -95,16 +99,23 @@ export async function GET(req: Request) {
             if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string') {
               continue;
             }
-            const permissions =
-              entry.permissions && typeof entry.permissions === 'object'
-                ? (entry.permissions as Record<string, unknown>)
-                : {};
+            // 名称/颜色取自条目本身；权限走与运行时相同的解析器（含字段级兜底）。
+            // permissions 字段缺失/损坏时解析器返回 null（运行时会回落底层角色），
+            // 这里按「无绑定 + 全部允许」展示，组本身仍要出现在列表里。
+            const perms = (await resolveCustomGroupPermissions(entry.id)) ?? {
+              transcriptionMinutesLimit: 60,
+              storageHoursLimit: 10,
+              allowedModels: 'local',
+              maxThinkingDepth: 'high' as const,
+              allowRealtimeSummary: true,
+              allowFinalSummary: true,
+            };
             groups.push({
               key: `custom:${entry.id}`,
               name: typeof entry.name === 'string' ? entry.name : entry.id,
               isCustom: true,
               color: typeof entry.color === 'string' ? entry.color : undefined,
-              ...pickBindings(permissions),
+              ...fromPermissions(perms),
             });
           }
         }

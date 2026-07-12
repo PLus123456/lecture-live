@@ -164,21 +164,29 @@ const groupsPayload = {
   groups: [
     {
       key: 'FREE',
-      name: 'FREE',
+      name: 'Free',
       isCustom: false,
       chatModelId: '',
       realtimeSummaryModelId: '',
       finalSummaryModelId: '',
+      allowedModels: '*',
+      allowRealtimeSummary: true,
+      allowFinalSummary: true,
     },
     {
       key: 'PRO',
-      name: 'PRO',
+      name: 'Pro',
       isCustom: false,
       chatModelId: '',
       realtimeSummaryModelId: '',
       finalSummaryModelId: '',
+      allowedModels: '*',
+      allowRealtimeSummary: true,
+      allowFinalSummary: true,
     },
     {
+      // 受限组：可用模型只有 mini（默认聊天模型豆包 Pro 不在集合内）+ 实时摘要已禁用
+      // → 按会员组视图必须体现「不可用标注 / 无可用聊天警告 / 摘要绑定禁用」
       key: 'custom:vip',
       name: 'VIP 内测',
       isCustom: true,
@@ -186,6 +194,9 @@ const groupsPayload = {
       chatModelId: '',
       realtimeSummaryModelId: '',
       finalSummaryModelId: '',
+      allowedModels: 'doubao-seed-2-0-mini',
+      allowRealtimeSummary: false,
+      allowFinalSummary: true,
     },
   ],
 };
@@ -417,8 +428,8 @@ test('按会员组视图：组行渲染 + 绑定写 PUT llm-group-models', async
 
   // 组标签出现（FREE/PRO/自定义组名）——限定在聊天块的组绑定区里
   const chatTier = page.locator('[data-purpose="CHAT"]');
-  await expect(chatTier.getByText('FREE', { exact: true })).toBeVisible();
-  await expect(chatTier.getByText('PRO', { exact: true })).toBeVisible();
+  await expect(chatTier.getByText('Free', { exact: true })).toBeVisible();
+  await expect(chatTier.getByText('Pro', { exact: true })).toBeVisible();
   await expect(chatTier.getByText('VIP 内测')).toBeVisible();
 
   // FREE 行下拉：首项是「跟随全局默认（豆包 2.0 Pro）」
@@ -444,6 +455,31 @@ test('按会员组视图：组行渲染 + 绑定写 PUT llm-group-models', async
       )
     )
     .toBe(true);
+
+  // 受限组（可用模型不含全局默认豆包 Pro）：
+  //  - 「跟随全局默认」选项带「该组不可用」标注 + 行下方出现无可用聊天模型警告
+  //  - 具体模型选项带「不在可用模型内」后缀
+  const vipSelect = chatBlock.locator('select').nth(2); // FREE/PRO/VIP 顺序
+  await expect(
+    vipSelect.locator('option', {
+      hasText: /该组不可用|not usable by this group/,
+    })
+  ).toHaveCount(1);
+  await expect(
+    vipSelect.locator('option', { hasText: /不在可用模型内|not in allowed models/ })
+  ).toHaveCount(1);
+  await expect(
+    chatBlock.getByText(/无可用聊天模型|no usable chat model/).first()
+  ).toBeVisible();
+
+  // 受限组关了实时摘要 → 实时摘要块该组的绑定选择器按「已禁用」渲染
+  const rtBlock = page.locator('[data-purpose="REALTIME_SUMMARY"]');
+  await rtBlock.locator('button').first().click();
+  await expect(
+    rtBlock.getByRole('combobox', { disabled: true }).locator('option', {
+      hasText: /该组已禁用此功能|Disabled for this group/,
+    })
+  ).toHaveCount(1);
 
   // 关键词块（不可按组绑定）：展开后显示「全部组统一」说明
   const kwBlock = page.locator('[data-purpose="KEYWORD_EXTRACTION"]');

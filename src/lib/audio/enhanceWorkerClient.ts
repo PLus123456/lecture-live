@@ -126,7 +126,12 @@ function authHeaders(config: EnhanceWorkerConfig): Record<string, string> {
 async function readErrorBody(res: Response): Promise<string> {
   try {
     const text = await res.text();
-    return text.slice(0, 300);
+    // 反代（nginx/openresty）的错误页是整段 HTML：剥掉标签只留正文（如
+    // "413 Request Entity Too Large"），否则错误消息/toast 里是一坨尖括号。
+    const plain = /<\s*html/i.test(text)
+      ? text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+      : text;
+    return plain.slice(0, 300);
   } catch {
     return '';
   }

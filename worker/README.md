@@ -72,6 +72,9 @@ curl -s -H "Authorization: Bearer <token>" http://127.0.0.1:8790/healthz
 # → {"ok":true,"version":...,"engines":{"ffmpeg":true,"deepFilter":true},...}
 ```
 
+nginx 配好后用浏览器直接打开 `https://你的域名/`，看到「✅ OK」页面即部署成功
+（根路径与 /healthz 无需鉴权，方便自检；任务端点仍全部要求 Bearer token）。
+
 装好后配 nginx TLS 反代（见下），在 LectureLive 管理后台 → 设置 → 音频增强里填 `https://你的域名` 和 token，点"测试连接"，最后在「用户组」里为需要的组打开音频增强能力。
 
 ## nginx 反代示例

@@ -149,6 +149,14 @@ const GROUP_BINDING_FIELD: Record<string, keyof GroupBinding> = {
   FINAL_SUMMARY: 'finalSummaryModelId',
 };
 
+const PURPOSE_LABEL_KEY: Record<ModelPurpose, string> = {
+  CHAT: 'adminSettings.purposeChat',
+  REALTIME_SUMMARY: 'adminSettings.purposeRealtimeSummary',
+  FINAL_SUMMARY: 'adminSettings.purposeFinalSummary',
+  KEYWORD_EXTRACTION: 'adminSettings.purposeKeywordExtraction',
+  EMBEDDING: 'adminSettings.purposeEmbedding',
+};
+
 const PURPOSE_ICONS: Record<ModelPurpose, typeof MessageCircle> = {
   CHAT: MessageCircle,
   REALTIME_SUMMARY: Zap,
@@ -665,13 +673,6 @@ function PurposeBlock({
   const isEmbedding = purpose === 'EMBEDDING';
   const tierMode = scope === 'tier';
 
-  const labelKey: Record<ModelPurpose, string> = {
-    CHAT: 'adminSettings.purposeChat',
-    REALTIME_SUMMARY: 'adminSettings.purposeRealtimeSummary',
-    FINAL_SUMMARY: 'adminSettings.purposeFinalSummary',
-    KEYWORD_EXTRACTION: 'adminSettings.purposeKeywordExtraction',
-    EMBEDDING: 'adminSettings.purposeEmbedding',
-  };
   const subKey: Record<ModelPurpose, string> = {
     CHAT: 'adminSettings.llmPurposeSubChat',
     REALTIME_SUMMARY: 'adminSettings.llmPurposeSubRealtime',
@@ -702,7 +703,7 @@ function PurposeBlock({
         </span>
         <span className="flex-1 min-w-0">
           <span className="block text-sm font-semibold text-charcoal-800 dark:text-cream-100">
-            {t(labelKey[purpose])}
+            {t(PURPOSE_LABEL_KEY[purpose])}
           </span>
           <span className="block text-xs text-charcoal-400 dark:text-charcoal-400 mt-0.5">
             {t(subKey[purpose])}
@@ -1623,14 +1624,52 @@ function RegistryModelModal({
   const [modelId, setModelId] = useState(model?.modelId ?? '');
   const [kind, setKind] = useState<RegistryKind>(model?.kind ?? 'TEXT');
   const [supportsImage, setSupportsImage] = useState(model?.supportsImage ?? false);
+  // 缺省规格：上下文 256K；输出顶到系统输出预算上限 8192（tokenBudget.OUTPUT_TOKENS_CAP，
+  // 配得再大运行时也会被 clamp，只是白吃输入预算）
   const [contextWindow, setContextWindow] = useState(
-    String(model?.contextWindow ?? 131072)
+    String(model?.contextWindow ?? 262144)
   );
-  const [maxTokens, setMaxTokens] = useState(String(model?.maxTokens ?? 4096));
+  const [maxTokens, setMaxTokens] = useState(String(model?.maxTokens ?? 8192));
   const [dimensions, setDimensions] = useState(
     model?.embeddingDimensions ? String(model.embeddingDimensions) : ''
   );
+  // 登记时一步挂载的用途（仅创建流程；文本模型默认勾聊天，嵌入模型默认勾嵌入）
+  const [attachPurposes, setAttachPurposes] = useState<Set<ModelPurpose>>(
+    () => new Set<ModelPurpose>(isNew ? ['CHAT'] : [])
+  );
   const [saving, setSaving] = useState(false);
+
+  // 切换模型类型时联动：可挂载用途集不同（文本↔嵌入互斥），规格默认值也不同——
+  // 仅当字段还是上一类型的默认值时才替换，避免覆盖管理员手填的值
+  const switchKind = (next: RegistryKind) => {
+    if (next === kind) return;
+    setKind(next);
+    if (isNew) {
+      setAttachPurposes(new Set<ModelPurpose>(next === 'EMBEDDING' ? ['EMBEDDING'] : ['CHAT']));
+      if (next === 'EMBEDDING' && contextWindow === '262144') {
+        setContextWindow('4096');
+      } else if (next === 'TEXT' && contextWindow === '4096') {
+        setContextWindow('262144');
+      }
+    }
+  };
+
+  const toggleAttach = (purpose: ModelPurpose) => {
+    setAttachPurposes((prev) => {
+      const next = new Set(prev);
+      if (next.has(purpose)) {
+        next.delete(purpose);
+      } else {
+        next.add(purpose);
+      }
+      return next;
+    });
+  };
+
+  const attachable: ModelPurpose[] =
+    kind === 'EMBEDDING'
+      ? ['EMBEDDING']
+      : ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION'];
 
   const inputCls =
     'w-full px-3 py-2 text-sm border border-cream-200 dark:border-charcoal-600 rounded-lg bg-white dark:bg-charcoal-700 text-charcoal-800 dark:text-cream-100 focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300';
@@ -1663,6 +1702,7 @@ function RegistryModelModal({
           maxTokens: out,
           embeddingDimensions:
             kind === 'EMBEDDING' && dimensions.trim() ? Number(dimensions) : null,
+          ...(isNew ? { purposes: Array.from(attachPurposes) } : {}),
         }),
       });
       if (res.ok) {
@@ -1727,7 +1767,7 @@ function RegistryModelModal({
                   <button
                     key={k}
                     type="button"
-                    onClick={() => setKind(k)}
+                    onClick={() => switchKind(k)}
                     className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
                       kind === k
                         ? 'bg-rust-50 dark:bg-rust-800/30 border-rust-300 dark:border-rust-600 text-rust-600 dark:text-rust-300 font-medium'
@@ -1795,9 +1835,40 @@ function RegistryModelModal({
                     onChange={(e) => setMaxTokens(e.target.value)}
                     className={inputCls}
                   />
+                  <p className="text-[10px] text-charcoal-300 dark:text-charcoal-500 mt-1">
+                    {t('adminSettings.llmMaxTokensCapHint')}
+                  </p>
                 </div>
               )}
             </div>
+
+            {/* 登记时一步挂载到用途（仅创建；不勾 = 只入库，之后在「用途路由」里挂载） */}
+            {isNew && (
+              <div data-testid="llm-attach-purposes">
+                <label className="text-xs text-charcoal-500 dark:text-charcoal-300 mb-1 block">
+                  {t('adminSettings.llmAttachOnCreate')}
+                </label>
+                <div className="flex flex-wrap gap-x-4 gap-y-1.5 rounded-lg border border-cream-200 dark:border-charcoal-600 bg-cream-50/60 dark:bg-charcoal-750 px-3 py-2.5">
+                  {attachable.map((purpose) => (
+                    <label
+                      key={purpose}
+                      className="flex items-center gap-1.5 text-xs text-charcoal-600 dark:text-cream-200 cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={attachPurposes.has(purpose)}
+                        onChange={() => toggleAttach(purpose)}
+                        className="rounded border-cream-300 text-rust-500 focus:ring-rust-200"
+                      />
+                      {t(PURPOSE_LABEL_KEY[purpose])}
+                    </label>
+                  ))}
+                </div>
+                <p className="text-[10px] text-charcoal-300 dark:text-charcoal-500 mt-1">
+                  {t('adminSettings.llmAttachOnCreateHint')}
+                </p>
+              </div>
+            )}
           </div>
 
           <div className="flex justify-end gap-2 pt-1">

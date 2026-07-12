@@ -52,6 +52,8 @@ export default defineConfig({
       DATABASE_URL: 'mysql://lecturelive:lecturelive@127.0.0.1:9/lecturelive',
       JWT_SECRET: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       ENCRYPTION_KEY: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      // 无库 harness 下让 / 直接渲染 Landing（否则 SSR 查库失败重定向 /setup）
+      E2E_FORCE_SETUP_COMPLETE: '1',
     },
   },
 });

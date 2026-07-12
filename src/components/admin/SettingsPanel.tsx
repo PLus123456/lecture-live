@@ -21,6 +21,7 @@ import {
   EyeOff,
   Upload,
   Image as ImageIcon,
+  AudioLines,
 } from 'lucide-react';
 import { useTheme } from '@/components/ThemeProvider';
 import ConfirmDialog from '@/components/ConfirmDialog';
@@ -37,6 +38,7 @@ type SettingsTab =
   | 'storage'
   | 'appearance'
   | 'asr'
+  | 'audioEnhance'
   | 'llm'
   | 'security';
 
@@ -83,6 +85,13 @@ interface SiteSettingsData {
   default_target_lang: string;
   translation_mode: string;
   async_upload_billing_multiplier: string;
+  // 录音音频增强（外部 worker 后处理）
+  audio_enhance_enabled: boolean;
+  audio_enhance_worker_url: string;
+  audio_enhance_worker_token: string;
+  audio_enhance_target_lufs: string;
+  audio_enhance_atten_lim_db: string;
+  audio_enhance_concurrency: string;
   // 安全相关
   rate_limit_auth: string;
   rate_limit_api: string;
@@ -101,6 +110,7 @@ const settingsTabs: { id: SettingsTab; label: string; icon: typeof Globe }[] = [
   { id: 'storage', label: 'Storage', icon: HardDrive },
   { id: 'appearance', label: 'Appearance', icon: Palette },
   { id: 'asr', label: 'ASR', icon: Cpu },
+  { id: 'audioEnhance', label: 'Audio Enhance', icon: AudioLines },
   { id: 'llm', label: 'LLM', icon: Server },
   { id: 'security', label: 'Security', icon: Shield },
 ];
@@ -147,6 +157,12 @@ const defaultSettings: SiteSettingsData = {
   default_target_lang: 'zh',
   translation_mode: 'soniox',
   async_upload_billing_multiplier: '0.8',
+  audio_enhance_enabled: false,
+  audio_enhance_worker_url: '',
+  audio_enhance_worker_token: '',
+  audio_enhance_target_lufs: '-14',
+  audio_enhance_atten_lim_db: '30',
+  audio_enhance_concurrency: '1',
   rate_limit_auth: '5',
   rate_limit_api: '60',
   jwt_expiry: '7',
@@ -1417,6 +1433,150 @@ function AsrPanel({
   );
 }
 
+/** 录音音频增强（外部 worker 后处理：响度归一化 + 降噪） */
+function AudioEnhancePanel({
+  settings,
+  onChange,
+  onToggle,
+}: {
+  settings: SiteSettingsData;
+  onChange: (key: string, value: string) => void;
+  onToggle: (key: string, value: boolean) => void;
+}) {
+  const { t } = useI18n();
+  const [verifying, setVerifying] = useState(false);
+  const [verifyResult, setVerifyResult] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
+
+  // 测试连接：带上表单当前值（token 是掩码时后端自动回落已保存值）
+  const handleVerify = async () => {
+    setVerifying(true);
+    setVerifyResult(null);
+    try {
+      const res = await fetch('/api/admin/audio-enhance/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workerUrl: settings.audio_enhance_worker_url,
+          workerToken: settings.audio_enhance_worker_token,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.ok) {
+        const deepFilter = data.engines?.deepFilter
+          ? t('adminSettings.audioEnhanceVerifyDeepFilter')
+          : t('adminSettings.audioEnhanceVerifyAfftdnOnly');
+        setVerifyResult({
+          ok: true,
+          message: `${t('adminSettings.audioEnhanceVerifyOk')} (v${data.version ?? '?'}, ${deepFilter})`,
+        });
+      } else {
+        setVerifyResult({
+          ok: false,
+          message: data?.error ?? t('common.networkError'),
+        });
+      }
+    } catch {
+      setVerifyResult({ ok: false, message: t('common.networkError') });
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  return (
+    <div>
+      <p className="text-xs text-charcoal-400 dark:text-charcoal-400 pb-2">
+        {t('adminSettings.audioEnhanceIntro')}
+      </p>
+      <SettingField
+        label={t('adminSettings.audioEnhanceEnabled')}
+        description={t('adminSettings.audioEnhanceEnabledDesc')}
+      >
+        <ToggleSwitch
+          checked={settings.audio_enhance_enabled as boolean}
+          onChange={(v) => onToggle('audio_enhance_enabled', v)}
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.audioEnhanceWorkerUrl')}
+        description={t('adminSettings.audioEnhanceWorkerUrlDesc')}
+      >
+        <TextInput
+          value={settings.audio_enhance_worker_url}
+          onChange={(v) => onChange('audio_enhance_worker_url', v)}
+          placeholder="https://enhance.example.com"
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.audioEnhanceWorkerToken')}
+        description={t('adminSettings.audioEnhanceWorkerTokenDesc')}
+      >
+        <div className="space-y-2">
+          <TextInput
+            value={settings.audio_enhance_worker_token}
+            onChange={(v) => onChange('audio_enhance_worker_token', v)}
+            type="password"
+            placeholder={t('adminSettings.audioEnhanceWorkerTokenPlaceholder')}
+          />
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handleVerify}
+              disabled={verifying || !settings.audio_enhance_worker_url}
+              className="px-3 py-1.5 text-xs font-medium text-charcoal-600 border border-cream-200 rounded-lg
+                         hover:bg-cream-50 dark:text-cream-200 dark:border-charcoal-600 dark:hover:bg-charcoal-700
+                         transition-colors disabled:opacity-50"
+            >
+              {verifying
+                ? t('common.loading')
+                : t('adminSettings.audioEnhanceVerify')}
+            </button>
+            {verifyResult && (
+              <span
+                className={`text-xs ${verifyResult.ok ? 'text-green-600' : 'text-rust-500'}`}
+              >
+                {verifyResult.message}
+              </span>
+            )}
+          </div>
+        </div>
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.audioEnhanceTargetLufs')}
+        description={t('adminSettings.audioEnhanceTargetLufsDesc')}
+      >
+        <TextInput
+          value={settings.audio_enhance_target_lufs}
+          onChange={(v) => onChange('audio_enhance_target_lufs', v)}
+          type="number"
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.audioEnhanceAttenLim')}
+        description={t('adminSettings.audioEnhanceAttenLimDesc')}
+      >
+        <TextInput
+          value={settings.audio_enhance_atten_lim_db}
+          onChange={(v) => onChange('audio_enhance_atten_lim_db', v)}
+          type="number"
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.audioEnhanceConcurrency')}
+        description={t('adminSettings.audioEnhanceConcurrencyDesc')}
+      >
+        <TextInput
+          value={settings.audio_enhance_concurrency}
+          onChange={(v) => onChange('audio_enhance_concurrency', v)}
+          type="number"
+        />
+      </SettingField>
+    </div>
+  );
+}
+
 /** 安全设置 */
 function SecurityPanel({
   settings,
@@ -1487,6 +1647,7 @@ export default function SettingsPanel() {
     storage: 'adminSettings.tabStorage',
     appearance: 'adminSettings.tabAppearance',
     asr: 'adminSettings.tabAsr',
+    audioEnhance: 'adminSettings.tabAudioEnhance',
     llm: 'adminSettings.tabLlm',
     security: 'adminSettings.tabSecurity',
   };
@@ -1629,6 +1790,14 @@ export default function SettingsPanel() {
         return <AppearancePanel settings={settings} onChange={handleChange} />;
       case 'asr':
         return <AsrPanel settings={settings} onChange={handleChange} />;
+      case 'audioEnhance':
+        return (
+          <AudioEnhancePanel
+            settings={settings}
+            onChange={handleChange}
+            onToggle={handleToggle}
+          />
+        );
       case 'llm':
         return <LlmSettingsPanel />;
       case 'security':

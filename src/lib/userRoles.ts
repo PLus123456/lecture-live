@@ -52,6 +52,8 @@ export interface GroupPermissions {
   allowRealtimeSummary: boolean;
   /** 是否允许使用总摘要（结束时的结构化报告） */
   allowFinalSummary: boolean;
+  /** 是否允许录音音频增强（外部 worker 后处理）。与其它开关不同：新重资源功能，缺省禁止 */
+  allowAudioEnhance: boolean;
   // ── 用途专用模型（与用户组绑定）──
   // 存的是 LlmModel 的 DB id（路由行）；空串/缺省 = 「跟随全局默认」（该用途 isDefault 的模型）。
   // 与 allowedModels 不同：allowedModels 只作用于聊天选择器，这几个才决定各用途实际用哪个模型。
@@ -68,6 +70,7 @@ export interface EffectiveFeatureFlags {
   maxThinkingDepth: ThinkingDepthCap;
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
+  allowAudioEnhance: boolean;
 }
 
 /** 某用户在运行时生效的摘要模型（由所属组解析而来）；null = 跟随全局该用途默认 */
@@ -133,6 +136,7 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         maxThinkingDepth: 'high',
         allowRealtimeSummary: true,
         allowFinalSummary: true,
+        allowAudioEnhance: true,
       };
     case 'PRO':
       return {
@@ -143,6 +147,8 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         maxThinkingDepth: 'high',
         allowRealtimeSummary: true,
         allowFinalSummary: true,
+        // 音频增强吃独立 worker 的算力，默认不放开，由管理员按组显式开启
+        allowAudioEnhance: false,
       };
     default:
       return {
@@ -155,6 +161,7 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         maxThinkingDepth: 'medium',
         allowRealtimeSummary: true,
         allowFinalSummary: true,
+        allowAudioEnhance: false,
       };
   }
 }
@@ -240,6 +247,10 @@ export async function resolveRoleQuotas(role: UserRole): Promise<GroupPermission
       cfg.allowFinalSummary,
       defaults.allowFinalSummary
     ),
+    allowAudioEnhance: coerceBool(
+      cfg.allowAudioEnhance,
+      defaults.allowAudioEnhance
+    ),
     realtimeSummaryModelId: coerceSummaryModelId(cfg.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(cfg.finalSummaryModelId),
     chatModelId: coerceSummaryModelId(cfg.chatModelId),
@@ -301,6 +312,8 @@ export async function resolveCustomGroupPermissions(
     maxThinkingDepth: coerceThinkingDepthCap(cfg.maxThinkingDepth, 'high'),
     allowRealtimeSummary: coerceBool(cfg.allowRealtimeSummary, true),
     allowFinalSummary: coerceBool(cfg.allowFinalSummary, true),
+    // 与其它开关的「缺省全开」相反：音频增强为新重资源功能，缺省禁止
+    allowAudioEnhance: coerceBool(cfg.allowAudioEnhance, false),
     realtimeSummaryModelId: coerceSummaryModelId(cfg.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(cfg.finalSummaryModelId),
     chatModelId: coerceSummaryModelId(cfg.chatModelId),
@@ -324,6 +337,7 @@ export async function resolveUserFeatureFlags(user: {
       maxThinkingDepth: 'high',
       allowRealtimeSummary: true,
       allowFinalSummary: true,
+      allowAudioEnhance: true,
     };
   }
 
@@ -334,6 +348,7 @@ export async function resolveUserFeatureFlags(user: {
         maxThinkingDepth: custom.maxThinkingDepth,
         allowRealtimeSummary: custom.allowRealtimeSummary,
         allowFinalSummary: custom.allowFinalSummary,
+        allowAudioEnhance: custom.allowAudioEnhance,
       };
     }
     // 自定义组不存在 → 回落底层角色配置
@@ -344,6 +359,7 @@ export async function resolveUserFeatureFlags(user: {
     maxThinkingDepth: roleQuotas.maxThinkingDepth,
     allowRealtimeSummary: roleQuotas.allowRealtimeSummary,
     allowFinalSummary: roleQuotas.allowFinalSummary,
+    allowAudioEnhance: roleQuotas.allowAudioEnhance,
   };
 }
 

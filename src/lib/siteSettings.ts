@@ -10,6 +10,7 @@ import { decrypt } from '@/lib/crypto';
 export const SENSITIVE_SETTING_KEYS = [
   'smtp_password',
   'cloudreve_client_secret',
+  'audio_enhance_worker_token',
 ] as const;
 
 /**
@@ -80,6 +81,13 @@ export interface SiteSettings {
   // 默认 0.8（8 折）。扣费与对账两侧共用此值，口径必须一致。范围 [0, 10]。
   async_upload_billing_multiplier: number;
   chat_files_quota_admin_mb: number;     // ADMIN 角色配额（MB），相当于上限
+  // 录音音频增强（外部 worker 后处理：响度归一化 + 降噪）
+  audio_enhance_enabled: boolean;        // 站点级总开关（组能力开关另见 GroupPermissions.allowAudioEnhance）
+  audio_enhance_worker_url: string;      // worker 基址，如 https://enhance.example.com
+  audio_enhance_worker_token: string;    // Bearer token（敏感，加密落库）
+  audio_enhance_target_lufs: number;     // 响度目标（LUFS），默认 -14
+  audio_enhance_atten_lim_db: number;    // 降噪衰减上限（dB），默认 30；越大降噪越狠、人声越干
+  audio_enhance_concurrency: number;     // 主服务器同时派发给 worker 的任务数，默认 1
 }
 
 const SITE_SETTINGS_CACHE_TTL_MS = 60_000;
@@ -134,6 +142,12 @@ const DEFAULT_SITE_SETTINGS: SiteSettings = {
   chat_files_quota_pro_mb: 1024,
   chat_files_quota_admin_mb: 10240,
   async_upload_billing_multiplier: 0.8,
+  audio_enhance_enabled: false,
+  audio_enhance_worker_url: '',
+  audio_enhance_worker_token: '',
+  audio_enhance_target_lufs: -14,
+  audio_enhance_atten_lim_db: 30,
+  audio_enhance_concurrency: 1,
 };
 
 let siteSettingsCache: SiteSettings | null = null;
@@ -353,6 +367,28 @@ function normalizeSiteSettings(raw: Record<string, string>): SiteSettings {
       DEFAULT_SITE_SETTINGS.async_upload_billing_multiplier,
       { min: 0, max: 10 }
     ),
+    audio_enhance_enabled: parseBoolean(
+      raw.audio_enhance_enabled,
+      DEFAULT_SITE_SETTINGS.audio_enhance_enabled
+    ),
+    audio_enhance_worker_token: decryptSensitiveSetting(
+      raw.audio_enhance_worker_token
+    ),
+    audio_enhance_target_lufs: parseInteger(
+      raw.audio_enhance_target_lufs,
+      DEFAULT_SITE_SETTINGS.audio_enhance_target_lufs,
+      { min: -30, max: -8 }
+    ),
+    audio_enhance_atten_lim_db: parseInteger(
+      raw.audio_enhance_atten_lim_db,
+      DEFAULT_SITE_SETTINGS.audio_enhance_atten_lim_db,
+      { min: 6, max: 100 }
+    ),
+    audio_enhance_concurrency: parseInteger(
+      raw.audio_enhance_concurrency,
+      DEFAULT_SITE_SETTINGS.audio_enhance_concurrency,
+      { min: 1, max: 4 }
+    ),
   };
 }
 
@@ -393,6 +429,9 @@ export function serializeSiteSettingsForAdmin(settings: SiteSettings) {
     cloudreve_client_secret: settings.cloudreve_client_secret
       ? SETTING_SECRET_MASK
       : '',
+    audio_enhance_worker_token: settings.audio_enhance_worker_token
+      ? SETTING_SECRET_MASK
+      : '',
     password_min_length: String(settings.password_min_length),
     smtp_port: String(settings.smtp_port),
     max_file_size: String(settings.max_file_size),
@@ -409,6 +448,9 @@ export function serializeSiteSettingsForAdmin(settings: SiteSettings) {
     chat_files_quota_pro_mb: String(settings.chat_files_quota_pro_mb),
     chat_files_quota_admin_mb: String(settings.chat_files_quota_admin_mb),
     async_upload_billing_multiplier: String(settings.async_upload_billing_multiplier),
+    audio_enhance_target_lufs: String(settings.audio_enhance_target_lufs),
+    audio_enhance_atten_lim_db: String(settings.audio_enhance_atten_lim_db),
+    audio_enhance_concurrency: String(settings.audio_enhance_concurrency),
   };
 }
 

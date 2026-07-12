@@ -38,6 +38,7 @@ import { generateSessionReport, generateSessionTitle } from '@/lib/llm/reportMan
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
 import { trackJob, JOB_TYPE } from '@/lib/jobQueue';
+import { maybeEnqueueAudioEnhanceForSession } from '@/lib/audio/enhanceProcessor';
 import {
   invalidateFoldersApiCache,
   invalidateSessionsApiCache,
@@ -413,6 +414,16 @@ export async function finalizeSession(
     // P0-6：CAS 成功，recordingPath 已落库；发布 staged 录音（删旧 previousReference，此路径通常无旧值）。
     if (stagedAudio) {
       await finalizeStagedArtifactPublish(session, stagedAudio).catch(() => undefined);
+    }
+
+    // 录音音频增强（后处理）：录音已发布且事务已提交，按站点/用户组门禁自动入队，
+    // 由 ws 进程的 enhance loop 派发给外部 worker。fire-and-forget，不阻塞收尾。
+    if (recordingPath && !recordingMissing) {
+      void maybeEnqueueAudioEnhanceForSession({
+        sessionId: session.id,
+        userId: session.userId,
+        triggeredBy: 'system',
+      });
     }
 
     // C14：事务已成功提交，永久 artifact 的 path 与 COMPLETED 状态已落库，此时才删草稿。

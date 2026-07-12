@@ -264,6 +264,7 @@ describe('resolveUserFeatureFlags', () => {
       maxThinkingDepth: 'high',
       allowRealtimeSummary: true,
       allowFinalSummary: true,
+      allowAudioEnhance: true,
     });
   });
 
@@ -308,6 +309,38 @@ describe('resolveUserFeatureFlags', () => {
     expect(f.allowRealtimeSummary).toBe(false);
     // allowFinalSummary 未在配置中 → 回落 FREE 默认 true
     expect(f.allowFinalSummary).toBe(true);
+  });
+
+  // ── 音频增强开关：与其它开关的「缺省全开」相反，缺省禁止 ──
+  it('audioEnhance：FREE/PRO 无配置默认禁止，ADMIN 恒允许', async () => {
+    expect((await resolveUserFeatureFlags({ role: 'FREE' })).allowAudioEnhance).toBe(false);
+    expect((await resolveUserFeatureFlags({ role: 'PRO' })).allowAudioEnhance).toBe(false);
+    expect((await resolveUserFeatureFlags({ role: 'ADMIN' })).allowAudioEnhance).toBe(true);
+  });
+
+  it('audioEnhance：自定义组缺省禁止（不随其它开关的默认全开），显式开启被采纳', async () => {
+    setSiteSettings({
+      custom_groups: [
+        { id: 'g_no_audio', permissions: { allowedModels: '*' } },
+        { id: 'g_audio', permissions: { allowedModels: '*', allowAudioEnhance: true } },
+      ],
+    });
+    expect(
+      (await resolveUserFeatureFlags({ role: 'FREE', customGroupId: 'g_no_audio' }))
+        .allowAudioEnhance
+    ).toBe(false);
+    expect(
+      (await resolveUserFeatureFlags({ role: 'FREE', customGroupId: 'g_audio' }))
+        .allowAudioEnhance
+    ).toBe(true);
+  });
+
+  it('audioEnhance：系统组 group_config 显式开启被采纳', async () => {
+    setSiteSettings({ group_config_PRO: { allowAudioEnhance: true } });
+    expect(
+      (await resolveUserFeatureFlags({ role: 'PRO', customGroupId: null }))
+        .allowAudioEnhance
+    ).toBe(true);
   });
 });
 

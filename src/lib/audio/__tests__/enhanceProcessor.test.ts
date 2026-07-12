@@ -29,7 +29,8 @@ const {
     },
   };
   const workerMock = {
-    getEnhanceWorkerConfig: vi.fn(),
+    getEnhanceFleetConfig: vi.fn(),
+    pingEnhanceWorker: vi.fn(),
     uploadEnhanceInput: vi.fn(),
     startEnhanceJob: vi.fn(),
     getEnhanceJob: vi.fn(),
@@ -52,8 +53,9 @@ vi.mock('@/lib/audio/enhanceWorkerClient', async (importOriginal) => {
     typeof import('@/lib/audio/enhanceWorkerClient')
   >();
   return {
-    ...original,
-    getEnhanceWorkerConfig: workerMock.getEnhanceWorkerConfig,
+    ...original, // EnhanceWorkerError / workerConfigFor / parseWorkerUrls 用真实现
+    getEnhanceFleetConfig: workerMock.getEnhanceFleetConfig,
+    pingEnhanceWorker: workerMock.pingEnhanceWorker,
     uploadEnhanceInput: workerMock.uploadEnhanceInput,
     startEnhanceJob: workerMock.startEnhanceJob,
     getEnhanceJob: workerMock.getEnhanceJob,
@@ -70,13 +72,16 @@ import {
   runAudioEnhanceTick,
 } from '@/lib/audio/enhanceProcessor';
 
-const WORKER_CONFIG = {
-  baseUrl: 'https://enhance.test',
+const WORKER_URL = 'https://enhance.test';
+const FLEET = {
+  workerUrls: [WORKER_URL],
   token: 't'.repeat(32),
   targetLufs: -14,
   attenLimDb: 30,
   concurrency: 1,
 };
+/** PROCESSING 任务的绑定 params（对账分支要求有效绑定，否则直接回炉） */
+const BOUND_PARAMS = JSON.stringify({ workerUrl: WORKER_URL });
 
 const SESSION = {
   id: 'sess-1',
@@ -108,7 +113,12 @@ function jobRow(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   // 默认空世界：没有任务、claim 都成功
-  workerMock.getEnhanceWorkerConfig.mockResolvedValue(WORKER_CONFIG);
+  workerMock.getEnhanceFleetConfig.mockResolvedValue(FLEET);
+  workerMock.pingEnhanceWorker.mockResolvedValue({
+    ok: true,
+    engines: { ffmpeg: true, deepFilter: true },
+    queue: { running: 0, queued: 0, capacity: 1, queueLimit: 8 },
+  });
   prismaMock.jobQueue.findMany.mockResolvedValue([]);
   prismaMock.jobQueue.count.mockResolvedValue(0);
   prismaMock.jobQueue.updateMany.mockResolvedValue({ count: 1 });
@@ -154,7 +164,7 @@ describe('enqueueAudioEnhance', () => {
 
 describe('runAudioEnhanceTick — 派发', () => {
   it('站点未配置 worker 时整轮短路', async () => {
-    workerMock.getEnhanceWorkerConfig.mockResolvedValue(null);
+    workerMock.getEnhanceFleetConfig.mockResolvedValue(null);
     await runAudioEnhanceTick();
     expect(prismaMock.jobQueue.findMany).not.toHaveBeenCalled();
   });
@@ -163,6 +173,7 @@ describe('runAudioEnhanceTick — 派发', () => {
     prismaMock.jobQueue.findMany
       .mockResolvedValueOnce([]) // PROCESSING 对账
       .mockResolvedValueOnce([]) // FAILED 自动重试
+      .mockResolvedValueOnce([]) // PROCESSING busy 统计（按台并发）
       .mockResolvedValueOnce([jobRow()]); // SUBMITTED 待派发
     workerMock.getEnhanceJob.mockRejectedValue(new EnhanceWorkerError('nf', 404));
     persistenceMock.loadSessionAudioArtifact.mockResolvedValue({
@@ -200,6 +211,7 @@ describe('runAudioEnhanceTick — 派发', () => {
     prismaMock.jobQueue.findMany
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([jobRow()]);
     prismaMock.jobQueue.updateMany.mockResolvedValue({ count: 0 }); // claim 失败
     await runAudioEnhanceTick();
@@ -208,6 +220,7 @@ describe('runAudioEnhanceTick — 派发', () => {
 
   it('会话已删：终态失败，不重试（nextRetryAt 不写入）', async () => {
     prismaMock.jobQueue.findMany
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([jobRow()]);
@@ -225,6 +238,7 @@ describe('runAudioEnhanceTick — 派发', () => {
 
   it('worker 队列满（429）：让位回 SUBMITTED，不标失败', async () => {
     prismaMock.jobQueue.findMany
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([jobRow()]);
@@ -256,6 +270,7 @@ describe('runAudioEnhanceTick — 派发', () => {
     prismaMock.jobQueue.findMany
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([jobRow()]);
     workerMock.getEnhanceJob.mockResolvedValue({ status: 'running' });
 
@@ -270,10 +285,103 @@ describe('runAudioEnhanceTick — 派发', () => {
   });
 });
 
+describe('runAudioEnhanceTick — 多 worker 负载均衡', () => {
+  it('派发选最空的可达台，并把绑定写进 params', async () => {
+    const W1 = 'https://w1.test';
+    const W2 = 'https://w2.test';
+    workerMock.getEnhanceFleetConfig.mockResolvedValue({
+      ...FLEET,
+      workerUrls: [W1, W2],
+    });
+    prismaMock.jobQueue.findMany
+      .mockResolvedValueOnce([]) // PROCESSING 对账
+      .mockResolvedValueOnce([]) // FAILED 自动重试
+      .mockResolvedValueOnce([]) // PROCESSING busy 统计
+      .mockResolvedValueOnce([jobRow()]); // SUBMITTED 待派发
+    // 新任务：全 fleet 找回都 404
+    workerMock.getEnhanceJob.mockRejectedValue(new EnhanceWorkerError('nf', 404));
+    // w1 忙（队列 3）、w2 空 → 应选 w2
+    workerMock.pingEnhanceWorker.mockImplementation(async (config: { baseUrl: string }) => ({
+      ok: true,
+      engines: { ffmpeg: true, deepFilter: true },
+      queue: {
+        running: config.baseUrl === W1 ? 1 : 0,
+        queued: config.baseUrl === W1 ? 2 : 0,
+        capacity: 1,
+        queueLimit: 8,
+      },
+    }));
+    persistenceMock.loadSessionAudioArtifact.mockResolvedValue({
+      data: Buffer.from([1]),
+      contentType: 'audio/webm',
+      fileName: 'x.webm',
+      path: SESSION.recordingPath,
+    });
+
+    await runAudioEnhanceTick();
+
+    expect(workerMock.uploadEnhanceInput).toHaveBeenCalledWith(
+      expect.objectContaining({ baseUrl: W2 }),
+      'job-1',
+      expect.any(Buffer),
+      'audio/webm'
+    );
+    // 绑定落库：params.workerUrl = w2
+    const bindWrite = prismaMock.jobQueue.update.mock.calls.find((c) => {
+      try {
+        return JSON.parse(c[0]?.data?.params ?? '{}').workerUrl === W2;
+      } catch {
+        return false;
+      }
+    });
+    expect(bindWrite).toBeTruthy();
+  });
+
+  it('全部 worker 不可达：让位回 SUBMITTED，不标失败不耗 attempt', async () => {
+    prismaMock.jobQueue.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([jobRow()]);
+    workerMock.getEnhanceJob.mockRejectedValue(new EnhanceWorkerError('nf', 404));
+    workerMock.pingEnhanceWorker.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    await runAudioEnhanceTick();
+
+    expect(workerMock.uploadEnhanceInput).not.toHaveBeenCalled();
+    expect(prismaMock.jobQueue.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'job-1', status: 'PROCESSING' },
+        data: { status: 'SUBMITTED', startedAt: null },
+      })
+    );
+    expect(prismaMock.jobQueue.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: 'FAILED' }) })
+    );
+  });
+
+  it('PROCESSING 无有效绑定（升级前旧任务）：回炉重派', async () => {
+    prismaMock.jobQueue.findMany
+      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date(), params: null })])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    await runAudioEnhanceTick();
+
+    expect(workerMock.getEnhanceJob).not.toHaveBeenCalled();
+    expect(prismaMock.jobQueue.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'job-1', status: 'PROCESSING' },
+        data: { status: 'SUBMITTED', startedAt: null },
+      })
+    );
+  });
+});
+
 describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
   it('succeeded：下载 → stage → CAS 落库 → publish → SUCCESS → 清 worker', async () => {
     prismaMock.jobQueue.findMany
-      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date() })])
+      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date(), params: BOUND_PARAMS })])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
     workerMock.getEnhanceJob.mockResolvedValue({
@@ -317,7 +425,7 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
 
   it('succeeded 但会话在下载期间被删：回滚 staged 对象并终态失败', async () => {
     prismaMock.jobQueue.findMany
-      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date() })])
+      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date(), params: BOUND_PARAMS })])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
     workerMock.getEnhanceJob.mockResolvedValue({ status: 'succeeded', output: {} });
@@ -334,7 +442,7 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
     });
     prismaMock.session.updateMany.mockResolvedValue({ count: 0 }); // CAS 失败=会话没了
     prismaMock.jobQueue.findUnique.mockResolvedValue(
-      jobRow({ status: 'PROCESSING', attempt: 1 })
+      jobRow({ status: 'PROCESSING', attempt: 1, params: BOUND_PARAMS })
     );
 
     await runAudioEnhanceTick();
@@ -345,12 +453,12 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
 
   it('failed 且 attempt 未用尽：FAILED + params 写入 nextRetryAt，会话回 pending', async () => {
     prismaMock.jobQueue.findMany
-      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date(), attempt: 1 })])
+      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date(), attempt: 1, params: BOUND_PARAMS })])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
     workerMock.getEnhanceJob.mockResolvedValue({ status: 'failed', error: 'ffmpeg exploded' });
     prismaMock.jobQueue.findUnique.mockResolvedValue(
-      jobRow({ status: 'PROCESSING', attempt: 1 })
+      jobRow({ status: 'PROCESSING', attempt: 1, params: BOUND_PARAMS })
     );
 
     await runAudioEnhanceTick();
@@ -370,12 +478,12 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
 
   it('failed 且 attempt 用尽：终态失败，会话标 failed 带错误', async () => {
     prismaMock.jobQueue.findMany
-      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date(), attempt: 3 })])
+      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date(), attempt: 3, params: BOUND_PARAMS })])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
     workerMock.getEnhanceJob.mockResolvedValue({ status: 'failed', error: 'boom' });
     prismaMock.jobQueue.findUnique.mockResolvedValue(
-      jobRow({ status: 'PROCESSING', attempt: 3 })
+      jobRow({ status: 'PROCESSING', attempt: 3, params: BOUND_PARAMS })
     );
 
     await runAudioEnhanceTick();
@@ -392,7 +500,7 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
 
   it('worker 404（重启丢任务）：回炉 SUBMITTED 等下轮重推', async () => {
     prismaMock.jobQueue.findMany
-      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date() })])
+      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: new Date(), params: BOUND_PARAMS })])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
     workerMock.getEnhanceJob.mockRejectedValue(new EnhanceWorkerError('nf', 404));
@@ -410,12 +518,12 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
   it('queued/running 超时：清 worker 并按可重试失败处理', async () => {
     const stale = new Date(Date.now() - 3 * 60 * 60_000); // 3h 前
     prismaMock.jobQueue.findMany
-      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: stale, attempt: 1 })])
+      .mockResolvedValueOnce([jobRow({ status: 'PROCESSING', startedAt: stale, attempt: 1, params: BOUND_PARAMS })])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([]);
     workerMock.getEnhanceJob.mockResolvedValue({ status: 'running' });
     prismaMock.jobQueue.findUnique.mockResolvedValue(
-      jobRow({ status: 'PROCESSING', attempt: 1 })
+      jobRow({ status: 'PROCESSING', attempt: 1, params: BOUND_PARAMS })
     );
 
     await runAudioEnhanceTick();
@@ -460,7 +568,12 @@ describe('runAudioEnhanceTick — 自动重试', () => {
     ];
     for (const failedJob of cases) {
       vi.clearAllMocks();
-      workerMock.getEnhanceWorkerConfig.mockResolvedValue(WORKER_CONFIG);
+      workerMock.getEnhanceFleetConfig.mockResolvedValue(FLEET);
+  workerMock.pingEnhanceWorker.mockResolvedValue({
+    ok: true,
+    engines: { ffmpeg: true, deepFilter: true },
+    queue: { running: 0, queued: 0, capacity: 1, queueLimit: 8 },
+  });
       prismaMock.jobQueue.count.mockResolvedValue(0);
       prismaMock.jobQueue.findMany
         .mockResolvedValueOnce([])

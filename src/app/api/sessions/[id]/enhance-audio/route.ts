@@ -5,7 +5,7 @@ import { assertOwnership } from '@/lib/security';
 import { withRequestLogging } from '@/lib/requestLogger';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { resolveUserFeatureFlags } from '@/lib/userRoles';
-import { getEnhanceWorkerConfig } from '@/lib/audio/enhanceWorkerClient';
+import { getEnhanceFleetConfig } from '@/lib/audio/enhanceWorkerClient';
 import {
   enqueueAudioEnhance,
   runAudioEnhanceTick,
@@ -44,7 +44,7 @@ export const POST = withRequestLogging(
     }
 
     // 站点级开关 + worker 配置齐备
-    const config = await getEnhanceWorkerConfig();
+    const config = await getEnhanceFleetConfig();
     if (!config) {
       return NextResponse.json(
         { error: 'Audio enhancement is not enabled on this site' },

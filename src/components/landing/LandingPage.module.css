@@ -601,9 +601,8 @@
 .heroCopy {
   position: relative;
   z-index: 3;
-  transform: translate3d(var(--hero-enter-x, 0px), var(--hero-copy-shift), 0);
-  opacity: calc(var(--hero-fade) * var(--hero-enter-o, 1));
-  animation: heroEnterLeft 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+  transform: translate3d(0, var(--hero-copy-shift), 0);
+  opacity: var(--hero-fade);
   will-change: transform, opacity;
 }
 
@@ -741,7 +740,6 @@
   padding: 70px 0 85px;
   transform: translate3d(var(--hero-enter-x, 0px), var(--hero-visual-shift), 0);
   opacity: calc((0.42 + var(--hero-fade) * 0.58) * var(--hero-enter-o, 1));
-  animation: heroEnterRight 0.9s cubic-bezier(0.16, 1, 0.3, 1) 0.08s both;
   perspective: 1200px;
   will-change: transform, opacity;
 }
@@ -756,7 +754,6 @@
   background: radial-gradient(circle at 38% 34%, rgba(241, 138, 94, 0.46), rgba(170, 53, 20, 0.15) 38%, transparent 68%);
   filter: blur(24px);
   opacity: 0.62;
-  animation: orbBreathe 6s ease-in-out infinite;
 }
 
 .productWindow {
@@ -770,7 +767,8 @@
   background: var(--ll-window-bg);
   box-shadow: inset 0 1px rgba(var(--ll-ink-on-dark-rgb), 0.07),
     0 58px 120px var(--ll-shadow-color-strong), 0 0 0 8px rgba(var(--ll-ink-rgb), 0.018);
-  transform: rotateX(2deg) rotateY(-4deg) rotateZ(0.4deg);
+  transform: translateY(var(--win-enter-y, 0px)) scale(var(--win-enter-s, 1))
+    rotateX(2deg) rotateY(-4deg) rotateZ(0.4deg);
   transform-origin: center;
 }
 
@@ -1102,7 +1100,6 @@
   color: rgba(var(--ll-ink-rgb), 0.78);
   box-shadow: 0 18px 50px var(--ll-shadow-color);
   backdrop-filter: blur(15px);
-  animation: badgeFloat 5s ease-in-out infinite;
 }
 
 .floatBadgeLive {
@@ -1139,7 +1136,6 @@
   padding: 0 14px;
   color: rgba(var(--ll-ink-rgb), 0.7);
   font-size: 9px;
-  animation-delay: -1.8s;
 }
 
 .floatBadgeAi {
@@ -1148,7 +1144,6 @@
   gap: 10px;
   min-width: 218px;
   padding: 10px 12px;
-  animation-delay: -3.1s;
 }
 
 .floatBadgeAi > svg:first-child {
@@ -2681,8 +2676,9 @@
   align-items: center;
   gap: 11px;
   opacity: 0;
-  transform: translateY(10px);
-  transition: opacity 0.5s ease, transform 0.5s ease;
+  transform: translateY(16px);
+  transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .continuum[data-visible="true"] .continuumNode {
@@ -2911,9 +2907,17 @@
   font-size: 7px;
 }
 
-/* 首屏进入动画：左侧文案从左、右侧产品图从右滑入并淡入。
-   用可动画的自定义属性驱动，只吃 X 位移与不透明度倍率，
-   与滚动视差(--hero-copy-shift/--hero-fade)组合而互不打架。 */
+/* ─────────────────────────────────────────────────────────────
+   首屏入场编排（第一幕）：
+   ① 顶栏从视口上方落下（back-out 回弹：轻微过冲再稳住）
+   ② 左侧文案逐行进场（expo-out 长尾：快进慢停，错峰 80ms）
+   ③ 右侧视觉滑入 → 产品窗口托起 → 徽章依次弹出（back-out 弹跳）
+   ④ 滚动提示最后淡入
+   heroCopy/heroVisual 的 transform/opacity 被滚动视差
+   (--hero-copy-shift/--hero-fade)占用，入场动画只写在子元素
+   或注册的自定义属性上，两套互不打架。
+   常驻动画（badgeFloat/orbBreathe）改为正延迟启动，起点与入场
+   动画的终点对齐，无缝接管，避免两条动画同时抢 transform。 */
 @property --hero-enter-x {
   syntax: "<length>";
   inherits: false;
@@ -2924,15 +2928,151 @@
   inherits: false;
   initial-value: 1;
 }
+@property --win-enter-y {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --win-enter-s {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 1;
+}
 
-@keyframes heroEnterLeft {
-  from { --hero-enter-x: -60px; --hero-enter-o: 0; }
-  to { --hero-enter-x: 0px; --hero-enter-o: 1; }
+/* ① 顶栏：0s → 0.68s */
+.navWrap {
+  animation: navDrop 0.68s cubic-bezier(0.3, 1.36, 0.44, 1) both;
+}
+
+/* ② 左侧文案：0.42s 起逐行进场 */
+.heroCopy .eyebrow {
+  animation: copyRise 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.42s both;
+}
+
+.heroCopy h1 {
+  animation: copyRise 0.75s cubic-bezier(0.16, 1, 0.3, 1) 0.5s both;
+}
+
+.heroCopy .heroDescription {
+  animation: copyRise 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.58s both;
+}
+
+.heroCopy .heroActions {
+  animation: copyRise 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.66s both;
+}
+
+.heroCopy .heroSignals {
+  animation: copyRise 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.74s both;
+}
+
+/* ③ 右侧视觉：0.78s 容器右滑，0.88s 窗口托起，1.28s 起徽章弹出 */
+.heroVisual {
+  animation: heroEnterRight 1s cubic-bezier(0.16, 1, 0.3, 1) 0.78s both;
+}
+
+.productWindow {
+  animation: windowRise 1.05s cubic-bezier(0.16, 1, 0.3, 1) 0.88s both;
+}
+
+.heroOrb {
+  animation: orbEnter 0.9s ease-out 0.82s both,
+    orbBreathe 6s ease-in-out 1.72s infinite;
+}
+
+.floatBadge {
+  animation: badgePop 0.55s cubic-bezier(0.34, 1.56, 0.64, 1) 1.28s both,
+    badgeFloat 5s ease-in-out 1.9s infinite;
+}
+
+/* 徽章两条动画的延迟成对覆盖：弹出错峰 140ms；
+   漂浮起点也错开，让三枚徽章的呼吸相位自然岔开 */
+.floatBadgeLanguage {
+  animation-delay: 1.42s, 3.1s;
+}
+
+.floatBadgeAi {
+  animation-delay: 1.56s, 4.3s;
+}
+
+/* ④ 滚动提示收尾 */
+.scrollCue {
+  animation: cueFade 0.9s ease-out 1.75s both;
+}
+
+@keyframes navDrop {
+  from {
+    opacity: 0;
+    transform: translateY(calc(-100% - 30px));
+  }
+  35% {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes copyRise {
+  from {
+    opacity: 0;
+    transform: translate3d(-26px, 14px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
 }
 
 @keyframes heroEnterRight {
-  from { --hero-enter-x: 60px; --hero-enter-o: 0; }
+  from { --hero-enter-x: 76px; --hero-enter-o: 0; }
   to { --hero-enter-x: 0px; --hero-enter-o: 1; }
+}
+
+@keyframes windowRise {
+  from {
+    opacity: 0;
+    --win-enter-y: 46px;
+    --win-enter-s: 0.96;
+  }
+  45% {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+    --win-enter-y: 0px;
+    --win-enter-s: 1;
+  }
+}
+
+@keyframes orbEnter {
+  from {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+  to {
+    opacity: 0.5;
+    transform: scale(0.92);
+  }
+}
+
+@keyframes badgePop {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.72);
+  }
+  60% {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes cueFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 @keyframes waveTalk {
@@ -2969,9 +3109,131 @@
   to { transform: translateX(-50%); }
 }
 
+/* 呼吸只走 scale/rotate，opacity 让位给 data-reveal 的滚动淡入
+   （动画若同时占用 opacity，reveal 的隐藏态会被永久掩蔽） */
 @keyframes orbitBreathe {
-  0%, 100% { transform: translate(-50%, -50%) rotate(-7deg) scale(0.98); opacity: 0.76; }
-  50% { transform: translate(-50%, -50%) rotate(-4deg) scale(1.03); opacity: 1; }
+  0%, 100% { transform: translate(-50%, -50%) rotate(-7deg) scale(0.98); }
+  50% { transform: translate(-50%, -50%) rotate(-4deg) scale(1.03); }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   折叠线以下的显隐编排：在通用 [data-reveal]（整块淡入上移）之上，
+   给重点区块拆出子元素级的错峰与质感差异。
+   注意通用规则 .page [data-reveal][data-visible] 的特异性是 (0,3,0)，
+   本节所有覆盖都必须 ≥ 它且排在其后。 */
+
+/* ── Bento 卡片：显隐改用一次性动画（cardRise），transition 完整还给
+      hover——顺带修复两处被通用 reveal 规则压死的既有交互：
+      ① :hover 上浮（transform 被 (0,3,0) 的 visible 规则覆盖，从未生效）
+      ② hover 的阴影/描边过渡（transition 列表被整个替换成 opacity/transform）
+      错峰用 animation-delay，与 transition-delay 互不相干，hover 零拖累。 */
+.page .bentoCard[data-reveal] {
+  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.4s ease, border-color 0.4s ease;
+}
+
+.page .bentoCard[data-reveal][data-visible="true"] {
+  transform: translate3d(0, 0, 0) scale(1);
+  animation: cardRise 0.7s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+.page .bentoCard[data-reveal][data-visible="true"]:hover {
+  transform: translate3d(0, -5px, 0) scale(1);
+}
+
+/* 行内错峰：第一行 [1,2]、第二行 [3,4,5]，行首 0ms 起步 */
+.page .bentoGrid > .bentoCard:nth-child(2),
+.page .bentoGrid > .bentoCard:nth-child(4) {
+  animation-delay: 0.09s;
+}
+
+.page .bentoGrid > .bentoCard:nth-child(5) {
+  animation-delay: 0.18s;
+}
+
+@keyframes cardRise {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 34px, 0) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+/* ── capabilities 标题：父块直通，子元素（标题列/导语）错峰上移 */
+.page .capabilitiesHeader[data-reveal] {
+  opacity: 1;
+  transform: none;
+}
+
+.capabilitiesHeader[data-reveal] > * {
+  opacity: 0;
+  transform: translate3d(0, 26px, 0);
+  transition: opacity 0.8s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.capabilitiesHeader[data-reveal][data-visible="true"] > * {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+}
+
+.capabilitiesHeader[data-reveal][data-visible="true"] > p {
+  transition-delay: 0.14s;
+}
+
+/* ── finalCta：父块直通，图标弹出（back-out）+ 文案逐行错峰 */
+.page .ctaContent[data-reveal] {
+  opacity: 1;
+  transform: none;
+}
+
+.ctaContent[data-reveal] > * {
+  opacity: 0;
+  transform: translate3d(0, 26px, 0);
+  transition: opacity 0.75s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.75s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.ctaContent[data-reveal] > .ctaMark {
+  transform: translate3d(0, 18px, 0) scale(0.6);
+  transition: opacity 0.55s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.7s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.ctaContent[data-reveal][data-visible="true"] > * {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+}
+
+.ctaContent[data-reveal][data-visible="true"] > .ctaMark {
+  transform: translate3d(0, 0, 0) scale(1);
+}
+
+.ctaContent[data-reveal][data-visible="true"] > span { transition-delay: 0.07s; }
+.ctaContent[data-reveal][data-visible="true"] > h2 { transition-delay: 0.14s; }
+.ctaContent[data-reveal][data-visible="true"] > p { transition-delay: 0.21s; }
+.ctaContent[data-reveal][data-visible="true"] > .ctaActions { transition-delay: 0.28s; }
+
+/* ── story 叙事区：设备角标比设备框晚一拍浮现 */
+.page .deviceCaption[data-reveal][data-visible="true"] {
+  transition-delay: 0.15s;
+}
+
+/* 轨道环落定在 0.9 而不是 1，贴近原「呼吸到 1」的基调 */
+.page .ctaOrbit[data-reveal][data-visible="true"] {
+  opacity: 0.9;
+}
+
+@media (max-width: 767px) {
+  /* 移动端单列，卡片各自入场，错峰只会徒增等待 */
+  .page .bentoGrid > .bentoCard:nth-child(2),
+  .page .bentoGrid > .bentoCard:nth-child(4),
+  .page .bentoGrid > .bentoCard:nth-child(5) {
+    animation-delay: 0s;
+  }
 }
 
 @media (max-width: 1160px) {
@@ -3235,7 +3497,8 @@
   .productWindow {
     min-height: 420px;
     border-radius: 18px;
-    transform: rotateX(0) rotateY(0) rotateZ(-0.5deg);
+    transform: translateY(var(--win-enter-y, 0px)) scale(var(--win-enter-s, 1))
+      rotateX(0) rotateY(0) rotateZ(-0.5deg);
   }
 
   .windowTopbar {
@@ -3562,8 +3825,13 @@
   .page *::after {
     scroll-behavior: auto !important;
     animation-duration: 0.01ms !important;
+    /* 入场/显隐编排靠 animation-delay 与 transition-delay 排队，
+       reduce 下两类延迟都要清零，否则内容会分批「瞬移」出现
+       而不是立即全部呈现 */
+    animation-delay: 0s !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
   }
 
   .heroCopy,

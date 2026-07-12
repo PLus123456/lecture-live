@@ -162,6 +162,32 @@ describe('enqueueAudioEnhance', () => {
   });
 });
 
+describe('enqueueAudioEnhance — 手动重试的残留清理', () => {
+  it('创建新任务前剥掉同会话 FAILED 残留的 nextRetryAt（防自动复活双跑）', async () => {
+    prismaMock.jobQueue.findFirst.mockResolvedValue(null);
+    prismaMock.jobQueue.findMany.mockResolvedValueOnce([
+      {
+        id: 'old-failed',
+        params: JSON.stringify({
+          workerUrl: WORKER_URL,
+          nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+        }),
+      },
+    ]);
+    prismaMock.jobQueue.create.mockResolvedValue({ id: 'job-new' });
+
+    await enqueueAudioEnhance({ sessionId: 'sess-1', userId: 'user-1' });
+
+    const strip = prismaMock.jobQueue.update.mock.calls.find(
+      (c) => c[0]?.where?.id === 'old-failed'
+    );
+    expect(strip).toBeTruthy();
+    const written = JSON.parse(strip![0].data.params);
+    expect(written.nextRetryAt).toBeUndefined();
+    expect(written.workerUrl).toBe(WORKER_URL); // 其它字段保留
+  });
+});
+
 describe('runAudioEnhanceTick — 派发', () => {
   it('站点未配置 worker 时整轮短路', async () => {
     workerMock.getEnhanceFleetConfig.mockResolvedValue(null);
@@ -280,6 +306,77 @@ describe('runAudioEnhanceTick — 派发', () => {
     expect(prismaMock.session.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: { audioEnhanceStatus: 'processing', audioEnhanceError: null },
+      })
+    );
+  });
+});
+
+describe('runAudioEnhanceTick — 确定性 4xx 快速终态', () => {
+  it('上传 413：立即终态失败（不写 nextRetryAt），会话标 failed', async () => {
+    prismaMock.jobQueue.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([jobRow()]);
+    workerMock.getEnhanceJob.mockRejectedValue(new EnhanceWorkerError('nf', 404));
+    persistenceMock.loadSessionAudioArtifact.mockResolvedValue({
+      data: Buffer.from([1]),
+      contentType: 'audio/webm',
+      fileName: 'x.webm',
+      path: SESSION.recordingPath,
+    });
+    workerMock.uploadEnhanceInput.mockRejectedValue(
+      new EnhanceWorkerError('worker PUT 失败: HTTP 413 Request Entity Too Large', 413)
+    );
+    prismaMock.jobQueue.findUnique.mockResolvedValue(
+      jobRow({ status: 'PROCESSING', attempt: 1 })
+    );
+
+    await runAudioEnhanceTick();
+
+    const failUpdate = prismaMock.jobQueue.update.mock.calls.find(
+      (c) => c[0]?.data?.status === 'FAILED'
+    );
+    expect(failUpdate).toBeTruthy();
+    // 确定性失败：不安排自动重试
+    expect(JSON.parse(failUpdate![0].data.params).nextRetryAt).toBeUndefined();
+    expect(prismaMock.session.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ audioEnhanceStatus: 'failed' }),
+      })
+    );
+  });
+
+  it('上传 503（可自愈）：仍走退避重试（写 nextRetryAt，会话回 pending）', async () => {
+    prismaMock.jobQueue.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([jobRow()]);
+    workerMock.getEnhanceJob.mockRejectedValue(new EnhanceWorkerError('nf', 404));
+    persistenceMock.loadSessionAudioArtifact.mockResolvedValue({
+      data: Buffer.from([1]),
+      contentType: 'audio/webm',
+      fileName: 'x.webm',
+      path: SESSION.recordingPath,
+    });
+    workerMock.uploadEnhanceInput.mockRejectedValue(
+      new EnhanceWorkerError('bad gateway', 503)
+    );
+    prismaMock.jobQueue.findUnique.mockResolvedValue(
+      jobRow({ status: 'PROCESSING', attempt: 1 })
+    );
+
+    await runAudioEnhanceTick();
+
+    const failUpdate = prismaMock.jobQueue.update.mock.calls.find(
+      (c) => c[0]?.data?.status === 'FAILED'
+    );
+    expect(failUpdate).toBeTruthy();
+    expect(typeof JSON.parse(failUpdate![0].data.params).nextRetryAt).toBe('string');
+    expect(prismaMock.session.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { audioEnhanceStatus: 'pending', audioEnhanceError: null },
       })
     );
   });

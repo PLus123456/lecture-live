@@ -104,6 +104,24 @@ export async function enqueueAudioEnhance(
       return existing.id;
     }
 
+    // 剥掉同会话 FAILED 残留任务的自动重试标记：马上要建新任务，旧失败任务若到期
+    // 自动复活会与新任务并行处理同一会话（双份上传 + 双次收割竞态）。
+    const staleFailed = await prisma.jobQueue.findMany({
+      where: {
+        type: JOB_TYPE.AUDIO_ENHANCE,
+        sessionId: options.sessionId,
+        status: JOB_STATUS.FAILED,
+      },
+      select: { id: true, params: true },
+    });
+    for (const row of staleFailed) {
+      const staleParams = parseJobParams(row.params);
+      if (staleParams.nextRetryAt) {
+        delete staleParams.nextRetryAt;
+        await writeJobParams(row.id, staleParams);
+      }
+    }
+
     const jobId = await createJob({
       type: JOB_TYPE.AUDIO_ENHANCE,
       sessionId: options.sessionId,
@@ -447,7 +465,18 @@ async function dispatchJob(
       });
       return;
     }
-    throw error;
+    if (
+      error instanceof EnhanceWorkerError &&
+      error.status >= 400 &&
+      error.status < 500 &&
+      error.status !== 408
+    ) {
+      // 确定性 4xx（413 体积超限 / 401 token 错 / 400 参数错）：重试也不会自愈，
+      // 立即终态失败——否则要陪着退避重试转 25 分钟圈才见到失败提示。
+      await failJob(jobId, session.id, error, { retryable: false });
+      return;
+    }
+    throw error; // 5xx / 网络错误：交给外层按可重试失败处理（退避后自动重试）
   }
   // 绑定落库 + 本轮派发计数（影响同 tick 后续任务的选台）
   await writeJobParams(jobId, { ...params, workerUrl: target });

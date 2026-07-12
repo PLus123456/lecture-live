@@ -86,6 +86,16 @@ async function loginThroughUi(page: Page) {
   await expect(page).toHaveURL(/\/home$/);
 }
 
+// 与 loginThroughUi 相同，但用 locale 无关的选择器（button[type=submit]），
+// 以便在强制中文 locale 时登录按钮文案变化后仍可点击。
+async function loginLocaleAgnostic(page: Page) {
+  await page.goto('/login');
+  await page.locator('input[type="email"]').fill('alice@example.com');
+  await page.locator('input[type="password"]').fill('Abcd1234');
+  await page.locator('button[type="submit"]').click();
+  await expect(page).toHaveURL(/\/home$/);
+}
+
 test('登录流程会提交凭据并进入首页', async ({ page }) => {
   const mocks = await mockLoginAndHomeApis(page);
 
@@ -96,6 +106,45 @@ test('登录流程会提交凭据并进入首页', async ({ page }) => {
     email: 'alice@example.com',
     password: 'Abcd1234',
   });
+});
+
+test('首页问候语：中文池按时段渲染，标题+副标题非空且作者为空时不出现空破折号', async ({
+  page,
+}) => {
+  // 强制中文 locale，走中文问候语池（含 poem/fun 混排与 author 拼接逻辑）
+  await page.addInitScript(() => {
+    try {
+      localStorage.setItem('lecture-live-locale', 'zh');
+    } catch {}
+  });
+  await mockLoginAndHomeApis(page);
+  await loginLocaleAgnostic(page);
+
+  // 大字标题：唯一的 h1.text-3xl（侧边栏 app 名是 text-sm，不会误命中）
+  const title = page.locator('h1.text-3xl');
+  await expect(title).toBeVisible();
+  await expect(title).not.toBeEmpty();
+
+  // 小字副标题：紧随标题的 <p>
+  const subtitle = title.locator('xpath=following-sibling::p[1]');
+  await expect(subtitle).toBeVisible();
+  const titleText = (await title.innerText()).trim();
+  const text = (await subtitle.innerText()).trim();
+  expect(text.length).toBeGreaterThan(0);
+
+  // 确认确实走了中文池（每条中文条目均含 CJK；英文池不含），
+  // 否则「无空破折号」在英文池下会平凡成立、失去意义
+  const CJK = /[一-鿿]/;
+  expect(CJK.test(titleText)).toBe(true);
+  expect(CJK.test(text)).toBe(true);
+
+  // 不出现「空破折号」：既不以 —— 开头也不以 —— 结尾
+  expect(text.startsWith('——')).toBe(false);
+  expect(text.endsWith('——')).toBe(false);
+  // 若含作者分隔符，则其后必须有非空作者名
+  if (text.includes('——')) {
+    expect((text.split('——').pop() ?? '').trim().length).toBeGreaterThan(0);
+  }
 });
 
 test('录音流程可以从首页创建新会话并跳转到会话页', async ({ page }) => {

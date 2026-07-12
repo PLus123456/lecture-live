@@ -28,6 +28,7 @@ import {
   Loader2,
   RefreshCw,
   Layers,
+  AudioLines,
 } from 'lucide-react';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
 import PlaybackSharePopover from '@/components/session/PlaybackSharePopover';
@@ -104,6 +105,27 @@ interface MobilePlaybackLayoutProps {
   displaySegments?: TranscriptSegment[];
   /** 完整版 bundle 是否已加载（区分「加载中」与「就绪但空」的空态文案，对齐 desktop）。 */
   fullLoaded?: boolean;
+  // 音频增强：父级 owns 状态/轮询，这里只渲染入口 + 「原声/增强」音源切换（对齐 full* 的分工）。
+  /** 门控：非分享 + 会话已完成/归档 + 有录音。 */
+  canEnhanceAudio?: boolean;
+  /** 当前用户所属组是否开通音频增强（服务端解析，据此显隐触发按钮）。 */
+  enhanceAvailable?: boolean;
+  /** 增强版音频已就绪 → 显示音源切换。 */
+  enhanceReady?: boolean;
+  /** 排队/处理中（禁用触发 + spinner + 进度）。 */
+  enhanceInProgress?: boolean;
+  /** 触发请求在途。 */
+  enhanceTriggering?: boolean;
+  /** 增强状态（'failed' 时触发按钮显示「重试」文案）。 */
+  enhanceStatus?: string | null;
+  /** worker 实时进度 0-100（拿不到为 null，只显示"处理中"）。 */
+  enhanceProgress?: number | null;
+  /** 触发增强（免费路径，无确认弹窗）。 */
+  onTriggerEnhance?: () => void;
+  /** 当前音源。 */
+  audioVariant?: 'original' | 'enhanced' | null;
+  /** 切换音源（父级带播放进度重新加载音频）。 */
+  onSwitchAudioVariant?: (variant: 'original' | 'enhanced') => void;
 }
 
 const TAB_KEYS: MobilePlaybackTab[] = ['report', 'transcript', 'summary', 'chat', 'info'];
@@ -358,6 +380,16 @@ export default function MobilePlaybackLayout({
   onSwitchTranscriptView,
   displaySegments,
   fullLoaded,
+  canEnhanceAudio,
+  enhanceAvailable,
+  enhanceReady,
+  enhanceInProgress,
+  enhanceTriggering,
+  enhanceStatus,
+  enhanceProgress,
+  onTriggerEnhance,
+  audioVariant,
+  onSwitchAudioVariant,
 }: MobilePlaybackLayoutProps) {
   const router = useRouter();
   const { t } = useI18n();
@@ -482,6 +514,81 @@ export default function MobilePlaybackLayout({
           {/* Transcript */}
           {activeTab === 'transcript' && (
             <div className="space-y-3">
+              {/* 音频增强：触发入口 / 处理中态 / 「原声/增强」音源切换（状态由父级 owns） */}
+              {canEnhanceAudio &&
+                (enhanceReady || enhanceInProgress || enhanceAvailable) && (
+                  <div className="space-y-2 pb-1">
+                    {enhanceReady ? (
+                      <div
+                        className="inline-flex w-full items-center rounded-lg bg-cream-100 p-0.5"
+                        role="tablist"
+                        aria-label={t('playback.audioEnhance.toggleLabel')}
+                      >
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioVariant === 'original'}
+                          data-testid="audio-original"
+                          onClick={() => onSwitchAudioVariant?.('original')}
+                          className={`flex-1 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors ${
+                            audioVariant === 'original'
+                              ? 'bg-white text-charcoal-700 shadow-sm'
+                              : 'text-charcoal-400'
+                          }`}
+                        >
+                          {t('playback.audioEnhance.original')}
+                        </button>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={audioVariant === 'enhanced'}
+                          data-testid="audio-enhanced"
+                          onClick={() => onSwitchAudioVariant?.('enhanced')}
+                          className={`flex-1 px-2.5 py-1.5 rounded-md text-[11px] font-medium transition-colors flex items-center justify-center gap-1 ${
+                            audioVariant === 'enhanced'
+                              ? 'bg-white text-rust-600 shadow-sm'
+                              : 'text-charcoal-400'
+                          }`}
+                        >
+                          <AudioLines className="w-3 h-3" />
+                          {t('playback.audioEnhance.enhanced')}
+                        </button>
+                      </div>
+                    ) : enhanceInProgress ? (
+                      <div
+                        className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg
+                                   bg-cream-100 text-charcoal-400 text-xs font-medium"
+                        data-testid="enhance-processing"
+                      >
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        {t('playback.audioEnhance.processing')}
+                        {enhanceProgress != null && enhanceProgress > 0 && (
+                          <span className="tabular-nums">
+                            {Math.round(enhanceProgress)}%
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      <button
+                        onClick={onTriggerEnhance}
+                        disabled={enhanceTriggering}
+                        data-testid="enhance-audio-btn"
+                        className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg
+                                   bg-rust-50 text-rust-600 text-xs font-medium
+                                   active:bg-rust-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {enhanceTriggering ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <AudioLines className="w-3.5 h-3.5" />
+                        )}
+                        {enhanceStatus === 'failed'
+                          ? t('playback.audioEnhance.retry')
+                          : t('playback.audioEnhance.button')}
+                      </button>
+                    )}
+                  </div>
+                )}
               {/* 完整版补全转录：生成入口 + 「实时/完整版」切换（收费确认弹窗由父级渲染） */}
               {(canGenerateFull || hasFullTranscript) && (
                 <div className="space-y-2 pb-1">

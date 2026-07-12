@@ -897,7 +897,7 @@ export default {
     audioEnhanceEnabled: '启用音频增强',
     audioEnhanceEnabledDesc: '站点级总开关；还需在用户组里开启对应能力',
     audioEnhanceWorkerUrl: 'Worker 地址',
-    audioEnhanceWorkerUrlDesc: '增强 worker 的 HTTPS 地址（nginx 反代），如 https://enhance.example.com',
+    audioEnhanceWorkerUrlDesc: '增强 worker 的 HTTPS 地址，一行一个或逗号分隔可配多台；多台时任务自动派发给最空闲的可达节点',
     audioEnhanceWorkerToken: 'Worker Token',
     audioEnhanceWorkerTokenDesc: '与 worker 约定的 Bearer token（AUDIO_WORKER_TOKEN，≥32 字符）；加密存储',
     audioEnhanceWorkerTokenPlaceholder: '留空保持已保存的 token',

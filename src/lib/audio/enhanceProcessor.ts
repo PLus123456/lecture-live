@@ -9,14 +9,17 @@ import {
   rollbackStagedArtifact,
 } from '@/lib/sessionPersistence';
 import {
-  getEnhanceWorkerConfig,
+  getEnhanceFleetConfig,
+  workerConfigFor,
+  pingEnhanceWorker,
   uploadEnhanceInput,
   startEnhanceJob,
   getEnhanceJob,
   downloadEnhanceOutput,
   deleteEnhanceJob,
   EnhanceWorkerError,
-  type EnhanceWorkerConfig,
+  type EnhanceFleetConfig,
+  type EnhanceJobStatus,
 } from '@/lib/audio/enhanceWorkerClient';
 import { logger, serializeError } from '@/lib/logger';
 
@@ -47,7 +50,11 @@ const RETRY_BACKOFF_MS = [5 * 60_000, 20 * 60_000, 45 * 60_000];
 const DEFAULT_MAX_ATTEMPTS = 3;
 
 interface EnhanceJobParams {
+  /** 任务绑定的 worker 基址（多台时由派发选定；后续对账/收割/清理都走它） */
+  workerUrl?: string;
   nextRetryAt?: string;
+  /** worker 侧最近一次上报的进度（admin 任务详情可见） */
+  progress?: { stage: string | null; percent: number; at: string };
   [key: string]: unknown;
 }
 
@@ -59,6 +66,13 @@ function parseJobParams(raw: string | null): EnhanceJobParams {
   } catch {
     return {};
   }
+}
+
+/** 就地改写 JobQueue.params（对账 loop 是 params 的单一写方，无并发写风险）。 */
+async function writeJobParams(jobId: string, params: EnhanceJobParams): Promise<void> {
+  await prisma.jobQueue
+    .update({ where: { id: jobId }, data: { params: JSON.stringify(params) } })
+    .catch(() => undefined);
 }
 
 // ─── 入队 ───
@@ -126,8 +140,8 @@ export async function maybeEnqueueAudioEnhanceForSession(options: {
   triggeredBy?: string;
 }): Promise<void> {
   try {
-    const config = await getEnhanceWorkerConfig();
-    if (!config) {
+    const fleet = await getEnhanceFleetConfig();
+    if (!fleet) {
       return;
     }
     const owner = await prisma.user.findUnique({
@@ -181,18 +195,18 @@ export function runAudioEnhanceTick(): Promise<void> {
 }
 
 async function executeTick(): Promise<void> {
-  const config = await getEnhanceWorkerConfig();
-  if (!config) {
+  const fleet = await getEnhanceFleetConfig();
+  if (!fleet) {
     return; // 站点未启用/未配置 worker：静默跳过（入队的任务保留，配置好后自动推进）
   }
 
-  // 1) 对账所有 PROCESSING 任务（收割完成/失败/丢失的）
+  // 1) 对账所有 PROCESSING 任务（收割完成/失败/丢失的，顺带记录进度）
   const processing = await prisma.jobQueue.findMany({
     where: { type: JOB_TYPE.AUDIO_ENHANCE, status: JOB_STATUS.PROCESSING },
     orderBy: { startedAt: 'asc' },
   });
   for (const job of processing) {
-    await reconcileProcessingJob(job, config).catch((error) => {
+    await reconcileProcessingJob(job, fleet).catch((error) => {
       enhanceLogger.warn(
         { jobId: job.id, sessionId: job.sessionId, err: serializeError(error) },
         '音频增强任务对账异常（下轮重试）'
@@ -221,23 +235,31 @@ async function executeTick(): Promise<void> {
     }
   }
 
-  // 3) 派发新的任务：受 worker 并发配置约束
-  const busy = await prisma.jobQueue.count({
+  // 3) 派发新的任务：并发按「每台 worker」计（总在途 = 台数 × concurrency）
+  const busyRows = await prisma.jobQueue.findMany({
     where: { type: JOB_TYPE.AUDIO_ENHANCE, status: JOB_STATUS.PROCESSING },
+    select: { params: true },
   });
-  const slots = Math.max(0, config.concurrency - busy);
-  if (slots === 0) {
+  const busyByUrl = new Map<string, number>();
+  for (const row of busyRows) {
+    const url = parseJobParams(row.params).workerUrl;
+    if (url) busyByUrl.set(url, (busyByUrl.get(url) ?? 0) + 1);
+  }
+  const totalSlots = fleet.workerUrls.length * fleet.concurrency - busyRows.length;
+  if (totalSlots <= 0) {
     return;
   }
   const submitted = await prisma.jobQueue.findMany({
     where: { type: JOB_TYPE.AUDIO_ENHANCE, status: JOB_STATUS.SUBMITTED },
     orderBy: { createdAt: 'asc' },
-    take: slots,
+    take: totalSlots,
   });
+  // tick 作用域内的 healthz 缓存：同轮派发多个任务只 ping 每台一次
+  const healthCache = new Map<string, { ok: boolean; load: number }>();
   for (const job of submitted) {
     const claimed = await claimJob(job.id);
     if (!claimed) continue; // 其它进程抢到了
-    await dispatchJob(job.id, job.sessionId, config).catch(async (error) => {
+    await dispatchJob(job, fleet, busyByUrl, healthCache).catch(async (error) => {
       enhanceLogger.warn(
         { jobId: job.id, sessionId: job.sessionId, err: serializeError(error) },
         '音频增强任务派发异常'
@@ -245,6 +267,71 @@ async function executeTick(): Promise<void> {
       await failJob(job.id, job.sessionId, error, { retryable: true });
     });
   }
+}
+
+// ─── 选台（负载均衡）───
+
+/**
+ * 从集群中挑一台可用 worker：先按「本地在途数 < 每台并发」过滤，再并行 ping 未探测过的
+ * 候选台，最后按「worker 实际队列长度 + 本进程已派发数」取最空者。全部不可达返回 null
+ * （任务留在队列，下轮再试）。healthCache 为 tick 作用域缓存。
+ */
+async function pickWorker(
+  fleet: EnhanceFleetConfig,
+  busyByUrl: Map<string, number>,
+  healthCache: Map<string, { ok: boolean; load: number }>
+): Promise<string | null> {
+  const candidates = fleet.workerUrls.filter(
+    (url) => (busyByUrl.get(url) ?? 0) < fleet.concurrency
+  );
+  if (candidates.length === 0) return null;
+
+  await Promise.all(
+    candidates
+      .filter((url) => !healthCache.has(url))
+      .map(async (url) => {
+        try {
+          const health = await pingEnhanceWorker(workerConfigFor(fleet, url), {
+            timeoutMs: 4_000,
+          });
+          healthCache.set(url, {
+            // engines 缺失 = token 鉴权失败的裸响应，同样视为不可用
+            ok: Boolean(health.ok && health.engines),
+            load: (health.queue?.running ?? 0) + (health.queue?.queued ?? 0),
+          });
+        } catch {
+          healthCache.set(url, { ok: false, load: Number.POSITIVE_INFINITY });
+        }
+      })
+  );
+
+  const alive = candidates.filter((url) => healthCache.get(url)?.ok);
+  if (alive.length === 0) return null;
+  alive.sort(
+    (a, b) =>
+      (healthCache.get(a)!.load + (busyByUrl.get(a) ?? 0)) -
+      (healthCache.get(b)!.load + (busyByUrl.get(b) ?? 0))
+  );
+  return alive[0];
+}
+
+/**
+ * 无绑定（升级前的旧任务/params 损坏）时逐台查找该任务落在哪台 worker 上。
+ * 单台部署时等价于原先的单次状态查询。找不到返回 null（按全新任务重推）。
+ */
+async function findJobOnFleet(
+  fleet: EnhanceFleetConfig,
+  jobId: string
+): Promise<{ url: string; remote: EnhanceJobStatus } | null> {
+  for (const url of fleet.workerUrls) {
+    try {
+      const remote = await getEnhanceJob(workerConfigFor(fleet, url), jobId);
+      return { url, remote };
+    } catch {
+      continue; // 404 或该台不可达：继续找下一台
+    }
+  }
+  return null;
 }
 
 /** 条件抢占：SUBMITTED → PROCESSING（跨进程唯一赢家），返回是否拿到。 */
@@ -276,36 +363,67 @@ async function loadSessionForEnhance(sessionId: string | null) {
 }
 
 async function dispatchJob(
-  jobId: string,
-  sessionId: string | null,
-  config: NonNullable<Awaited<ReturnType<typeof getEnhanceWorkerConfig>>>
+  job: JobRow,
+  fleet: EnhanceFleetConfig,
+  busyByUrl: Map<string, number>,
+  healthCache: Map<string, { ok: boolean; load: number }>
 ): Promise<void> {
-  const session = await loadSessionForEnhance(sessionId);
+  const jobId = job.id;
+  const session = await loadSessionForEnhance(job.sessionId);
   if (!session || !session.recordingPath) {
     // 会话已删或没有录音：终态失败，不再重试
-    await failJob(jobId, sessionId, new Error('会话或录音不存在'), { retryable: false });
+    await failJob(jobId, job.sessionId, new Error('会话或录音不存在'), { retryable: false });
     return;
   }
 
-  // 对账 worker 现状：进程中断/stale 回收后重派时，worker 可能早已在跑甚至已完成
-  let remote: Awaited<ReturnType<typeof getEnhanceJob>> | null = null;
-  try {
-    remote = await getEnhanceJob(config, jobId);
-  } catch (error) {
-    if (!(error instanceof EnhanceWorkerError) || error.status !== 404) {
-      throw error;
+  // 对账 worker 现状：进程中断/stale 回收后重派时，任务可能早已在某台上跑甚至已完成。
+  // 优先查绑定的台；无绑定（旧任务/升级场景）则逐台找回。
+  const params = parseJobParams(job.params);
+  const bound =
+    params.workerUrl && fleet.workerUrls.includes(params.workerUrl)
+      ? params.workerUrl
+      : null;
+  let located: { url: string; remote: EnhanceJobStatus } | null = null;
+  if (bound) {
+    try {
+      located = { url: bound, remote: await getEnhanceJob(workerConfigFor(fleet, bound), jobId) };
+    } catch (error) {
+      if (!(error instanceof EnhanceWorkerError) || error.status !== 404) {
+        throw error; // 绑定台网络异常：保持 PROCESSING，下轮重试
+      }
     }
-  }
-  if (remote?.status === 'succeeded') {
-    await harvestJob(jobId, session, config);
-    return;
-  }
-  if (remote?.status === 'queued' || remote?.status === 'running') {
-    await markSessionProcessing(session.id);
-    return; // 已在 worker 队列里：保持 PROCESSING，等对账收割
+  } else {
+    located = await findJobOnFleet(fleet, jobId);
   }
 
-  // 404 / created / failed（半途而废）→ 重推输入并启动
+  if (located) {
+    // 找到在途/已完成的任务：补写绑定（找回场景），按实际状态走
+    if (located.url !== params.workerUrl) {
+      await writeJobParams(jobId, { ...params, workerUrl: located.url });
+    }
+    if (located.remote.status === 'succeeded') {
+      await harvestJob(jobId, session, fleet, located.url);
+      return;
+    }
+    if (located.remote.status === 'queued' || located.remote.status === 'running') {
+      await markSessionProcessing(session.id);
+      return; // 已在 worker 队列里：保持 PROCESSING，等对账收割
+    }
+    // created / failed（半途而废）：留在这台上重推
+  }
+
+  // 选台（找回场景沿用原台；全新任务按负载挑最空的可达台）
+  const target = located?.url ?? (await pickWorker(fleet, busyByUrl, healthCache));
+  if (!target) {
+    // 全部 worker 不可达/占满：让位回 SUBMITTED，下轮再试，不消耗 attempt
+    await prisma.jobQueue.updateMany({
+      where: { id: jobId, status: JOB_STATUS.PROCESSING },
+      data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
+    });
+    return;
+  }
+  const config = workerConfigFor(fleet, target);
+
   const audio = await loadSessionAudioArtifact(session);
   if (!audio) {
     await failJob(jobId, session.id, new Error('录音文件读取失败'), { retryable: false });
@@ -314,14 +432,15 @@ async function dispatchJob(
   try {
     await uploadEnhanceInput(config, jobId, audio.data, audio.contentType);
     await startEnhanceJob(config, jobId, {
-      targetLufs: config.targetLufs,
-      attenLimDb: config.attenLimDb,
+      targetLufs: fleet.targetLufs,
+      attenLimDb: fleet.attenLimDb,
       denoise: 'auto',
       outputFormat: 'm4a',
     });
   } catch (error) {
     if (error instanceof EnhanceWorkerError && error.status === 429) {
-      // worker 队列满：让位回 SUBMITTED，下轮再派，不消耗 attempt
+      // 这台队列满：清绑定让位回 SUBMITTED，下轮重选（可能落到别台），不消耗 attempt
+      await writeJobParams(jobId, { ...params, workerUrl: undefined });
       await prisma.jobQueue.updateMany({
         where: { id: jobId, status: JOB_STATUS.PROCESSING },
         data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
@@ -330,8 +449,14 @@ async function dispatchJob(
     }
     throw error;
   }
+  // 绑定落库 + 本轮派发计数（影响同 tick 后续任务的选台）
+  await writeJobParams(jobId, { ...params, workerUrl: target });
+  busyByUrl.set(target, (busyByUrl.get(target) ?? 0) + 1);
   await markSessionProcessing(session.id);
-  enhanceLogger.info({ jobId, sessionId: session.id }, '音频增强任务已派发给 worker');
+  enhanceLogger.info(
+    { jobId, sessionId: session.id, worker: target },
+    '音频增强任务已派发给 worker'
+  );
 }
 
 async function markSessionProcessing(sessionId: string): Promise<void> {
@@ -354,8 +479,23 @@ interface JobRow {
 
 async function reconcileProcessingJob(
   job: JobRow,
-  config: NonNullable<Awaited<ReturnType<typeof getEnhanceWorkerConfig>>>
+  fleet: EnhanceFleetConfig
 ): Promise<void> {
+  const params = parseJobParams(job.params);
+  const bound =
+    params.workerUrl && fleet.workerUrls.includes(params.workerUrl)
+      ? params.workerUrl
+      : null;
+  if (!bound) {
+    // PROCESSING 却无有效绑定（升级前的旧任务/配置里删了那台）：回炉重派（dispatch 会逐台找回）
+    await prisma.jobQueue.updateMany({
+      where: { id: job.id, status: JOB_STATUS.PROCESSING },
+      data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
+    });
+    return;
+  }
+  const config = workerConfigFor(fleet, bound);
+
   const session = await loadSessionForEnhance(job.sessionId);
   if (!session) {
     // 会话中途被删：清 worker、终态失败
@@ -364,18 +504,19 @@ async function reconcileProcessingJob(
     return;
   }
 
-  let remote: Awaited<ReturnType<typeof getEnhanceJob>>;
+  let remote: EnhanceJobStatus;
   try {
     remote = await getEnhanceJob(config, job.id);
   } catch (error) {
     if (error instanceof EnhanceWorkerError && error.status === 404) {
-      // worker 重启弄丢任务：回炉 SUBMITTED，下轮重推输入（jobId 不变，幂等）
+      // worker 重启弄丢任务：清绑定回炉 SUBMITTED，下轮重推输入（jobId 不变，幂等）
+      await writeJobParams(job.id, { ...params, workerUrl: undefined });
       await prisma.jobQueue.updateMany({
         where: { id: job.id, status: JOB_STATUS.PROCESSING },
         data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
       });
       enhanceLogger.info(
-        { jobId: job.id, sessionId: session.id },
+        { jobId: job.id, sessionId: session.id, worker: bound },
         'worker 侧任务丢失，回炉重派'
       );
       return;
@@ -385,7 +526,7 @@ async function reconcileProcessingJob(
 
   switch (remote.status) {
     case 'succeeded':
-      await harvestJob(job.id, session, config);
+      await harvestJob(job.id, session, fleet, bound);
       return;
     case 'failed':
       await deleteEnhanceJob(config, job.id).catch(() => undefined);
@@ -394,7 +535,18 @@ async function reconcileProcessingJob(
       });
       return;
     default: {
-      // queued/running：超时守卫（防 worker 假活卡死占坑）
+      // queued/running：记录进度（admin 任务详情可见；变化才写，避免无谓写放大）
+      const percent = Number.isFinite(remote.progress) ? remote.progress : 0;
+      if (
+        params.progress?.percent !== percent ||
+        params.progress?.stage !== (remote.stage ?? null)
+      ) {
+        await writeJobParams(job.id, {
+          ...params,
+          progress: { stage: remote.stage ?? null, percent, at: new Date().toISOString() },
+        });
+      }
+      // 超时守卫（防 worker 假活卡死占坑）
       const startedAt = job.startedAt?.getTime() ?? Date.now();
       if (Date.now() - startedAt > MAX_WORKER_RUNTIME_MS) {
         await deleteEnhanceJob(config, job.id).catch(() => undefined);
@@ -409,8 +561,10 @@ async function reconcileProcessingJob(
 async function harvestJob(
   jobId: string,
   session: NonNullable<Awaited<ReturnType<typeof loadSessionForEnhance>>>,
-  config: EnhanceWorkerConfig
+  fleet: EnhanceFleetConfig,
+  workerUrl: string
 ): Promise<void> {
+  const config = workerConfigFor(fleet, workerUrl);
   const output = await downloadEnhanceOutput(config, jobId);
   const remote = await getEnhanceJob(config, jobId).catch(() => null);
 

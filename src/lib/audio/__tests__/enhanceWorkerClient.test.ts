@@ -9,7 +9,9 @@ vi.mock('@/lib/siteSettings', () => ({
 }));
 
 import {
-  getEnhanceWorkerConfig,
+  getEnhanceFleetConfig,
+  parseWorkerUrls,
+  workerConfigFor,
   pingEnhanceWorker,
   uploadEnhanceInput,
   startEnhanceJob,
@@ -38,16 +40,41 @@ afterEach(() => {
   getSiteSettingsMock.mockReset();
 });
 
-describe('getEnhanceWorkerConfig', () => {
-  it('启用且配置齐备时返回配置（URL 去尾斜杠）', async () => {
+describe('parseWorkerUrls', () => {
+  it('逗号/换行/空白分隔，去尾斜杠去重，保持顺序', () => {
+    expect(
+      parseWorkerUrls(
+        'https://a.test/, https://b.test\nhttps://a.test\n  https://c.test//  '
+      )
+    ).toEqual(['https://a.test', 'https://b.test', 'https://c.test']);
+    expect(parseWorkerUrls('   ')).toEqual([]);
+  });
+});
+
+describe('getEnhanceFleetConfig', () => {
+  it('启用且配置齐备时返回集群配置（URL 规范化）', async () => {
     getSiteSettingsMock.mockResolvedValue(settings());
-    const config = await getEnhanceWorkerConfig();
-    expect(config).toMatchObject({
-      baseUrl: 'https://enhance.test',
+    const fleet = await getEnhanceFleetConfig();
+    expect(fleet).toMatchObject({
+      workerUrls: ['https://enhance.test'],
       targetLufs: -14,
       attenLimDb: 30,
       concurrency: 1,
     });
+    expect(workerConfigFor(fleet!, fleet!.workerUrls[0])).toEqual({
+      baseUrl: 'https://enhance.test',
+      token: 't'.repeat(32),
+    });
+  });
+
+  it('多台配置解析成有序列表', async () => {
+    getSiteSettingsMock.mockResolvedValue(
+      settings({
+        audio_enhance_worker_url: 'https://w1.test, https://w2.test/',
+      })
+    );
+    const fleet = await getEnhanceFleetConfig();
+    expect(fleet?.workerUrls).toEqual(['https://w1.test', 'https://w2.test']);
   });
 
   it('未启用 / 缺 URL / 缺 token 时都返回 null', async () => {
@@ -57,7 +84,7 @@ describe('getEnhanceWorkerConfig', () => {
       { audio_enhance_worker_token: '' },
     ]) {
       getSiteSettingsMock.mockResolvedValue(settings(patch));
-      expect(await getEnhanceWorkerConfig()).toBeNull();
+      expect(await getEnhanceFleetConfig()).toBeNull();
     }
   });
 });

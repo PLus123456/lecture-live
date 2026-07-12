@@ -116,6 +116,14 @@ server {
 | `FFMPEG_BIN` / `FFPROBE_BIN` | `ffmpeg` / `ffprobe` | 可执行文件路径 |
 | `DEEP_FILTER_BIN` | （PATH 查找） | deep-filter 路径；不配则找 `deep-filter`/`deepFilter` |
 
+## 多台 worker（负载均衡）
+
+有多台机器时，把每台各自装好（`install.sh` 重复即可，**token 手动改成同一个值**），然后在管理后台
+的 Worker 地址里一行一个填入全部 HTTPS 地址。主服务器派发任务时会并行探活、把任务派给
+「实际队列 + 在途任务」最少的可达节点，并把任务与节点绑定（后续轮询/取回都走同一台）；
+某台宕机/队列满时任务自动改派其它节点，全部不可达则在主服务器队列里等待。
+「派发并发数」语义是**每台**的并发（总在途 = 台数 × 该值）。
+
 ## 处理管线与耗时预期
 
 `输入 → 48kHz 单声道 WAV → loudnorm 双遍（-14 LUFS）→ deep-filter（--atten-lim-db 30）→ AAC 96k (m4a, faststart)`

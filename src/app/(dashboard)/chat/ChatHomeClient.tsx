@@ -15,11 +15,12 @@ import {
   X,
   ArrowUp,
   ChevronRight,
+  FileText,
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
-import { useIsMobile } from '@/hooks/useIsMobile';
 import { toast } from '@/stores/toastStore';
+import { formatBytes } from '@/lib/format';
 import { useChatStore } from '@/stores/chatStore';
 import {
   useConversationListStore,
@@ -27,7 +28,29 @@ import {
 } from '@/stores/conversationListStore';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import ComposerModelControls from '@/components/chat/ComposerModelControls';
+import ComposerAttachMenu from '@/components/chat/ComposerAttachMenu';
 import RecordingPicker from '@/components/chat/RecordingPicker';
+
+/** 附件文件类型白名单（与 GlobalChat / 服务端对齐）——首页 composer 也用同一套 accept。 */
+const ACCEPT_FILE_INPUT_STRING = [
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.ms-powerpoint',
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'application/json',
+  'application/x-yaml',
+  'text/yaml',
+  'text/*',
+  '.md', '.txt', '.json', '.yaml', '.yml',
+  '.py', '.js', '.ts', '.tsx', '.jsx', '.go', '.rs', '.java', '.cpp', '.c', '.h',
+].join(',');
+const MAX_FILE_BYTES = 50 * 1024 * 1024; // 50MB
 
 /**
  * 「最近对话」时间格式：当天显示 HH:MM；7 天内显示 X 天前；更早显示 YYYY-MM-DD。
@@ -68,7 +91,6 @@ export default function ChatHomeClient() {
   const router = useRouter();
   const { t } = useI18n();
   const { token } = useAuth();
-  const isMobile = useIsMobile();
 
   const items = useConversationListStore((s) => s.items);
   const listLoading = useConversationListStore((s) => s.loading);
@@ -83,6 +105,9 @@ export default function ChatHomeClient() {
   const [pendingRecordings, setPendingRecordings] = useState<
     Array<{ id: string; title: string }>
   >([]);
+  /** 起聊前预选的文档（创建对话后立即上传，attachmentIds 随自动发送带上） */
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   // IME 合成守卫（与 GlobalChat 同步，含 Safari compositionend→keydown 时间窗）
   const [composing, setComposing] = useState(false);
@@ -134,9 +159,35 @@ export default function ChatHomeClient() {
         toast.error(t('common.operationFailed'));
         return;
       }
-      useChatStore
-        .getState()
-        .setPendingFirstMessage({ conversationId: newId, text });
+      // 预选文档：对话建好后立即上传，拿到 attachmentId 随首条消息一并带上。
+      // 单个失败不阻断起聊（其它附件与正文照常发），仅 toast 提示。
+      const attachmentIds: string[] = [];
+      for (const file of pendingFiles) {
+        try {
+          const form = new FormData();
+          form.append('file', file);
+          form.append('conversationId', newId);
+          const upRes = await fetch('/api/chat-uploads', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` },
+            body: form,
+          });
+          if (!upRes.ok) {
+            toast.error(t('chat.uploadFailed'), file.name);
+            continue;
+          }
+          const upData = (await upRes.json()) as { attachmentId?: string };
+          if (upData.attachmentId) attachmentIds.push(upData.attachmentId);
+        } catch {
+          toast.error(t('chat.uploadFailed'), file.name);
+        }
+      }
+      setPendingFiles([]);
+      useChatStore.getState().setPendingFirstMessage({
+        conversationId: newId,
+        text,
+        ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+      });
       // 强刷共享列表：路由变化触发的侧栏刷新不带 force，1.5s 去抖窗口内
       // （进页面即刷过一次）新会话会缺席侧栏，这里显式补上。
       void useConversationListStore.getState().refresh(token, { force: true });
@@ -149,7 +200,19 @@ export default function ChatHomeClient() {
     } finally {
       setCreating(false);
     }
-  }, [draft, creating, token, pendingRecordings, router, t]);
+  }, [draft, creating, token, pendingRecordings, pendingFiles, router, t]);
+
+  /* 选择文档：本地暂存到 pendingFiles（真正上传发生在 handleStart 建好对话之后）。 */
+  const handleFilePick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > MAX_FILE_BYTES) {
+      toast.error(t('chat.fileTooLarge'));
+      return;
+    }
+    setPendingFiles((prev) => [...prev, file]);
+  };
 
   /* ──────────────────────────────────────────────────────────────
      删除对话：二次确认 → DELETE → 同步共享列表
@@ -227,9 +290,11 @@ export default function ChatHomeClient() {
           </h1>
         </div>
 
-        {/* Composer：输入首条消息即开聊 */}
+        {/* Composer：输入首条消息即开聊。
+            relative z-20：composer 与下方「最近对话」都因 animate-fade-in-up 各成层叠上下文，
+            默认后者（DOM 靠后）盖住前者，导致模型下拉被「最近对话」遮住；抬高 composer 层级即可。 */}
         <div
-          className="rounded-2xl border border-cream-300 bg-white shadow-sm
+          className="relative z-20 rounded-2xl border border-cream-300 bg-white shadow-sm
                      focus-within:border-rust-400 focus-within:ring-1 focus-within:ring-rust-400
                      px-4 pt-3 pb-2.5 mb-10 animate-fade-in-up stagger-2 transition-colors"
         >
@@ -262,6 +327,41 @@ export default function ChatHomeClient() {
               ))}
             </div>
           )}
+          {/* 预选文档 chips（对话建好后上传，attachmentIds 随首条消息带上） */}
+          {pendingFiles.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {pendingFiles.map((f, i) => (
+                <span
+                  key={`${f.name}-${i}`}
+                  className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md
+                             text-[11px] border bg-cream-50 border-cream-300 text-charcoal-600 animate-tag-pop"
+                  title={f.name}
+                >
+                  <FileText className="w-3 h-3 flex-shrink-0 text-charcoal-400" />
+                  <span className="truncate max-w-[180px]">{f.name}</span>
+                  <span className="text-charcoal-400 flex-shrink-0">· {formatBytes(f.size)}</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setPendingFiles((prev) => prev.filter((_, j) => j !== i))
+                    }
+                    title={t('chat.removeAttachment')}
+                    className="w-4 h-4 rounded hover:bg-charcoal-100 text-charcoal-400
+                               hover:text-charcoal-700 flex items-center justify-center"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept={ACCEPT_FILE_INPUT_STRING}
+            onChange={handleFilePick}
+            className="hidden"
+          />
           <textarea
             ref={composerRef}
             rows={2}
@@ -295,24 +395,17 @@ export default function ChatHomeClient() {
                        focus:outline-none text-charcoal-700 placeholder:text-charcoal-300
                        disabled:cursor-not-allowed"
           />
-          {/* 工具行：添加录音（左） —— 模型 · 思考 · 发送（右），与对话页 composer 一致 */}
+          {/* 工具行：＋附件菜单（左，上传文档 / 添加录音）—— 模型 · 思考 · 发送（右），与对话页 composer 一致 */}
           <div className="flex items-center justify-between pt-1">
-            <button
-              type="button"
-              onClick={() => setPickerOpen(true)}
+            <ComposerAttachMenu
+              direction="down"
+              onPickFile={() => fileInputRef.current?.click()}
+              onAttachRecording={() => setPickerOpen(true)}
               disabled={creating}
-              title={t('chat.attachRecording')}
-              className="inline-flex items-center gap-1.5 px-2 h-8 rounded-lg text-xs
-                         text-charcoal-400 hover:bg-cream-100 hover:text-charcoal-600
-                         transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              <Mic className="w-4 h-4" />
-              {t('chat.attachRecording')}
-            </button>
+            />
 
             <div className="flex items-center gap-1.5">
-              {/* 桌面端模型选择器在对话侧栏底部；移动端无侧栏，保留在此 */}
-              {isMobile && <ComposerModelControls direction="down" disabled={creating} />}
+              <ComposerModelControls direction="down" disabled={creating} />
               <button
                 type="button"
                 onClick={() => void handleStart()}

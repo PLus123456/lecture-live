@@ -21,7 +21,6 @@ import {
   X,
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
-import { useIsMobile } from '@/hooks/useIsMobile';
 import { useAuthStore } from '@/stores/authStore';
 import { useConversationListStore } from '@/stores/conversationListStore';
 import {
@@ -399,7 +398,6 @@ export default function GlobalChat({
   onAccessDenied?: () => void;
 }) {
   const { t } = useI18n();
-  const isMobile = useIsMobile();
   const router = useRouter();
   const token = useAuthStore((s) => s.token);
 
@@ -600,7 +598,7 @@ export default function GlobalChat({
               // 不应突然自动发送 —— 放回输入框由用户决定。
               pending.ageMs < 60_000
             ) {
-              void handleSend(pending.text);
+              void handleSend(pending.text, { attachmentIds: pending.attachmentIds });
             } else {
               setInput(pending.text);
             }
@@ -1061,7 +1059,10 @@ export default function GlobalChat({
      U12 之前的端点要求 conversation.session 非空；纯全局 chat
      可能返回 404，本组件会把错误内容显示到占位 assistant 气泡里。
      ────────────────────────────────────────────────────────────── */
-  const handleSend = async (textOverride?: string) => {
+  const handleSend = async (
+    textOverride?: string,
+    extra?: { attachmentIds?: string[] }
+  ) => {
     const value = (textOverride ?? input).trim();
     const hasImages = pendingImages.length > 0;
     if (
@@ -1147,7 +1148,12 @@ export default function GlobalChat({
     try {
       const thinkingFields = preferenceToFields(selectedThinkingPreference);
       const recordingIds = recordings.map((r) => r.sessionId);
-      const attachmentIds = attachments.map((a) => a.id);
+      // 首页起聊时预上传的附件经 pendingFirstMessage 显式带入（此刻 attachments 状态可能还没
+      // 拉回来，不能只依赖它，否则首条自动发送会漏掉刚传的文档）。
+      const attachmentIds =
+        extra?.attachmentIds && extra.attachmentIds.length > 0
+          ? extra.attachmentIds
+          : attachments.map((a) => a.id);
 
       const res = await fetch('/api/llm/chat', {
         method: 'POST',
@@ -1536,8 +1542,7 @@ export default function GlobalChat({
           />
 
           <div className="flex items-center gap-1.5 min-w-0">
-            {/* 桌面端模型选择器已移到对话侧栏底部；移动端无侧栏，保留在此 */}
-            {isMobile && <ComposerModelControls />}
+            <ComposerModelControls />
             <ChatContextIndicator tokenUsage={tokenUsage} contextFull={contextFull} />
 
             {isLoading ? (

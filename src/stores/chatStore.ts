@@ -98,6 +98,8 @@ interface ChatStore {
   pendingFirstMessage: {
     conversationId: string;
     text: string;
+    /** 首页 composer 预上传的附件 id（创建对话时随即上传，自动发送时一并带上） */
+    attachmentIds?: string[];
     createdAt: number;
   } | null;
 
@@ -112,7 +114,9 @@ interface ChatStore {
   // ── 导航 Setters ──
   setActiveConversation: (id: string | null) => void;
   setPendingFirstMessage: (
-    pending: { conversationId: string; text: string } | null
+    pending:
+      | { conversationId: string; text: string; attachmentIds?: string[] }
+      | null
   ) => void;
   /**
    * 原子地取走指定对话的待发首条消息（取到即清空，StrictMode 二次挂载/
@@ -120,7 +124,7 @@ interface ChatStore {
    */
   takePendingFirstMessage: (
     conversationId: string
-  ) => { text: string; ageMs: number } | null;
+  ) => { text: string; attachmentIds?: string[]; ageMs: number } | null;
   setConversations: (list: ConversationMeta[]) => void;
   addConversation: (conv: ConversationMeta) => void;
   /**
@@ -170,6 +174,7 @@ const INITIAL_RUNTIME = {
   pendingFirstMessage: null as {
     conversationId: string;
     text: string;
+    attachmentIds?: string[];
     createdAt: number;
   } | null,
 } as const;
@@ -261,7 +266,11 @@ export const useChatStore = create<ChatStore>()(
         const pending = get().pendingFirstMessage;
         if (!pending || pending.conversationId !== conversationId) return null;
         set({ pendingFirstMessage: null });
-        return { text: pending.text, ageMs: Date.now() - pending.createdAt };
+        return {
+          text: pending.text,
+          attachmentIds: pending.attachmentIds,
+          ageMs: Date.now() - pending.createdAt,
+        };
       },
 
       setConversations: (conversations) => set({ conversations }),

@@ -5,6 +5,7 @@ import { createPortal } from 'react-dom';
 import { useTranscriptStore } from '@/stores/transcriptStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import { useSettingsStore } from '@/stores/settingsStore';
+import { useI18n } from '@/lib/i18n';
 
 const LANG_NAMES: Record<string, string> = {
   en: 'English', zh: 'Chinese', ja: 'Japanese', ko: 'Korean',
@@ -80,6 +81,30 @@ function getCaptureStream(canvas: HTMLCanvasElement, fps: number): MediaStream |
   return null;
 }
 
+/** 轮询等待条件成立（webkit 前缀 PiP API 没有任何完成信号，只能轮询验证） */
+function waitForCondition(
+  check: () => boolean,
+  timeoutMs: number,
+  stepMs: number,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (check()) {
+      resolve(true);
+      return;
+    }
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      if (check()) {
+        clearInterval(timer);
+        resolve(true);
+      } else if (Date.now() - started >= timeoutMs) {
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, stepMs);
+  });
+}
+
 /** 请求 Video PiP（兼容标准 API 和 webkit 前缀） */
 async function requestVideoPip(video: HTMLVideoElement): Promise<void> {
   // 优先使用标准 API
@@ -87,9 +112,19 @@ async function requestVideoPip(video: HTMLVideoElement): Promise<void> {
     await video.requestPictureInPicture();
     return;
   }
-  // iOS Safari webkit 前缀
+  // iOS Safari webkit 前缀。fire-and-forget：不 throw 也不返回 promise，
+  // 失败（低电量模式拦掉播放、视频无可用帧）只能靠轮询 presentationMode 验证，
+  // 否则静默失败会被当成成功，用户点了按钮什么都不发生且不会回落 inline
   if (typeof (video as any).webkitSetPresentationMode === 'function') {
     (video as any).webkitSetPresentationMode('picture-in-picture');
+    const entered = await waitForCondition(
+      () => (video as any).webkitPresentationMode === 'picture-in-picture',
+      1500,
+      50,
+    );
+    if (!entered) {
+      throw new Error('webkitSetPresentationMode did not enter picture-in-picture');
+    }
     return;
   }
   throw new Error('No PiP API available');
@@ -102,6 +137,28 @@ function exitVideoPip(): void {
   } else if ((document as any).webkitExitPictureInPicture) {
     try { (document as any).webkitExitPictureInPicture(); } catch { /* ignore */ }
   }
+}
+
+/** 圆角矩形路径 — ctx.roundRect 要 Safari 16+ / Chrome 99+，缺失时用 arcTo 手画 */
+function roundRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+): void {
+  if (typeof (ctx as any).roundRect === 'function') {
+    ctx.roundRect(x, y, w, h, r);
+    return;
+  }
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
 }
 
 
@@ -134,9 +191,9 @@ function getPreferredPipStrategy(): {
 /**
  * 初始化弹出窗口的 DOM：注入样式 + 创建挂载点
  */
-function bootstrapPipWindow(win: Window) {
+function bootstrapPipWindow(win: Window, title: string) {
   // 设置标题
-  win.document.title = 'Reference Tool — Translation';
+  win.document.title = title;
 
   // 注入样式
   const style = win.document.createElement('style');
@@ -159,6 +216,7 @@ function bootstrapPipWindow(win: Window) {
  * - Safari / Firefox / 其它：页内可拖拽悬浮面板（InlinePipPanel）
  */
 export function usePipReferenceTool() {
+  const { t } = useI18n();
   const [pipWindow, setPipWindow] = useState<Window | null>(null);
   const [isOpen, setIsOpen] = useState(false);
   const [pinned, setPinned] = useState(true);
@@ -191,7 +249,7 @@ export function usePipReferenceTool() {
         preferInitialWindowPlacement: true,
       });
 
-      bootstrapPipWindow(pip);
+      bootstrapPipWindow(pip, t('pipTool.windowTitle'));
       pip.addEventListener('pagehide', handleWindowClosed);
 
       try { pip.focus(); } catch { /* ignore */ }
@@ -211,11 +269,16 @@ export function usePipReferenceTool() {
       });
       return false;
     }
-  }, [handleWindowClosed]);
+  }, [handleWindowClosed, t]);
 
   // ── Video PiP 路径（Safari）──
   const openVideoPip = useCallback(async (): Promise<boolean> => {
-    return videoPip.open();
+    const opened = await videoPip.open();
+    if (opened) {
+      setIsOpen(true);
+      setMode('video-pip');
+    }
+    return opened;
   }, [videoPip]);
 
   // ── Inline 路径（Firefox / 其它）——页内悬浮面板 ──
@@ -225,50 +288,43 @@ export function usePipReferenceTool() {
     console.info('[PiP] Inline floating panel opened');
   }, []);
 
+  // 防双击并发：video-pip 的打开要经过异步验证（webkit 轮询最长 ~3s），
+  // 期间 isOpen 仍为 false，靠 isOpen 挡不住第二次 open
+  const openingRef = useRef(false);
+
   const open = useCallback(() => {
+    if (openingRef.current) return;
+    openingRef.current = true;
     const { strategy, reason } = getPreferredPipStrategy();
     console.info('[PiP] Strategy:', strategy, 'Reason:', reason);
 
-    if (strategy === 'inline') {
-      openInline();
-      return;
-    }
-
-    if (strategy === 'video-pip') {
-      void openVideoPip().then((opened) => {
-        if (opened) {
-          setIsOpen(true);
-          setMode('video-pip');
+    void (async () => {
+      try {
+        if (strategy === 'document-pip') {
+          if (await openDocPip()) return;
+          // Document PiP 失败时尝试 Video PiP
+          if (supportsVideoPip()) {
+            console.warn('[PiP] Document PiP failed, trying Video PiP');
+            if (await openVideoPip()) return;
+          }
+          console.warn('[PiP] Document PiP failed, falling back to inline panel');
+          openInline();
           return;
         }
-        console.warn('[PiP] Video PiP failed, falling back to inline panel');
-        openInline();
-      }).catch(() => {
-        openInline();
-      });
-      return;
-    }
-
-    void openDocPip().then((opened) => {
-      if (opened) return;
-      // Document PiP 失败时尝试 Video PiP
-      if (supportsVideoPip()) {
-        console.warn('[PiP] Document PiP failed, trying Video PiP');
-        return openVideoPip().then((ok) => {
-          if (ok) {
-            setIsOpen(true);
-            setMode('video-pip');
-            return;
-          }
+        if (strategy === 'video-pip') {
+          if (await openVideoPip()) return;
+          console.warn('[PiP] Video PiP failed, falling back to inline panel');
           openInline();
-        });
+          return;
+        }
+        openInline();
+      } catch {
+        console.warn('[PiP] Unexpected error, trying inline fallback');
+        openInline();
+      } finally {
+        openingRef.current = false;
       }
-      console.warn('[PiP] Document PiP failed, falling back to inline panel');
-      openInline();
-    }).catch(() => {
-      console.warn('[PiP] Unexpected error, trying inline fallback');
-      openInline();
-    });
+    })();
   }, [openDocPip, openVideoPip, openInline]);
 
   const close = useCallback(() => {
@@ -352,20 +408,26 @@ function wrapText(
   return lines;
 }
 
+/** Canvas 渲染数据（labels 由外部经 i18n 翻译后传入 —— 模块级函数拿不到 hook） */
+interface PipCanvasData {
+  srcName: string;
+  tgtName: string;
+  recentSourceText: string;
+  recentTargetText: string;
+  hasTranslation: boolean;
+  labels: {
+    title: string;
+    waiting: string;
+    translating: string;
+  };
+}
+
 /**
  * 在 Canvas 上绘制完整的 PiP 界面
- * 完全复刻 PIP_STYLES 中的布局和视觉效果
+ * 复刻 PIP_STYLES 中的布局和视觉效果（不画 footer 按钮 ——
+ * 系统级视频 PiP 收不到点击，画假按钮只会误导用户）
  */
-function renderPipCanvas(
-  canvas: HTMLCanvasElement,
-  data: {
-    srcName: string;
-    tgtName: string;
-    recentSourceText: string;
-    recentTargetText: string;
-    hasTranslation: boolean;
-  },
-) {
+function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
   const dpr = window.devicePixelRatio || 2;
   const w = PIP_WIDTH;
   const h = PIP_HEIGHT;
@@ -378,7 +440,8 @@ function renderPipCanvas(
     canvas.style.height = `${h}px`;
   }
 
-  const ctx = canvas.getContext('2d', { alpha: false })!;
+  const ctx = canvas.getContext('2d', { alpha: false });
+  if (!ctx) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   const margin = 6; // 外边距（对应 .pip-container margin: 6px）
@@ -394,7 +457,7 @@ function renderPipCanvas(
 
   // ── 圆角容器 ──
   ctx.beginPath();
-  ctx.roundRect(innerX, innerY, innerW, innerH, radius);
+  roundRectPath(ctx, innerX, innerY, innerW, innerH, radius);
   ctx.fillStyle = COLORS.bg;
   ctx.fill();
   ctx.strokeStyle = COLORS.border;
@@ -430,39 +493,12 @@ function renderPipCanvas(
   ctx.fillStyle = COLORS.rust;
   ctx.font = `700 11px ${FONT_FAMILY}`;
   ctx.letterSpacing = '0.08em';
-  ctx.fillText('REFERENCE TOOL', contentX + 28, headerCenterY);
+  ctx.fillText(data.labels.title.toUpperCase(), contentX + 28, headerCenterY);
   ctx.letterSpacing = '0px';
 
-  // ── Footer（高度 36px） ──
-  const footerH = 36;
-  const footerY = innerY + innerH - footerH;
-
-  // Footer 顶部分割线
-  ctx.beginPath();
-  ctx.moveTo(innerX, footerY);
-  ctx.lineTo(innerX + innerW, footerY);
-  ctx.strokeStyle = COLORS.headerBorder;
-  ctx.lineWidth = 1;
-  ctx.stroke();
-
-  // Footer 按钮文字
-  ctx.fillStyle = COLORS.rust;
-  ctx.font = `600 10px ${FONT_FAMILY}`;
-  ctx.textBaseline = 'middle';
-  ctx.letterSpacing = '0.06em';
-  const footerCenterY = footerY + footerH / 2;
-  // 右对齐
-  const copyText = '⧉ COPY';
-  const listenText = '🔊 LISTEN';
-  const listenW = ctx.measureText(listenText).width;
-  const copyW = ctx.measureText(copyText).width;
-  ctx.fillText(listenText, innerX + innerW - padX - listenW, footerCenterY);
-  ctx.fillText(copyText, innerX + innerW - padX - listenW - 16 - copyW, footerCenterY);
-  ctx.letterSpacing = '0px';
-
-  // ── 内容区 ──
+  // ── 内容区（无 footer —— 视频 PiP 里按钮不可点，空间全给文本） ──
   const contentTop = headerY + headerH + 8;
-  const contentBottom = footerY - 8;
+  const contentBottom = innerY + innerH - 10;
   const contentHeight = contentBottom - contentTop;
 
   if (!data.recentSourceText && !data.recentTargetText) {
@@ -471,7 +507,7 @@ function renderPipCanvas(
     ctx.font = `italic 13px ${FONT_FAMILY}`;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'center';
-    ctx.fillText('Waiting for transcript...', w / 2, contentTop + contentHeight / 2);
+    ctx.fillText(data.labels.waiting, w / 2, contentTop + contentHeight / 2);
     ctx.textAlign = 'left';
     return;
   }
@@ -582,28 +618,88 @@ function renderPipCanvas(
   } else {
     ctx.fillStyle = COLORS.muted;
     ctx.font = `italic 400 17px ${FONT_FAMILY}`;
-    ctx.fillText('Translating...', contentX, tgtTextY);
+    ctx.fillText(data.labels.translating, contentX, tgtTextY);
   }
   ctx.restore();
 }
 
+/** 前台数据驱动重绘的最小间隔（ms）。后台标签 setTimeout 会被钳到 ~1s，字幕场景足够 */
+const DRAW_MIN_INTERVAL_MS = 100;
+
+/** captureStream 帧率上限。数据驱动下 canvas 只在内容变化时变脏，30 是上限不是常载 */
+const CAPTURE_FPS = 30;
+
+const EMPTY_PIP_DATA: PipCanvasData = {
+  srcName: '',
+  tgtName: '',
+  recentSourceText: '',
+  recentTargetText: '',
+  hasTranslation: false,
+  labels: { title: 'Reference Tool', waiting: '', translating: '' },
+};
+
 /**
  * Safari Video PiP Hook — 管理 Canvas → Video → PiP 生命周期
  *
- * 关键设计：挂载时「预热」video 元素
+ * 关键设计一：挂载时「预热」video 元素（仅限策略判定会走 video-pip 的浏览器）。
  * iOS Safari 要求 requestPictureInPicture() 在用户手势上下文内同步调用，
  * 但如果 video 还没有可用帧（readyState < HAVE_CURRENT_FRAME）则会被拒绝。
  * 预热方案：挂载时即创建 canvas → captureStream → video.play()，
  * 这样用户点击 PiP 按钮时 video 已有数据，可直接进入画中画。
+ *
+ * 关键设计二：重绘由数据更新驱动（updateData → 节流 setTimeout），不用 rAF 循环。
+ * rAF 在标签页切后台时被完全暂停，而 PiP 的主用例恰恰是切走看别的内容 ——
+ * rAF 驱动意味着一切后台 PiP 画面立即冻结。setTimeout 在后台最多被钳到 ~1s
+ * 一次，对字幕流完全够用；前台按 DRAW_MIN_INTERVAL_MS 节流。
  */
 function useVideoPip(onClosed: () => void) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const rafRef = useRef<number>(0);
   const warmedUpRef = useRef(false);
-  const dataRef = useRef<Parameters<typeof renderPipCanvas>[1]>({
-    srcName: '', tgtName: '', recentSourceText: '', recentTargetText: '', hasTranslation: false,
-  });
+  const activeRef = useRef(false); // PiP 是否处于打开状态（重绘门闩）
+  const drawTimerRef = useRef(0);
+  const lastDrawRef = useRef(0);
+  const dataRef = useRef<PipCanvasData>(EMPTY_PIP_DATA);
+  const onClosedRef = useRef(onClosed);
+
+  useEffect(() => {
+    onClosedRef.current = onClosed;
+  }, [onClosed]);
+
+  const drawNow = useCallback(() => {
+    lastDrawRef.current = Date.now();
+    if (!canvasRef.current) return;
+    try {
+      renderPipCanvas(canvasRef.current, dataRef.current);
+    } catch {
+      // 老 Safari 的 canvas API 差异最多损失一帧，不许波及页面
+    }
+  }, []);
+
+  const scheduleDraw = useCallback(() => {
+    if (!activeRef.current || drawTimerRef.current) return;
+    const delay = Math.max(0, DRAW_MIN_INTERVAL_MS - (Date.now() - lastDrawRef.current));
+    drawTimerRef.current = window.setTimeout(() => {
+      drawTimerRef.current = 0;
+      drawNow();
+    }, delay);
+  }, [drawNow]);
+
+  const stopDrawing = useCallback(() => {
+    activeRef.current = false;
+    if (drawTimerRef.current) {
+      clearTimeout(drawTimerRef.current);
+      drawTimerRef.current = 0;
+    }
+  }, []);
+
+  // 系统级关闭（PiP 窗口自带的 X / webkit 回到 inline）：必须停止重绘并通知上层收状态，
+  // 否则重绘调度会一直挂着跑到页面卸载
+  const handleNativeClose = useCallback(() => {
+    if (!activeRef.current) return;
+    stopDrawing();
+    onClosedRef.current();
+  }, [stopDrawing]);
 
   // 确保 canvas 和 video 元素存在（懒创建，隐藏在 DOM 中）
   const ensureElements = useCallback(() => {
@@ -624,65 +720,72 @@ function useVideoPip(onClosed: () => void) {
       // 注意：不设置 autopictureinpicture，避免页面切后台时自动进入 PiP
       video.muted = true;
       video.autoplay = true;
+      // iOS 对不可见/离屏视频可能直接拒绝 PiP：放在视口内右下角，
+      // 1% 透明度肉眼不可见（iOS 对 opacity:0 的元素可能跳过渲染），
+      // pointer-events 关闭不挡交互
       video.style.position = 'fixed';
-      video.style.left = '-9999px';
-      video.style.top = '-9999px';
-      // iOS Safari 需要视频元素有合理的尺寸才能开启系统级 PiP
-      video.style.width = `${PIP_WIDTH}px`;
+      video.style.right = '0';
+      video.style.bottom = '0';
+      video.style.width = `${Math.min(PIP_WIDTH, window.innerWidth)}px`;
       video.style.height = `${PIP_HEIGHT}px`;
-      video.style.opacity = '0.01'; // iOS 对 opacity:0 的元素可能跳过渲染
+      video.style.opacity = '0.01';
       video.style.pointerEvents = 'none';
+      // 退出监听在元素创建时一次性注册。原实现每次 open 都新挂一个
+      // webkit 监听器，在只走标准事件的浏览器里永不移除、越积越多；
+      // 幂等由 handleNativeClose 里的 activeRef 门闩保证
+      video.addEventListener('leavepictureinpicture', () => handleNativeClose());
+      video.addEventListener('webkitpresentationmodechanged', () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        if ((video as any).webkitPresentationMode !== 'picture-in-picture') {
+          handleNativeClose();
+        }
+      });
       document.body.appendChild(video);
       videoRef.current = video;
     }
     return { canvas: canvasRef.current, video: videoRef.current };
-  }, []);
+  }, [handleNativeClose]);
 
   // ── 预热：挂载时创建元素、渲染一帧、启动流并播放 ──
-  // 使 video.readyState >= HAVE_CURRENT_FRAME，确保后续 PiP 请求不会因缺数据被拒
+  // 使 video.readyState >= HAVE_CURRENT_FRAME，确保后续 PiP 请求不会因缺数据被拒。
+  // 只在策略判定会走 video-pip 的浏览器上做 —— Chrome 走 Document PiP，
+  // supportsVideoPip() 在 Chrome 上同样为真，按它判会给每个会话页
+  // 白白挂一条 captureStream + 常驻播放的隐藏视频
   useEffect(() => {
-    if (!supportsVideoPip() || warmedUpRef.current) return;
+    if (warmedUpRef.current) return;
+    if (getPreferredPipStrategy().strategy !== 'video-pip') return;
     warmedUpRef.current = true;
-    const { canvas, video } = ensureElements();
-    renderPipCanvas(canvas, dataRef.current);
-    const stream = getCaptureStream(canvas, 5); // 低帧率预热，节省资源
-    if (stream) {
-      video.srcObject = stream;
-      video.play().catch(() => { /* 静音自动播放一般不会被阻止 */ });
+    try {
+      const { canvas, video } = ensureElements();
+      renderPipCanvas(canvas, dataRef.current);
+      const stream = getCaptureStream(canvas, CAPTURE_FPS);
+      if (stream) {
+        video.srcObject = stream;
+        video.play().catch(() => { /* 静音自动播放一般不会被阻止 */ });
+      }
+    } catch (err) {
+      // Safari ≤15 缺 ctx.roundRect 等：预热失败只是 video-pip 不可用
+      //（open 时会再试并回落 inline），绝不允许把整个会话页打崩
+      console.warn('[PiP] Video PiP warm-up failed:', err);
     }
   }, [ensureElements]);
-
-  // 启动渲染循环（PiP 打开后全速渲染）
-  const startRenderLoop = useCallback(() => {
-    // 先取消已有循环，防止重复
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    const render = () => {
-      if (canvasRef.current) {
-        renderPipCanvas(canvasRef.current, dataRef.current);
-      }
-      rafRef.current = requestAnimationFrame(render);
-    };
-    rafRef.current = requestAnimationFrame(render);
-  }, []);
-
-  const stopRenderLoop = useCallback(() => {
-    if (rafRef.current) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = 0;
-    }
-  }, []);
 
   // 打开 Video PiP
   const open = useCallback(async (): Promise<boolean> => {
     try {
       const { canvas, video } = ensureElements();
 
-      // 渲染最新一帧
-      renderPipCanvas(canvas, dataRef.current);
+      // 渲染最新一帧；canvas 渲染都跑不通（老 Safari）就直接判不可用，让上层落 inline
+      try {
+        renderPipCanvas(canvas, dataRef.current);
+      } catch (renderErr) {
+        console.warn('[PiP] Canvas render failed, video PiP unavailable:', renderErr);
+        return false;
+      }
 
       // 如果流已断开（首次打开或 close 后仍保留），重新连接
       if (!video.srcObject) {
-        const stream = getCaptureStream(canvas, 30);
+        const stream = getCaptureStream(canvas, CAPTURE_FPS);
         if (!stream) {
           console.error('[PiP] captureStream not available');
           return false;
@@ -711,29 +814,19 @@ function useVideoPip(onClosed: () => void) {
         await requestVideoPip(video);
       }
 
-      // 监听 PiP 退出（标准事件 + webkit 事件）
-      video.addEventListener('leavepictureinpicture', onClosed, { once: true });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      video.addEventListener('webkitpresentationmodechanged', function handler(this: HTMLVideoElement) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        if ((this as any).webkitPresentationMode !== 'picture-in-picture') {
-          onClosed();
-          this.removeEventListener('webkitpresentationmodechanged', handler);
-        }
-      });
-
-      startRenderLoop();
+      activeRef.current = true;
+      drawNow();
       console.info('[PiP] Video PiP opened successfully');
       return true;
     } catch (err) {
       console.error('[PiP] Video PiP failed:', err);
       return false;
     }
-  }, [ensureElements, startRenderLoop, onClosed]);
+  }, [ensureElements, drawNow]);
 
   // 关闭 Video PiP
   const close = useCallback(() => {
-    stopRenderLoop();
+    stopDrawing();
     try {
       exitVideoPip();
       // webkit 前缀：将展示模式改回 inline
@@ -745,17 +838,19 @@ function useVideoPip(onClosed: () => void) {
     } catch { /* ignore */ }
     // 保留 video.srcObject 不销毁 —— 下次 open 时可快速重用，
     // 避免重新创建流和等待 video 加载数据
-  }, [stopRenderLoop]);
+  }, [stopDrawing]);
 
-  // 更新渲染数据（由外部 bridge 组件调用）
-  const updateData = useCallback((data: Parameters<typeof renderPipCanvas>[1]) => {
+  // 更新渲染数据（由外部 bridge 组件调用）—— 这里就是重绘的驱动源：
+  // 转录/翻译到达才重绘，后台标签页也能更新（WebSocket 驱动的 JS 不受 rAF 暂停影响）
+  const updateData = useCallback((data: PipCanvasData) => {
     dataRef.current = data;
-  }, []);
+    scheduleDraw();
+  }, [scheduleDraw]);
 
   // 组件卸载时完全清理
   useEffect(() => {
     return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (drawTimerRef.current) clearTimeout(drawTimerRef.current);
       try { exitVideoPip(); } catch { /* ignore */ }
       if (canvasRef.current) {
         canvasRef.current.remove();
@@ -776,6 +871,7 @@ function useVideoPip(onClosed: () => void) {
  * 共享的流式内容数据 hook
  */
 function usePipContentData() {
+  const { t } = useI18n();
   const segments = useTranscriptStore((s) => s.segments);
   const currentPreview = useTranscriptStore((s) => s.currentPreview);
   const currentPreviewTranslation = useTranscriptStore((s) => s.currentPreviewTranslation);
@@ -807,7 +903,13 @@ function usePipContentData() {
   const srcName = (LANG_NAMES[sourceLang] || sourceLang || 'Source').toUpperCase();
   const tgtName = (LANG_NAMES[targetLang] || targetLang || 'Target').toUpperCase();
 
-  return { segments, translations, sourceLang, targetLang, hasTranslation, srcName, tgtName, recentSourceText, recentTargetText };
+  const labels = useMemo(() => ({
+    title: t('pipTool.title'),
+    waiting: t('pipTool.waiting'),
+    translating: t('pipTool.translating'),
+  }), [t]);
+
+  return { segments, translations, sourceLang, targetLang, hasTranslation, srcName, tgtName, recentSourceText, recentTargetText, labels };
 }
 
 /** 共享的 PiP 内容 JSX（Header + Stream Content + Footer） */
@@ -819,7 +921,8 @@ function PipContent({
   onClose: () => void;
   dragHandleProps?: React.HTMLAttributes<HTMLDivElement>;
 }) {
-  const { segments, translations, sourceLang, targetLang, hasTranslation, srcName, tgtName, recentSourceText, recentTargetText } = usePipContentData();
+  const { t } = useI18n();
+  const { segments, translations, sourceLang, targetLang, hasTranslation, srcName, tgtName, recentSourceText, recentTargetText, labels } = usePipContentData();
   const srcScrollRef = useRef<HTMLDivElement | null>(null);
   const tgtScrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -836,15 +939,15 @@ function PipContent({
           <svg className="pip-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="m5 8 6 6" /><path d="m4 14 6 6" /><path d="M2 5h12" /><path d="M7 2h1" /><path d="m22 22-5-10-5 10" /><path d="M14 18h6" />
           </svg>
-          <span className="pip-title">REFERENCE TOOL</span>
+          <span className="pip-title">{labels.title}</span>
         </div>
         <div className="pip-header-right">
-          <button className={`pip-pin-btn ${pinned ? 'pinned' : ''}`} onClick={onTogglePin} title={pinned ? 'Unpin' : 'Pin on top'}>
+          <button className={`pip-pin-btn ${pinned ? 'pinned' : ''}`} onClick={onTogglePin} title={pinned ? t('pipTool.unpin') : t('pipTool.pin')}>
             <svg viewBox="0 0 24 24" fill={pinned ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="14" height="14">
               <line x1="12" y1="17" x2="12" y2="22" /><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z" />
             </svg>
           </button>
-          <button className="pip-close-btn" onClick={onClose} title="Close">
+          <button className="pip-close-btn" onClick={onClose} title={t('pipTool.close')}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="14" height="14">
               <path d="M18 6 6 18" /><path d="m6 6 12 12" />
             </svg>
@@ -855,7 +958,7 @@ function PipContent({
       {/* 流式内容区 */}
       <div className="pip-stream-content">
         {!recentSourceText && !recentTargetText ? (
-          <div className="pip-empty">Waiting for transcript...</div>
+          <div className="pip-empty">{labels.waiting}</div>
         ) : (
           <>
             <div className="pip-lang-section pip-source-section">
@@ -874,7 +977,7 @@ function PipContent({
                   {recentTargetText ? (
                     <p className="pip-target-text">{recentTargetText}</p>
                   ) : (
-                    <p className="pip-target-text translating">Translating...</p>
+                    <p className="pip-target-text translating">{labels.translating}</p>
                   )}
                 </div>
               </div>
@@ -885,18 +988,21 @@ function PipContent({
 
       {/* Footer */}
       <div className="pip-footer">
-        <button className="pip-footer-btn" onClick={() => {
+        <button className="pip-footer-btn" onClick={(e) => {
           const lastSeg = segments[segments.length - 1];
           if (!lastSeg) return;
           const text = hasTranslation && translations[lastSeg.id]
             ? `${lastSeg.text}\n\n${translations[lastSeg.id]}`
             : lastSeg.text;
-          navigator.clipboard.writeText(text).catch(() => {});
+          // Document PiP 下焦点在 PiP 窗口：必须用按钮所在窗口的 clipboard，
+          // 主窗口的 navigator.clipboard 会因 "document is not focused" 被静默拒绝
+          const view = e.currentTarget.ownerDocument.defaultView ?? window;
+          view.navigator.clipboard?.writeText(text).catch(() => {});
         }}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="12" height="12">
             <rect width="14" height="14" x="8" y="8" rx="2" ry="2" /><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
           </svg>
-          COPY
+          {t('pipTool.copy')}
         </button>
         <button className="pip-footer-btn" onClick={() => {
           const lastSeg = segments[segments.length - 1];
@@ -912,7 +1018,7 @@ function PipContent({
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="12" height="12">
             <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" /><path d="M15.54 8.46a5 5 0 0 1 0 7.07" /><path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
           </svg>
-          LISTEN
+          {t('pipTool.listen')}
         </button>
       </div>
     </>
@@ -933,7 +1039,14 @@ export function PipPortal({
   onTogglePin: () => void;
   onClose: () => void;
 }) {
-  const mountEl = pipWindow.document.getElementById('pip-root');
+  // 窗口被关到 state 更新之间可能夹一次 store 驱动的 re-render，
+  // 访问已关闭窗口的 document 不允许把主页面打崩
+  let mountEl: HTMLElement | null = null;
+  try {
+    mountEl = pipWindow.closed ? null : pipWindow.document.getElementById('pip-root');
+  } catch {
+    mountEl = null;
+  }
   if (!mountEl) return null;
 
   return createPortal(
@@ -944,9 +1057,19 @@ export function PipPortal({
   );
 }
 
+/** 面板到视口边缘的最小留白 */
+const PANEL_MARGIN = 8;
+
+function clampPanelPos(x: number, y: number, w: number, h: number) {
+  return {
+    x: Math.max(PANEL_MARGIN, Math.min(x, window.innerWidth - w - PANEL_MARGIN)),
+    y: Math.max(PANEL_MARGIN, Math.min(y, window.innerHeight - h - PANEL_MARGIN)),
+  };
+}
+
 /**
  * 页内悬浮面板 — Safari / Firefox / 不支持 Document PiP 的浏览器
- * 支持拖拽移动
+ * 支持拖拽移动；尺寸随视口收缩（iPhone 视口 < 420px）
  */
 export function InlinePipPanel({
   pinned,
@@ -959,19 +1082,30 @@ export function InlinePipPanel({
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const dragState = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null);
-  const [pos, setPos] = useState({ x: -1, y: -1 });
+  const [size, setSize] = useState({ w: PIP_WIDTH, h: PIP_HEIGHT });
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
 
-  // 初始化位置：右下角
+  // 初始化位置（右下角）+ 视口变化时收缩尺寸、把面板拉回可见区域。
+  // 原实现固定 420×320 且初始 x 可为负：iPhone 上面板出屏、关闭按钮不可达
   useEffect(() => {
-    if (pos.x === -1) {
-      setPos({
-        x: window.innerWidth - PIP_WIDTH - 24,
-        y: window.innerHeight - PIP_HEIGHT - 24,
-      });
-    }
-  }, [pos.x]);
+    const fit = () => {
+      const w = Math.min(PIP_WIDTH, window.innerWidth - PANEL_MARGIN * 2);
+      const h = Math.min(PIP_HEIGHT, window.innerHeight - PANEL_MARGIN * 2);
+      setSize({ w, h });
+      setPos((p) => clampPanelPos(
+        p?.x ?? window.innerWidth - w - 24,
+        p?.y ?? window.innerHeight - h - 24,
+        w,
+        h,
+      ));
+    };
+    fit();
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+  }, []);
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
+    if (!pos) return;
     // 不拦截按钮点击
     if ((e.target as HTMLElement).closest('button')) return;
     e.preventDefault();
@@ -983,11 +1117,13 @@ export function InlinePipPanel({
     if (!dragState.current) return;
     const dx = e.clientX - dragState.current.startX;
     const dy = e.clientY - dragState.current.startY;
-    setPos({
-      x: Math.max(0, Math.min(window.innerWidth - PIP_WIDTH, dragState.current.origX + dx)),
-      y: Math.max(0, Math.min(window.innerHeight - PIP_HEIGHT, dragState.current.origY + dy)),
-    });
-  }, []);
+    setPos(clampPanelPos(
+      dragState.current.origX + dx,
+      dragState.current.origY + dy,
+      size.w,
+      size.h,
+    ));
+  }, [size]);
 
   const onPointerUp = useCallback(() => {
     dragState.current = null;
@@ -1013,6 +1149,9 @@ export function InlinePipPanel({
     };
   }, []);
 
+  // 首帧等 fit() 算出位置再渲染，避免负坐标闪现
+  if (!pos) return null;
+
   return (
     <div
       ref={panelRef}
@@ -1021,8 +1160,8 @@ export function InlinePipPanel({
         position: 'fixed',
         left: pos.x,
         top: pos.y,
-        width: PIP_WIDTH,
-        height: PIP_HEIGHT,
+        width: size.w,
+        height: size.h,
         zIndex: 9999,
       }}
     >
@@ -1035,12 +1174,12 @@ export function InlinePipPanel({
  * Video PiP 数据桥接组件 — 在 video-pip 模式下渲染，
  * 从 Zustand store 读取转录/翻译数据并推送到 Canvas 渲染器
  */
-export function VideoPipBridge({ updateData }: { updateData: (data: Parameters<typeof renderPipCanvas>[1]) => void }) {
-  const { srcName, tgtName, recentSourceText, recentTargetText, hasTranslation } = usePipContentData();
+export function VideoPipBridge({ updateData }: { updateData: (data: PipCanvasData) => void }) {
+  const { srcName, tgtName, recentSourceText, recentTargetText, hasTranslation, labels } = usePipContentData();
 
   useEffect(() => {
-    updateData({ srcName, tgtName, recentSourceText, recentTargetText, hasTranslation });
-  }, [srcName, tgtName, recentSourceText, recentTargetText, hasTranslation, updateData]);
+    updateData({ srcName, tgtName, recentSourceText, recentTargetText, hasTranslation, labels });
+  }, [srcName, tgtName, recentSourceText, recentTargetText, hasTranslation, labels, updateData]);
 
   return null; // 纯数据桥接，不渲染任何 DOM
 }

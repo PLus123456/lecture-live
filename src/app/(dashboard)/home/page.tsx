@@ -39,88 +39,154 @@ interface FolderItem {
 }
 
 /* ───────── 时间段问候语系统（按语言切换） ─────────
-   中文：应景古诗，每个时段 3 套；英文：意境相近的短句 3 套。
-   每个时段用「日期×24＋小时」作伪随机种子选一句，每小时轮换。 */
+   中文：应景古诗（poem）与轻松梗（fun）混排；英文：意境相近的短句。
+   - 季节过滤：仅保留「当季 + all」，过滤后为空则回退该时段全部条目。
+   - 季节优先：当季专属条目排在前面，all 条目随后（不丢任何条目）。
+   - 逐日轮换：每个时段一天只出一条，逐日推进，保证一段时间内每条都能轮到。 */
+type Season = 'spring' | 'summer' | 'autumn' | 'winter' | 'all';
+type GreetingType = 'poem' | 'fun';
+
 interface Greeting {
+  type: GreetingType;
+  season: Season;
   title: string;
-  subtitle: string;
+  text: string;
+  author: string | null;
 }
 
 const greetingsByLocale: Record<Locale, Record<string, Greeting[]>> = {
   zh: {
     // 6:00 - 11:59 晨
     morning: [
-      { title: '晨光熹微', subtitle: '春眠不觉晓，处处闻啼鸟。——孟浩然' },
-      { title: '初日高林', subtitle: '清晨入古寺，初日照高林。——常建' },
-      { title: '朝辞彩云', subtitle: '朝辞白帝彩云间，千里江陵一日还。——李白' },
+      { type: 'poem', season: 'spring', title: '晨光熹微', text: '春眠不觉晓，处处闻啼鸟。', author: '孟浩然' },
+      { type: 'poem', season: 'all', title: '初日高林', text: '清晨入古寺，初日照高林。', author: '常建' },
+      { type: 'poem', season: 'all', title: '朝辞彩云', text: '朝辞白帝彩云间，千里江陵一日还。', author: '李白' },
+      { type: 'poem', season: 'spring', title: '黄鹂翠柳', text: '两个黄鹂鸣翠柳，一行白鹭上青天。', author: '杜甫' },
+      { type: 'poem', season: 'all', title: '早行人', text: '莫道君行早，更有早行人。', author: '《增广贤文》' },
+      { type: 'fun', season: 'all', title: '早八时刻', text: '早八人，早八魂。', author: null },
+      { type: 'fun', season: 'all', title: '战胜被窝', text: '恭喜你战胜了被窝，这是今天的第一场胜利。', author: null },
+      { type: 'fun', season: 'all', title: '咖啡时间', text: '咖啡因正在派送中，请稍候。', author: null },
+      { type: 'fun', season: 'spring', title: '春晓修订版', text: '春眠不觉晓，早八迟到了。', author: '孟浩然（大概不会承认）' },
     ],
     // 12:00 - 13:59 午
-    midday: [
-      { title: '日正当午', subtitle: '锄禾日当午，汗滴禾下土。——李绅' },
-      { title: '绿树夏长', subtitle: '绿树阴浓夏日长，楼台倒影入池塘。——高骈' },
-      { title: '篱落无人', subtitle: '日长篱落无人过，惟有蜻蜓蛱蝶飞。——范成大' },
+    noon: [
+      { type: 'poem', season: 'all', title: '日正当午', text: '锄禾日当午，汗滴禾下土。', author: '李绅' },
+      { type: 'poem', season: 'all', title: '日高思茶', text: '酒困路长惟欲睡，日高人渴漫思茶。', author: '苏轼' },
+      { type: 'poem', season: 'summer', title: '午睡初起', text: '日长睡起无情思，闲看儿童捉柳花。', author: '杨万里' },
+      { type: 'poem', season: 'spring', title: '草堂春睡', text: '草堂春睡足，窗外日迟迟。', author: '《三国演义》' },
+      { type: 'poem', season: 'summer', title: '绿树夏长', text: '绿树阴浓夏日长，楼台倒影入池塘。', author: '高骈' },
+      { type: 'poem', season: 'summer', title: '蜻蜓蛱蝶', text: '日长篱落无人过，惟有蜻蜓蛱蝶飞。', author: '范成大' },
+      { type: 'fun', season: 'all', title: '干饭时刻', text: '干饭人，干饭魂。', author: null },
+      { type: 'fun', season: 'all', title: '民以食为天', text: '这句真是古人说的。', author: '《史记·郦生列传》' },
+      { type: 'fun', season: 'all', title: '午休宣言', text: '午休神圣不可侵犯。', author: null },
     ],
     // 14:00 - 17:59 午后 · 斜阳
     afternoon: [
-      { title: '半江瑟瑟', subtitle: '一道残阳铺水中，半江瑟瑟半江红。——白居易' },
-      { title: '枫林晚照', subtitle: '停车坐爱枫林晚，霜叶红于二月花。——杜牧' },
-      { title: '夕阳无限', subtitle: '夕阳无限好，只是近黄昏。——李商隐' },
+      { type: 'poem', season: 'autumn', title: '半江瑟瑟', text: '一道残阳铺水中，半江瑟瑟半江红。', author: '白居易' },
+      { type: 'poem', season: 'autumn', title: '枫林晚照', text: '停车坐爱枫林晚，霜叶红于二月花。', author: '杜牧' },
+      { type: 'poem', season: 'all', title: '人间晚晴', text: '天意怜幽草，人间重晚晴。', author: '李商隐' },
+      { type: 'poem', season: 'autumn', title: '落霞孤鹜', text: '落霞与孤鹜齐飞，秋水共长天一色。', author: '王勃' },
+      { type: 'poem', season: 'all', title: '飞鸟相还', text: '山气日夕佳，飞鸟相与还。', author: '陶渊明' },
+      { type: 'fun', season: 'all', title: '生产力低谷', text: '下午三点：科学认证的生产力低谷。', author: null },
+      { type: 'fun', season: 'all', title: '都记着呢', text: '走神了？没关系，字幕都帮你记着。', author: null },
+      { type: 'fun', season: 'all', title: '眼皮下班', text: '眼皮正在申请提前下班。', author: null },
     ],
     // 18:00 - 21:59 暮
     evening: [
-      { title: '空山新雨', subtitle: '空山新雨后，天气晚来秋。——王维' },
-      { title: '日暮客愁', subtitle: '移舟泊烟渚，日暮客愁新。——孟浩然' },
-      { title: '江枫渔火', subtitle: '月落乌啼霜满天，江枫渔火对愁眠。——张继' },
+      { type: 'poem', season: 'autumn', title: '空山新雨', text: '空山新雨后，天气晚来秋。', author: '王维' },
+      { type: 'poem', season: 'winter', title: '能饮一杯', text: '晚来天欲雪，能饮一杯无？', author: '白居易' },
+      { type: 'poem', season: 'winter', title: '红泥火炉', text: '绿蚁新醅酒，红泥小火炉。', author: '白居易' },
+      { type: 'poem', season: 'summer', title: '蛙声一片', text: '稻花香里说丰年，听取蛙声一片。', author: '辛弃疾' },
+      { type: 'poem', season: 'spring', title: '夜静春山', text: '人闲桂花落，夜静春山空。', author: '王维' },
+      { type: 'poem', season: 'all', title: '满河星', text: '微微风簇浪，散作满河星。', author: '查慎行' },
+      { type: 'fun', season: 'all', title: '晚间补课', text: '白天没听懂的，晚上补回来。', author: null },
+      { type: 'fun', season: 'all', title: '今夜不去pub', text: '别人在 pub，你在看 lecture。respect。', author: null },
+      { type: 'fun', season: 'all', title: '晚上好', text: '吃了吗？没吃先去吃。', author: null },
     ],
     // 22:00 - 5:59 深夜
-    lateNight: [
-      { title: '床前明月', subtitle: '床前明月光，疑是地上霜。——李白' },
-      { title: '西窗夜雨', subtitle: '何当共剪西窗烛，却话巴山夜雨时。——李商隐' },
-      { title: '银烛秋光', subtitle: '银烛秋光冷画屏，轻罗小扇扑流萤。——杜牧' },
+    night: [
+      { type: 'poem', season: 'all', title: '床前明月', text: '床前明月光，疑是地上霜。', author: '李白' },
+      { type: 'poem', season: 'all', title: '秉烛夜游', text: '昼短苦夜长，何不秉烛游。', author: '《古诗十九首》' },
+      { type: 'poem', season: 'spring', title: '更深月色', text: '更深月色半人家，北斗阑干南斗斜。', author: '刘方平' },
+      { type: 'poem', season: 'all', title: '三更灯火', text: '三更灯火五更鸡，正是男儿读书时。', author: '颜真卿' },
+      { type: 'poem', season: 'all', title: '天涯共此时', text: '海上生明月，天涯共此时。', author: '张九龄' },
+      { type: 'fun', season: 'all', title: '第一生产力', text: 'due 是第一生产力。', author: null },
+      { type: 'fun', season: 'all', title: '服务器与你', text: '这个点还醒着的，除了你就是服务器。', author: null },
+      { type: 'fun', season: 'all', title: '早点睡', text: '说真的，早点睡，lecture 明天还在。', author: null },
+      { type: 'fun', season: 'all', title: '来得及', text: '现在去睡，一切都还来得及。', author: null },
     ],
   },
   en: {
     morning: [
-      { title: 'Good morning, early bird', subtitle: 'The best ideas come with the morning light.' },
-      { title: 'Dawn of discovery', subtitle: 'Every lecture is a new adventure waiting to begin.' },
-      { title: 'Sunrise scholar', subtitle: 'The world is quiet — perfect time to focus.' },
+      { type: 'poem', season: 'all', title: 'Good morning, early bird', text: 'The best ideas come with the morning light.', author: null },
+      { type: 'poem', season: 'all', title: 'Dawn of discovery', text: 'Every lecture is a new adventure waiting to begin.', author: null },
+      { type: 'poem', season: 'all', title: 'Sunrise scholar', text: 'The world is quiet — perfect time to focus.', author: null },
     ],
-    midday: [
-      { title: 'Afternoon plus', subtitle: 'Keep the momentum going through the midday sun.' },
-      { title: 'Noon notes', subtitle: 'Half the day down, twice the knowledge gained.' },
-      { title: 'Midday mind', subtitle: 'A quick review before the afternoon rush.' },
+    noon: [
+      { type: 'poem', season: 'all', title: 'Afternoon plus', text: 'Keep the momentum going through the midday sun.', author: null },
+      { type: 'poem', season: 'all', title: 'Noon notes', text: 'Half the day down, twice the knowledge gained.', author: null },
+      { type: 'poem', season: 'all', title: 'Midday mind', text: 'A quick review before the afternoon rush.', author: null },
     ],
     afternoon: [
-      { title: 'Golden hour study', subtitle: 'The afternoon light pairs well with deep thinking.' },
-      { title: 'Afternoon flow', subtitle: 'You\'re in the zone — don\'t stop now.' },
-      { title: 'Tea time transcripts', subtitle: 'Sip, listen, and let the words flow.' },
+      { type: 'poem', season: 'all', title: 'Golden hour study', text: 'The afternoon light pairs well with deep thinking.', author: null },
+      { type: 'poem', season: 'all', title: 'Afternoon flow', text: 'You\'re in the zone — don\'t stop now.', author: null },
+      { type: 'poem', season: 'all', title: 'Tea time transcripts', text: 'Sip, listen, and let the words flow.', author: null },
     ],
     evening: [
-      { title: 'Evening reflections', subtitle: 'Review the day\'s discoveries while they\'re still warm.' },
-      { title: 'Twilight thinker', subtitle: 'The quiet evening is perfect for deep learning.' },
-      { title: 'Moonlit studies', subtitle: 'Let the calm of evening sharpen your focus.' },
+      { type: 'poem', season: 'all', title: 'Evening reflections', text: 'Review the day\'s discoveries while they\'re still warm.', author: null },
+      { type: 'poem', season: 'all', title: 'Twilight thinker', text: 'The quiet evening is perfect for deep learning.', author: null },
+      { type: 'poem', season: 'all', title: 'Moonlit studies', text: 'Let the calm of evening sharpen your focus.', author: null },
     ],
-    lateNight: [
-      { title: 'Night owl mode', subtitle: 'The city sleeps, but your mind is wide awake.' },
-      { title: 'Midnight scholar', subtitle: 'Great minds work while the world dreams.' },
-      { title: 'Stars & syllables', subtitle: 'Under the night sky, every word counts more.' },
+    night: [
+      { type: 'poem', season: 'all', title: 'Night owl mode', text: 'The city sleeps, but your mind is wide awake.', author: null },
+      { type: 'poem', season: 'all', title: 'Midnight scholar', text: 'Great minds work while the world dreams.', author: null },
+      { type: 'poem', season: 'all', title: 'Stars & syllables', text: 'Under the night sky, every word counts more.', author: null },
     ],
   },
 };
 
-function getGreeting(locale: Locale): Greeting {
-  const hour = new Date().getHours();
-  let period: string;
-  if (hour >= 6 && hour < 12) period = 'morning';
-  else if (hour >= 12 && hour < 14) period = 'midday';
-  else if (hour >= 14 && hour < 18) period = 'afternoon';
-  else if (hour >= 18 && hour < 22) period = 'evening';
-  else period = 'lateNight';
+// 时段：[起, 止)，night 跨午夜（22–24 与 0–6 均算 night）
+function getPeriod(hour: number): string {
+  if (hour >= 6 && hour < 12) return 'morning';
+  if (hour >= 12 && hour < 14) return 'noon';
+  if (hour >= 14 && hour < 18) return 'afternoon';
+  if (hour >= 18 && hour < 22) return 'evening';
+  return 'night';
+}
 
-  const pool = (greetingsByLocale[locale] ?? greetingsByLocale.en)[period];
-  // 使用日期 + 小时作为伪随机种子，每小时变一次
-  const seed = new Date().getDate() * 24 + hour;
-  return pool[seed % pool.length];
+// 季节：3–5 spring、6–8 summer、9–11 autumn、12/1/2 winter
+function getSeason(month: number): Season {
+  if (month >= 3 && month <= 5) return 'spring';
+  if (month >= 6 && month <= 8) return 'summer';
+  if (month >= 9 && month <= 11) return 'autumn';
+  return 'winter';
+}
+
+function getGreeting(locale: Locale): Greeting {
+  const now = new Date();
+  const period = getPeriod(now.getHours());
+  const season = getSeason(now.getMonth() + 1);
+
+  const items = (greetingsByLocale[locale] ?? greetingsByLocale.en)[period] ?? [];
+
+  // 季节过滤：保留「当季 + all」；过滤后为空则回退该时段全部条目
+  const inSeason = items.filter((g) => g.season === season || g.season === 'all');
+  const pool = inSeason.length > 0 ? inSeason : items;
+
+  // 季节优先：当季专属条目排在前面，其余随后（组内保持原序，不丢任何条目）
+  const ordered = [
+    ...pool.filter((g) => g.season === season),
+    ...pool.filter((g) => g.season !== season),
+  ];
+
+  // 逐日轮换：以距 1970 的天数为序号，每个时段一天只出一条，逐日推进保证每条都能轮到
+  const dayIndex = Math.floor(now.getTime() / 86_400_000);
+  return ordered[dayIndex % ordered.length];
+}
+
+// 渲染文案：author 非空 → 「text——author」，为 null → 仅 text（不出现空破折号）
+function formatGreetingText(g: Greeting): string {
+  return g.author ? `${g.text}——${g.author}` : g.text;
 }
 
 export default function HomePage() {
@@ -330,7 +396,7 @@ export default function HomePage() {
                 {greeting.title}
               </h1>
               <p className="text-charcoal-400 text-sm italic">
-                {greeting.subtitle}
+                {formatGreetingText(greeting)}
               </p>
             </div>
 

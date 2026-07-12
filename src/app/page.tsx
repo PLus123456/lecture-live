@@ -40,6 +40,10 @@ export async function generateMetadata(): Promise<Metadata> {
  * 自动标记为完成（兼容已有部署）。
  */
 async function isSetupComplete(): Promise<boolean> {
+  // E2E 种子：e2e harness 的 DATABASE_URL 指向不可达端口（全靠 page.route 拦
+  // 浏览器请求），SSR 查库必然失败并把 / 重定向到 /setup，Landing 页就永远
+  // 测不到。置此环境变量跳过检查（其余数据源均有 catch 兜底回默认值）。
+  if (process.env.E2E_FORCE_SETUP_COMPLETE === '1') return true;
   try {
     const setting = await prisma.siteSetting.findUnique({
       where: { key: 'setup_complete' },

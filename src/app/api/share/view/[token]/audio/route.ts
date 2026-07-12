@@ -60,6 +60,7 @@ export async function GET(
           recordingPath: true,
           transcriptPath: true,
           summaryPath: true,
+          enhancedAudioPath: true,
         },
       },
     },
@@ -82,12 +83,18 @@ export async function GET(
 
   const range = req.headers.get('range');
 
+  // 音频增强：增强版（响度归一化+降噪）已就绪时分享回放优先播它——分享出去的课堂录音
+  // 本就是给人听的，听得清的版本永远是更好的默认。原始录音仍可由 owner 在回放页切换。
+  const shareSession = link.session.enhancedAudioPath
+    ? { ...link.session, recordingPath: link.session.enhancedAudioPath }
+    : link.session;
+
   // P2-2/P2-3：解析录音物理位置后按位置类型流式取字节，均不把整段录音读进内存（长录音 + 并发
   // Range 会放大内存直至 OOM）：Cloudreve 透传上游 range/stream；本地文件 createReadStream 按 range
   // 流式读。MIME 一律按引用扩展名推断（含 mp3/wav/ogg），修 async 生成的 MP3 在旧代码里被一律标成
   // audio/webm、在 nosniff 下无法播放的问题。流式失败/定位不到时回退到缓冲读取（保留旧候选回退语义）。
   try {
-    const location = await resolveSessionAudioLocation(link.session);
+    const location = await resolveSessionAudioLocation(shareSession);
 
     if (location?.kind === 'cloudreve') {
       try {
@@ -171,7 +178,7 @@ export async function GET(
     }
 
     // 回退：Cloudreve 流式失败或无法定位物理文件 → 缓冲读取（含旧候选文件回退语义）。
-    const artifact = await loadSessionAudioArtifact(link.session);
+    const artifact = await loadSessionAudioArtifact(shareSession);
     if (!artifact) {
       return Response.json(
         { error: 'Audio not found' },

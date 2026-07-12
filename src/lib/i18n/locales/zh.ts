@@ -691,6 +691,18 @@ export default {
       statusTranscribing: '转录中…',
       statusFinalizing: '收尾中…',
     },
+    audioEnhance: {
+      button: '音频增强',
+      retry: '重试音频增强',
+      processing: '音频增强处理中…',
+      original: '原声',
+      enhanced: '增强',
+      toggleLabel: '音频源',
+      hint: '对录音做响度归一化与降噪，让远距离收音也清晰可听',
+      doneToast: '音频增强完成，可随时切换到增强版',
+      failToast: '音频增强失败',
+      triggerFail: '音频增强启动失败',
+    },
   },
 
   exportModal: {
@@ -820,6 +832,10 @@ export default {
     finalSummary: '总摘要：',
     allowRealtimeSummary: '允许实时摘要',
     allowFinalSummary: '允许总摘要',
+    audioEnhance: '音频增强：',
+    allowAudioEnhance: '允许音频增强',
+    allowAudioEnhanceHint:
+      '录音结束后在外部 worker 上做后处理（响度归一化+降噪）。默认关闭——较吃 worker 算力。',
     // 分区标题 + 摘要模型（用户组绑定；与「设置 > LLM」的模型目录/全局默认联动）
     sectionQuota: '配额',
     allowedModelsHint: '仅决定用户在对话里能选哪些模型；不影响摘要与报告用哪个模型。',
@@ -871,9 +887,30 @@ export default {
     tabStorage: '存储',
     tabAppearance: '外观',
     tabAsr: 'ASR',
+    tabAudioEnhance: '音频增强',
     tabLlm: 'LLM',
     tabSecurity: '安全',
     saveChanges: '保存更改',
+    // 录音音频增强（外部 worker 后处理）
+    audioEnhanceIntro:
+      '录音结束后送独立 worker 机器做后处理：两遍响度归一化（EBU R128）+ DeepFilterNet 降噪，让麦克风离讲者很远的录音也清晰可听。哪些用户组可用在「用户组」里按组配置。',
+    audioEnhanceEnabled: '启用音频增强',
+    audioEnhanceEnabledDesc: '站点级总开关；还需在用户组里开启对应能力',
+    audioEnhanceWorkerUrl: 'Worker 地址',
+    audioEnhanceWorkerUrlDesc: '增强 worker 的 HTTPS 地址（nginx 反代），如 https://enhance.example.com',
+    audioEnhanceWorkerToken: 'Worker Token',
+    audioEnhanceWorkerTokenDesc: '与 worker 约定的 Bearer token（AUDIO_WORKER_TOKEN，≥32 字符）；加密存储',
+    audioEnhanceWorkerTokenPlaceholder: '留空保持已保存的 token',
+    audioEnhanceVerify: '测试连接',
+    audioEnhanceVerifyOk: 'Worker 可达',
+    audioEnhanceVerifyDeepFilter: 'DeepFilterNet 可用',
+    audioEnhanceVerifyAfftdnOnly: '未装 DeepFilterNet，将回落 ffmpeg afftdn',
+    audioEnhanceTargetLufs: '目标响度（LUFS）',
+    audioEnhanceTargetLufsDesc: 'EBU R128 综合响度目标；默认 -14，可选 -30 ～ -8',
+    audioEnhanceAttenLim: '降噪衰减上限（dB）',
+    audioEnhanceAttenLimDesc: '100 = 完全消除背景音（人声可能发干）；20–30 保留自然环境音。默认 30',
+    audioEnhanceConcurrency: '派发并发数',
+    audioEnhanceConcurrencyDesc: '同时派发给 worker 的任务数；2 核 worker 保持 1',
 
     // Site Info
     siteName: '站点名称',
@@ -1321,6 +1358,7 @@ export default {
     typeStorageCleanup: '存储清理',
     typeStorageMigration: '存储迁移',
     typeBillingMaintenance: '账单维护',
+    typeAudioEnhance: '音频增强',
     // 表头
     colTime: '时间',
     colType: '类型',

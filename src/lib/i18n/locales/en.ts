@@ -709,6 +709,18 @@ export default {
       statusTranscribing: 'Transcribing…',
       statusFinalizing: 'Finalizing…',
     },
+    audioEnhance: {
+      button: 'Enhance Audio',
+      retry: 'Retry Enhancement',
+      processing: 'Enhancing audio…',
+      original: 'Original',
+      enhanced: 'Enhanced',
+      toggleLabel: 'Audio source',
+      hint: 'Normalize loudness and reduce noise, so distant-microphone recordings are clearly audible',
+      doneToast: 'Audio enhancement complete — switch to the enhanced track anytime',
+      failToast: 'Audio enhancement failed',
+      triggerFail: 'Failed to start audio enhancement',
+    },
   },
 
   exportModal: {
@@ -838,6 +850,10 @@ export default {
     finalSummary: 'Final summary:',
     allowRealtimeSummary: 'Allow realtime summary',
     allowFinalSummary: 'Allow final summary',
+    audioEnhance: 'Audio enhance:',
+    allowAudioEnhance: 'Allow audio enhancement',
+    allowAudioEnhanceHint:
+      'Post-process recordings (loudness normalization + denoise) on the external worker after each session ends. Off by default — heavy on worker compute.',
     // Section titles + summary models (bound to the group; linked to the model catalog / global defaults in Settings > LLM)
     sectionQuota: 'Quota',
     allowedModelsHint: 'Only controls which models users can pick in chat; it does not affect which model does summaries/reports.',
@@ -889,8 +905,29 @@ export default {
     tabStorage: 'Storage',
     tabAppearance: 'Appearance',
     tabAsr: 'ASR',
+    tabAudioEnhance: 'Audio Enhance',
     tabLlm: 'LLM',
     tabSecurity: 'Security',
+    // 录音音频增强（外部 worker 后处理）
+    audioEnhanceIntro:
+      'Post-process finished recordings on a dedicated worker machine: two-pass loudness normalization (EBU R128) plus DeepFilterNet denoising, so distant-microphone recordings become clearly audible. Which user groups may use it is configured per group in User Groups.',
+    audioEnhanceEnabled: 'Enable audio enhancement',
+    audioEnhanceEnabledDesc: 'Site-wide switch; also requires the group capability toggle',
+    audioEnhanceWorkerUrl: 'Worker URL',
+    audioEnhanceWorkerUrlDesc: 'HTTPS address of the enhancement worker (nginx reverse proxy), e.g. https://enhance.example.com',
+    audioEnhanceWorkerToken: 'Worker token',
+    audioEnhanceWorkerTokenDesc: 'Bearer token shared with the worker (AUDIO_WORKER_TOKEN, ≥32 chars); stored encrypted',
+    audioEnhanceWorkerTokenPlaceholder: 'Leave blank to keep the saved token',
+    audioEnhanceVerify: 'Test connection',
+    audioEnhanceVerifyOk: 'Worker reachable',
+    audioEnhanceVerifyDeepFilter: 'DeepFilterNet available',
+    audioEnhanceVerifyAfftdnOnly: 'DeepFilterNet missing — will fall back to ffmpeg afftdn',
+    audioEnhanceTargetLufs: 'Target loudness (LUFS)',
+    audioEnhanceTargetLufsDesc: 'EBU R128 integrated loudness target; default -14, valid -30 to -8',
+    audioEnhanceAttenLim: 'Denoise attenuation limit (dB)',
+    audioEnhanceAttenLimDesc: '100 = remove background completely (may sound dry); 20–30 keeps a natural ambience. Default 30',
+    audioEnhanceConcurrency: 'Dispatch concurrency',
+    audioEnhanceConcurrencyDesc: 'Jobs sent to the worker at once. Keep 1 for a 2-core worker',
     saveChanges: 'Save Changes',
 
     // Site Info
@@ -1342,6 +1379,7 @@ export default {
     typeStorageCleanup: 'Storage Cleanup',
     typeStorageMigration: 'Storage Migration',
     typeBillingMaintenance: 'Billing Maintenance',
+    typeAudioEnhance: 'Audio Enhance',
     // Table headers
     colTime: 'Time',
     colType: 'Type',

@@ -16,6 +16,7 @@ import {
   Sparkles,
   FileText,
   MessageCircle,
+  AudioLines,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
@@ -35,6 +36,8 @@ interface GroupPermissions {
   maxThinkingDepth: ThinkingDepthCap;
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
+  /** 录音音频增强（外部 worker 后处理）；新重资源功能，缺省禁止 */
+  allowAudioEnhance?: boolean;
   /** 该组实时摘要模型（DB model id；'' = 跟随全局默认） */
   realtimeSummaryModelId?: string;
   /** 该组总摘要模型（DB model id；'' = 跟随全局默认） */
@@ -189,6 +192,15 @@ function GroupCard({
               <span>{t('admin.finalSummary')}</span>
               <span className="font-medium">
                 {group.permissions.allowFinalSummary
+                  ? t('admin.enabled')
+                  : t('admin.disabled')}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-sm text-charcoal-600">
+              <AudioLines className="w-3.5 h-3.5 text-charcoal-400" />
+              <span>{t('admin.audioEnhance')}</span>
+              <span className="font-medium">
+                {group.permissions.allowAudioEnhance
                   ? t('admin.enabled')
                   : t('admin.disabled')}
               </span>
@@ -491,6 +503,8 @@ function PermissionsForm({
   setAllowRealtime,
   allowFinal,
   setAllowFinal,
+  allowAudio,
+  setAllowAudio,
   realtimeSummaryModelId,
   setRealtimeSummaryModelId,
   finalSummaryModelId,
@@ -519,6 +533,8 @@ function PermissionsForm({
   setAllowRealtime: (v: boolean) => void;
   allowFinal: boolean;
   setAllowFinal: (v: boolean) => void;
+  allowAudio: boolean;
+  setAllowAudio: (v: boolean) => void;
   realtimeSummaryModelId: string;
   setRealtimeSummaryModelId: (v: string) => void;
   finalSummaryModelId: string;
@@ -657,6 +673,20 @@ function PermissionsForm({
           />
         </div>
 
+        {/* 录音音频增强：开关（结束录音后送外部 worker 做响度归一化 + 降噪） */}
+        <div className="rounded-lg border border-cream-200 px-3 py-2.5 space-y-1.5">
+          <CapabilityToggle
+            icon={<AudioLines className="w-3.5 h-3.5 text-charcoal-400" />}
+            label={t('admin.allowAudioEnhance')}
+            checked={adminLocked ? true : allowAudio}
+            onChange={setAllowAudio}
+            disabled={adminLocked}
+          />
+          <p className="text-[11px] text-charcoal-400 pl-6">
+            {t('admin.allowAudioEnhanceHint')}
+          </p>
+        </div>
+
         <p className="text-[11px] text-charcoal-400">
           {adminLocked ? t('admin.adminGroupLockedHint') : t('admin.summaryModelHint')}
         </p>
@@ -680,6 +710,8 @@ function usePermissionsForm(
   );
   const [allowRealtime, setAllowRealtime] = useState(initPermissions.allowRealtimeSummary);
   const [allowFinal, setAllowFinal] = useState(initPermissions.allowFinalSummary);
+  // 音频增强缺省禁止（与后端解析口径一致：新重资源功能不随旧配置自动放开）
+  const [allowAudio, setAllowAudio] = useState(initPermissions.allowAudioEnhance === true);
 
   // 摘要/聊天模型（DB id；'' = 跟随全局默认）
   const [realtimeSummaryModelId, setRealtimeSummaryModelId] = useState(
@@ -746,6 +778,7 @@ function usePermissionsForm(
       maxThinkingDepth: thinkingEnabled ? maxDepth : 'off',
       allowRealtimeSummary: allowRealtime,
       allowFinalSummary: allowFinal,
+      allowAudioEnhance: allowAudio,
       // 能力关掉时把对应摘要模型一并清空（跟随全局）——关了还留个具体模型 id 是无意义的死配置
       realtimeSummaryModelId: allowRealtime ? realtimeSummaryModelId : '',
       finalSummaryModelId: allowFinal ? finalSummaryModelId : '',
@@ -761,6 +794,7 @@ function usePermissionsForm(
     maxDepth, setMaxDepth,
     allowRealtime, setAllowRealtime,
     allowFinal, setAllowFinal,
+    allowAudio, setAllowAudio,
     realtimeSummaryModelId, setRealtimeSummaryModelId,
     finalSummaryModelId, setFinalSummaryModelId,
     chatModelId, setChatModelId,
@@ -912,6 +946,8 @@ function CreateGroupModal({
     maxThinkingDepth: 'high',
     allowRealtimeSummary: true,
     allowFinalSummary: true,
+    // 音频增强例外：新重资源功能，新建组也缺省禁止，由管理员显式开启
+    allowAudioEnhance: false,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
   };

@@ -58,8 +58,8 @@ LectureLive is a full-stack web application for live teaching scenarios. It comb
   </tr>
   <tr>
     <td width="50%">
-      <strong>Recording and playback</strong><br />
-      Keep audio aligned with transcript data so sessions can be reviewed and replayed later.
+      <strong>Recording, playback &amp; audio enhancement</strong><br />
+      Keep audio aligned with transcript data for later review, with optional post-processing (loudness normalization + AI denoising) on an offloaded worker so distant-microphone recordings stay clearly audible.
     </td>
     <td width="50%">
       <strong>Self-hosted operations</strong><br />
@@ -112,6 +112,8 @@ flowchart LR
 │  (Prisma)  │                  │         │      │ file store  │
 └────────────┘                  └─────────┘      └─────────────┘
 ```
+
+Optionally, an **audio enhancement worker** ([`worker/`](worker/)) can run on a separate low-cost machine (e.g. a free Oracle Cloud ARM instance). After each recording finishes, the main server pushes the audio to it over HTTPS for two-pass loudness normalization (EBU R128) and DeepFilterNet denoising, then stores the enhanced track alongside the original so playback can switch between them. The worker is fully passive — it never connects back to the main server and can be restarted at any time.
 
 ## Tech Stack
 
@@ -179,6 +181,20 @@ curl http://localhost:3000/api/health
 
 The Docker stack includes the app server, WebSocket service, MySQL 8.4, Redis 7, and Cloudreve.
 
+### Optional: Audio Enhancement Worker
+
+Offload recording post-processing (loudness normalization + denoising) to a separate machine — a free-tier Oracle Cloud ARM instance (2 cores / 12 GB) is plenty:
+
+```bash
+# On the worker machine (Ubuntu/Debian):
+sudo bash worker/install.sh          # installs service, generates the auth token
+# Put the printed HTTPS reverse-proxy config into nginx, then in the
+# LectureLive admin panel: Settings → Audio Enhance → fill in URL + token
+# → Test connection → enable, and allow the feature per user group.
+```
+
+See [`worker/README.md`](worker/README.md) for manual setup, nginx details, and tuning.
+
 ## Repository Map
 
 ```text
@@ -205,7 +221,8 @@ lecture-live/
 ├── public/                 # App icons and static assets
 ├── docker-compose.yml
 ├── Dockerfile
-└── deploy/                 # Deployment shims and runtime helpers
+├── deploy/                 # Deployment shims and runtime helpers
+└── worker/                 # Optional audio enhancement worker (separate machine)
 ```
 
 ## Configuration & Security

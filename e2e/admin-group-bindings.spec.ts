@@ -205,6 +205,14 @@ test('组编辑面板渲染能力绑定控件且模型去重', async ({ page }) 
   // 具体可选的总摘要模型也在选项里
   await expect(page.getByRole('option', { name: /豆包lite总摘要/ })).toHaveCount(1);
 
+  // 默认聊天模型下拉：标签 + 具体 CHAT 模型选项（存 DB id，与摘要模型同口径）
+  await expect(
+    page.getByText(/默认聊天模型|Default chat model/).first()
+  ).toBeVisible();
+  await expect(
+    page.getByRole('option', { name: /GPT-4o · OpenAI 主力/ })
+  ).toHaveCount(1);
+
   await page.screenshot({
     path: 'artifacts/admin-group-bindings.png',
     fullPage: true,

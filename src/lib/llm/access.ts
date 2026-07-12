@@ -8,6 +8,7 @@ import {
 import { prisma } from '@/lib/prisma';
 import {
   resolveUserFeatureFlags,
+  resolveUserDefaultChatModelId,
   clampDepthToCap,
   type EffectiveFeatureFlags,
   type ThinkingDepthCap,
@@ -79,6 +80,12 @@ export async function resolveAuthorizedLlmSelection(
      * 会把受限组的摘要误判成 403。
      */
     enforceDefaultModelAccess?: boolean;
+    /**
+     * 未指定模型时是否先套用「组默认聊天模型」（组绑定 chatModelId，管理员决策、绕过
+     * allowedModels 门禁）。缺省跟随 enforceDefaultModelAccess（即聊天路径默认开启）；
+     * 摘要路径传了 enforceDefaultModelAccess:false 即自动关闭，避免组的聊天默认误入摘要。
+     */
+    applyGroupChatDefault?: boolean;
   }
 ): Promise<AuthorizedLlmSelection> {
   const user = await prisma.user.findUnique({
@@ -120,9 +127,35 @@ export async function resolveAuthorizedLlmSelection(
     }
   };
 
+  // 组默认聊天模型：用户未显式选模型时按组绑定解析（组绑定=管理员决策，绕过 allowedModels）。
+  // 存在性经 getModelById 校验，失效（模型已删/回落 env provider）视作未绑定 → 走全局默认。
+  const applyGroupChatDefault =
+    opts?.applyGroupChatDefault ?? enforceDefaultModelAccess;
+  const resolveGroupChatDefaultOrNull = async () => {
+    if (!applyGroupChatDefault) return null;
+    const groupDefaultId = await resolveUserDefaultChatModelId(user).catch(
+      () => null
+    );
+    if (!groupDefaultId) return null;
+    const cfg = await getModelById(groupDefaultId).catch(() => null);
+    if (cfg && cfg.dbModelId === groupDefaultId) {
+      return { cfg, modelId: groupDefaultId };
+    }
+    return null;
+  };
+
   const normalizedIdentifier = requestedIdentifier?.trim();
   if (!normalizedIdentifier) {
-    // 未指定模型 → 下游会回落到 CHAT 用途的默认模型，先校验默认模型是否被授权。
+    // 未指定模型 → 组默认聊天模型优先，其次回落到 CHAT 用途的全局默认（需校验授权）。
+    const groupDefault = await resolveGroupChatDefaultOrNull();
+    if (groupDefault) {
+      return {
+        user,
+        providerConfig: groupDefault.cfg,
+        modelId: groupDefault.modelId,
+        featureFlags,
+      };
+    }
     await assertDefaultModelAllowedOrThrow();
     return { user, featureFlags };
   }
@@ -165,8 +198,17 @@ export async function resolveAuthorizedLlmSelection(
   }
 
   // 非空但既不是已配置的 DB 模型、也不是已配置的 provider 名 —— 即「伪造 / 陈旧」的 id。
-  // 下游会回落到 CHAT 默认模型，这里必须像空 id 分支一样校验默认模型授权，否则受限用户
-  // 发一个 model:"does-not-exist" 就能拿到未授权的默认模型（绕过用户组模型绑定）。
+  // 与空 id 分支同口径：组默认聊天模型优先；否则下游会回落到 CHAT 默认模型，必须校验
+  // 默认模型授权，防止受限用户发 model:"does-not-exist" 绕过用户组模型绑定。
+  const groupDefault = await resolveGroupChatDefaultOrNull();
+  if (groupDefault) {
+    return {
+      user,
+      providerConfig: groupDefault.cfg,
+      modelId: groupDefault.modelId,
+      featureFlags,
+    };
+  }
   await assertDefaultModelAllowedOrThrow();
   return { user, featureFlags };
 }

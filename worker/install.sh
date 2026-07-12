@@ -51,6 +51,17 @@ fi
 info "ffmpeg: $(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')"
 
 # ── 3. 依赖：deep-filter（best-effort 自动下载；失败不阻塞，会自动兜底 afftdn） ──
+# 先探测 cargo 安装的位置（服务以 llworker 运行且 ProtectHome=true，home 下的二进制
+# 对服务不可见，必须复制到系统路径）。
+if ! command -v deep-filter &>/dev/null; then
+    for CARGO_BIN in "/root/.cargo/bin/deep-filter" \
+                     "${SUDO_USER:+/home/${SUDO_USER}/.cargo/bin/deep-filter}"; do
+        [[ -n "$CARGO_BIN" && -x "$CARGO_BIN" ]] || continue
+        warn "在 $CARGO_BIN 发现 cargo 安装的 deep-filter，复制到 /usr/local/bin（服务的沙箱看不到 home 目录）"
+        install -m 0755 "$CARGO_BIN" /usr/local/bin/deep-filter
+        break
+    done
+fi
 if command -v deep-filter &>/dev/null; then
     info "deep-filter 已安装: $(command -v deep-filter)"
 else

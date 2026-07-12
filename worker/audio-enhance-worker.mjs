@@ -190,9 +190,11 @@ async function which(cmd) {
   return null
 }
 
-let deepFilterPathCache // undefined=未探测 null=不可用 string=路径
+// 只缓存「找到了」的结果；没找到不缓存——每次调用重探（healthz/每任务一次 which，
+// 开销可忽略）。这样运行中补装 deep-filter 后立即生效，无需重启服务。
+let deepFilterPathCache = null // null=尚未找到 string=路径
 async function resolveDeepFilter() {
-  if (deepFilterPathCache !== undefined) return deepFilterPathCache
+  if (deepFilterPathCache) return deepFilterPathCache
   if (CONFIG.deepFilterBin) {
     try {
       await fs.access(CONFIG.deepFilterBin)

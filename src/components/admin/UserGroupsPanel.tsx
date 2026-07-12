@@ -15,6 +15,7 @@ import {
   Brain,
   Sparkles,
   FileText,
+  MessageCircle,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
@@ -38,6 +39,8 @@ interface GroupPermissions {
   realtimeSummaryModelId?: string;
   /** 该组总摘要模型（DB model id；'' = 跟随全局默认） */
   finalSummaryModelId?: string;
+  /** 该组默认聊天模型（DB model id；'' = 跟随全局 CHAT 默认；用户未显式选模型时生效） */
+  chatModelId?: string;
 }
 
 interface UserGroup {
@@ -218,6 +221,18 @@ function GroupCard({
                 </span>
               </div>
             )}
+            <div className="flex items-center gap-2 text-sm text-charcoal-600 min-w-0">
+              <MessageCircle className="w-3.5 h-3.5 text-charcoal-400 shrink-0" />
+              <span className="shrink-0">{t('admin.defaultChatModel')}</span>
+              <span className="font-medium truncate">
+                {summaryModelDisplay(
+                  t,
+                  group.permissions.chatModelId,
+                  catalog.chatOptions,
+                  catalog.chatDefault,
+                )}
+              </span>
+            </div>
           </div>
 
           <div className="flex items-center gap-2 mt-4 pt-3 border-t border-cream-100">
@@ -269,14 +284,18 @@ interface SummaryModelOption {
  */
 interface ModelCatalog {
   chat: ModelInfo[];
+  /** CHAT 用途的具体路由行（默认聊天模型下拉，存 DB id） */
+  chatOptions: SummaryModelOption[];
   realtimeSummary: SummaryModelOption[];
   finalSummary: SummaryModelOption[];
+  chatDefault?: SummaryModelOption;
   realtimeDefault?: SummaryModelOption;
   finalDefault?: SummaryModelOption;
 }
 
 const EMPTY_CATALOG: ModelCatalog = {
   chat: [],
+  chatOptions: [],
   realtimeSummary: [],
   finalSummary: [],
 };
@@ -468,6 +487,8 @@ function PermissionsForm({
   setRealtimeSummaryModelId,
   finalSummaryModelId,
   setFinalSummaryModelId,
+  chatModelId,
+  setChatModelId,
 }: {
   minutesLimit: string;
   setMinutesLimit: (v: string) => void;
@@ -493,6 +514,8 @@ function PermissionsForm({
   setRealtimeSummaryModelId: (v: string) => void;
   finalSummaryModelId: string;
   setFinalSummaryModelId: (v: string) => void;
+  chatModelId: string;
+  setChatModelId: (v: string) => void;
 }) {
   const { t } = useI18n();
   const inputCls =
@@ -530,6 +553,18 @@ function PermissionsForm({
           onToggle={onToggle}
           onToggleAll={onToggleAll}
         />
+        {/* 默认聊天模型：用户未显式选模型时该组用哪个（组绑定=管理员决策，可越过勾选集）*/}
+        <div className="pt-1.5">
+          <SummaryModelSelect
+            label={t('admin.defaultChatModel')}
+            value={chatModelId}
+            onChange={setChatModelId}
+            options={catalog.chatOptions}
+            globalDefault={catalog.chatDefault}
+            disabled={false}
+          />
+          <p className="text-[11px] text-charcoal-400 mt-1 pl-6">{t('admin.defaultChatModelHint')}</p>
+        </div>
       </div>
 
       {/* ── 能力开关 + 摘要模型（每个能力与它的模型选择就近放一起）── */}
@@ -620,13 +655,14 @@ function usePermissionsForm(
   const [allowRealtime, setAllowRealtime] = useState(initPermissions.allowRealtimeSummary);
   const [allowFinal, setAllowFinal] = useState(initPermissions.allowFinalSummary);
 
-  // 摘要模型（DB id；'' = 跟随全局默认）
+  // 摘要/聊天模型（DB id；'' = 跟随全局默认）
   const [realtimeSummaryModelId, setRealtimeSummaryModelId] = useState(
     initPermissions.realtimeSummaryModelId ?? '',
   );
   const [finalSummaryModelId, setFinalSummaryModelId] = useState(
     initPermissions.finalSummaryModelId ?? '',
   );
+  const [chatModelId, setChatModelId] = useState(initPermissions.chatModelId ?? '');
 
   const isAllInit = initPermissions.allowedModels === '*';
   const [selectAll, setSelectAll] = useState(isAllInit);
@@ -687,6 +723,7 @@ function usePermissionsForm(
       // 能力关掉时把对应摘要模型一并清空（跟随全局）——关了还留个具体模型 id 是无意义的死配置
       realtimeSummaryModelId: allowRealtime ? realtimeSummaryModelId : '',
       finalSummaryModelId: allowFinal ? finalSummaryModelId : '',
+      chatModelId,
     };
   };
 
@@ -700,6 +737,7 @@ function usePermissionsForm(
     allowFinal, setAllowFinal,
     realtimeSummaryModelId, setRealtimeSummaryModelId,
     finalSummaryModelId, setFinalSummaryModelId,
+    chatModelId, setChatModelId,
     selected, selectAll,
     handleToggle, handleToggleAll,
     buildPermissions,
@@ -969,8 +1007,10 @@ export default function UserGroupsPanel() {
 
       const seenChat = new Set<string>();
       const chat: ModelInfo[] = [];
+      const chatOptions: SummaryModelOption[] = [];
       const realtimeSummary: SummaryModelOption[] = [];
       const finalSummary: SummaryModelOption[] = [];
+      let chatDefault: SummaryModelOption | undefined;
       let realtimeDefault: SummaryModelOption | undefined;
       let finalDefault: SummaryModelOption | undefined;
 
@@ -989,6 +1029,12 @@ export default function UserGroupsPanel() {
           const id = (m.id ?? '').trim();
           const displayName = (m.displayName || modelId).trim();
           if (m.purpose === 'CHAT') {
+            // 默认聊天模型以 DB id 为准（与摘要模型同口径）
+            if (id) {
+              const opt: SummaryModelOption = { id, displayName, providerName: p.name, modelId };
+              chatOptions.push(opt);
+              if (m.isDefault) chatDefault = opt;
+            }
             // allowedModels 按 modelId 去重
             if (!modelId || seenChat.has(modelId)) continue;
             seenChat.add(modelId);
@@ -1008,7 +1054,7 @@ export default function UserGroupsPanel() {
         }
       }
 
-      setCatalog({ chat, realtimeSummary, finalSummary, realtimeDefault, finalDefault });
+      setCatalog({ chat, chatOptions, realtimeSummary, finalSummary, chatDefault, realtimeDefault, finalDefault });
     } catch (err) {
       console.error('加载模型目录失败:', err);
     }

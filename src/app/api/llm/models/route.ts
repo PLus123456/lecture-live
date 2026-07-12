@@ -1,7 +1,12 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
-import { listAvailableModels, parseProviders } from '@/lib/llm/gateway';
+import {
+  listAvailableModels,
+  parseProviders,
+  getModelById,
+  getProviderForPurpose,
+} from '@/lib/llm/gateway';
 import type {
   ChatModelOption,
   ChatModelsResponse,
@@ -13,6 +18,7 @@ import { jsonWithCache } from '@/lib/httpCache';
 import {
   clampDepthToCap,
   resolveUserFeatureFlags,
+  resolveUserDefaultChatModelId,
   type ThinkingDepthCap,
 } from '@/lib/userRoles';
 
@@ -67,13 +73,32 @@ export async function GET(req: Request) {
     );
 
     const models: ChatModelOption[] = [];
-    let defaultModel = '';
 
-    // 按底层 modelId + displayName 去重，同一模型分配多个 purpose 时只显示一次
-    // 优先使用 CHAT 用途的记录（因为对话界面使用）
-    const seenModelKeys = new Map<string, number>(); // key → models 数组索引
+    const buildOption = (cfg: (typeof dbModels)[number]): ChatModelOption => {
+      const mode = cfg.thinkingMode;
+      return {
+        name: cfg.dbModelId!,
+        id: cfg.dbModelId!,
+        modelId: cfg.model,
+        displayName: cfg.displayName || cfg.model,
+        supportsThinking: mode !== 'NONE' && thinkingCap !== 'off',
+        thinkingMode: mode,
+        supportsThinkingDepth: mode === 'DEPTH' && thinkingCap !== 'off',
+        supportsImage: cfg.supportsImage,
+        contextWindow: cfg.contextWindow,
+        allowedDepths: allowedDepthsFor(mode, thinkingCap),
+        purpose: 'CHAT' as LlmPurpose,
+      };
+    };
 
+    // 聊天选择器只列「CHAT 用途路由」的模型：用途路由决定每个功能挂哪些模型，
+    // 仅挂在摘要/关键词/嵌入上的模型不再出现在聊天里（旧行为是全用途混列）。
+    // 同一底层模型（modelId + displayName）去重，保留 sortOrder 靠前的路由行。
+    const seenModelKeys = new Set<string>();
     for (const cfg of dbModels) {
+      if (cfg.purpose !== 'CHAT') {
+        continue;
+      }
       // 非 ADMIN 用户允许按 dbModelId、provider 名称或底层 modelId 授权。
       if (
         user.role !== 'ADMIN' &&
@@ -85,44 +110,38 @@ export async function GET(req: Request) {
         continue;
       }
 
-      const mode = cfg.thinkingMode;
-      const allowedDepths = allowedDepthsFor(mode, thinkingCap);
-
-      const buildOption = (purpose: LlmPurpose): ChatModelOption => ({
-        name: cfg.dbModelId!,
-        id: cfg.dbModelId!,
-        modelId: cfg.model,
-        displayName: cfg.displayName || cfg.model,
-        supportsThinking: mode !== 'NONE' && thinkingCap !== 'off',
-        thinkingMode: mode,
-        supportsThinkingDepth: mode === 'DEPTH' && thinkingCap !== 'off',
-        supportsImage: cfg.supportsImage,
-        contextWindow: cfg.contextWindow,
-        allowedDepths,
-        purpose,
-      });
-
-      // 去重：同一底层模型（modelId + displayName）只保留一条，优先用 CHAT 用途的记录
       const dedupeKey = `${cfg.model}::${cfg.displayName || cfg.model}`;
-      const existingIdx = seenModelKeys.get(dedupeKey);
-
-      if (existingIdx !== undefined) {
-        if (cfg.purpose === 'CHAT') {
-          models[existingIdx] = buildOption('CHAT');
-        }
+      if (seenModelKeys.has(dedupeKey)) {
         continue;
       }
-
-      const idx = models.length;
-      seenModelKeys.set(dedupeKey, idx);
-      models.push(buildOption((cfg.purpose ?? 'CHAT') as LlmPurpose));
-
-      // 该用途下 isDefault 的模型作为 defaultModel
-      if (cfg.purpose === 'CHAT' && !defaultModel) {
-        defaultModel = cfg.dbModelId!;
-      }
+      seenModelKeys.add(dedupeKey);
+      models.push(buildOption(cfg));
     }
 
+    // 默认模型：组绑定的默认聊天模型优先（管理员决策，必要时补进选项列表），
+    // 其次全局 CHAT 用途默认（isDefault 路由），最后回落列表第一项。
+    let defaultModel = '';
+    const groupDefaultId = await resolveUserDefaultChatModelId(user).catch(
+      () => null
+    );
+    if (groupDefaultId) {
+      const cfg = await getModelById(groupDefaultId).catch(() => null);
+      if (cfg && cfg.dbModelId === groupDefaultId) {
+        if (!models.some((m) => m.id === groupDefaultId)) {
+          models.unshift(buildOption(cfg));
+        }
+        defaultModel = groupDefaultId;
+      }
+    }
+    if (!defaultModel) {
+      const globalDefault = await getProviderForPurpose('CHAT').catch(() => null);
+      if (
+        globalDefault?.dbModelId &&
+        models.some((m) => m.id === globalDefault.dbModelId)
+      ) {
+        defaultModel = globalDefault.dbModelId;
+      }
+    }
     if (!defaultModel && models.length > 0) {
       defaultModel = models[0].name;
     }

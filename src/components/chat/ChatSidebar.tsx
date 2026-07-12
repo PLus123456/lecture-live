@@ -5,7 +5,6 @@ import { usePathname, useRouter } from 'next/navigation';
 import { useEffect } from 'react';
 import { ArrowLeft, Plus, History, MessageSquare, Mic } from 'lucide-react';
 import SlidingSidebar from '@/components/layout/SlidingSidebar';
-import ComposerModelControls from '@/components/chat/ComposerModelControls';
 import { useI18n } from '@/lib/i18n';
 import { useAuthStore } from '@/stores/authStore';
 import { useConversationListStore } from '@/stores/conversationListStore';
@@ -123,19 +122,8 @@ export default function ChatSidebar({ visible }: { visible: boolean }) {
         )}
       </div>
 
-      {/* 底部：模型选择器（桌面端从 composer 移到此处）+ 全部对话入口 */}
-      <div className="flex-shrink-0 border-t border-cream-200 p-3 space-y-2">
-        {/* 仅在对话区可见时渲染 —— ChatSidebar 在所有 dashboard 页常驻挂载（滑动动画需要），
-            但模型选择器只属于对话区：避免在 /admin、/home 等页面白白拉取 /api/llm/models，
-            也避免那些页面渲染这个离屏控件（曾因此在 /api/llm/models 未 mock 时整页崩溃）。 */}
-        {visible && (
-          <div className="px-[10px] py-2 rounded-lg border border-cream-200 bg-cream-50/60">
-            <div className="text-[10px] font-medium text-charcoal-400 tracking-wider uppercase mb-1">
-              {t('chat.model')}
-            </div>
-            <ComposerModelControls layout="block" />
-          </div>
-        )}
+      {/* 底部：全部对话（搜索 / 归档 / 清理的完整管理页） */}
+      <div className="flex-shrink-0 border-t border-cream-200 p-3">
         <Link
           href="/conversations"
           className={`

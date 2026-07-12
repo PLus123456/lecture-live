@@ -512,6 +512,33 @@ test('模型库：验证连通性 + 删除网关确认弹窗', async ({ page }) 
     )
     .toBe(true);
 
+  // 登记模型弹窗：默认规格 256K/8192、用途勾选默认勾「聊天」，保存 → POST 带 purposes
+  await page.getByRole('button', { name: /^模型$|^Model$/ }).click();
+  const modal = page.locator('.fixed.inset-0').last();
+  await expect(modal.getByText(/登记模型|Register Model/)).toBeVisible();
+  const ctxInput = modal.locator('input[type="number"]').first();
+  await expect(ctxInput).toHaveValue('262144');
+  const outInput = modal.locator('input[type="number"]').nth(1);
+  await expect(outInput).toHaveValue('8192');
+  const attachBox = modal.getByTestId('llm-attach-purposes');
+  await expect(
+    attachBox.locator('input[type="checkbox"]:checked')
+  ).toHaveCount(1); // 默认勾聊天
+  await modal.locator('input').first().fill('新模型');
+  await modal.locator('input').nth(1).fill('new-model-x');
+  await modal.getByRole('button', { name: /^保存$|^Save$/ }).click();
+  await expect
+    .poll(() =>
+      captured.some(
+        (r) =>
+          r.method === 'POST' &&
+          r.path === '/api/admin/llm-providers/prov-ark/registry' &&
+          JSON.stringify((r.body as { purposes?: string[] })?.purposes) ===
+            JSON.stringify(['CHAT'])
+      )
+    )
+    .toBe(true);
+
   // 删除网关 → 确认弹窗出现（含级联警告文案），确认后 DELETE
   await page.getByRole('button', { name: /删除网关|Delete Gateway/ }).click();
   await expect(page.getByText(/删除该网关|Delete this gateway/).first()).toBeVisible();

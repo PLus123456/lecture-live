@@ -637,6 +637,7 @@ export default {
     tabInfo: '信息',
     loadingReport: '正在加载报告...',
     noReport: '当前会话暂无报告。',
+    reportGeneratingBg: '总结报告生成中，完成后将自动显示…',
     insignificantTitle: '该录制内容不足以生成摘要',
     score: '评分：{score}%',
     keyConclusions: '关键结论',

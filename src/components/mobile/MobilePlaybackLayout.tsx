@@ -59,6 +59,8 @@ interface MobilePlaybackLayoutProps {
   summaries: SummaryBlock[];
   reportData: SessionReportData | null;
   reportLoading: boolean;
+  /** 收尾后台仍在生成总摘要报告（父级轮询任务队列得知）→ 空态显示「生成中」而非重新生成入口。 */
+  reportPendingBg?: boolean;
   // 音频播放
   isPlaying: boolean;
   currentTimeMs: number;
@@ -152,12 +154,14 @@ function formatDate(dateStr: string): string {
 function ReportContent({
   reportData,
   reportLoading,
+  reportPendingBg,
   isShareMode,
   onRegenerateReport,
   regeneratingReport,
 }: {
   reportData: SessionReportData | null;
   reportLoading: boolean;
+  reportPendingBg?: boolean;
   isShareMode?: boolean;
   onRegenerateReport?: () => void;
   regeneratingReport?: boolean;
@@ -196,6 +200,17 @@ function ReportContent({
   }
 
   if (!reportData) {
+    if (reportPendingBg) {
+      return (
+        <div
+          className="text-center text-charcoal-400 text-sm py-12"
+          data-testid="report-generating-bg"
+        >
+          <Loader2 className="w-6 h-6 mx-auto mb-2 opacity-40 animate-spin" />
+          <p>{t('playback.reportGeneratingBg')}</p>
+        </div>
+      );
+    }
     return (
       <div className="text-center text-charcoal-400 text-sm py-12">
         <ClipboardList className="w-6 h-6 mx-auto mb-2 opacity-30" />
@@ -350,6 +365,7 @@ export default function MobilePlaybackLayout({
   summaries,
   reportData,
   reportLoading,
+  reportPendingBg,
   isPlaying,
   currentTimeMs,
   effectiveDurationMs,
@@ -505,6 +521,7 @@ export default function MobilePlaybackLayout({
             <ReportContent
               reportData={reportData}
               reportLoading={reportLoading}
+              reportPendingBg={reportPendingBg}
               isShareMode={isShareMode}
               onRegenerateReport={onRegenerateReport}
               regeneratingReport={regeneratingReport}

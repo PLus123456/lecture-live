@@ -8,6 +8,7 @@ import { Loader2 } from 'lucide-react';
 import SiteLogo from '@/components/SiteLogo';
 import { useI18n } from '@/lib/i18n';
 import DOMPurify from 'dompurify';
+import ThemeSwitcher from '@/components/ThemeSwitcher';
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -79,6 +80,7 @@ export default function RegisterPage() {
 
   return (
     <div className="min-h-[100dvh] flex flex-col items-center justify-center bg-cream-50 px-4">
+      <ThemeSwitcher variant="button" className="fixed right-4 top-4 z-10" />
       <div className="w-full max-w-sm flex-1 flex flex-col justify-center">
         <div className="text-center mb-8 animate-fade-in-up">
           <div className="mx-auto mb-3 animate-pop-in">

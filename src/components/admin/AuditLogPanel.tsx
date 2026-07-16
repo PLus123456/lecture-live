@@ -63,18 +63,18 @@ interface Pagination {
 
 // 颜色板：使用统一的 token 简化映射
 const PALETTE = {
-  green:  { color: '#059669', bg: '#d1fae5' },
-  amber:  { color: '#d97706', bg: '#fef3c7' },
-  blue:   { color: '#2563eb', bg: '#dbeafe' },
-  violet: { color: '#7c3aed', bg: '#ede9fe' },
-  purple: { color: '#8b5cf6', bg: '#f3e8ff' },
-  red:    { color: '#dc2626', bg: '#fee2e2' },
-  gray:   { color: '#6b7280', bg: '#f3f4f6' },
-  cyan:   { color: '#0891b2', bg: '#cffafe' },
-  indigo: { color: '#4f46e5', bg: '#e0e7ff' },
-  teal:   { color: '#0d9488', bg: '#ccfbf1' },
-  orange: { color: '#ea580c', bg: '#ffedd5' },
-  slate:  { color: '#475569', bg: '#f1f5f9' },
+  green:  { color: 'var(--tone-green-fg)', bg: 'var(--tone-green-bg-strong)' },
+  amber:  { color: 'var(--tone-amber-fg)', bg: 'var(--tone-amber-bg-strong)' },
+  blue:   { color: 'var(--tone-blue-fg)', bg: 'var(--tone-blue-bg-strong)' },
+  violet: { color: 'var(--tone-purple-fg)', bg: 'var(--tone-purple-bg-strong)' },
+  purple: { color: 'var(--tone-purple-fg)', bg: 'var(--tone-purple-bg-strong)' },
+  red:    { color: 'var(--tone-red-fg)', bg: 'var(--tone-red-bg-strong)' },
+  gray:   { color: 'var(--theme-text-muted)', bg: 'var(--theme-surface-hover)' },
+  cyan:   { color: 'var(--tone-sky-fg)', bg: 'var(--tone-sky-bg-strong)' },
+  indigo: { color: 'var(--tone-blue-fg)', bg: 'var(--tone-blue-bg-strong)' },
+  teal:   { color: 'var(--tone-green-fg)', bg: 'var(--tone-green-bg-strong)' },
+  orange: { color: 'var(--theme-accent)', bg: 'var(--theme-accent-soft)' },
+  slate:  { color: 'var(--theme-text-muted)', bg: 'var(--theme-surface-hover)' },
 } as const;
 
 type Tone = keyof typeof PALETTE;

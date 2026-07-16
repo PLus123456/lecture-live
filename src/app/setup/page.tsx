@@ -9,6 +9,7 @@ import {
   Loader2, AlertCircle, Eye, EyeOff, Plus, Trash2,
 } from 'lucide-react';
 import SiteLogo from '@/components/SiteLogo';
+import ThemeSwitcher from '@/components/ThemeSwitcher';
 
 /* ------------------------------------------------------------------ */
 /*  类型定义                                                           */
@@ -363,6 +364,7 @@ export default function SetupPage() {
   if (loading) {
     return (
       <div className="min-h-[100dvh] flex items-center justify-center bg-cream-50">
+        <ThemeSwitcher variant="button" className="fixed right-4 top-4 z-10" />
         <div className="flex items-center gap-2 text-charcoal-400">
           <Loader2 className="w-5 h-5 animate-spin" />
           <span className="text-sm">正在检查设置状态…</span>
@@ -376,6 +378,7 @@ export default function SetupPage() {
 
   return (
     <div className="min-h-[100dvh] bg-cream-50 py-8 px-4">
+      <ThemeSwitcher variant="button" className="fixed right-4 top-4 z-10" />
       <div className="max-w-2xl mx-auto">
         {/* Header */}
         <div className="text-center mb-8">

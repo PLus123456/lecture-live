@@ -33,6 +33,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useI18n, type Locale } from '@/lib/i18n';
 import { makeLandingCopy, type LandingT } from './copy';
 import styles from './LandingPage.module.css';
+import ThemeSwitcher from '@/components/ThemeSwitcher';
 
 interface LandingPageProps {
   siteName: string;
@@ -438,6 +439,7 @@ export default function LandingPage({
           </div>
 
           <div className={styles.navActions}>
+            <ThemeSwitcher variant="button" className={styles.themeToggle} />
             <button
               type="button"
               className={styles.langToggle}

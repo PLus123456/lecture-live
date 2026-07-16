@@ -10,8 +10,9 @@ import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { useI18n } from '@/lib/i18n';
 import { UI_LOCALE_OPTIONS, type Locale } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
-import { Settings, Globe, Cpu, Mic, Lock, Tags, Scissors, Languages, X } from 'lucide-react';
+import { Settings, Globe, Cpu, Mic, Lock, Tags, Scissors, Languages, Palette, X } from 'lucide-react';
 import type { ChatModelOption, ChatModelsResponse } from '@/types/llm';
+import ThemeSwitcher from '@/components/ThemeSwitcher';
 
 function clampNumber(value: string, fallback: number, min: number, max: number) {
   const parsed = Number.parseInt(value, 10);
@@ -233,6 +234,18 @@ export default function UserSettingsModal() {
                 </div>
               </div>
             )}
+          </section>
+
+          {/* 外观 */}
+          <section className="bg-white rounded-xl border border-cream-200 p-5">
+            <h3 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-2">
+              <Palette className="w-4 h-4 text-rust-500" />
+              {t('settings.appearance')}
+            </h3>
+            <p className="mb-4 text-[11px] leading-relaxed text-charcoal-400">
+              {t('settings.appearanceDesc')}
+            </p>
+            <ThemeSwitcher variant="segmented" />
           </section>
 
           {/* 界面语言 */}

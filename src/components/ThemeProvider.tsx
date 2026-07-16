@@ -6,7 +6,7 @@
 
 import { createContext, useContext, useEffect, useState, useCallback } from 'react';
 
-type Theme = 'light' | 'dark' | 'system';
+export type Theme = 'light' | 'dark' | 'system';
 
 interface ThemeContextValue {
   theme: Theme;
@@ -49,8 +49,10 @@ export default function ThemeProvider({
   children: React.ReactNode;
   defaultTheme?: Theme;
 }) {
-  const [theme, setThemeState] = useState<Theme>('system');
-  const [resolvedTheme, setResolvedTheme] = useState<'light' | 'dark'>('light');
+  const [theme, setThemeState] = useState<Theme>(defaultTheme);
+  const [resolvedTheme, setResolvedTheme] = useState<'light' | 'dark'>(
+    defaultTheme === 'system' ? 'light' : defaultTheme
+  );
 
   // 应用主题到 <html> 元素
   const applyTheme = useCallback((t: Theme) => {
@@ -58,11 +60,14 @@ export default function ThemeProvider({
     setResolvedTheme(resolved);
 
     const root = document.documentElement;
-    if (resolved === 'dark') {
-      root.classList.add('dark');
-    } else {
-      root.classList.remove('dark');
-    }
+    root.classList.remove('light', 'dark');
+    root.classList.add(resolved);
+    root.dataset.theme = resolved;
+    root.style.colorScheme = resolved;
+
+    // 同步移动端浏览器工具栏颜色，避免深色页面顶部仍出现亮色闪块。
+    const themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+    themeColor?.setAttribute('content', resolved === 'dark' ? '#100E0D' : '#FDFCFA');
   }, []);
 
   // 初始化：从 localStorage 读取偏好

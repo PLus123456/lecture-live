@@ -2427,7 +2427,7 @@ export default function PlaybackPage() {
                   }}
                   className="playback-volume-slider w-20"
                   style={{
-                    background: `linear-gradient(to right, #C44B20 0%, #C44B20 ${(muted ? 0 : volume) * 100}%, #E8DFD0 ${(muted ? 0 : volume) * 100}%, #E8DFD0 100%)`,
+                    background: `linear-gradient(to right, var(--theme-accent) 0%, var(--theme-accent) ${(muted ? 0 : volume) * 100}%, var(--theme-track) ${(muted ? 0 : volume) * 100}%, var(--theme-track) 100%)`,
                   }}
                   aria-label={t('common.volume')}
                 />

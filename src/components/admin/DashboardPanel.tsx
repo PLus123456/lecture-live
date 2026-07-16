@@ -226,7 +226,7 @@ function ActivityRow({
               {v > 0 && (
                 <span
                   className="text-[10px] font-semibold tabular-nums"
-                  style={{ color: intensity > 0.5 ? 'white' : '#3a3a3a' }}
+                  style={{ color: intensity > 0.5 ? 'white' : 'var(--theme-chart-label)' }}
                 >
                   {v}
                 </span>
@@ -396,11 +396,11 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
               y1={toY(v)}
               x2={W - padR}
               y2={toY(v)}
-              stroke="#e8e2d9"
+              stroke="var(--theme-chart-grid)"
               strokeWidth={1}
               strokeDasharray="4 3"
             />
-            <text x={padL - 8} y={toY(v) + 4} textAnchor="end" fontSize={11} fill="#b0a89e">
+            <text x={padL - 8} y={toY(v) + 4} textAnchor="end" fontSize={11} fill="var(--theme-chart-axis)">
               {v}
             </text>
           </g>
@@ -433,7 +433,7 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
               y={H - 6}
               textAnchor="middle"
               fontSize={11}
-              fill="#b0a89e"
+              fill="var(--theme-chart-axis)"
             >
               {d.date.slice(5)}
             </text>
@@ -447,7 +447,7 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
             y1={padT}
             x2={tooltip.x}
             y2={padT + chartH}
-            stroke="#c4b9ac"
+            stroke="var(--theme-border-strong)"
             strokeWidth={1}
             strokeDasharray="4 2"
           />
@@ -462,7 +462,7 @@ function CombinedTrendChart({ data, t }: { data: DailyStats[]; t: ReturnType<typ
               cy={seriesPoints[si][tooltip.index].y}
               r={5}
               fill={s.color}
-              stroke="white"
+              stroke="var(--theme-surface)"
               strokeWidth={2}
             />
           ))}
@@ -591,7 +591,7 @@ function Distribution3DBars({
                   y1={y}
                   x2={padL + chartW + depth}
                   y2={y - depth}
-                  stroke="#e2dac9"
+                  stroke="var(--theme-chart-grid)"
                   strokeWidth={1}
                   strokeDasharray="2 3"
                 />
@@ -667,7 +667,7 @@ function Distribution3DBars({
                     textAnchor="middle"
                     fontSize={11}
                     fontWeight={600}
-                    fill="#5a4f43"
+                    fill="var(--theme-chart-label)"
                     style={{ animation: `barRise 700ms cubic-bezier(0.25, 1, 0.4, 1) ${i * 100 + 200}ms backwards` }}
                   >
                     {it.value.toLocaleString()}
@@ -680,7 +680,7 @@ function Distribution3DBars({
                   y={H - 14}
                   textAnchor="middle"
                   fontSize={10}
-                  fill="#9c8e7d"
+                  fill="var(--theme-chart-label-muted)"
                 >
                   {it.label.length > 6 ? it.label.slice(0, 5) + '…' : it.label}
                 </text>
@@ -868,9 +868,9 @@ export default function DashboardPanel() {
   );
 
   const KPI_BG: Record<SeriesKey, string> = {
-    newUsers: '#e8e0d4',
-    recordings: '#f0ddd0',
-    shares: '#d9e4d6',
+    newUsers: 'var(--tone-blue-bg-strong)',
+    recordings: 'var(--tone-amber-bg-strong)',
+    shares: 'var(--tone-green-bg-strong)',
   };
 
   return (
@@ -931,8 +931,8 @@ export default function DashboardPanel() {
             delta={null}
             deltaLabel=""
             spark={[]}
-            color="#9a7a64"
-            bg="#e4d8cf"
+            color="var(--theme-chart-label-muted)"
+            bg="var(--theme-surface-hover)"
             loading={loading}
           />
         </div>

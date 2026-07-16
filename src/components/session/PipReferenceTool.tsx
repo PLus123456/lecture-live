@@ -6,6 +6,7 @@ import { useTranscriptStore } from '@/stores/transcriptStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useI18n } from '@/lib/i18n';
+import { useTheme } from '@/components/ThemeProvider';
 
 const LANG_NAMES: Record<string, string> = {
   en: 'English', zh: 'Chinese', ja: 'Japanese', ko: 'Korean',
@@ -191,9 +192,12 @@ function getPreferredPipStrategy(): {
 /**
  * 初始化弹出窗口的 DOM：注入样式 + 创建挂载点
  */
-function bootstrapPipWindow(win: Window, title: string) {
+function bootstrapPipWindow(win: Window, title: string, theme: 'light' | 'dark') {
   // 设置标题
   win.document.title = title;
+  win.document.documentElement.classList.remove('light', 'dark');
+  win.document.documentElement.classList.add(theme);
+  win.document.documentElement.style.colorScheme = theme;
 
   // 注入样式
   const style = win.document.createElement('style');
@@ -217,6 +221,7 @@ function bootstrapPipWindow(win: Window, title: string) {
  */
 export function usePipReferenceTool() {
   const { t } = useI18n();
+  const { resolvedTheme } = useTheme();
   const [pipWindow, setPipWindow] = useState<Window | null>(null);
   const [isOpen, setIsOpen] = useState(false);
   const [pinned, setPinned] = useState(true);
@@ -249,7 +254,7 @@ export function usePipReferenceTool() {
         preferInitialWindowPlacement: true,
       });
 
-      bootstrapPipWindow(pip, t('pipTool.windowTitle'));
+      bootstrapPipWindow(pip, t('pipTool.windowTitle'), resolvedTheme);
       pip.addEventListener('pagehide', handleWindowClosed);
 
       try { pip.focus(); } catch { /* ignore */ }
@@ -269,7 +274,7 @@ export function usePipReferenceTool() {
       });
       return false;
     }
-  }, [handleWindowClosed, t]);
+  }, [handleWindowClosed, resolvedTheme, t]);
 
   // ── Video PiP 路径（Safari）──
   const openVideoPip = useCallback(async (): Promise<boolean> => {
@@ -353,6 +358,18 @@ export function usePipReferenceTool() {
     };
   }, [pipWindow]);
 
+  // 主题切换时，同步已打开的独立 Document PiP 窗口。
+  useEffect(() => {
+    if (!pipWindow || pipWindow.closed) return;
+    try {
+      pipWindow.document.documentElement.classList.remove('light', 'dark');
+      pipWindow.document.documentElement.classList.add(resolvedTheme);
+      pipWindow.document.documentElement.style.colorScheme = resolvedTheme;
+    } catch {
+      // 窗口关闭过程中的短暂访问失败可安全忽略。
+    }
+  }, [pipWindow, resolvedTheme]);
+
   return { pipWindow, isOpen, pinned, setPinned, mode, open, close, toggle, videoPipUpdate: videoPip.updateData };
 }
 
@@ -363,7 +380,8 @@ export function usePipReferenceTool() {
 // ═══════════════════════════════════════════════════════════════════════
 
 /** 设计色板 — 与 PIP_STYLES 完全一致 */
-const COLORS = {
+const LIGHT_COLORS = {
+  page: '#f5f0eb',
   bg: '#fffdf9',
   border: '#e8dfd6',
   headerBorder: '#ede6dd',
@@ -376,6 +394,21 @@ const COLORS = {
   footerBg: '#fffdf9',
   iconBg: '#f5ede5',
 } as const;
+
+const DARK_COLORS: Record<keyof typeof LIGHT_COLORS, string> = {
+  page: '#100e0d',
+  bg: '#191512',
+  border: '#3a312c',
+  headerBorder: '#302923',
+  rust: '#f08c63',
+  charcoal: '#f8f3eb',
+  charcoalLight: '#c9bcaa',
+  muted: '#786f67',
+  mutedLight: '#a99f93',
+  divider: '#302923',
+  footerBg: '#191512',
+  iconBg: '#2a2420',
+};
 
 const FONT_FAMILY = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
 
@@ -410,6 +443,7 @@ function wrapText(
 
 /** Canvas 渲染数据（labels 由外部经 i18n 翻译后传入 —— 模块级函数拿不到 hook） */
 interface PipCanvasData {
+  theme: 'light' | 'dark';
   srcName: string;
   tgtName: string;
   recentSourceText: string;
@@ -428,6 +462,7 @@ interface PipCanvasData {
  * 系统级视频 PiP 收不到点击，画假按钮只会误导用户）
  */
 function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
+  const colors = data.theme === 'dark' ? DARK_COLORS : LIGHT_COLORS;
   const dpr = window.devicePixelRatio || 2;
   const w = PIP_WIDTH;
   const h = PIP_HEIGHT;
@@ -452,15 +487,15 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
   const innerH = h - margin * 2;
 
   // ── 背景 ──
-  ctx.fillStyle = '#f5f0eb';
+  ctx.fillStyle = colors.page;
   ctx.fillRect(0, 0, w, h);
 
   // ── 圆角容器 ──
   ctx.beginPath();
   roundRectPath(ctx, innerX, innerY, innerW, innerH, radius);
-  ctx.fillStyle = COLORS.bg;
+  ctx.fillStyle = colors.bg;
   ctx.fill();
-  ctx.strokeStyle = COLORS.border;
+  ctx.strokeStyle = colors.border;
   ctx.lineWidth = 1;
   ctx.stroke();
 
@@ -476,13 +511,13 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
   ctx.beginPath();
   ctx.moveTo(innerX, headerY + headerH);
   ctx.lineTo(innerX + innerW, headerY + headerH);
-  ctx.strokeStyle = COLORS.headerBorder;
+  ctx.strokeStyle = colors.headerBorder;
   ctx.lineWidth = 1;
   ctx.stroke();
 
   // Header 图标（翻译图标 — 简化绘制为文字替代）
   const headerCenterY = headerY + headerH / 2;
-  ctx.fillStyle = COLORS.rust;
+  ctx.fillStyle = colors.rust;
   ctx.font = `bold 14px ${FONT_FAMILY}`;
   ctx.textBaseline = 'middle';
   // 小翻译图标用文字 "文A" 模拟
@@ -490,7 +525,7 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
   ctx.fillText('文A', contentX, headerCenterY);
 
   // Header 标题
-  ctx.fillStyle = COLORS.rust;
+  ctx.fillStyle = colors.rust;
   ctx.font = `700 11px ${FONT_FAMILY}`;
   ctx.letterSpacing = '0.08em';
   ctx.fillText(data.labels.title.toUpperCase(), contentX + 28, headerCenterY);
@@ -503,7 +538,7 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
 
   if (!data.recentSourceText && !data.recentTargetText) {
     // 空状态
-    ctx.fillStyle = COLORS.muted;
+    ctx.fillStyle = colors.muted;
     ctx.font = `italic 13px ${FONT_FAMILY}`;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'center';
@@ -530,7 +565,7 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
   let cursorY = contentTop;
 
   // 源语言标签
-  ctx.fillStyle = COLORS.charcoalLight;
+  ctx.fillStyle = colors.charcoalLight;
   ctx.font = `700 9px ${FONT_FAMILY}`;
   ctx.textBaseline = 'top';
   ctx.letterSpacing = '0.1em';
@@ -544,7 +579,7 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
   ctx.rect(contentX, cursorY, contentW, srcAreaH - 15);
   ctx.clip();
 
-  ctx.fillStyle = COLORS.charcoalLight;
+  ctx.fillStyle = colors.charcoalLight;
   ctx.font = `400 12px/${1.55} ${FONT_FAMILY}`;
   ctx.font = `400 12px ${FONT_FAMILY}`;
   const srcLines = wrapText(ctx, data.recentSourceText, contentW);
@@ -574,7 +609,7 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
   ctx.beginPath();
   ctx.moveTo(contentX, dividerY);
   ctx.lineTo(contentX + contentW, dividerY);
-  ctx.strokeStyle = COLORS.divider;
+  ctx.strokeStyle = colors.divider;
   ctx.lineWidth = 1;
   ctx.stroke();
 
@@ -582,7 +617,7 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
   const tgtStartY = dividerY + 7;
 
   // 目标语言标签
-  ctx.fillStyle = COLORS.rust;
+  ctx.fillStyle = colors.rust;
   ctx.font = `700 9px ${FONT_FAMILY}`;
   ctx.textBaseline = 'top';
   ctx.letterSpacing = '0.1em';
@@ -597,7 +632,7 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
   ctx.clip();
 
   if (data.recentTargetText) {
-    ctx.fillStyle = COLORS.rust;
+    ctx.fillStyle = colors.rust;
     ctx.font = `500 17px ${FONT_FAMILY}`;
     const tgtLines = wrapText(ctx, data.recentTargetText, contentW);
     const tgtLineH = 17 * 1.5;
@@ -616,7 +651,7 @@ function renderPipCanvas(canvas: HTMLCanvasElement, data: PipCanvasData) {
     }
     ctx.globalAlpha = 1;
   } else {
-    ctx.fillStyle = COLORS.muted;
+    ctx.fillStyle = colors.muted;
     ctx.font = `italic 400 17px ${FONT_FAMILY}`;
     ctx.fillText(data.labels.translating, contentX, tgtTextY);
   }
@@ -630,6 +665,7 @@ const DRAW_MIN_INTERVAL_MS = 100;
 const CAPTURE_FPS = 30;
 
 const EMPTY_PIP_DATA: PipCanvasData = {
+  theme: 'light',
   srcName: '',
   tgtName: '',
   recentSourceText: '',
@@ -1175,11 +1211,12 @@ export function InlinePipPanel({
  * 从 Zustand store 读取转录/翻译数据并推送到 Canvas 渲染器
  */
 export function VideoPipBridge({ updateData }: { updateData: (data: PipCanvasData) => void }) {
+  const { resolvedTheme } = useTheme();
   const { srcName, tgtName, recentSourceText, recentTargetText, hasTranslation, labels } = usePipContentData();
 
   useEffect(() => {
-    updateData({ srcName, tgtName, recentSourceText, recentTargetText, hasTranslation, labels });
-  }, [srcName, tgtName, recentSourceText, recentTargetText, hasTranslation, labels, updateData]);
+    updateData({ theme: resolvedTheme, srcName, tgtName, recentSourceText, recentTargetText, hasTranslation, labels });
+  }, [resolvedTheme, srcName, tgtName, recentSourceText, recentTargetText, hasTranslation, labels, updateData]);
 
   return null; // 纯数据桥接，不渲染任何 DOM
 }
@@ -1187,19 +1224,47 @@ export function VideoPipBridge({ updateData }: { updateData: (data: PipCanvasDat
 /** PiP 窗口内的样式 — 与截图参考风格一致，兼容所有浏览器 */
 const PIP_STYLES = `
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --pip-page: #f5f0eb;
+    --pip-surface: #fffdf9;
+    --pip-border: #e8dfd6;
+    --pip-divider: #ede6dd;
+    --pip-accent: #9b4e2c;
+    --pip-text: #3d3631;
+    --pip-text-secondary: #6b5d52;
+    --pip-text-muted: #b8ada2;
+    --pip-icon-muted: #a09388;
+    --pip-hover: #f0e8df;
+    --pip-accent-soft: #f5ede5;
+    --pip-scrollbar: #d9d0c6;
+  }
+  html.dark {
+    --pip-page: #100e0d;
+    --pip-surface: #191512;
+    --pip-border: #3a312c;
+    --pip-divider: #302923;
+    --pip-accent: #f08c63;
+    --pip-text: #f8f3eb;
+    --pip-text-secondary: #c9bcaa;
+    --pip-text-muted: #786f67;
+    --pip-icon-muted: #a99f93;
+    --pip-hover: #2a2420;
+    --pip-accent-soft: rgba(196, 75, 32, 0.18);
+    --pip-scrollbar: #514841;
+  }
   html, body { height: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #f5f0eb;
-    color: #3d3631;
+    background: var(--pip-page);
+    color: var(--pip-text);
     overflow: hidden;
   }
   #pip-root { display: flex; flex-direction: column; height: 100vh; }
 
   .pip-container {
     display: flex; flex-direction: column; height: 100%;
-    background: #fffdf9;
-    border: 1px solid #e8dfd6;
+    background: var(--pip-surface);
+    border: 1px solid var(--pip-border);
     border-radius: 12px;
     margin: 6px;
     overflow: hidden;
@@ -1210,23 +1275,23 @@ const PIP_STYLES = `
   .pip-header {
     display: flex; align-items: center; justify-content: space-between;
     padding: 10px 14px;
-    border-bottom: 1px solid #ede6dd;
+    border-bottom: 1px solid var(--pip-divider);
     flex-shrink: 0;
   }
   .pip-header-left { display: flex; align-items: center; gap: 8px; }
-  .pip-icon { width: 16px; height: 16px; color: #9b4e2c; }
+  .pip-icon { width: 16px; height: 16px; color: var(--pip-accent); }
   .pip-title {
     font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
-    color: #9b4e2c; text-transform: uppercase;
+    color: var(--pip-accent); text-transform: uppercase;
   }
   .pip-header-right { display: flex; align-items: center; gap: 4px; }
   .pip-pin-btn, .pip-close-btn {
     width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
-    border: none; background: transparent; color: #a09388; cursor: pointer;
+    border: none; background: transparent; color: var(--pip-icon-muted); cursor: pointer;
     border-radius: 6px; transition: all 0.15s;
   }
-  .pip-pin-btn:hover, .pip-close-btn:hover { background: #f0e8df; color: #6b5d52; }
-  .pip-pin-btn.pinned { color: #9b4e2c; }
+  .pip-pin-btn:hover, .pip-close-btn:hover { background: var(--pip-hover); color: var(--pip-text-secondary); }
+  .pip-pin-btn.pinned { color: var(--pip-accent); }
 
   /* 流式内容区 */
   .pip-stream-content {
@@ -1236,7 +1301,7 @@ const PIP_STYLES = `
 
   .pip-empty {
     height: 100%; display: flex; align-items: center; justify-content: center;
-    color: #b8ada2; font-size: 13px; font-style: italic;
+    color: var(--pip-text-muted); font-size: 13px; font-style: italic;
   }
 
   /* 语言分区 */
@@ -1250,8 +1315,8 @@ const PIP_STYLES = `
     font-size: 9px; font-weight: 700; letter-spacing: 0.1em;
     text-transform: uppercase; margin-bottom: 4px; flex-shrink: 0;
   }
-  .pip-source-label { color: #6b5d52; }
-  .pip-target-label { color: #9b4e2c; }
+  .pip-source-label { color: var(--pip-text-secondary); }
+  .pip-target-label { color: var(--pip-accent); }
 
   /* 文本滚动容器 — 只显示最新 3-4 行，溢出后自动滚到底部 */
   .pip-lang-text-wrap {
@@ -1260,24 +1325,24 @@ const PIP_STYLES = `
     -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 100%);
   }
   .pip-lang-text-wrap::-webkit-scrollbar { width: 3px; }
-  .pip-lang-text-wrap::-webkit-scrollbar-thumb { background: #d9d0c6; border-radius: 3px; }
-  .pip-lang-text-wrap { scrollbar-width: thin; scrollbar-color: #d9d0c6 transparent; }
+  .pip-lang-text-wrap::-webkit-scrollbar-thumb { background: var(--pip-scrollbar); border-radius: 3px; }
+  .pip-lang-text-wrap { scrollbar-width: thin; scrollbar-color: var(--pip-scrollbar) transparent; }
 
   .pip-source-text {
-    font-size: 12px; line-height: 1.55; color: #6b5d52;
+    font-size: 12px; line-height: 1.55; color: var(--pip-text-secondary);
     margin: 0;
   }
 
   .pip-target-text {
-    font-size: 17px; line-height: 1.5; color: #9b4e2c;
+    font-size: 17px; line-height: 1.5; color: var(--pip-accent);
     font-weight: 500; margin: 0;
   }
   .pip-target-text.translating {
-    color: #b8ada2; font-style: italic; font-weight: 400;
+    color: var(--pip-text-muted); font-style: italic; font-weight: 400;
   }
 
   .pip-divider {
-    height: 1px; background: #ede6dd; flex-shrink: 0;
+    height: 1px; background: var(--pip-divider); flex-shrink: 0;
     margin: 6px 0;
   }
 
@@ -1285,7 +1350,7 @@ const PIP_STYLES = `
   .pip-footer {
     display: flex; justify-content: flex-end; gap: 6px;
     padding: 8px 14px;
-    border-top: 1px solid #ede6dd;
+    border-top: 1px solid var(--pip-divider);
     flex-shrink: 0;
   }
   .pip-footer-btn {
@@ -1293,10 +1358,10 @@ const PIP_STYLES = `
     padding: 5px 10px; border-radius: 6px;
     border: none; background: transparent;
     font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
-    color: #9b4e2c; cursor: pointer; text-transform: uppercase;
+    color: var(--pip-accent); cursor: pointer; text-transform: uppercase;
     transition: background 0.15s;
   }
-  .pip-footer-btn:hover { background: #f5ede5; }
+  .pip-footer-btn:hover { background: var(--pip-accent-soft); }
 `;
 
 /** 页内悬浮面板样式 — 所有选择器 scope 到 .pip-inline-panel 下 */
@@ -1307,39 +1372,64 @@ const INLINE_PIP_STYLES = `
   }
 
   .pip-inline-panel {
+    --pip-surface: #fffdf9;
+    --pip-border: #e8dfd6;
+    --pip-divider: #ede6dd;
+    --pip-accent: #9b4e2c;
+    --pip-text: #3d3631;
+    --pip-text-secondary: #6b5d52;
+    --pip-text-muted: #b8ada2;
+    --pip-icon-muted: #a09388;
+    --pip-hover: #f0e8df;
+    --pip-accent-soft: #f5ede5;
+    --pip-scrollbar: #d9d0c6;
     display: flex; flex-direction: column;
-    background: #fffdf9;
-    border: 1px solid #e8dfd6;
+    background: var(--pip-surface);
+    border: 1px solid var(--pip-border);
     border-radius: 12px;
     overflow: hidden;
     box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.08);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    color: #3d3631;
+    color: var(--pip-text);
     animation: pipPanelIn 0.2s ease-out;
+  }
+
+  html.dark .pip-inline-panel {
+    --pip-surface: #191512;
+    --pip-border: #3a312c;
+    --pip-divider: #302923;
+    --pip-accent: #f08c63;
+    --pip-text: #f8f3eb;
+    --pip-text-secondary: #c9bcaa;
+    --pip-text-muted: #786f67;
+    --pip-icon-muted: #a99f93;
+    --pip-hover: #2a2420;
+    --pip-accent-soft: rgba(196, 75, 32, 0.18);
+    --pip-scrollbar: #514841;
   }
 
   .pip-inline-panel .pip-header {
     display: flex; align-items: center; justify-content: space-between;
     padding: 10px 14px;
-    border-bottom: 1px solid #ede6dd;
+    border-bottom: 1px solid var(--pip-divider);
     flex-shrink: 0;
   }
   .pip-inline-panel .pip-header-left { display: flex; align-items: center; gap: 8px; }
-  .pip-inline-panel .pip-icon { width: 16px; height: 16px; color: #9b4e2c; }
+  .pip-inline-panel .pip-icon { width: 16px; height: 16px; color: var(--pip-accent); }
   .pip-inline-panel .pip-title {
     font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
-    color: #9b4e2c; text-transform: uppercase;
+    color: var(--pip-accent); text-transform: uppercase;
   }
   .pip-inline-panel .pip-header-right { display: flex; align-items: center; gap: 4px; }
   .pip-inline-panel .pip-pin-btn,
   .pip-inline-panel .pip-close-btn {
     width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
-    border: none; background: transparent; color: #a09388; cursor: pointer;
+    border: none; background: transparent; color: var(--pip-icon-muted); cursor: pointer;
     border-radius: 6px; transition: all 0.15s;
   }
   .pip-inline-panel .pip-pin-btn:hover,
-  .pip-inline-panel .pip-close-btn:hover { background: #f0e8df; color: #6b5d52; }
-  .pip-inline-panel .pip-pin-btn.pinned { color: #9b4e2c; }
+  .pip-inline-panel .pip-close-btn:hover { background: var(--pip-hover); color: var(--pip-text-secondary); }
+  .pip-inline-panel .pip-pin-btn.pinned { color: var(--pip-accent); }
 
   .pip-inline-panel .pip-stream-content {
     flex: 1; display: flex; flex-direction: column;
@@ -1348,7 +1438,7 @@ const INLINE_PIP_STYLES = `
 
   .pip-inline-panel .pip-empty {
     height: 100%; display: flex; align-items: center; justify-content: center;
-    color: #b8ada2; font-size: 13px; font-style: italic;
+    color: var(--pip-text-muted); font-size: 13px; font-style: italic;
   }
 
   .pip-inline-panel .pip-lang-section {
@@ -1361,8 +1451,8 @@ const INLINE_PIP_STYLES = `
     font-size: 9px; font-weight: 700; letter-spacing: 0.1em;
     text-transform: uppercase; margin-bottom: 4px; flex-shrink: 0;
   }
-  .pip-inline-panel .pip-source-label { color: #6b5d52; }
-  .pip-inline-panel .pip-target-label { color: #9b4e2c; }
+  .pip-inline-panel .pip-source-label { color: var(--pip-text-secondary); }
+  .pip-inline-panel .pip-target-label { color: var(--pip-accent); }
 
   .pip-inline-panel .pip-lang-text-wrap {
     flex: 1; overflow-y: auto; scroll-behavior: smooth;
@@ -1370,30 +1460,30 @@ const INLINE_PIP_STYLES = `
     -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 100%);
   }
   .pip-inline-panel .pip-lang-text-wrap::-webkit-scrollbar { width: 3px; }
-  .pip-inline-panel .pip-lang-text-wrap::-webkit-scrollbar-thumb { background: #d9d0c6; border-radius: 3px; }
+  .pip-inline-panel .pip-lang-text-wrap::-webkit-scrollbar-thumb { background: var(--pip-scrollbar); border-radius: 3px; }
 
   .pip-inline-panel .pip-source-text {
-    font-size: 12px; line-height: 1.55; color: #6b5d52;
+    font-size: 12px; line-height: 1.55; color: var(--pip-text-secondary);
     margin: 0;
   }
 
   .pip-inline-panel .pip-target-text {
-    font-size: 17px; line-height: 1.5; color: #9b4e2c;
+    font-size: 17px; line-height: 1.5; color: var(--pip-accent);
     font-weight: 500; margin: 0;
   }
   .pip-inline-panel .pip-target-text.translating {
-    color: #b8ada2; font-style: italic; font-weight: 400;
+    color: var(--pip-text-muted); font-style: italic; font-weight: 400;
   }
 
   .pip-inline-panel .pip-divider {
-    height: 1px; background: #ede6dd; flex-shrink: 0;
+    height: 1px; background: var(--pip-divider); flex-shrink: 0;
     margin: 6px 0;
   }
 
   .pip-inline-panel .pip-footer {
     display: flex; justify-content: flex-end; gap: 6px;
     padding: 8px 14px;
-    border-top: 1px solid #ede6dd;
+    border-top: 1px solid var(--pip-divider);
     flex-shrink: 0;
   }
   .pip-inline-panel .pip-footer-btn {
@@ -1401,8 +1491,8 @@ const INLINE_PIP_STYLES = `
     padding: 5px 10px; border-radius: 6px;
     border: none; background: transparent;
     font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
-    color: #9b4e2c; cursor: pointer; text-transform: uppercase;
+    color: var(--pip-accent); cursor: pointer; text-transform: uppercase;
     transition: background 0.15s;
   }
-  .pip-inline-panel .pip-footer-btn:hover { background: #f5ede5; }
+  .pip-inline-panel .pip-footer-btn:hover { background: var(--pip-accent-soft); }
 `;

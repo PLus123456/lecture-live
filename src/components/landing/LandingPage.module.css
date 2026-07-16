@@ -535,6 +535,22 @@
   transition: color 0.2s ease, background 0.2s ease, border-color 0.2s ease;
 }
 
+.themeToggle {
+  width: 42px;
+  height: 42px;
+  border-color: var(--ll-border);
+  border-radius: 11px;
+  background: transparent;
+  color: rgba(var(--ll-ink-rgb), 0.66);
+  box-shadow: none;
+}
+
+.themeToggle:hover {
+  border-color: var(--ll-border-strong);
+  background: rgba(var(--ll-ink-rgb), 0.06);
+  color: var(--ll-text);
+}
+
 .langToggle:hover {
   border-color: var(--ll-border-strong);
   background: rgba(var(--ll-ink-rgb), 0.06);
@@ -3893,4 +3909,3 @@
     width: calc(100% - 28px);
   }
 }
-

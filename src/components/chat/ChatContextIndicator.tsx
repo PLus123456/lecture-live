@@ -13,10 +13,10 @@ import { useExitAnimation } from '@/hooks/useExitAnimation';
 import type { ChatTokenUsage } from '@/stores/chatStore';
 
 function getRingColor(percent: number, contextFull: boolean): { stroke: string } {
-  if (contextFull) return { stroke: '#7c3aed' }; // 紫：RAG/EOL
-  if (percent < 0.6) return { stroke: '#059669' };
-  if (percent < 0.85) return { stroke: '#d97706' };
-  return { stroke: '#dc2626' };
+  if (contextFull) return { stroke: 'var(--tone-purple-fg)' }; // 紫：RAG/EOL
+  if (percent < 0.6) return { stroke: 'var(--tone-green-fg)' };
+  if (percent < 0.85) return { stroke: 'var(--tone-amber-fg)' };
+  return { stroke: 'var(--tone-red-fg)' };
 }
 
 function BreakdownRow({ label, value }: { label: string; value: number }) {
@@ -80,7 +80,7 @@ export default function ChatContextIndicator({
                    hover:bg-cream-100 transition-colors"
       >
         <svg viewBox="0 0 24 24" className="w-5 h-5 -rotate-90">
-          <circle cx="12" cy="12" r={radius} fill="none" stroke="#e5e7eb" strokeWidth="2" />
+          <circle cx="12" cy="12" r={radius} fill="none" stroke="var(--theme-track)" strokeWidth="2" />
           <circle
             cx="12"
             cy="12"

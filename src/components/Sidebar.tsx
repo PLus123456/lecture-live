@@ -21,6 +21,7 @@ import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
 import { formatBytes } from '@/lib/format';
+import ThemeSwitcher from '@/components/ThemeSwitcher';
 
 /**
  * slideOut：dashboard layout 在进入对话区（/chat、/conversations）时传 true，
@@ -241,6 +242,7 @@ export default function Sidebar({ slideOut = false }: { slideOut?: boolean }) {
           </button>
           {/* 设置 & 登出靠右，收起后隐藏 */}
           <div className={`flex items-center gap-1 transition-opacity duration-300 ${sidebarCollapsed ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
+            <ThemeSwitcher variant="button" className="border-transparent shadow-none" />
             <button
               onClick={() => useSettingsStore.getState().setUserSettingsOpen(true)}
               className="w-9 h-9 rounded-lg flex items-center justify-center

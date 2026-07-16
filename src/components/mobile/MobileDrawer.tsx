@@ -8,6 +8,7 @@ import {
   Settings,
   ShieldCheck,
   User,
+  Palette,
   X,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
@@ -16,6 +17,7 @@ import { useSettingsStore } from '@/stores/settingsStore';
 import { useI18n } from '@/lib/i18n';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
 import { useExitAnimation } from '@/hooks/useExitAnimation';
+import ThemeSwitcher from '@/components/ThemeSwitcher';
 
 interface MobileDrawerProps {
   open: boolean;
@@ -150,6 +152,19 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
               />
             </div>
             <p className="mt-2 text-xs text-charcoal-400">{quotaLabel}</p>
+          </section>
+
+          <section className="mt-3 flex items-center justify-between rounded-2xl border border-cream-200 bg-white px-4 py-3">
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-rust-50 text-rust-500">
+                <Palette className="h-4 w-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-charcoal-700">{t('settings.appearance')}</div>
+                <div className="truncate text-[11px] text-charcoal-400">{t('settings.colorTheme')}</div>
+              </div>
+            </div>
+            <ThemeSwitcher variant="button" />
           </section>
 
           <div className="mt-5 space-y-2">

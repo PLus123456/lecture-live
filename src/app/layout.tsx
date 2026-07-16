@@ -10,8 +10,30 @@ export const viewport: Viewport = {
   // 普通手机: maximum-scale=1（防止 iOS 输入框自动缩放）
   // 折叠屏/桌面模式: 不限制（允许缩放适配）
   viewportFit: 'cover',
-  themeColor: '#C75B3A',
+  themeColor: [
+    { media: '(prefers-color-scheme: light)', color: '#FDFCFA' },
+    { media: '(prefers-color-scheme: dark)', color: '#100E0D' },
+  ],
 };
+
+function themeBootstrapScript(defaultTheme: 'light' | 'dark') {
+  return `(() => {
+    try {
+      const stored = localStorage.getItem('lecture-live-theme');
+      const preference = stored === 'light' || stored === 'dark' || stored === 'system'
+        ? stored
+        : '${defaultTheme}';
+      const resolved = preference === 'system'
+        ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+        : preference;
+      const root = document.documentElement;
+      root.classList.remove('light', 'dark');
+      root.classList.add(resolved);
+      root.dataset.theme = resolved;
+      root.style.colorScheme = resolved;
+    } catch (_) {}
+  })();`;
+}
 
 export async function generateMetadata(): Promise<Metadata> {
   const settings = await getSiteSettings().catch(() => null);
@@ -64,7 +86,10 @@ export default async function RootLayout({
   const theme = settings?.theme === 'dark' ? 'dark' : 'light';
 
   return (
-    <html lang={locale} suppressHydrationWarning>
+    <html lang={locale} className={theme} data-theme={theme} suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeBootstrapScript(theme) }} />
+      </head>
       <body>
         <ClientProviders
           defaults={{

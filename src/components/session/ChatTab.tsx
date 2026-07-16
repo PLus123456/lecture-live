@@ -307,10 +307,10 @@ function KeywordSteps({ steps }: { steps: KeywordStep[] }) {
 /* ------------------------------------------------------------------ */
 
 function getRingColor(percent: number, contextFull: boolean): { stroke: string; bg: string; text: string } {
-  if (contextFull) return { stroke: '#7c3aed', bg: '#ede9fe', text: 'text-purple-600' }; // 紫：RAG/EOL
-  if (percent < 0.6) return { stroke: '#059669', bg: '#d1fae5', text: 'text-green-600' };
-  if (percent < 0.85) return { stroke: '#d97706', bg: '#fef3c7', text: 'text-amber-600' };
-  return { stroke: '#dc2626', bg: '#fee2e2', text: 'text-red-600' };
+  if (contextFull) return { stroke: 'var(--tone-purple-fg)', bg: 'var(--tone-purple-bg-strong)', text: 'text-purple-600' }; // 紫：RAG/EOL
+  if (percent < 0.6) return { stroke: 'var(--tone-green-fg)', bg: 'var(--tone-green-bg-strong)', text: 'text-green-600' };
+  if (percent < 0.85) return { stroke: 'var(--tone-amber-fg)', bg: 'var(--tone-amber-bg-strong)', text: 'text-amber-600' };
+  return { stroke: 'var(--tone-red-fg)', bg: 'var(--tone-red-bg-strong)', text: 'text-red-600' };
 }
 
 function ContextRingButton({
@@ -345,7 +345,7 @@ function ContextRingButton({
           cy="12"
           r={radius}
           fill="none"
-          stroke="#e5e7eb"
+          stroke="var(--theme-track)"
           strokeWidth="2"
         />
         <circle

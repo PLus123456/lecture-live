@@ -926,7 +926,8 @@ export default function ActiveSessionPage() {
             sessionStorage.removeItem('lecture-live-translations');
             sessionStorage.removeItem('lecture-live-summary');
           } catch { /* silent */ }
-          setTimeout(() => router.push(`/session/${sessionId}/playback`), 600);
+          // finalized=1：告知回放页刚收尾完成，报告/标题正由后台生成，乐观显示「生成中」并轮询刷新
+          setTimeout(() => router.push(`/session/${sessionId}/playback?finalized=1`), 600);
         } else if (data.status === 'FINALIZING' && !retried) {
           // 可能 finalize 请求被刷新中断 — 超时后自动重试一次
           retried = true;
@@ -1426,7 +1427,8 @@ export default function ActiveSessionPage() {
       }
 
       setTimeout(() => {
-        router.push(`/session/${sessionId}/playback`);
+        // finalized=1：回放页据此乐观显示「报告生成中」并轮询后台任务完成后自动刷新报告/标题
+        router.push(`/session/${sessionId}/playback?finalized=1`);
       }, 800);
     } catch (error) {
       failFinalization(

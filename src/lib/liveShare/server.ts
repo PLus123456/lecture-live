@@ -511,6 +511,111 @@ function createShareErrorHandler(socket: Socket) {
   };
 }
 
+// SHARE-REVOKE-001：观众 token 只在 join 时校验一次，撤销/轮换/过期对已连接
+// socket 原本永久无效。复核间隔是"错过撤销通知（WS 重启、内部请求失败）或链接
+// 自然过期"时被驱逐的最坏延迟；撤销主路径走内部通知即时生效，不依赖这个间隔。
+const VIEWER_REVALIDATE_INTERVAL_MS = 60_000;
+
+const ROOM_PREFIX = 'live:';
+
+interface RevalidateViewersOptions {
+  /**
+   * transition（录制结束转回放）场景静默断开：观众已被主播的 SHARE_OFFLINE 置为
+   * 静态完成态，不发 share_error，避免完成视图被错误页覆盖。撤销/过期则要发，
+   * 让观众明确看到"链接已失效"。两种断开客户端都不会自动重连
+   * （reason = 'io server disconnect'）；就算手动重连，join 也会被重新校验拒绝。
+   */
+  silent?: boolean;
+}
+
+/**
+ * 按 DB 当前状态重新校验某 session 房间里的所有观众，驱逐持失效 token 的 socket。
+ * fail-safe：判定依据只有 DB（isLive + expiresAt + token 归属本 session），与触发
+ * 来源无关——被恶意/重复触发时，合法观众重新校验后原样保留。返回驱逐数。
+ */
+export async function revalidateSessionViewers(
+  io: SocketIO,
+  sessionId: string,
+  options: RevalidateViewersOptions = {}
+): Promise<number> {
+  const roomSockets = await io.in(getRoomId(sessionId)).fetchSockets();
+  const viewers = roomSockets.filter((roomSocket) => !roomSocket.data.isHost);
+  if (viewers.length === 0) {
+    return 0;
+  }
+
+  const tokens = [
+    ...new Set(
+      viewers
+        .map((viewer) =>
+          typeof viewer.data.shareToken === 'string' ? viewer.data.shareToken : null
+        )
+        .filter((token): token is string => Boolean(token))
+    ),
+  ];
+
+  const validLinks = tokens.length
+    ? await prisma.shareLink.findMany({
+        where: {
+          token: { in: tokens },
+          sessionId,
+          isLive: true,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+        },
+        select: { token: true },
+      })
+    : [];
+  const validTokens = new Set(validLinks.map((link) => link.token));
+
+  let evicted = 0;
+  for (const viewer of viewers) {
+    const token = viewer.data.shareToken;
+    if (typeof token === 'string' && validTokens.has(token)) {
+      continue;
+    }
+
+    if (!options.silent) {
+      viewer.emit('share_error', {
+        message: 'Share link revoked',
+        code: 'SHARE_REVOKED',
+      });
+    }
+    viewer.disconnect(true);
+    evicted += 1;
+  }
+
+  if (evicted > 0) {
+    liveShareLogger.info(
+      { sessionId, evicted, silent: Boolean(options.silent) },
+      'Evicted live share viewers with revoked or expired tokens'
+    );
+    await emitViewerCount(io, sessionId).catch(() => undefined);
+  }
+
+  return evicted;
+}
+
+/** 对所有 live 房间跑一遍观众复核（周期兜底用），串行避免 DB 并发尖峰。 */
+export async function revalidateAllLiveRooms(io: SocketIO): Promise<void> {
+  const sessionIds: string[] = [];
+  for (const room of io.sockets.adapter.rooms.keys()) {
+    if (room.startsWith(ROOM_PREFIX)) {
+      sessionIds.push(room.slice(ROOM_PREFIX.length));
+    }
+  }
+
+  for (const sessionId of sessionIds) {
+    try {
+      await revalidateSessionViewers(io, sessionId);
+    } catch (error) {
+      liveShareLogger.warn(
+        { sessionId, err: serializeError(error) },
+        'Periodic live share viewer revalidation failed'
+      );
+    }
+  }
+}
+
 /**
  * 装载实时分享逻辑，返回一个 teardown 函数：清掉 U61 的 TTL 清扫定时器与所有
  * 未决的 host 下线宽限计时，并清空快照 Map。生产环境 setupLiveShare 仅调用一次，
@@ -522,6 +627,13 @@ export function setupLiveShare(io: SocketIO): () => void {
     void sweepStaleSnapshots(io).catch(() => undefined);
   }, SNAPSHOT_SWEEP_INTERVAL_MS);
   sweepTimer.unref?.();
+
+  // SHARE-REVOKE-001：周期复核所有房间的观众 token，兜底"撤销通知丢失/链接自然
+  // 过期"两类没有即时驱逐信号的失效。撤销主路径由内部通知即时触发,不等这个周期。
+  const revalidateTimer = setInterval(() => {
+    void revalidateAllLiveRooms(io).catch(() => undefined);
+  }, VIEWER_REVALIDATE_INTERVAL_MS);
+  revalidateTimer.unref?.();
 
   io.on('connection', async (socket) => {
     const emitError = createShareErrorHandler(socket);
@@ -576,6 +688,9 @@ export function setupLiveShare(io: SocketIO): () => void {
 
         socket.data.isHost = false;
         socket.data.sessionId = sessionId;
+        // SHARE-REVOKE-001：记录观众所持 token，撤销/过期复核时按它重新校验；
+        // 没有这条记录就无法定位"持已撤销 token 的 socket"。
+        socket.data.shareToken = safeToken;
         socket.join(getRoomId(sessionId));
 
         liveShareLogger.info(
@@ -752,6 +867,7 @@ export function setupLiveShare(io: SocketIO): () => void {
 
   return function teardownLiveShare() {
     clearInterval(sweepTimer);
+    clearInterval(revalidateTimer);
     for (const timer of pendingHostOffline.values()) {
       clearTimeout(timer);
     }

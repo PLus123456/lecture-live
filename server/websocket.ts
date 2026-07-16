@@ -4,6 +4,7 @@
 import { createServer } from 'http';
 import { Server as SocketIO, Socket } from 'socket.io';
 import { setupLiveShare } from '../src/lib/liveShare/server';
+import { handleLiveShareInternalRequest } from '../src/lib/liveShare/internalHttp';
 import { getTrustedForwardedIp, shouldTrustProxyHeaders } from '../src/lib/clientIp';
 import {
   startBillingMaintenanceLoop,
@@ -96,7 +97,13 @@ function decrementConnectionCount(ip: string) {
   connectionsByIp.set(ip, nextCount);
 }
 
-const httpServer = createServer();
+// SHARE-REVOKE-001：API 进程的撤销通知走这个 listener。必须在 socket.io attach
+// 之前挂上——engine.io 会接管 'request' 事件，仅把非 /socket.io/ 路径回落给
+// createServer 时已注册的 listener。io 在下方初始化完成后（listen 之前）才可能
+// 收到请求，闭包引用是安全的。
+const httpServer = createServer((req, res) =>
+  handleLiveShareInternalRequest(io, req, res)
+);
 const io = new SocketIO(httpServer, {
   cors: {
     origin: process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000',

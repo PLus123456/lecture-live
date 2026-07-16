@@ -10,6 +10,7 @@ const {
   shareLinkUpdateMock,
   shareLinkCreateMock,
   shareLinkUpdateManyMock,
+  notifyLiveShareLinksRevokedMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   enforceRateLimitMock: vi.fn(),
@@ -19,10 +20,15 @@ const {
   shareLinkUpdateMock: vi.fn(),
   shareLinkCreateMock: vi.fn(),
   shareLinkUpdateManyMock: vi.fn(),
+  notifyLiveShareLinksRevokedMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({
   verifyAuth: verifyAuthMock,
+}));
+
+vi.mock('@/lib/liveShare/revocationNotifier', () => ({
+  notifyLiveShareLinksRevoked: notifyLiveShareLinksRevokedMock,
 }));
 
 vi.mock('@/lib/rateLimit', () => ({
@@ -169,5 +175,35 @@ describe('/api/share/create route', () => {
         expiresAt: expect.any(Date),
       },
     });
+    // SHARE-REVOKE-001：撤销必须同步通知 WS 进程驱逐已连接观众
+    expect(notifyLiveShareLinksRevokedMock).toHaveBeenCalledWith(
+      'session-1',
+      'revoke'
+    );
+  });
+
+  it('keepForPlayback 转回放时以 transition 模式通知 WS 驱逐观众', async () => {
+    shareLinkUpdateManyMock.mockResolvedValue({ count: 1 });
+
+    const response = await DELETE(
+      createJsonRequest('http://localhost:3000/api/share/create', {
+        method: 'DELETE',
+        body: { sessionId: 'session-1', keepForPlayback: true },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(shareLinkUpdateManyMock).toHaveBeenCalledWith({
+      where: {
+        sessionId: 'session-1',
+        createdBy: 'user-1',
+        isLive: true,
+      },
+      data: { isLive: false },
+    });
+    expect(notifyLiveShareLinksRevokedMock).toHaveBeenCalledWith(
+      'session-1',
+      'transition'
+    );
   });
 });

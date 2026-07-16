@@ -655,6 +655,7 @@ export default {
     tabInfo: 'Info',
     loadingReport: 'Loading report...',
     noReport: 'No report available for this session.',
+    reportGeneratingBg: 'Generating summary report — it will appear here automatically…',
     insignificantTitle: 'Recording deemed not significant',
     score: 'Score: {score}%',
     keyConclusions: 'Key Conclusions',

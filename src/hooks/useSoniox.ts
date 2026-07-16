@@ -30,6 +30,9 @@ type RecordingHandle = {
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 1500;
+// R1-L1：临时 key 的 max_session_duration_seconds 到点 Soniox 会硬断连接（丢最后几秒未 final
+// 的字 + 闪断提示）。提前这么多秒主动优雅轮换（重新 mint 接续），把硬断变成平滑切换。
+const ROTATION_LEAD_S = 30;
 // 连接需持续稳定这么久未再断开，才复位重连退避计数。防止断网抖动(连上→秒断→再连)下
 // 每次短暂 WS open 都把计数清零，导致 MAX_RECONNECT_ATTEMPTS 永远到不了、无限重连风暴。
 const STABLE_CONNECTION_MS = 8000;
@@ -69,6 +72,10 @@ export function useSoniox(
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stableConnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // R1-L1：连接寿命轮换定时器 + 轮换实现的 ref 中转（scheduleRotation 需被 attemptReconnect
+  // 引用，而轮换本身要走 attemptReconnect —— 经 ref 解开 useCallback 循环依赖）。
+  const rotationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rotateConnectionRef = useRef<() => void>(() => {});
   const remoteDraftSeqsRef = useRef<Set<number>>(new Set());
   // 分片上传的 429 退避截止时刻(epoch ms)。窗口内一律短路不再撞限流。
   const chunkBackoffUntilRef = useRef(0);
@@ -760,6 +767,12 @@ export function useSoniox(
         reconnectAttemptsRef.current = 0;
       }
 
+      // 连接已死/即将停：寿命轮换随之作废（重连/恢复成功拿到新 key 时会重新 schedule）。
+      if (rotationTimerRef.current) {
+        clearTimeout(rotationTimerRef.current);
+        rotationTimerRef.current = null;
+      }
+
       const current = recordingRef.current;
       recordingRef.current = null;
       runIdRef.current += 1;
@@ -792,6 +805,28 @@ export function useSoniox(
       setRecordingState,
     ]
   );
+
+  // R1-L1：安排连接寿命轮换。key 响应带 max_session_duration_seconds（=本次预扣分钟），到点
+  // Soniox 服务端硬断；提前 ROTATION_LEAD_S 主动轮换。稳定引用（无依赖）：实际轮换经
+  // rotateConnectionRef 中转，可被 attemptReconnect 安全引用而不成环。
+  const scheduleRotation = useCallback((maxSessionSeconds?: number) => {
+    if (rotationTimerRef.current) {
+      clearTimeout(rotationTimerRef.current);
+      rotationTimerRef.current = null;
+    }
+    // 太短的窗口（收缩到只剩 1 分钟的额度尾巴）不轮换：让 Soniox 硬断 + 既有断线重连兜底，
+    // 重连时若额度真耗尽会被 mint 403 拒绝并走重连失败提示。
+    if (!maxSessionSeconds || maxSessionSeconds <= ROTATION_LEAD_S * 2) {
+      return;
+    }
+    rotationTimerRef.current = setTimeout(
+      () => {
+        rotationTimerRef.current = null;
+        rotateConnectionRef.current();
+      },
+      (maxSessionSeconds - ROTATION_LEAD_S) * 1000
+    );
+  }, []);
 
   // 内部重连函数 — 断网后自动尝试重新建立 Soniox 连接
   const attemptReconnect = useCallback(
@@ -958,7 +993,7 @@ export function useSoniox(
               deviceId: sourceType === 'mic' ? selectedMicDeviceId : undefined,
               managedStream,
               regionPreference: settings.sonioxRegionPreference,
-              clientReferenceId: sessionId,
+              attribution: { kind: 'realtime', sessionId },
               onAudioLevel: (level) => {
                 if (level >= audioActivityThreshold) {
                   markAudioActivity();
@@ -977,6 +1012,7 @@ export function useSoniox(
               region: result.temporaryKey.region,
               wsUrl: result.temporaryKey.ws_base_url,
             });
+            scheduleRotation(result.temporaryKey.max_session_duration_seconds);
           }
 
           recordingRef.current = result as {
@@ -1001,6 +1037,7 @@ export function useSoniox(
       markAudioActivity,
       onAutoResume,
       pauseForInterruption,
+      scheduleRotation,
       sessionId,
       setConnectionMeta,
       setConnectionState,
@@ -1010,6 +1047,39 @@ export function useSoniox(
       uploadDraftChunk,
     ]
   );
+
+  // R1-L1：主动寿命轮换。与 pauseForInterruption 同款代际机制：先递增 runId 使旧句柄的
+  // onError/onConnectionChange 全部失效（stop 触发的回调不会误入「断线自动暂停」路径），
+  // 再优雅 stop 旧连接（flush 已缓冲音频的 final token），随即走既有 attemptReconnect 状态机
+  // 重新 mint（新预扣、新 grant）接续转录。归档采集不经 Soniox——轮换期间音频零丢失；转录
+  // 空隙 ~1-2s（重连退避 + 建连），远好于硬断（丢最后 ~5s 未 final 的字 + 中断提示）。
+  const rotateConnection = useCallback(() => {
+    // 仅在录音进行中且句柄健在时轮换；暂停/收尾/断线中（重连状态机已接管）都跳过——那些
+    // 路径恢复时自会重新 mint 并重新 schedule。
+    if (useTranscriptStore.getState().recordingState !== 'recording') {
+      return;
+    }
+    const current = recordingRef.current;
+    if (!current) {
+      return;
+    }
+    recordingRef.current = null;
+    runIdRef.current += 1;
+    void (async () => {
+      try {
+        await current.recording.stop?.();
+      } catch {
+        // 旧句柄回调已失效，stop 失败无副作用（连接反正会被 Soniox 到点断掉）
+      }
+    })();
+    reconnectAttemptsRef.current = 0;
+    shouldReconnectRef.current = true;
+    void attemptReconnect();
+  }, [attemptReconnect]);
+
+  useEffect(() => {
+    rotateConnectionRef.current = rotateConnection;
+  }, [rotateConnection]);
 
   const startNewRecording = useCallback(
     async (startOptions?: {
@@ -1229,7 +1299,7 @@ export function useSoniox(
             deviceId: sourceType === 'mic' ? selectedMicDeviceId : undefined,
             managedStream,
             regionPreference: settings.sonioxRegionPreference,
-            clientReferenceId: sessionId,
+            attribution: { kind: 'realtime', sessionId },
             onAudioLevel: (level) => {
               if (level >= audioActivityThreshold) {
                 markAudioActivity();
@@ -1244,6 +1314,7 @@ export function useSoniox(
             region: result.temporaryKey.region,
             wsUrl: result.temporaryKey.ws_base_url,
           });
+          scheduleRotation(result.temporaryKey.max_session_duration_seconds);
         }
 
         if (runId !== runIdRef.current) {
@@ -1325,6 +1396,7 @@ export function useSoniox(
       setPausedAt,
       setRecordingState,
       negotiateStartSeq,
+      scheduleRotation,
       syncRemoteDraft,
       updateTranscriptionLatency,
       token,
@@ -1454,6 +1526,10 @@ export function useSoniox(
         clearTimeout(stableConnTimerRef.current);
         stableConnTimerRef.current = null;
       }
+      if (rotationTimerRef.current) {
+        clearTimeout(rotationTimerRef.current);
+        rotationTimerRef.current = null;
+      }
 
       // 使在途录音回调失效，防止孤儿实例继续写 store / 上传 chunk
       runIdRef.current += 1;
@@ -1532,6 +1608,10 @@ export function useSoniox(
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
+    }
+    if (rotationTimerRef.current) {
+      clearTimeout(rotationTimerRef.current);
+      rotationTimerRef.current = null;
     }
     cancelStableConn();
     reconnectAttemptsRef.current = 0;
@@ -1618,6 +1698,10 @@ export function useSoniox(
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
     }
+    if (rotationTimerRef.current) {
+      clearTimeout(rotationTimerRef.current);
+      rotationTimerRef.current = null;
+    }
     cancelStableConn();
     reconnectAttemptsRef.current = 0;
     shouldReconnectRef.current = false;
@@ -1679,6 +1763,12 @@ export function useSoniox(
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = null;
+    }
+    // 暂停即撤销寿命轮换：暂停中无音频采集，被 Soniox 到点硬断零损失；恢复时短暂停复用句柄
+    // 靠「硬断→自动重连」兜底、长暂停走重建（新 mint 会重新 schedule）。
+    if (rotationTimerRef.current) {
+      clearTimeout(rotationTimerRef.current);
+      rotationTimerRef.current = null;
     }
     reconnectAttemptsRef.current = 0;
     shouldReconnectRef.current = false;

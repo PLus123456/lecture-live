@@ -127,10 +127,23 @@ export function buildSonioxConfig(config: SessionConfig): SonioxSessionConfig {
   return sonioxConfig;
 }
 
+/**
+ * R1-L1：mint 时的流归属声明。服务端据此做预扣门禁并把 grant 关联到可结算实体
+ * （realtime → Session finalize 链；interpret → InterpretSession deduct/cron 链），
+ * 并以之构造 Soniox 侧的 client_reference_id（服务端拼 kind:userId:grantId，客户端不可控）。
+ */
+export interface StreamAttribution {
+  kind: 'realtime' | 'interpret';
+  /** realtime 必填：所属 Session.id（服务端校验归属+活跃状态）。 */
+  sessionId?: string;
+  /** interpret 可选：/interpret/start 返回的 anchorId（精确关联，多标签页并发不串场）。 */
+  anchorId?: string | null;
+}
+
 export async function fetchTemporaryApiKey(
   authToken: string,
   regionPreference?: SonioxRegionPreference,
-  clientReferenceId?: string
+  attribution?: StreamAttribution
 ): Promise<TemporaryApiKeyResponse> {
   // auto 模式下，用客户端 ping 选延迟最低的区域
   let resolvedRegion: string | undefined;
@@ -151,7 +164,9 @@ export async function fetchTemporaryApiKey(
     },
     body: JSON.stringify({
       region: resolvedRegion,
-      clientReferenceId,
+      kind: attribution?.kind,
+      sessionId: attribution?.sessionId,
+      anchorId: attribution?.anchorId ?? undefined,
     }),
   });
   if (!res.ok) {
@@ -183,7 +198,7 @@ export async function startSonioxRecording(
     preAcquiredStream?: MediaStream | null;
     managedStream?: MediaStream | null;
     regionPreference?: SonioxRegionPreference;
-    clientReferenceId?: string;
+    attribution?: StreamAttribution;
     onAudioLevel?: (level: number) => void;
   }
 ) {
@@ -215,7 +230,12 @@ export async function startSonioxRecording(
       recording: fakeRecording,
       client: {},
       source: {},
-      temporaryKey: { region: 'test', ws_base_url: 'wss://fake', api_key: 'fake' },
+      temporaryKey: {
+        region: 'test',
+        ws_base_url: 'wss://fake',
+        api_key: 'fake',
+        expires_at: '',
+      } as unknown as TemporaryApiKeyResponse,
     };
   }
 
@@ -226,7 +246,7 @@ export async function startSonioxRecording(
   const temporaryKey = await fetchTemporaryApiKey(
     authToken,
     options?.regionPreference,
-    options?.clientReferenceId
+    options?.attribution
   );
   const wsBaseUrl = temporaryKey.ws_url ?? temporaryKey.ws_base_url;
   if (!wsBaseUrl) {

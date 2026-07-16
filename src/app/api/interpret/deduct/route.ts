@@ -7,6 +7,7 @@ import {
   getQuotaSnapshot,
 } from '@/lib/quota';
 import { claimInterpretSessionForDeduct } from '@/lib/interpret/session';
+import { settleStreamGrants } from '@/lib/soniox/streamGrant';
 import { getBillableMinutes } from '@/lib/billing';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger } from '@/lib/logger';
@@ -108,6 +109,18 @@ export async function POST(req: Request) {
         anchorStartedAt,
         tx
       );
+
+      // R1-L2：认领成功即结算本场锚点关联的全部未结 stream grants（释放 mint 预扣），与实扣
+      // 同事务——预扣是占位，净效果=billableMinutes（billable=0 的空场也要释放，不留悬挂预扣）。
+      // already_settled 时 cron 已连锚点带 grants 一并结算；no_record 无锚点行、grants 无键可循，
+      // 留给 usage cron 孤儿兜底。
+      if (claim.outcome === 'claimed' && claim.sessionId) {
+        await settleStreamGrants(
+          { interpretSessionId: claim.sessionId },
+          'interpret_deduct',
+          tx
+        );
+      }
 
       const skip =
         claim.outcome === 'already_settled' ||

@@ -13,6 +13,7 @@ import { logger } from '@/lib/logger';
 import { getBillableMinutes } from '@/lib/billing';
 import { deductTranscriptionMinutes, recordInterpretUsage } from '@/lib/quota';
 import { MAX_INTERPRET_DURATION_MS } from '@/lib/interpret/anchor';
+import { settleStreamGrants } from '@/lib/soniox/streamGrant';
 
 /** 可选 Prisma 客户端：默认全局 `prisma`；deduct 传入 $transaction 的 tx 使认领与扣费同事务原子。 */
 type InterpretDbClient = Prisma.TransactionClient;
@@ -99,6 +100,30 @@ export async function ensureActiveInterpretSession(
       'ensureActiveInterpretSession failed (non-blocking; key mint proceeds)'
     );
     return { id: null, created: false };
+  }
+}
+
+/**
+ * R1-L2：把一条「刚补建、还没有任何串流发生」的空锚点无费结算（settledAt 置位、billedMinutes=0）。
+ * 用于 mint 失败回滚：ensureActiveInterpretSession 在预扣前新建的锚点，若随后 Soniox 签发失败，
+ * 客户端根本拿不到 key、不可能串流——不回收则 cron 7h 后按墙钟对这条空锚点扣满 6h（诚实用户被
+ * 凭空计费）。只结算 settledAt=null 的（条件原子，与 deduct/cron 互斥）；best-effort 吞错——失败
+ * 留给 cron 的后果只是误扣风险回到旧行为，不阻塞错误响应。
+ */
+export async function settleInterpretSessionAsVoid(
+  id: string,
+  settledBy: string
+): Promise<void> {
+  try {
+    await prisma.interpretSession.updateMany({
+      where: { id, settledAt: null },
+      data: { settledAt: new Date(), settledBy, billedMinutes: 0 },
+    });
+  } catch (err) {
+    sessionLogger.warn(
+      { interpretSessionId: id, message: err instanceof Error ? err.message : String(err) },
+      'failed to void empty interpret anchor after mint failure'
+    );
   }
 }
 
@@ -193,15 +218,25 @@ export async function reclaimStaleInterpretSessions(now: Date): Promise<number> 
 
   let reclaimed = 0;
   for (const s of stale) {
+    // R1-L2：优先按 Soniox usage-logs 实测串流量计费（usage cron 已回填各 grant.actualMs，
+    // 7h 阈值远晚于回填窗口）——比「墙钟封 6h」精确得多：崩溃在第 3 分钟的诚实用户按 3 分钟扣，
+    // 改装客户端串满多少扣多少。无 grants/未回填（部署前旧数据、usage 拉取故障）退回墙钟封顶。
+    const grantAgg = await prisma.sonioxStreamGrant.aggregate({
+      where: { interpretSessionId: s.id, actualMs: { gt: 0 } },
+      _sum: { actualMs: true },
+    });
+    const grantActualMs = grantAgg._sum.actualMs ?? 0;
     const elapsedMs = Math.min(
-      Math.max(0, now.getTime() - s.startedAt.getTime()),
+      grantActualMs > 0
+        ? grantActualMs
+        : Math.max(0, now.getTime() - s.startedAt.getTime()),
       MAX_INTERPRET_DURATION_MS
     );
     const billable = getBillableMinutes(elapsedMs);
 
-    // 认领 + 扣费 + 记台账**同事务**原子：任一步失败整体回滚 → 会话保持未结算(settledAt=null)、
-    // 下个周期重试，杜绝「已结算却没扣费」的静默免单（审查 R2/R7 的 cron 侧同构）。与 /deduct 经
-    // settledAt 条件认领互斥（claimed.count!==1 = deduct 抢先）→ 恰好扣一次。
+    // 认领 + 结算 grants + 扣费 + 记台账**同事务**原子：任一步失败整体回滚 → 会话保持未结算
+    // (settledAt=null)、下个周期重试，杜绝「已结算却没扣费」的静默免单（审查 R2/R7 的 cron 侧
+    // 同构）。与 /deduct 经 settledAt 条件认领互斥（claimed.count!==1 = deduct 抢先）→ 恰好扣一次。
     const settled = await prisma
       .$transaction(async (tx) => {
         const claimed = await tx.interpretSession.updateMany({
@@ -211,6 +246,12 @@ export async function reclaimStaleInterpretSessions(now: Date): Promise<number> 
         if (claimed.count !== 1) {
           return false; // deduct 抢先结算
         }
+        // 释放本场 grants 的 mint 预扣（占位→实扣净替换），与扣费同事务恰好一次。
+        await settleStreamGrants(
+          { interpretSessionId: s.id },
+          'interpret_cron',
+          tx
+        );
         if (billable > 0) {
           const snap = await deductTranscriptionMinutes(s.userId, billable, tx);
           // ADMIN 恒不扣费（snap.role==='ADMIN' 即 deduct 短路），不记台账。

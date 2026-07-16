@@ -151,6 +151,15 @@ async function ensureQuotaWindow(
     data: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
   });
 
+  // R1-L2：Soniox 串流 grant 的在途预留同理——预留计入 transcriptionMinutesUsed，used 归零即预留
+  // 作废，先把未结 grant 的 reservedMinutes 清零（同上，先清列再归零 used，消除并发 settle 读到
+  // 未清预留二次释放的坏窗口）。grant 本身保持未结：跨月仍在串的流照常由 finalize/deduct/usage-cron
+  // 结算（届时释放 0），孤儿有用量照常按 actualMs 转扣——只作废预留、不作废计费。
+  await db.sonioxStreamGrant.updateMany({
+    where: { userId, settledAt: null, reservedMinutes: { gt: 0 } },
+    data: { reservedMinutes: 0 },
+  });
+
   // 已过期：用乐观锁重置，防止并发请求同时重置清零刚扣的配额
   const resetResult = await db.user.updateMany({
     where: {
@@ -461,7 +470,21 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
       });
       const interpretMinutes = interpretAgg._sum.billedMinutes ?? 0;
 
-      const expectedMinutes = sessionMinutes + interpretMinutes;
+      // R1-L2：usage cron 经 grant 直接补扣的分钟（孤儿转扣/迟到补扣）不走 Session 也不走
+      // InterpretUsage，台账就是 grant 行本身（billedMinutes，settledAt=扣费时刻）。不计入则凡被
+      // 兜底扣过的用户恒报负 drift、按报表「修复」会把真实扣费退掉（B6 同款教训）。周期口径一致：
+      // settledAt >= cycleStart。
+      const grantAgg = await prisma.sonioxStreamGrant.aggregate({
+        where: {
+          userId: user.id,
+          settledAt: { gte: cycleStart },
+          billedMinutes: { gt: 0 },
+        },
+        _sum: { billedMinutes: true },
+      });
+      const grantMinutes = grantAgg._sum.billedMinutes ?? 0;
+
+      const expectedMinutes = sessionMinutes + interpretMinutes + grantMinutes;
 
       return {
         id: user.id,
@@ -713,6 +736,66 @@ export async function reserveTranscriptionMinutes(
       AND transcriptionMinutesUsed + ${normalized} <= transcriptionMinutesLimit
   `;
   return affected === 1;
+}
+
+export interface ShrinkReservationResult {
+  /** 实际预扣的分钟（0=额度已耗尽，调用方应拒绝；ADMIN 恒等于请求值、不写库）。 */
+  reservedMinutes: number;
+  role: string;
+}
+
+/**
+ * 原子**收缩**预留转录分钟（R1-L2：Soniox 临时 key 签发时的预扣门禁）。
+ *
+ * 与 reserveTranscriptionMinutes（定额、不够即拒）不同：这里按「剩余额度」收缩——
+ * 预扣 min(maxMinutes, limit-used)，返回实际预扣量；剩 0 才拒。这样额度只剩 3 分钟的用户
+ * 仍能发起一条最长 3 分钟的流（key 的 max_session_duration_seconds 会同步收缩到预扣量，
+ * 到点 Soniox 硬断），月度额度第一次成为实时强制，而非事后超扣。
+ *
+ * MySQL 无 UPDATE...RETURNING，「读剩余→算收缩值→写」必须 FOR UPDATE 锁行才原子（同
+ * settleReservation 的模式）：要求调用方传入**事务客户端**。先 ensureQuotaWindow（事务内）
+ * 做跨月窗口校正，再锁行读、条件写。ADMIN 无限额：不写库、按请求值放行。
+ */
+export async function reserveTranscriptionMinutesUpTo(
+  userId: string,
+  maxMinutes: number,
+  tx: QuotaDbClient
+): Promise<ShrinkReservationResult | null> {
+  const user = await ensureQuotaWindow(userId, new Date(), tx);
+  if (!user) return null;
+  if (user.role === 'ADMIN') {
+    return { reservedMinutes: Math.max(1, Math.floor(maxMinutes)), role: user.role };
+  }
+
+  const requested = Math.max(0, Math.floor(maxMinutes));
+  if (requested <= 0) {
+    return { reservedMinutes: 0, role: user.role };
+  }
+
+  const rows = await tx.$queryRaw<
+    Array<{ transcriptionMinutesUsed: number; transcriptionMinutesLimit: number }>
+  >`
+    SELECT transcriptionMinutesUsed, transcriptionMinutesLimit
+    FROM User WHERE id = ${userId} FOR UPDATE
+  `;
+  const row = rows[0];
+  if (!row) return null;
+
+  const remaining = Math.max(
+    0,
+    Number(row.transcriptionMinutesLimit) - Number(row.transcriptionMinutesUsed)
+  );
+  const granted = Math.min(requested, remaining);
+  if (granted <= 0) {
+    return { reservedMinutes: 0, role: user.role };
+  }
+
+  await tx.$executeRaw`
+    UPDATE User
+    SET transcriptionMinutesUsed = transcriptionMinutesUsed + ${granted}
+    WHERE id = ${userId}
+  `;
+  return { reservedMinutes: granted, role: user.role };
 }
 
 /**

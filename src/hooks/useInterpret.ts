@@ -43,6 +43,9 @@ type RecordingHandle = {
   stop?: () => Promise<void> | void;
 };
 
+// R1-L1：key 的 max_session_duration_seconds 到点 Soniox 硬断连接；提前这么多秒主动平滑轮换。
+const ROTATION_LEAD_S = 30;
+
 export function useInterpret() {
   const [isRunning, setIsRunning] = useState(false);
   const [connectionState, setConnectionState] = useState<string>('disconnected');
@@ -67,6 +70,14 @@ export function useInterpret() {
   // 同步重入保护：防止快速双击 start/stop 造成孤儿录音或双重扣费
   const isStartingRef = useRef(false);
   const isStoppingRef = useRef(false);
+  // R1-L1：连接寿命轮换。key 的 max_session_duration_seconds（=服务端本次预扣分钟）到点
+  // Soniox 硬断；提前主动优雅轮换（re-mint 新 key/新预扣接续本场）。重建连接复用 start 时的
+  // 回调与 WS 配置（processor 延续、段落不断），锚点/计时器不动——仍是同一场同传。
+  const rotationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rotateConnectionRef = useRef<() => void>(() => {});
+  const sonioxConfigRef = useRef<ReturnType<typeof buildSonioxConfig> | null>(null);
+  const callbacksRef = useRef<Parameters<typeof startSonioxRecording>[2] | null>(null);
+  const deviceIdRef = useRef<string | undefined>(undefined);
 
   const token = useAuthStore((s) => s.token);
 
@@ -96,6 +107,75 @@ export function useInterpret() {
     },
     []
   );
+
+  // R1-L1：安排寿命轮换（稳定引用，经 rotateConnectionRef 中转避免 useCallback 环）。
+  const scheduleRotation = useCallback((maxSessionSeconds?: number) => {
+    if (rotationTimerRef.current) {
+      clearTimeout(rotationTimerRef.current);
+      rotationTimerRef.current = null;
+    }
+    // 收缩到极短（额度尾巴）不轮换：让 Soniox 硬断兜底，重启会因额度耗尽被 mint 403 明确拒绝。
+    if (!maxSessionSeconds || maxSessionSeconds <= ROTATION_LEAD_S * 2) {
+      return;
+    }
+    rotationTimerRef.current = setTimeout(
+      () => {
+        rotationTimerRef.current = null;
+        rotateConnectionRef.current();
+      },
+      (maxSessionSeconds - ROTATION_LEAD_S) * 1000
+    );
+  }, []);
+
+  // R1-L1：主动平滑轮换——优雅停旧连接（final flush 仍进同一 processor，段落不断），随即用
+  // start 时存下的同一套回调/配置重新建连（re-mint：服务端新预扣、新 grant，anchorId 不变仍
+  // 关联本场锚点）。失败置 error（与断线同表现，用户可停止结算或重开）。
+  const rotateConnection = useCallback(() => {
+    void (async () => {
+      const current = recordingRef.current;
+      const callbacks = callbacksRef.current;
+      const sonioxConfig = sonioxConfigRef.current;
+      const authToken = useAuthStore.getState().token;
+      if (!current || !callbacks || !sonioxConfig || !authToken) {
+        return;
+      }
+      recordingRef.current = null;
+      try {
+        await current.recording.stop?.();
+      } catch (e) {
+        console.error('Interpret rotation: error stopping old connection:', e);
+      }
+      // stop 之后用户可能已同时点了停止（isStoppingRef/句柄已清）——不再重建
+      if (isStoppingRef.current || !startTimeRef.current) {
+        return;
+      }
+      try {
+        const settings = useSettingsStore.getState();
+        const result = await startSonioxRecording(sonioxConfig, authToken, callbacks, {
+          sourceType: 'mic',
+          deviceId: deviceIdRef.current,
+          regionPreference: settings.sonioxRegionPreference,
+          attribution: { kind: 'interpret', anchorId: anchorIdRef.current },
+        });
+        if (isStoppingRef.current || !startTimeRef.current) {
+          // 轮换建连期间被停止：立刻拆掉刚建的连接，不留孤儿流
+          try {
+            await (result as { recording: RecordingHandle }).recording.stop?.();
+          } catch { /* silent */ }
+          return;
+        }
+        recordingRef.current = result as { recording: RecordingHandle; client: unknown };
+        scheduleRotation(result.temporaryKey?.max_session_duration_seconds);
+      } catch (error) {
+        console.error('Interpret rotation failed:', error);
+        setConnectionState('error');
+      }
+    })();
+  }, [scheduleRotation]);
+
+  useEffect(() => {
+    rotateConnectionRef.current = rotateConnection;
+  }, [rotateConnection]);
 
   const start = useCallback(
     async (langA: string, langB: string, deviceId?: string) => {
@@ -232,44 +312,52 @@ export function useInterpret() {
       setIsRunning(true);
       setConnectionState('connecting');
 
+      // 回调与配置存 ref：寿命轮换（rotateConnection）重建连接时原样复用——processor 延续、
+      // 段落不断，锚点/计时器不动，仍是同一场同传。
+      const callbacks: Parameters<typeof startSonioxRecording>[2] = {
+        onPartialResult: (tokens) => {
+          const rtTokens = tokens as RealtimeToken[];
+          // 原文 preview 侧仍基于当前转录 token 的 language 判断
+          for (const t of rtTokens) {
+            if (t.translation_status !== 'translation' && t.language) {
+              setPreviewLang(t.language);
+              previewLangRef.current = t.language;
+            }
+          }
+          processorRef.current?.processTokens(rtTokens);
+        },
+        onEndpoint: () => {
+          processorRef.current?.onEndpoint();
+        },
+        onError: (error) => {
+          console.error('Interpret Soniox error:', error);
+          setConnectionState('error');
+        },
+        onConnectionChange: (state) => {
+          setConnectionState(state);
+        },
+      };
+      callbacksRef.current = callbacks;
+      sonioxConfigRef.current = sonioxConfig;
+      deviceIdRef.current = deviceId || undefined;
+
       try {
         const result = await startSonioxRecording(
           sonioxConfig,
           token,
-          {
-            onPartialResult: (tokens) => {
-              const rtTokens = tokens as RealtimeToken[];
-              // 原文 preview 侧仍基于当前转录 token 的 language 判断
-              for (const t of rtTokens) {
-                if (t.translation_status !== 'translation' && t.language) {
-                  setPreviewLang(t.language);
-                  previewLangRef.current = t.language;
-                }
-              }
-              processorRef.current?.processTokens(rtTokens);
-            },
-            onEndpoint: () => {
-              processorRef.current?.onEndpoint();
-            },
-            onError: (error) => {
-              console.error('Interpret Soniox error:', error);
-              setConnectionState('error');
-            },
-            onConnectionChange: (state) => {
-              setConnectionState(state);
-            },
-          },
+          callbacks,
           {
             // U25：同传恒为麦克风采集，用页面传入的 deviceId；
             // 不复用讲座页持久化的 audioSource（可能是 'system'）或 preferredMicDeviceId。
             sourceType: 'mic',
             deviceId: deviceId || undefined,
             regionPreference: settings.sonioxRegionPreference,
-            clientReferenceId: `interpret:${langA}:${langB}`,
+            attribution: { kind: 'interpret', anchorId: anchorIdRef.current },
           }
         );
 
         recordingRef.current = result as { recording: RecordingHandle; client: unknown };
+        scheduleRotation(result.temporaryKey?.max_session_duration_seconds);
       } catch (error) {
         console.error('Failed to start interpret:', error);
         setIsRunning(false);
@@ -284,7 +372,7 @@ export function useInterpret() {
         isStartingRef.current = false;
       }
     },
-    [token]
+    [token, scheduleRotation]
   );
 
   const stop = useCallback(async () => {
@@ -298,6 +386,13 @@ export function useInterpret() {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
+    // 本场结束：寿命轮换作废（下一场 start 会重新 schedule）
+    if (rotationTimerRef.current) {
+      clearTimeout(rotationTimerRef.current);
+      rotationTimerRef.current = null;
+    }
+    callbacksRef.current = null;
+    sonioxConfigRef.current = null;
 
     const duration = startTimeRef.current ? Date.now() - startTimeRef.current : 0;
     startTimeRef.current = null;

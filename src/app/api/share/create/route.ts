@@ -12,6 +12,7 @@ import {
 import { jsonWithCache } from '@/lib/httpCache';
 import { assertOwnership, parsePositiveInteger, sanitizeTextInput } from '@/lib/security';
 import { logAction } from '@/lib/auditLog';
+import { notifyLiveShareLinksRevoked } from '@/lib/liveShare/revocationNotifier';
 
 const MAX_SHARE_HOURS = 24 * 7;
 
@@ -260,6 +261,12 @@ export async function DELETE(req: Request) {
         : { isLive: false, expiresAt: new Date() },
     });
     await invalidateShareLinksApiCache(user.id);
+    // SHARE-REVOKE-001：观众 socket 只在 join 时校验 token，仅写 DB 撤销对已连接
+    // 观众永久无效——必须通知 WS 进程即时驱逐（通知失败由 WS 周期复核兜底）。
+    await notifyLiveShareLinksRevoked(
+      sessionId,
+      keepForPlayback ? 'transition' : 'revoke'
+    );
 
     logAction(req, keepForPlayback ? 'share.transition_playback' : 'share.revoke', {
       user,

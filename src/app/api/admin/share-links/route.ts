@@ -3,6 +3,7 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
 import { invalidateShareLinksApiCache } from '@/lib/apiResponseCache';
 import { logAction } from '@/lib/auditLog';
+import { notifyLiveShareLinksRevoked } from '@/lib/liveShare/revocationNotifier';
 
 // 管理员：获取全站分享链接列表（分页 + 过滤）
 export async function GET(req: Request) {
@@ -152,6 +153,15 @@ export async function DELETE(req: Request) {
     // 失效缓存：所有受影响的创建者
     const creatorIds = [...new Set(targets.map((t) => t.createdBy))];
     await Promise.all(creatorIds.map((id) => invalidateShareLinksApiCache(id)));
+
+    // SHARE-REVOKE-001：硬删链接同样要即时驱逐已连接的 WS 观众（按 DB 复核，
+    // 同 session 下未被删除的其他有效链接的观众不受影响）。
+    const affectedSessionIds = [...new Set(targets.map((t) => t.sessionId))];
+    await Promise.all(
+      affectedSessionIds.map((sessionId) =>
+        notifyLiveShareLinksRevoked(sessionId, 'revoke')
+      )
+    );
 
     logAction(req, 'admin.share.delete', {
       user: admin,

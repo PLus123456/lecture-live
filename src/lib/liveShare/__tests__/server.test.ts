@@ -5,15 +5,18 @@ import { Server as SocketIOServer } from 'socket.io';
 import { io as createClient, Socket } from 'socket.io-client';
 import { onceSocketEvent } from '../../../../tests/utils/socket';
 
-const { shareLinkFindUniqueMock, verifyAuthTokenMock } = vi.hoisted(() => ({
-  shareLinkFindUniqueMock: vi.fn(),
-  verifyAuthTokenMock: vi.fn(),
-}));
+const { shareLinkFindUniqueMock, shareLinkFindManyMock, verifyAuthTokenMock } =
+  vi.hoisted(() => ({
+    shareLinkFindUniqueMock: vi.fn(),
+    shareLinkFindManyMock: vi.fn(),
+    verifyAuthTokenMock: vi.fn(),
+  }));
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
     shareLink: {
       findUnique: shareLinkFindUniqueMock,
+      findMany: shareLinkFindManyMock,
     },
   },
 }));
@@ -40,7 +43,11 @@ vi.mock('@/lib/logger', () => {
   };
 });
 
-import { setupLiveShare } from '@/lib/liveShare/server';
+import {
+  revalidateAllLiveRooms,
+  revalidateSessionViewers,
+  setupLiveShare,
+} from '@/lib/liveShare/server';
 
 describe('setupLiveShare', () => {
   let httpServer: ReturnType<typeof createServer>;
@@ -84,6 +91,10 @@ describe('setupLiveShare', () => {
         };
       }
     );
+
+    // 观众复核（SHARE-REVOKE-001）用 findMany 查仍然有效的 token；默认与
+    // findUnique 一致——share-token 有效。撤销类用例内再覆盖为失效。
+    shareLinkFindManyMock.mockResolvedValue([{ token: 'share-token' }]);
 
     httpServer = createServer();
     io = new SocketIOServer(httpServer, {
@@ -519,5 +530,172 @@ describe('setupLiveShare', () => {
     await expect(errorPromise).resolves.toEqual({
       message: 'Invalid or expired share link',
     });
+  });
+
+  it('SHARE-REVOKE-001：复核驱逐持已撤销 token 的观众，保留合法观众与主播', async () => {
+    // 两个 token 同属 session-1，join 时都有效
+    shareLinkFindUniqueMock.mockImplementation(
+      async ({ where: { token } }: { where: { token: string } }) => {
+        if (token !== 'share-token' && token !== 'revoked-token') {
+          return null;
+        }
+
+        return {
+          id: token === 'share-token' ? 'link-1' : 'link-2',
+          token,
+          sessionId: 'session-1',
+          createdBy: 'user-1',
+          isLive: true,
+          expiresAt: null,
+          session: {
+            id: 'session-1',
+            userId: 'user-1',
+            status: 'RECORDING',
+          },
+        };
+      }
+    );
+
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    const legitViewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(legitViewer);
+    await onceSocketEvent(legitViewer, 'connect');
+    const legitInitialState = onceSocketEvent(legitViewer, 'initial_state');
+    legitViewer.emit('join', { shareToken: 'share-token' });
+    await legitInitialState;
+
+    const revokedViewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(revokedViewer);
+    await onceSocketEvent(revokedViewer, 'connect');
+    const revokedInitialState = onceSocketEvent(revokedViewer, 'initial_state');
+    revokedViewer.emit('join', { shareToken: 'revoked-token' });
+    await revokedInitialState;
+
+    // 撤销 revoked-token：DB 复核只承认 share-token 仍有效
+    shareLinkFindManyMock.mockResolvedValue([{ token: 'share-token' }]);
+
+    const revokedErrorPromise = onceSocketEvent<{ message: string; code?: string }>(
+      revokedViewer,
+      'share_error'
+    );
+    const revokedDisconnectPromise = onceSocketEvent<string>(
+      revokedViewer,
+      'disconnect'
+    );
+    // join 时的 count:2 广播可能仍在途中，等待驱逐后的 count 降到 1（而非只取
+    // 下一个事件）以避免时序竞态。
+    const viewerCountDroppedPromise = new Promise<void>((resolve) => {
+      const handler = ({ count }: { count: number }) => {
+        if (count === 1) {
+          legitViewer.off('viewer_count', handler);
+          resolve();
+        }
+      };
+      legitViewer.on('viewer_count', handler);
+    });
+
+    const evicted = await revalidateSessionViewers(io, 'session-1');
+
+    expect(evicted).toBe(1);
+    await expect(revokedErrorPromise).resolves.toEqual({
+      message: 'Share link revoked',
+      code: 'SHARE_REVOKED',
+    });
+    // 服务端主动断开：socket.io 客户端对该 reason 不会自动重连
+    await expect(revokedDisconnectPromise).resolves.toBe('io server disconnect');
+    // 驱逐后向房间广播了更新的观众数（只剩合法观众）
+    await viewerCountDroppedPromise;
+    expect(legitViewer.connected).toBe(true);
+    expect(broadcaster.connected).toBe(true);
+
+    // 复核查询按本 session + 仍在有效期的 live 链接过滤
+    expect(shareLinkFindManyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          sessionId: 'session-1',
+          isLive: true,
+          token: { in: expect.arrayContaining(['share-token', 'revoked-token']) },
+        }),
+      })
+    );
+  });
+
+  it('SHARE-REVOKE-001：token 仍有效时复核不驱逐（重放/误触发安全）', async () => {
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+    const initialState = onceSocketEvent(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+    await initialState;
+
+    const evicted = await revalidateSessionViewers(io, 'session-1');
+
+    expect(evicted).toBe(0);
+    expect(viewer.connected).toBe(true);
+  });
+
+  it('SHARE-REVOKE-001：transition 模式静默断开，不发 share_error', async () => {
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+    const initialState = onceSocketEvent(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+    await initialState;
+
+    const shareErrorSpy = vi.fn();
+    viewer.on('share_error', shareErrorSpy);
+    const disconnectPromise = onceSocketEvent<string>(viewer, 'disconnect');
+
+    shareLinkFindManyMock.mockResolvedValue([]);
+    const evicted = await revalidateSessionViewers(io, 'session-1', {
+      silent: true,
+    });
+
+    expect(evicted).toBe(1);
+    await expect(disconnectPromise).resolves.toBe('io server disconnect');
+    expect(shareErrorSpy).not.toHaveBeenCalled();
+  });
+
+  it('SHARE-REVOKE-001：revalidateAllLiveRooms 扫描所有 live 房间并驱逐失效观众', async () => {
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+    const initialState = onceSocketEvent(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+    await initialState;
+
+    const disconnectPromise = onceSocketEvent<string>(viewer, 'disconnect');
+
+    shareLinkFindManyMock.mockResolvedValue([]);
+    await revalidateAllLiveRooms(io);
+
+    await expect(disconnectPromise).resolves.toBe('io server disconnect');
   });
 });

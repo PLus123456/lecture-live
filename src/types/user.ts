@@ -21,6 +21,8 @@ export interface UserFeatureFlags {
 export interface UserQuotas {
   transcriptionMinutesUsed: number;
   transcriptionMinutesLimit: number;
+  /** 购买的永久转录时长池余额（分钟，充值系统 Model A）。remainingTranscriptionMinutes 已含它。 */
+  purchasedMinutesBalance?: number;
   remainingTranscriptionMinutes?: number;
   remainingTranscriptionMs?: number;
   storageHoursUsed: number;

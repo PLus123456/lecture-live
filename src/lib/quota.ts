@@ -21,6 +21,8 @@ type QuotaUserRecord = {
   role: 'ADMIN' | 'PRO' | 'FREE';
   transcriptionMinutesUsed: number;
   transcriptionMinutesLimit: number;
+  // 充值系统（Model A）：购买的永久转录时长池（gross 余额，分钟）。月度免费额度用尽后自动动用。
+  purchasedMinutesBalance: number;
   storageHoursUsed: number;
   storageHoursLimit: number;
   storageBytesUsed: bigint;
@@ -34,6 +36,8 @@ export interface UserQuotaSnapshot {
   role: 'ADMIN' | 'PRO' | 'FREE';
   transcriptionMinutesUsed: number;
   transcriptionMinutesLimit: number;
+  // 购买的永久转录时长池余额（分钟）。remainingTranscriptionMinutes 已含它。
+  purchasedMinutesBalance: number;
   remainingTranscriptionMinutes: number;
   remainingTranscriptionMs: number;
   storageHoursUsed: number;
@@ -56,12 +60,14 @@ function normalizeNonNegativeAmount(value: number): number {
 }
 
 function toQuotaSnapshot(user: QuotaUserRecord): UserQuotaSnapshot {
+  // Model A：剩余 = max(0, (limit + 购买池) − used)。购买池作为 gross 余额直接叠加在月度上限上，
+  // 由 getRemainingTranscriptionMinutes(used, limit+purchased) 统一计算（内含 max(0, floor(·))）。
   const remainingTranscriptionMinutes =
     user.role === 'ADMIN'
       ? ADMIN_UNLIMITED_MINUTES
       : getRemainingTranscriptionMinutes(
           user.transcriptionMinutesUsed,
-          user.transcriptionMinutesLimit
+          user.transcriptionMinutesLimit + user.purchasedMinutesBalance
         );
 
   const storageBytesUsed = Number(user.storageBytesUsed);
@@ -76,6 +82,7 @@ function toQuotaSnapshot(user: QuotaUserRecord): UserQuotaSnapshot {
     role: user.role,
     transcriptionMinutesUsed: user.transcriptionMinutesUsed,
     transcriptionMinutesLimit: user.transcriptionMinutesLimit,
+    purchasedMinutesBalance: user.purchasedMinutesBalance,
     remainingTranscriptionMinutes,
     remainingTranscriptionMs: remainingTranscriptionMinutes * 60_000,
     storageHoursUsed: user.storageHoursUsed,
@@ -93,6 +100,7 @@ const QUOTA_USER_SELECT = {
   role: true,
   transcriptionMinutesUsed: true,
   transcriptionMinutesLimit: true,
+  purchasedMinutesBalance: true,
   storageHoursUsed: true,
   storageHoursLimit: true,
   storageBytesUsed: true,
@@ -100,6 +108,34 @@ const QUOTA_USER_SELECT = {
   allowedModels: true,
   quotaResetAt: true,
 } as const;
+
+/**
+ * Model A 池结算：算某用户「本周期已消费的购买时长池分钟」（owed），供月度重置时从 gross 池扣减。
+ * owed = max(0, (used − 在途预留) − limit)。**必须排除在途预留**（async/full/grant reservedMinutes）：
+ * 预留只是计入 used 的占位、尚未真正消费，会在下个周期结算时重新扣费——若把预留也算作已消费，
+ * 会对同一批分钟重复扣池子。仅对持池用户（purchased>0）调用，其余用户 owed 恒 0、无需查询。
+ */
+async function computePoolOwed(
+  userId: string,
+  used: number,
+  limit: number,
+  db: QuotaDbClient
+): Promise<number> {
+  const sessionAgg = await db.session.aggregate({
+    where: { userId },
+    _sum: { asyncReservedMinutes: true, fullReservedMinutes: true },
+  });
+  const grantAgg = await db.sonioxStreamGrant.aggregate({
+    where: { userId, settledAt: null },
+    _sum: { reservedMinutes: true },
+  });
+  const inflight =
+    (sessionAgg._sum.asyncReservedMinutes ?? 0) +
+    (sessionAgg._sum.fullReservedMinutes ?? 0) +
+    (grantAgg._sum.reservedMinutes ?? 0);
+  const committedUsed = Math.max(0, used - inflight);
+  return Math.max(0, committedUsed - Math.max(0, limit));
+}
 
 async function ensureQuotaWindow(
   userId: string,
@@ -131,6 +167,18 @@ async function ensureQuotaWindow(
     return user;
   }
 
+  // 充值系统（Model A）：在清预留 + 归零 used 之前，先算持池用户本周期已消费的池子分钟（owed），
+  // 稍后随重置从 gross 池扣减。owed 用**清空前**的预留快照并排除在途预留（见 computePoolOwed）。
+  const poolOwed =
+    user.purchasedMinutesBalance > 0
+      ? await computePoolOwed(
+          userId,
+          user.transcriptionMinutesUsed,
+          user.transcriptionMinutesLimit,
+          db
+        )
+      : 0;
+
   // B1（防跨周期二次释放，审查 R1）：**先清**该用户在途预留列，**再**把 used 归零。
   // 顺序是关键——若先归零 used 再清列，两条非事务 updateMany 之间会出现「used=0 但 col=est」的
   // 窗口，让并发 finalize 的 settle 读到未清的 est 二次释放、把新周期真实扣费抹掉（用 GREATEST 截 0
@@ -160,7 +208,26 @@ async function ensureQuotaWindow(
     data: { reservedMinutes: 0 },
   });
 
-  // 已过期：用乐观锁重置，防止并发请求同时重置清零刚扣的配额
+  const nextResetAt = getNextQuotaResetAt(now);
+
+  // 持池用户（poolOwed>0）：原子「归零 used + 推进窗口 + 扣 gross 池 owed」。乐观锁 WHERE
+  // quotaResetAt<=now 保证并发下只有一个请求真正执行（另一个 affectedRows=0、不重复扣池），
+  // GREATEST 防负（门禁保证 owed<=purchased，护栏兜底）。
+  if (poolOwed > 0) {
+    await db.$executeRaw`
+      UPDATE User
+      SET purchasedMinutesBalance = GREATEST(0, purchasedMinutesBalance - ${poolOwed}),
+          transcriptionMinutesUsed = 0,
+          quotaResetAt = ${nextResetAt}
+      WHERE id = ${userId} AND quotaResetAt <= ${now}
+    `;
+    return db.user.findUnique({
+      where: { id: userId },
+      select: QUOTA_USER_SELECT,
+    });
+  }
+
+  // 已过期（无池或本周期未动用池）：用乐观锁重置，防止并发请求同时重置清零刚扣的配额
   const resetResult = await db.user.updateMany({
     where: {
       id: userId,
@@ -168,7 +235,7 @@ async function ensureQuotaWindow(
     },
     data: {
       transcriptionMinutesUsed: 0,
-      quotaResetAt: getNextQuotaResetAt(now),
+      quotaResetAt: nextResetAt,
     },
   });
 
@@ -234,7 +301,11 @@ export async function checkQuota(
 
   switch (type) {
     case 'transcription_minutes':
-      return user.transcriptionMinutesUsed < user.transcriptionMinutesLimit;
+      // Model A：月度上限 + 购买的永久时长池都算可用额度。
+      return (
+        user.transcriptionMinutesUsed <
+        user.transcriptionMinutesLimit + user.purchasedMinutesBalance
+      );
     case 'storage_hours': {
       // storageHoursUsed 列从不 increment（死维度）；实时用 SUM(durationMs)/3600000 作为
       // 已用量，与 storageHoursLimit 比较。这样删录音后占用自动回落，杜绝"恒 0<limit 恒真"。
@@ -342,6 +413,50 @@ export async function resetExpiredTranscriptionQuotas(
   // 残留的极窄 TOCTOU（findMany 与清列之间某用户新建预留被误清）只会让该新预留永久留在 used
   // （过量计费、对用户不利、非白送），且会在下一周期重置自愈——远小于跨周期二次释放（漏收费）的危害，可接受。
   // R4：异步上传与完整版补全两类在途预留一并清（一条 updateMany 原子清两列，见 ensureQuotaWindow）。
+  // 充值系统（Model A）：持池用户先逐个原子结算——按 owed 从 gross 池扣本周期已用溢出，同时归零 used、
+  // 推进窗口。必须在批量重置前做（owed 用清空前的预留快照算）；结算成功者 quotaResetAt 已推进，
+  // 自然被后续批量 WHERE quotaResetAt<=now 排除，不重复处理。持池用户很少，逐个成本可忽略。
+  let poolResetCount = 0;
+  const poolHolders = await prisma.user.findMany({
+    where: { quotaResetAt: { lte: now }, purchasedMinutesBalance: { gt: 0 } },
+    select: {
+      id: true,
+      transcriptionMinutesUsed: true,
+      transcriptionMinutesLimit: true,
+    },
+  });
+  for (const ph of poolHolders) {
+    const owed = await computePoolOwed(
+      ph.id,
+      ph.transcriptionMinutesUsed,
+      ph.transcriptionMinutesLimit,
+      prisma
+    );
+    // 先清该用户在途预留列（与 ensureQuotaWindow 同序：先清列再归零 used，防跨周期二次释放）。
+    await prisma.session.updateMany({
+      where: {
+        userId: ph.id,
+        OR: [
+          { asyncReservedMinutes: { gt: 0 } },
+          { fullReservedMinutes: { gt: 0 } },
+        ],
+      },
+      data: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+    });
+    await prisma.sonioxStreamGrant.updateMany({
+      where: { userId: ph.id, settledAt: null, reservedMinutes: { gt: 0 } },
+      data: { reservedMinutes: 0 },
+    });
+    const affected = await prisma.$executeRaw`
+      UPDATE User
+      SET purchasedMinutesBalance = GREATEST(0, purchasedMinutesBalance - ${owed}),
+          transcriptionMinutesUsed = 0,
+          quotaResetAt = ${nextResetAt}
+      WHERE id = ${ph.id} AND quotaResetAt <= ${now}
+    `;
+    if (affected === 1) poolResetCount += 1;
+  }
+
   const expiredUsers = await prisma.user.findMany({
     where: { quotaResetAt: { lte: now } },
     select: { id: true },
@@ -370,7 +485,65 @@ export async function resetExpiredTranscriptionQuotas(
     },
   });
 
-  return result.count;
+  return poolResetCount + result.count;
+}
+
+/**
+ * 充值系统（Model A）：**下调 transcriptionMinutesLimit 时**结算购买时长池（对持池用户）。
+ *
+ * 背景：Model A 用 overflow = max(0, used − limit) 表示「本周期已动用的池子分钟」，仅在 limit 恒定时成立。
+ * 若把 limit 调低而不动 used（角色到期降级 / 用户组同步 / admin 改角色配额都这么做），used 会瞬间远超
+ * 新 limit：既让下次月度重置把「旧 limit 下本属免费的消费」误算成池子消费（甚至清零池子），又让对账
+ *（used 应等于本周期总消费）与「used 被人为压低」相矛盾而虚报 drift。
+ *
+ * 处理（仅当 used > newLimit 的持池用户）：按**旧 limit** 结算真实池子消费（purchased -= max(0, used − oldLimit)），
+ * 并**整周期重置**——used→0 且推进 quotaResetAt。整周期重置让对账的 cycleStart 越过本周期已计费 session、
+ * used 归 0 ⇒ drift 恒 0（不触发误报→admin「修复」→下次重置过量扣池的连锁），同时从根上消除「limit 中途
+ * 变化令 used 与 overflow 脱钩」的误扣。代价是被降级/降配的持池用户获得一份新的当期免费额度（轻微慷慨、
+ * 事件罕见，可接受）。newLimit >= oldLimit（升配/不变）无需处理；used<=newLimit 时无 false overflow、
+ * 池子也未动用，亦为 no-op（WHERE 过滤）。仅作用于持池用户（purchasedMinutesBalance>0），无池用户保持既有
+ *「usage 不动」行为。
+ *
+ * SQL：purchased 赋值在前引用旧 used，used 归零在后（MySQL 同语句 SET 左→右，须此序）；GREATEST 防负。
+ */
+export async function settlePoolOnLimitChange(
+  userId: string,
+  oldLimit: number,
+  newLimit: number,
+  db: QuotaDbClient = prisma
+): Promise<void> {
+  if (!Number.isFinite(oldLimit) || !Number.isFinite(newLimit)) return;
+  if (newLimit >= oldLimit) return;
+  const oldLim = Math.max(0, Math.floor(oldLimit));
+  const newLim = Math.max(0, Math.floor(newLimit));
+  const nextResetAt = getNextQuotaResetAt();
+  await db.$executeRaw`
+    UPDATE User
+    SET purchasedMinutesBalance = GREATEST(0, purchasedMinutesBalance
+          - GREATEST(0, transcriptionMinutesUsed - ${oldLim})),
+        transcriptionMinutesUsed = 0,
+        quotaResetAt = ${nextResetAt}
+    WHERE id = ${userId}
+      AND purchasedMinutesBalance > 0
+      AND transcriptionMinutesUsed > ${newLim}
+  `;
+}
+
+/**
+ * 充值系统（Model A）：给用户的购买时长池加分钟（买时间到账）。gross 池只在此处与月度重置结算两处变更。
+ * 应在钱包结算事务内调用（与扣余额同事务）；随 PaymentOrder 认领的 pending→paid CAS 幂等，不会重复到账。
+ */
+export async function grantPurchasedMinutes(
+  userId: string,
+  minutes: number,
+  db: QuotaDbClient = prisma
+): Promise<void> {
+  const normalized = normalizeNonNegativeAmount(minutes);
+  if (normalized <= 0) return;
+  await db.user.update({
+    where: { id: userId },
+    data: { purchasedMinutesBalance: { increment: normalized } },
+  });
 }
 
 /**
@@ -728,12 +901,15 @@ export async function reserveTranscriptionMinutes(
   const normalized = normalizeNonNegativeAmount(minutes);
   if (normalized <= 0) return true;
 
-  // 条件原子扣减：仅当扣减后不超过 limit 才更新。affectedRows=1 表示预留成功。
+  // 条件原子扣减：仅当扣减后不超过「月度上限 + 购买池」才更新。affectedRows=1 表示预留成功。
+  // Model A：used 仍只 +normalized（数学不变），仅门禁放宽到含 gross 池；used 可因此超过 limit，
+  // 超出部分即本周期已动用的池子分钟，月度重置时按 owed 从池中结算。
   const affected = await db.$executeRaw`
     UPDATE User
     SET transcriptionMinutesUsed = transcriptionMinutesUsed + ${normalized}
     WHERE id = ${userId}
-      AND transcriptionMinutesUsed + ${normalized} <= transcriptionMinutesLimit
+      AND transcriptionMinutesUsed + ${normalized}
+          <= transcriptionMinutesLimit + purchasedMinutesBalance
   `;
   return affected === 1;
 }
@@ -773,17 +949,25 @@ export async function reserveTranscriptionMinutesUpTo(
   }
 
   const rows = await tx.$queryRaw<
-    Array<{ transcriptionMinutesUsed: number; transcriptionMinutesLimit: number }>
+    Array<{
+      transcriptionMinutesUsed: number;
+      transcriptionMinutesLimit: number;
+      purchasedMinutesBalance: number;
+    }>
   >`
-    SELECT transcriptionMinutesUsed, transcriptionMinutesLimit
+    SELECT transcriptionMinutesUsed, transcriptionMinutesLimit, purchasedMinutesBalance
     FROM User WHERE id = ${userId} FOR UPDATE
   `;
   const row = rows[0];
   if (!row) return null;
 
+  // Model A：可预扣 = max(0, (月度上限 + 购买池) − 已用)。含池子后，免费额度耗尽的用户仍能凭
+  // 购买时长发起流（key 的 max_session_duration_seconds 随之收缩到此值，而非在免费额度耗尽即硬断）。
   const remaining = Math.max(
     0,
-    Number(row.transcriptionMinutesLimit) - Number(row.transcriptionMinutesUsed)
+    Number(row.transcriptionMinutesLimit) +
+      Number(row.purchasedMinutesBalance) -
+      Number(row.transcriptionMinutesUsed)
   );
   const granted = Math.min(requested, remaining);
   if (granted <= 0) {

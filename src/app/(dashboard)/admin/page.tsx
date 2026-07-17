@@ -12,6 +12,7 @@ import DashboardPanel from '@/components/admin/DashboardPanel';
 import SettingsPanel from '@/components/admin/SettingsPanel';
 import UserGroupsPanel from '@/components/admin/UserGroupsPanel';
 import UserManagementPanel from '@/components/admin/UserManagementPanel';
+import RechargePanel from '@/components/admin/RechargePanel';
 import AuditLogPanel from '@/components/admin/AuditLogPanel';
 import ReconciliationPanel from '@/components/admin/ReconciliationPanel';
 import JobQueuePanel from '@/components/admin/JobQueuePanel';
@@ -166,6 +167,7 @@ export default function AdminPage() {
             {activeTab === 'settings' && <SettingsPanel />}
             {activeTab === 'groups' && <UserGroupsPanel />}
             {activeTab === 'users' && <UserManagementPanel />}
+            {activeTab === 'recharge' && <RechargePanel />}
             {activeTab === 'files' && <FilesPanel />}
             {activeTab === 'chatFiles' && <ChatFilesPanel />}
             {activeTab === 'shareLinks' && <ShareLinksPanel />}
@@ -187,6 +189,7 @@ export default function AdminPage() {
         {activeTab === 'settings' && <SettingsPanel />}
         {activeTab === 'groups' && <UserGroupsPanel />}
         {activeTab === 'users' && <UserManagementPanel />}
+        {activeTab === 'recharge' && <RechargePanel />}
         {activeTab === 'files' && <FilesPanel />}
         {activeTab === 'chatFiles' && <ChatFilesPanel />}
         {activeTab === 'shareLinks' && <ShareLinksPanel />}

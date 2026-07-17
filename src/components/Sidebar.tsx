@@ -74,18 +74,25 @@ export default function Sidebar({ slideOut = false }: { slideOut?: boolean }) {
     }
   };
 
-  // 配额进度
+  // 配额进度（Model A：分母含购买的永久时长池，避免只用月度上限时 used 超 limit 后进度条恒 100%）
   const getQuotaPercent = () => {
     if (!quotas) return 0;
-    if (quotas.transcriptionMinutesLimit <= 0) return 0;
-    return Math.min(100, Math.round(
-      (quotas.transcriptionMinutesUsed / quotas.transcriptionMinutesLimit) * 100
-    ));
+    const total =
+      quotas.transcriptionMinutesLimit + (quotas.purchasedMinutesBalance ?? 0);
+    if (total <= 0) return 0;
+    return Math.min(100, Math.round((quotas.transcriptionMinutesUsed / total) * 100));
   };
 
   const getQuotaRemaining = () => {
     if (!quotas) return '';
-    const remaining = Math.max(0, quotas.transcriptionMinutesLimit - quotas.transcriptionMinutesUsed);
+    // 优先用后端算好的剩余（已含购买池）；缺省时兜底为「月度上限 + 池 − 已用」。
+    const remaining = Math.max(
+      0,
+      quotas.remainingTranscriptionMinutes ??
+        quotas.transcriptionMinutesLimit +
+          (quotas.purchasedMinutesBalance ?? 0) -
+          quotas.transcriptionMinutesUsed
+    );
     const h = Math.floor(remaining / 60);
     const m = remaining % 60;
     if (h > 0) return t('sidebar.hoursMinutesLeft', { hours: h, minutes: m });
@@ -202,9 +209,13 @@ export default function Sidebar({ slideOut = false }: { slideOut?: boolean }) {
           </div>
         )}
 
-        {/* 用户信息 */}
+        {/* 用户信息（点击打开充值中心） */}
         <div className="pt-2 pb-1 px-2 overflow-hidden">
-          <div className="flex items-center gap-2.5 py-2 px-2">
+          <button
+            onClick={() => useSettingsStore.getState().setRechargeOpen(true)}
+            title={t('recharge.title')}
+            className="w-full flex items-center gap-2.5 py-2 px-2 rounded-lg hover:bg-cream-100 dark:hover:bg-charcoal-800 transition-colors"
+          >
             <div className="w-8 h-8 rounded-full bg-gradient-to-br from-rust-400 to-rust-600 flex items-center justify-center flex-shrink-0 shadow-sm">
               <span className="text-white text-xs font-bold">
                 {user ? getInitials(user.displayName) : <User className="w-4 h-4" />}
@@ -222,7 +233,7 @@ export default function Sidebar({ slideOut = false }: { slideOut?: boolean }) {
                 )}
               </div>
             </div>
-          </div>
+          </button>
         </div>
 
         {/* 折叠 | 设置 | 登出 — 纯图标 */}

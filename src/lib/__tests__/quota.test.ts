@@ -82,16 +82,27 @@ import {
   recordInterpretUsage,
   reconcileTranscriptionUsage,
   reserveStorageMinutes,
+  getQuotaSnapshot,
+  grantPurchasedMinutes,
+  settlePoolOnLimitChange,
 } from '@/lib/quota';
 
 const futureReset = new Date('2099-01-01T00:00:00.000Z');
 
-function freeUser(overrides: Partial<{ storageBytesUsed: bigint }> = {}) {
+function freeUser(
+  overrides: Partial<{
+    storageBytesUsed: bigint;
+    transcriptionMinutesUsed: number;
+    transcriptionMinutesLimit: number;
+    purchasedMinutesBalance: number;
+  }> = {}
+) {
   return {
     id: 'user-free',
     role: 'FREE' as const,
-    transcriptionMinutesUsed: 0,
-    transcriptionMinutesLimit: 60,
+    transcriptionMinutesUsed: overrides.transcriptionMinutesUsed ?? 0,
+    transcriptionMinutesLimit: overrides.transcriptionMinutesLimit ?? 60,
+    purchasedMinutesBalance: overrides.purchasedMinutesBalance ?? 0,
     storageHoursUsed: 0,
     storageHoursLimit: 10,
     storageBytesUsed: overrides.storageBytesUsed ?? BigInt(0),
@@ -107,6 +118,7 @@ function adminUser() {
     role: 'ADMIN' as const,
     transcriptionMinutesUsed: 0,
     transcriptionMinutesLimit: 60,
+    purchasedMinutesBalance: 0,
     storageHoursUsed: 0,
     storageHoursLimit: 10,
     storageBytesUsed: BigInt(0),
@@ -425,6 +437,7 @@ describe('deductTranscriptionMinutes', () => {
       role: over.role ?? ('FREE' as const),
       transcriptionMinutesUsed: over.transcriptionMinutesUsed ?? 0,
       transcriptionMinutesLimit: 600,
+      purchasedMinutesBalance: 0,
       storageHoursUsed: 0,
       storageHoursLimit: 10,
       storageBytesUsed: BigInt(0),
@@ -622,8 +635,21 @@ describe('reserveTranscriptionMinutesUpTo（R1-L2：mint 收缩式预扣）', ()
   function makeTx(user: ReturnType<typeof freeUser> | ReturnType<typeof adminUser> | null, row?: {
     transcriptionMinutesUsed: number;
     transcriptionMinutesLimit: number;
+    purchasedMinutesBalance?: number;
   } | null) {
-    const queryRaw = vi.fn().mockResolvedValue(row === null ? [] : [row ?? { transcriptionMinutesUsed: 0, transcriptionMinutesLimit: 60 }]);
+    // FOR UPDATE 行默认注入 purchasedMinutesBalance:0（Model A 新列），各测试 row 可覆盖。
+    const queryRaw = vi.fn().mockResolvedValue(
+      row === null
+        ? []
+        : [
+            {
+              purchasedMinutesBalance: 0,
+              transcriptionMinutesUsed: 0,
+              transcriptionMinutesLimit: 60,
+              ...(row ?? {}),
+            },
+          ]
+    );
     const executeRaw = vi.fn().mockResolvedValue(1);
     const tx = {
       user: {
@@ -768,12 +794,15 @@ describe('resetExpiredTranscriptionQuotas', () => {
   });
 
   it('单条原子 updateMany 重置 used，返回 count；并按到期用户清其在途预留（B1/R4）', async () => {
-    // 先 findMany 到期用户（供清预留用），再 updateMany 重置 used
-    userFindManyMock.mockResolvedValueOnce([
-      { id: 'u1' },
-      { id: 'u2' },
-      { id: 'u3' },
-    ]);
+    // 充值系统（Model A）：resetExpired 先 findMany 持池用户（这里无），再 findMany 到期用户
+    //（供清预留用），最后 updateMany 重置 used。
+    userFindManyMock
+      .mockResolvedValueOnce([]) // poolHolders（无持池用户）
+      .mockResolvedValueOnce([
+        { id: 'u1' },
+        { id: 'u2' },
+        { id: 'u3' },
+      ]);
     userUpdateManyMock.mockResolvedValueOnce({ count: 3 });
 
     const now = new Date('2026-02-01T00:00:00.000Z');
@@ -803,7 +832,9 @@ describe('resetExpiredTranscriptionQuotas', () => {
   });
 
   it('无过期窗口：findMany 空 → 不清预留；返回 updateMany count=0', async () => {
-    userFindManyMock.mockResolvedValueOnce([]);
+    userFindManyMock
+      .mockResolvedValueOnce([]) // poolHolders
+      .mockResolvedValueOnce([]); // expiredUsers
     userUpdateManyMock.mockResolvedValueOnce({ count: 0 });
 
     expect(await resetExpiredTranscriptionQuotas(new Date())).toBe(0);
@@ -1112,5 +1143,200 @@ describe('reconcileTranscriptionUsage — 按扣费时刻 billedAt 归期（B7�
         }),
       })
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 充值系统：购买时长池（Model A / gross 池）
+// ─────────────────────────────────────────────────────────────────────────────
+describe('购买时长池 Model A（gross 池）', () => {
+  beforeEach(() => {
+    userFindUniqueMock.mockReset();
+    userFindManyMock.mockReset();
+    userUpdateMock.mockReset();
+    userUpdateManyMock.mockReset();
+    executeRawMock.mockReset();
+    sessionAggregateMock.mockReset();
+    sessionUpdateManyMock.mockReset();
+    streamGrantAggregateMock.mockReset();
+    streamGrantUpdateManyMock.mockReset();
+  });
+
+  describe('snapshot / 门禁：剩余与 checkQuota 含池子', () => {
+    it('▶ 月度用尽但有池子：remaining = 池子余额，且 purchasedMinutesBalance 暴露', async () => {
+      userFindUniqueMock.mockResolvedValueOnce(
+        freeUser({ transcriptionMinutesUsed: 60, transcriptionMinutesLimit: 60, purchasedMinutesBalance: 100 })
+      );
+      const snap = await getQuotaSnapshot('user-free');
+      expect(snap?.remainingTranscriptionMinutes).toBe(100); // max(0, 60+100-60)
+      expect(snap?.purchasedMinutesBalance).toBe(100);
+    });
+
+    it('▶ 部分动用池子（used 超 limit）：remaining 正确回落', async () => {
+      userFindUniqueMock.mockResolvedValueOnce(
+        freeUser({ transcriptionMinutesUsed: 90, transcriptionMinutesLimit: 60, purchasedMinutesBalance: 100 })
+      );
+      const snap = await getQuotaSnapshot('user-free');
+      expect(snap?.remainingTranscriptionMinutes).toBe(70); // 60+100-90
+    });
+
+    it('▶ checkQuota：月度用尽但池子有余 → true', async () => {
+      userFindUniqueMock.mockResolvedValueOnce(
+        freeUser({ transcriptionMinutesUsed: 60, transcriptionMinutesLimit: 60, purchasedMinutesBalance: 50 })
+      );
+      await expect(checkQuota('user-free', 'transcription_minutes')).resolves.toBe(true);
+    });
+
+    it('▶ checkQuota：月度+池子都耗尽 → false', async () => {
+      userFindUniqueMock.mockResolvedValueOnce(
+        freeUser({ transcriptionMinutesUsed: 110, transcriptionMinutesLimit: 60, purchasedMinutesBalance: 50 })
+      );
+      await expect(checkQuota('user-free', 'transcription_minutes')).resolves.toBe(false);
+    });
+
+    it('▶ 无池子且月度用尽 → false（回归旧行为）', async () => {
+      userFindUniqueMock.mockResolvedValueOnce(
+        freeUser({ transcriptionMinutesUsed: 60, transcriptionMinutesLimit: 60, purchasedMinutesBalance: 0 })
+      );
+      await expect(checkQuota('user-free', 'transcription_minutes')).resolves.toBe(false);
+    });
+  });
+
+  describe('reserveTranscriptionMinutesUpTo：收缩含池子（Soniox key 时长）', () => {
+    // 复用同文件上方 makeTx；这里内联一个最小 tx。
+    function txWith(row: {
+      transcriptionMinutesUsed: number;
+      transcriptionMinutesLimit: number;
+      purchasedMinutesBalance: number;
+    }) {
+      const queryRaw = vi.fn().mockResolvedValue([row]);
+      const executeRaw = vi.fn().mockResolvedValue(1);
+      const tx = {
+        user: {
+          findUnique: vi.fn().mockResolvedValue(
+            freeUser({
+              transcriptionMinutesUsed: row.transcriptionMinutesUsed,
+              transcriptionMinutesLimit: row.transcriptionMinutesLimit,
+              purchasedMinutesBalance: row.purchasedMinutesBalance,
+            })
+          ),
+          updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+        },
+        session: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+        sonioxStreamGrant: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+        $queryRaw: queryRaw,
+        $executeRaw: executeRaw,
+      } as unknown as Prisma.TransactionClient;
+      return { tx, executeRaw };
+    }
+
+    it('▶ 月度用尽但池子 40：可预扣到 40（而非 0），key 不再在免费额度硬断', async () => {
+      const { tx } = txWith({
+        transcriptionMinutesUsed: 60,
+        transcriptionMinutesLimit: 60,
+        purchasedMinutesBalance: 40,
+      });
+      const res = await reserveTranscriptionMinutesUpTo('user-free', 999, tx);
+      expect(res).toEqual({ reservedMinutes: 40, role: 'FREE' });
+    });
+  });
+
+  describe('grantPurchasedMinutes：买时间到账', () => {
+    it('▶ 正向：increment 池子', async () => {
+      userUpdateMock.mockResolvedValueOnce({});
+      await grantPurchasedMinutes('u1', 200);
+      expect(userUpdateMock).toHaveBeenCalledWith({
+        where: { id: 'u1' },
+        data: { purchasedMinutesBalance: { increment: 200 } },
+      });
+    });
+
+    it('▶ 边界：<=0 不写库', async () => {
+      await grantPurchasedMinutes('u1', 0);
+      await grantPurchasedMinutes('u1', -5);
+      expect(userUpdateMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('settlePoolOnLimitChange：限额下调结算', () => {
+    it('▶ 升配/相等：不发 SQL（免费额度只增不减）', async () => {
+      await settlePoolOnLimitChange('u1', 60, 600);
+      await settlePoolOnLimitChange('u1', 60, 60);
+      expect(executeRawMock).not.toHaveBeenCalled();
+    });
+
+    it('▶ 下调：发一条原子 UPDATE，携带旧/新上限', async () => {
+      executeRawMock.mockResolvedValueOnce(1);
+      await settlePoolOnLimitChange('u1', 600, 60);
+      expect(executeRawMock).toHaveBeenCalledTimes(1);
+      // Prisma.sql 标签模板插值顺序：oldLim, nextResetAt, userId, newLim
+      const call = executeRawMock.mock.calls[0];
+      expect(call[1]).toBe(600); // oldLim
+      expect(call[3]).toBe('u1'); // userId
+      expect(call[4]).toBe(60); // newLim
+    });
+  });
+
+  describe('月度重置：持池用户结算溢出（排除在途预留）', () => {
+    it('▶ 持池用户按 owed=max(0,(used-预留)-limit) 扣池，non-pool 走批量', async () => {
+      // 池用户：used=150, limit=60, 无在途预留 → owed=90
+      userFindManyMock
+        .mockResolvedValueOnce([
+          { id: 'p', transcriptionMinutesUsed: 150, transcriptionMinutesLimit: 60 },
+        ]) // poolHolders
+        .mockResolvedValueOnce([]); // expiredUsers（池用户已推进窗口，被排除）
+      sessionAggregateMock.mockResolvedValueOnce({
+        _sum: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+      });
+      streamGrantAggregateMock.mockResolvedValueOnce({ _sum: { reservedMinutes: 0 } });
+      sessionUpdateManyMock.mockResolvedValue({ count: 0 });
+      streamGrantUpdateManyMock.mockResolvedValue({ count: 0 });
+      executeRawMock.mockResolvedValueOnce(1); // per-user 原子重置
+      userUpdateManyMock.mockResolvedValueOnce({ count: 0 }); // 批量重置
+
+      const now = new Date('2026-06-01T00:00:00.000Z');
+      const count = await resetExpiredTranscriptionQuotas(now);
+
+      expect(executeRawMock).toHaveBeenCalledTimes(1);
+      expect(executeRawMock.mock.calls[0][1]).toBe(90); // owed
+      expect(count).toBe(1); // poolResetCount(1) + batch(0)
+    });
+
+    it('▶ 排除在途预留：used=150 中 50 是预留 → owed=40（不误扣预留占用）', async () => {
+      userFindManyMock
+        .mockResolvedValueOnce([
+          { id: 'p', transcriptionMinutesUsed: 150, transcriptionMinutesLimit: 60 },
+        ])
+        .mockResolvedValueOnce([]);
+      sessionAggregateMock.mockResolvedValueOnce({
+        _sum: { asyncReservedMinutes: 30, fullReservedMinutes: 20 },
+      });
+      streamGrantAggregateMock.mockResolvedValueOnce({ _sum: { reservedMinutes: 0 } });
+      sessionUpdateManyMock.mockResolvedValue({ count: 0 });
+      streamGrantUpdateManyMock.mockResolvedValue({ count: 0 });
+      executeRawMock.mockResolvedValueOnce(1);
+      userUpdateManyMock.mockResolvedValueOnce({ count: 0 });
+
+      await resetExpiredTranscriptionQuotas(new Date('2026-06-01T00:00:00.000Z'));
+      // owed = max(0, (150 - 50) - 60) = 40
+      expect(executeRawMock.mock.calls[0][1]).toBe(40);
+    });
+  });
+
+  describe('deductTranscriptionMinutes：Model A 下 used 数学不变、不碰池子', () => {
+    it('▶ 扣费只 increment used，不触及 purchasedMinutesBalance', async () => {
+      userFindUniqueMock.mockResolvedValueOnce(
+        freeUser({ transcriptionMinutesUsed: 55, transcriptionMinutesLimit: 60, purchasedMinutesBalance: 100 })
+      );
+      userUpdateMock.mockResolvedValueOnce(
+        freeUser({ transcriptionMinutesUsed: 65, transcriptionMinutesLimit: 60, purchasedMinutesBalance: 100 })
+      );
+      await deductTranscriptionMinutes('user-free', 10);
+      expect(userUpdateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { transcriptionMinutesUsed: { increment: 10 } },
+        })
+      );
+    });
   });
 });

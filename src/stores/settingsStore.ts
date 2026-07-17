@@ -47,6 +47,7 @@ interface SettingsStore {
   // UI
   sidebarCollapsed: boolean;
   userSettingsOpen: boolean;
+  rechargeOpen: boolean;
 
   // Auto-start flag: set by setup page, consumed by session page
   pendingAutoStart: boolean;
@@ -79,6 +80,7 @@ interface SettingsStore {
   setSegmentSplitRatio: (ratio: number) => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
   setUserSettingsOpen: (open: boolean) => void;
+  setRechargeOpen: (open: boolean) => void;
   getSessionConfig: (sessionId?: string) => SessionConfig;
 }
 
@@ -106,6 +108,7 @@ export const useSettingsStore = create<SettingsStore>()(
       segmentSplitRatio: 0.25,
       sidebarCollapsed: false,
       userSettingsOpen: false,
+      rechargeOpen: false,
       pendingAutoStart: false,
       pendingSystemStream: null,
       pendingSessionId: null,
@@ -143,6 +146,7 @@ export const useSettingsStore = create<SettingsStore>()(
       setSegmentSplitRatio: (segmentSplitRatio) => set({ segmentSplitRatio }),
       setSidebarCollapsed: (collapsed) => set({ sidebarCollapsed: collapsed }),
       setUserSettingsOpen: (userSettingsOpen) => set({ userSettingsOpen }),
+      setRechargeOpen: (rechargeOpen) => set({ rechargeOpen }),
 
       getSessionConfig: (sessionId) => {
         const s = get();
@@ -182,6 +186,7 @@ export const useSettingsStore = create<SettingsStore>()(
         // reconnectAfterRefresh → getSessionConfig 需靠 pendingSessionId 匹配会话，
         // 否则回退到手动 terms，丢失文件夹/课程关键词（U77）。
         delete rest.userSettingsOpen;
+        delete rest.rechargeOpen;
         return rest;
       },
     }

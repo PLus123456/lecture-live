@@ -9,6 +9,7 @@ import {
   ShieldCheck,
   User,
   Palette,
+  Wallet,
   X,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
@@ -54,6 +55,7 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
   const user = useAuthStore((state) => state.user);
   const quotas = useAuthStore((state) => state.quotas);
   const setUserSettingsOpen = useSettingsStore((state) => state.setUserSettingsOpen);
+  const setRechargeOpen = useSettingsStore((state) => state.setRechargeOpen);
 
   useSwipeGesture(drawerRef, {
     onSwipeRight: onClose,
@@ -74,8 +76,11 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
   }, [open]);
 
   const isAdmin = user?.role === 'ADMIN';
+  // Model A：分母含购买的永久时长池，避免 used 超月度上限后进度条恒 100%。
   const quotaPercent = getQuotaPercent(
-    quotas?.transcriptionMinutesLimit,
+    quotas
+      ? quotas.transcriptionMinutesLimit + (quotas.purchasedMinutesBalance ?? 0)
+      : undefined,
     quotas?.transcriptionMinutesUsed
   );
   const quotaLabel = useMemo(() => {
@@ -83,9 +88,13 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
       return t('mobile.noQuotaData');
     }
 
+    // 优先用后端算好的剩余（已含购买池）；缺省兜底为「月度上限 + 池 − 已用」。
     const remaining = Math.max(
       0,
-      quotas.transcriptionMinutesLimit - quotas.transcriptionMinutesUsed
+      quotas.remainingTranscriptionMinutes ??
+        quotas.transcriptionMinutesLimit +
+          (quotas.purchasedMinutesBalance ?? 0) -
+          quotas.transcriptionMinutesUsed
     );
     const hours = Math.floor(remaining / 60);
     const minutes = remaining % 60;
@@ -168,6 +177,17 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
           </section>
 
           <div className="mt-5 space-y-2">
+            <button
+              onClick={() => {
+                onClose();
+                setRechargeOpen(true);
+              }}
+              className="flex w-full items-center gap-3 rounded-2xl border border-cream-200 bg-white px-4 py-3 text-left text-sm font-medium text-charcoal-700 transition-colors hover:bg-cream-50"
+            >
+              <Wallet className="h-4 w-4 text-rust-500" />
+              {t('recharge.title')}
+            </button>
+
             <button
               onClick={() => {
                 onClose();

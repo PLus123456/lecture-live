@@ -15,6 +15,7 @@ import {
   reconcileStorageBytes,
   settleAsyncReservation,
   settleFullReservation,
+  settlePoolOnLimitChange,
 } from '@/lib/quota';
 import {
   resolveRoleQuotas,
@@ -1161,7 +1162,13 @@ export async function expireRoleDowngrades(now: Date): Promise<number> {
       roleExpiresAt: { lte: now },
       originalRole: { not: null },
     },
-    select: { id: true, role: true, originalRole: true },
+    select: {
+      id: true,
+      role: true,
+      originalRole: true,
+      transcriptionMinutesLimit: true,
+      purchasedMinutesBalance: true,
+    },
     take: 500,
     orderBy: { roleExpiresAt: 'asc' },
   });
@@ -1209,6 +1216,15 @@ export async function expireRoleDowngrades(now: Date): Promise<number> {
       continue;
     }
     downgraded += 1;
+    // 充值系统（Model A）：降级把 limit 调低而不动 used。用捕获的旧上限按旧口径结算持池用户的时长池
+    //（并整周期重置），仅在降级已成功后执行、且仅对持池用户，避免误扣未真正降级的用户。
+    if (user.purchasedMinutesBalance > 0) {
+      await settlePoolOnLimitChange(
+        user.id,
+        user.transcriptionMinutesLimit,
+        quotas.transcriptionMinutesLimit
+      );
+    }
     billingLogger.info(
       { userId: user.id, from: user.role, to: targetRole },
       'expired membership downgraded to original role'

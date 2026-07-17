@@ -60,9 +60,25 @@ export class StripeProvider implements PaymentProvider {
     if (!header || !this.webhookSecret) return null;
     if (!verifyStripeSignature(rawBody, header, this.webhookSecret)) return null;
 
+    // 时间戳容差（防重放）：拒绝签名时间超过 5 分钟的通知。虽然到账 CAS 本身幂等，
+    // 时效窗口仍是 Stripe 推荐的纵深防护。
+    const tSec = Number(
+      header.split(',').find((p) => p.trim().startsWith('t='))?.split('=')[1]
+    );
+    if (Number.isFinite(tSec) && Math.abs(Date.now() / 1000 - tSec) > 300) {
+      return null;
+    }
+
     let event: {
       type?: string;
-      data?: { object?: { client_reference_id?: string; metadata?: Record<string, string>; payment_status?: string } };
+      data?: {
+        object?: {
+          client_reference_id?: string;
+          metadata?: Record<string, string>;
+          payment_status?: string;
+          amount_total?: number;
+        };
+      };
     };
     try {
       event = JSON.parse(rawBody);
@@ -77,7 +93,10 @@ export class StripeProvider implements PaymentProvider {
     // checkout.session.completed 且 payment_status='paid' 视为成功。
     const paid =
       event.type === 'checkout.session.completed' && obj.payment_status === 'paid';
-    return { outTradeNo, paid, rawStatus: event.type };
+    // amount_total 为最小货币单位（分/cent），与订单 amountCents 同口径，供上层对账。
+    const amountCents =
+      typeof obj.amount_total === 'number' ? obj.amount_total : undefined;
+    return { outTradeNo, paid, amountCents, rawStatus: event.type };
   }
 }
 

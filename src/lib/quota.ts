@@ -504,7 +504,7 @@ export async function resetExpiredTranscriptionQuotas(
  * 池子也未动用，亦为 no-op（WHERE 过滤）。仅作用于持池用户（purchasedMinutesBalance>0），无池用户保持既有
  *「usage 不动」行为。
  *
- * SQL：purchased 赋值在前引用旧 used，used 归零在后（MySQL 同语句 SET 左→右，须此序）；GREATEST 防负。
+ * 实现见 settlePoolOnLimitChangeTx：owed 排除在途预留（async/full/grant），先清预留列再整周期重置扣池。
  */
 export async function settlePoolOnLimitChange(
   userId: string,
@@ -514,15 +514,82 @@ export async function settlePoolOnLimitChange(
 ): Promise<void> {
   if (!Number.isFinite(oldLimit) || !Number.isFinite(newLimit)) return;
   if (newLimit >= oldLimit) return;
+  // 结算涉及「读 used → 排除在途预留算 owed → 清预留列 → 整周期重置扣池」多表多语句，必须原子。
+  // 传入基础客户端（有 $transaction）时自包一层事务；已是事务客户端（无 $transaction）时直接执行。
+  const maybeTx = db as {
+    $transaction?: (fn: (tx: QuotaDbClient) => Promise<void>) => Promise<void>;
+  };
+  if (typeof maybeTx.$transaction === 'function') {
+    await maybeTx.$transaction((tx) =>
+      settlePoolOnLimitChangeTx(tx, userId, oldLimit, newLimit)
+    );
+  } else {
+    await settlePoolOnLimitChangeTx(db, userId, oldLimit, newLimit);
+  }
+}
+
+/**
+ * settlePoolOnLimitChange 的事务体（须在事务内运行）：
+ *  1) 读当前 used/pool，仅对持池（purchased>0）且 used>新上限者结算；
+ *  2) owed = max(0, (used − 在途预留) − 旧上限)——**排除在途预留**（与月度重置同口径 computePoolOwed）。
+ *     否则把 async/full/grant 里尚未真正消费的预留也当作已消费扣进池子（Q_HIGH 幻扣：上传失败即凭空扣池）；
+ *  3) **先清**在途预留列（async/full session + 未结 grant）再归零 used（与 ensureQuotaWindow 同序）。
+ *     否则悬空预留会在后续 finalize/settle 时对新周期真实用量二次释放、把完成的转录白扣成 0（Q_HIGH 免费分钟）；
+ *  4) 整周期重置：扣 owed（GREATEST 防负）+ used 归零 + 推进 quotaResetAt。
+ */
+async function settlePoolOnLimitChangeTx(
+  db: QuotaDbClient,
+  userId: string,
+  oldLimit: number,
+  newLimit: number
+): Promise<void> {
   const oldLim = Math.max(0, Math.floor(oldLimit));
   const newLim = Math.max(0, Math.floor(newLimit));
-  const nextResetAt = getNextQuotaResetAt();
+
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: { transcriptionMinutesUsed: true, purchasedMinutesBalance: true },
+  });
+  if (!user || user.purchasedMinutesBalance <= 0) return;
+  // used 未超新上限：无 false overflow、池子本周期也未动用 → no-op（与旧 WHERE 语义一致）。
+  if (user.transcriptionMinutesUsed <= newLim) return;
+
+  // owed 用**清预留前**的快照、并排除在途预留计算（否则重复扣池）。
+  const owed = await computePoolOwed(
+    userId,
+    user.transcriptionMinutesUsed,
+    oldLim,
+    db
+  );
+
+  const now = new Date();
+  const nextResetAt = getNextQuotaResetAt(now);
+
+  // 先清预留列、再归零 used：消除并发 settle/finalize 读到未清预留二次释放的坏窗口（同月度重置）。
+  await db.session.updateMany({
+    where: {
+      userId,
+      OR: [
+        { asyncReservedMinutes: { gt: 0 } },
+        { fullReservedMinutes: { gt: 0 } },
+      ],
+    },
+    data: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+  });
+  await db.sonioxStreamGrant.updateMany({
+    where: { userId, settledAt: null, reservedMinutes: { gt: 0 } },
+    data: { reservedMinutes: 0 },
+  });
+
+  // 整周期重置 + 记结算下界 transcriptionUsageReconcileFrom=now（Q_MED）：used 周期中途归零后，
+  // 对账窗口 cycleStart 仍月对齐指向月初，会把结算前已计费 session 误报为 drift；此下界让 reconcile
+  // 用 max(cycleStart, now) 截断、排除结算前 session，杜绝虚报（→admin 误“修正”→过量扣池）。
   await db.$executeRaw`
     UPDATE User
-    SET purchasedMinutesBalance = GREATEST(0, purchasedMinutesBalance
-          - GREATEST(0, transcriptionMinutesUsed - ${oldLim})),
+    SET purchasedMinutesBalance = GREATEST(0, purchasedMinutesBalance - ${owed}),
         transcriptionMinutesUsed = 0,
-        quotaResetAt = ${nextResetAt}
+        quotaResetAt = ${nextResetAt},
+        transcriptionUsageReconcileFrom = ${now}
     WHERE id = ${userId}
       AND purchasedMinutesBalance > 0
       AND transcriptionMinutesUsed > ${newLim}
@@ -584,12 +651,21 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
       email: true,
       transcriptionMinutesUsed: true,
       quotaResetAt: true,
+      transcriptionUsageReconcileFrom: true,
     },
   });
 
   const results = await Promise.all(
     users.map(async (user) => {
-      const cycleStart = getQuotaCycleStartAt(user.quotaResetAt);
+      const monthCycleStart = getQuotaCycleStartAt(user.quotaResetAt);
+      // Q_MED：限额下调结算会在周期中途把 used 归零并记 transcriptionUsageReconcileFrom；用它作为
+      // 对账下界（取较晚者），排除结算前已计费的 session，避免虚报 drift。正常情况下该列为空或早于
+      // 月对齐的 cycleStart，max 使其无影响；月度重置后 cycleStart 自然越过它而失效（无需清列）。
+      const cycleStart =
+        user.transcriptionUsageReconcileFrom &&
+        user.transcriptionUsageReconcileFrom > monthCycleStart
+          ? user.transcriptionUsageReconcileFrom
+          : monthCycleStart;
 
       const sessions = await prisma.session.findMany({
         where: {

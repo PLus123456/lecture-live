@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server';
+import { Prisma } from '@prisma/client';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
 import { logAction } from '@/lib/auditLog';
+import { settlePoolOnLimitChange } from '@/lib/quota';
 import {
   resolveRoleQuotas,
   coerceThinkingDepthCap,
@@ -11,6 +13,31 @@ import {
 
 // 系统内置角色
 const SYSTEM_ROLES = ['FREE', 'PRO', 'ADMIN'] as const;
+
+/**
+ * 充值系统（Model A）：在下调某用户组的 transcriptionMinutesLimit 前，先按各用户**旧上限**结算其
+ * 购买时长池（仅持池 purchasedMinutesBalance>0 且旧上限 > 新上限者）。否则下次月度重置会用新的低
+ * limit 把「旧 limit 下本属免费的消费」误算成池子消费、甚至清零已购池（C2）。必须在同一事务内、
+ * 在批量 updateMany **之前**调用（传入 tx），使「结算池 + 下调上限」原子提交。
+ * 限额不变/上调时 findMany 命中为空 → no-op。
+ */
+async function settlePoolForLoweredLimit(
+  tx: Prisma.TransactionClient,
+  where: Prisma.UserWhereInput,
+  newLimit: number
+): Promise<void> {
+  const poolHolders = await tx.user.findMany({
+    where: {
+      ...where,
+      purchasedMinutesBalance: { gt: 0 },
+      transcriptionMinutesLimit: { gt: newLimit },
+    },
+    select: { id: true, transcriptionMinutesLimit: true },
+  });
+  for (const ph of poolHolders) {
+    await settlePoolOnLimitChange(ph.id, ph.transcriptionMinutesLimit, newLimit, tx);
+  }
+}
 
 interface GroupPermissions {
   transcriptionMinutesLimit: number;
@@ -453,6 +480,12 @@ export async function PUT(req: Request) {
           update: { value: JSON.stringify(sanitized) },
           create: { key: settingKey, value: JSON.stringify(sanitized) },
         });
+        // C2：下调分钟上限前先按旧上限结算持池用户的时长池（同事务原子）。
+        await settlePoolForLoweredLimit(
+          tx,
+          { role: groupId as 'ADMIN' | 'PRO' | 'FREE', customGroupId: null },
+          sanitized.transcriptionMinutesLimit
+        );
         await tx.user.updateMany({
           where: { role: groupId as 'ADMIN' | 'PRO' | 'FREE', customGroupId: null },
           data: {
@@ -495,6 +528,12 @@ export async function PUT(req: Request) {
         if (color !== undefined) groups[idx].color = color.trim();
         await saveCustomGroups(groups, tx);
 
+        // C2：下调分钟上限前先按旧上限结算持池用户的时长池（同事务原子）。
+        await settlePoolForLoweredLimit(
+          tx,
+          { customGroupId: groupId },
+          sanitized.transcriptionMinutesLimit
+        );
         // 同步该自定义组内所有用户的配额（在事务内）
         await tx.user.updateMany({
           where: { customGroupId: groupId },
@@ -576,6 +615,12 @@ export async function DELETE(req: Request) {
         const roleSet = new Set(affectedUsers.map((u) => u.role));
         for (const role of roleSet) {
           const defaults = await resolveRoleQuotas(role);
+          // C2：删组恢复默认配额若下调了分钟上限，先按旧上限结算持池用户的时长池。
+          await settlePoolForLoweredLimit(
+            tx,
+            { customGroupId: groupId, role },
+            defaults.transcriptionMinutesLimit
+          );
           await tx.user.updateMany({
             where: { customGroupId: groupId, role },
             data: {

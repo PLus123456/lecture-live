@@ -45,6 +45,11 @@ export interface CallbackResult {
   outTradeNo: string;
   /** 是否已支付成功。 */
   paid: boolean;
+  /**
+   * 网关回报的**实付金额（分）**，用于与订单金额对账（M1/M2）。上层 creditPaidOrder 若发现与
+   * PaymentOrder.amountCents 不一致则拒绝到账。渠道无法给出金额（如 sandbox）时留空 → 跳过对账。
+   */
+  amountCents?: number;
   /** 网关侧订单号/流水号（审计）。 */
   providerRef?: string;
   /** 网关原始状态串（审计/排障）。 */

@@ -22,7 +22,10 @@ interface TierInput {
 
 function intOrNull(v: unknown): number | null {
   const n = Number(v);
-  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : null;
+  // 负数与超 32 位（Int 列上限）视为无效 → 返回 null（让上层回 400 或回退默认），不再截 0：
+  // 否则 priceCents=-100 会被静默截成 ¥0 档（L3），超大值写库时 Int 溢出 500 而非干净的 400。
+  if (!Number.isFinite(n) || n < 0 || n > 2_147_483_647) return null;
+  return Math.floor(n);
 }
 
 /** 校验并归一化档位输入；返回 { data } 或 { error }。 */

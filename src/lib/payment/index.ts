@@ -20,7 +20,11 @@ export async function getPaymentProvider(
 
   switch (name) {
     case 'sandbox':
-      return s.sandboxEnabled ? new SandboxProvider() : null;
+      // 沙箱无验签、无真实支付：即便管理员误开 DB 开关，也在生产环境硬拒（H4）。
+      // 非生产（dev/test/e2e）才据开关启用，让本地/测试链路可完整跑通。
+      return s.sandboxEnabled && process.env.NODE_ENV !== 'production'
+        ? new SandboxProvider()
+        : null;
     case 'stripe':
       return s.stripeEnabled && s.stripeSecretKey ? new StripeProvider(s) : null;
     case 'alipay':

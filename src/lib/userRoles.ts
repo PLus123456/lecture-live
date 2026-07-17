@@ -1,7 +1,6 @@
 import type { UserRole } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { getSiteSettings } from '@/lib/siteSettings';
-import { settlePoolOnLimitChange } from '@/lib/quota';
 
 export function normalizeUserRole(
   value: unknown,
@@ -481,81 +480,7 @@ export async function resolveRoleStorageBytesLimit(role: UserRole): Promise<bigi
   return BigInt(Math.floor(safeMb)) * BigInt(MB);
 }
 
-/**
- * 将自定义用户组的配额同步到指定用户。
- * 字节配额按用户角色从 SiteSetting 解析（自定义组沿用其底层角色的字节上限）。
- */
-export async function syncUserQuotas(userId: string, permissions: GroupPermissions) {
-  const target = await prisma.user.findUnique({
-    where: { id: userId },
-    select: {
-      role: true,
-      transcriptionMinutesLimit: true,
-      purchasedMinutesBalance: true,
-    },
-  });
-  const storageBytesLimit = target
-    ? await resolveRoleStorageBytesLimit(target.role)
-    : undefined;
-  // 充值系统（Model A）：下调分钟上限前先按旧上限结算持池用户的时长池，
-  // 避免 owed 依赖 limit 而在下次月度重置误扣/清零池子。
-  if (
-    target &&
-    target.purchasedMinutesBalance > 0 &&
-    permissions.transcriptionMinutesLimit < target.transcriptionMinutesLimit
-  ) {
-    await settlePoolOnLimitChange(
-      userId,
-      target.transcriptionMinutesLimit,
-      permissions.transcriptionMinutesLimit
-    );
-  }
-  await prisma.user.update({
-    where: { id: userId },
-    data: {
-      allowedModels: permissions.allowedModels,
-      transcriptionMinutesLimit: permissions.transcriptionMinutesLimit,
-      storageHoursLimit: permissions.storageHoursLimit,
-      ...(storageBytesLimit !== undefined && { storageBytesLimit }),
-    },
-  });
-}
-
-/**
- * 批量同步自定义组内所有用户的配额。
- * 字节配额按角色解析后逐角色 updateMany（自定义组成员可能跨角色）。
- */
-export async function syncUsersOfCustomGroup(groupId: string, permissions: GroupPermissions) {
-  // 充值系统（Model A）：组内持池用户先按各自旧上限结算池子，再批量下调分钟上限。
-  const poolHolders = await prisma.user.findMany({
-    where: {
-      customGroupId: groupId,
-      purchasedMinutesBalance: { gt: 0 },
-      transcriptionMinutesLimit: { gt: permissions.transcriptionMinutesLimit },
-    },
-    select: { id: true, transcriptionMinutesLimit: true },
-  });
-  for (const ph of poolHolders) {
-    await settlePoolOnLimitChange(
-      ph.id,
-      ph.transcriptionMinutesLimit,
-      permissions.transcriptionMinutesLimit
-    );
-  }
-  await prisma.user.updateMany({
-    where: { customGroupId: groupId },
-    data: {
-      allowedModels: permissions.allowedModels,
-      transcriptionMinutesLimit: permissions.transcriptionMinutesLimit,
-      storageHoursLimit: permissions.storageHoursLimit,
-    },
-  });
-  // 字节上限按角色（FREE/PRO/ADMIN）分别回填
-  for (const role of ['FREE', 'PRO', 'ADMIN'] as const) {
-    const storageBytesLimit = await resolveRoleStorageBytesLimit(role);
-    await prisma.user.updateMany({
-      where: { customGroupId: groupId, role },
-      data: { storageBytesLimit },
-    });
-  }
-}
+// 注：自定义组/角色配额同步（含下调分钟上限时的时长池结算）现内联在
+// /api/admin/groups 路由的事务里（settlePoolForLoweredLimit + updateMany，见 C2 修复）。
+// 曾有 syncUserQuotas / syncUsersOfCustomGroup 两个助手意图承担此事，但从未被任何调用方引用
+//（死代码，且会让人误以为结算已接好），已移除。

@@ -67,14 +67,24 @@ export class AlipayProvider implements PaymentProvider {
     if (!sign) return null;
     if (!verifyAlipaySign(params, sign, this.alipayPublicKeyPem)) return null;
 
+    // 验签通过后仍须校验业务字段（支付宝集成规范要求，M2）：app_id 必须是本应用，否则拒绝——
+    // 防止用「攻击者自己支付宝应用」生成的合法签名通知（同一平台密钥可验签）来给我方订单冒充到账。
+    // seller_id 若已配置则一并校验（当前未存商户 PID，暂略）。金额对账由上层据 amountCents 完成。
+    if (this.appId && params.app_id && params.app_id !== this.appId) return null;
+
     const outTradeNo = params.out_trade_no || '';
     if (!outTradeNo) return null;
     const paid =
       params.trade_status === 'TRADE_SUCCESS' ||
       params.trade_status === 'TRADE_FINISHED';
+    // 支付宝金额以「元」计，两位小数 → 转分对账。
+    const amountCents = params.total_amount
+      ? Math.round(Number(params.total_amount) * 100)
+      : undefined;
     return {
       outTradeNo,
       paid,
+      amountCents: Number.isFinite(amountCents) ? amountCents : undefined,
       providerRef: params.trade_no,
       rawStatus: params.trade_status,
     };

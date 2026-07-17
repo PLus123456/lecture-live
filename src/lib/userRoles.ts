@@ -1,6 +1,7 @@
 import type { UserRole } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { getSiteSettings } from '@/lib/siteSettings';
+import { settlePoolOnLimitChange } from '@/lib/quota';
 
 export function normalizeUserRole(
   value: unknown,
@@ -487,11 +488,28 @@ export async function resolveRoleStorageBytesLimit(role: UserRole): Promise<bigi
 export async function syncUserQuotas(userId: string, permissions: GroupPermissions) {
   const target = await prisma.user.findUnique({
     where: { id: userId },
-    select: { role: true },
+    select: {
+      role: true,
+      transcriptionMinutesLimit: true,
+      purchasedMinutesBalance: true,
+    },
   });
   const storageBytesLimit = target
     ? await resolveRoleStorageBytesLimit(target.role)
     : undefined;
+  // 充值系统（Model A）：下调分钟上限前先按旧上限结算持池用户的时长池，
+  // 避免 owed 依赖 limit 而在下次月度重置误扣/清零池子。
+  if (
+    target &&
+    target.purchasedMinutesBalance > 0 &&
+    permissions.transcriptionMinutesLimit < target.transcriptionMinutesLimit
+  ) {
+    await settlePoolOnLimitChange(
+      userId,
+      target.transcriptionMinutesLimit,
+      permissions.transcriptionMinutesLimit
+    );
+  }
   await prisma.user.update({
     where: { id: userId },
     data: {
@@ -508,6 +526,22 @@ export async function syncUserQuotas(userId: string, permissions: GroupPermissio
  * 字节配额按角色解析后逐角色 updateMany（自定义组成员可能跨角色）。
  */
 export async function syncUsersOfCustomGroup(groupId: string, permissions: GroupPermissions) {
+  // 充值系统（Model A）：组内持池用户先按各自旧上限结算池子，再批量下调分钟上限。
+  const poolHolders = await prisma.user.findMany({
+    where: {
+      customGroupId: groupId,
+      purchasedMinutesBalance: { gt: 0 },
+      transcriptionMinutesLimit: { gt: permissions.transcriptionMinutesLimit },
+    },
+    select: { id: true, transcriptionMinutesLimit: true },
+  });
+  for (const ph of poolHolders) {
+    await settlePoolOnLimitChange(
+      ph.id,
+      ph.transcriptionMinutesLimit,
+      permissions.transcriptionMinutesLimit
+    );
+  }
   await prisma.user.updateMany({
     where: { customGroupId: groupId },
     data: {

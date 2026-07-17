@@ -17,6 +17,7 @@ import {
   Share2,
   FolderOpen,
   Paperclip,
+  Wallet,
   type LucideIcon,
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
@@ -26,6 +27,7 @@ export type AdminTab =
   | 'settings'
   | 'groups'
   | 'users'
+  | 'recharge'
   | 'files'
   | 'chatFiles'
   | 'shareLinks'
@@ -38,6 +40,7 @@ export const ADMIN_TABS: AdminTab[] = [
   'settings',
   'groups',
   'users',
+  'recharge',
   'files',
   'chatFiles',
   'shareLinks',
@@ -62,6 +65,7 @@ export function useAdminTabs(): AdminTabItem[] {
     { id: 'settings', label: t('nav.settings'), icon: Settings },
     { id: 'groups', label: t('nav.userGroups'), icon: UserCog },
     { id: 'users', label: t('nav.users'), icon: Users },
+    { id: 'recharge', label: t('nav.recharge'), icon: Wallet },
     { id: 'files', label: t('nav.files'), icon: FolderOpen },
     { id: 'chatFiles', label: t('nav.chatFiles'), icon: Paperclip },
     { id: 'shareLinks', label: t('nav.shareLinks'), icon: Share2 },

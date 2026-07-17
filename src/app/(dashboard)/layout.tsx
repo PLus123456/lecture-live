@@ -7,6 +7,7 @@ import ChatSidebar from '@/components/chat/ChatSidebar';
 import AdminSidebar from '@/components/admin/AdminSidebar';
 import AuthGuard from '@/components/layout/AuthGuard';
 import UserSettingsModal from '@/components/UserSettingsModal';
+import RechargeModal, { RechargeReturnHandler } from '@/components/RechargeModal';
 import BottomTabBar from '@/components/mobile/BottomTabBar';
 import MobileDrawer from '@/components/mobile/MobileDrawer';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -44,6 +45,10 @@ export default function DashboardLayout({
         )}
         {isMobile && <MobileDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} />}
         <UserSettingsModal />
+        <RechargeModal />
+        <Suspense fallback={null}>
+          <RechargeReturnHandler />
+        </Suspense>
         <main
           className={`transition-all duration-300 ${
             isMobile

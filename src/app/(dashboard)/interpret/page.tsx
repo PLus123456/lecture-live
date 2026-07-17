@@ -200,7 +200,9 @@ export default function InterpretPage() {
     !isRunning &&
     langA !== langB &&
     quotas &&
-    quotas.transcriptionMinutesUsed < quotas.transcriptionMinutesLimit;
+    // Model A：月度上限 + 购买的永久时长池都算可用额度
+    quotas.transcriptionMinutesUsed <
+      quotas.transcriptionMinutesLimit + (quotas.purchasedMinutesBalance ?? 0);
 
   const handleSwap = useCallback(() => {
     if (isRunning) return;
@@ -281,7 +283,8 @@ export default function InterpretPage() {
 
         {/* 配额不足警告 */}
         {quotas &&
-          quotas.transcriptionMinutesUsed >= quotas.transcriptionMinutesLimit && (
+          quotas.transcriptionMinutesUsed >=
+            quotas.transcriptionMinutesLimit + (quotas.purchasedMinutesBalance ?? 0) && (
             <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-amber-700 text-sm">
               {t('interpret.quotaWarning')}
             </div>
@@ -461,7 +464,8 @@ export default function InterpretPage() {
 
       {/* 配额不足警告 */}
       {quotas &&
-        quotas.transcriptionMinutesUsed >= quotas.transcriptionMinutesLimit && (
+        quotas.transcriptionMinutesUsed >=
+          quotas.transcriptionMinutesLimit + (quotas.purchasedMinutesBalance ?? 0) && (
           <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-amber-700 text-sm">
             {t('interpret.quotaWarning')}
           </div>

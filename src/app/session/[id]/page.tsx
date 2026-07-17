@@ -676,7 +676,8 @@ export default function ActiveSessionPage() {
             (quotaSnapshot.remainingTranscriptionMinutes ??
               Math.max(
                 0,
-                quotaSnapshot.transcriptionMinutesLimit -
+                quotaSnapshot.transcriptionMinutesLimit +
+                  (quotaSnapshot.purchasedMinutesBalance ?? 0) -
                   quotaSnapshot.transcriptionMinutesUsed
               )) * 60_000
           )
@@ -1476,7 +1477,8 @@ export default function ActiveSessionPage() {
           (latestQuota
             ? Math.max(
                 0,
-                latestQuota.transcriptionMinutesLimit -
+                latestQuota.transcriptionMinutesLimit +
+                  (latestQuota.purchasedMinutesBalance ?? 0) -
                   latestQuota.transcriptionMinutesUsed
               )
             : null);

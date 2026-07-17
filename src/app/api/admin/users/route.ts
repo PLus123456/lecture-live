@@ -10,7 +10,7 @@ import {
   resolveRoleQuotas,
   resolveRoleStorageBytesLimit,
 } from '@/lib/userRoles';
-import { releaseStorageBytes } from '@/lib/quota';
+import { releaseStorageBytes, settlePoolOnLimitChange } from '@/lib/quota';
 import { deleteCloudreveAttachmentFiles } from '@/lib/storage/cloudreveFileDelete';
 
 // 共享的用户查询 select 字段
@@ -604,6 +604,20 @@ export async function PATCH(req: Request) {
     // 存储用量不可在此重置（它是 SUM(session.durationMs) 的实时占用，只随删录音回落）。
     if (fields.resetTranscriptionUsage === true) {
       data.transcriptionMinutesUsed = 0;
+    }
+
+    // 充值系统（Model A）：若本次下调了转录分钟上限（角色/组/显式覆盖任一路径已写入 data），
+    // 先按旧上限结算持池用户的时长池并整周期重置，避免下次月度重置误扣/清零池子、或对账虚报 drift。
+    if (
+      typeof data.transcriptionMinutesLimit === 'number' &&
+      existing.purchasedMinutesBalance > 0 &&
+      data.transcriptionMinutesLimit < existing.transcriptionMinutesLimit
+    ) {
+      await settlePoolOnLimitChange(
+        userId,
+        existing.transcriptionMinutesLimit,
+        data.transcriptionMinutesLimit
+      );
     }
 
     if (Object.keys(data).length === 0) {

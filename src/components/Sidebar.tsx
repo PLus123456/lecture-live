@@ -242,22 +242,22 @@ export default function Sidebar({ slideOut = false }: { slideOut?: boolean }) {
           </button>
           {/* 设置 & 登出靠右，收起后隐藏 */}
           <div className={`flex items-center gap-1 transition-opacity duration-300 ${sidebarCollapsed ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
-            <ThemeSwitcher variant="button" className="border-transparent shadow-none" />
+            <ThemeSwitcher variant="ghost" />
             <button
               onClick={() => useSettingsStore.getState().setUserSettingsOpen(true)}
-              className="w-9 h-9 rounded-lg flex items-center justify-center
+              className="group w-9 h-9 rounded-lg flex items-center justify-center
                          text-charcoal-400 hover:bg-cream-100 hover:text-charcoal-600 transition-colors"
               title={t('nav.settings')}
             >
-              <Settings className="w-4 h-4" />
+              <Settings className="w-4 h-4 transition-transform duration-200 group-hover:rotate-45" />
             </button>
             <button
               onClick={() => void handleLogout()}
-              className="w-9 h-9 rounded-lg flex items-center justify-center
+              className="group w-9 h-9 rounded-lg flex items-center justify-center
                          text-charcoal-400 hover:bg-red-50 hover:text-red-500 transition-colors"
               title={t('auth.signOut')}
             >
-              <LogOut className="w-4 h-4" />
+              <LogOut className="w-4 h-4 transition-transform duration-200 group-hover:translate-x-0.5" />
             </button>
           </div>
         </div>

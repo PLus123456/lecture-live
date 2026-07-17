@@ -14,6 +14,8 @@ const {
   transactionMock,
   deductMock,
   recordUsageMock,
+  settleGrantsMock,
+  grantAggregateMock,
 } = vi.hoisted(() => ({
   createMock: vi.fn(),
   findFirstMock: vi.fn(),
@@ -23,6 +25,8 @@ const {
   transactionMock: vi.fn(),
   deductMock: vi.fn(),
   recordUsageMock: vi.fn(),
+  settleGrantsMock: vi.fn(),
+  grantAggregateMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -34,9 +38,17 @@ vi.mock('@/lib/prisma', () => ({
       findMany: findManyMock,
       update: updateMock,
     },
+    // R1-L2：cron 优先按 grants 的 usage-logs 实测时长计费（事务外聚合）。
+    sonioxStreamGrant: {
+      aggregate: grantAggregateMock,
+    },
     // cron reclaim 的认领+扣费同事务；默认实现执行回调并注入带 interpretSession 的 tx。
     $transaction: (...a: unknown[]) => transactionMock(...a),
   },
+}));
+// R1-L2：cron 事务内会结算本场 grants（释放 mint 预扣）——mock 掉原语本体，单测只验调用与互斥。
+vi.mock('@/lib/soniox/streamGrant', () => ({
+  settleStreamGrants: settleGrantsMock,
 }));
 vi.mock('@/lib/quota', () => ({
   deductTranscriptionMinutes: deductMock,
@@ -73,6 +85,8 @@ beforeEach(() => {
   updateMock.mockResolvedValue(undefined);
   recordUsageMock.mockResolvedValue(undefined);
   deductMock.mockResolvedValue({ role: 'FREE' });
+  settleGrantsMock.mockResolvedValue({ settledCount: 0, releasedMinutes: 0, actualMsTotal: 0 });
+  grantAggregateMock.mockResolvedValue({ _sum: { actualMs: null } });
   // cron reclaim 事务：执行回调并注入带 interpretSession.updateMany 的 tx（复用 updateManyMock）。
   transactionMock.mockImplementation(
     async (cb: (tx: unknown) => Promise<unknown>) =>
@@ -217,6 +231,44 @@ describe('reclaimStaleInterpretSessions', () => {
       6 * 60 * 60_000,
       expect.anything()
     );
+  });
+
+  it('R1-L2：grants 有 usage-logs 实测 → 按 sum(actualMs) 计费（精确口径取代墙钟封顶）+ 事务内结算 grants', async () => {
+    // startedAt = now - 8h（墙钟口径本应封 6h=360min），但实测串流只有 20 分钟 → 按 20 扣
+    const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
+    findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
+    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 20 * 60_000 } });
+    updateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    const n = await reclaimStaleInterpretSessions(NOW);
+
+    expect(n).toBe(1);
+    expect(grantAggregateMock).toHaveBeenCalledWith({
+      where: { interpretSessionId: 's1', actualMs: { gt: 0 } },
+      _sum: { actualMs: true },
+    });
+    expect(updateManyMock).toHaveBeenCalledWith({
+      where: { id: 's1', settledAt: null },
+      data: { settledAt: NOW, settledBy: 'cron_reclaim', billedMinutes: 20 },
+    });
+    // 结算本场 grants（释放 mint 预扣）与扣费同事务
+    expect(settleGrantsMock).toHaveBeenCalledWith(
+      { interpretSessionId: 's1' },
+      'interpret_cron',
+      expect.anything()
+    );
+    expect(deductMock).toHaveBeenCalledWith('u1', 20, expect.anything());
+  });
+
+  it('R1-L2：实测量超 6h 上限 → 仍封顶（防 Soniox 侧异常大值）', async () => {
+    const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
+    findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
+    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 9 * 60 * 60_000 } });
+    updateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    await reclaimStaleInterpretSessions(NOW);
+
+    expect(deductMock).toHaveBeenCalledWith('u1', 360, expect.anything());
   });
 
   it('认领输给 deduct(count=0) → 跳过、不扣费（互斥，不双扣）', async () => {

@@ -36,6 +36,7 @@ import {
 import { finalizeAsyncTranscription } from '@/lib/audio/asyncTranscribeFinalize';
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
 import { reclaimStaleInterpretSessions } from '@/lib/interpret/session';
+import { reconcileSonioxStreamUsage } from '@/lib/soniox/usageReconciliation';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
 // FINALIZING 专项：已发起收尾但卡住的会话（前端崩/断网/服务端重启导致 finalize 没跑完）
@@ -86,6 +87,14 @@ export interface BillingMaintenanceSummary {
   releasedOrphanFullReservations: number;
   cleanedOrphanSoniox: number;
   reclaimedInterpretSessions: number;
+  sonioxUsageReconciliation: {
+    regionsPolled: number;
+    logsSeen: number;
+    backfilled: number;
+    lateCharged: number;
+    orphanCharged: number;
+    orphanRefunded: number;
+  } | null;
   storageBytesReconciled: number;
   reconciliationRunId: string | null;
   chatFilesCleanup: {
@@ -275,6 +284,21 @@ export async function runBillingMaintenance(options?: {
     // 不 rethrow —— 其他维护任务结果仍要返回
   }
 
+  // R1-L3：Soniox usage-logs 对账——回填各 grant 的实测串流时长（actualMs）、结算孤儿 grant
+  // （有用量转实扣/没用过退预扣）、迟到补扣。放在 interpret reclaim **之前**：让紧随其后的
+  // interpret cron 能用上刚回填的精确时长（否则退回墙钟封顶口径）。失败仅 log 不 rethrow。
+  let sonioxUsageReconciliation: BillingMaintenanceSummary['sonioxUsageReconciliation'] =
+    null;
+  try {
+    sonioxUsageReconciliation = await reconcileSonioxStreamUsage(now);
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'soniox usage reconciliation failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
   // B3 兜底：对超时仍未结算的同声传译会话按服务端墙钟兜底扣费（防「客户端不调 /deduct 白嫖」）。
   // 与 /deduct 经 settledAt 条件认领互斥，恰好扣一次。失败仅 log 不 rethrow。
   let reclaimedInterpretSessions = 0;
@@ -401,6 +425,7 @@ export async function runBillingMaintenance(options?: {
         releasedOrphanFullReservations,
         cleanedOrphanSoniox,
         reclaimedInterpretSessions,
+        sonioxUsageReconciliation,
         storageBytesReconciled,
         reconciliationRunId,
         chatFilesCleanup,
@@ -419,6 +444,7 @@ export async function runBillingMaintenance(options?: {
     releasedOrphanFullReservations,
     cleanedOrphanSoniox,
     reclaimedInterpretSessions,
+    sonioxUsageReconciliation,
     storageBytesReconciled,
     reconciliationRunId,
     chatFilesCleanup,

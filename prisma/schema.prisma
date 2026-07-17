@@ -286,6 +286,37 @@ model InterpretSession {
   @@index([anchorId])
 }
 
+// R1-L2：Soniox 临时 key 签发台账 + 预扣载体。浏览器直连 Soniox 串流，mint 是唯一必经服务端点：
+// 每次签发落一行并**原子预扣** reservedMinutes（计入 transcriptionMinutesUsed，额度不足按剩余收缩、
+// 收缩到 0 拒发）；key 本身带 max_session_duration_seconds=预扣分钟(到点 Soniox 硬断连) + single_use
+// (一 key 一连接)，故单 key 可串流量恒 ≤ 已预扣量——改装客户端白嫖收益=0，想续流必须回来再 mint 再预扣。
+// 结算（互斥闸门=settledAt 条件原子认领，恰好一次）：
+//  - session finalize / interpret deduct / interpret cron：释放预留，实扣走各自既有链路；
+//  - usage cron（对账）：按 /v1/usage-logs 回填 actualMs（client_reference_id=kind:userId:grantId，
+//    服务端构造客户端不可控；实测暴力断连的流也入账），对无人认领的孤儿 grant 有用量按实际转扣
+//    （billedMinutes，对账 expected 计入）、无用量退预扣。月度重置把未结 grant 的预留清零（随 used 归零作废）。
+model SonioxStreamGrant {
+  id                 String    @id @default(cuid())
+  userId             String                          // 冗余列，不建 relation（同 InterpretUsage 惯例）
+  kind               String                          // 'realtime' | 'interpret'
+  sessionId          String?                         // realtime：关联 Session.id（finalize 结算键）
+  interpretSessionId String?                         // interpret：关联 InterpretSession.id（deduct/cron 结算键）
+  region             String                          // us/eu/jp：审计 + usage-logs 分区归属
+  reservedMinutes    Int                             // 签发时预扣分钟（月度重置清零；结算时按当前值释放）
+  maxSessionSeconds  Int                             // 下发给 Soniox 的单连接时长硬上限（审计）
+  mintedAt           DateTime  @default(now())
+  settledAt          DateTime?                       // 非空=已结算；一切结算路径的互斥闸门
+  settledBy          String?                         // 'session_finalize'|'interpret_deduct'|'interpret_cron'|'usage_cron'|'usage_refund'|'mint_failed'|'admin'
+  actualMs           Int?                            // usage-logs 实测串流毫秒（对账回填，CAS 恰好一次）
+  usageLogUuid       String?                         // usage-logs 条目 uuid（审计/去重）
+  billedMinutes      Int?                            // 经本 grant 直接补扣的分钟（孤儿转扣/迟到补扣；对账 expected 计入）
+
+  @@index([userId, settledAt])
+  @@index([settledAt, mintedAt])
+  @@index([sessionId])
+  @@index([interpretSessionId])
+}
+
 // ─── 站点设置（Key-Value 存储） ───
 model SiteSetting {
   key       String   @id          // 如 "site_name", "site_url", "logo_path" 等

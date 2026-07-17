@@ -44,4 +44,9 @@ export interface TemporaryApiKeyResponse {
   ws_url?: string;
   rest_base_url?: string;
   region: SonioxRegion;
+  /**
+   * R1-L1：本 key 建立的连接的串流时长硬上限（秒）＝服务端本次预扣的额度。到点 Soniox 服务端
+   * 断连（temp_api_key_session_expired）；客户端应提前 ~30s 主动平滑轮换（重新 mint 接续）。
+   */
+  max_session_duration_seconds?: number;
 }

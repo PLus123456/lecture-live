@@ -296,7 +296,7 @@ function getRegionConfig(region: SonioxRegion): SonioxRuntimeConfig | null {
  * 从数据库获取区域配置（加密存储的 API Key 会自动解密）。
  * 环境变量优先，数据库其次。
  */
-async function getRegionConfigAsync(region: SonioxRegion): Promise<SonioxRuntimeConfig | null> {
+export async function getRegionConfigAsync(region: SonioxRegion): Promise<SonioxRuntimeConfig | null> {
   // 先尝试环境变量
   const envConfig = getRegionConfig(region);
   if (envConfig) return envConfig;

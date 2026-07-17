@@ -30,6 +30,10 @@ import {
 } from '@/lib/audio/recordingDuration';
 import { clampSessionDurationMs, getBillableMinutes } from '@/lib/billing';
 import { deductTranscriptionMinutes } from '@/lib/quota';
+import {
+  settleStreamGrants,
+  sumSessionGrantActualMs,
+} from '@/lib/soniox/streamGrant';
 import { resolveUserFeatureFlags, resolveUserSummaryModels } from '@/lib/userRoles';
 import { callLLM } from '@/lib/llm/gateway';
 import { resolveSummaryModel } from '@/lib/llm/summaryModel';
@@ -251,10 +255,18 @@ export async function finalizeSession(
     // now 的墙钟含全部暂停/挂机空闲，客户端没能上报暂停时会把空闲整段当录音计费、超额扣配额
     // （审计 medium）。此路径改以实际转录覆盖的时长为准（更接近真实录音量，宁少勿多）。
     const isAutoReclaim = options.finalizeSource === 'system_auto_reclaim';
+    // R1-L2：但「宁少勿多」不能少过 Soniox 实测串流量——改装客户端直连串流、不回传任何转录内容，
+    // 挂到 reclaim 时 transcript/durationMs 皆 0，若只按内容口径就整场免单。usage cron 已把该
+    // session 各 grant 的 usage-logs 实测毫秒回填到 actualMs（真实产生转录成本的量，不含挂机
+    // 空闲——流断即停表），auto-reclaim 用它作时长下限。诚实用户正常收尾不走此分支，口径不变。
+    const grantActualMs = isAutoReclaim
+      ? await sumSessionGrantActualMs(options.sessionId).catch(() => 0)
+      : 0;
     const resolvedDurationMs = Math.max(
       session.durationMs ?? 0,
       transcriptDurationMs,
       isAutoReclaim ? 0 : serverDurationMs,
+      grantActualMs,
       legacyDurationFallbackMs
     );
     const finalDurationMs = clampSessionDurationMs(
@@ -377,6 +389,15 @@ export async function finalizeSession(
       if (updateResult.count === 0) {
         return { lockLost: true as const };
       }
+
+      // R1-L2：结算本会话全部未结 stream grants（释放 mint 时的预扣），与实扣同事务原子提交——
+      // 预扣是「占位」，实扣走下方权威口径；净效果 = billableMinutes，多退少补恰好一次。
+      // 只有锁赢家（count===1）走到这里，与 usage-cron 的孤儿结算经 settledAt 条件认领互斥。
+      await settleStreamGrants(
+        { sessionId: options.sessionId },
+        'session_finalize',
+        tx
+      );
 
       if (shouldDeduct) {
         // 走 deductTranscriptionMinutes（内含 ensureQuotaWindow 跨月度重置点窗口校正，

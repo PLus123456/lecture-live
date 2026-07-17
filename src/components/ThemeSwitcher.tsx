@@ -5,7 +5,7 @@ import { useI18n } from '@/lib/i18n';
 import { useTheme, type Theme } from '@/components/ThemeProvider';
 
 interface ThemeSwitcherProps {
-  variant?: 'button' | 'segmented';
+  variant?: 'button' | 'ghost' | 'segmented';
   className?: string;
   showLabels?: boolean;
 }
@@ -24,18 +24,28 @@ export default function ThemeSwitcher({
   const { theme, resolvedTheme, setTheme } = useTheme();
   const { t } = useI18n();
 
-  if (variant === 'button') {
+  if (variant === 'button' || variant === 'ghost') {
     const nextTheme = resolvedTheme === 'dark' ? 'light' : 'dark';
     const Icon = resolvedTheme === 'dark' ? Sun : Moon;
     const label = resolvedTheme === 'dark'
       ? t('settings.switchToLight')
       : t('settings.switchToDark');
 
+    // `ghost` is a chrome-less icon button that sits beside other flat icon
+    // buttons (e.g. the sidebar footer's settings/logout). It carries no border,
+    // background or shadow and leans on the global dark compatibility layer for
+    // its night palette, exactly like those neighbours — so the rest and hover
+    // states line up. `button` keeps the raised, self-contained treatment used
+    // for the floating toggles on the login/setup/landing pages.
+    const chrome = variant === 'ghost'
+      ? 'text-charcoal-400 transition-colors hover:bg-cream-100 hover:text-charcoal-600 focus-visible:ring-2 focus-visible:ring-rust-400'
+      : 'border border-cream-200 bg-white text-charcoal-400 shadow-sm transition-all hover:border-cream-300 hover:bg-cream-100 hover:text-charcoal-700 focus-visible:ring-2 focus-visible:ring-rust-400 focus-visible:ring-offset-2 dark:border-charcoal-700 dark:bg-charcoal-800 dark:text-cream-400 dark:hover:border-charcoal-600 dark:hover:bg-charcoal-700 dark:hover:text-cream-100 dark:focus-visible:ring-offset-charcoal-900';
+
     return (
       <button
         type="button"
         onClick={() => setTheme(nextTheme)}
-        className={`group inline-flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg border border-cream-200 bg-white text-charcoal-400 shadow-sm transition-all hover:border-cream-300 hover:bg-cream-100 hover:text-charcoal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rust-400 focus-visible:ring-offset-2 dark:border-charcoal-700 dark:bg-charcoal-800 dark:text-cream-400 dark:hover:border-charcoal-600 dark:hover:bg-charcoal-700 dark:hover:text-cream-100 dark:focus-visible:ring-offset-charcoal-900 ${className}`}
+        className={`group inline-flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg focus-visible:outline-none ${chrome} ${className}`}
         aria-label={label}
         title={label}
       >

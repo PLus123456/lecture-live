@@ -16,6 +16,7 @@ export async function GET(req: Request) {
       displayName: true,
       role: true,
       createdAt: true,
+      emailVerifiedAt: true,
       transcriptionMinutesUsed: true,
       transcriptionMinutesLimit: true,
       storageHoursUsed: true,

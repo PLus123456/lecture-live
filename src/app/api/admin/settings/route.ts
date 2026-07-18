@@ -21,6 +21,8 @@ import {
   validateCloudreveBaseUrl,
 } from '@/lib/storage/cloudreve';
 import { parseWorkerUrls } from '@/lib/audio/enhanceWorkerClient';
+import { isValidEmailAddress } from '@/lib/email/domains';
+import { invalidateMailer } from '@/lib/email/mailer';
 
 // 获取所有站点设置
 export async function GET(req: Request) {
@@ -81,13 +83,20 @@ export async function PUT(req: Request) {
       // 历史上还写过 default_user_role，但从未有读取方 —— 是写得进、读不出的幽灵键，已移除避免误导。
       'email_verification',
       'password_min_length',
+      // 注册域名管控（教育邮箱白名单 + 一次性邮箱拦截）
+      'block_disposable_email',
+      'disposable_email_extra',
+      'email_domain_allowlist',
+      'email_domain_allowlist_enforce',
       // 邮件相关
       'smtp_host',
       'smtp_port',
       'smtp_user',
       'smtp_password',
+      'smtp_secure',
       'sender_name',
       'sender_email',
+      'marketing_emails_enabled',
       // 存储相关
       'storage_mode',
       'cloudreve_url',
@@ -222,6 +231,20 @@ export async function PUT(req: Request) {
       entries[workerUrlIdx] = ['audio_enhance_worker_url', workerUrls.join(',')];
     }
 
+    // 发件人邮箱格式校验（非空时）：配错的 From 地址会导致所有外发邮件被拒，提前拦下。
+    const senderEmailIdx = entries.findIndex(([key]) => key === 'sender_email');
+    if (senderEmailIdx >= 0) {
+      const rawSender = entries[senderEmailIdx][1];
+      const senderStr = typeof rawSender === 'string' ? rawSender.trim() : '';
+      if (senderStr && !isValidEmailAddress(senderStr)) {
+        return NextResponse.json(
+          { error: `发件人邮箱格式不正确: ${senderStr}` },
+          { status: 400 }
+        );
+      }
+      entries[senderEmailIdx] = ['sender_email', senderStr];
+    }
+
     // 记录切换前的存储模式，用于检测是否需要迁移
     const previousSettings = await getSiteSettings({ fresh: true });
 
@@ -261,6 +284,7 @@ export async function PUT(req: Request) {
     invalidateSonioxDbConfigCache();
     invalidateTrustedProxyCache();
     invalidateCloudreveConfigCache();
+    invalidateMailer(); // SMTP 配置可能已变，丢弃缓存的 transporter
     const settings = await getSiteSettings({ fresh: true });
 
     // U86：审计日志移到事务提交之后。此前在事务前 fire-and-forget 记录，事务失败会留下

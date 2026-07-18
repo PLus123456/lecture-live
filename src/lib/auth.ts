@@ -526,6 +526,9 @@ export async function registerWithOptions(
     role?: UserPayload['role'];
     bcryptRounds?: number;
     jwtExpiryDays?: number;
+    // 邮箱是否视为已验证。开启站点级邮箱验证硬门禁时，注册路由传 false，
+    // 让新账号 emailVerifiedAt=null（未验证不得登录）；默认 true 保持历史行为。
+    emailVerified?: boolean;
   }
 ) {
   const role = normalizeUserRole(options?.role, 'FREE');
@@ -536,6 +539,7 @@ export async function registerWithOptions(
     resolveRoleQuotas(role),
     resolveRoleStorageBytesLimit(role),
   ]);
+  const emailVerified = options?.emailVerified !== false;
   const user = await prisma.user.create({
     data: {
       email,
@@ -543,6 +547,7 @@ export async function registerWithOptions(
       displayName,
       role,
       quotaResetAt: getNextQuotaResetAt(),
+      emailVerifiedAt: emailVerified ? new Date() : null,
       ...quotas,
       storageBytesLimit,
     },
@@ -584,10 +589,13 @@ export async function changePassword(
   });
 }
 
+/** login() 在「密码正确但邮箱未验证」时抛出的哨兵错误，供路由映射到「需验证」响应。 */
+export const EMAIL_NOT_VERIFIED_ERROR = 'Email not verified';
+
 export async function login(
   email: string,
   password: string,
-  options?: { jwtExpiryDays?: number; bcryptRounds?: number }
+  options?: { jwtExpiryDays?: number; bcryptRounds?: number; requireEmailVerified?: boolean }
 ) {
   const user = await prisma.user.findUnique({ where: { email } });
 
@@ -605,6 +613,11 @@ export async function login(
   // （不向调用方泄露"该账号存在但被封"）。verifyToken 同步拦截其旧 token。
   if (user.status !== 1) {
     throw new Error('Invalid credentials');
+  }
+  // 邮箱验证硬门禁：站点开启验证且此账号未验证时拒绝登录。此检查在密码校验**之后**，
+  // 只有已知正确口令者才会看到这个错误，故不构成账户枚举侧信道（合法本人需要它来触发重发）。
+  if (options?.requireEmailVerified && user.emailVerifiedAt == null) {
+    throw new Error(EMAIL_NOT_VERIFIED_ERROR);
   }
   const token = signToken({
     id: user.id,

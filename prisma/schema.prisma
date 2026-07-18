@@ -39,6 +39,13 @@ model User {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
+  // 邮箱验证：null=未验证。开启站点级 email_verification 硬门禁后，未验证账号不得登录。
+  // 初始 admin（setup）与关闭验证前已存在的老用户视为已验证（迁移时回填 createdAt）。
+  emailVerifiedAt DateTime?
+  // 邮件通知订阅偏好（JSON：{ [category]: boolean }）。缺失/未列出的分类走该分类默认值；
+  // 事务类邮件（验证/重置/安全通知）不受此开关影响，恒发。见 src/lib/email/preferences.ts。
+  emailPreferences String? @db.Text
+
   // 配额
   transcriptionMinutesUsed  Int       @default(0)
   transcriptionMinutesLimit Int       @default(60) // FREE=60min/月, PRO=600, ADMIN=unlimited
@@ -61,8 +68,28 @@ model User {
   // 只在「购买到账」与「月度重置结算溢出」两处变更；月内所有扣费/预留都不碰它。
   purchasedMinutesBalance Int @default(0)
 
-  sessions   Session[]
-  shareLinks ShareLink[]
+  sessions    Session[]
+  shareLinks  ShareLink[]
+  emailTokens EmailToken[]
+}
+
+// ─── 邮件令牌（邮箱验证 / 密码重置） ───
+// 安全：只存 raw token 的 SHA-256 十六进制哈希（tokenHash），raw token 仅出现在发出的邮件里。
+// 校验时对入参哈希后按 tokenHash 唯一索引查找（等价常量时间，避免时序侧信道）。单次使用
+// （consumedAt 一旦置位即失效）、短 TTL（验证 24h / 重置 1h）、按 (userId,type) 可批量作废旧令牌。
+model EmailToken {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type       String // "VERIFY_EMAIL" | "RESET_PASSWORD"
+  tokenHash  String    @unique // sha256(rawToken) hex
+  expiresAt  DateTime
+  consumedAt DateTime? // 非空=已使用，作废
+  requestIp  String? // 申请来源 IP（审计）
+  createdAt  DateTime  @default(now())
+
+  @@index([userId, type])
+  @@index([expiresAt])
 }
 
 model Session {

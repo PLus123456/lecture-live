@@ -30,6 +30,7 @@ import {
 } from '@/lib/audio/recordingDuration';
 import { clampSessionDurationMs, getBillableMinutes } from '@/lib/billing';
 import { deductTranscriptionMinutes } from '@/lib/quota';
+import { maybeSendTranscriptionQuotaAlert } from '@/lib/email/quotaAlert';
 import {
   settleStreamGrants,
   sumSessionGrantActualMs,
@@ -440,6 +441,11 @@ export async function finalizeSession(
     }
 
     const updatedSession = commit.updated!;
+
+    // 转录配额「快用完」提醒（事务已提交后，fire-and-forget，仅在本次真扣了分钟时触发）。
+    if (shouldDeduct) {
+      void maybeSendTranscriptionQuotaAlert(session.userId).catch(() => undefined);
+    }
 
     // P0-6：CAS 成功，recordingPath 已落库；发布 staged 录音（删旧 previousReference，此路径通常无旧值）。
     if (stagedAudio) {

@@ -61,13 +61,19 @@ interface SiteSettingsData {
   default_group: string;
   email_verification: boolean;
   password_min_length: string;
+  block_disposable_email: boolean;
+  disposable_email_extra: string;
+  email_domain_allowlist: string;
+  email_domain_allowlist_enforce: boolean;
   // 邮件相关
   smtp_host: string;
   smtp_port: string;
   smtp_user: string;
   smtp_password: string;
+  smtp_secure: boolean;
   sender_name: string;
   sender_email: string;
+  marketing_emails_enabled: boolean;
   // 存储相关
   storage_mode: string;
   cloudreve_url: string;
@@ -137,12 +143,18 @@ const defaultSettings: SiteSettingsData = {
   default_group: 'FREE',
   email_verification: false,
   password_min_length: '8',
+  block_disposable_email: false,
+  disposable_email_extra: '',
+  email_domain_allowlist: '',
+  email_domain_allowlist_enforce: false,
   smtp_host: '',
   smtp_port: '587',
   smtp_user: '',
   smtp_password: '',
+  smtp_secure: false,
   sender_name: 'LectureLive',
   sender_email: '',
+  marketing_emails_enabled: true,
   storage_mode: 'local',
   cloudreve_url: '',
   cloudreve_client_id: '',
@@ -594,8 +606,37 @@ function RegistrationPanel({
       <SettingField label={t('adminSettings.emailVerification')} description={t('adminSettings.emailVerificationDesc')}>
         <ToggleSwitch checked={settings.email_verification as boolean} onChange={(v) => onToggle('email_verification', v)} />
       </SettingField>
+      {settings.email_verification && (
+        <div className="-mt-2 mb-2 px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-700 dark:bg-amber-900/20 dark:border-amber-800 dark:text-amber-300">
+          {t('adminSettings.emailVerificationNeedsSmtp')}
+        </div>
+      )}
       <SettingField label={t('adminSettings.minPasswordLength')} description={t('adminSettings.minPasswordLengthDesc')}>
         <TextInput value={settings.password_min_length} onChange={(v) => onChange('password_min_length', v)} type="number" />
+      </SettingField>
+      <SettingField label={t('adminSettings.blockDisposableEmail')} description={t('adminSettings.blockDisposableEmailDesc')}>
+        <ToggleSwitch checked={settings.block_disposable_email as boolean} onChange={(v) => onToggle('block_disposable_email', v)} />
+      </SettingField>
+      {settings.block_disposable_email && (
+        <SettingField label={t('adminSettings.disposableEmailExtra')} description={t('adminSettings.disposableEmailExtraDesc')}>
+          <TextAreaInput
+            value={settings.disposable_email_extra}
+            onChange={(v) => onChange('disposable_email_extra', v)}
+            placeholder={'mailinator.com\nexample-temp.com'}
+            rows={2}
+          />
+        </SettingField>
+      )}
+      <SettingField label={t('adminSettings.emailDomainAllowlist')} description={t('adminSettings.emailDomainAllowlistDesc')}>
+        <TextAreaInput
+          value={settings.email_domain_allowlist}
+          onChange={(v) => onChange('email_domain_allowlist', v)}
+          placeholder={'edu.cn\nstanford.edu'}
+          rows={2}
+        />
+      </SettingField>
+      <SettingField label={t('adminSettings.emailDomainAllowlistEnforce')} description={t('adminSettings.emailDomainAllowlistEnforceDesc')}>
+        <ToggleSwitch checked={settings.email_domain_allowlist_enforce as boolean} onChange={(v) => onToggle('email_domain_allowlist_enforce', v)} />
       </SettingField>
       {/* 头像设置说明 */}
       <div className="py-4 border-b border-cream-100 dark:border-charcoal-700 last:border-0">
@@ -612,11 +653,53 @@ function RegistrationPanel({
 function EmailPanel({
   settings,
   onChange,
+  onToggle,
 }: {
   settings: SiteSettingsData;
   onChange: (key: string, value: string) => void;
+  onToggle: (key: string, value: boolean) => void;
 }) {
   const { t } = useI18n();
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [testRecipient, setTestRecipient] = useState('');
+
+  // 测试：带上表单当前值（密码为掩码时后端自动回落已保存值）。sendTo 有值则发测试邮件，否则仅测连接。
+  const runTest = async (withSend: boolean) => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const res = await fetch('/api/admin/email/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          smtp_host: settings.smtp_host,
+          smtp_port: settings.smtp_port,
+          smtp_user: settings.smtp_user,
+          smtp_password: settings.smtp_password,
+          smtp_secure: settings.smtp_secure,
+          sender_name: settings.sender_name,
+          sender_email: settings.sender_email,
+          ...(withSend ? { sendTo: testRecipient } : {}),
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.ok) {
+        setTestResult({
+          ok: true,
+          text: withSend ? t('adminSettings.emailTestSendOk') : t('adminSettings.emailTestOk'),
+        });
+      } else {
+        setTestResult({ ok: false, text: data?.error ?? t('common.networkError') });
+      }
+    } catch {
+      setTestResult({ ok: false, text: t('common.networkError') });
+    } finally {
+      setTesting(false);
+    }
+  };
+
   return (
     <div>
       <SettingField label={t('adminSettings.smtpServer')} description={t('adminSettings.smtpServerDesc')}>
@@ -624,6 +707,9 @@ function EmailPanel({
       </SettingField>
       <SettingField label={t('adminSettings.smtpPort')}>
         <TextInput value={settings.smtp_port} onChange={(v) => onChange('smtp_port', v)} placeholder="587" />
+      </SettingField>
+      <SettingField label={t('adminSettings.smtpSecure')} description={t('adminSettings.smtpSecureDesc')}>
+        <ToggleSwitch checked={settings.smtp_secure as boolean} onChange={(v) => onToggle('smtp_secure', v)} />
       </SettingField>
       <SettingField label={t('adminSettings.smtpUsername')}>
         <TextInput value={settings.smtp_user} onChange={(v) => onChange('smtp_user', v)} placeholder="user@example.com" />
@@ -637,6 +723,50 @@ function EmailPanel({
       <SettingField label={t('adminSettings.senderEmail')}>
         <TextInput value={settings.sender_email} onChange={(v) => onChange('sender_email', v)} placeholder="noreply@example.com" />
       </SettingField>
+      <SettingField label={t('adminSettings.marketingEmails')} description={t('adminSettings.marketingEmailsDesc')}>
+        <ToggleSwitch checked={settings.marketing_emails_enabled as boolean} onChange={(v) => onToggle('marketing_emails_enabled', v)} />
+      </SettingField>
+
+      {/* 测试连接 / 发送测试邮件 */}
+      <div className="py-4 border-t border-cream-100 dark:border-charcoal-700 space-y-2">
+        <div className="text-sm font-medium text-charcoal-700 dark:text-cream-200">
+          {t('adminSettings.emailTestTitle')}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => runTest(false)}
+            disabled={testing || !settings.smtp_host}
+            className="px-3 py-1.5 text-xs font-medium text-charcoal-600 border border-cream-200 rounded-lg
+                       hover:bg-cream-50 dark:text-cream-200 dark:border-charcoal-600 dark:hover:bg-charcoal-700
+                       transition-colors disabled:opacity-50"
+          >
+            {testing ? t('common.loading') : t('adminSettings.emailTestConnection')}
+          </button>
+          <input
+            type="email"
+            value={testRecipient}
+            onChange={(e) => setTestRecipient(e.target.value)}
+            placeholder={t('adminSettings.emailTestRecipient')}
+            className="flex-1 min-w-[180px] px-3 py-1.5 text-xs rounded-lg border border-cream-300 dark:border-charcoal-600
+                       dark:bg-charcoal-800 dark:text-cream-100 focus:outline-none focus:ring-2 focus:ring-rust-400"
+          />
+          <button
+            type="button"
+            onClick={() => runTest(true)}
+            disabled={testing || !settings.smtp_host || !testRecipient}
+            className="px-3 py-1.5 text-xs font-medium text-white bg-rust-500 rounded-lg
+                       hover:bg-rust-600 transition-colors disabled:opacity-50"
+          >
+            {t('adminSettings.emailTestSend')}
+          </button>
+        </div>
+        {testResult && (
+          <div className={`text-xs ${testResult.ok ? 'text-green-600 dark:text-green-400' : 'text-rust-500'}`}>
+            {testResult.text}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1808,7 +1938,7 @@ export default function SettingsPanel() {
       case 'registration':
         return <RegistrationPanel settings={settings} onChange={handleChange} onToggle={handleToggle} />;
       case 'email':
-        return <EmailPanel settings={settings} onChange={handleChange} />;
+        return <EmailPanel settings={settings} onChange={handleChange} onToggle={handleToggle} />;
       case 'storage':
         return <StoragePanel settings={settings} onChange={handleChange} />;
       case 'appearance':

@@ -280,6 +280,8 @@ async function handleCreateAdmin(body: {
       displayName,
       role: 'ADMIN',
       quotaResetAt: getNextQuotaResetAt(),
+      // 初始管理员通过部署向导创建，视为已验证——否则开启邮箱验证后管理员会把自己锁在门外。
+      emailVerifiedAt: new Date(),
       transcriptionMinutesLimit: 999999,
       storageHoursLimit: 999999,
       allowedModels: 'local,gpt,claude,deepseek',

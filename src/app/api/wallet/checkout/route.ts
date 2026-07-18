@@ -87,6 +87,19 @@ export async function POST(req: Request) {
     creditCents: tier.kind === 'topup' ? tier.creditCents ?? tier.priceCents : undefined,
     returnUrl,
     subject: tier.name,
+    // 冻结发放快照：回调结算按此发放，不再读 live 档位（H1 档位删/停不致退单、H2 冻结价防漂移）。
+    grant:
+      kind === 'purchase'
+        ? {
+            kind: tier.kind === 'membership' ? 'membership' : 'minutes',
+            priceCents: tier.priceCents,
+            tierId: tier.id,
+            tierName: tier.name,
+            grantRole: tier.grantRole,
+            durationDays: tier.durationDays,
+            grantMinutes: tier.grantMinutes,
+          }
+        : undefined,
   });
 
   try {

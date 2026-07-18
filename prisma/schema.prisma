@@ -43,6 +43,11 @@ model User {
   transcriptionMinutesUsed  Int       @default(0)
   transcriptionMinutesLimit Int       @default(60) // FREE=60min/月, PRO=600, ADMIN=unlimited
   quotaResetAt              DateTime?
+  // 充值系统（Model A）：限额下调结算（settlePoolOnLimitChange）会在**周期中途**把 used 归零，
+  // 而对账窗口 cycleStart 按 quotaResetAt 月对齐仍指向月初 → 会把本周期结算前已计费的 session 误报为
+  // drift（Q_MED）。此列记录「结算发生的时刻」作为对账下界：reconcile 用 max(cycleStart, 此列) 截断，
+  // 排除结算前已计费的 session。正常月度重置后 cycleStart 自然越过此值（max 使其失效），无需清列。
+  transcriptionUsageReconcileFrom DateTime?
   storageHoursUsed          Float     @default(0)
   storageHoursLimit         Float     @default(10) // FREE=10h录音, PRO=100h, ADMIN=unlimited
   storageBytesUsed          BigInt    @default(0) // chat 上传文件累计字节

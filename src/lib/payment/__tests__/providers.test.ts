@@ -2,8 +2,9 @@ import { describe, expect, it } from 'vitest';
 import crypto from 'crypto';
 import { SandboxProvider } from '@/lib/payment/providers/sandbox';
 import { verifyStripeSignature } from '@/lib/payment/providers/stripe';
-import { buildSignString } from '@/lib/payment/providers/alipay';
+import { AlipayProvider, buildSignString } from '@/lib/payment/providers/alipay';
 import { decryptWechatResource } from '@/lib/payment/providers/wechat';
+import type { RechargeSettings } from '@/lib/payment/settings';
 
 describe('SandboxProvider', () => {
   const provider = new SandboxProvider();
@@ -80,6 +81,64 @@ describe('支付宝待签名串构造', () => {
       charset: 'utf-8',
     });
     expect(s).toBe('a=1&b=2&charset=utf-8');
+  });
+});
+
+describe('支付宝回调业务字段校验（M2）+ 金额对账', () => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+  });
+  const pubPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const provider = new AlipayProvider({
+    alipayAppId: 'app-123',
+    alipayPrivateKey: '',
+    alipayPublicKey: pubPem,
+    alipayGateway: '',
+  } as unknown as RechargeSettings);
+
+  // 用测试私钥对 buildSignString(params) 签名，模拟支付宝异步通知。
+  function signedBody(params: Record<string, string>): string {
+    const sign = crypto
+      .createSign('RSA-SHA256')
+      .update(buildSignString(params), 'utf8')
+      .sign(privateKey, 'base64');
+    return new URLSearchParams({ ...params, sign }).toString();
+  }
+
+  it('▶ app_id 匹配 + 合法签名 → paid，且回报金额转分（12.34 元→1234 分）', async () => {
+    const body = signedBody({
+      app_id: 'app-123',
+      out_trade_no: 'LLA',
+      trade_status: 'TRADE_SUCCESS',
+      total_amount: '12.34',
+    });
+    const res = await provider.verifyCallback(new Request('https://app.test/cb'), body);
+    expect(res?.paid).toBe(true);
+    expect(res?.outTradeNo).toBe('LLA');
+    expect(res?.amountCents).toBe(1234);
+  });
+
+  it('▶ app_id 不匹配（他人应用即便签名合法）→ null（M2 防冒充到账）', async () => {
+    const body = signedBody({
+      app_id: 'attacker-app',
+      out_trade_no: 'LLA',
+      trade_status: 'TRADE_SUCCESS',
+      total_amount: '12.34',
+    });
+    const res = await provider.verifyCallback(new Request('https://app.test/cb'), body);
+    expect(res).toBeNull();
+  });
+
+  it('▶ 签名非法 → null（验签仍是第一道闸）', async () => {
+    const body = new URLSearchParams({
+      app_id: 'app-123',
+      out_trade_no: 'LLA',
+      trade_status: 'TRADE_SUCCESS',
+      total_amount: '12.34',
+      sign: 'deadbeef',
+    }).toString();
+    const res = await provider.verifyCallback(new Request('https://app.test/cb'), body);
+    expect(res).toBeNull();
   });
 });
 

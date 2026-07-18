@@ -932,6 +932,33 @@ describe('reconcileTranscriptionUsage — 计入 interpret 台账', () => {
     });
   });
 
+  it('▶ Q_MED 结算下界：reconcileFrom 晚于月初 → 对账窗口用结算时刻，排除结算前 session', async () => {
+    const reconcileFrom = new Date('2026-01-15T00:00:00.000Z'); // 结算发生在周期中途
+    userFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'u-settled',
+        email: 's@x.com',
+        transcriptionMinutesUsed: 0, // 结算已把 used 归零
+        quotaResetAt: futureReset,
+        transcriptionUsageReconcileFrom: reconcileFrom,
+      },
+    ]);
+    sessionFindManyMock.mockResolvedValueOnce([]); // 结算前 session 被 DB 按下界过滤掉
+    interpretUsageAggregateMock.mockResolvedValueOnce({ _sum: { billedMinutes: 0 } });
+
+    const result = await reconcileTranscriptionUsage();
+
+    // 无虚报 drift（结算前已计费 session 被排除，expected=used=0）
+    expect(result).toEqual([]);
+    // 关键：session 与 interpret 查询的下界都用结算时刻（2026-01-15），而非月初（mock 的 2026-01-01）
+    const sessionWhere = sessionFindManyMock.mock.calls[0][0].where;
+    expect(sessionWhere.OR[0].billedAt.gte).toEqual(reconcileFrom);
+    expect(interpretUsageAggregateMock).toHaveBeenCalledWith({
+      where: { userId: 'u-settled', chargedAt: { gte: reconcileFrom } },
+      _sum: { billedMinutes: true },
+    });
+  });
+
   it('混合用户：expected = session 分钟 + interpret 分钟', async () => {
     // Session 2 分钟（120000ms → ceil=2）+ interpret 3 分钟 = expected 5；used 5 → drift 0
     userFindManyMock.mockResolvedValueOnce([
@@ -1265,15 +1292,76 @@ describe('购买时长池 Model A（gross 池）', () => {
       expect(executeRawMock).not.toHaveBeenCalled();
     });
 
-    it('▶ 下调：发一条原子 UPDATE，携带旧/新上限', async () => {
-      executeRawMock.mockResolvedValueOnce(1);
+    it('▶ 无池用户：no-op（不清预留、不发 SQL）', async () => {
+      userFindUniqueMock.mockResolvedValueOnce({
+        transcriptionMinutesUsed: 500,
+        purchasedMinutesBalance: 0,
+      });
       await settlePoolOnLimitChange('u1', 600, 60);
+      expect(executeRawMock).not.toHaveBeenCalled();
+      expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+    });
+
+    it('▶ used<=新上限：no-op（无 false overflow、池未动用）', async () => {
+      userFindUniqueMock.mockResolvedValueOnce({
+        transcriptionMinutesUsed: 50,
+        purchasedMinutesBalance: 100,
+      });
+      await settlePoolOnLimitChange('u1', 600, 60); // newLim=60, used=50<=60
+      expect(executeRawMock).not.toHaveBeenCalled();
+    });
+
+    it('▶ 下调：按旧上限扣 owed + 清在途预留 + 整周期重置', async () => {
+      userFindUniqueMock.mockResolvedValueOnce({
+        transcriptionMinutesUsed: 150,
+        purchasedMinutesBalance: 100,
+      });
+      sessionAggregateMock.mockResolvedValueOnce({
+        _sum: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+      });
+      streamGrantAggregateMock.mockResolvedValueOnce({ _sum: { reservedMinutes: 0 } });
+      sessionUpdateManyMock.mockResolvedValueOnce({ count: 0 });
+      streamGrantUpdateManyMock.mockResolvedValueOnce({ count: 0 });
+      executeRawMock.mockResolvedValueOnce(1);
+
+      await settlePoolOnLimitChange('u1', 60, 30); // oldLim=60, newLim=30, used=150
+      // 插值序：owed, nextResetAt, now(reconcileFrom), userId, newLim。owed=max(0,(150-0)-60)=90
       expect(executeRawMock).toHaveBeenCalledTimes(1);
-      // Prisma.sql 标签模板插值顺序：oldLim, nextResetAt, userId, newLim
       const call = executeRawMock.mock.calls[0];
-      expect(call[1]).toBe(600); // oldLim
-      expect(call[3]).toBe('u1'); // userId
-      expect(call[4]).toBe(60); // newLim
+      expect(call[1]).toBe(90); // owed
+      expect(call[3]).toBeInstanceOf(Date); // now → transcriptionUsageReconcileFrom（Q_MED）
+      expect(call[4]).toBe('u1'); // userId
+      expect(call[5]).toBe(30); // newLim
+      // Q_HIGH：必须清在途预留列（否则悬空预留后续二次释放）。
+      expect(sessionUpdateManyMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+        })
+      );
+      expect(streamGrantUpdateManyMock).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { reservedMinutes: 0 } })
+      );
+    });
+
+    it('▶ Q_HIGH 排除在途预留：used=200 全为预留 → owed=0（不幻扣池子），但仍清预留列', async () => {
+      userFindUniqueMock.mockResolvedValueOnce({
+        transcriptionMinutesUsed: 200,
+        purchasedMinutesBalance: 500,
+      });
+      sessionAggregateMock.mockResolvedValueOnce({
+        _sum: { asyncReservedMinutes: 200, fullReservedMinutes: 0 },
+      });
+      streamGrantAggregateMock.mockResolvedValueOnce({ _sum: { reservedMinutes: 0 } });
+      sessionUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+      streamGrantUpdateManyMock.mockResolvedValueOnce({ count: 0 });
+      executeRawMock.mockResolvedValueOnce(1);
+
+      await settlePoolOnLimitChange('u1', 60, 30); // oldLim=60
+      // owed = max(0, (200-200) - 60) = 0 —— 预留未真正消费，绝不扣池子
+      expect(executeRawMock.mock.calls[0][1]).toBe(0);
+      // 但预留列仍被清（悬空预留会二次释放，见 Q_HIGH 免费分钟）
+      expect(sessionUpdateManyMock).toHaveBeenCalled();
+      expect(streamGrantUpdateManyMock).toHaveBeenCalled();
     });
   });
 

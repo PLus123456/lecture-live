@@ -36,7 +36,13 @@ async function handle(req: Request, providerName: string, isBrowserGet: boolean)
 
   let credit: Awaited<ReturnType<typeof creditPaidOrder>> | null = null;
   if (result.paid) {
-    credit = await creditPaidOrder(result.outTradeNo, result.providerRef);
+    // 传入回调渠道名（H3 绑定订单 provider）与网关实付金额（M1/M2 对账）。
+    credit = await creditPaidOrder(
+      result.outTradeNo,
+      result.providerRef,
+      providerName,
+      result.amountCents
+    );
   }
 
   if (isBrowserGet) {

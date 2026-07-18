@@ -71,6 +71,12 @@ export class WechatProvider implements PaymentProvider {
     const signature = req.headers.get('wechatpay-signature');
     if (!timestamp || !nonce || !signature || !this.platformCertPem) return null;
 
+    // 时间戳容差（防重放）：拒绝签名时间超过 5 分钟的通知（微信推荐；到账 CAS 另有幂等兜底）。
+    const tSec = Number(timestamp);
+    if (Number.isFinite(tSec) && Math.abs(Date.now() / 1000 - tSec) > 300) {
+      return null;
+    }
+
     // 1) 验签：message = `${timestamp}\n${nonce}\n${rawBody}\n`，用平台证书公钥验 RSA-SHA256。
     if (
       !verifyWechatSignature(
@@ -94,7 +100,12 @@ export class WechatProvider implements PaymentProvider {
     const decrypted = decryptWechatResource(resource, this.apiV3Key);
     if (!decrypted) return null;
 
-    let payload: { out_trade_no?: string; trade_state?: string; transaction_id?: string };
+    let payload: {
+      out_trade_no?: string;
+      trade_state?: string;
+      transaction_id?: string;
+      amount?: { total?: number; payer_total?: number };
+    };
     try {
       payload = JSON.parse(decrypted);
     } catch {
@@ -102,9 +113,13 @@ export class WechatProvider implements PaymentProvider {
     }
     const outTradeNo = payload.out_trade_no || '';
     if (!outTradeNo) return null;
+    // 微信 amount.total 以「分」为单位，与订单 amountCents 同口径，供上层对账。
+    const amountCents =
+      typeof payload.amount?.total === 'number' ? payload.amount.total : undefined;
     return {
       outTradeNo,
       paid: payload.trade_state === 'SUCCESS',
+      amountCents,
       providerRef: payload.transaction_id,
       rawStatus: payload.trade_state,
     };

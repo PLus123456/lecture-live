@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * 用户「使用时长」管理 —— admin 用户详情弹窗烟测。
@@ -113,11 +113,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('用户详情弹窗：真实存储用量 + 单用户配额覆盖 + 重置 + 到期校验', async ({ page }) => {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('admin@lecturelive.com');
-  await page.locator('input[type="password"]').fill('admin123');
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  await loginAsAdmin(page, { prewarm: ['/admin?tab=users'] });
 
   await page.goto('/admin?tab=users');
   await page.waitForLoadState('networkidle');

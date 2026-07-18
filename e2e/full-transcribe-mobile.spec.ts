@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { devices, expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 完整版补全转录·移动端（阶段C）端到端：mobile 回放页（MobilePlaybackLayout）transcript tab
@@ -69,11 +69,11 @@ function fullSegment() {
 }
 
 async function loginThroughUi(page: Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('alice@example.com');
-  await page.locator('input[type="password"]').fill('Abcd1234');
-  await page.getByRole('button', { name: 'Sign In' }).click();
-  await expect(page).toHaveURL(/\/home$/);
+  await loginViaForm(page, {
+    email: 'alice@example.com',
+    password: 'Abcd1234',
+    prewarm: ['/session/prewarm/playback'],
+  });
 }
 
 interface FullMockOptions {

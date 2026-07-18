@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * Admin 充值面板烟测 —— 全量 route mock、无真实 DB。
@@ -68,11 +68,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function loginAdmin(page: import('@playwright/test').Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('admin@lecturelive.com');
-  await page.locator('input[type="password"]').fill('admin123');
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  await loginAsAdmin(page, { prewarm: ['/admin?tab=recharge'] });
   await page.goto('/admin?tab=recharge');
   await page.waitForLoadState('networkidle');
   await expect(page.getByText(/Recharge System|充值系统/).first()).toBeVisible();

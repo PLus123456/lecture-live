@@ -54,9 +54,17 @@ async function readContracts(page: Page): Promise<AnimationContract[]> {
 }
 
 test.describe('Landing 首屏入场编排', () => {
+  test.beforeEach(async ({ page }) => {
+    // 并行 + 冷 dev server 下 '/' 的客户端 chunk 可能落后于流式 shell 很久，
+    // 先用 page.request 预热编译（不产生导航、不动页面状态）。
+    await page.request.get('/').catch(() => undefined);
+  });
+
   test('第一幕时序：顶栏先落，再左列逐行，最后右侧视觉', async ({ page }) => {
     await page.goto('/');
-    await expect(page.locator('#landing-title')).toBeAttached();
+    await expect(page.locator('#landing-title')).toBeAttached({
+      timeout: 15_000,
+    });
 
     const contracts = await readContracts(page);
 
@@ -105,7 +113,9 @@ test.describe('Landing 首屏入场编排', () => {
 
   test('折叠线以下：分区显隐编排与悬浮交互恢复', async ({ page }) => {
     await page.goto('/');
-    await expect(page.locator('#landing-title')).toBeAttached();
+    await expect(page.locator('#landing-title')).toBeAttached({
+      timeout: 15_000,
+    });
 
     // ── Bento 卡片：入场动画错峰契约（animation-delay 与 hover 的
     //    transition-delay 解耦），以及被通用 reveal 规则压死的 hover
@@ -181,7 +191,9 @@ test.describe('Landing 首屏入场编排', () => {
   test('prefers-reduced-motion：内容立即全部呈现，无分批入场', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await page.goto('/');
-    await expect(page.locator('#landing-title')).toBeAttached();
+    await expect(page.locator('#landing-title')).toBeAttached({
+      timeout: 15_000,
+    });
 
     // reduce 下动画被压到 0.01ms 且 delay 清零：所有元素应当已经可见，
     // 不给 10s 的宽限——2s 内没到位就说明 delay 清零失效（分批瞬移回归）。

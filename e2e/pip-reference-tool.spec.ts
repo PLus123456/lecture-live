@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { devices, expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 画中画参考工具端到端：用 addInitScript 桩掉各家 PiP API 模拟浏览器形态，
@@ -42,11 +42,11 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function loginThroughUi(page: Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('alice@example.com');
-  await page.locator('input[type="password"]').fill('Abcd1234');
-  await page.getByRole('button', { name: 'Sign In' }).click();
-  await expect(page).toHaveURL(/\/home$/);
+  await loginViaForm(page, {
+    email: 'alice@example.com',
+    password: 'Abcd1234',
+    prewarm: ['/session/prewarm'],
+  });
 }
 
 // 预置 zustand persist 的转录 store 快照（暂停态 + 一段已完成转录），

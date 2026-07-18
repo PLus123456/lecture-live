@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 充值中心（用户端）烟测 —— 全量 route mock、无真实 DB。
@@ -100,11 +100,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function login(page: import('@playwright/test').Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('stu@example.com');
-  await page.locator('input[type="password"]').fill('whatever');
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  await loginViaForm(page, { email: 'stu@example.com', password: 'whatever' });
 }
 
 async function openRechargeModal(page: import('@playwright/test').Page) {

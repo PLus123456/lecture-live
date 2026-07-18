@@ -63,11 +63,22 @@ export async function POST(req: Request) {
     });
 
     // 仅对正常账号发送重置邮件；被禁用账号静默（也不给重置入口）。
+    //
+    // 刻意不 await：SMTP 往返要 200ms~3s，而账号不存在时是立即返回 —— 这个时间差本身就是
+    // 账号枚举信道，通用响应文案挡不住它。响应内容与发信结果无关（永远 GENERIC_OK），
+    // 把发信移出响应路径即可抹平。login() 用的是反向手法（给不存在的分支补一次 dummy bcrypt
+    // 拉平耗时），这里不照搬：SMTP 延迟不可预测，且不该为不存在的账号真去连一次 SMTP。
     if (user && user.status === 1) {
-      await sendPasswordResetEmail(user, {
+      void sendPasswordResetEmail(user, {
         settings: siteSettings ?? undefined,
         requestIp: clientIp === 'unknown' ? null : clientIp,
-      });
+      }).catch((err) =>
+        logger.error(
+          { err: serializeError(err) },
+          '[forgot-password] 发送重置邮件失败'
+        )
+      );
+      // 审计的是「发起了重置请求」，与投递成败无关，故不再挂在 await 之后。
       logAction(req, 'user.password.reset_requested', {
         user: { id: user.id, email: user.email, role: 'FREE' },
         userName: user.displayName,

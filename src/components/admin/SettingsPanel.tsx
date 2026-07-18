@@ -26,6 +26,7 @@ import {
 import { useTheme } from '@/components/ThemeProvider';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import LlmSettingsPanel from '@/components/admin/LlmSettingsPanel';
+import EmailBroadcastSection from '@/components/admin/EmailBroadcastSection';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
 
@@ -767,6 +768,9 @@ function EmailPanel({
           </div>
         )}
       </div>
+
+      {/* 群发公告/促销：product_updates / promotions 两个用户开关的唯一实际发信来源 */}
+      <EmailBroadcastSection />
     </div>
   );
 }

@@ -70,8 +70,11 @@ function buildTransporter(cfg: EmailConfig): Transporter {
     host: cfg.host,
     port: cfg.port,
     secure: cfg.secure, // 465 隐式 TLS；否则明文起步
-    // 非隐式 TLS 时要求 STARTTLS 升级（拒绝明文投递），端口 25 例外（部分中继不支持）。
-    requireTLS: !cfg.secure && cfg.port !== 25,
+    // 非隐式 TLS 时要求 STARTTLS 升级（拒绝明文投递）。
+    // 端口 25 的豁免收窄到「匿名投递」：老式中继确实常不支持 STARTTLS，但那只在不带凭据时成立。
+    // 一旦配了 user/password，无条件豁免就意味着中间人剥掉 STARTTLS 通告即可让我们
+    // 明文发出 AUTH LOGIN（base64 的账号密码等于明文）—— 有凭据就绝不接受降级。
+    requireTLS: !cfg.secure && !(cfg.port === 25 && !cfg.user),
     auth: cfg.user ? { user: cfg.user, pass: cfg.password } : undefined,
     connectionTimeout: 10_000,
     greetingTimeout: 10_000,

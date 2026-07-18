@@ -5,6 +5,7 @@ import {
   normalizeEmail,
   getEmailDomain,
   parseDomainList,
+  parseDomainListDetailed,
   domainMatchesList,
   isDisposableEmail,
   isEducationEmail,
@@ -79,6 +80,31 @@ describe('parseDomainList', () => {
   });
 });
 
+describe('parseDomainListDetailed（丢弃项必须可见）', () => {
+  it('把无法解析的条目按原文回报，而不是静默吞掉', () => {
+    const r = parseDomainListDetailed('edu.cn, *.edu.cn, .stanford.edu, edu');
+    expect(r.valid).toEqual(['edu.cn']);
+    // 原文回显：管理员要认得出自己填的是哪一条
+    expect(r.invalid).toEqual(['*.edu.cn', '.stanford.edu', 'edu']);
+  });
+  it('全部合法时 invalid 为空', () => {
+    const r = parseDomainListDetailed('edu.cn\nstanford.edu');
+    expect(r.valid).toEqual(['edu.cn', 'stanford.edu']);
+    expect(r.invalid).toEqual([]);
+  });
+  it('纯分隔符/空输入不算配置错误', () => {
+    for (const raw of ['', '   ', ' , ; \n ', null, undefined]) {
+      const r = parseDomainListDetailed(raw);
+      expect(r.valid).toEqual([]);
+      expect(r.invalid).toEqual([]);
+    }
+  });
+  it('重复的非法条目只报一次', () => {
+    const r = parseDomainListDetailed('*.edu.cn, *.edu.cn');
+    expect(r.invalid).toEqual(['*.edu.cn']);
+  });
+});
+
 describe('domainMatchesList（含子域）', () => {
   it('精确与子域匹配', () => {
     expect(domainMatchesList('edu.cn', ['edu.cn'])).toBe(true);
@@ -143,6 +169,44 @@ describe('checkRegistrationEmail', () => {
     expect(r.isEducation).toBe(true);
     expect(checkRegistrationEmail('x@gmail.com', policy).ok).toBe(true);
   });
+
+  // #10：白名单强制开着、管理员填的条目却一条都没解析出来（如 "*.edu.cn"）。
+  // 旧实现 allowlist.length>0 不成立 → 直接跳过强制 → 全世界都能注册，而管理员以为已生效。
+  it('强制白名单但条目全部非法 → fail-closed，不放行任何人', () => {
+    const policy = buildDomainPolicy({
+      block_disposable_email: false,
+      disposable_email_extra: '',
+      email_domain_allowlist: '*.edu.cn',
+      email_domain_allowlist_enforce: true,
+    });
+    expect(policy.allowlist).toEqual([]);
+    const r = checkRegistrationEmail('anyone@gmail.com', policy);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('allowlist_misconfigured');
+    // 连管理员本想放行的院校域名也一并拒掉——配置坏了就是坏了，不猜他的意图
+    expect(checkRegistrationEmail('x@pku.edu.cn', policy).ok).toBe(false);
+  });
+
+  it('强制白名单 + 白名单本就为空 → 维持「不限制」放行（有意行为，非配置错误）', () => {
+    const policy = buildDomainPolicy({
+      block_disposable_email: false,
+      disposable_email_extra: '',
+      email_domain_allowlist: '',
+      email_domain_allowlist_enforce: true,
+    });
+    expect(checkRegistrationEmail('x@gmail.com', policy).ok).toBe(true);
+  });
+
+  it('部分条目非法时按已解析出的白名单强制（不整体 fail-closed）', () => {
+    const policy = buildDomainPolicy({
+      block_disposable_email: false,
+      disposable_email_extra: '',
+      email_domain_allowlist: 'pku.edu.cn, *.edu.cn',
+      email_domain_allowlist_enforce: true,
+    });
+    expect(checkRegistrationEmail('x@pku.edu.cn', policy).ok).toBe(true);
+    expect(checkRegistrationEmail('x@gmail.com', policy).reason).toBe('not_allowlisted');
+  });
 });
 
 describe('buildDomainPolicy', () => {
@@ -157,5 +221,15 @@ describe('buildDomainPolicy', () => {
     expect(policy.disposableExtra).toEqual(['temp.io', 'spam.co']);
     expect(policy.allowlist).toEqual(['edu.cn']);
     expect(policy.allowlistEnforce).toBe(true);
+    expect(policy.allowlistInvalid).toEqual([]);
+  });
+  it('把白名单里被丢弃的条目带进 policy（供调用方报错/日志）', () => {
+    const policy = buildDomainPolicy({
+      block_disposable_email: false,
+      disposable_email_extra: '',
+      email_domain_allowlist: 'edu.cn, *.edu.cn',
+      email_domain_allowlist_enforce: true,
+    });
+    expect(policy.allowlistInvalid).toEqual(['*.edu.cn']);
   });
 });

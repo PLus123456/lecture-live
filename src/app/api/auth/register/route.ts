@@ -89,6 +89,19 @@ export async function POST(req: Request) {
     const policy = buildDomainPolicy(siteSettings);
     const domainCheck = checkRegistrationEmail(email, policy);
     if (!domainCheck.ok) {
+      // 白名单配置坏了（强制开着但一条都没解析出来）：这是站点配置故障，不是用户的错。
+      // 换任何邮箱都注册不了，所以既不能说"请换用符合要求的邮箱"，也不能静默放行 ——
+      // 报 503 让它在监控里可见，并把丢弃的原始条目写进日志供管理员按图索骥。
+      if (domainCheck.reason === 'allowlist_misconfigured') {
+        logger.error(
+          { invalidEntries: policy.allowlistInvalid },
+          '[register] 域名白名单强制开启但无一条有效条目，注册已 fail-closed；请修正 email_domain_allowlist'
+        );
+        return NextResponse.json(
+          { error: '注册域名白名单配置有误，请联系管理员' },
+          { status: 503 }
+        );
+      }
       const reasonMessage =
         domainCheck.reason === 'disposable_blocked'
           ? '不支持使用一次性/临时邮箱注册，请换用常用邮箱'
@@ -142,8 +155,25 @@ export async function POST(req: Request) {
         return { ok: false as const, error: 'send failed' };
       });
       if (!sendResult.ok) {
-        // 账号已创建但邮件没发出去：提示用户稍后在登录页重发，不算致命错误。
-        logger.warn('[register] 验证邮件未成功发送，用户需稍后重发');
+        // 账号已创建但验证信没发出去。**不能**照旧回「请前往邮箱查收」——那封信根本不存在，
+        // 用户会一直等；而账号已占住了这个唯一邮箱，重注册撞 P2002、登录被 403 挡、
+        // 走重置密码又要经同一条坏 SMTP，等于死胡同。
+        // 也**不**在此 fail-open 放行（把账号标成已验证）：isEmailEnabled 那处 fail-open 是
+        // 管理员可见的全局姿态，而这里的失败是单次、可被攻击者诱发的（打爆 SMTP 即可绕过验证）。
+        // 故：保留门禁，如实告知，并把既有的「重新发送」入口给他——SMTP 修好后本人即可自助恢复。
+        logger.error(
+          { userId: user.id },
+          '[register] 验证邮件发送失败，账号已创建但用户无法完成验证；请检查 SMTP 配置'
+        );
+        return NextResponse.json(
+          {
+            verificationRequired: true,
+            emailSendFailed: true,
+            email: user.email,
+            message: '账号已创建，但验证邮件发送失败，请稍后重试发送',
+          },
+          { status: 201 }
+        );
       }
       return NextResponse.json(
         {

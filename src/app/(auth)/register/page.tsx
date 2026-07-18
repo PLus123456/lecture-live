@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/hooks/useAuth';
-import { Loader2, MailCheck } from 'lucide-react';
+import { Loader2, MailCheck, MailWarning } from 'lucide-react';
 import SiteLogo from '@/components/SiteLogo';
 import { useI18n } from '@/lib/i18n';
 import DOMPurify from 'dompurify';
@@ -27,6 +27,8 @@ export default function RegisterPage() {
   const [passwordMinLength, setPasswordMinLength] = useState(8);
   // 邮箱验证硬门禁：注册成功但需验证时，进入「去邮箱查收」态（不跳转 /home）。
   const [verificationSentTo, setVerificationSentTo] = useState<string | null>(null);
+  // 账号建好了但验证信没发出去：同一面板改用告警态，否则让用户空等一封不存在的邮件。
+  const [verificationSendFailed, setVerificationSendFailed] = useState(false);
   const [resendMsg, setResendMsg] = useState('');
   const [resending, setResending] = useState(false);
 
@@ -75,6 +77,7 @@ export default function RegisterPage() {
     try {
       const result = await registerUser(email, password, displayName);
       if (result && 'verificationRequired' in result && result.verificationRequired) {
+        setVerificationSendFailed(Boolean(result.emailSendFailed));
         setVerificationSentTo(email);
         return;
       }
@@ -130,14 +133,26 @@ export default function RegisterPage() {
 
         {verificationSentTo ? (
           <div className="bg-white rounded-xl shadow-sm border border-cream-200 p-6 space-y-4 animate-fade-in-up stagger-2 text-center">
-            <div className="mx-auto w-12 h-12 rounded-full bg-green-50 flex items-center justify-center">
-              <MailCheck className="w-6 h-6 text-green-600" />
+            <div
+              className={`mx-auto w-12 h-12 rounded-full flex items-center justify-center ${
+                verificationSendFailed ? 'bg-amber-50' : 'bg-green-50'
+              }`}
+            >
+              {verificationSendFailed ? (
+                <MailWarning className="w-6 h-6 text-amber-600" />
+              ) : (
+                <MailCheck className="w-6 h-6 text-green-600" />
+              )}
             </div>
             <h2 className="font-serif text-lg font-bold text-charcoal-800">
-              {t('auth.checkEmailTitle')}
+              {verificationSendFailed
+                ? t('auth.verificationSendFailedTitle')
+                : t('auth.checkEmailTitle')}
             </h2>
             <p className="text-sm text-charcoal-500">
-              {t('auth.checkEmailDesc', { email: verificationSentTo })}
+              {verificationSendFailed
+                ? t('auth.verificationSendFailedDesc', { email: verificationSentTo })
+                : t('auth.checkEmailDesc', { email: verificationSentTo })}
             </p>
             {resendMsg && (
               <div className="px-3 py-2 rounded-lg bg-cream-50 border border-cream-200 text-xs text-charcoal-600">

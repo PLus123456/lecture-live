@@ -90,6 +90,9 @@ export default {
     checkEmailDesc: '我们已向 {email} 发送了一封验证邮件，请点击其中的链接完成邮箱验证。',
     resendVerification: '重新发送验证邮件',
     verificationResent: '如果该邮箱待验证，我们已重新发送验证邮件。',
+    // 账号建好了但验证信没发出去——别让用户去查一封永远不会到的邮件，直接引导到重发按钮
+    verificationSendFailedTitle: '账号已创建，但验证邮件发送失败',
+    verificationSendFailedDesc: '{email} 的账号已创建，但验证邮件没能发出去。请点击下方重新发送；若持续失败，请联系站点管理员。',
     verifyEmailPrompt: '你的邮箱尚未验证，请先完成验证后再登录。',
     forgotPassword: '忘记密码？',
     forgotPasswordTitle: '找回密码',
@@ -100,6 +103,7 @@ export default {
     resetPasswordDone: '密码已重置，正在跳转到登录页…',
     resetPasswordSubmit: '重置密码',
     resetLinkInvalid: '重置链接无效或已过期，请重新申请。',
+    resetMissingToken: '这个页面需要从密码重置邮件里的链接打开。请重新申请一封重置邮件。',
     verifying: '正在验证你的邮箱…',
     verifySuccess: '邮箱验证成功，正在进入…',
     verifyFailed: '验证链接无效或已过期，请重新获取。',
@@ -1036,6 +1040,25 @@ export default {
     emailTestRecipient: '收件邮箱（可选）',
     emailTestOk: 'SMTP 连接成功',
     emailTestSendOk: '测试邮件已发送，请查收',
+
+    // 群发公告/促销
+    broadcastTitle: '群发邮件',
+    broadcastDesc: '向用户发送产品更新或促销邮件。只发给邮箱已验证、且未退订该分类的用户。发送不可撤回，请先统计人数并给自己发一封测试信。',
+    broadcastAudienceAll: '全部用户',
+    broadcastSubject: '邮件标题（收件箱里显示的主题）',
+    broadcastHeading: '正文大标题',
+    broadcastBody: '正文内容',
+    broadcastCtaLabel: '按钮文字（可选）',
+    broadcastCountRecipients: '统计收件人',
+    broadcastSendTest: '发测试信给自己',
+    broadcastTestSent: '测试邮件已发送至 {email}',
+    broadcastRecipientCount: '符合条件的收件人：{n} 人',
+    broadcastMarketingOff: '站点营销邮件总开关已关闭，当前不会发送给任何人。',
+    broadcastTruncated: '收件人超过单次上限，本次只会发送前 5000 人。',
+    broadcastSend: '开始群发',
+    broadcastConfirm: '确认向 {n} 人发送？此操作不可撤回。',
+    broadcastConfirmSend: '确认发送',
+    broadcastDispatched: '已开始发送，共 {n} 封（后台派发，稍后可在日志中查看结果）',
 
     // Storage
     storageMode: '存储模式',

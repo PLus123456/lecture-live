@@ -267,6 +267,8 @@ export async function creditPaidOrder(
   return { ok: true, alreadyProcessed: false, status: 'paid', returnUrl: meta.returnUrl };
 }
 
+const yuan = (cents: number) => `¥${(Math.max(0, cents) / 100).toFixed(2)}`;
+
 /**
  * 订单到账后给用户发一封「订阅/购买成功」通知邮件。fire-and-forget、事务外调用。
  * 重新读订单 + 用户当前状态（拿到发放后的最新 role/到期），失败只吞不影响支付主流程。
@@ -281,7 +283,6 @@ async function notifyOrderCredited(orderId: string): Promise<void> {
   if (!user) return;
 
   const meta = parseMeta(order.metadataJson);
-  const yuan = (cents: number) => `¥${(Math.max(0, cents) / 100).toFixed(2)}`;
   const planName =
     order.kind === 'purchase'
       ? meta.grant?.tierName ?? '会员/时长'
@@ -310,8 +311,41 @@ export async function spendFromBalance(
   tierId: string,
   opts: { operatorId?: string } = {}
 ): Promise<void> {
-  await prisma.$transaction(async (tx) => {
-    await spendOnTierTx(tx, userId, tierId, opts);
+  const spec = await prisma.$transaction(async (tx) => {
+    return spendOnTierTx(tx, userId, tierId, opts);
+  });
+
+  // 余额购买此前完全不发通知：钱扣了、角色变了、tokenVersion++ 还把人踢下线，用户零感知。
+  // 网关支付走 creditPaidOrder 有确认信，纯余额出账没有 —— 同一笔消费两条路径待遇不同。
+  // 必须排在事务**提交之后**：放事务里既拖长事务，回滚后还会留下一封说谎的确认信。
+  void notifyBalancePurchase(userId, spec).catch(() => undefined);
+}
+
+/**
+ * 余额购买成功后的确认邮件。fire-and-forget、事务外调用。
+ * 与 notifyOrderCredited 同源同模板，区别只是没有 PaymentOrder（纯余额出账不建订单行）。
+ */
+async function notifyBalancePurchase(
+  userId: string,
+  spec: GrantSnapshot
+): Promise<void> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, email: true, displayName: true, emailPreferences: true, roleExpiresAt: true },
+  });
+  if (!user) return;
+
+  // 同 notifyOrderCredited 的口径：只有确实拿到到期日的会员购买才写有效期。
+  // 空值一律省略该行，绝不渲染成「永久有效」—— 那正是审计 #3 里最糟的谎报。
+  const expiresLabel =
+    spec.kind === 'membership' && user.roleExpiresAt
+      ? user.roleExpiresAt.toLocaleDateString('zh-CN')
+      : null;
+
+  await sendSubscriptionSuccessEmail(user, {
+    planName: spec.tierName,
+    amountLabel: yuan(spec.priceCents),
+    expiresLabel,
   });
 }
 
@@ -459,10 +493,12 @@ async function spendOnTierTx(
   userId: string,
   tierId: string,
   opts: { operatorId?: string; orderId?: string }
-): Promise<void> {
+): Promise<GrantSnapshot> {
   const spec = await resolveTierGrant(tx, tierId);
   if (!spec) throw new WalletError('档位不存在或已下架', 'tier_unavailable');
   await applyGrantTx(tx, userId, spec, opts);
+  // 回传给调用方在事务提交后发确认邮件（事务内拿不到「已提交」这个事实）。
+  return spec;
 }
 
 /**

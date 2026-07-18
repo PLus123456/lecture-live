@@ -9,6 +9,7 @@ const {
   isEmailEnabledMock,
   sendVerificationEmailMock,
   resolveRequestClientIpMock,
+  loggerErrorMock,
 } = vi.hoisted(() => ({
   findUniqueMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
@@ -17,6 +18,12 @@ const {
   isEmailEnabledMock: vi.fn(),
   sendVerificationEmailMock: vi.fn(),
   resolveRequestClientIpMock: vi.fn(),
+  loggerErrorMock: vi.fn(),
+}));
+
+vi.mock('@/lib/logger', () => ({
+  logger: { error: loggerErrorMock, warn: vi.fn(), info: vi.fn() },
+  serializeError: (e: unknown) => e,
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -119,6 +126,36 @@ describe('POST /api/auth/resend-verification', () => {
 
     expect(res.status).toBe(200);
     expect(sendVerificationEmailMock).not.toHaveBeenCalled();
+  });
+
+  // #12 时序枚举：账号存在且待验证的分支此前 await 完整 SMTP 往返（200ms~3s），
+  // 其余分支立即返回 —— 响应文案一致也没用，耗时差本身就能筛出「哪些邮箱待验证」。
+  // 这里不做墙钟断言（必然 flaky），改测结构属性：发信永远挂起时路由仍要能返回。
+  it('不等待 SMTP 往返：发信挂起时依然立即返回', async () => {
+    let releaseSend: (() => void) | undefined;
+    sendVerificationEmailMock.mockReturnValue(
+      new Promise<void>((resolve) => {
+        releaseSend = resolve;
+      })
+    );
+
+    // 若实现改回 await，这里会一直挂着直到测试超时 → 红
+    const res = await post('user@example.com');
+
+    expect(res.status).toBe(200);
+    expect(sendVerificationEmailMock).toHaveBeenCalledTimes(1);
+    releaseSend?.();
+  });
+
+  it('发信失败不影响对外响应，但要落错误日志', async () => {
+    sendVerificationEmailMock.mockRejectedValue(new Error('smtp down'));
+
+    const res = await post('user@example.com');
+    expect(res.status).toBe(200);
+
+    // fire-and-forget：断言前先排空微任务，否则 .catch 还没跑到
+    await new Promise((r) => setTimeout(r, 0));
+    expect(loggerErrorMock).toHaveBeenCalled();
   });
 
   // 防枚举：账号存在/不存在/已验证/门禁关闭，对外响应必须逐字节一致。

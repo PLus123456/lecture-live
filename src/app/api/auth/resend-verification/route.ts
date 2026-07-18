@@ -52,8 +52,15 @@ export async function POST(req: Request) {
     if (ipLimited) return ipLimited;
   }
 
-  // 无效邮箱或邮件系统未启用：静默返回通用成功（不泄露差异）。
-  if (!email || !isValidEmailAddress(email) || !(await isEmailEnabled(siteSettings ?? undefined))) {
+  // 无效邮箱、邮件系统未启用、或站点根本没开邮箱验证：静默返回通用成功（不泄露差异）。
+  //
+  // 必须同时校验 email_verification 开关（与 login/register 的门禁判据一致）：开关关着时
+  // emailVerifiedAt 为空的账号照样能登录，"重发验证邮件"没有任何业务意义，却会让任何匿名者
+  // 报一个已知邮箱、就驱动本站往对方收件箱投一封品牌正确的验证信 —— 而 verify-email 消费令牌后
+  // 是直接签发会话的，等于凭空造出一封「一键登录」邮件。没有验证门禁就不该有验证邮件。
+  const verificationActive =
+    !!siteSettings?.email_verification && (await isEmailEnabled(siteSettings ?? undefined));
+  if (!email || !isValidEmailAddress(email) || !verificationActive) {
     return NextResponse.json(GENERIC_OK);
   }
 

@@ -178,26 +178,67 @@ function cleanOverride(override?: Partial<EmailConfig>): Partial<EmailConfig> {
   return out;
 }
 
-/** 解析「已保存配置 + 临时覆盖」得到发信配置。用于后台测试（可在保存前试）。 */
+type ResolvedConfig =
+  | { ok: true; config: EmailConfig }
+  | { ok: false; error: string };
+
+/** SMTP 主机名基础格式校验：挡住带协议头/空白/CRLF/路径的输入。 */
+function isValidSmtpHost(host: string): boolean {
+  if (!host || host.length > 255) return false;
+  // 不禁私网：内网中继（10.x 的 Postfix、本机 MTA）是合法且常见的 SMTP 部署，
+  // 照搬 validateCloudreveBaseUrl 的「默认禁私网」会把真实用户的配置打死。
+  return !/[\s/\\@]|^[a-z]+:/i.test(host);
+}
+
+/**
+ * 解析「已保存配置 + 临时覆盖」得到发信配置。用于后台测试（可在保存前试）。
+ *
+ * 安全约束：已保存的 SMTP 密码只在「目的地与账号都没变」时才继承。密码是绑定在
+ * (host, port, user) 上的凭据 —— 调用方一旦改了其中任意一项还沿用已存密码，就等于
+ * 让本站把自己的 SMTP 口令投递到对方指定的主机上（`transporter.verify()` 会照常
+ * 跑 AUTH LOGIN）。GET 接口特意把密码脱敏成 ******** 防读取，这条路径不能反手把明文送出去。
+ * 这里不区分恶意与手滑：管理员把 host 打错成抢注域名，后果完全一样。
+ */
 async function resolveConfigWithOverride(
   override?: Partial<EmailConfig>
-): Promise<EmailConfig | null> {
+): Promise<ResolvedConfig> {
   const settings = await getSiteSettings({ fresh: true }).catch(() => null);
   const base = settings ? resolveEmailConfig(settings) : null;
   const o = cleanOverride(override);
-  if (base) return { ...base, ...o };
+
+  if (o.host !== undefined && !isValidSmtpHost(o.host)) {
+    return { ok: false, error: 'SMTP 主机名格式不正确' };
+  }
+
+  if (base) {
+    const retargeted =
+      (o.host !== undefined && o.host !== base.host) ||
+      (o.port !== undefined && o.port !== base.port) ||
+      (o.user !== undefined && o.user !== base.user);
+    if (retargeted && o.password === undefined && base.password) {
+      return {
+        ok: false,
+        error: '更换 SMTP 主机 / 端口 / 账号后必须重新填写密码，不会沿用已保存的密码',
+      };
+    }
+    return { ok: true, config: { ...base, ...o } };
+  }
+
   if (o.host && (o.fromEmail || o.user)) {
     return {
-      host: o.host,
-      port: o.port ?? 587,
-      secure: o.secure ?? false,
-      user: o.user ?? '',
-      password: o.password ?? '',
-      fromName: o.fromName ?? 'LectureLive',
-      fromEmail: o.fromEmail ?? o.user ?? '',
+      ok: true,
+      config: {
+        host: o.host,
+        port: o.port ?? 587,
+        secure: o.secure ?? false,
+        user: o.user ?? '',
+        password: o.password ?? '',
+        fromName: o.fromName ?? 'LectureLive',
+        fromEmail: o.fromEmail ?? o.user ?? '',
+      },
     };
   }
-  return null;
+  return { ok: false, error: 'SMTP 未配置' };
 }
 
 /**
@@ -207,8 +248,9 @@ async function resolveConfigWithOverride(
 export async function verifyEmailConnection(
   override?: Partial<EmailConfig>
 ): Promise<{ ok: boolean; error?: string }> {
-  const cfg = await resolveConfigWithOverride(override);
-  if (!cfg) return { ok: false, error: 'SMTP 未配置' };
+  const resolved = await resolveConfigWithOverride(override);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  const cfg = resolved.config;
   try {
     const transporter = buildTransporter(cfg);
     await transporter.verify();
@@ -227,8 +269,9 @@ export async function sendMailWithConfig(
   override: Partial<EmailConfig> | undefined,
   input: SendMailInput
 ): Promise<SendResult> {
-  const cfg = await resolveConfigWithOverride(override);
-  if (!cfg) return { ok: false, error: 'SMTP 未配置' };
+  const resolved = await resolveConfigWithOverride(override);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  const cfg = resolved.config;
   try {
     const transporter = buildTransporter(cfg);
     const info = await transporter.sendMail({

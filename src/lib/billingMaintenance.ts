@@ -206,12 +206,11 @@ export async function runBillingMaintenance(options?: {
     // 不 rethrow —— 其他维护任务结果仍要返回
   }
 
-  // 会员到期前提醒（best-effort，非阻塞、不 rethrow）。
-  try {
-    await sendExpiryReminders(now);
-  } catch (err) {
-    billingLogger.error({ err: serializeError(err) }, 'expiry reminder failed');
-  }
+  // 注：会员到期前提醒挪到本函数**末尾**执行（原本在这里）。它是整个维护循环里唯一
+  // 依赖外部网络（SMTP）的步骤，一旦邮件服务商变慢/不可达，串行发信会把后面所有步骤
+  // ——会话回收、异步上传回收、孤儿预留释放、Soniox 对账——一起拖住；而 triggerRun 的
+  // in-flight 守卫会让 15 分钟定时器持续空跳，等于整套维护停摆。发提醒信是这里面最不
+  // 紧急的事，必须排在最后，且自带时间预算。
 
   // 过期会话回收
   let reclaimedSessions = 0;
@@ -402,6 +401,13 @@ export async function runBillingMaintenance(options?: {
       );
       // 不 rethrow —— 其他维护任务结果仍要返回
     }
+  }
+
+  // 会员到期前提醒（best-effort，不 rethrow）。排在所有回收/对账之后：见前文注释。
+  try {
+    await sendExpiryReminders(now);
+  } catch (err) {
+    billingLogger.error({ err: serializeError(err) }, 'expiry reminder failed');
   }
 
   if (
@@ -1171,7 +1177,22 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
  * 发信本身受用户「到期提醒」偏好约束（isCategoryEnabledForUser）。best-effort，任何异常上抛给调用方吞掉。
  */
 const EXPIRY_REMINDER_WINDOW_DAYS = 7;
-export async function sendExpiryReminders(now: Date): Promise<number> {
+/** 同时在途的发信数。SMTP 侧不是无限并发，取小值即可把 500 人的串行墙压掉两个数量级。 */
+const EXPIRY_REMINDER_CONCURRENCY = 5;
+/**
+ * 单轮发提醒的总时间预算。超预算即停止派发、剩下的留给下一轮（15 分钟后）——
+ * 没抢到去重键的用户不会被标记，所以下一轮会原样重新捞到，7 天窗口内足够发完。
+ * 有了它，即便 SMTP 完全不可达，维护循环也只会多花这点时间，不会拖成小时级停摆。
+ */
+const EXPIRY_REMINDER_BUDGET_MS = 2 * 60_000;
+export async function sendExpiryReminders(
+  now: Date,
+  /** 仅供测试注入；生产调用不传，用上面的常量。 */
+  opts?: { concurrency?: number; budgetMs?: number }
+): Promise<number> {
+  const concurrency = Math.max(1, opts?.concurrency ?? EXPIRY_REMINDER_CONCURRENCY);
+  const budgetMs = Math.max(1, opts?.budgetMs ?? EXPIRY_REMINDER_BUDGET_MS);
+
   const redis = getRedisClient();
   if (!redis || redis.status !== 'ready') return 0; // 无 Redis 无法去重，跳过
 
@@ -1195,31 +1216,81 @@ export async function sendExpiryReminders(now: Date): Promise<number> {
   });
 
   let sent = 0;
-  for (const user of candidates) {
-    if (!user.roleExpiresAt) continue;
-    const expiryDay = user.roleExpiresAt.toISOString().slice(0, 10); // YYYY-MM-DD
-    const dedupKey = `email:expiry-reminded:${user.id}:${expiryDay}`;
-    try {
-      // SET NX：抢到才发，保证每用户每到期日仅一封。TTL 覆盖提醒窗口 + 余量。
-      const won = await redis.set(dedupKey, '1', 'EX', (EXPIRY_REMINDER_WINDOW_DAYS + 2) * 86400, 'NX');
-      if (won !== 'OK') continue;
+  let failed = 0;
+  let cursor = 0;
+  let budgetExhausted = false;
+  const deadline = Date.now() + budgetMs;
 
-      const daysLeft = Math.max(
-        1,
-        Math.ceil((user.roleExpiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))
-      );
-      await sendExpiryReminderEmail(user, {
-        planName: user.role,
-        expiresLabel: user.roleExpiresAt.toLocaleDateString('zh-CN'),
-        daysLeft,
-      });
-      sent += 1;
-    } catch (err) {
-      billingLogger.warn(
-        { err: serializeError(err), userId: user.id },
-        'expiry reminder send failed for user'
-      );
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      if (Date.now() >= deadline) {
+        budgetExhausted = true;
+        return;
+      }
+      const index = cursor++;
+      if (index >= candidates.length) return;
+      const user = candidates[index];
+      if (!user.roleExpiresAt) continue;
+
+      const expiryDay = user.roleExpiresAt.toISOString().slice(0, 10); // YYYY-MM-DD
+      const dedupKey = `email:expiry-reminded:${user.id}:${expiryDay}`;
+      try {
+        // SET NX：抢到才发，保证每用户每到期日仅一封。TTL 覆盖提醒窗口 + 余量。
+        const won = await redis.set(
+          dedupKey,
+          '1',
+          'EX',
+          (EXPIRY_REMINDER_WINDOW_DAYS + 2) * 86400,
+          'NX'
+        );
+        if (won !== 'OK') continue;
+
+        const daysLeft = Math.max(
+          1,
+          Math.ceil((user.roleExpiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))
+        );
+        const result = await sendExpiryReminderEmail(user, {
+          planName: user.role,
+          expiresLabel: user.roleExpiresAt.toLocaleDateString('zh-CN'),
+          daysLeft,
+        });
+
+        // 去重键是发之前抢的，发失败就得还回去：否则一次瞬时 SMTP 故障会让这批用户
+        // 在整个到期窗口内永远收不到提醒（TTL 9 天 > 7 天窗口），会员就这么静默过期了。
+        // 用户主动关闭该分类（ok:true + skipped:preference）不算失败，保留占位。
+        if (!result.ok) {
+          await redis.del(dedupKey).catch(() => undefined);
+          failed += 1;
+          billingLogger.warn(
+            { userId: user.id, error: result.error },
+            'expiry reminder delivery failed, dedup key released for retry'
+          );
+          continue;
+        }
+        // sendExpiryReminderEmail 对失败是返回 ok:false 而非抛错，所以这里必须看返回值：
+        // 原先无条件 sent += 1，SMTP 全挂时也会报告"已发 N 封"。
+        if (result.error !== 'skipped:preference') sent += 1;
+      } catch (err) {
+        failed += 1;
+        await redis.del(dedupKey).catch(() => undefined);
+        billingLogger.warn(
+          { err: serializeError(err), userId: user.id },
+          'expiry reminder send failed for user'
+        );
+      }
     }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, candidates.length) }, () => worker())
+  );
+
+  if (budgetExhausted) {
+    // 不静默截断：剩下的没抢去重键，下一轮会重新捞到。
+    billingLogger.warn(
+      { processed: Math.min(cursor, candidates.length), total: candidates.length, sent, failed },
+      'expiry reminder time budget exhausted, remainder deferred to next maintenance run'
+    );
   }
   return sent;
 }

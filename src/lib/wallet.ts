@@ -232,6 +232,7 @@ export async function creditPaidOrder(
   }
 
   // tx2：purchase 订单按冻结快照发放（缺快照的旧订单回落读 live 档位）。发放失败不回滚到账。
+  let granted = true;
   if (order.kind === 'purchase') {
     try {
       await prisma.$transaction(async (tx) => {
@@ -243,6 +244,7 @@ export async function creditPaidOrder(
       });
     } catch (err) {
       // 已到账余额保留（钱不丢），仅记录以便人工补发/退款。网关据 tx1 成功照常收到 ACK、停止重试。
+      granted = false;
       const reason = err instanceof Error ? err.message : 'unknown';
       console.error(`购买发放失败，已到账余额保留（outTradeNo=${outTradeNo}）:`, err);
       logSystemEvent(
@@ -253,7 +255,14 @@ export async function creditPaidOrder(
   }
 
   // 订阅/充值成功通知邮件（fire-and-forget，受用户「订阅」偏好与站点营销总开关约束）。
-  void notifyOrderCredited(order.id).catch(() => undefined);
+  //
+  // 发放失败时**绝不**发信：此时用户其实没拿到会员/时长，只是余额还在（待人工补发或退款）。
+  // 发一封「订阅成功」不但是假的，还会因为 roleExpiresAt 仍为空而渲染成「有效期至：永久有效」
+  // —— 把最糟的结果显示成最好的结果，用户既不会来报障，客服也无从发现。
+  // 充值订单（kind !== 'purchase'）没有发放环节，tx1 到账即成功，照常发。
+  if (granted) {
+    void notifyOrderCredited(order.id).catch(() => undefined);
+  }
 
   return { ok: true, alreadyProcessed: false, status: 'paid', returnUrl: meta.returnUrl };
 }
@@ -277,11 +286,12 @@ async function notifyOrderCredited(orderId: string): Promise<void> {
     order.kind === 'purchase'
       ? meta.grant?.tierName ?? '会员/时长'
       : '钱包充值';
+  // 会员购买必然写入真实到期日（applyGrantTx 的 days 至少为 1），所以这里 roleExpiresAt 为空
+  // 只可能是异常态（发放失败/被并发改写），绝不是「永久有效」—— 真正的永久角色只有 admin 手工授予。
+  // 拿不准就不写这一行（模板对空值直接省略），也好过向用户断言一个它并没有得到的权益。
   const expiresLabel =
-    order.kind === 'purchase' && meta.grant?.kind === 'membership'
-      ? user.roleExpiresAt
-        ? user.roleExpiresAt.toLocaleDateString('zh-CN')
-        : '永久有效'
+    order.kind === 'purchase' && meta.grant?.kind === 'membership' && user.roleExpiresAt
+      ? user.roleExpiresAt.toLocaleDateString('zh-CN')
       : null;
 
   await sendSubscriptionSuccessEmail(user, {

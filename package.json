@@ -30,6 +30,7 @@
     "db:generate": "node scripts/run-prisma.mjs generate",
     "db:studio": "node scripts/run-prisma.mjs studio",
     "db:backfill-conversation-user-id": "node scripts/backfill-conversation-user-id.mjs",
+    "db:backfill-email-verified-at": "node scripts/backfill-email-verified-at.mjs",
     "billing:reset-quotas": "node scripts/reset-monthly-quotas.mjs",
     "billing:reconcile": "node scripts/reconcile-transcription-usage.mjs",
     "billing:maintenance": "ts-node scripts/billing-maintenance.ts",

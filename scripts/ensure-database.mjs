@@ -8,6 +8,9 @@
 //   ② prisma db push：把 schema 最终态对齐到库（加可空列 / 索引 / 改默认值等安全变更）。
 //   ③ 历史归属回填（scripts/backfill-conversation-user-id.mjs）：给 db push 新加的可空列
 //      （Conversation.userId）回填历史值，避免老对话变「无主」→ 404。
+//   ④ 存量用户邮箱验证豁免（scripts/backfill-email-verified-at.mjs）：同理给 User.emailVerifiedAt
+//      回填 createdAt，避免管理员开启 email_verification 时把全部老用户锁死在登录门外。
+//      一次性（SiteSetting 标记），跑过不再执行。
 //
 // 受 AUTO_DB_PUSH 控制：设为 0/false/off 时整体跳过（用户选择手动管理 schema）。
 //
@@ -98,6 +101,13 @@ runStep(
   '③ 回填历史对话归属（Conversation.userId）...',
   process.execPath,
   [path.join(SCRIPT_DIR, 'backfill-conversation-user-id.mjs')]
+);
+
+// ④ 存量用户邮箱验证豁免（一次性，靠 SiteSetting 标记幂等）
+runStep(
+  '④ 回填存量用户邮箱验证状态（User.emailVerifiedAt）...',
+  process.execPath,
+  [path.join(SCRIPT_DIR, 'backfill-email-verified-at.mjs')]
 );
 
 console.log('[db:init] Database schema is ready.');

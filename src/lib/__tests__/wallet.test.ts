@@ -10,7 +10,9 @@ const {
   walletTxCreateMock,
   rechargeTierFindUniqueMock,
   executeRawMock,
+  sendSubscriptionSuccessEmailMock,
 } = vi.hoisted(() => ({
+  sendSubscriptionSuccessEmailMock: vi.fn(),
   paymentOrderUpdateManyMock: vi.fn(),
   paymentOrderFindUniqueMock: vi.fn(),
   paymentOrderCreateMock: vi.fn(),
@@ -60,6 +62,10 @@ vi.mock('@/lib/auditLog', () => ({
   logSystemEvent: vi.fn(),
 }));
 
+vi.mock('@/lib/email', () => ({
+  sendSubscriptionSuccessEmail: sendSubscriptionSuccessEmailMock,
+}));
+
 import { creditPaidOrder, spendFromBalance, adminAdjust, WalletError } from '@/lib/wallet';
 
 beforeEach(() => {
@@ -71,6 +77,8 @@ beforeEach(() => {
   walletTxCreateMock.mockReset();
   rechargeTierFindUniqueMock.mockReset();
   executeRawMock.mockReset();
+  sendSubscriptionSuccessEmailMock.mockReset();
+  sendSubscriptionSuccessEmailMock.mockResolvedValue({ ok: true });
   userUpdateMock.mockResolvedValue({ walletBalanceCents: 0 });
   // 条件扣款守卫默认扣款成功（余额充足）；余额不足的用例各自覆盖为 { count: 0 }。
   userUpdateManyMock.mockResolvedValue({ count: 1 });
@@ -514,5 +522,181 @@ describe('adminAdjust：管理员手动调整', () => {
     );
     // 池扣减用 GREATEST raw 防负。
     expect(executeRawMock).toHaveBeenCalled();
+  });
+});
+
+/**
+ * 「订阅成功」通知邮件的发送条件。
+ *
+ * 回归背景：notifyOrderCredited 原本排在 tx2 的 try/catch **外面**无条件触发，于是发放失败
+ * （档位被删/管理员账号/并发扣光余额）时用户照样收到「订阅成功」，且因为 roleExpiresAt 仍为空
+ * 被渲染成「有效期至：永久有效」—— 把最糟的结果显示成最好的结果。
+ */
+describe('creditPaidOrder：订阅成功通知邮件', () => {
+  const NOTIFY_USER = {
+    id: 'u1',
+    email: 'buyer@example.com',
+    displayName: '买家',
+    emailPreferences: null,
+  };
+
+  // notifyOrderCredited 是 fire-and-forget（void + catch），creditPaidOrder 不等它。
+  // 断言前必须排空微任务队列 —— 否则「不该发信」那条会因为发信还没来得及发生而空过。
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('▶ 发放失败 → 绝不发「订阅成功」邮件', async () => {
+    const failedOrder = {
+      id: 'o-fail',
+      userId: 'u1',
+      kind: 'purchase',
+      tierId: 't-gone',
+      amountCents: 3900,
+      status: 'paid',
+      metadataJson: JSON.stringify({ creditCents: 3900 }), // 无 grant 快照
+    };
+    paymentOrderUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    // 两次都要给：creditPaidOrder 认领后读一次，notifyOrderCredited 还会重新读一次。
+    // 若只给一次，notify 会在第二次拿到 undefined 后提前 return —— 那样即便删掉防线本用例
+    // 也照样"通过"，成为一条永远绿的假测试。
+    paymentOrderFindUniqueMock
+      .mockResolvedValueOnce(failedOrder)
+      .mockResolvedValueOnce(failedOrder);
+    // 档位已被删除 → resolveTierGrant 返回 null → applyGrantTx 之前就抛 tier_unavailable
+    rechargeTierFindUniqueMock.mockResolvedValueOnce(null);
+    // 用户查得到：确保"没发信"只可能是防线起了作用，而不是数据缺失导致的提前返回。
+    userFindUniqueMock.mockResolvedValueOnce({ ...NOTIFY_USER, roleExpiresAt: null });
+
+    const res = await creditPaidOrder('LLGRANTFAIL');
+    await flush();
+
+    // 钱已到账（不回滚），但发放没成功
+    expect(res.ok).toBe(true);
+    expect(sendSubscriptionSuccessEmailMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ 会员发放成功 → 发信且写真实到期日', async () => {
+    const expiry = new Date('2026-08-18T00:00:00Z');
+    paymentOrderUpdateManyMock.mockResolvedValue({ count: 1 });
+    paymentOrderFindUniqueMock
+      .mockResolvedValueOnce({
+        id: 'o-ok',
+        userId: 'u1',
+        kind: 'purchase',
+        tierId: 't-pro',
+        amountCents: 3900,
+        status: 'paid',
+        metadataJson: JSON.stringify({
+          creditCents: 3900,
+          grant: {
+            kind: 'membership',
+            priceCents: 3900,
+            tierId: 't-pro',
+            tierName: 'PRO 月卡',
+            grantRole: 'PRO',
+            durationDays: 30,
+          },
+        }),
+      })
+      // notifyOrderCredited 会重新读一次订单
+      .mockResolvedValueOnce({
+        id: 'o-ok',
+        userId: 'u1',
+        kind: 'purchase',
+        amountCents: 3900,
+        metadataJson: JSON.stringify({
+          grant: { kind: 'membership', tierName: 'PRO 月卡' },
+        }),
+      });
+    userFindUniqueMock
+      .mockResolvedValueOnce({ walletBalanceCents: 3900, role: 'FREE', originalRole: null, roleExpiresAt: null })
+      .mockResolvedValueOnce({ walletBalanceCents: 0 })
+      .mockResolvedValueOnce({ ...NOTIFY_USER, roleExpiresAt: expiry });
+
+    await creditPaidOrder('LLOK');
+    await flush();
+
+    expect(sendSubscriptionSuccessEmailMock).toHaveBeenCalledTimes(1);
+    const [user, params] = sendSubscriptionSuccessEmailMock.mock.calls[0];
+    expect(user).toMatchObject({ id: 'u1', email: 'buyer@example.com' });
+    expect(params.planName).toBe('PRO 月卡');
+    expect(params.amountLabel).toBe('¥39.00');
+    expect(params.expiresLabel).toBe(expiry.toLocaleDateString('zh-CN'));
+  });
+
+  // 纵深防御：即便某天异常态走到了这里，也不许把「没有到期日」说成「永久有效」。
+  it('▶ 会员单但到期日为空 → 省略有效期，不得写「永久有效」', async () => {
+    paymentOrderUpdateManyMock.mockResolvedValue({ count: 1 });
+    paymentOrderFindUniqueMock
+      .mockResolvedValueOnce({
+        id: 'o-noexp',
+        userId: 'u1',
+        kind: 'purchase',
+        tierId: 't-pro',
+        amountCents: 3900,
+        status: 'paid',
+        metadataJson: JSON.stringify({
+          creditCents: 3900,
+          grant: {
+            kind: 'membership',
+            priceCents: 3900,
+            tierId: 't-pro',
+            tierName: 'PRO 月卡',
+            grantRole: 'PRO',
+            durationDays: 30,
+          },
+        }),
+      })
+      .mockResolvedValueOnce({
+        id: 'o-noexp',
+        userId: 'u1',
+        kind: 'purchase',
+        amountCents: 3900,
+        metadataJson: JSON.stringify({
+          grant: { kind: 'membership', tierName: 'PRO 月卡' },
+        }),
+      });
+    userFindUniqueMock
+      .mockResolvedValueOnce({ walletBalanceCents: 3900, role: 'FREE', originalRole: null, roleExpiresAt: null })
+      .mockResolvedValueOnce({ walletBalanceCents: 0 })
+      .mockResolvedValueOnce({ ...NOTIFY_USER, roleExpiresAt: null });
+
+    await creditPaidOrder('LLNOEXP');
+    await flush();
+
+    expect(sendSubscriptionSuccessEmailMock).toHaveBeenCalledTimes(1);
+    const params = sendSubscriptionSuccessEmailMock.mock.calls[0][1];
+    expect(params.expiresLabel).toBeNull();
+    expect(params.expiresLabel).not.toBe('永久有效');
+  });
+
+  it('▶ 纯充值订单（无发放环节）→ 照常发信', async () => {
+    paymentOrderUpdateManyMock.mockResolvedValue({ count: 1 });
+    paymentOrderFindUniqueMock
+      .mockResolvedValueOnce({
+        id: 'o-top',
+        userId: 'u1',
+        kind: 'topup',
+        tierId: null,
+        amountCents: 10000,
+        status: 'paid',
+        metadataJson: JSON.stringify({ creditCents: 12000 }),
+      })
+      .mockResolvedValueOnce({
+        id: 'o-top',
+        userId: 'u1',
+        kind: 'topup',
+        amountCents: 10000,
+        metadataJson: JSON.stringify({}),
+      });
+    userUpdateMock.mockResolvedValueOnce({ walletBalanceCents: 12000 });
+    userFindUniqueMock.mockResolvedValueOnce({ ...NOTIFY_USER, roleExpiresAt: null });
+
+    await creditPaidOrder('LLTOP');
+    await flush();
+
+    expect(sendSubscriptionSuccessEmailMock).toHaveBeenCalledTimes(1);
+    const params = sendSubscriptionSuccessEmailMock.mock.calls[0][1];
+    expect(params.planName).toBe('钱包充值');
+    expect(params.expiresLabel).toBeNull();
   });
 });

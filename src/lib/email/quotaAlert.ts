@@ -28,19 +28,29 @@ export async function maybeSendTranscriptionQuotaAlert(userId: string): Promise<
         displayName: true,
         emailPreferences: true,
         role: true,
+        status: true,
         transcriptionMinutesUsed: true,
         transcriptionMinutesLimit: true,
+        purchasedMinutesBalance: true,
         quotaResetAt: true,
       },
     });
     if (!user) return;
     if (user.role === 'ADMIN') return;
+    // 封禁账号不打扰（与 billingMaintenance 的到期提醒口径一致）。被封后仍可能有
+    // system_auto_reclaim 定时任务替他收尾会话，进而走到这里。
+    if (user.status !== 1) return;
 
-    const limit = user.transcriptionMinutesLimit;
-    if (!Number.isFinite(limit) || limit <= 0 || limit >= UNLIMITED_SENTINEL) return;
+    const baseLimit = user.transcriptionMinutesLimit;
+    if (!Number.isFinite(baseLimit) || baseLimit <= 0 || baseLimit >= UNLIMITED_SENTINEL) return;
 
+    // 分母必须与真门禁一致（Model A：月度上限 + 永久时长池，见 quota.ts 的原子扣减 WHERE）。
+    // 只看 limit 的话，刚买了 1000 分钟包的用户在 used=54/limit=60 时就会收到「已用 90%」，
+    // 而他其实还有一整池分钟没动；且 Model A 允许 used 超过 limit，百分比还会一路涨过 100%，
+    // 按周期去重意味着每个月都误报一次。
+    const effectiveLimit = baseLimit + Math.max(0, user.purchasedMinutesBalance);
     const used = user.transcriptionMinutesUsed;
-    const percent = used / limit;
+    const percent = used / effectiveLimit;
     if (percent < QUOTA_ALERT_THRESHOLD) return;
 
     // 按当前配额周期去重（quotaResetAt 变了即新周期，可再次提醒）。
@@ -49,11 +59,23 @@ export async function maybeSendTranscriptionQuotaAlert(userId: string): Promise<
     const won = await redis.set(dedupKey, '1', 'EX', 40 * 86400, 'NX');
     if (won !== 'OK') return;
 
-    await sendQuotaAlertEmail(user, {
+    const result = await sendQuotaAlertEmail(user, {
       quotaLabel: '转录分钟',
-      usedLabel: `${used} / ${limit} 分钟`,
+      usedLabel: `${used} / ${effectiveLimit} 分钟`,
       percentLabel: `${Math.min(100, Math.round(percent * 100))}%`,
     });
+
+    // 去重键是「发之前」抢的，发失败就得还回去：否则一次瞬时 SMTP 故障
+    // 会让这个用户在整个配额周期内再也收不到提醒，而日志还显示"已发送"。
+    // 偏好跳过（ok:true + skipped:preference）属于用户主动关闭，保留占位不重试。
+    if (!result.ok) {
+      await redis.del(dedupKey).catch(() => undefined);
+      logger.warn(
+        { userId: user.id, error: result.error },
+        '[quotaAlert] 配额提醒发送失败，已释放去重键待下次重试'
+      );
+      return;
+    }
     logger.info({ userId: user.id }, '[quotaAlert] 已发送配额提醒');
   } catch (err) {
     logger.warn({ err: serializeError(err) }, '[quotaAlert] 处理失败（忽略）');

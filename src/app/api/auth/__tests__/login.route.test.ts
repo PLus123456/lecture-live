@@ -7,12 +7,24 @@ const {
   getSiteSettingsMock,
   enforceRateLimitMock,
   logActionMock,
+  isEmailEnabledMock,
+  maybeNotifyNewDeviceLoginMock,
 } = vi.hoisted(() => ({
   loginMock: vi.fn(),
   setAuthCookieMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
   enforceRateLimitMock: vi.fn(),
   logActionMock: vi.fn(),
+  isEmailEnabledMock: vi.fn(),
+  maybeNotifyNewDeviceLoginMock: vi.fn(),
+}));
+
+vi.mock('@/lib/email', () => ({
+  isEmailEnabled: isEmailEnabledMock,
+}));
+
+vi.mock('@/lib/email/loginAlert', () => ({
+  maybeNotifyNewDeviceLogin: maybeNotifyNewDeviceLoginMock,
 }));
 
 vi.mock('@/lib/auth', () => ({
@@ -47,6 +59,7 @@ describe('POST /api/auth/login', () => {
       jwt_expiry: 14,
     });
     enforceRateLimitMock.mockResolvedValue(null);
+    isEmailEnabledMock.mockResolvedValue(false);
     setAuthCookieMock.mockImplementation(
       (response: Response, token: string, options: { maxAge: number }) => {
         response.headers.set(
@@ -151,5 +164,88 @@ describe('POST /api/auth/login', () => {
         detail: expect.stringContaining('alice@example.com'),
       })
     );
+  });
+
+  // 邮箱验证硬门禁。此前服务端零覆盖：requireEmailVerified 被删掉、写反、或 && 改成 ||
+  // 整个测试套件都不会红，唯一的"覆盖"是 e2e 里自己 mock 出来的 403 响应。
+  describe('邮箱验证硬门禁', () => {
+    const loginBody = {
+      method: 'POST' as const,
+      body: { email: 'alice@example.com', password: 'Abcd1234' },
+    };
+
+    it('开关开启且 SMTP 可用时，要求 login() 校验邮箱验证状态', async () => {
+      getSiteSettingsMock.mockResolvedValue({ email_verification: true, jwt_expiry: 14 });
+      isEmailEnabledMock.mockResolvedValue(true);
+      loginMock.mockResolvedValue({
+        user: { id: 'u1', email: 'alice@example.com', displayName: 'Alice', role: 'FREE' },
+        token: 'server-jwt',
+      });
+
+      await POST(createJsonRequest('http://localhost:3000/api/auth/login', loginBody));
+
+      expect(loginMock).toHaveBeenCalledWith(
+        'alice@example.com',
+        'Abcd1234',
+        expect.objectContaining({ requireEmailVerified: true })
+      );
+    });
+
+    it('未验证账号返回 403 + needsVerification（口令已核对正确才会走到这里）', async () => {
+      getSiteSettingsMock.mockResolvedValue({ email_verification: true, jwt_expiry: 14 });
+      isEmailEnabledMock.mockResolvedValue(true);
+      loginMock.mockRejectedValue(new Error('Email not verified'));
+
+      const response = await POST(
+        createJsonRequest('http://localhost:3000/api/auth/login', loginBody)
+      );
+
+      expect(response.status).toBe(403);
+      await expect(readJson<Record<string, unknown>>(response)).resolves.toMatchObject({
+        needsVerification: true,
+        email: 'alice@example.com',
+      });
+      expect(setAuthCookieMock).not.toHaveBeenCalled();
+      expect(logActionMock).toHaveBeenCalledWith(
+        expect.any(Request),
+        'user.login.unverified',
+        expect.objectContaining({ detail: expect.stringContaining('alice@example.com') })
+      );
+    });
+
+    // fail-open：开关开着但 SMTP 没配时不得启用门禁，否则半配置的站点会把所有人锁在门外。
+    it('SMTP 未配置时不启用门禁（fail-open）', async () => {
+      getSiteSettingsMock.mockResolvedValue({ email_verification: true, jwt_expiry: 14 });
+      isEmailEnabledMock.mockResolvedValue(false);
+      loginMock.mockResolvedValue({
+        user: { id: 'u1', email: 'alice@example.com', displayName: 'Alice', role: 'FREE' },
+        token: 'server-jwt',
+      });
+
+      await POST(createJsonRequest('http://localhost:3000/api/auth/login', loginBody));
+
+      expect(loginMock).toHaveBeenCalledWith(
+        'alice@example.com',
+        'Abcd1234',
+        expect.objectContaining({ requireEmailVerified: false })
+      );
+    });
+
+    it('开关关闭时不启用门禁（即使 SMTP 可用）', async () => {
+      getSiteSettingsMock.mockResolvedValue({ email_verification: false, jwt_expiry: 14 });
+      isEmailEnabledMock.mockResolvedValue(true);
+      loginMock.mockResolvedValue({
+        user: { id: 'u1', email: 'alice@example.com', displayName: 'Alice', role: 'FREE' },
+        token: 'server-jwt',
+      });
+
+      await POST(createJsonRequest('http://localhost:3000/api/auth/login', loginBody));
+
+      expect(loginMock).toHaveBeenCalledWith(
+        'alice@example.com',
+        'Abcd1234',
+        expect.objectContaining({ requireEmailVerified: false })
+      );
+    });
   });
 });

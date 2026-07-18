@@ -162,16 +162,27 @@ async function readStoredManifestMetadata(
   }
 }
 
+// 原子写 manifest：先写同目录唯一临时文件，再 rename 覆盖目标（同分区 rename 是原子操作，
+// 与 transcriptDraftPersistence.writeFileAtomic 同款）。直接对同一路径并发 writeFile 不原子——
+// open(O_TRUNC) 与 write 是两步，多写者交错时短 JSON 盖在长 JSON 上会留下尾部残留的坏文件，
+// JSON.parse 失败→元数据读为 null→收尾把有分片的草稿当「无草稿」丢录音、seal 状态被隐藏。
+// tmp+rename 保证 manifest.json 任一时刻都是某个写者的完整版本（进程被杀/磁盘满同样不留半截）。
 async function writeStoredManifestMetadata(
   session: DraftSessionSource,
   metadata: StoredManifestMetadata
 ) {
   await ensureDraftDir(session);
-  await fs.writeFile(
-    getDraftManifestPath(session),
-    JSON.stringify(metadata, null, 2),
-    'utf-8'
-  );
+  const manifestPath = getDraftManifestPath(session);
+  const tmpPath = `${manifestPath}.tmp.${process.pid}.${Date.now()}.${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    await fs.writeFile(tmpPath, JSON.stringify(metadata, null, 2), 'utf-8');
+    await fs.rename(tmpPath, manifestPath);
+  } catch (error) {
+    await fs.rm(tmpPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 export async function loadRecordingDraftManifest(

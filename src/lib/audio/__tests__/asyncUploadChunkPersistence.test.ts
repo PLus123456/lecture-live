@@ -124,3 +124,55 @@ describe('P1-15 merge 精确长度 / 总字节 / hash 校验', () => {
     await expect(mod.mergeAsyncUploadChunks(session)).rejects.toThrow(/sha256 mismatch/);
   });
 });
+
+describe('manifest 并发写原子性', () => {
+  it('并发 persist 期间与收尾后，manifest 都必须可读且字段齐全（不撕裂）', async () => {
+    // 与 recordingDraftPersistence 的「并发写入不会因为 manifest 竞态丢失 seq」同款场景。
+    // 裸 writeFile 写 manifest 时（open(O_TRUNC)+write 两步不原子）有两种坏死法：
+    //  1) 写者 persist 里的 readMetadata 撞进别的写者 truncate 后、write 前的窗口
+    //     → 读到空/半截 JSON → 元数据当 null → 误抛「Upload not initialized」；
+    //  2) 并发读清单的调用方在同一窗口读到 null（表现为续传协商读不到状态）。
+    const totalChunks = 50;
+    await mod.initAsyncUpload(session, {
+      originalFileName: 'a.webm',
+      originalMimeType: 'video/webm',
+      originalSize: totalChunks * 10,
+      totalChunks,
+      chunkSize: 10,
+    });
+    const seqs = Array.from({ length: totalChunks }, (_, i) => i);
+
+    // 多轮突发放大碰撞窗口：同 seq 重复 persist 在本模块是合法重写（last-wins），
+    // 每轮都造出 50 个并发的 read→writeMetadata；3 条并行读者贯穿始终。
+    const bursts = 5;
+    let totalReads = 0;
+    let nullReads = 0;
+    for (let round = 0; round < bursts; round += 1) {
+      let writersSettled = false;
+      const writersDone = Promise.all(
+        seqs.map((seq) => mod.persistAsyncUploadChunk(session, { seq, data: buf('A', 10) }))
+      ).finally(() => {
+        writersSettled = true;
+      });
+
+      // 写入进行中持续并发读：init 已落盘，任何一次读都不允许拿到 null。
+      const readerLoop = async () => {
+        while (!writersSettled) {
+          const read = await mod.loadAsyncUploadManifest(session);
+          totalReads += 1;
+          if (read === null) nullReads += 1;
+        }
+      };
+      const readersDone = Promise.all([readerLoop(), readerLoop(), readerLoop()]);
+      await writersDone;
+      await readersDone;
+    }
+
+    expect(totalReads).toBeGreaterThan(0);
+    expect(nullReads).toBe(0);
+
+    const manifest = await mod.loadAsyncUploadManifest(session);
+    expect(manifest?.receivedSeqs).toEqual(seqs);
+    expect(manifest?.totalChunks).toBe(totalChunks);
+  });
+});

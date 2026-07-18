@@ -141,9 +141,25 @@ async function readMetadata(session: UploadSessionSource): Promise<StoredManifes
   }
 }
 
+// 原子写 manifest：先写同目录唯一临时文件，再 rename 覆盖目标（同分区 rename 是原子操作，
+// 与本文件 chunk 写入、transcriptDraftPersistence.writeFileAtomic、recordingDraftPersistence
+// 同款）。裸 writeFile 是 open(O_TRUNC)+write 两步：并发分片上传时读侧可撞进 truncate 之后、
+// write 之前的窗口，读到空/半截 JSON→元数据当 null→persist 误抛「Upload not initialized」、
+// 续传协商/finalize 误判未初始化；若并发写者 JSON 长短不一（换文件 re-init 撞上在途分片写），
+// 短盖长还会留下尾部残留的坏 JSON 持久损毁 manifest。
 async function writeMetadata(session: UploadSessionSource, metadata: StoredManifestMetadata) {
   await ensureDir(session);
-  await fs.writeFile(getManifestPath(session), JSON.stringify(metadata, null, 2), 'utf-8');
+  const manifestPath = getManifestPath(session);
+  const tmpPath = `${manifestPath}.tmp.${process.pid}.${Date.now()}.${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    await fs.writeFile(tmpPath, JSON.stringify(metadata, null, 2), 'utf-8');
+    await fs.rename(tmpPath, manifestPath);
+  } catch (error) {
+    await fs.rm(tmpPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 /**
@@ -249,11 +265,19 @@ export async function persistAsyncUploadChunk(
   }
 
   await ensureDir(session);
-  // 写到临时文件再 rename，避免并发写同 seq 时半截内容
+  // 写到临时文件再 rename，避免并发写同 seq 时半截内容。tmp 名必须带随机后缀：
+  // 仅 pid+毫秒时，同毫秒并发写同 seq 会共用同一 tmp 路径，撕裂的就是 tmp 本身。
   const finalPath = getChunkFilePath(session, options.seq);
-  const tempPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
-  await fs.writeFile(tempPath, options.data);
-  await fs.rename(tempPath, finalPath);
+  const tempPath = `${finalPath}.tmp-${process.pid}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  try {
+    await fs.writeFile(tempPath, options.data);
+    await fs.rename(tempPath, finalPath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
 
   const now = Date.now();
   await writeMetadata(session, { ...existing, updatedAt: now });

@@ -130,8 +130,6 @@ interface MobilePlaybackLayoutProps {
   onSwitchAudioVariant?: (variant: 'original' | 'enhanced') => void;
 }
 
-const TAB_KEYS: MobilePlaybackTab[] = ['report', 'transcript', 'summary', 'chat', 'info'];
-
 function formatDuration(ms: number): string {
   const totalSeconds = Math.floor(ms / 1000);
   const hours = Math.floor(totalSeconds / 3600);

@@ -1,6 +1,6 @@
 import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 const quotaPayload = {
   quotas: {
@@ -79,21 +79,18 @@ async function mockLoginAndHomeApis(page: Page) {
 }
 
 async function loginThroughUi(page: Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('alice@example.com');
-  await page.locator('input[type="password"]').fill('Abcd1234');
-  await page.getByRole('button', { name: 'Sign In' }).click();
-  await expect(page).toHaveURL(/\/home$/);
+  await loginViaForm(page, {
+    email: 'alice@example.com',
+    password: 'Abcd1234',
+    prewarm: ['/session/prewarm'],
+  });
 }
 
 // 与 loginThroughUi 相同，但用 locale 无关的选择器（button[type=submit]），
 // 以便在强制中文 locale 时登录按钮文案变化后仍可点击。
 async function loginLocaleAgnostic(page: Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('alice@example.com');
-  await page.locator('input[type="password"]').fill('Abcd1234');
-  await page.locator('button[type="submit"]').click();
-  await expect(page).toHaveURL(/\/home$/);
+  // loginViaForm 走 button[type=submit]，本就与 locale 无关。
+  await loginThroughUi(page);
 }
 
 test('登录流程会提交凭据并进入首页', async ({ page }) => {

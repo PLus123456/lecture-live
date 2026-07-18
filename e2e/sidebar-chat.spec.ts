@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * U8 — 侧栏「对话」入口 + 字节配额条的视觉烟测。
@@ -91,11 +91,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('sidebar shows new Chat entry', async ({ page }) => {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('admin@lecturelive.com');
-  await page.locator('input[type="password"]').fill('admin123');
-  await page.getByRole('button', { name: 'Sign In' }).click();
-  await expect(page).toHaveURL(/\/home$/);
+  await loginAsAdmin(page);
 
   // 视觉快照 — 不强制 fullPage 避免抖动
   await page.screenshot({ path: 'artifacts/u8-sidebar.png', fullPage: false });

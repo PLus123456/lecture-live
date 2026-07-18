@@ -1,7 +1,12 @@
 import { test, expect, type Page, type Route } from '@playwright/test';
 import path from 'path';
 import fs from 'fs';
-import { fulfillJson, fulfillSse, installBrowserStubs } from './helpers';
+import {
+  fulfillJson,
+  fulfillSse,
+  installBrowserStubs,
+  loginViaForm,
+} from './helpers';
 
 /**
  * U15 — 全局对话（/chat）端到端，对齐 PR#169/#170「Claude 式聊天布局重构」。
@@ -402,11 +407,12 @@ async function snap(page: Page, name: string) {
 }
 
 async function loginAsAdmin(page: Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill(ADMIN_EMAIL);
-  await page.locator('input[type="password"]').fill(ADMIN_PASSWORD);
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  // /chat 与 /chat/[conversationId] 是两个路由文件，都要预热（id 任意，只为逼编译）。
+  await loginViaForm(page, {
+    email: ADMIN_EMAIL,
+    password: ADMIN_PASSWORD,
+    prewarm: ['/chat', '/chat/prewarm'],
+  });
 }
 
 let state: ChatMockState;

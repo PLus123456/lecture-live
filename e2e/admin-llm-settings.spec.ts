@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * Admin「设置 > LLM」两段式设置页烟测（用途路由 + 模型库）。
@@ -292,11 +292,9 @@ async function setupRoutes(page: Page, captured: CapturedRequest[]) {
 }
 
 async function gotoLlmSettings(page: Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('admin@lecturelive.com');
-  await page.locator('input[type="password"]').fill('admin123');
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  await loginAsAdmin(page, {
+    prewarm: ['/admin?tab=settings&subtab=llm'],
+  });
 
   await page.goto('/admin?tab=settings&subtab=llm');
   await page.waitForLoadState('networkidle');

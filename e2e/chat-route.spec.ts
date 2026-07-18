@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * U10 — /chat 路由 + Claude 式起聊首页烟测（对齐 PR#169/#170 重构）。
@@ -134,11 +134,7 @@ test.beforeEach(async ({ page }) => {
 test('chat route renders composer, new-conversation entry, and recent chats', async ({
   page,
 }) => {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('admin@lecturelive.com');
-  await page.locator('input[type="password"]').fill('admin123');
-  await page.getByRole('button', { name: /Sign In|登录/i }).click();
-  await expect(page).toHaveURL(/\/home$/);
+  await loginAsAdmin(page, { prewarm: ['/chat'] });
 
   await page.goto('/chat');
   await page.waitForLoadState('networkidle');

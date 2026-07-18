@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * U13 — admin「Chat 文件」面板烟测（对齐重构后的 admin tab 结构）。
@@ -90,11 +90,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('admin chat files panel renders', async ({ page }) => {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('admin@lecturelive.com');
-  await page.locator('input[type="password"]').fill('admin123');
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  await loginAsAdmin(page, { prewarm: ['/admin?tab=chatFiles'] });
 
   await page.goto('/admin?tab=chatFiles');
   await page.waitForLoadState('networkidle');

@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 跨会话隔离端到端（P0-3）+ 录音重连可视 affordance（P1-4）+ 回放保护（P1-8）。
@@ -39,11 +39,11 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function loginThroughUi(page: Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('alice@example.com');
-  await page.locator('input[type="password"]').fill('Abcd1234');
-  await page.getByRole('button', { name: 'Sign In' }).click();
-  await expect(page).toHaveURL(/\/home$/);
+  await loginViaForm(page, {
+    email: 'alice@example.com',
+    password: 'Abcd1234',
+    prewarm: ['/session/prewarm'],
+  });
 }
 
 interface CrossSessionMockOptions {

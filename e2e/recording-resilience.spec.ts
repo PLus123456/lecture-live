@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 录音健壮性端到端：会话被服务端回收（reclaim）后停止收尾不再静默删库丢录音（审计 critical）。
@@ -33,11 +33,11 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function loginThroughUi(page: Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('alice@example.com');
-  await page.locator('input[type="password"]').fill('Abcd1234');
-  await page.getByRole('button', { name: 'Sign In' }).click();
-  await expect(page).toHaveURL(/\/home$/);
+  await loginViaForm(page, {
+    email: 'alice@example.com',
+    password: 'Abcd1234',
+    prewarm: ['/session/prewarm'],
+  });
 }
 
 // 预置 zustand persist 的转录 store 快照：录音中刷新遗留的「暂停态 + 已有转录段」。

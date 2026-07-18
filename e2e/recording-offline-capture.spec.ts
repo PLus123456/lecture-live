@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson } from './helpers';
+import { fulfillJson, loginViaForm } from './helpers';
 
 /**
  * 断网续采端到端：录音中网络断开时，本地录音继续、只中断转录（审计后新增功能）。
@@ -28,11 +28,11 @@ const quotaPayload = {
 };
 
 async function loginThroughUi(page: Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('alice@example.com');
-  await page.locator('input[type="password"]').fill('Abcd1234');
-  await page.getByRole('button', { name: 'Sign In' }).click();
-  await expect(page).toHaveURL(/\/home$/);
+  await loginViaForm(page, {
+    email: 'alice@example.com',
+    password: 'Abcd1234',
+    prewarm: ['/session/prewarm'],
+  });
 }
 
 function installMocks(page: Page) {

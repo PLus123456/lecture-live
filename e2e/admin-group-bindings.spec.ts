@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * 用户组能力绑定 —— admin 组编辑面板烟测。
@@ -146,11 +146,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('组编辑面板渲染能力绑定控件且模型去重', async ({ page }) => {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('admin@lecturelive.com');
-  await page.locator('input[type="password"]').fill('admin123');
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  await loginAsAdmin(page, { prewarm: ['/admin?tab=groups'] });
 
   await page.goto('/admin?tab=groups');
   await page.waitForLoadState('networkidle');
@@ -220,11 +216,7 @@ test('组编辑面板渲染能力绑定控件且模型去重', async ({ page }) 
 });
 
 test('编辑弹窗挂到 body 且铺满视口（不再错位）', async ({ page }) => {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('admin@lecturelive.com');
-  await page.locator('input[type="password"]').fill('admin123');
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  await loginAsAdmin(page, { prewarm: ['/admin?tab=groups'] });
 
   await page.goto('/admin?tab=groups');
   await page.waitForLoadState('networkidle');

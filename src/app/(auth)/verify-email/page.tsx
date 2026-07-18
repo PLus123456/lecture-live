@@ -47,7 +47,9 @@ export default function VerifyEmailPage() {
         // 验证成功：后端已下发会话 cookie，同步客户端 store 后进入应用。
         setAuth(data.user, data.token);
         setStatus('success');
-        setTimeout(() => router.push('/home'), 1500);
+        // replace 而非 push：验证令牌是一次性的，把本页留在历史里意味着用户按一下后退
+        // 就会重放已消费的链接，然后对着一个刚验证成功的账号弹「链接无效或已过期」。
+        setTimeout(() => router.replace('/home'), 1500);
       } catch {
         setStatus('error');
         setErrorMsg(t('common.networkError'));

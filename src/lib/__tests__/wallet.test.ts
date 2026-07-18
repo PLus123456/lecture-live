@@ -44,10 +44,25 @@ vi.mock('@/lib/prisma', () => {
     prisma: {
       ...tx,
       // $transaction 直接以同一 mock 作为 tx 客户端执行回调。
-      $transaction: (cb: (t: typeof tx) => unknown) => cb(tx),
+      // 可被单测替换：真实 Prisma 里「回调跑完」≠「已提交」，要验证提交后才做的副作用
+      // （如 #16 的确认邮件）就必须能模拟「回调成功但提交失败」。
+      $transaction: (cb: (t: typeof tx) => unknown) => transactionImpl(cb, tx),
     },
   };
 });
+
+/**
+ * 默认实现＝直接跑回调。测试可临时替换成「跑完回调再抛错」来模拟 COMMIT 阶段失败
+ * （死锁、连接断开），从而区分"事务内做的事"与"提交后才做的事"。
+ */
+type TxRunner = <T>(cb: (t: T) => unknown, tx: T) => unknown;
+let transactionImpl: TxRunner = (cb, tx) => cb(tx);
+const setTransactionImpl = (impl: TxRunner) => {
+  transactionImpl = impl;
+};
+const resetTransactionImpl = () => {
+  transactionImpl = (cb, tx) => cb(tx);
+};
 
 vi.mock('@/lib/userRoles', () => ({
   resolveRoleQuotas: vi.fn().mockResolvedValue({
@@ -69,6 +84,7 @@ vi.mock('@/lib/email', () => ({
 import { creditPaidOrder, spendFromBalance, adminAdjust, WalletError } from '@/lib/wallet';
 
 beforeEach(() => {
+  resetTransactionImpl(); // 防止「提交失败」替身泄漏到其它用例
   paymentOrderUpdateManyMock.mockReset();
   paymentOrderFindUniqueMock.mockReset();
   userUpdateMock.mockReset();
@@ -457,6 +473,180 @@ describe('spendFromBalance：余额购买', () => {
     await expect(spendFromBalance('admin', 't-pro')).rejects.toMatchObject({
       code: 'admin_no_membership',
     });
+  });
+
+  // #16：余额购买此前完全不发确认信 —— 钱扣了、角色变了、tokenVersion++ 还把人踢下线，
+  // 用户零通知。网关支付有信，纯余额出账没有，同一笔消费两条路径待遇不同。
+  it('▶ #16 会员档位购买成功后发确认邮件（含真实到期日）', async () => {
+    rechargeTierFindUniqueMock.mockResolvedValueOnce({
+      id: 't-pro',
+      kind: 'membership',
+      name: 'PRO月卡',
+      priceCents: 3000,
+      grantRole: 'PRO',
+      durationDays: 30,
+      active: true,
+    });
+    userFindUniqueMock
+      .mockResolvedValueOnce({
+        walletBalanceCents: 3000,
+        role: 'FREE',
+        originalRole: null,
+        roleExpiresAt: null,
+      })
+      .mockResolvedValueOnce({ walletBalanceCents: 0 })
+      // notifyBalancePurchase 事务后重新读用户，拿发放后的到期日
+      .mockResolvedValueOnce({
+        id: 'u1',
+        email: 'u1@example.com',
+        displayName: '张三',
+        emailPreferences: null,
+        roleExpiresAt: new Date('2026-08-17T00:00:00.000Z'),
+      });
+    userUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    await spendFromBalance('u1', 't-pro');
+    // fire-and-forget：排空微任务再断言
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(sendSubscriptionSuccessEmailMock).toHaveBeenCalledTimes(1);
+    const [user, params] = sendSubscriptionSuccessEmailMock.mock.calls[0];
+    expect(user).toMatchObject({ id: 'u1', email: 'u1@example.com' });
+    expect(params).toMatchObject({ planName: 'PRO月卡', amountLabel: '¥30.00' });
+    expect(params.expiresLabel).toBeTruthy();
+  });
+
+  it('▶ #16 分钟包购买同样发确认信，但不写有效期', async () => {
+    rechargeTierFindUniqueMock.mockResolvedValueOnce({
+      id: 't-min',
+      kind: 'minutes',
+      name: '600分钟包',
+      priceCents: 5000,
+      grantMinutes: 600,
+      active: true,
+    });
+    userFindUniqueMock
+      .mockResolvedValueOnce({
+        walletBalanceCents: 5000,
+        role: 'FREE',
+        originalRole: null,
+        roleExpiresAt: null,
+      })
+      .mockResolvedValueOnce({ walletBalanceCents: 0 })
+      .mockResolvedValueOnce({
+        id: 'u1',
+        email: 'u1@example.com',
+        displayName: '张三',
+        emailPreferences: null,
+        // 分钟包不动角色，用户可能本来就有会员到期日——也绝不能拿它当本次购买的有效期
+        roleExpiresAt: new Date('2026-09-01T00:00:00.000Z'),
+      });
+    userUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    await spendFromBalance('u1', 't-min');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(sendSubscriptionSuccessEmailMock).toHaveBeenCalledTimes(1);
+    expect(sendSubscriptionSuccessEmailMock.mock.calls[0][1].expiresLabel).toBeNull();
+  });
+
+  // 事务失败=没买成，绝不能发确认信（同 #3 的教训）。
+  it('▶ #16 购买失败时不发确认邮件', async () => {
+    rechargeTierFindUniqueMock.mockResolvedValueOnce({
+      id: 't1',
+      kind: 'minutes',
+      name: 'x',
+      priceCents: 5000,
+      grantMinutes: 600,
+      active: true,
+    });
+    userFindUniqueMock.mockResolvedValueOnce({
+      walletBalanceCents: 100,
+      role: 'FREE',
+      originalRole: null,
+      roleExpiresAt: null,
+    });
+    userUpdateManyMock.mockResolvedValueOnce({ count: 0 });
+
+    await expect(spendFromBalance('u1', 't1')).rejects.toMatchObject({
+      code: 'insufficient_balance',
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(sendSubscriptionSuccessEmailMock).not.toHaveBeenCalled();
+  });
+
+  // 变异测试抓出来的漏网之鱼：把发信挪进事务回调里，上面那些断言全都照样绿 ——
+  // 因为 $transaction 替身只是原地跑回调，区分不了「事务内」与「已提交」。
+  // 这里显式模拟「回调成功但 COMMIT 失败」：确认信必须一封都发不出去，
+  // 否则用户会收到一封「购买成功」而钱和权益其实都回滚了。
+  it('▶ #16 事务提交失败时不发确认邮件（发信必须在提交之后）', async () => {
+    setTransactionImpl(async (cb, tx) => {
+      await cb(tx); // 回调本身成功
+      throw new Error('commit failed'); // 提交阶段炸了 → 整笔回滚
+    });
+
+    rechargeTierFindUniqueMock.mockResolvedValueOnce({
+      id: 't-min',
+      kind: 'minutes',
+      name: '600分钟包',
+      priceCents: 5000,
+      grantMinutes: 600,
+      active: true,
+    });
+    userFindUniqueMock
+      .mockResolvedValueOnce({
+        walletBalanceCents: 5000,
+        role: 'FREE',
+        originalRole: null,
+        roleExpiresAt: null,
+      })
+      .mockResolvedValueOnce({ walletBalanceCents: 0 })
+      .mockResolvedValueOnce({
+        id: 'u1',
+        email: 'u1@example.com',
+        displayName: '张三',
+        emailPreferences: null,
+        roleExpiresAt: null,
+      });
+    userUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    await expect(spendFromBalance('u1', 't-min')).rejects.toThrow('commit failed');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(sendSubscriptionSuccessEmailMock).not.toHaveBeenCalled();
+  });
+
+  // 发信失败不能反过来把已成功的购买变成失败。
+  it('▶ #16 发信失败不影响购买本身', async () => {
+    sendSubscriptionSuccessEmailMock.mockRejectedValueOnce(new Error('smtp down'));
+    rechargeTierFindUniqueMock.mockResolvedValueOnce({
+      id: 't-min',
+      kind: 'minutes',
+      name: '600分钟包',
+      priceCents: 5000,
+      grantMinutes: 600,
+      active: true,
+    });
+    userFindUniqueMock
+      .mockResolvedValueOnce({
+        walletBalanceCents: 5000,
+        role: 'FREE',
+        originalRole: null,
+        roleExpiresAt: null,
+      })
+      .mockResolvedValueOnce({ walletBalanceCents: 0 })
+      .mockResolvedValueOnce({
+        id: 'u1',
+        email: 'u1@example.com',
+        displayName: '张三',
+        emailPreferences: null,
+        roleExpiresAt: null,
+      });
+    userUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    await expect(spendFromBalance('u1', 't-min')).resolves.toBeUndefined();
+    await new Promise((r) => setTimeout(r, 0));
   });
 });
 

@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Loader2, CheckCircle2 } from 'lucide-react';
+import { Loader2, CheckCircle2, AlertCircle } from 'lucide-react';
 import SiteLogo from '@/components/SiteLogo';
 import ThemeSwitcher from '@/components/ThemeSwitcher';
 import { useI18n } from '@/lib/i18n';
@@ -11,7 +11,9 @@ import { useI18n } from '@/lib/i18n';
 export default function ResetPasswordPage() {
   const router = useRouter();
   const { t } = useI18n();
-  const [token, setToken] = useState<string | null>(null);
+  // 三态：undefined=尚未从 URL 解析（首帧），null=解析过但确实没有 token，string=拿到了。
+  // 不区分「还没读」和「读了没有」就无法在首帧之后立刻给出解释，只能干晾一个禁用表单。
+  const [token, setToken] = useState<string | null | undefined>(undefined);
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [minLength, setMinLength] = useState(8);
@@ -77,7 +79,8 @@ export default function ResetPasswordPage() {
         return;
       }
       setDone(true);
-      setTimeout(() => router.push('/login'), 2500);
+      // replace 而非 push：重置令牌一次性，后退重放会对着刚改好密码的用户弹「链接已失效」。
+      setTimeout(() => router.replace('/login'), 2500);
     } catch {
       setError(t('common.networkError'));
     } finally {
@@ -98,7 +101,23 @@ export default function ResetPasswordPage() {
           </h1>
         </div>
 
-        {done ? (
+        {token === null ? (
+          /* 链接里没有 token：此前这里渲染的是一个按钮被 disabled 钉死的表单，
+             既提交不了、也不给任何解释（handleSubmit 里那段缺 token 的报错分支
+             因为按钮 disabled 根本走不到）。直接说明原因并给出重新申请的入口。 */
+          <div className="bg-white rounded-xl shadow-sm border border-cream-200 p-6 space-y-4 animate-fade-in-up text-center">
+            <div className="mx-auto w-12 h-12 rounded-full bg-amber-50 flex items-center justify-center">
+              <AlertCircle className="w-6 h-6 text-amber-600" />
+            </div>
+            <p className="text-sm text-charcoal-600">{t('auth.resetMissingToken')}</p>
+            <Link
+              href="/forgot-password"
+              className="inline-block text-sm text-rust-500 hover:underline"
+            >
+              {t('auth.forgotPasswordTitle')}
+            </Link>
+          </div>
+        ) : done ? (
           <div className="bg-white rounded-xl shadow-sm border border-cream-200 p-6 space-y-4 animate-fade-in-up text-center">
             <div className="mx-auto w-12 h-12 rounded-full bg-green-50 flex items-center justify-center">
               <CheckCircle2 className="w-6 h-6 text-green-600" />

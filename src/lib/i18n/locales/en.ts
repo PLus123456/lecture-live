@@ -90,6 +90,10 @@ export default {
     checkEmailDesc: 'We sent a verification email to {email}. Click the link inside to verify your address.',
     resendVerification: 'Resend verification email',
     verificationResent: 'If that email is awaiting verification, we have resent the verification email.',
+    // Account created but the verification email never went out — do not tell the user to go
+    // check an inbox that will stay empty; point them at the resend button instead.
+    verificationSendFailedTitle: 'Account created, but the email could not be sent',
+    verificationSendFailedDesc: 'Your account for {email} was created, but we could not send the verification email. Try resending it below — if it keeps failing, please contact the site administrator.',
     verifyEmailPrompt: 'Your email is not verified yet. Please verify it before signing in.',
     forgotPassword: 'Forgot password?',
     forgotPasswordTitle: 'Reset your password',
@@ -100,6 +104,7 @@ export default {
     resetPasswordDone: 'Password reset. Redirecting to sign in…',
     resetPasswordSubmit: 'Reset password',
     resetLinkInvalid: 'This reset link is invalid or expired. Please request a new one.',
+    resetMissingToken: 'Open this page from the link in your password reset email. Please request a new reset email.',
     verifying: 'Verifying your email…',
     verifySuccess: 'Email verified. Signing you in…',
     verifyFailed: 'This verification link is invalid or expired. Please request a new one.',
@@ -1055,6 +1060,25 @@ export default {
     emailTestRecipient: 'Recipient email (optional)',
     emailTestOk: 'SMTP connection succeeded',
     emailTestSendOk: 'Test email sent, please check your inbox',
+
+    // Broadcast announcements / promotions
+    broadcastTitle: 'Broadcast Email',
+    broadcastDesc: 'Send a product update or promotional email to users. Only users with a verified address who have not opted out of this category will receive it. Sending cannot be undone — count recipients and send yourself a test first.',
+    broadcastAudienceAll: 'All users',
+    broadcastSubject: 'Subject line (shown in the inbox)',
+    broadcastHeading: 'Body heading',
+    broadcastBody: 'Body text',
+    broadcastCtaLabel: 'Button label (optional)',
+    broadcastCountRecipients: 'Count recipients',
+    broadcastSendTest: 'Send test to myself',
+    broadcastTestSent: 'Test email sent to {email}',
+    broadcastRecipientCount: 'Eligible recipients: {n}',
+    broadcastMarketingOff: 'The site-wide marketing email switch is off — nobody would receive this.',
+    broadcastTruncated: 'Recipients exceed the per-send cap; only the first 5000 will be sent.',
+    broadcastSend: 'Start broadcast',
+    broadcastConfirm: 'Send to {n} recipients? This cannot be undone.',
+    broadcastConfirmSend: 'Confirm send',
+    broadcastDispatched: 'Dispatch started for {n} messages (sent in the background; check logs for results)',
 
     // Storage
     storageMode: 'Storage Mode',

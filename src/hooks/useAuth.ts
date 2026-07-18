@@ -20,8 +20,14 @@ export function useAuth() {
         throw new Error(data.error || 'Registration failed');
       }
       // 开启邮箱验证硬门禁时，注册不返回会话——不要 setAuth，交回给页面进入「去邮箱验证」态。
+      // emailSendFailed=true 表示账号建好了但验证信没发出去，页面要改用告警态而非「请查收」。
       if (data.verificationRequired) {
-        return data as { verificationRequired: true; email: string; message?: string };
+        return data as {
+          verificationRequired: true;
+          email: string;
+          message?: string;
+          emailSendFailed?: boolean;
+        };
       }
       setAuth(data.user, data.token);
       return data;

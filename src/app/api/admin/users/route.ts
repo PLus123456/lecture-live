@@ -26,6 +26,9 @@ const USER_SELECT = {
   roleExpiresAt: true,
   avatarPath: true,
   createdAt: true,
+  // 邮箱验证状态：门禁开启时它为空就登不上。此前 admin 侧完全查不到这个字段，
+  // 用户报「登不上」时后台无从诊断，故纳入列表。
+  emailVerifiedAt: true,
   transcriptionMinutesUsed: true,
   transcriptionMinutesLimit: true,
   storageHoursUsed: true,
@@ -165,6 +168,11 @@ export async function POST(req: Request) {
         displayName,
         passwordHash,
         role: normalizedRole,
+        // 管理员手工建号即视为已验证：邮箱和初始密码都是管理员亲自填的，等于线下背书。
+        // 此前这里不写该字段 → email_verification 开启时，管理员建的账号一律 403 登不上，
+        // 而后台也看不到这个字段，谁都诊断不出来。
+        // 让用户去验证一个管理员替他填的地址也没有意义：地址填错了，验证信照样收不到。
+        emailVerifiedAt: new Date(),
         ...quotas,
         storageBytesLimit,
       },
@@ -421,6 +429,9 @@ export async function PATCH(req: Request) {
       storageHoursLimit?: number;
       // 一键重置该用户本月已用转录时长（transcriptionMinutesUsed → 0）。
       resetTranscriptionUsage?: boolean;
+      // 人工标记邮箱已验证。存量用户卡在「未验证」时的唯一后台补救入口
+      // （例如注册时填了收不到信的地址、或 SMTP 坏掉期间注册的账号）。
+      markEmailVerified?: boolean;
     };
 
     if (!userId) {
@@ -458,6 +469,16 @@ export async function PATCH(req: Request) {
       data.passwordHash = await bcrypt.hash(fields.password, siteSettings.bcrypt_rounds);
       // 修改密码后令旧 token 失效
       data.tokenVersion = { increment: 1 };
+    }
+
+    // 人工标记/撤销邮箱验证。true 时只在尚未验证的情况下写入，避免每次保存都刷新时间戳
+    // （那会把「什么时候验证的」这条审计线索抹掉）。
+    if (fields.markEmailVerified !== undefined) {
+      if (fields.markEmailVerified) {
+        if (!existing.emailVerifiedAt) data.emailVerifiedAt = new Date();
+      } else {
+        data.emailVerifiedAt = null;
+      }
     }
 
     if (fields.role !== undefined) {

@@ -62,24 +62,50 @@ export function getEmailDomain(email: string): string | null {
   return normalized.slice(atIndex + 1);
 }
 
-/** 解析逗号/换行/空格分隔的域名列表：小写、去 @ 前缀、去重、丢弃非法项。 */
-export function parseDomainList(raw: string | null | undefined): string[] {
-  if (!raw) return [];
+export interface DomainListParse {
+  valid: string[];   // 归一化后的合法域名（小写、去重、去 @ 前缀与尾点）
+  invalid: string[]; // 无法解析的原始条目（保留用户输入原文，用于报错回显）
+}
+
+/**
+ * 解析逗号/换行/空格分隔的域名列表，**同时返回被丢弃的条目**。
+ * 丢弃项必须能被调用方看见：静默吞掉 `*.edu.cn` 这类通配写法会让管理员以为白名单已生效，
+ * 而实际解析结果为空 —— 强制开关随即变成"谁都能注册"（见 checkRegistrationEmail 的 fail-closed）。
+ */
+export function parseDomainListDetailed(
+  raw: string | null | undefined
+): DomainListParse {
+  if (!raw) return { valid: [], invalid: [] };
   const seen = new Set<string>();
-  const out: string[] = [];
+  const valid: string[] = [];
+  const invalidSeen = new Set<string>();
+  const invalid: string[] = [];
   for (const piece of raw.split(/[\s,;]+/)) {
-    let d = piece.trim().toLowerCase();
-    if (!d) continue;
+    const original = piece.trim();
+    if (!original) continue;
+    let d = original.toLowerCase();
     // 容错：用户可能粘贴 "@edu.cn" 或 "user@edu.cn"
     const at = d.lastIndexOf('@');
     if (at >= 0) d = d.slice(at + 1);
     d = d.replace(/\.+$/, '');
-    if (!isValidDomain(d)) continue;
+    if (!isValidDomain(d)) {
+      // 回显原文（而非清洗后的残渣），管理员才认得出自己填的是哪一条
+      if (!invalidSeen.has(original)) {
+        invalidSeen.add(original);
+        invalid.push(original);
+      }
+      continue;
+    }
     if (seen.has(d)) continue;
     seen.add(d);
-    out.push(d);
+    valid.push(d);
   }
-  return out;
+  return { valid, invalid };
+}
+
+/** 解析逗号/换行/空格分隔的域名列表：小写、去 @ 前缀、去重、丢弃非法项。 */
+export function parseDomainList(raw: string | null | undefined): string[] {
+  return parseDomainListDetailed(raw).valid;
 }
 
 /**
@@ -121,6 +147,11 @@ export interface DomainPolicy {
   disposableExtra: string[]; // 额外黑名单域名（已 parseDomainList）
   allowlist: string[];       // 白名单/教育域名（已 parseDomainList）
   allowlistEnforce: boolean; // true=只有白名单域名能注册
+  /**
+   * 白名单里被丢弃的非法条目（原文）。非空 + allowlist 为空 = 管理员填了内容但一条都没解析出来，
+   * 此时强制开关必须 fail-closed，否则等于静默失效。手工构造 policy 时可省略。
+   */
+  allowlistInvalid?: string[];
 }
 
 /** 从 SiteSettings 的原始字段构造域名策略。 */
@@ -130,10 +161,12 @@ export function buildDomainPolicy(settings: {
   email_domain_allowlist: string;
   email_domain_allowlist_enforce: boolean;
 }): DomainPolicy {
+  const allowlistParsed = parseDomainListDetailed(settings.email_domain_allowlist);
   return {
     blockDisposable: settings.block_disposable_email,
     disposableExtra: parseDomainList(settings.disposable_email_extra),
-    allowlist: parseDomainList(settings.email_domain_allowlist),
+    allowlist: allowlistParsed.valid,
+    allowlistInvalid: allowlistParsed.invalid,
     allowlistEnforce: settings.email_domain_allowlist_enforce,
   };
 }
@@ -167,7 +200,8 @@ export function isEducationEmail(email: string, policy: DomainPolicy): boolean {
 export type RegistrationEmailRejection =
   | 'invalid_format'
   | 'disposable_blocked'
-  | 'not_allowlisted';
+  | 'not_allowlisted'
+  | 'allowlist_misconfigured';
 
 export interface RegistrationEmailCheck {
   ok: boolean;
@@ -191,10 +225,19 @@ export function checkRegistrationEmail(
   if (policy.blockDisposable && isDisposableEmail(email, policy)) {
     return { ok: false, reason: 'disposable_blocked', isEducation };
   }
-  if (policy.allowlistEnforce && policy.allowlist.length > 0) {
-    const domain = getEmailDomain(email);
-    if (!domain || !domainMatchesList(domain, policy.allowlist)) {
-      return { ok: false, reason: 'not_allowlisted', isEducation };
+  if (policy.allowlistEnforce) {
+    if (policy.allowlist.length === 0) {
+      // 白名单整体解析失败（管理员填了 "*.edu.cn" 之类，一条都不合法）。放行所有人等于
+      // 静默架空他显式开启的强制开关，故 fail-closed 并让调用方把配置错误报出来。
+      // 与「白名单本就为空」区分：那是有意的"不限制"，保持放行。
+      if ((policy.allowlistInvalid?.length ?? 0) > 0) {
+        return { ok: false, reason: 'allowlist_misconfigured', isEducation };
+      }
+    } else {
+      const domain = getEmailDomain(email);
+      if (!domain || !domainMatchesList(domain, policy.allowlist)) {
+        return { ok: false, reason: 'not_allowlisted', isEducation };
+      }
     }
   }
   return { ok: true, isEducation };

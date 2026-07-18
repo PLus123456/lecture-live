@@ -8,9 +8,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 
 const pushMock = vi.fn();
+const replaceMock = vi.fn();
 const setAuthMock = vi.fn();
 
-vi.mock('next/navigation', () => ({ useRouter: () => ({ push: pushMock }) }));
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: pushMock, replace: replaceMock }),
+}));
 vi.mock('next/link', () => ({
   default: ({
     href,
@@ -103,6 +106,29 @@ describe('VerifyEmailPage', () => {
       expect(setAuthMock).toHaveBeenCalledTimes(1);
     });
     expect(screen.getByText(/email verified/i)).toBeInTheDocument();
+  });
+
+  // #19：验证令牌一次性，成功后若用 push 留在历史里，后退即重放已消费的链接，
+  // 对着一个刚验证成功的登录用户弹「链接无效或已过期」。
+  it('验证成功后用 replace 跳转，不留一次性令牌页在历史里', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mockFetch({
+      ok: true,
+      status: 200,
+      body: {
+        verified: true,
+        user: { id: 'u1', email: 'a@b.com', displayName: 'A', role: 'FREE' },
+        token: 'client-session',
+      },
+    });
+    render(<VerifyEmailPage />);
+
+    await waitFor(() => expect(setAuthMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(replaceMock).toHaveBeenCalledWith('/home');
+    expect(pushMock).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 
   it('缺少令牌时显示对应提示且不发请求', async () => {

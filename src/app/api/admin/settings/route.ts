@@ -21,7 +21,7 @@ import {
   validateCloudreveBaseUrl,
 } from '@/lib/storage/cloudreve';
 import { parseWorkerUrls } from '@/lib/audio/enhanceWorkerClient';
-import { isValidEmailAddress } from '@/lib/email/domains';
+import { isValidEmailAddress, parseDomainListDetailed } from '@/lib/email/domains';
 import { invalidateMailer } from '@/lib/email/mailer';
 
 // 获取所有站点设置
@@ -243,6 +243,31 @@ export async function PUT(req: Request) {
         );
       }
       entries[senderEmailIdx] = ['sender_email', senderStr];
+    }
+
+    // 注册域名白名单 / 一次性邮箱补充黑名单：逐条校验，**不接受静默丢弃**。
+    // 此前 parseDomainList 会把 "*.edu.cn"、"edu"、".edu.cn" 这类写法直接吞掉，页面又原样回显
+    // 管理员填的原文 —— 于是白名单解析成空数组、强制开关形同虚设，而他以为已经生效。
+    // 落库统一存归一化后的结果，保证「设置页看到的」就是「实际生效的」。
+    const domainListFields: Array<[key: string, label: string]> = [
+      ['email_domain_allowlist', '注册域名白名单'],
+      ['disposable_email_extra', '一次性邮箱补充黑名单'],
+    ];
+    for (const [key, label] of domainListFields) {
+      const idx = entries.findIndex(([k]) => k === key);
+      if (idx < 0) continue;
+      const rawValue = entries[idx][1];
+      const rawStr = typeof rawValue === 'string' ? rawValue : '';
+      const parsed = parseDomainListDetailed(rawStr);
+      if (parsed.invalid.length > 0) {
+        return NextResponse.json(
+          {
+            error: `${label}存在无法识别的域名: ${parsed.invalid.join(', ')}。请填写域名本身（如 edu.cn、stanford.edu），不要使用通配符或前导点，子域名会自动匹配。`,
+          },
+          { status: 400 }
+        );
+      }
+      entries[idx] = [key, parsed.valid.join(',')];
     }
 
     // 记录切换前的存储模式，用于检测是否需要迁移

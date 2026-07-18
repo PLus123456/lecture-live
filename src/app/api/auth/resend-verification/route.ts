@@ -71,11 +71,20 @@ export async function POST(req: Request) {
     });
 
     // 仅对「存在 + 正常 + 未验证」发送；其余情况静默。
+    //
+    // 刻意不 await（同 forgot-password）：await 完整 SMTP 往返再返回，会让「账号存在且待验证」
+    // 比其余分支慢 200ms~3s，通用响应文案挡不住这个时间差 —— 这里泄露的还不止账号存在性，
+    // 连验证状态一并暴露。响应与发信结果无关，故把发信移出响应路径。
     if (user && user.status === 1 && user.emailVerifiedAt == null) {
-      await sendVerificationEmail(user, {
+      void sendVerificationEmail(user, {
         settings: siteSettings ?? undefined,
         requestIp: clientIp === 'unknown' ? null : clientIp,
-      });
+      }).catch((err) =>
+        logger.error(
+          { err: serializeError(err) },
+          '[resend-verification] 发送验证邮件失败'
+        )
+      );
       logAction(req, 'user.verification.resend', {
         user: { id: user.id, email: user.email, role: 'FREE' },
         userName: user.displayName,

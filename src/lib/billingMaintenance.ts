@@ -24,6 +24,7 @@ import {
 import { runTranscriptionUsageReconciliation } from '@/lib/reconciliation';
 import { getRedisClient } from '@/lib/redis';
 import { sendExpiryReminderEmail } from '@/lib/email';
+import { pruneExpiredEmailTokens } from '@/lib/email/tokens';
 import { finalizeSession } from '@/lib/sessionFinalization';
 import {
   runChatFilesCleanup,
@@ -100,6 +101,7 @@ export interface BillingMaintenanceSummary {
   } | null;
   storageBytesReconciled: number;
   reconciliationRunId: string | null;
+  prunedEmailTokens: number;
   chatFilesCleanup: {
     agingDeleted: number;
     softCapDeleted: number;
@@ -410,6 +412,22 @@ export async function runBillingMaintenance(options?: {
     billingLogger.error({ err: serializeError(err) }, 'expiry reminder failed');
   }
 
+  // 过期/已消费邮件令牌清理。EmailToken 表此前无任何清理入口，只靠用户删除级联，
+  // 是纯增长的死数据。跟车每日对账窗口（reconciliationRunId 非空 = 今天的窗口已开）——
+  // 一条 deleteMany 不值得每 15 分钟跑一次。
+  // 位置同样在所有回收/对账之后：#5 的教训是任何可能变慢的步骤都不许排在会话回收前面。
+  let prunedEmailTokens = 0;
+  if (reconciliationRunId) {
+    try {
+      prunedEmailTokens = await pruneExpiredEmailTokens();
+      if (prunedEmailTokens > 0) {
+        billingLogger.info({ prunedEmailTokens }, 'expired email tokens pruned');
+      }
+    } catch (err) {
+      billingLogger.error({ err: serializeError(err) }, 'email token prune failed');
+    }
+  }
+
   if (
     resetUsers > 0 ||
     expiredRoleDowngrades > 0 ||
@@ -422,6 +440,7 @@ export async function runBillingMaintenance(options?: {
     cleanedOrphanSoniox > 0 ||
     reclaimedInterpretSessions > 0 ||
     storageBytesReconciled > 0 ||
+    prunedEmailTokens > 0 ||
     reconciliationRunId ||
     (chatFilesCleanup &&
       (chatFilesCleanup.agingDeleted > 0 ||
@@ -444,6 +463,7 @@ export async function runBillingMaintenance(options?: {
         sonioxUsageReconciliation,
         storageBytesReconciled,
         reconciliationRunId,
+        prunedEmailTokens,
         chatFilesCleanup,
       })
     );
@@ -463,6 +483,7 @@ export async function runBillingMaintenance(options?: {
     sonioxUsageReconciliation,
     storageBytesReconciled,
     reconciliationRunId,
+    prunedEmailTokens,
     chatFilesCleanup,
   };
 }

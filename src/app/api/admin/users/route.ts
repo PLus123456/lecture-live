@@ -12,6 +12,7 @@ import {
 } from '@/lib/userRoles';
 import { releaseStorageBytes, settlePoolOnLimitChange } from '@/lib/quota';
 import { deleteCloudreveAttachmentFiles } from '@/lib/storage/cloudreveFileDelete';
+import { invalidateUserEmailTokens } from '@/lib/email/tokens';
 
 // 共享的用户查询 select 字段
 const USER_SELECT = {
@@ -624,10 +625,17 @@ export async function PATCH(req: Request) {
       return NextResponse.json({ error: '没有需要更新的字段' }, { status: 400 });
     }
 
-    const user = await prisma.user.update({
-      where: { id: userId },
-      data,
-      select: USER_SELECT,
+    const user = await prisma.$transaction(async (tx) => {
+      // 管理员代改密码与自助改密同源：不作废未消费的邮件令牌，一封没用过的重置链接
+      // 就能在 1h 内把管理员刚设的密码改掉（tokenVersion++ 踢掉的会话拦不住它）。
+      if (data.passwordHash !== undefined) {
+        await invalidateUserEmailTokens(userId, { db: tx });
+      }
+      return tx.user.update({
+        where: { id: userId },
+        data,
+        select: USER_SELECT,
+      });
     });
 
     logAction(req, 'admin.user.update', {

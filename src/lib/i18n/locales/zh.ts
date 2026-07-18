@@ -104,6 +104,13 @@ export default {
     verifySuccess: '邮箱验证成功，正在进入…',
     verifyFailed: '验证链接无效或已过期，请重新获取。',
     verifyMissingToken: '缺少验证令牌，请从邮件中的链接打开。',
+    // 限流 / 通用失败：服务端只回 { error }（且是硬编码中文），前端一律按状态码自行出文案
+    rateLimited: '操作过于频繁，请稍后再试。',
+    passwordMinLengthN: '新密码至少 {n} 位',
+    passwordNeedsLetterAndDigit: '新密码需同时包含字母和数字',
+    forgotPasswordFailed: '发送重置邮件失败，请稍后再试。',
+    resendVerificationFailed: '重新发送验证邮件失败，请稍后再试。',
+    resetPasswordFailed: '重置密码失败，请稍后再试。',
   },
 
   // 邮件通知偏好（个人设置页）

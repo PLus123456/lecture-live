@@ -10,6 +10,9 @@ import {
   resolveRoleStorageBytesLimit,
 } from '@/lib/userRoles';
 import { getNextQuotaResetAt } from '@/lib/billing';
+// 直接引 tokens 而非 @/lib/email 桶文件：桶会拉进 mailer/模板（含 nodemailer），
+// 而 auth 是几乎所有路由的公共依赖，没必要为一句 updateMany 背上整个发信栈。
+import { invalidateUserEmailTokens } from '@/lib/email/tokens';
 
 const DEFAULT_JWT_EXPIRY_DAYS = 7;
 const COOKIE_NAME = 'lecture-live-token';
@@ -574,18 +577,23 @@ export async function changePassword(
     throw new Error('Current password is incorrect');
   }
   const passwordHash = await bcrypt.hash(newPassword, options?.bcryptRounds ?? 12);
-  return prisma.user.update({
-    where: { id: userId },
-    data: {
-      passwordHash,
-      tokenVersion: { increment: 1 },
-    },
-    select: {
-      id: true,
-      email: true,
-      role: true,
-      tokenVersion: true,
-    },
+  // 改密与「作废该用户全部未消费邮件令牌」必须同进同退：只改密不作废，一封没用过的
+  // 重置链接就能在 1h 内把刚改的密码再改回去（tokenVersion++ 踢掉的会话拦不住它）。
+  return prisma.$transaction(async (tx) => {
+    await invalidateUserEmailTokens(userId, { db: tx });
+    return tx.user.update({
+      where: { id: userId },
+      data: {
+        passwordHash,
+        tokenVersion: { increment: 1 },
+      },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        tokenVersion: true,
+      },
+    });
   });
 }
 

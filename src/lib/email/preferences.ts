@@ -11,7 +11,7 @@
 
 import 'server-only';
 import { createHmac, hkdfSync, timingSafeEqual } from 'node:crypto';
-import { ENCRYPTION_KEY } from '@/lib/serverSecrets';
+import { ENCRYPTION_KEY, ENCRYPTION_KEY_PREVIOUS } from '@/lib/serverSecrets';
 
 export type EmailCategory =
   | 'security_alert'
@@ -119,35 +119,86 @@ export function isCategoryEnabledForUser(
 
 // ─────────────────────────── 退订令牌 ───────────────────────────
 
-let unsubKeyCache: Buffer | null = null;
-function getUnsubKey(): Buffer {
-  if (!unsubKeyCache) {
-    unsubKeyCache = Buffer.from(
-      hkdfSync('sha256', ENCRYPTION_KEY, 'lecturelive-salt', 'lecturelive-email-unsub', 32)
+/**
+ * 令牌载荷 = userId + 退订范围 + 过期时刻，**三者全部进 HMAC**。
+ *
+ * 范围必须签进去：早先版本只签 userId、把 category 留作裸 URL 参数，于是一封 promotions
+ * 退订链接一旦外泄（转发、共享收件箱、邮件归档），把参数改成 `category=all` 就能替人关掉
+ * 全部通知——包括到期提醒和配额提醒这两个跟钱直接相关的。
+ *
+ * 过期时刻同理：无期限的退订链接一旦泄露就是永久有效。取 180 天——远超合规要求的
+ * 「发信后 30 天内可退订」，又把泄露窗口收在有限范围内。
+ *
+ * 仍然做不到的：主动吊销（无状态签名的固有代价）。真要吊销得落库，与「一键退订必须
+ * 零依赖可用」相冲突，故明确不做。
+ */
+const UNSUB_TOKEN_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+
+/** 退订范围：单个可控分类，或 'all'（关闭全部通知类）。 */
+export type UnsubscribeScope = EmailCategory | 'all';
+
+export type UnsubscribePayload = { userId: string; scope: UnsubscribeScope };
+
+const unsubKeyCache = new Map<string, Buffer>();
+function deriveUnsubKey(secret: string): Buffer {
+  let key = unsubKeyCache.get(secret);
+  if (!key) {
+    key = Buffer.from(
+      hkdfSync('sha256', secret, 'lecturelive-salt', 'lecturelive-email-unsub', 32)
     );
+    unsubKeyCache.set(secret, key);
   }
-  return unsubKeyCache;
+  return key;
 }
 
-function sign(userId: string): string {
-  return createHmac('sha256', getUnsubKey())
-    .update(`unsub:${userId}`)
+/** 校验时依次试当前密钥与上一代密钥，让 ENCRYPTION_KEY 轮换不作废存量退订链接。 */
+function verificationSecrets(): string[] {
+  return ENCRYPTION_KEY_PREVIOUS ? [ENCRYPTION_KEY, ENCRYPTION_KEY_PREVIOUS] : [ENCRYPTION_KEY];
+}
+
+/** 签名覆盖 userId|scope|exp 全体，任一被改动签名即不符。 */
+function sign(userId: string, scope: string, expiresAt: number, secret: string): string {
+  return createHmac('sha256', deriveUnsubKey(secret))
+    .update(`unsub:v2:${userId}:${scope}:${expiresAt}`)
     .digest('base64url');
 }
 
-/** 生成无状态退订令牌：base64url(userId).sig。放进通知邮件的退订链接。 */
-export function makeUnsubscribeToken(userId: string): string {
-  const idPart = Buffer.from(userId, 'utf8').toString('base64url');
-  return `${idPart}.${sign(userId)}`;
+function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
 }
 
-/** 校验退订令牌，返回 userId 或 null。timing-safe，签名不符即拒。 */
-export function verifyUnsubscribeToken(token: string): string | null {
+/**
+ * 生成无状态退订令牌：base64url(userId).scope.exp.sig
+ * 退订范围与有效期都在令牌里且被签名覆盖，收件人无法自行扩大范围或延长有效期。
+ */
+export function makeUnsubscribeToken(
+  userId: string,
+  scope: UnsubscribeScope,
+  options?: { now?: number; ttlMs?: number }
+): string {
+  const now = options?.now ?? Date.now();
+  const expiresAt = now + (options?.ttlMs ?? UNSUB_TOKEN_TTL_MS);
+  const idPart = Buffer.from(userId, 'utf8').toString('base64url');
+  return `${idPart}.${scope}.${expiresAt}.${sign(userId, scope, expiresAt, ENCRYPTION_KEY)}`;
+}
+
+/**
+ * 校验退订令牌，返回 { userId, scope } 或 null。
+ * 签名不符 / 过期 / 范围非法 一律拒；比较 timing-safe。
+ */
+export function verifyUnsubscribeToken(
+  token: string,
+  options?: { now?: number }
+): UnsubscribePayload | null {
   if (typeof token !== 'string') return null;
-  const dot = token.indexOf('.');
-  if (dot <= 0 || dot === token.length - 1) return null;
-  const idPart = token.slice(0, dot);
-  const sigPart = token.slice(dot + 1);
+  const parts = token.split('.');
+  if (parts.length !== 4) return null;
+  const [idPart, scope, expPart, sigPart] = parts;
+  if (!idPart || !scope || !expPart || !sigPart) return null;
+
   let userId: string;
   try {
     userId = Buffer.from(idPart, 'base64url').toString('utf8');
@@ -156,9 +207,20 @@ export function verifyUnsubscribeToken(token: string): string | null {
   }
   if (!userId) return null;
 
-  const expected = sign(userId);
-  const a = Buffer.from(sigPart);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return null;
-  return timingSafeEqual(a, b) ? userId : null;
+  // 范围必须是「用户可控分类」或 all——事务类（安全提醒）不允许退订。
+  if (scope !== 'all' && !(isKnownCategory(scope) && !CATEGORY_BY_KEY.get(scope)!.transactional)) {
+    return null;
+  }
+
+  const expiresAt = Number(expPart);
+  if (!Number.isSafeInteger(expiresAt)) return null;
+
+  // 先验签再看过期：签名不符的令牌里的 exp 本就不可信。
+  const signatureOk = verificationSecrets().some((secret) =>
+    safeEqual(sigPart, sign(userId, scope, expiresAt, secret))
+  );
+  if (!signatureOk) return null;
+  if ((options?.now ?? Date.now()) >= expiresAt) return null;
+
+  return { userId, scope: scope as UnsubscribeScope };
 }

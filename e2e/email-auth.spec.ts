@@ -46,7 +46,8 @@ test('注册开启邮箱验证：进入「去邮箱查收」态并可重发', as
       );
     }
     if (p === '/api/auth/resend-verification' && method === 'POST') {
-      return fulfillJson(route, { ok: true, message: 'resent ok' });
+      // 服务端真实响应：message 恒为硬编码中文。前端必须忽略它、渲染自己的 i18n 文案。
+      return fulfillJson(route, { ok: true, message: '如果该邮箱待验证，我们已重新发送验证邮件。' });
     }
     return fulfillJson(route, {});
   });
@@ -63,7 +64,9 @@ test('注册开启邮箱验证：进入「去邮箱查收」态并可重发', as
 
   // 重发按钮 → 显示回执
   await page.getByRole('button', { name: /Resend verification email|重新发送验证邮件/i }).click();
-  await expect(page.getByText(/resent ok/i)).toBeVisible({ timeout: 10_000 });
+  await expect(
+    page.getByText(/we have resent the verification email|已重新发送验证邮件/i)
+  ).toBeVisible({ timeout: 10_000 });
 });
 
 test('登录未验证：403 needsVerification → 展示重发入口', async ({ page }) => {
@@ -83,7 +86,8 @@ test('登录未验证：403 needsVerification → 展示重发入口', async ({ 
       );
     }
     if (p === '/api/auth/resend-verification' && method === 'POST') {
-      return fulfillJson(route, { ok: true, message: 'resent ok' });
+      // 服务端真实响应：message 恒为硬编码中文。前端必须忽略它、渲染自己的 i18n 文案。
+      return fulfillJson(route, { ok: true, message: '如果该邮箱待验证，我们已重新发送验证邮件。' });
     }
     return fulfillJson(route, {});
   });
@@ -99,7 +103,9 @@ test('登录未验证：403 needsVerification → 展示重发入口', async ({ 
   });
   await expect(resendBtn).toBeVisible({ timeout: 15_000 });
   await resendBtn.click();
-  await expect(page.getByText(/resent ok/i)).toBeVisible({ timeout: 10_000 });
+  await expect(
+    page.getByText(/we have resent the verification email|已重新发送验证邮件/i)
+  ).toBeVisible({ timeout: 10_000 });
 });
 
 test('登录页有「忘记密码」链接跳到 /forgot-password', async ({ page }) => {
@@ -120,7 +126,10 @@ test('忘记密码：提交后进入通用成功态（防枚举）', async ({ pa
     const method = route.request().method();
     if (p === '/api/site-config') return fulfillJson(route, { site_name: 'QA' });
     if (p === '/api/auth/forgot-password' && method === 'POST') {
-      return fulfillJson(route, { ok: true, message: 'if that email matches an account, we sent a reset link' });
+      return fulfillJson(route, {
+        ok: true,
+        message: '如果该邮箱对应一个账号，我们已发送密码重置邮件，请查收。',
+      });
     }
     return fulfillJson(route, {});
   });
@@ -128,7 +137,38 @@ test('忘记密码：提交后进入通用成功态（防枚举）', async ({ pa
   await page.goto('/forgot-password');
   await page.locator('input[type="email"]').fill('whoever@example.com');
   await page.locator('button[type="submit"]').first().click();
-  await expect(page.getByText(/if that email matches an account/i)).toBeVisible({ timeout: 15_000 });
+  await expect(
+    page.getByText(/if that email matches an account|我们已发送密码重置邮件/i)
+  ).toBeVisible({ timeout: 15_000 });
+});
+
+// 回归：限流响应只有 { error }、没有 message。早先前端写 `data?.message ?? t('已发送')`，
+// 于是第 4 次点「发送重置邮件」会显示绿色的「已发送」，用户干等一封永远不会来的信。
+test('忘记密码：限流 429 必须显示限流提示，而不是「已发送」', async ({ page }) => {
+  await installBrowserStubs(page);
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url());
+    const p = url.pathname;
+    const method = route.request().method();
+    if (p === '/api/site-config') return fulfillJson(route, { site_name: 'QA' });
+    if (p === '/api/auth/forgot-password' && method === 'POST') {
+      return fulfillJson(route, { error: 'Too many requests' }, 429);
+    }
+    return fulfillJson(route, {});
+  });
+
+  await page.goto('/forgot-password');
+  await page.locator('input[type="email"]').fill('whoever@example.com');
+  await page.locator('button[type="submit"]').first().click();
+
+  await expect(
+    page.getByText(/too many attempts|操作过于频繁/i)
+  ).toBeVisible({ timeout: 15_000 });
+  await expect(
+    page.getByText(/if that email matches an account|我们已发送密码重置邮件/i)
+  ).toHaveCount(0);
+  // 表单要留在原地，用户能改邮箱重试
+  await expect(page.locator('input[type="email"]')).toBeVisible();
 });
 
 test('重置密码：密码不一致拦截；一致则成功', async ({ page }) => {
@@ -139,7 +179,7 @@ test('重置密码：密码不一致拦截；一致则成功', async ({ page }) 
     const method = route.request().method();
     if (p === '/api/site-config') return fulfillJson(route, { password_min_length: 8 });
     if (p === '/api/auth/reset-password' && method === 'POST') {
-      return fulfillJson(route, { ok: true, message: 'password reset' });
+      return fulfillJson(route, { ok: true, message: '密码已重置，请用新密码登录' });
     }
     return fulfillJson(route, {});
   });

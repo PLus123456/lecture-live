@@ -86,8 +86,15 @@ export default function LoginPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),
       });
-      const data = await res.json().catch(() => null);
-      setResendMsg(data?.message ?? t('auth.verificationResent'));
+      // 文案走 i18n 键，不采用服务端 message（服务端永远填硬编码中文）。
+      // 先判状态码：限流只回 { error } 无 message，不判就会把 429 显示成「已重新发送」。
+      if (!res.ok) {
+        setResendMsg(
+          res.status === 429 ? t('auth.rateLimited') : t('auth.resendVerificationFailed')
+        );
+        return;
+      }
+      setResendMsg(t('auth.verificationResent'));
     } catch {
       setResendMsg(t('common.networkError'));
     } finally {

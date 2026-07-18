@@ -38,9 +38,10 @@ export default function VerifyEmailPage() {
           body: JSON.stringify({ token }),
         });
         const data = await res.json().catch(() => null);
+        // 文案走 i18n 键，不采用服务端 error（服务端永远是硬编码中文，英文键因此成了死代码）。
         if (!res.ok || !data?.verified) {
           setStatus('error');
-          setErrorMsg(data?.error ?? t('auth.verifyFailed'));
+          setErrorMsg(res.status === 429 ? t('auth.rateLimited') : t('auth.verifyFailed'));
           return;
         }
         // 验证成功：后端已下发会话 cookie，同步客户端 store 后进入应用。

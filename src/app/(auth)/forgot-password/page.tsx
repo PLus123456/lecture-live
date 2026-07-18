@@ -13,9 +13,11 @@ export default function ForgotPasswordPage() {
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
   const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError('');
     setLoading(true);
     try {
       const res = await fetch('/api/auth/forgot-password', {
@@ -23,13 +25,19 @@ export default function ForgotPasswordPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),
       });
-      const data = await res.json().catch(() => null);
-      // 防枚举：后端恒返回通用成功文案，前端一律进入「已发送」态。
-      setMessage(data?.message ?? t('auth.forgotPasswordSent'));
+      // 文案全部走 i18n 键，不采用服务端 message：服务端永远填硬编码中文，
+      // 早先的 `data?.message ?? t(...)` 让英文键永不渲染。
+      // 必须先看状态码：限流只回 { error } 无 message，不判 res.ok 就会把 429
+      // 渲染成绿色的「已发送」，用户干等一封永远不会来的信。
+      if (!res.ok) {
+        setError(res.status === 429 ? t('auth.rateLimited') : t('auth.forgotPasswordFailed'));
+        return;
+      }
+      // 防枚举：成功分支后端恒返回通用响应，前端一律进入「已发送」态。
+      setMessage(t('auth.forgotPasswordSent'));
       setSent(true);
     } catch {
-      setMessage(t('common.networkError'));
-      setSent(true);
+      setError(t('common.networkError'));
     } finally {
       setLoading(false);
     }
@@ -66,6 +74,11 @@ export default function ForgotPasswordPage() {
             onSubmit={handleSubmit}
             className="bg-white rounded-xl shadow-sm border border-cream-200 p-6 space-y-4 animate-fade-in-up stagger-2"
           >
+            {error && (
+              <div className="px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-xs text-red-600 animate-shake">
+                {error}
+              </div>
+            )}
             <div>
               <label className="block text-xs font-medium text-charcoal-600 mb-1">
                 {t('auth.email')}

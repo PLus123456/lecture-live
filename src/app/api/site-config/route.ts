@@ -1,4 +1,3 @@
-import { NextResponse } from 'next/server';
 import { getSiteSettings, toPublicSiteConfig } from '@/lib/siteSettings';
 import { jsonWithCache } from '@/lib/httpCache';
 

@@ -29,7 +29,7 @@ function makeResponse(r: MockResponse) {
 /** 依次返回预排响应；网络错误用 'THROW' 触发 fetch reject。 */
 function queueFetch(steps: Array<MockResponse | 'THROW'>) {
   let i = 0;
-  return vi.fn(async (_url?: string | URL | Request, _init?: RequestInit) => {
+  return vi.fn<(url?: string | URL | Request, init?: RequestInit) => Promise<Response>>(async () => {
     const step = steps[Math.min(i, steps.length - 1)];
     i += 1;
     if (step === 'THROW') {

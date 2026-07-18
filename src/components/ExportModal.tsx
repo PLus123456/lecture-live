@@ -267,7 +267,6 @@ export default function ExportModal({
   }, [isOpen, sessionId, token, fetchSessionData]);
 
   const exportSegments = resolveArrayOverride(segmentsOverride, sessionData?.segments);
-  const exportTranslations = resolveRecordOverride(translationsOverride, sessionData?.translations);
   const exportSummaries = resolveArrayOverride(summariesOverride, sessionData?.summaries);
   const exportReport = report ?? sessionData?.report ?? null;
   const exportHasRecording = Boolean(resolveHasRecording(hasRecording, sessionData?.hasRecording) && sessionId);

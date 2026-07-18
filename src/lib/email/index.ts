@@ -48,10 +48,10 @@ function buildResetUrl(siteUrl: string, rawToken: string): string {
   return `${trimTrailingSlash(siteUrl)}/reset-password?token=${encodeURIComponent(rawToken)}`;
 }
 function buildUnsubscribeUrl(siteUrl: string, userId: string, category: EmailCategory): string {
-  const token = makeUnsubscribeToken(userId);
-  return `${trimTrailingSlash(siteUrl)}/api/auth/unsubscribe?token=${encodeURIComponent(
-    token
-  )}&category=${encodeURIComponent(category)}`;
+  // 退订范围签进令牌本身，不再另挂裸 category 参数——否则收件人改一个词就能把
+  // 「退订促销」变成「关掉全部通知」（含到期/配额这类跟钱相关的提醒）。
+  const token = makeUnsubscribeToken(userId, category);
+  return `${trimTrailingSlash(siteUrl)}/api/auth/unsubscribe?token=${encodeURIComponent(token)}`;
 }
 
 /** RFC 8058 一键退订邮件头：邮件客户端可直接 POST 退订链接完成退订，利于送达率与合规。 */

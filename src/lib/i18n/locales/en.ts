@@ -104,6 +104,14 @@ export default {
     verifySuccess: 'Email verified. Signing you in…',
     verifyFailed: 'This verification link is invalid or expired. Please request a new one.',
     verifyMissingToken: 'Missing verification token. Please open the link from your email.',
+    // Rate limiting / generic failures: the server only returns { error } (hardcoded Chinese),
+    // so the client derives its own copy from the status code.
+    rateLimited: 'Too many attempts. Please try again later.',
+    passwordMinLengthN: 'New password must be at least {n} characters.',
+    passwordNeedsLetterAndDigit: 'New password must contain both a letter and a digit.',
+    forgotPasswordFailed: 'Could not send the reset email. Please try again later.',
+    resendVerificationFailed: 'Could not resend the verification email. Please try again later.',
+    resetPasswordFailed: 'Could not reset your password. Please try again later.',
   },
 
   // 邮件通知偏好（个人设置页）

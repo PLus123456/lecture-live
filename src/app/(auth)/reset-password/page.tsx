@@ -47,6 +47,17 @@ export default function ResetPasswordPage() {
       setError(t('auth.resetLinkInvalid'));
       return;
     }
+    // 本地先按服务端同一套口径校验密码（长度 + 至少一个字母 + 至少一个数字）。
+    // 这样服务端剩下的 400 只可能是令牌/账号问题，前端才能给出准确且本地化的文案——
+    // 否则「密码没有数字」和「链接已过期」在客户端是同一个 400，无从区分。
+    if (password.length < minLength) {
+      setError(t('auth.passwordMinLengthN', { n: String(minLength) }));
+      return;
+    }
+    if (!/[a-zA-Z]/.test(password) || !/\d/.test(password)) {
+      setError(t('auth.passwordNeedsLetterAndDigit'));
+      return;
+    }
     setLoading(true);
     try {
       const res = await fetch('/api/auth/reset-password', {
@@ -54,9 +65,15 @@ export default function ResetPasswordPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token, password }),
       });
-      const data = await res.json().catch(() => null);
+      // 文案一律走 i18n 键，不采用服务端 message/error（服务端永远是硬编码中文）。
       if (!res.ok) {
-        setError(data?.error ?? t('common.networkError'));
+        setError(
+          res.status === 429
+            ? t('auth.rateLimited')
+            : res.status === 400
+              ? t('auth.resetLinkInvalid')
+              : t('auth.resetPasswordFailed')
+        );
         return;
       }
       setDone(true);

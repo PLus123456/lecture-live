@@ -8,15 +8,18 @@ import {
   parsePreferences,
   serializePreferences,
   getUserFacingCategories,
-  isKnownCategory,
   type EmailCategory,
+  type UnsubscribeScope,
 } from '@/lib/email/preferences';
 
 /**
- * /api/auth/unsubscribe?token=..&category=..
+ * /api/auth/unsubscribe?token=..
  *  - GET：渲染一个自包含确认页（带 POST 按钮）。用 GET 直接退订会被邮件安全扫描器的预取误触发，
  *    故 GET 只展示、不改动；真正退订走 POST（也兼容 RFC 8058 List-Unsubscribe-Post 一键退订）。
- *  - POST：将该分类偏好置 false（category=all 则关闭全部通知类）。无需登录，凭 HMAC 退订令牌鉴权。
+ *  - POST：将令牌所授权范围内的分类偏好置 false。无需登录，凭 HMAC 退订令牌鉴权。
+ *
+ * 退订范围**只认令牌里签过名的那个**，不接受 URL/表单传入的 category——否则一封
+ * 「退订促销」的链接改个参数就能替人关掉全部通知（含到期提醒、配额提醒）。
  */
 
 const CATEGORY_LABELS: Record<EmailCategory, string> = {
@@ -28,13 +31,12 @@ const CATEGORY_LABELS: Record<EmailCategory, string> = {
   promotions: '促销活动',
 };
 
-function htmlPage(title: string, message: string, options?: { form?: { token: string; category: string; buttonLabel: string } }): string {
+function htmlPage(title: string, message: string, options?: { form?: { token: string; buttonLabel: string } }): string {
   const esc = (s: string) =>
     s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   const formHtml = options?.form
     ? `<form method="POST" style="margin-top:20px;">
          <input type="hidden" name="token" value="${esc(options.form.token)}">
-         <input type="hidden" name="category" value="${esc(options.form.category)}">
          <button type="submit" style="background:#C0552F;color:#fff;border:none;border-radius:8px;padding:12px 28px;font-size:15px;font-weight:600;cursor:pointer;">${esc(options.form.buttonLabel)}</button>
        </form>`
     : '';
@@ -48,34 +50,30 @@ function htmlPage(title: string, message: string, options?: { form?: { token: st
 </body></html>`;
 }
 
-function resolveCategories(categoryParam: string): EmailCategory[] | null {
-  if (categoryParam === 'all') {
-    return getUserFacingCategories().map((d) => d.key);
-  }
-  if (isKnownCategory(categoryParam) && categoryParam !== 'security_alert') {
-    return [categoryParam];
-  }
-  return null;
+/** 把令牌里的退订范围展开成要关闭的分类列表。范围合法性已由 verifyUnsubscribeToken 保证。 */
+function expandScope(scope: UnsubscribeScope): EmailCategory[] {
+  return scope === 'all' ? getUserFacingCategories().map((d) => d.key) : [scope];
+}
+
+function scopeLabel(scope: UnsubscribeScope): string {
+  return scope === 'all' ? '全部通知邮件' : CATEGORY_LABELS[scope];
 }
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const token = url.searchParams.get('token') ?? '';
-  const categoryParam = url.searchParams.get('category') ?? '';
 
-  const userId = verifyUnsubscribeToken(token);
-  const categories = resolveCategories(categoryParam);
-  if (!userId || !categories) {
-    return new NextResponse(htmlPage('链接无效', '该退订链接无效或已损坏。'), {
+  const payload = verifyUnsubscribeToken(token);
+  if (!payload) {
+    return new NextResponse(htmlPage('链接无效', '该退订链接无效或已过期。'), {
       status: 400,
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
   }
 
-  const label = categoryParam === 'all' ? '全部通知邮件' : CATEGORY_LABELS[categories[0]];
   return new NextResponse(
-    htmlPage('确认退订', `点击下方按钮，停止接收「${label}」。`, {
-      form: { token, category: categoryParam, buttonLabel: '确认退订' },
+    htmlPage('确认退订', `点击下方按钮，停止接收「${scopeLabel(payload.scope)}」。`, {
+      form: { token, buttonLabel: '确认退订' },
     }),
     { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
   );
@@ -84,37 +82,34 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   // 兼容表单提交（application/x-www-form-urlencoded）与一键退订（RFC 8058）。
   let token = '';
-  let categoryParam = '';
   const url = new URL(req.url);
   const contentType = req.headers.get('content-type') ?? '';
   try {
     if (contentType.includes('application/json')) {
-      const body = (await req.json()) as { token?: string; category?: string };
+      const body = (await req.json()) as { token?: string };
       token = body.token ?? '';
-      categoryParam = body.category ?? '';
     } else if (
       contentType.includes('application/x-www-form-urlencoded') ||
       contentType.includes('multipart/form-data')
     ) {
       const form = await req.formData();
       token = String(form.get('token') ?? '');
-      categoryParam = String(form.get('category') ?? '');
     }
   } catch {
     // 忽略解析错误，下面回落 query 参数
   }
   // 回落到 query（List-Unsubscribe 一键退订常把参数放 URL）
   token = token || url.searchParams.get('token') || '';
-  categoryParam = categoryParam || url.searchParams.get('category') || '';
 
-  const userId = verifyUnsubscribeToken(token);
-  const categories = resolveCategories(categoryParam);
-  if (!userId || !categories) {
-    return new NextResponse(htmlPage('链接无效', '该退订链接无效或已损坏。'), {
+  const payload = verifyUnsubscribeToken(token);
+  if (!payload) {
+    return new NextResponse(htmlPage('链接无效', '该退订链接无效或已过期。'), {
       status: 400,
       headers: { 'Content-Type': 'text/html; charset=utf-8' },
     });
   }
+  const { userId, scope } = payload;
+  const categories = expandScope(scope);
 
   try {
     const user = await prisma.user.findUnique({
@@ -133,7 +128,7 @@ export async function POST(req: Request) {
         action: 'user.email.unsubscribe',
         userId: user.id,
         userName: user.email,
-        detail: `退订: ${categoryParam}`,
+        detail: `退订: ${scope}`,
         ip: ip === 'unknown' ? null : ip,
       });
     }
@@ -145,9 +140,8 @@ export async function POST(req: Request) {
     });
   }
 
-  const label = categoryParam === 'all' ? '全部通知邮件' : CATEGORY_LABELS[categories[0]];
   return new NextResponse(
-    htmlPage('已退订', `你将不再收到「${label}」。可随时在个人设置中重新开启。`),
+    htmlPage('已退订', `你将不再收到「${scopeLabel(scope)}」。可随时在个人设置中重新开启。`),
     { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
   );
 }

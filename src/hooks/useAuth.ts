@@ -15,11 +15,14 @@ export function useAuth() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password, displayName }),
       });
+      const data = await res.json();
       if (!res.ok) {
-        const data = await res.json();
         throw new Error(data.error || 'Registration failed');
       }
-      const data = await res.json();
+      // 开启邮箱验证硬门禁时，注册不返回会话——不要 setAuth，交回给页面进入「去邮箱验证」态。
+      if (data.verificationRequired) {
+        return data as { verificationRequired: true; email: string; message?: string };
+      }
       setAuth(data.user, data.token);
       return data;
     },
@@ -33,11 +36,19 @@ export function useAuth() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || 'Login failed');
-      }
       const data = await res.json();
+      if (!res.ok) {
+        const err = new Error(data.error || 'Login failed') as Error & {
+          needsVerification?: boolean;
+          email?: string;
+        };
+        // 邮箱未验证（硬门禁）：把标记带给页面，展示「重发验证邮件」入口。
+        if (res.status === 403 && data.needsVerification) {
+          err.needsVerification = true;
+          err.email = data.email;
+        }
+        throw err;
+      }
       setAuth(data.user, data.token);
       return data;
     },

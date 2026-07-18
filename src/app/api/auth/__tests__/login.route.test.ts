@@ -17,6 +17,7 @@ const {
 
 vi.mock('@/lib/auth', () => ({
   CLIENT_SESSION_TOKEN: '__cookie_session__',
+  EMAIL_NOT_VERIFIED_ERROR: 'Email not verified',
   getJwtExpiryConfig: (days?: number) => ({
     expiresInDays: days ?? 7,
     cookieMaxAge: (days ?? 7) * 24 * 60 * 60,

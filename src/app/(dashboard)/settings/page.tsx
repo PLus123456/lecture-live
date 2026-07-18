@@ -9,6 +9,7 @@ import { useI18n } from '@/lib/i18n';
 import { UI_LOCALE_OPTIONS, type Locale } from '@/lib/i18n';
 import { Settings, Globe, Cpu, Mic, Lock, Tags, Scissors, Languages } from 'lucide-react';
 import { toast } from '@/stores/toastStore';
+import EmailPreferencesSection from '@/components/EmailPreferencesSection';
 import type { ChatModelOption, ChatModelsResponse } from '@/types/llm';
 
 function clampNumber(value: string, fallback: number, min: number, max: number) {
@@ -257,6 +258,8 @@ export default function SettingsPage() {
             </button>
           </div>
         </section>
+
+        <EmailPreferencesSection />
 
         <section className="bg-white rounded-xl border border-cream-200 p-5 animate-fade-in-up">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-charcoal-700 mb-4">

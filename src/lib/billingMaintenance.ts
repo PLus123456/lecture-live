@@ -22,6 +22,8 @@ import {
   resolveRoleStorageBytesLimit,
 } from '@/lib/userRoles';
 import { runTranscriptionUsageReconciliation } from '@/lib/reconciliation';
+import { getRedisClient } from '@/lib/redis';
+import { sendExpiryReminderEmail } from '@/lib/email';
 import { finalizeSession } from '@/lib/sessionFinalization';
 import {
   runChatFilesCleanup,
@@ -202,6 +204,13 @@ export async function runBillingMaintenance(options?: {
       'expired role downgrade failed'
     );
     // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
+  // 会员到期前提醒（best-effort，非阻塞、不 rethrow）。
+  try {
+    await sendExpiryReminders(now);
+  } catch (err) {
+    billingLogger.error({ err: serializeError(err) }, 'expiry reminder failed');
   }
 
   // 过期会话回收
@@ -1156,6 +1165,65 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
  * 不写时也是幂等：每个用户用条件原子 update（再校验 roleExpiresAt<=now 且 originalRole 非空），
  * 与 admin 端"续费/改角色"并发时不会误降级已被延期的用户。usage（已用量）不动，留给配额周期重置。
  */
+/**
+ * 会员到期前提醒：扫描未来 REMINDER_WINDOW_DAYS 天内到期的临时会员，各发一封续订提醒。
+ * 用 Redis 去重（每用户每到期日最多提醒一次），故仅在 Redis 可用时执行——否则 15 分钟一轮会重复轰炸。
+ * 发信本身受用户「到期提醒」偏好约束（isCategoryEnabledForUser）。best-effort，任何异常上抛给调用方吞掉。
+ */
+const EXPIRY_REMINDER_WINDOW_DAYS = 7;
+export async function sendExpiryReminders(now: Date): Promise<number> {
+  const redis = getRedisClient();
+  if (!redis || redis.status !== 'ready') return 0; // 无 Redis 无法去重，跳过
+
+  const windowEnd = new Date(now.getTime() + EXPIRY_REMINDER_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+  const candidates = await prisma.user.findMany({
+    where: {
+      roleExpiresAt: { gt: now, lte: windowEnd },
+      originalRole: { not: null }, // 仅临时会员（到期会降级的）
+      status: 1,
+    },
+    select: {
+      id: true,
+      email: true,
+      displayName: true,
+      emailPreferences: true,
+      role: true,
+      roleExpiresAt: true,
+    },
+    take: 500,
+    orderBy: { roleExpiresAt: 'asc' },
+  });
+
+  let sent = 0;
+  for (const user of candidates) {
+    if (!user.roleExpiresAt) continue;
+    const expiryDay = user.roleExpiresAt.toISOString().slice(0, 10); // YYYY-MM-DD
+    const dedupKey = `email:expiry-reminded:${user.id}:${expiryDay}`;
+    try {
+      // SET NX：抢到才发，保证每用户每到期日仅一封。TTL 覆盖提醒窗口 + 余量。
+      const won = await redis.set(dedupKey, '1', 'EX', (EXPIRY_REMINDER_WINDOW_DAYS + 2) * 86400, 'NX');
+      if (won !== 'OK') continue;
+
+      const daysLeft = Math.max(
+        1,
+        Math.ceil((user.roleExpiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))
+      );
+      await sendExpiryReminderEmail(user, {
+        planName: user.role,
+        expiresLabel: user.roleExpiresAt.toLocaleDateString('zh-CN'),
+        daysLeft,
+      });
+      sent += 1;
+    } catch (err) {
+      billingLogger.warn(
+        { err: serializeError(err), userId: user.id },
+        'expiry reminder send failed for user'
+      );
+    }
+  }
+  return sent;
+}
+
 export async function expireRoleDowngrades(now: Date): Promise<number> {
   const candidates = await prisma.user.findMany({
     where: {

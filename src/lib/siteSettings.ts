@@ -51,8 +51,16 @@ export interface SiteSettings {
   smtp_port: number;
   smtp_user: string;
   smtp_password: string;
+  smtp_secure: boolean;              // 隐式 TLS（通常 465 端口）；false 时若服务器支持则走 STARTTLS
   sender_name: string;
   sender_email: string;
+  // 注册域名管控（教育邮箱白名单 + 一次性邮箱拦截）
+  block_disposable_email: boolean;   // 开启后拦截一次性/临时邮箱域名注册
+  disposable_email_extra: string;    // 管理员追加的一次性邮箱域名（逗号/换行分隔），与内置列表合并
+  email_domain_allowlist: string;    // 允许注册的域名白名单（逗号/换行分隔，如 edu.cn,stanford.edu）；空=不限制
+  email_domain_allowlist_enforce: boolean; // true=只有白名单域名能注册；false=白名单仅作标记（教育邮箱识别）
+  // 营销/通知邮件站点级总开关（关闭则一律不发促销类邮件，无视个人偏好；事务类邮件不受影响）
+  marketing_emails_enabled: boolean;
   storage_mode: 'local' | 'cloudreve';
   cloudreve_url: string;
   cloudreve_client_id: string;
@@ -115,8 +123,14 @@ const DEFAULT_SITE_SETTINGS: SiteSettings = {
   smtp_port: 587,
   smtp_user: '',
   smtp_password: '',
+  smtp_secure: false,
   sender_name: 'LectureLive',
   sender_email: '',
+  block_disposable_email: false,
+  disposable_email_extra: '',
+  email_domain_allowlist: '',
+  email_domain_allowlist_enforce: false,
+  marketing_emails_enabled: true,
   storage_mode: 'local',
   cloudreve_url: '',
   cloudreve_client_id: '',
@@ -272,6 +286,22 @@ function normalizeSiteSettings(raw: Record<string, string>): SiteSettings {
       raw.smtp_port,
       DEFAULT_SITE_SETTINGS.smtp_port,
       { min: 1, max: 65535 }
+    ),
+    smtp_secure: parseBoolean(
+      raw.smtp_secure,
+      DEFAULT_SITE_SETTINGS.smtp_secure
+    ),
+    block_disposable_email: parseBoolean(
+      raw.block_disposable_email,
+      DEFAULT_SITE_SETTINGS.block_disposable_email
+    ),
+    email_domain_allowlist_enforce: parseBoolean(
+      raw.email_domain_allowlist_enforce,
+      DEFAULT_SITE_SETTINGS.email_domain_allowlist_enforce
+    ),
+    marketing_emails_enabled: parseBoolean(
+      raw.marketing_emails_enabled,
+      DEFAULT_SITE_SETTINGS.marketing_emails_enabled
     ),
     storage_mode: parseEnum(
       raw.storage_mode,

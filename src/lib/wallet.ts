@@ -6,6 +6,7 @@ import { prisma } from '@/lib/prisma';
 import { resolveRoleQuotas, resolveRoleStorageBytesLimit } from '@/lib/userRoles';
 import { logSystemEvent } from '@/lib/auditLog';
 import type { PaymentProviderName } from '@/lib/payment/types';
+import { sendSubscriptionSuccessEmail } from '@/lib/email';
 
 /** 面向用户的钱包业务错误（余额不足 / 档位无效等）。路由据 code 回 4xx。 */
 export class WalletError extends Error {
@@ -251,7 +252,43 @@ export async function creditPaidOrder(
     }
   }
 
+  // 订阅/充值成功通知邮件（fire-and-forget，受用户「订阅」偏好与站点营销总开关约束）。
+  void notifyOrderCredited(order.id).catch(() => undefined);
+
   return { ok: true, alreadyProcessed: false, status: 'paid', returnUrl: meta.returnUrl };
+}
+
+/**
+ * 订单到账后给用户发一封「订阅/购买成功」通知邮件。fire-and-forget、事务外调用。
+ * 重新读订单 + 用户当前状态（拿到发放后的最新 role/到期），失败只吞不影响支付主流程。
+ */
+async function notifyOrderCredited(orderId: string): Promise<void> {
+  const order = await prisma.paymentOrder.findUnique({ where: { id: orderId } });
+  if (!order) return;
+  const user = await prisma.user.findUnique({
+    where: { id: order.userId },
+    select: { id: true, email: true, displayName: true, emailPreferences: true, roleExpiresAt: true },
+  });
+  if (!user) return;
+
+  const meta = parseMeta(order.metadataJson);
+  const yuan = (cents: number) => `¥${(Math.max(0, cents) / 100).toFixed(2)}`;
+  const planName =
+    order.kind === 'purchase'
+      ? meta.grant?.tierName ?? '会员/时长'
+      : '钱包充值';
+  const expiresLabel =
+    order.kind === 'purchase' && meta.grant?.kind === 'membership'
+      ? user.roleExpiresAt
+        ? user.roleExpiresAt.toLocaleDateString('zh-CN')
+        : '永久有效'
+      : null;
+
+  await sendSubscriptionSuccessEmail(user, {
+    planName,
+    amountLabel: yuan(order.amountCents),
+    expiresLabel,
+  });
 }
 
 /**

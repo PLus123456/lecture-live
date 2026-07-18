@@ -23,6 +23,10 @@ export default function LoginPage() {
   const [announcement, setAnnouncement] = useState('');
   const [footerCode, setFooterCode] = useState('');
   const [allowRegistration, setAllowRegistration] = useState(true);
+  // 邮箱未验证：展示重发入口
+  const [needsVerification, setNeedsVerification] = useState(false);
+  const [resendMsg, setResendMsg] = useState('');
+  const [resending, setResending] = useState(false);
 
   useEffect(() => {
     const loadSiteConfig = async () => {
@@ -56,14 +60,38 @@ export default function LoginPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setNeedsVerification(false);
+    setResendMsg('');
     setLoading(true);
     try {
       await loginUser(email, password);
       router.push('/home');
     } catch (err) {
+      const e2 = err as Error & { needsVerification?: boolean };
+      if (e2?.needsVerification) {
+        setNeedsVerification(true);
+      }
       setError(err instanceof Error ? err.message : 'Login failed');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleResend = async () => {
+    setResending(true);
+    setResendMsg('');
+    try {
+      const res = await fetch('/api/auth/resend-verification', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json().catch(() => null);
+      setResendMsg(data?.message ?? t('auth.verificationResent'));
+    } catch {
+      setResendMsg(t('common.networkError'));
+    } finally {
+      setResending(false);
     }
   };
 
@@ -97,6 +125,21 @@ export default function LoginPage() {
               {error}
             </div>
           )}
+          {needsVerification && (
+            <div className="px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-700 space-y-2">
+              <div>{t('auth.verifyEmailPrompt')}</div>
+              <button
+                type="button"
+                onClick={handleResend}
+                disabled={resending}
+                className="inline-flex items-center gap-1.5 font-medium text-rust-600 hover:underline disabled:opacity-50"
+              >
+                {resending && <Loader2 className="w-3 h-3 animate-spin" />}
+                {t('auth.resendVerification')}
+              </button>
+              {resendMsg && <div className="text-charcoal-500">{resendMsg}</div>}
+            </div>
+          )}
 
           <div>
             <label className="block text-xs font-medium text-charcoal-600 mb-1">
@@ -124,6 +167,11 @@ export default function LoginPage() {
               className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm
                          focus:outline-none focus:ring-2 focus:ring-rust-400 focus:border-transparent"
             />
+            <div className="mt-1.5 text-right">
+              <Link href="/forgot-password" className="text-xs text-charcoal-400 hover:text-rust-500 hover:underline">
+                {t('auth.forgotPassword')}
+              </Link>
+            </div>
           </div>
 
           <button

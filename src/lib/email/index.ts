@@ -218,6 +218,32 @@ export async function sendQuotaAlertEmail(
   return sendMail({ to: user.email, ...mail, headers: listUnsubHeaders(unsubscribeUrl) });
 }
 
+/** 文档翻译完成/失败通知。 */
+export async function sendDocTranslateEmail(
+  user: EmailUser,
+  params: {
+    fileName: string;
+    outcome: 'completed' | 'failed';
+    errorMessage?: string | null;
+    refunded?: boolean;
+  },
+  options?: { settings?: SiteSettings }
+): Promise<SendResult> {
+  const settings = await resolveSettings(options?.settings);
+  if (!settings) return { ok: false, error: 'settings unavailable' };
+  if (!shouldSendCategory(user, 'doc_translate', settings)) {
+    return { ok: true, error: 'skipped:preference' };
+  }
+  const ctx = getBrandCtx(settings);
+  const unsubscribeUrl = buildUnsubscribeUrl(ctx.siteUrl, user.id, 'doc_translate');
+  const mail = templates.docTranslateEmail(ctx, {
+    displayName: user.displayName,
+    ...params,
+    unsubscribeUrl,
+  });
+  return sendMail({ to: user.email, ...mail, headers: listUnsubHeaders(unsubscribeUrl) });
+}
+
 /** 通用通知/公告/促销（管理员自定义），按 category 走偏好过滤。 */
 export async function sendGenericNotificationEmail(
   user: EmailUser,

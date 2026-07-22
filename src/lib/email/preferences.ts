@@ -18,6 +18,7 @@ export type EmailCategory =
   | 'subscription'
   | 'expiry_reminder'
   | 'quota_alert'
+  | 'doc_translate'
   | 'product_updates'
   | 'promotions';
 
@@ -34,6 +35,7 @@ export const EMAIL_CATEGORY_DEFS: readonly CategoryDef[] = [
   { key: 'subscription', transactional: false, marketing: false, defaultOptIn: true },
   { key: 'expiry_reminder', transactional: false, marketing: false, defaultOptIn: true },
   { key: 'quota_alert', transactional: false, marketing: false, defaultOptIn: true },
+  { key: 'doc_translate', transactional: false, marketing: false, defaultOptIn: true },
   { key: 'product_updates', transactional: false, marketing: true, defaultOptIn: true },
   { key: 'promotions', transactional: false, marketing: true, defaultOptIn: true },
 ];

@@ -25,13 +25,14 @@ beforeEach(() => {
 });
 
 describe('LLM_PURPOSES', () => {
-  it('包含全部 5 个用途，特别是 EMBEDDING —— 否则 admin 设默认会静默丢失', () => {
+  it('包含全部 6 个用途，特别是 EMBEDDING —— 否则 admin 设默认会静默丢失', () => {
     expect(LLM_PURPOSES).toContain('CHAT');
     expect(LLM_PURPOSES).toContain('REALTIME_SUMMARY');
     expect(LLM_PURPOSES).toContain('FINAL_SUMMARY');
     expect(LLM_PURPOSES).toContain('KEYWORD_EXTRACTION');
     expect(LLM_PURPOSES).toContain('EMBEDDING');
-    expect(LLM_PURPOSES).toHaveLength(5);
+    expect(LLM_PURPOSES).toContain('TRANSLATION');
+    expect(LLM_PURPOSES).toHaveLength(6);
   });
 });
 

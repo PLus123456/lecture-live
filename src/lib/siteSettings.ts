@@ -96,6 +96,16 @@ export interface SiteSettings {
   audio_enhance_target_lufs: number;     // 响度目标（LUFS），默认 -14
   audio_enhance_atten_lim_db: number;    // 降噪衰减上限（dB），默认 30；越大降噪越狠、人声越干
   audio_enhance_concurrency: number;     // 主服务器同时派发给 worker 的任务数，默认 1
+  // 翻译模块（句子翻译走 LLM；文档翻译走外部 pdf2zh worker，见 TranslationWorker 表）
+  translation_text_enabled: boolean;         // 句子翻译站点级开关
+  translation_text_daily_free_limit: number; // 免费模式下每人每日次数上限（0=不限）
+  translation_text_billing_mode: 'free' | 'per_char'; // 免费+限流 / 按字符扣钱包分
+  translation_text_price_cents_per_kchar: number;     // per_char 模式：每千字符价格（分）
+  translation_doc_enabled: boolean;          // 文档翻译站点级开关
+  translation_doc_price_cents_per_page: number; // 每页价格（分），报价=页数×单价
+  translation_doc_max_pages: number;         // 单文档页数上限
+  translation_doc_max_mb: number;            // 单文档大小上限（MB，≤30 受 middleware bodySize 约束）
+  translation_doc_watermark: boolean;        // true=保留 pdf2zh 水印产物；false=取无水印产物
 }
 
 const SITE_SETTINGS_CACHE_TTL_MS = 60_000;
@@ -162,6 +172,15 @@ const DEFAULT_SITE_SETTINGS: SiteSettings = {
   audio_enhance_target_lufs: -14,
   audio_enhance_atten_lim_db: 30,
   audio_enhance_concurrency: 1,
+  translation_text_enabled: true,
+  translation_text_daily_free_limit: 100,
+  translation_text_billing_mode: 'free',
+  translation_text_price_cents_per_kchar: 1,
+  translation_doc_enabled: false,
+  translation_doc_price_cents_per_page: 10,
+  translation_doc_max_pages: 300,
+  translation_doc_max_mb: 30,
+  translation_doc_watermark: false,
 };
 
 let siteSettingsCache: SiteSettings | null = null;
@@ -419,6 +438,48 @@ function normalizeSiteSettings(raw: Record<string, string>): SiteSettings {
       DEFAULT_SITE_SETTINGS.audio_enhance_concurrency,
       { min: 1, max: 4 }
     ),
+    translation_text_enabled: parseBoolean(
+      raw.translation_text_enabled,
+      DEFAULT_SITE_SETTINGS.translation_text_enabled
+    ),
+    translation_text_daily_free_limit: parseInteger(
+      raw.translation_text_daily_free_limit,
+      DEFAULT_SITE_SETTINGS.translation_text_daily_free_limit,
+      { min: 0, max: 100000 }
+    ),
+    translation_text_billing_mode: parseEnum(
+      raw.translation_text_billing_mode,
+      ['free', 'per_char'] as const,
+      DEFAULT_SITE_SETTINGS.translation_text_billing_mode
+    ),
+    translation_text_price_cents_per_kchar: parseInteger(
+      raw.translation_text_price_cents_per_kchar,
+      DEFAULT_SITE_SETTINGS.translation_text_price_cents_per_kchar,
+      { min: 0, max: 10000 }
+    ),
+    translation_doc_enabled: parseBoolean(
+      raw.translation_doc_enabled,
+      DEFAULT_SITE_SETTINGS.translation_doc_enabled
+    ),
+    translation_doc_price_cents_per_page: parseInteger(
+      raw.translation_doc_price_cents_per_page,
+      DEFAULT_SITE_SETTINGS.translation_doc_price_cents_per_page,
+      { min: 0, max: 100000 }
+    ),
+    translation_doc_max_pages: parseInteger(
+      raw.translation_doc_max_pages,
+      DEFAULT_SITE_SETTINGS.translation_doc_max_pages,
+      { min: 1, max: 5000 }
+    ),
+    translation_doc_max_mb: parseInteger(
+      raw.translation_doc_max_mb,
+      DEFAULT_SITE_SETTINGS.translation_doc_max_mb,
+      { min: 1, max: 30 }
+    ),
+    translation_doc_watermark: parseBoolean(
+      raw.translation_doc_watermark,
+      DEFAULT_SITE_SETTINGS.translation_doc_watermark
+    ),
   };
 }
 
@@ -481,6 +542,15 @@ export function serializeSiteSettingsForAdmin(settings: SiteSettings) {
     audio_enhance_target_lufs: String(settings.audio_enhance_target_lufs),
     audio_enhance_atten_lim_db: String(settings.audio_enhance_atten_lim_db),
     audio_enhance_concurrency: String(settings.audio_enhance_concurrency),
+    translation_text_daily_free_limit: String(settings.translation_text_daily_free_limit),
+    translation_text_price_cents_per_kchar: String(
+      settings.translation_text_price_cents_per_kchar
+    ),
+    translation_doc_price_cents_per_page: String(
+      settings.translation_doc_price_cents_per_page
+    ),
+    translation_doc_max_pages: String(settings.translation_doc_max_pages),
+    translation_doc_max_mb: String(settings.translation_doc_max_mb),
   };
 }
 

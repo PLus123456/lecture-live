@@ -11,6 +11,7 @@ import {
   Palette,
   Wallet,
   X,
+  BookA,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { useAuthStore } from '@/stores/authStore';
@@ -177,6 +178,15 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
           </section>
 
           <div className="mt-5 space-y-2">
+            <Link
+              href="/translate"
+              onClick={onClose}
+              className="flex items-center gap-3 rounded-2xl border border-cream-200 bg-white px-4 py-3 text-sm font-medium text-charcoal-700 transition-colors hover:bg-cream-50"
+            >
+              <BookA className="h-4 w-4 text-rust-500" />
+              {t('nav.translate')}
+            </Link>
+
             <button
               onClick={() => {
                 onClose();

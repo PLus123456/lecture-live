@@ -54,6 +54,10 @@ export interface GroupPermissions {
   allowFinalSummary: boolean;
   /** 是否允许录音音频增强（外部 worker 后处理）。与其它开关不同：新重资源功能，缺省禁止 */
   allowAudioEnhance: boolean;
+  /** 是否允许句子翻译（翻译页文本 tab，走 LLM；免费+限流，缺省允许） */
+  allowTextTranslation: boolean;
+  /** 是否允许文档翻译（外部 worker + 按页扣费）。同 allowAudioEnhance：重资源功能，缺省禁止 */
+  allowDocTranslation: boolean;
   // ── 用途专用模型（与用户组绑定）──
   // 存的是 LlmModel 的 DB id（路由行）；空串/缺省 = 「跟随全局默认」（该用途 isDefault 的模型）。
   // 与 allowedModels 不同：allowedModels 只作用于聊天选择器，这几个才决定各用途实际用哪个模型。
@@ -63,6 +67,8 @@ export interface GroupPermissions {
   finalSummaryModelId?: string;
   /** 该组聊天的默认模型 id（用户未显式选模型时用；空 = 跟随全局 CHAT 默认） */
   chatModelId?: string;
+  /** 该组翻译（句子+文档）使用的模型 id（空 = 跟随全局 TRANSLATION 默认） */
+  translationModelId?: string;
 }
 
 /** 某用户在运行时生效的能力开关（由所属组解析而来，组配置为唯一真源） */
@@ -71,6 +77,8 @@ export interface EffectiveFeatureFlags {
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
   allowAudioEnhance: boolean;
+  allowTextTranslation: boolean;
+  allowDocTranslation: boolean;
 }
 
 /** 某用户在运行时生效的摘要模型（由所属组解析而来）；null = 跟随全局该用途默认 */
@@ -137,6 +145,8 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         allowRealtimeSummary: true,
         allowFinalSummary: true,
         allowAudioEnhance: true,
+        allowTextTranslation: true,
+        allowDocTranslation: true,
       };
     case 'PRO':
       return {
@@ -149,6 +159,9 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         allowFinalSummary: true,
         // 音频增强吃独立 worker 的算力，默认不放开，由管理员按组显式开启
         allowAudioEnhance: false,
+        allowTextTranslation: true,
+        // 文档翻译同音频增强：吃独立 worker 算力 + 按页扣费，默认不放开
+        allowDocTranslation: false,
       };
     default:
       return {
@@ -162,6 +175,8 @@ export function getDefaultQuotasForRole(role: UserRole): GroupPermissions {
         allowRealtimeSummary: true,
         allowFinalSummary: true,
         allowAudioEnhance: false,
+        allowTextTranslation: true,
+        allowDocTranslation: false,
       };
   }
 }
@@ -251,9 +266,18 @@ export async function resolveRoleQuotas(role: UserRole): Promise<GroupPermission
       cfg.allowAudioEnhance,
       defaults.allowAudioEnhance
     ),
+    allowTextTranslation: coerceBool(
+      cfg.allowTextTranslation,
+      defaults.allowTextTranslation
+    ),
+    allowDocTranslation: coerceBool(
+      cfg.allowDocTranslation,
+      defaults.allowDocTranslation
+    ),
     realtimeSummaryModelId: coerceSummaryModelId(cfg.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(cfg.finalSummaryModelId),
     chatModelId: coerceSummaryModelId(cfg.chatModelId),
+    translationModelId: coerceSummaryModelId(cfg.translationModelId),
   };
 }
 
@@ -314,9 +338,13 @@ export async function resolveCustomGroupPermissions(
     allowFinalSummary: coerceBool(cfg.allowFinalSummary, true),
     // 与其它开关的「缺省全开」相反：音频增强为新重资源功能，缺省禁止
     allowAudioEnhance: coerceBool(cfg.allowAudioEnhance, false),
+    allowTextTranslation: coerceBool(cfg.allowTextTranslation, true),
+    // 文档翻译同音频增强：重资源 + 扣费，缺省禁止
+    allowDocTranslation: coerceBool(cfg.allowDocTranslation, false),
     realtimeSummaryModelId: coerceSummaryModelId(cfg.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(cfg.finalSummaryModelId),
     chatModelId: coerceSummaryModelId(cfg.chatModelId),
+    translationModelId: coerceSummaryModelId(cfg.translationModelId),
   };
 }
 
@@ -338,6 +366,8 @@ export async function resolveUserFeatureFlags(user: {
       allowRealtimeSummary: true,
       allowFinalSummary: true,
       allowAudioEnhance: true,
+      allowTextTranslation: true,
+      allowDocTranslation: true,
     };
   }
 
@@ -349,6 +379,8 @@ export async function resolveUserFeatureFlags(user: {
         allowRealtimeSummary: custom.allowRealtimeSummary,
         allowFinalSummary: custom.allowFinalSummary,
         allowAudioEnhance: custom.allowAudioEnhance,
+        allowTextTranslation: custom.allowTextTranslation,
+        allowDocTranslation: custom.allowDocTranslation,
       };
     }
     // 自定义组不存在 → 回落底层角色配置
@@ -360,6 +392,8 @@ export async function resolveUserFeatureFlags(user: {
     allowRealtimeSummary: roleQuotas.allowRealtimeSummary,
     allowFinalSummary: roleQuotas.allowFinalSummary,
     allowAudioEnhance: roleQuotas.allowAudioEnhance,
+    allowTextTranslation: roleQuotas.allowTextTranslation,
+    allowDocTranslation: roleQuotas.allowDocTranslation,
   };
 }
 
@@ -423,6 +457,33 @@ export async function resolveUserDefaultChatModelId(user: {
   }
 
   return perms.chatModelId?.trim() || null;
+}
+
+/**
+ * 解析某用户运行时生效的「翻译专用模型」id（句子/文档翻译共用）。
+ *
+ * 与 resolveUserSummaryModels 同解析链：ADMIN 不绑定（跟随全局 TRANSLATION 默认）→
+ * 有自定义组读 custom_groups → 否则读系统角色 group_config_<role>。返回 null = 跟随全局默认。
+ * 只解析 id 不校验存在性；调用方经 resolveGroupBoundModel 校验，失效即回落全局默认。
+ */
+export async function resolveUserTranslationModelId(user: {
+  role: UserRole;
+  customGroupId?: string | null;
+}): Promise<string | null> {
+  if (user.role === 'ADMIN') {
+    return null;
+  }
+
+  let perms: GroupPermissions | null = null;
+  if (user.customGroupId) {
+    perms = await resolveCustomGroupPermissions(user.customGroupId);
+    // 自定义组不存在 → 回落底层角色配置
+  }
+  if (!perms) {
+    perms = await resolveRoleQuotas(user.role);
+  }
+
+  return perms.translationModelId?.trim() || null;
 }
 
 /**

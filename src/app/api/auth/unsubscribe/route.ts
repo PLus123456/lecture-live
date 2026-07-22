@@ -27,6 +27,7 @@ const CATEGORY_LABELS: Record<EmailCategory, string> = {
   subscription: '订阅/购买通知',
   expiry_reminder: '会员到期提醒',
   quota_alert: '配额提醒',
+  doc_translate: '文档翻译通知',
   product_updates: '产品更新',
   promotions: '促销活动',
 };

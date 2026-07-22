@@ -4,7 +4,7 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { logAction } from '@/lib/auditLog';
 
 // 有效的 LLM 用途枚举值
-const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING'];
+const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING', 'TRANSLATION'];
 const VALID_THINKING_MODES = ['NONE', 'AUTO', 'FORCED', 'DEPTH'];
 
 // 添加模型到指定供应商

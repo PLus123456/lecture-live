@@ -15,6 +15,7 @@ import {
   ChevronRight,
   FileText,
   Hash,
+  Languages,
   Loader2,
   Mic,
   Sparkles,
@@ -68,6 +69,7 @@ const JOB_TYPE_ICON: Record<string, IconType> = {
   report_generation: FileText,
   title_generation: Tag,
   keyword_extraction: Hash,
+  doc_translate: Languages,
 };
 
 const ASYNC_STATUS_ICON: Record<string, IconType> = {

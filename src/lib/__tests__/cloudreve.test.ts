@@ -93,6 +93,15 @@ function createSiteSettings(overrides: Partial<SiteSettings> = {}): SiteSettings
     audio_enhance_target_lufs: -14,
     audio_enhance_atten_lim_db: 30,
     audio_enhance_concurrency: 1,
+    translation_text_enabled: true,
+    translation_text_daily_free_limit: 100,
+    translation_text_billing_mode: 'free',
+    translation_text_price_cents_per_kchar: 1,
+    translation_doc_enabled: false,
+    translation_doc_price_cents_per_page: 10,
+    translation_doc_max_pages: 300,
+    translation_doc_max_mb: 30,
+    translation_doc_watermark: false,
     ...overrides,
   };
 }

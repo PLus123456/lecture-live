@@ -127,6 +127,8 @@ export async function middleware(request: NextRequest) {
   // 2. API 路由鉴权（/api/* 除了 /api/auth/*, /api/share/view/*, /api/setup* 等公开端点）
   //    充值支付回调 /api/wallet/callback/* 与沙箱确认页 /api/wallet/sandbox/* 也放行：
   //    网关异步通知/浏览器跳转不带用户 JWT，鉴权由各 provider 的验签（verifyCallback）承担。
+  //    翻译 LLM 代理 /api/translate/llm-proxy/* 同理：调用方是外部翻译 worker（无用户 JWT），
+  //    鉴权由端点校验任务级代理凭据（TranslationTask.proxyTokenHash）承担。
   const isProtectedApi =
     request.nextUrl.pathname.startsWith('/api/') &&
     !request.nextUrl.pathname.startsWith('/api/auth/') &&
@@ -136,6 +138,7 @@ export async function middleware(request: NextRequest) {
     !request.nextUrl.pathname.startsWith('/api/site-config') &&
     !request.nextUrl.pathname.startsWith('/api/wallet/callback/') &&
     !request.nextUrl.pathname.startsWith('/api/wallet/sandbox/') &&
+    !request.nextUrl.pathname.startsWith('/api/translate/llm-proxy/') &&
     !request.nextUrl.pathname.startsWith('/api/setup');
 
   const authHeader = request.headers.get('Authorization');

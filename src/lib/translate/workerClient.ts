@@ -60,9 +60,37 @@ export interface TranslateJobParams {
     baseUrl: string;
     /** 任务级代理凭据（只对该任务有效，任务终态即失效） */
     apiKey: string;
-    /** 透传给 pdf2zh 的模型名占位（代理端点服务端强制真实路由，不信任此值） */
+    /**
+     * 派发时按任务实际路由生成的模型标识（buildWorkerModelLabel），worker 原样透传给
+     * pdf2zh。pdf2zh 的翻译缓存键含模型名——标识随真实模型变化，换模型即换缓存空间
+     * （不再复用旧模型的译文），同模型则正常命中缓存。代理端点依旧服务端强制路由，
+     * 不信任此值，它只影响 pdf2zh 侧的缓存分键。
+     */
     model: string;
   };
+}
+
+/**
+ * 生成下发给 worker/pdf2zh 的模型标识：真实反映本次任务实际解析到的路由
+ * （供应商名 + 底层模型 + 温度 + 路由行 id 后缀），让 pdf2zh 按模型分缓存键。
+ * 解析失败/env 兜底也给稳定值，slug 化避免奇异字符进缓存键。
+ */
+export function buildWorkerModelLabel(
+  provider: {
+    name: string;
+    model: string;
+    temperature: number;
+    dbModelId?: string;
+  } | null
+): string {
+  if (!provider) return 'lecture-live-gateway';
+  const slug = (s: string) => s.replace(/[^\w.:-]+/g, '_');
+  const base = slug(`${provider.name}-${provider.model}`).slice(0, 80);
+  // 温度编入：admin 调温度也应换缓存空间（译文风格随之变化）
+  const temp = `t${Math.round((provider.temperature ?? 0) * 10)}`;
+  // 路由行 id 后缀：同名模型挂在不同网关/路由行时也分键
+  const suffix = provider.dbModelId ? provider.dbModelId.slice(-6) : 'env';
+  return `${base}-${temp}-${suffix}`;
 }
 
 export interface TranslateJobStatus {

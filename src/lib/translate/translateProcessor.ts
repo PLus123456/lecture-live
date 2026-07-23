@@ -5,6 +5,8 @@ import { prisma } from '@/lib/prisma';
 import { JOB_TYPE, JOB_STATUS, createJob, retryJob } from '@/lib/jobQueue';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { refundWalletCents } from '@/lib/wallet';
+import { resolveUserTranslationModelId } from '@/lib/userRoles';
+import { resolveGroupBoundModel } from '@/lib/llm/summaryModel';
 import {
   getTranslateFleetConfig,
   pingTranslateWorker,
@@ -13,6 +15,7 @@ import {
   getTranslateJob,
   downloadTranslateOutput,
   deleteTranslateJob,
+  buildWorkerModelLabel,
   TranslateWorkerError,
   type TranslateFleetConfig,
   type TranslateWorkerConfig,
@@ -308,6 +311,8 @@ async function loadTask(taskId: string | undefined) {
       chargedCents: true,
       refundedAt: true,
       pageCount: true,
+      modelId: true,
+      user: { select: { role: true, customGroupId: true } },
     },
   });
 }
@@ -419,6 +424,24 @@ async function dispatchJob(
 
   const settings = await getSiteSettings();
   const appUrl = settings.site_url.replace(/\/+$/, '');
+
+  // 派发时解析任务实际使用的模型：① 生成真实模型标识下发（pdf2zh 缓存按模型分键，
+  // 换模型不再复用旧译文）；② 解析出具体路由行且任务尚无快照时定格回 task.modelId，
+  // 让代理端点全程恒定同一模型（中途 admin 换全局默认不影响在途任务）。
+  const boundId =
+    task.modelId || (await resolveUserTranslationModelId(task.user).catch(() => null));
+  const resolved = await resolveGroupBoundModel(boundId, 'TRANSLATION').catch(() => null);
+  const resolvedDbId =
+    resolved?.provider?.dbModelId && resolved.provider.purpose === 'TRANSLATION'
+      ? resolved.provider.dbModelId
+      : null;
+  if (resolvedDbId && !task.modelId) {
+    await prisma.translationTask
+      .updateMany({ where: { id: task.id }, data: { modelId: resolvedDbId } })
+      .catch(() => undefined);
+  }
+  const modelLabel = buildWorkerModelLabel(resolved?.provider ?? null);
+
   try {
     await uploadTranslateInput(target, jobId, source);
     const proxyToken = await issueProxyToken(task.id);
@@ -431,7 +454,7 @@ async function dispatchJob(
       llm: {
         baseUrl: `${appUrl}/api/translate/llm-proxy/v1`,
         apiKey: proxyToken,
-        model: 'lecture-live-gateway',
+        model: modelLabel,
       },
     });
   } catch (error) {

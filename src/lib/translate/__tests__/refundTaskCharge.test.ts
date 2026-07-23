@@ -26,6 +26,8 @@ vi.mock('@/lib/jobQueue', () => ({
   retryJob: vi.fn(),
 }));
 vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: vi.fn() }));
+vi.mock('@/lib/userRoles', () => ({ resolveUserTranslationModelId: vi.fn() }));
+vi.mock('@/lib/llm/summaryModel', () => ({ resolveGroupBoundModel: vi.fn() }));
 vi.mock('@/lib/translate/workerClient', () => ({
   getTranslateFleetConfig: vi.fn(),
   pingTranslateWorker: vi.fn(),
@@ -34,6 +36,7 @@ vi.mock('@/lib/translate/workerClient', () => ({
   getTranslateJob: vi.fn(),
   downloadTranslateOutput: vi.fn(),
   deleteTranslateJob: vi.fn(),
+  buildWorkerModelLabel: vi.fn(() => 'mock-model'),
   TranslateWorkerError: class extends Error {},
 }));
 vi.mock('@/lib/translate/taskStorage', () => ({

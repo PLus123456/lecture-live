@@ -577,3 +577,101 @@ export async function adminAdjust(input: {
     });
   });
 }
+
+/**
+ * 通用服务消费出账（当前消费方：文档翻译 type='translation'）。
+ * 原子守卫同 applyGrantTx（C1）：WHERE walletBalanceCents>=amount 条件扣减，count=0 抛
+ * insufficient_balance；行锁串行化并发，杜绝双花/负余额。记 WalletTransaction 台账。
+ * **幂等由调用方保证**（翻译确认端点先做任务状态 CAS，赢家才进这里扣款）。
+ * 可传入外部事务 tx（与业务状态写入同事务提交，避免「扣了钱任务没建起来」）。
+ */
+export async function spendWalletCents(
+  input: {
+    userId: string;
+    amountCents: number;
+    type: string;
+    note?: string;
+    operatorId?: string;
+  },
+  tx?: Prisma.TransactionClient
+): Promise<{ balanceAfterCents: number }> {
+  const amount = Math.round(input.amountCents);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new WalletError('扣费金额非法', 'bad_request');
+  }
+  const run = async (db: Prisma.TransactionClient) => {
+    const spent = await db.user.updateMany({
+      where: { id: input.userId, walletBalanceCents: { gte: amount } },
+      data: { walletBalanceCents: { decrement: amount } },
+    });
+    if (spent.count === 0) {
+      // 区分「用户不存在」与「余额不足」，给路由清晰的 4xx 语义
+      const exists = await db.user.findUnique({
+        where: { id: input.userId },
+        select: { id: true },
+      });
+      if (!exists) throw new WalletError('用户不存在', 'user_not_found');
+      throw new WalletError('钱包余额不足', 'insufficient_balance');
+    }
+    const after = await db.user.findUnique({
+      where: { id: input.userId },
+      select: { walletBalanceCents: true },
+    });
+    const balanceAfterCents = after?.walletBalanceCents ?? 0;
+    await db.walletTransaction.create({
+      data: {
+        userId: input.userId,
+        type: input.type,
+        amountCents: -amount,
+        balanceAfterCents,
+        operatorId: input.operatorId ?? null,
+        note: input.note ?? null,
+      },
+    });
+    return { balanceAfterCents };
+  };
+  return tx ? run(tx) : prisma.$transaction(run);
+}
+
+/**
+ * 通用服务退款入账（当前消费方：文档翻译 type='translation_refund'）。
+ * 加钱无守卫；**幂等由调用方保证**（翻译退款用 TranslationTask.refundedAt 的 CAS 闸，
+ * 赢家才进这里入账）。可传入外部事务与业务状态同事务提交。
+ */
+export async function refundWalletCents(
+  input: {
+    userId: string;
+    amountCents: number;
+    type: string;
+    note?: string;
+    operatorId?: string;
+  },
+  tx?: Prisma.TransactionClient
+): Promise<{ balanceAfterCents: number }> {
+  const amount = Math.round(input.amountCents);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new WalletError('退款金额非法', 'bad_request');
+  }
+  const run = async (db: Prisma.TransactionClient) => {
+    const updated = await db.user
+      .update({
+        where: { id: input.userId },
+        data: { walletBalanceCents: { increment: amount } },
+        select: { walletBalanceCents: true },
+      })
+      .catch(() => null);
+    if (!updated) throw new WalletError('用户不存在', 'user_not_found');
+    await db.walletTransaction.create({
+      data: {
+        userId: input.userId,
+        type: input.type,
+        amountCents: amount,
+        balanceAfterCents: updated.walletBalanceCents,
+        operatorId: input.operatorId ?? null,
+        note: input.note ?? null,
+      },
+    });
+    return { balanceAfterCents: updated.walletBalanceCents };
+  };
+  return tx ? run(tx) : prisma.$transaction(run);
+}

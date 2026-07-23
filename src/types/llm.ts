@@ -41,7 +41,8 @@ export type LlmPurpose =
   | 'REALTIME_SUMMARY'
   | 'FINAL_SUMMARY'
   | 'KEYWORD_EXTRACTION'
-  | 'EMBEDDING';
+  | 'EMBEDDING'
+  | 'TRANSLATION';
 
 /**
  * 思考模式（与后端 LlmModel.thinkingMode 一致）

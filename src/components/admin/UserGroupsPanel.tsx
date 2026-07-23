@@ -17,6 +17,8 @@ import {
   FileText,
   MessageCircle,
   AudioLines,
+  Languages,
+  FileOutput,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
@@ -38,12 +40,18 @@ interface GroupPermissions {
   allowFinalSummary: boolean;
   /** 录音音频增强（外部 worker 后处理）；新重资源功能，缺省禁止 */
   allowAudioEnhance?: boolean;
+  /** 句子翻译（LLM，免费+限流）；缺省允许 */
+  allowTextTranslation?: boolean;
+  /** 文档翻译（外部 worker + 按页扣费）；同音频增强，缺省禁止 */
+  allowDocTranslation?: boolean;
   /** 该组实时摘要模型（DB model id；'' = 跟随全局默认） */
   realtimeSummaryModelId?: string;
   /** 该组总摘要模型（DB model id；'' = 跟随全局默认） */
   finalSummaryModelId?: string;
   /** 该组默认聊天模型（DB model id；'' = 跟随全局 CHAT 默认；用户未显式选模型时生效） */
   chatModelId?: string;
+  /** 该组翻译模型（DB model id；'' = 跟随全局 TRANSLATION 默认） */
+  translationModelId?: string;
 }
 
 interface UserGroup {
@@ -205,6 +213,17 @@ function GroupCard({
                   : t('admin.disabled')}
               </span>
             </div>
+            <div className="flex items-center gap-2 text-sm text-charcoal-600">
+              <Languages className="w-3.5 h-3.5 text-charcoal-400" />
+              <span>{t('admin.translation')}</span>
+              <span className="font-medium">
+                {group.id === 'ADMIN' ||
+                group.permissions.allowTextTranslation !== false ||
+                group.permissions.allowDocTranslation
+                  ? t('admin.enabled')
+                  : t('admin.disabled')}
+              </span>
+            </div>
             {group.permissions.allowRealtimeSummary && (
               <div className="flex items-center gap-2 text-sm text-charcoal-600 min-w-0">
                 <Sparkles className="w-3.5 h-3.5 text-charcoal-400 shrink-0" />
@@ -300,9 +319,11 @@ interface ModelCatalog {
   chatOptions: SummaryModelOption[];
   realtimeSummary: SummaryModelOption[];
   finalSummary: SummaryModelOption[];
+  translation: SummaryModelOption[];
   chatDefault?: SummaryModelOption;
   realtimeDefault?: SummaryModelOption;
   finalDefault?: SummaryModelOption;
+  translationDefault?: SummaryModelOption;
 }
 
 const EMPTY_CATALOG: ModelCatalog = {
@@ -310,6 +331,7 @@ const EMPTY_CATALOG: ModelCatalog = {
   chatOptions: [],
   realtimeSummary: [],
   finalSummary: [],
+  translation: [],
 };
 
 /** 在某用途的选项列表里解析一个已保存的 model id 的展示名（用于卡片/下拉回显） */
@@ -505,12 +527,18 @@ function PermissionsForm({
   setAllowFinal,
   allowAudio,
   setAllowAudio,
+  allowTextTrans,
+  setAllowTextTrans,
+  allowDocTrans,
+  setAllowDocTrans,
   realtimeSummaryModelId,
   setRealtimeSummaryModelId,
   finalSummaryModelId,
   setFinalSummaryModelId,
   chatModelId,
   setChatModelId,
+  translationModelId,
+  setTranslationModelId,
   adminLocked = false,
 }: {
   minutesLimit: string;
@@ -535,12 +563,18 @@ function PermissionsForm({
   setAllowFinal: (v: boolean) => void;
   allowAudio: boolean;
   setAllowAudio: (v: boolean) => void;
+  allowTextTrans: boolean;
+  setAllowTextTrans: (v: boolean) => void;
+  allowDocTrans: boolean;
+  setAllowDocTrans: (v: boolean) => void;
   realtimeSummaryModelId: string;
   setRealtimeSummaryModelId: (v: string) => void;
   finalSummaryModelId: string;
   setFinalSummaryModelId: (v: string) => void;
   chatModelId: string;
   setChatModelId: (v: string) => void;
+  translationModelId: string;
+  setTranslationModelId: (v: string) => void;
   /** ADMIN 系统组：能力开关与模型绑定在运行时恒被短路（全量能力/跟随全局默认），控件只读展示 */
   adminLocked?: boolean;
 }) {
@@ -687,6 +721,35 @@ function PermissionsForm({
           </p>
         </div>
 
+        {/* 翻译：句子/文档两开关 + 共用翻译模型（任一开着时模型下拉可用） */}
+        <div className="rounded-lg border border-cream-200 px-3 py-2.5 space-y-2.5">
+          <CapabilityToggle
+            icon={<Languages className="w-3.5 h-3.5 text-charcoal-400" />}
+            label={t('admin.allowTextTranslation')}
+            checked={adminLocked ? true : allowTextTrans}
+            onChange={setAllowTextTrans}
+            disabled={adminLocked}
+          />
+          <CapabilityToggle
+            icon={<FileOutput className="w-3.5 h-3.5 text-charcoal-400" />}
+            label={t('admin.allowDocTranslation')}
+            checked={adminLocked ? true : allowDocTrans}
+            onChange={setAllowDocTrans}
+            disabled={adminLocked}
+          />
+          <p className="text-[11px] text-charcoal-400 pl-6">
+            {t('admin.allowDocTranslationHint')}
+          </p>
+          <SummaryModelSelect
+            label={t('admin.translationModel')}
+            value={adminLocked ? '' : translationModelId}
+            onChange={setTranslationModelId}
+            options={catalog.translation}
+            globalDefault={catalog.translationDefault}
+            disabled={adminLocked || (!allowTextTrans && !allowDocTrans)}
+          />
+        </div>
+
         <p className="text-[11px] text-charcoal-400">
           {adminLocked ? t('admin.adminGroupLockedHint') : t('admin.summaryModelHint')}
         </p>
@@ -712,8 +775,15 @@ function usePermissionsForm(
   const [allowFinal, setAllowFinal] = useState(initPermissions.allowFinalSummary);
   // 音频增强缺省禁止（与后端解析口径一致：新重资源功能不随旧配置自动放开）
   const [allowAudio, setAllowAudio] = useState(initPermissions.allowAudioEnhance === true);
+  // 句子翻译缺省允许；文档翻译同音频增强缺省禁止
+  const [allowTextTrans, setAllowTextTrans] = useState(
+    initPermissions.allowTextTranslation !== false,
+  );
+  const [allowDocTrans, setAllowDocTrans] = useState(
+    initPermissions.allowDocTranslation === true,
+  );
 
-  // 摘要/聊天模型（DB id；'' = 跟随全局默认）
+  // 摘要/聊天/翻译模型（DB id；'' = 跟随全局默认）
   const [realtimeSummaryModelId, setRealtimeSummaryModelId] = useState(
     initPermissions.realtimeSummaryModelId ?? '',
   );
@@ -721,6 +791,9 @@ function usePermissionsForm(
     initPermissions.finalSummaryModelId ?? '',
   );
   const [chatModelId, setChatModelId] = useState(initPermissions.chatModelId ?? '');
+  const [translationModelId, setTranslationModelId] = useState(
+    initPermissions.translationModelId ?? '',
+  );
 
   const isAllInit = initPermissions.allowedModels === '*';
   const [selectAll, setSelectAll] = useState(isAllInit);
@@ -779,10 +852,13 @@ function usePermissionsForm(
       allowRealtimeSummary: allowRealtime,
       allowFinalSummary: allowFinal,
       allowAudioEnhance: allowAudio,
+      allowTextTranslation: allowTextTrans,
+      allowDocTranslation: allowDocTrans,
       // 能力关掉时把对应摘要模型一并清空（跟随全局）——关了还留个具体模型 id 是无意义的死配置
       realtimeSummaryModelId: allowRealtime ? realtimeSummaryModelId : '',
       finalSummaryModelId: allowFinal ? finalSummaryModelId : '',
       chatModelId,
+      translationModelId: allowTextTrans || allowDocTrans ? translationModelId : '',
     };
   };
 
@@ -795,9 +871,12 @@ function usePermissionsForm(
     allowRealtime, setAllowRealtime,
     allowFinal, setAllowFinal,
     allowAudio, setAllowAudio,
+    allowTextTrans, setAllowTextTrans,
+    allowDocTrans, setAllowDocTrans,
     realtimeSummaryModelId, setRealtimeSummaryModelId,
     finalSummaryModelId, setFinalSummaryModelId,
     chatModelId, setChatModelId,
+    translationModelId, setTranslationModelId,
     selected, selectAll,
     handleToggle, handleToggleAll,
     buildPermissions,
@@ -946,10 +1025,13 @@ function CreateGroupModal({
     maxThinkingDepth: 'high',
     allowRealtimeSummary: true,
     allowFinalSummary: true,
-    // 音频增强例外：新重资源功能，新建组也缺省禁止，由管理员显式开启
+    // 音频增强/文档翻译例外：新重资源功能，新建组也缺省禁止，由管理员显式开启
     allowAudioEnhance: false,
+    allowTextTranslation: true,
+    allowDocTranslation: false,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
+    translationModelId: '',
   };
   const pf = usePermissionsForm(defaultPermissions, models);
 
@@ -1073,9 +1155,11 @@ export default function UserGroupsPanel() {
       const chatOptions: SummaryModelOption[] = [];
       const realtimeSummary: SummaryModelOption[] = [];
       const finalSummary: SummaryModelOption[] = [];
+      const translation: SummaryModelOption[] = [];
       let chatDefault: SummaryModelOption | undefined;
       let realtimeDefault: SummaryModelOption | undefined;
       let finalDefault: SummaryModelOption | undefined;
+      let translationDefault: SummaryModelOption | undefined;
 
       for (const p of (data.providers ?? []) as {
         name: string;
@@ -1102,22 +1186,39 @@ export default function UserGroupsPanel() {
             if (!modelId || seenChat.has(modelId)) continue;
             seenChat.add(modelId);
             chat.push({ modelId, displayName, providerName: p.name });
-          } else if (m.purpose === 'REALTIME_SUMMARY' || m.purpose === 'FINAL_SUMMARY') {
-            // 摘要模型以 DB id 为准（同一 modelId 在两个供应商下是两个不同的可选项）
+          } else if (
+            m.purpose === 'REALTIME_SUMMARY' ||
+            m.purpose === 'FINAL_SUMMARY' ||
+            m.purpose === 'TRANSLATION'
+          ) {
+            // 摘要/翻译模型以 DB id 为准（同一 modelId 在两个供应商下是两个不同的可选项）
             if (!id) continue;
             const opt: SummaryModelOption = { id, displayName, providerName: p.name, modelId };
             if (m.purpose === 'REALTIME_SUMMARY') {
               realtimeSummary.push(opt);
               if (m.isDefault) realtimeDefault = opt;
-            } else {
+            } else if (m.purpose === 'FINAL_SUMMARY') {
               finalSummary.push(opt);
               if (m.isDefault) finalDefault = opt;
+            } else {
+              translation.push(opt);
+              if (m.isDefault) translationDefault = opt;
             }
           }
         }
       }
 
-      setCatalog({ chat, chatOptions, realtimeSummary, finalSummary, chatDefault, realtimeDefault, finalDefault });
+      setCatalog({
+        chat,
+        chatOptions,
+        realtimeSummary,
+        finalSummary,
+        translation,
+        chatDefault,
+        realtimeDefault,
+        finalDefault,
+        translationDefault,
+      });
     } catch (err) {
       console.error('加载模型目录失败:', err);
     }

@@ -13,6 +13,7 @@ export const JOB_TYPE = {
   TITLE_GENERATION: 'title_generation',
   CHAT_FILES_CLEANUP: 'chat_files_cleanup',
   AUDIO_ENHANCE: 'audio_enhance',
+  DOC_TRANSLATE: 'doc_translate',
 } as const;
 
 export type JobType = (typeof JOB_TYPE)[keyof typeof JOB_TYPE];

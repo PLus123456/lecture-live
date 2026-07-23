@@ -68,9 +68,10 @@ model User {
   // 只在「购买到账」与「月度重置结算溢出」两处变更；月内所有扣费/预留都不碰它。
   purchasedMinutesBalance Int @default(0)
 
-  sessions    Session[]
-  shareLinks  ShareLink[]
-  emailTokens EmailToken[]
+  sessions         Session[]
+  shareLinks       ShareLink[]
+  emailTokens      EmailToken[]
+  translationTasks TranslationTask[]
 }
 
 // ─── 邮件令牌（邮箱验证 / 密码重置） ───
@@ -409,6 +410,7 @@ enum LlmPurpose {
   FINAL_SUMMARY // 最终摘要
   KEYWORD_EXTRACTION // 关键词提取
   EMBEDDING // 嵌入向量（用于 chat L6 RAG 检索）
+  TRANSLATION // 翻译（句子/文档，翻译模块专用）
 }
 
 // ─── LLM 用途路由行（用途 × 模型，一行一个绑定） ───
@@ -620,4 +622,63 @@ model WalletTransaction {
 
   @@index([userId, createdAt])
   @@index([type, createdAt])
+}
+
+// ─── 翻译系统：外部文档翻译 worker（一机一行一套设置） ───
+// AGPL 隔离：pdf2zh-next 部署在独立机器，主应用只通过 HTTPS 调其 wrapper（协议见
+// TRANSLATION_WORKER_PROTOCOL.md）。token 每台独立、AES-256-GCM 加密存储（enc:v2:）。
+// status/lastCheckedAt/lastError 照 LlmRegistryModel 连通性验证惯例，由 verify 与调度健康检查写入。
+model TranslationWorker {
+  id            String    @id @default(cuid())
+  name          String // 显示名，如「甲骨文 ARM-1」
+  baseUrl       String // wrapper 基址（https://host[:port]），存储时去尾斜杠
+  token         String    @db.Text // Bearer token（≥32 字符），加密落库
+  enabled       Boolean   @default(true)
+  concurrency   Int       @default(1) // 该机同时翻译任务数上限
+  weight        Int       @default(1) // 负载均衡权重（选台评分 = 负载/权重）
+  qps           Int       @default(4) // 下发给 pdf2zh 的 --qps（LLM 后端每秒请求上限）
+  status        String    @default("UNVERIFIED") // "UNVERIFIED" | "OK" | "FAILED"
+  lastCheckedAt DateTime?
+  lastError     String?   @db.Text
+  sortOrder     Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+// ─── 翻译系统：文档翻译任务（业务真源；调度态在 JobQueue type=doc_translate，两者经 jobQueueId 关联） ───
+// 计费：按页报价（SiteSetting translation_doc_price_cents_per_page）→ 用户确认时原子预扣钱包分
+// （spendWalletCents，台账 type=translation）→ 失败/取消全额退（type=translation_refund，幂等看 refundedAt）。
+// llm*Tokens 由 LLM 代理回流端点累计（成本可视，不参与定价）。proxyTokenHash 是任务级代理凭据的
+// sha256（原文只下发给 worker，照 EmailToken 只存哈希惯例），任务离开 TRANSLATING 后校验即失效。
+model TranslationTask {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fileName        String // 原始文件名（展示用，路径安全由存储层负责）
+  fileBytes       Int // 源 PDF 字节数
+  pageCount       Int // 页数（报价依据）
+  status          String    @default("QUOTED") // QUOTED | PENDING | TRANSLATING | COMPLETED | FAILED | CANCELED
+  progress        Int       @default(0) // 0-100，调度对账时从 worker 回写
+  sourceLang      String // pdf2zh lang-in（如 "en"）
+  targetLang      String // pdf2zh lang-out（如 "zh"）
+  modelId         String? // 任务创建时解析定格的 LlmModel(DB id) 快照；空=当时的 TRANSLATION 默认
+  glossaryJson    String?   @db.Text // 术语表 JSON [{src,dst}]，下发 worker 转 pdf2zh glossary
+  estimatedCents  Int       @default(0) // 报价（页数 × 单价）
+  chargedCents    Int       @default(0) // 确认时实扣金额
+  refundedAt      DateTime? // 非空=已退款（幂等闸）
+  sourcePath      String? // 源 PDF 存储路径
+  monoPath        String? // 译文单语 PDF
+  dualPath        String? // 双语对照 PDF
+  llmInputTokens  Int       @default(0)
+  llmOutputTokens Int       @default(0)
+  proxyTokenHash  String?   @unique // sha256(任务级 LLM 代理 token)
+  workerId        String? // 派发绑定的 TranslationWorker id（审计）
+  jobQueueId      String? // 关联 JobQueue 行
+  errorMessage    String?   @db.Text
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  completedAt     DateTime?
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
 }

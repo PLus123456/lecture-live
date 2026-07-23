@@ -22,6 +22,9 @@ import {
   Upload,
   Image as ImageIcon,
   AudioLines,
+  Languages,
+  RefreshCw,
+  Pencil,
 } from 'lucide-react';
 import { useTheme } from '@/components/ThemeProvider';
 import ConfirmDialog from '@/components/ConfirmDialog';
@@ -40,6 +43,7 @@ type SettingsTab =
   | 'appearance'
   | 'asr'
   | 'audioEnhance'
+  | 'translation'
   | 'llm'
   | 'security';
 
@@ -99,6 +103,16 @@ interface SiteSettingsData {
   audio_enhance_target_lufs: string;
   audio_enhance_atten_lim_db: string;
   audio_enhance_concurrency: string;
+  // 翻译模块
+  translation_text_enabled: boolean;
+  translation_text_daily_free_limit: string;
+  translation_text_billing_mode: string;
+  translation_text_price_cents_per_kchar: string;
+  translation_doc_enabled: boolean;
+  translation_doc_price_cents_per_page: string;
+  translation_doc_max_pages: string;
+  translation_doc_max_mb: string;
+  translation_doc_watermark: boolean;
   // 安全相关
   rate_limit_auth: string;
   rate_limit_api: string;
@@ -118,6 +132,7 @@ const settingsTabs: { id: SettingsTab; label: string; icon: typeof Globe }[] = [
   { id: 'appearance', label: 'Appearance', icon: Palette },
   { id: 'asr', label: 'ASR', icon: Cpu },
   { id: 'audioEnhance', label: 'Audio Enhance', icon: AudioLines },
+  { id: 'translation', label: 'Translation', icon: Languages },
   { id: 'llm', label: 'LLM', icon: Server },
   { id: 'security', label: 'Security', icon: Shield },
 ];
@@ -176,6 +191,15 @@ const defaultSettings: SiteSettingsData = {
   audio_enhance_target_lufs: '-14',
   audio_enhance_atten_lim_db: '30',
   audio_enhance_concurrency: '1',
+  translation_text_enabled: true,
+  translation_text_daily_free_limit: '100',
+  translation_text_billing_mode: 'free',
+  translation_text_price_cents_per_kchar: '1',
+  translation_doc_enabled: false,
+  translation_doc_price_cents_per_page: '10',
+  translation_doc_max_pages: '300',
+  translation_doc_max_mb: '30',
+  translation_doc_watermark: false,
   rate_limit_auth: '5',
   rate_limit_api: '60',
   jwt_expiry: '7',
@@ -1736,6 +1760,590 @@ function AudioEnhancePanel({
   );
 }
 
+// ──── 翻译服务设置 ────
+
+interface TranslateWorkerRow {
+  id: string;
+  name: string;
+  baseUrl: string;
+  hasToken: boolean;
+  enabled: boolean;
+  concurrency: number;
+  weight: number;
+  qps: number;
+  status: string;
+  lastCheckedAt: string | null;
+  lastError: string | null;
+  sortOrder: number;
+}
+
+interface WorkerFormState {
+  name: string;
+  baseUrl: string;
+  token: string;
+  concurrency: string;
+  weight: string;
+  qps: string;
+}
+
+const EMPTY_WORKER_FORM: WorkerFormState = {
+  name: '',
+  baseUrl: '',
+  token: '',
+  concurrency: '1',
+  weight: '1',
+  qps: '4',
+};
+
+/** worker 行内编辑/新增共用的字段组（紧凑网格） */
+function WorkerFormFields({
+  form,
+  setForm,
+  isNew,
+}: {
+  form: WorkerFormState;
+  setForm: (updater: (prev: WorkerFormState) => WorkerFormState) => void;
+  isNew: boolean;
+}) {
+  const { t } = useI18n();
+  const numCls =
+    'w-full px-2 py-1.5 text-sm border border-cream-200 rounded-lg bg-white text-charcoal-800 ' +
+    'dark:bg-charcoal-700 dark:border-charcoal-600 dark:text-cream-100 ' +
+    'focus:outline-none focus:ring-2 focus:ring-rust-200';
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+      <div className="col-span-2 md:col-span-1">
+        <label className="text-[11px] text-charcoal-400 block mb-0.5">
+          {t('adminSettings.translationWorkerName')}
+        </label>
+        <input
+          value={form.name}
+          onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
+          className={numCls}
+          placeholder="ARM-1"
+        />
+      </div>
+      <div className="col-span-2">
+        <label className="text-[11px] text-charcoal-400 block mb-0.5">
+          {t('adminSettings.translationWorkerUrl')}
+        </label>
+        <input
+          value={form.baseUrl}
+          onChange={(e) => setForm((p) => ({ ...p, baseUrl: e.target.value }))}
+          className={numCls}
+          placeholder="https://translate-1.example.com"
+        />
+      </div>
+      <div className="col-span-2 md:col-span-3">
+        <label className="text-[11px] text-charcoal-400 block mb-0.5">
+          {t('adminSettings.translationWorkerToken')}
+          {!isNew && (
+            <span className="ml-1 text-charcoal-300">
+              {t('adminSettings.translationWorkerTokenKeep')}
+            </span>
+          )}
+        </label>
+        <input
+          type="password"
+          value={form.token}
+          onChange={(e) => setForm((p) => ({ ...p, token: e.target.value }))}
+          className={numCls}
+          placeholder={isNew ? t('adminSettings.translationWorkerTokenPlaceholder') : '********'}
+        />
+      </div>
+      <div>
+        <label className="text-[11px] text-charcoal-400 block mb-0.5">
+          {t('adminSettings.translationWorkerConcurrency')}
+        </label>
+        <input
+          type="number"
+          min={1}
+          max={8}
+          value={form.concurrency}
+          onChange={(e) => setForm((p) => ({ ...p, concurrency: e.target.value }))}
+          className={numCls}
+        />
+      </div>
+      <div>
+        <label className="text-[11px] text-charcoal-400 block mb-0.5">
+          {t('adminSettings.translationWorkerWeight')}
+        </label>
+        <input
+          type="number"
+          min={1}
+          max={100}
+          value={form.weight}
+          onChange={(e) => setForm((p) => ({ ...p, weight: e.target.value }))}
+          className={numCls}
+        />
+      </div>
+      <div>
+        <label className="text-[11px] text-charcoal-400 block mb-0.5">
+          {t('adminSettings.translationWorkerQps')}
+        </label>
+        <input
+          type="number"
+          min={1}
+          max={100}
+          value={form.qps}
+          onChange={(e) => setForm((p) => ({ ...p, qps: e.target.value }))}
+          className={numCls}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** 翻译 worker 集群管理（一机一行一套设置；CRUD 即时生效，不走全局保存按钮） */
+function TranslationWorkersSection() {
+  const { t } = useI18n();
+  const [workers, setWorkers] = useState<TranslateWorkerRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+  const [createForm, setCreateForm] = useState<WorkerFormState>(EMPTY_WORKER_FORM);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState<WorkerFormState>(EMPTY_WORKER_FORM);
+  const [busy, setBusy] = useState(false);
+  const [verifyingId, setVerifyingId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<TranslateWorkerRow | null>(null);
+
+  const reload = useCallback(async () => {
+    try {
+      const res = await fetch('/api/admin/translate/workers');
+      if (res.ok) {
+        const data = await res.json();
+        setWorkers(Array.isArray(data.workers) ? data.workers : []);
+      }
+    } catch (err) {
+      console.error('加载翻译 worker 失败:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    reload();
+  }, [reload]);
+
+  const handleCreate = async () => {
+    setBusy(true);
+    try {
+      const res = await fetch('/api/admin/translate/workers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: createForm.name,
+          baseUrl: createForm.baseUrl,
+          token: createForm.token,
+          concurrency: Number(createForm.concurrency),
+          weight: Number(createForm.weight),
+          qps: Number(createForm.qps),
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        toast.error(data?.error ?? t('common.networkError'));
+        return;
+      }
+      toast.success(t('adminSettings.translationWorkerCreated'));
+      setCreateForm(EMPTY_WORKER_FORM);
+      setShowCreate(false);
+      await reload();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleUpdate = async (id: string) => {
+    setBusy(true);
+    try {
+      const payload: Record<string, unknown> = {
+        name: editForm.name,
+        baseUrl: editForm.baseUrl,
+        concurrency: Number(editForm.concurrency),
+        weight: Number(editForm.weight),
+        qps: Number(editForm.qps),
+      };
+      if (editForm.token.trim()) payload.token = editForm.token.trim();
+      const res = await fetch(`/api/admin/translate/workers/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        toast.error(data?.error ?? t('common.networkError'));
+        return;
+      }
+      toast.success(t('common.saved'));
+      setEditingId(null);
+      await reload();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleToggleEnabled = async (row: TranslateWorkerRow) => {
+    const res = await fetch(`/api/admin/translate/workers/${row.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !row.enabled }),
+    }).catch(() => null);
+    if (res?.ok) {
+      setWorkers((prev) =>
+        prev.map((w) => (w.id === row.id ? { ...w, enabled: !row.enabled } : w))
+      );
+    } else {
+      toast.error(t('common.networkError'));
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/admin/translate/workers/${deleteTarget.id}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        toast.error(data?.error ?? t('common.networkError'));
+        return;
+      }
+      toast.success(t('adminSettings.translationWorkerDeleted'));
+      setDeleteTarget(null);
+      await reload();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleVerify = async (id?: string) => {
+    setVerifyingId(id ?? 'all');
+    try {
+      const res = await fetch('/api/admin/translate/workers/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(id ? { id } : {}),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        toast.error(data?.error ?? t('common.networkError'));
+      }
+      await reload(); // verify 落库，重拉即拿到最新状态灯
+    } finally {
+      setVerifyingId(null);
+    }
+  };
+
+  const statusDot = (row: TranslateWorkerRow) => {
+    const color =
+      row.status === 'OK'
+        ? 'bg-green-500'
+        : row.status === 'FAILED'
+          ? 'bg-rust-500'
+          : 'bg-charcoal-300';
+    return <span className={`w-2 h-2 rounded-full flex-shrink-0 ${color}`} />;
+  };
+
+  return (
+    <div className="pt-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-sm font-medium text-charcoal-700 dark:text-cream-200">
+            {t('adminSettings.translationWorkers')}
+          </div>
+          <div className="text-xs text-charcoal-400 mt-0.5">
+            {t('adminSettings.translationWorkersDesc')}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => handleVerify()}
+            disabled={verifyingId !== null || workers.length === 0}
+            className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-charcoal-600 border border-cream-200 rounded-lg
+                       hover:bg-cream-50 dark:text-cream-200 dark:border-charcoal-600 dark:hover:bg-charcoal-700
+                       transition-colors disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3 h-3 ${verifyingId === 'all' ? 'animate-spin' : ''}`} />
+            {t('adminSettings.translationVerifyAll')}
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowCreate((v) => !v)}
+            className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-white bg-rust-500 rounded-lg
+                       hover:bg-rust-600 transition-colors"
+          >
+            <Plus className="w-3 h-3" />
+            {t('adminSettings.translationWorkerAdd')}
+          </button>
+        </div>
+      </div>
+
+      {showCreate && (
+        <div className="rounded-lg border border-cream-200 dark:border-charcoal-600 p-3 space-y-2 bg-cream-50/50 dark:bg-charcoal-700/30">
+          <WorkerFormFields form={createForm} setForm={setCreateForm} isNew />
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setShowCreate(false)}
+              className="px-3 py-1.5 text-xs text-charcoal-500 rounded-lg hover:bg-cream-100 dark:hover:bg-charcoal-700"
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              type="button"
+              onClick={handleCreate}
+              disabled={busy || !createForm.name.trim() || !createForm.baseUrl.trim() || createForm.token.trim().length < 32}
+              className="px-3 py-1.5 text-xs text-white bg-rust-500 rounded-lg hover:bg-rust-600 disabled:opacity-50"
+            >
+              {busy ? t('common.loading') : t('common.create')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {loading ? (
+        <div className="text-xs text-charcoal-400 py-3">{t('common.loading')}</div>
+      ) : workers.length === 0 ? (
+        <div className="text-xs text-charcoal-400 py-3">
+          {t('adminSettings.translationWorkersEmpty')}
+        </div>
+      ) : (
+        <ul className="space-y-2">
+          {workers.map((row) => (
+            <li
+              key={row.id}
+              className="rounded-lg border border-cream-200 dark:border-charcoal-600 p-3 space-y-2"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                {statusDot(row)}
+                <span className="text-sm font-medium text-charcoal-700 dark:text-cream-200 flex-shrink-0">
+                  {row.name}
+                </span>
+                <span className="text-xs text-charcoal-400 truncate">{row.baseUrl}</span>
+                <span className="ml-auto flex items-center gap-2 flex-shrink-0">
+                  <span className="text-[11px] text-charcoal-400 tabular-nums">
+                    ×{row.concurrency} · w{row.weight} · {row.qps}qps
+                  </span>
+                  <ToggleSwitch checked={row.enabled} onChange={() => handleToggleEnabled(row)} />
+                  <button
+                    type="button"
+                    title={t('adminSettings.translationVerifyOne')}
+                    onClick={() => handleVerify(row.id)}
+                    className="p-1.5 text-charcoal-400 hover:text-charcoal-600 rounded-md hover:bg-cream-100 dark:hover:bg-charcoal-700"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${verifyingId === row.id ? 'animate-spin' : ''}`} />
+                  </button>
+                  <button
+                    type="button"
+                    title={t('common.edit')}
+                    onClick={() => {
+                      if (editingId === row.id) {
+                        setEditingId(null);
+                      } else {
+                        setEditingId(row.id);
+                        setEditForm({
+                          name: row.name,
+                          baseUrl: row.baseUrl,
+                          token: '',
+                          concurrency: String(row.concurrency),
+                          weight: String(row.weight),
+                          qps: String(row.qps),
+                        });
+                      }
+                    }}
+                    className="p-1.5 text-charcoal-400 hover:text-charcoal-600 rounded-md hover:bg-cream-100 dark:hover:bg-charcoal-700"
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    title={t('common.delete')}
+                    onClick={() => setDeleteTarget(row)}
+                    className="p-1.5 text-charcoal-400 hover:text-rust-500 rounded-md hover:bg-cream-100 dark:hover:bg-charcoal-700"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </span>
+              </div>
+              {row.status === 'FAILED' && row.lastError && (
+                <div className="text-[11px] text-rust-500 pl-4 truncate" title={row.lastError}>
+                  {row.lastError}
+                </div>
+              )}
+              {row.lastCheckedAt && (
+                <div className="text-[11px] text-charcoal-300 pl-4">
+                  {t('adminSettings.translationLastChecked')}{' '}
+                  {new Date(row.lastCheckedAt).toLocaleString()}
+                </div>
+              )}
+              {editingId === row.id && (
+                <div className="pt-2 border-t border-cream-100 dark:border-charcoal-700 space-y-2">
+                  <WorkerFormFields form={editForm} setForm={setEditForm} isNew={false} />
+                  <div className="flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setEditingId(null)}
+                      className="px-3 py-1.5 text-xs text-charcoal-500 rounded-lg hover:bg-cream-100 dark:hover:bg-charcoal-700"
+                    >
+                      {t('common.cancel')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleUpdate(row.id)}
+                      disabled={busy}
+                      className="px-3 py-1.5 text-xs text-white bg-rust-500 rounded-lg hover:bg-rust-600 disabled:opacity-50"
+                    >
+                      {busy ? t('common.loading') : t('common.save')}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title={t('adminSettings.translationWorkerDeleteTitle')}
+        message={
+          deleteTarget
+            ? t('adminSettings.translationWorkerDeleteMsg', { name: deleteTarget.name })
+            : ''
+        }
+        confirmText={t('common.delete')}
+        danger
+        loading={busy}
+        onConfirm={handleDelete}
+        onCancel={() => setDeleteTarget(null)}
+      />
+    </div>
+  );
+}
+
+/** 翻译模块设置（句子翻译 + 文档翻译 + worker 集群） */
+function TranslationPanel({
+  settings,
+  onChange,
+  onToggle,
+}: {
+  settings: SiteSettingsData;
+  onChange: (key: string, value: string) => void;
+  onToggle: (key: string, value: boolean) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div>
+      <p className="text-xs text-charcoal-400 dark:text-charcoal-400 pb-2">
+        {t('adminSettings.translationIntro')}
+      </p>
+
+      {/* ── 句子翻译 ── */}
+      <SettingField
+        label={t('adminSettings.translationTextEnabled')}
+        description={t('adminSettings.translationTextEnabledDesc')}
+      >
+        <ToggleSwitch
+          checked={settings.translation_text_enabled as boolean}
+          onChange={(v) => onToggle('translation_text_enabled', v)}
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.translationTextBillingMode')}
+        description={t('adminSettings.translationTextBillingModeDesc')}
+      >
+        <SelectInput
+          value={settings.translation_text_billing_mode}
+          onChange={(v) => onChange('translation_text_billing_mode', v)}
+          options={[
+            { value: 'free', label: t('adminSettings.translationBillingFree') },
+            { value: 'per_char', label: t('adminSettings.translationBillingPerChar') },
+          ]}
+        />
+      </SettingField>
+      {settings.translation_text_billing_mode === 'per_char' ? (
+        <SettingField
+          label={t('adminSettings.translationTextPrice')}
+          description={t('adminSettings.translationTextPriceDesc')}
+        >
+          <TextInput
+            value={settings.translation_text_price_cents_per_kchar}
+            onChange={(v) => onChange('translation_text_price_cents_per_kchar', v)}
+            type="number"
+          />
+        </SettingField>
+      ) : (
+        <SettingField
+          label={t('adminSettings.translationTextDailyLimit')}
+          description={t('adminSettings.translationTextDailyLimitDesc')}
+        >
+          <TextInput
+            value={settings.translation_text_daily_free_limit}
+            onChange={(v) => onChange('translation_text_daily_free_limit', v)}
+            type="number"
+          />
+        </SettingField>
+      )}
+
+      {/* ── 文档翻译 ── */}
+      <SettingField
+        label={t('adminSettings.translationDocEnabled')}
+        description={t('adminSettings.translationDocEnabledDesc')}
+      >
+        <ToggleSwitch
+          checked={settings.translation_doc_enabled as boolean}
+          onChange={(v) => onToggle('translation_doc_enabled', v)}
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.translationDocPrice')}
+        description={t('adminSettings.translationDocPriceDesc')}
+      >
+        <TextInput
+          value={settings.translation_doc_price_cents_per_page}
+          onChange={(v) => onChange('translation_doc_price_cents_per_page', v)}
+          type="number"
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.translationDocMaxPages')}
+        description={t('adminSettings.translationDocMaxPagesDesc')}
+      >
+        <TextInput
+          value={settings.translation_doc_max_pages}
+          onChange={(v) => onChange('translation_doc_max_pages', v)}
+          type="number"
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.translationDocMaxMb')}
+        description={t('adminSettings.translationDocMaxMbDesc')}
+      >
+        <TextInput
+          value={settings.translation_doc_max_mb}
+          onChange={(v) => onChange('translation_doc_max_mb', v)}
+          type="number"
+        />
+      </SettingField>
+      <SettingField
+        label={t('adminSettings.translationDocWatermark')}
+        description={t('adminSettings.translationDocWatermarkDesc')}
+      >
+        <ToggleSwitch
+          checked={settings.translation_doc_watermark as boolean}
+          onChange={(v) => onToggle('translation_doc_watermark', v)}
+        />
+      </SettingField>
+
+      {/* ── worker 集群（即时 CRUD，不随全局保存按钮） ── */}
+      <TranslationWorkersSection />
+    </div>
+  );
+}
+
 /** 安全设置 */
 function SecurityPanel({
   settings,
@@ -1807,6 +2415,7 @@ export default function SettingsPanel() {
     appearance: 'adminSettings.tabAppearance',
     asr: 'adminSettings.tabAsr',
     audioEnhance: 'adminSettings.tabAudioEnhance',
+    translation: 'adminSettings.tabTranslation',
     llm: 'adminSettings.tabLlm',
     security: 'adminSettings.tabSecurity',
   };
@@ -1952,6 +2561,14 @@ export default function SettingsPanel() {
       case 'audioEnhance':
         return (
           <AudioEnhancePanel
+            settings={settings}
+            onChange={handleChange}
+            onToggle={handleToggle}
+          />
+        );
+      case 'translation':
+        return (
+          <TranslationPanel
             settings={settings}
             onChange={handleChange}
             onToggle={handleToggle}

@@ -14,6 +14,7 @@ import {
   User,
   Languages,
   MessageSquare,
+  BookA,
 } from 'lucide-react';
 import Image from 'next/image';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -44,6 +45,7 @@ export default function Sidebar({ slideOut = false }: { slideOut?: boolean }) {
   const navItems = [
     { href: '/home', label: t('nav.home'), icon: Home },
     { href: '/interpret', label: t('nav.interpret'), icon: Languages },
+    { href: '/translate', label: t('nav.translate'), icon: BookA },
     { href: '/chat', label: t('nav.chat'), icon: MessageSquare },
     { href: '/folders', label: t('nav.folders'), icon: FolderOpen },
     { href: '/shared', label: t('nav.shared'), icon: Share2 },

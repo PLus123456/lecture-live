@@ -265,6 +265,8 @@ describe('resolveUserFeatureFlags', () => {
       allowRealtimeSummary: true,
       allowFinalSummary: true,
       allowAudioEnhance: true,
+      allowTextTranslation: true,
+      allowDocTranslation: true,
     });
   });
 

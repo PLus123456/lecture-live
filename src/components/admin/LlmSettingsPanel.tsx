@@ -13,6 +13,7 @@ import {
   FileText,
   Tag,
   Search,
+  Languages,
   Star,
   X,
   Plus,
@@ -37,7 +38,8 @@ type ModelPurpose =
   | 'REALTIME_SUMMARY'
   | 'FINAL_SUMMARY'
   | 'KEYWORD_EXTRACTION'
-  | 'EMBEDDING';
+  | 'EMBEDDING'
+  | 'TRANSLATION';
 type ThinkingMode = 'NONE' | 'AUTO' | 'FORCED' | 'DEPTH';
 type ThinkingDepth = 'low' | 'medium' | 'high';
 type RegistryKind = 'TEXT' | 'EMBEDDING';
@@ -98,11 +100,14 @@ interface GroupBinding {
   chatModelId: string;
   realtimeSummaryModelId: string;
   finalSummaryModelId: string;
+  translationModelId: string;
   /** 该组聊天可用模型（'*' 或逗号分隔 token）；与「用户组」面板/运行时同源 */
   allowedModels: string;
-  /** 组能力开关：关了则对应摘要绑定是死配置，选择器按禁用渲染 */
+  /** 组能力开关：关了则对应摘要/翻译绑定是死配置，选择器按禁用渲染 */
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
+  allowTextTranslation: boolean;
+  allowDocTranslation: boolean;
 }
 
 /**
@@ -134,6 +139,7 @@ const PURPOSES: ModelPurpose[] = [
   'FINAL_SUMMARY',
   'KEYWORD_EXTRACTION',
   'EMBEDDING',
+  'TRANSLATION',
 ];
 
 /** 支持按用户组绑定默认模型的用途（关键词/嵌入恒为全局统一） */
@@ -141,12 +147,14 @@ const GROUP_BINDABLE = new Set<ModelPurpose>([
   'CHAT',
   'REALTIME_SUMMARY',
   'FINAL_SUMMARY',
+  'TRANSLATION',
 ]);
 
 const GROUP_BINDING_FIELD: Record<string, keyof GroupBinding> = {
   CHAT: 'chatModelId',
   REALTIME_SUMMARY: 'realtimeSummaryModelId',
   FINAL_SUMMARY: 'finalSummaryModelId',
+  TRANSLATION: 'translationModelId',
 };
 
 const PURPOSE_LABEL_KEY: Record<ModelPurpose, string> = {
@@ -155,6 +163,7 @@ const PURPOSE_LABEL_KEY: Record<ModelPurpose, string> = {
   FINAL_SUMMARY: 'adminSettings.purposeFinalSummary',
   KEYWORD_EXTRACTION: 'adminSettings.purposeKeywordExtraction',
   EMBEDDING: 'adminSettings.purposeEmbedding',
+  TRANSLATION: 'adminSettings.purposeTranslation',
 };
 
 const PURPOSE_ICONS: Record<ModelPurpose, typeof MessageCircle> = {
@@ -163,6 +172,7 @@ const PURPOSE_ICONS: Record<ModelPurpose, typeof MessageCircle> = {
   FINAL_SUMMARY: FileText,
   KEYWORD_EXTRACTION: Tag,
   EMBEDDING: Search,
+  TRANSLATION: Languages,
 };
 
 const THINKING_MODES: ThinkingMode[] = ['NONE', 'AUTO', 'FORCED', 'DEPTH'];
@@ -248,10 +258,13 @@ export default function LlmSettingsPanel() {
             chatModelId: g.chatModelId ?? '',
             realtimeSummaryModelId: g.realtimeSummaryModelId ?? '',
             finalSummaryModelId: g.finalSummaryModelId ?? '',
+            translationModelId: g.translationModelId ?? '',
             // 兜底按「不产生虚假警告」取向：可用模型缺省视作全允许、能力缺省视作开启
             allowedModels: g.allowedModels ?? '*',
             allowRealtimeSummary: g.allowRealtimeSummary ?? true,
             allowFinalSummary: g.allowFinalSummary ?? true,
+            allowTextTranslation: g.allowTextTranslation ?? true,
+            allowDocTranslation: g.allowDocTranslation ?? true,
           }))
         );
       }
@@ -679,6 +692,7 @@ function PurposeBlock({
     FINAL_SUMMARY: 'adminSettings.llmPurposeSubFinal',
     KEYWORD_EXTRACTION: 'adminSettings.llmPurposeSubKeyword',
     EMBEDDING: 'adminSettings.llmPurposeSubEmbedding',
+    TRANSLATION: 'adminSettings.llmPurposeSubTranslation',
   };
 
   return (
@@ -764,7 +778,11 @@ function PurposeBlock({
                   // 组能力开关关闭 → 该绑定是死配置，禁用展示（与组编辑弹窗行为一致）
                   const capabilityOff =
                     (purpose === 'REALTIME_SUMMARY' && !g.allowRealtimeSummary) ||
-                    (purpose === 'FINAL_SUMMARY' && !g.allowFinalSummary);
+                    (purpose === 'FINAL_SUMMARY' && !g.allowFinalSummary) ||
+                    // 翻译绑定：句子/文档任一开着都有意义，两者全关才算死配置
+                    (purpose === 'TRANSLATION' &&
+                      !g.allowTextTranslation &&
+                      !g.allowDocTranslation);
                   // 聊天：全局默认不在该组可用模型内且未绑定 → 该组实际无可用聊天模型，显式警告
                   const globalDefaultUsable =
                     !defaultRoute || isRouteAllowedForGroup(defaultRoute, g);
@@ -1303,6 +1321,7 @@ function RegistryCard({
     FINAL_SUMMARY: t('adminSettings.purposeFinalSummary'),
     KEYWORD_EXTRACTION: t('adminSettings.purposeKeywordExtraction'),
     EMBEDDING: t('adminSettings.purposeEmbedding'),
+    TRANSLATION: t('adminSettings.purposeTranslation'),
   };
 
   return (

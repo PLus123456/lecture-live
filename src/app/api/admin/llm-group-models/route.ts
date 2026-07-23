@@ -14,6 +14,7 @@ const GROUP_BINDABLE_PURPOSES = [
   'CHAT',
   'REALTIME_SUMMARY',
   'FINAL_SUMMARY',
+  'TRANSLATION',
 ] as const;
 type GroupBindablePurpose = (typeof GROUP_BINDABLE_PURPOSES)[number];
 
@@ -22,6 +23,7 @@ const PURPOSE_FIELD: Record<GroupBindablePurpose, string> = {
   CHAT: 'chatModelId',
   REALTIME_SUMMARY: 'realtimeSummaryModelId',
   FINAL_SUMMARY: 'finalSummaryModelId',
+  TRANSLATION: 'translationModelId',
 };
 
 // 可按组绑定的系统角色。ADMIN 恒跟随全局默认（resolveUser* 对 ADMIN 短路），不暴露绑定入口。
@@ -36,12 +38,15 @@ interface GroupModelBinding {
   chatModelId: string;
   realtimeSummaryModelId: string;
   finalSummaryModelId: string;
+  translationModelId: string;
   // ── 与用户组编辑弹窗同源的上下文（决定绑定项在按组视图里怎么展示）──
   /** 该组聊天可用模型（'*' 或逗号分隔 token；与运行时 access.ts 同一匹配口径） */
   allowedModels: string;
-  /** 组能力开关：关了则对应摘要绑定是死配置，UI 必须禁用 */
+  /** 组能力开关：关了则对应摘要/翻译绑定是死配置，UI 必须禁用 */
   allowRealtimeSummary: boolean;
   allowFinalSummary: boolean;
+  allowTextTranslation: boolean;
+  allowDocTranslation: boolean;
 }
 
 /** 从运行时解析器的结果抽出按组视图需要的字段（绑定 + 可用模型 + 能力开关） */
@@ -50,9 +55,12 @@ function fromPermissions(perms: GroupPermissions) {
     chatModelId: coerceSummaryModelId(perms.chatModelId),
     realtimeSummaryModelId: coerceSummaryModelId(perms.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(perms.finalSummaryModelId),
+    translationModelId: coerceSummaryModelId(perms.translationModelId),
     allowedModels: perms.allowedModels,
     allowRealtimeSummary: perms.allowRealtimeSummary,
     allowFinalSummary: perms.allowFinalSummary,
+    allowTextTranslation: perms.allowTextTranslation,
+    allowDocTranslation: perms.allowDocTranslation,
   };
 }
 
@@ -110,6 +118,8 @@ export async function GET(req: Request) {
               allowRealtimeSummary: true,
               allowFinalSummary: true,
               allowAudioEnhance: false,
+              allowTextTranslation: true,
+              allowDocTranslation: false,
             };
             groups.push({
               key: `custom:${entry.id}`,

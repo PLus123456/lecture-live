@@ -5,7 +5,10 @@ import {
   type LLMProviderConfig,
 } from '@/lib/llm/gateway';
 
-/** 与用户组绑定的两个摘要用途 */
+/** 可与用户组绑定专用模型的用途（摘要两用途 + 翻译） */
+export type GroupBoundPurpose = 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'TRANSLATION';
+
+/** 与用户组绑定的两个摘要用途（历史别名，既有摘要调用方继续用） */
 export type SummaryPurpose = 'REALTIME_SUMMARY' | 'FINAL_SUMMARY';
 
 export interface ResolvedSummaryModel {
@@ -26,7 +29,7 @@ export interface ResolvedSummaryModel {
  */
 export async function resolveSummaryModel(
   groupModelId: string | null | undefined,
-  fallbackPurpose: SummaryPurpose
+  fallbackPurpose: GroupBoundPurpose
 ): Promise<ResolvedSummaryModel> {
   const id = groupModelId?.trim();
   if (id) {
@@ -40,3 +43,6 @@ export async function resolveSummaryModel(
   const provider = await getProviderForPurpose(fallbackPurpose).catch(() => null);
   return { routing: { purpose: fallbackPurpose }, provider };
 }
+
+/** 语义化别名：非摘要用途（如 TRANSLATION）的组绑定模型解析走这个名字，逻辑完全同上 */
+export const resolveGroupBoundModel = resolveSummaryModel;

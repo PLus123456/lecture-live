@@ -18,6 +18,10 @@ import {
   startAudioEnhanceLoop,
   stopAudioEnhanceLoop,
 } from '../src/lib/audio/enhanceLoop';
+import {
+  startDocTranslateLoop,
+  stopDocTranslateLoop,
+} from '../src/lib/translate/translateLoop';
 import { logger, serializeError } from '../src/lib/logger';
 
 const PORT = parseInt(process.env.WS_PORT || '3001', 10);
@@ -208,6 +212,7 @@ const teardownLiveShare = setupLiveShare(io);
 startBillingMaintenanceLoop();
 startCloudreveTokenRefreshLoop();
 startAudioEnhanceLoop();
+startDocTranslateLoop();
 
 httpServer.listen(PORT, () => {
   wsLogger.info({ port: PORT }, 'WebSocket server listening');
@@ -223,6 +228,7 @@ async function shutdown(signal: string) {
   stopBillingMaintenanceLoop();
   stopCloudreveTokenRefreshLoop();
   stopAudioEnhanceLoop();
+  stopDocTranslateLoop();
   // 清掉直播分享的 TTL 清扫定时器 / host 下线宽限计时并清空内存快照，
   // 避免优雅关停时残留模块级定时器阻碍进程干净退出。
   teardownLiveShare();

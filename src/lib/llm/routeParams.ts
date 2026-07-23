@@ -11,6 +11,7 @@ export const DEFAULT_TEMPERATURE: Record<LlmAdminPurpose, number> = {
   FINAL_SUMMARY: 0.4,
   KEYWORD_EXTRACTION: 0.2,
   EMBEDDING: 0.3, // 嵌入不用温度，占位
+  TRANSLATION: 0.2, // 翻译求忠实，低温
 };
 
 /**

@@ -136,6 +136,16 @@ export async function PUT(req: Request) {
       'audio_enhance_target_lufs',
       'audio_enhance_atten_lim_db',
       'audio_enhance_concurrency',
+      // 翻译模块（worker 列表在 TranslationWorker 表，走 /api/admin/translate/workers）
+      'translation_text_enabled',
+      'translation_text_daily_free_limit',
+      'translation_text_billing_mode',
+      'translation_text_price_cents_per_kchar',
+      'translation_doc_enabled',
+      'translation_doc_price_cents_per_page',
+      'translation_doc_max_pages',
+      'translation_doc_max_mb',
+      'translation_doc_watermark',
     ]);
 
     // 过滤非法键

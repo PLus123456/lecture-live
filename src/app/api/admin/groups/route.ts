@@ -50,11 +50,17 @@ interface GroupPermissions {
   allowFinalSummary: boolean;
   /** 录音音频增强（外部 worker 后处理）；新重资源功能，缺省禁止 */
   allowAudioEnhance: boolean;
+  /** 句子翻译（LLM，免费+限流）；缺省允许 */
+  allowTextTranslation: boolean;
+  /** 文档翻译（外部 worker + 按页扣费）；同音频增强，缺省禁止 */
+  allowDocTranslation: boolean;
   // ── 用途专用模型（DB model id；空 = 跟随全局该用途默认）──
   realtimeSummaryModelId: string;
   finalSummaryModelId: string;
   /** 组默认聊天模型（用户未显式选模型时用；空 = 跟随全局 CHAT 默认） */
   chatModelId: string;
+  /** 翻译（句子+文档）模型（空 = 跟随全局 TRANSLATION 默认） */
+  translationModelId: string;
 }
 
 interface CustomGroupEntry {
@@ -76,9 +82,12 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     allowRealtimeSummary: true,
     allowFinalSummary: true,
     allowAudioEnhance: false,
+    allowTextTranslation: true,
+    allowDocTranslation: false,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
     chatModelId: '',
+    translationModelId: '',
   },
   PRO: {
     transcriptionMinutesLimit: 600,
@@ -89,9 +98,12 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     allowRealtimeSummary: true,
     allowFinalSummary: true,
     allowAudioEnhance: false,
+    allowTextTranslation: true,
+    allowDocTranslation: false,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
     chatModelId: '',
+    translationModelId: '',
   },
   ADMIN: {
     transcriptionMinutesLimit: 999999,
@@ -102,9 +114,12 @@ const DEFAULT_GROUP_PERMISSIONS: Record<string, GroupPermissions> = {
     allowRealtimeSummary: true,
     allowFinalSummary: true,
     allowAudioEnhance: true,
+    allowTextTranslation: true,
+    allowDocTranslation: true,
     realtimeSummaryModelId: '',
     finalSummaryModelId: '',
     chatModelId: '',
+    translationModelId: '',
   },
 };
 
@@ -150,9 +165,18 @@ function normalizePermissions(
       typeof p.allowAudioEnhance === 'boolean'
         ? p.allowAudioEnhance
         : fallback.allowAudioEnhance,
+    allowTextTranslation:
+      typeof p.allowTextTranslation === 'boolean'
+        ? p.allowTextTranslation
+        : fallback.allowTextTranslation,
+    allowDocTranslation:
+      typeof p.allowDocTranslation === 'boolean'
+        ? p.allowDocTranslation
+        : fallback.allowDocTranslation,
     realtimeSummaryModelId: coerceSummaryModelId(p.realtimeSummaryModelId),
     finalSummaryModelId: coerceSummaryModelId(p.finalSummaryModelId),
     chatModelId: coerceSummaryModelId(p.chatModelId),
+    translationModelId: coerceSummaryModelId(p.translationModelId),
   };
 }
 
@@ -165,11 +189,14 @@ const CUSTOM_GROUP_FALLBACK: GroupPermissions = {
   maxThinkingDepth: 'high',
   allowRealtimeSummary: true,
   allowFinalSummary: true,
-  // 音频增强与「缺省全开」相反：新重资源功能，缺省禁止（与 userRoles 解析口径一致）
+  // 音频增强/文档翻译与「缺省全开」相反：新重资源功能，缺省禁止（与 userRoles 解析口径一致）
   allowAudioEnhance: false,
+  allowTextTranslation: true,
+  allowDocTranslation: false,
   realtimeSummaryModelId: '',
   finalSummaryModelId: '',
   chatModelId: '',
+  translationModelId: '',
 };
 
 // Prisma 事务客户端类型
@@ -223,9 +250,12 @@ function sanitizeFeatureFlags(
   | 'allowRealtimeSummary'
   | 'allowFinalSummary'
   | 'allowAudioEnhance'
+  | 'allowTextTranslation'
+  | 'allowDocTranslation'
   | 'realtimeSummaryModelId'
   | 'finalSummaryModelId'
   | 'chatModelId'
+  | 'translationModelId'
 > {
   return {
     maxThinkingDepth: coerceThinkingDepthCap(
@@ -245,11 +275,21 @@ function sanitizeFeatureFlags(
       typeof permissions?.allowAudioEnhance === 'boolean'
         ? permissions.allowAudioEnhance
         : false,
+    allowTextTranslation:
+      typeof permissions?.allowTextTranslation === 'boolean'
+        ? permissions.allowTextTranslation
+        : true,
+    // 文档翻译同音频增强：缺省禁止
+    allowDocTranslation:
+      typeof permissions?.allowDocTranslation === 'boolean'
+        ? permissions.allowDocTranslation
+        : false,
     realtimeSummaryModelId: coerceSummaryModelId(
       permissions?.realtimeSummaryModelId
     ),
     finalSummaryModelId: coerceSummaryModelId(permissions?.finalSummaryModelId),
     chatModelId: coerceSummaryModelId(permissions?.chatModelId),
+    translationModelId: coerceSummaryModelId(permissions?.translationModelId),
   };
 }
 

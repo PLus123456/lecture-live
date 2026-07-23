@@ -372,6 +372,54 @@ export function quotaAlertEmail(
   };
 }
 
+export function docTranslateEmail(
+  ctx: BrandCtx,
+  params: {
+    displayName: string;
+    fileName: string;
+    outcome: 'completed' | 'failed';
+    errorMessage?: string | null;
+    refunded?: boolean;
+    unsubscribeUrl: string;
+  }
+): RenderedEmail {
+  const name = escapeHtml(params.displayName);
+  const file = escapeHtml(params.fileName);
+  const ok = params.outcome === 'completed';
+  const bodyHtml = ok
+    ? `
+    <p style="margin:0 0 12px 0;">你好 ${name}，</p>
+    <p style="margin:0;">你的文档 <strong>${file}</strong> 已翻译完成，双语/单语版本均可下载。</p>`
+    : `
+    <p style="margin:0 0 12px 0;">你好 ${name}，</p>
+    <p style="margin:0 0 12px 0;">很抱歉，你的文档 <strong>${file}</strong> 翻译失败${
+      params.errorMessage ? `（${escapeHtml(params.errorMessage)}）` : ''
+    }。</p>
+    <p style="margin:0;">${params.refunded ? '费用已全额退回钱包余额。' : ''}你可以在翻译页重新发起。</p>`;
+  return {
+    subject: ok
+      ? `文档翻译完成 · ${ctx.siteName}`
+      : `文档翻译失败 · ${ctx.siteName}`,
+    html: renderLayout({
+      ...ctx,
+      heading: ok ? '文档翻译完成' : '文档翻译失败',
+      bodyHtml,
+      cta: { url: `${ctx.siteUrl}/translate`, label: ok ? '下载译文' : '查看详情' },
+      unsubscribeUrl: params.unsubscribeUrl,
+    }),
+    text: renderText(
+      [
+        `你好 ${params.displayName}，`,
+        '',
+        ok
+          ? `你的文档「${params.fileName}」已翻译完成，可前往翻译页下载。`
+          : `你的文档「${params.fileName}」翻译失败${params.refunded ? '，费用已全额退回钱包' : ''}。`,
+      ],
+      { ctaUrl: `${ctx.siteUrl}/translate`, unsubscribeUrl: params.unsubscribeUrl, siteName: ctx.siteName }
+    ),
+  };
+}
+
 /** 通用通知/公告/促销（管理员自定义主题与正文）。bodyText 会被转义。 */
 export function genericNotificationEmail(
   ctx: BrandCtx,

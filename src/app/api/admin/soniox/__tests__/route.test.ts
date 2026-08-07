@@ -153,7 +153,7 @@ describe('PUT /api/admin/soniox', () => {
 
   // P2-2：只改 wsUrl/restUrl、apiKey 留空 = 保留已存密钥 → 下一次转录就带着真密钥
   // 连到新地址（Soniox 密钥随握手直接送出）。
-  describe('改端点必须重填密钥', () => {
+  describe('换靶闸范围：Soniox 不设闸（只保 SMTP）', () => {
     beforeEach(() => {
       siteSettingFindManyMock.mockResolvedValue([
         { key: 'soniox_US_api_key', value: 'enc:real-soniox-key' },
@@ -162,21 +162,22 @@ describe('PUT /api/admin/soniox', () => {
       ]);
     });
 
-    it('只改 wsUrl、apiKey 不传 → 400，且一个字都不落库', async () => {
+    // ↓ 这条固化的是「换靶闸只保 SMTP」这个刻意的范围决定（见 admin/settings/route.ts 的说明）。
+    //   若有人把这道闸加回来，它会立刻转红 —— 那时应先回到范围决定本身重新讨论。
+    it('只改 wsUrl、apiKey 不传 → 放行并落库', async () => {
       const res = await PUT(
-        makeRequest({ regions: { us: { wsUrl: 'wss://attacker.tld/ws' } } })
+        makeRequest({ regions: { us: { wsUrl: 'wss://stt-rt2.soniox.example/ws' } } })
       );
-      expect(res.status).toBe(400);
-      expect(siteSettingUpsertMock).not.toHaveBeenCalled();
-      expect(transactionMock).not.toHaveBeenCalled();
+      expect(res.status).toBe(200);
+      expect(transactionMock).toHaveBeenCalled();
     });
 
-    it('只改 restUrl、apiKey 不传 → 同样 400', async () => {
+    it('只改 restUrl、apiKey 不传 → 同样放行', async () => {
       const res = await PUT(
-        makeRequest({ regions: { us: { restUrl: 'https://attacker.tld' } } })
+        makeRequest({ regions: { us: { restUrl: 'https://api2.soniox.example' } } })
       );
-      expect(res.status).toBe(400);
-      expect(transactionMock).not.toHaveBeenCalled();
+      expect(res.status).toBe(200);
+      expect(transactionMock).toHaveBeenCalled();
     });
 
     it('改地址同时重填 apiKey → 放行', async () => {

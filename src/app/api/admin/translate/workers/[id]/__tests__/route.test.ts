@@ -58,7 +58,7 @@ function makeRequest(body: unknown): Request {
 
 const params = Promise.resolve({ id: 'w-1' });
 
-describe('PATCH /api/admin/translate/workers/[id] — 改端点必须重填 token', () => {
+describe('PATCH /api/admin/translate/workers/[id] — 换靶闸范围：不设闸（只保 SMTP）', () => {
   beforeEach(() => {
     requireAdminAccessMock.mockReset();
     workerFindUniqueMock.mockReset();
@@ -75,22 +75,24 @@ describe('PATCH /api/admin/translate/workers/[id] — 改端点必须重填 toke
     }));
   });
 
-  it('只改 baseUrl、token 不传 → 400，且不落库（核心攻击形状）', async () => {
+  // ↓ 这条固化的是「换靶闸只保 SMTP」这个刻意的范围决定（见 admin/settings/route.ts 的说明）。
+  //   若有人把这道闸加回来，它会立刻转红 —— 那时应先回到范围决定本身重新讨论。
+  it('只改 baseUrl、token 不传 → 放行并落库（换机器是常规运维）', async () => {
     const res = await PATCH(
-      makeRequest({ baseUrl: 'https://attacker.tld' }),
+      makeRequest({ baseUrl: 'https://w9.corp.example' }),
       { params }
     );
-    expect(res.status).toBe(400);
-    expect(workerUpdateMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(workerUpdateMock).toHaveBeenCalled();
   });
 
-  it('token 传空串（= 保持原值）同样拦下', async () => {
+  it('token 只传空白（= 保持原值）同样放行', async () => {
     const res = await PATCH(
-      makeRequest({ baseUrl: 'https://attacker.tld', token: '   ' }),
+      makeRequest({ baseUrl: 'https://w9.corp.example', token: '   ' }),
       { params }
     );
-    expect(res.status).toBe(400);
-    expect(workerUpdateMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(workerUpdateMock).toHaveBeenCalled();
   });
 
   it('改 baseUrl 同时重填 token → 放行，两者一起写入', async () => {

@@ -3,11 +3,6 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { getSiteSettings, SETTING_SECRET_MASK } from '@/lib/siteSettings';
 import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
 import { pingEnhanceWorker, parseWorkerUrls } from '@/lib/audio/enhanceWorkerClient';
-import {
-  findUnsavedEndpoints,
-  hasFreshSecret,
-  retargetErrorMessage,
-} from '@/lib/credentialRetarget';
 
 /**
  * POST /api/admin/audio-enhance/verify — 音频增强 worker 连通性测试（支持多台）。
@@ -50,24 +45,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: 'worker token 未配置' }, { status: 400 });
   }
 
-  // 改端点必须重填 token（P2-2）：本接口一次请求就能完成外带 —— 传一个陌生 workerUrl、
-  // token 留空/填掩码，服务端就会把解密后的真实 token 以 Authorization: Bearer 送到那台主机。
-  // 已存 token 只允许沿用到「已保存的地址」；探测新地址必须本次显式给出 token。
-  if (!hasFreshSecret(body.workerToken) && settings.audio_enhance_worker_token) {
-    const unsaved = findUnsavedEndpoints(
-      urls,
-      parseWorkerUrls(settings.audio_enhance_worker_url)
-    );
-    if (unsaved.length > 0) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: retargetErrorMessage('worker 地址', 'worker token'),
-        },
-        { status: 400 }
-      );
-    }
-  }
+  // 注：这里**刻意不做**「探测未保存地址必须显式给 token」的换靶闸（P2-2 已收窄为只保 SMTP）。
+  // 这是「填好地址先点一下测试连接」的常规动作，逼着重填 token 会把它变得很难用。
+  // 残余风险与收口方向见 admin/settings/route.ts 里的说明。
 
   for (const url of urls) {
     try {

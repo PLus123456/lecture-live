@@ -60,7 +60,7 @@ function makeRequest(body: unknown): Request {
 
 const params = Promise.resolve({ id: 'p-1' });
 
-describe('PATCH /api/admin/llm-providers/[id] — 改端点必须重填密钥', () => {
+describe('PATCH /api/admin/llm-providers/[id] — 换靶闸范围：不设闸（只保 SMTP）', () => {
   beforeEach(() => {
     requireAdminAccessMock.mockReset();
     providerFindUniqueMock.mockReset();
@@ -80,22 +80,24 @@ describe('PATCH /api/admin/llm-providers/[id] — 改端点必须重填密钥', 
     modelFindManyMock.mockResolvedValue([]);
   });
 
-  it('只改 apiBase、apiKey 不传 → 400，且不落库（核心攻击形状）', async () => {
+  // ↓ 这条固化的是「换靶闸只保 SMTP」这个刻意的范围决定（见 admin/settings/route.ts 的说明）。
+  //   若有人把这道闸加回来，它会立刻转红 —— 那时应先回到范围决定本身重新讨论。
+  it('只改 apiBase、apiKey 不传 → 放行并落库（厂商 key 常常取不回来）', async () => {
     const res = await PATCH(
-      makeRequest({ apiBase: 'https://attacker.tld/v1' }),
+      makeRequest({ apiBase: 'https://llm2.corp.example/v1' }),
       { params }
     );
-    expect(res.status).toBe(400);
-    expect(providerUpdateMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(providerUpdateMock).toHaveBeenCalled();
   });
 
-  it('apiKey 传空串（= 保持原值）同样拦下', async () => {
+  it('apiKey 传空串（= 保持原值）同样放行', async () => {
     const res = await PATCH(
-      makeRequest({ apiBase: 'https://attacker.tld/v1', apiKey: '' }),
+      makeRequest({ apiBase: 'https://llm2.corp.example/v1', apiKey: '' }),
       { params }
     );
-    expect(res.status).toBe(400);
-    expect(providerUpdateMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(providerUpdateMock).toHaveBeenCalled();
   });
 
   it('改 apiBase 同时重填 apiKey → 放行，两者一起写入', async () => {

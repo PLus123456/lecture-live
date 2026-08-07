@@ -81,7 +81,7 @@ function makeRequest(body: unknown): Request {
   });
 }
 
-describe('PUT /api/admin/settings — 改端点必须重填凭据', () => {
+describe('PUT /api/admin/settings — 改端点必须重填凭据（范围：只保 SMTP）', () => {
   beforeEach(() => {
     requireAdminAccessMock.mockReset();
     siteSettingUpsertMock.mockReset();
@@ -174,28 +174,31 @@ describe('PUT /api/admin/settings — 改端点必须重填凭据', () => {
     expect(res.status).toBe(200);
   });
 
-  it('改 cloudreve_url + client_secret 填掩码 → 400（同款形状）', async () => {
+  // ↓ 以下两条固化的是「刻意只保 SMTP」这个范围决定（不是遗漏）。自建服务换机器/换 IP
+  //   是常规运维，逼着重填一把可能取不回来的密钥代价大于收益。若哪天有人把这两类又加回
+  //   那张 retargetGuards 表，这两条会立刻转红 —— 那时应当先回到这个范围决定本身重新讨论。
+  it('改 cloudreve_url + client_secret 填掩码 → 放行（换靶闸只保 SMTP）', async () => {
     const res = await PUT(
       makeRequest({
-        cloudreve_url: 'https://attacker.tld',
+        cloudreve_url: 'https://storage.example',
         cloudreve_client_id: 'client-1',
         cloudreve_client_secret: SETTING_SECRET_MASK,
       })
     );
-    expect(res.status).toBe(400);
-    expect(transactionMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(transactionMock).toHaveBeenCalled();
   });
 
-  it('增强 worker 地址加一台新主机 + token 填掩码 → 400', async () => {
+  it('增强 worker 地址加一台新主机 + token 填掩码 → 放行（同上）', async () => {
     const res = await PUT(
       makeRequest({
         audio_enhance_worker_url:
-          'https://w1.corp.example,https://w2.corp.example,https://attacker.tld',
+          'https://w1.corp.example,https://w2.corp.example,https://w3.corp.example',
         audio_enhance_worker_token: SETTING_SECRET_MASK,
       })
     );
-    expect(res.status).toBe(400);
-    expect(transactionMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(transactionMock).toHaveBeenCalled();
   });
 
   it('worker 地址仅分隔符/空白差异 → 视为没变，放行', async () => {

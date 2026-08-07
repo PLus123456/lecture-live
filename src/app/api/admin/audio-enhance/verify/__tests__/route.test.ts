@@ -48,7 +48,7 @@ function makeRequest(body: unknown): Request {
   });
 }
 
-describe('POST /api/admin/audio-enhance/verify — 改端点必须重填 token', () => {
+describe('POST /api/admin/audio-enhance/verify — 换靶闸范围：不设闸（只保 SMTP）', () => {
   beforeEach(() => {
     requireAdminAccessMock.mockReset();
     getSiteSettingsMock.mockReset();
@@ -66,32 +66,35 @@ describe('POST /api/admin/audio-enhance/verify — 改端点必须重填 token',
     });
   });
 
-  it('陌生地址 + token 填掩码 → 400，且一个探测请求都不发（核心攻击形状）', async () => {
+  // ↓ 以下三条固化的是「换靶闸只保 SMTP」这个刻意的范围决定（见 admin/settings/route.ts 的说明）。
+  //   「填好新地址先点一下测试连接」是常规动作，逼着同时重填 token 会把这个按钮变得很难用。
+  //   若有人把这道闸加回来，它们会立刻转红 —— 那时应先回到范围决定本身重新讨论。
+  it('未保存的地址 + token 填掩码 → 照常探测（沿用已存 token）', async () => {
     const res = await POST(
       makeRequest({
-        workerUrl: 'https://attacker.tld',
+        workerUrl: 'https://w9.corp.example',
         workerToken: SETTING_SECRET_MASK,
       })
     );
-    expect(res.status).toBe(400);
-    expect(pingEnhanceWorkerMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(pingEnhanceWorkerMock).toHaveBeenCalled();
   });
 
-  it('陌生地址 + token 整个不传 → 同样 400', async () => {
-    const res = await POST(makeRequest({ workerUrl: 'https://attacker.tld' }));
-    expect(res.status).toBe(400);
-    expect(pingEnhanceWorkerMock).not.toHaveBeenCalled();
+  it('未保存的地址 + token 整个不传 → 同样照常探测', async () => {
+    const res = await POST(makeRequest({ workerUrl: 'https://w9.corp.example' }));
+    expect(res.status).toBe(200);
+    expect(pingEnhanceWorkerMock).toHaveBeenCalled();
   });
 
-  it('已保存地址里混一个陌生地址 → 整笔拒绝，不逐台放行', async () => {
+  it('已保存地址里混一台新机器 → 整批照常探测', async () => {
     const res = await POST(
       makeRequest({
-        workerUrl: 'https://w1.corp.example,https://attacker.tld',
+        workerUrl: 'https://w1.corp.example,https://w9.corp.example',
         workerToken: '',
       })
     );
-    expect(res.status).toBe(400);
-    expect(pingEnhanceWorkerMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(pingEnhanceWorkerMock).toHaveBeenCalled();
   });
 
   it('陌生地址但本次显式给了 token → 放行，且用的是新 token', async () => {

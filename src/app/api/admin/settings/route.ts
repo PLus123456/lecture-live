@@ -310,6 +310,21 @@ export async function PUT(req: Request) {
         previousSettings.audio_enhance_worker_url
       ),
     };
+    // 「改端点必须重填凭据」**只对 SMTP 生效**，这是刻意收窄的范围，别再往这张表里加行。
+    //
+    // 保留 SMTP 的理由：邮件服务商地址几乎不会变（改它基本只有换靶一种解释），而 SMTP 口令
+    // 常常就是邮箱账号本身的密码、在别处复用，外带出去的破坏面最大。管理员真要改也一定知道
+    // 这个口令，重填成本≈0。
+    //
+    // 其余几类（Cloudreve / 音频增强 worker / 翻译 worker / LLM apiBase / Soniox）已放开：
+    // 那些地址通常是自建服务，机器 IP 一变就得改，却要求重填一把可能根本取不回来的密钥
+    //（LLM 厂商的 key 多数只在创建时显示一次），代价明显大于收益。
+    //
+    // 放开后接受的残余风险（明确记录，不要当成没有）：admin 会话一旦失陷（XSS / cookie 泄露 /
+    // 内部人），攻击者可以「改地址 + 密钥留空」让服务端把解密后的真实凭据主动投递到新地址
+    //（LLM 的 Authorization: Bearer、worker token 都是一次握手就送出去）。这条通道无法从
+    // GET 侧堵住——GET 一直是脱敏的，它绕的正是脱敏。真要收口，方向是给这类改动加一次
+    // 登录密码二次确认（盗号者不知道登录密码），而不是把重填密钥的负担压回管理员身上。
     const retargetGuards: Array<{
       secretKey: string;
       endpointKeys: string[];
@@ -321,18 +336,6 @@ export async function PUT(req: Request) {
         endpointKeys: ['smtp_host', 'smtp_port', 'smtp_user'],
         endpointLabel: 'SMTP 主机 / 端口 / 账号',
         secretLabel: 'SMTP 密码',
-      },
-      {
-        secretKey: 'cloudreve_client_secret',
-        endpointKeys: ['cloudreve_url', 'cloudreve_client_id'],
-        endpointLabel: 'Cloudreve 地址 / Client ID',
-        secretLabel: 'Client Secret',
-      },
-      {
-        secretKey: 'audio_enhance_worker_token',
-        endpointKeys: ['audio_enhance_worker_url'],
-        endpointLabel: '音频增强 worker 地址',
-        secretLabel: 'worker token',
       },
     ];
     for (const guard of retargetGuards) {

@@ -9,10 +9,6 @@ import {
 import { serializeProviderForAdmin } from '@/lib/llm/providerAdmin';
 import { logAction } from '@/lib/auditLog';
 import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
-import {
-  requiresSecretReentry,
-  retargetErrorMessage,
-} from '@/lib/credentialRetarget';
 
 // 更新 LLM 供应商
 export async function PATCH(
@@ -71,21 +67,10 @@ export async function PATCH(
       }
     }
 
-    // 改端点必须重填密钥（P2-2）：只改 apiBase、apiKey 留空 = 沿用已存密钥，
-    // 之后每一次 LLM 调用都会把解密后的真实 apiKey 以 Authorization 发到新地址。
-    // 上面的私网黑名单只挡内网，公网的攻击者地址照样过 —— 换靶这一层必须单独挡。
-    if (
-      requiresSecretReentry({
-        endpoint: [{ current: existing.apiBase, next: updateData.apiBase }],
-        hasStoredSecret: Boolean(existing.apiKey),
-        suppliedSecret: body.apiKey,
-      })
-    ) {
-      return NextResponse.json(
-        { error: retargetErrorMessage('API Base', 'API Key') },
-        { status: 400 }
-      );
-    }
+    // 注：这里**刻意不做**「改 apiBase 必须重填 apiKey」的换靶闸（P2-2 已收窄为只保 SMTP）。
+    // 多数厂商的 API Key 只在创建时显示一次，取不回来；为了改一个自建推理服务的地址就要求
+    // 重新签发 key，代价大于收益。残余风险与收口方向见 admin/settings/route.ts 里的说明。
+    // 上面的私网黑名单仍在（挡内网），但公网地址不拦。
 
     if (body.isAnthropic !== undefined) updateData.isAnthropic = body.isAnthropic;
     if (body.sortOrder !== undefined) updateData.sortOrder = body.sortOrder;

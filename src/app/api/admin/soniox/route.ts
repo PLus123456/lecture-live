@@ -13,10 +13,6 @@ import {
   validateSonioxRestUrl,
   validateSonioxWsUrl,
 } from '@/lib/sonioxUrlValidation';
-import {
-  requiresSecretReentry,
-  retargetErrorMessage,
-} from '@/lib/credentialRetarget';
 
 const VALID_REGIONS = ['us', 'eu', 'jp'] as const;
 
@@ -153,26 +149,10 @@ export async function PUT(req: Request) {
 
       const upper = region.toUpperCase();
 
-      // 改端点必须重填密钥（P2-2）：只改 wsUrl/restUrl、apiKey 留空 = 保留已存密钥，
-      // 下一次实时转录/异步转录就带着真密钥连到新地址（Soniox 密钥随握手直接送出）。
-      // apiKey 显式传空串是「删除密钥」，同事务里就没了，不存在可外带的凭据 → 放行。
-      if (config.apiKey !== '') {
-        if (
-          requiresSecretReentry({
-            endpoint: [
-              { current: existingByKey.get(`soniox_${upper}_ws_url`) ?? '', next: config.wsUrl },
-              { current: existingByKey.get(`soniox_${upper}_rest_url`) ?? '', next: config.restUrl },
-            ],
-            hasStoredSecret: Boolean(existingByKey.get(`soniox_${upper}_api_key`)),
-            suppliedSecret: config.apiKey,
-          })
-        ) {
-          return NextResponse.json(
-            { error: `${region} 区域：${retargetErrorMessage('接入地址', 'API Key')}` },
-            { status: 400 }
-          );
-        }
-      }
+      // 注：这里**刻意不做**「改 wsUrl/restUrl 必须重填 apiKey」的换靶闸
+      //（P2-2 已收窄为只保 SMTP）。自建代理/中转地址会变，不该每次都逼着重填密钥。
+      // 下面的 validateSonioxWsUrl / validateSonioxRestUrl 仍在挡内网地址。
+      // 残余风险与收口方向见 admin/settings/route.ts 里的说明。
 
       // API Key：非空则加密写入，空字符串 = 删除
       if (config.apiKey !== undefined) {

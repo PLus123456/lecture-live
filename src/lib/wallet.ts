@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import { Prisma, type UserRole } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { resolveRoleQuotas, resolveRoleStorageBytesLimit } from '@/lib/userRoles';
+import { settlePoolOnLimitChange } from '@/lib/quota';
 import { logSystemEvent } from '@/lib/auditLog';
 import type { PaymentProviderName } from '@/lib/payment/types';
 import { sendSubscriptionSuccessEmail } from '@/lib/email';
@@ -44,6 +45,10 @@ interface OrderMetadata {
   returnUrl?: string; // 支付完成后浏览器跳回
   subject?: string;
   grant?: GrantSnapshot; // purchase 订单：回调按此冻结快照发放
+  // purchase 订单的**发放闸**（L15）。PaymentOrder 无 granted 列（schema 冻结），故把标记落在
+  // metadata 里：tx2 内以「旧 metadataJson 原文」为 CAS 条件抢占它，抢到才发放。发放失败整段
+  // 回滚、标记一并撤销 → 网关重投时能再试一次（原先重投直接 return，用户付了钱永远拿不到权益）。
+  grantedAt?: string;
 }
 
 function parseMeta(json: string | null): OrderMetadata {
@@ -61,6 +66,20 @@ function generateOutTradeNo(): string {
 }
 
 const ORDER_TTL_MS = 30 * 60_000; // 未支付订单 30 分钟过期
+
+/** 归一化 ISO-4217 币种码（大写、去空白）；非法/空值回 ''，由调用方决定回落。 */
+function normalizeCurrency(v: string | null | undefined): string {
+  const s = (v ?? '').trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(s) ? s : '';
+}
+
+export const DEFAULT_ORDER_CURRENCY = 'CNY';
+
+/**
+ * 通知必带实付金额的渠道（L20）。这三家的异步通知协议都含金额字段，缺失只可能是解析出错或
+ * 伪造 —— 不能像 sandbox 那样「无金额就跳过对账」fail-open：那等于把 M1/M2 金额对账整条关掉。
+ */
+const AMOUNT_REQUIRED_PROVIDERS: PaymentProviderName[] = ['alipay', 'wechat', 'stripe'];
 
 export interface WalletSummary {
   walletBalanceCents: number;
@@ -91,6 +110,8 @@ export async function createPaymentOrder(input: {
   provider: PaymentProviderName;
   kind: 'topup' | 'purchase';
   amountCents: number;
+  /** ISO-4217 币种码；下单时冻结到订单行，回调按 (amount, currency) 二元组对账（P3-15）。 */
+  currency?: string;
   tierId?: string;
   creditCents?: number;
   returnUrl?: string;
@@ -114,6 +135,7 @@ export async function createPaymentOrder(input: {
       tierId: input.tierId ?? null,
       outTradeNo: generateOutTradeNo(),
       amountCents,
+      currency: normalizeCurrency(input.currency) || DEFAULT_ORDER_CURRENCY,
       status: 'pending',
       metadataJson: JSON.stringify(metadata),
       expiresAt: new Date(Date.now() + ORDER_TTL_MS),
@@ -128,6 +150,73 @@ export interface CreditResult {
   returnUrl?: string;
 }
 
+/** tx1 的拒绝原因（同时是审计事件名后缀）。null = 通过。 */
+type RejectReason =
+  | 'refunded'
+  | 'amount_mismatch'
+  | 'amount_missing'
+  | 'currency_mismatch'
+  | null;
+
+/** 已发放的判据：这两类台账带 orderId，一笔购买订单至多各一条。 */
+const GRANT_TX_TYPES = ['purchase_membership', 'purchase_minutes'];
+
+/**
+ * purchase 订单的发放段（tx2），至多执行一次：
+ *  1) 台账查重——老订单（本次改动之前发放的）没有 grantedAt 标记，靠 orderId 上的出账台账兜底，
+ *     否则重投会把它们再发一遍；
+ *  2) 以「旧 metadataJson 原文」为条件 CAS 抢占 grantedAt 标记，count=0 = 并发重投已抢走 → 放弃；
+ *  3) 发放。三步同事务：发放抛错则标记一并回滚，网关重投时能再试（L15）。
+ * 发放失败**绝不**回滚 tx1 的到账（钱留在钱包），仅记事件供人工补发/退款。
+ */
+async function settleGrantOnce(
+  order: {
+    id: string;
+    userId: string;
+    tierId: string | null;
+    outTradeNo: string;
+    metadataJson: string | null;
+  },
+  meta: OrderMetadata
+): Promise<boolean> {
+  if (meta.grantedAt) return true;
+  try {
+    await prisma.$transaction(async (tx) => {
+      const already = await tx.walletTransaction.findFirst({
+        where: { orderId: order.id, type: { in: GRANT_TX_TYPES } },
+        select: { id: true },
+      });
+      if (already) return;
+      const claim = await tx.paymentOrder.updateMany({
+        where: { id: order.id, metadataJson: order.metadataJson },
+        data: {
+          metadataJson: JSON.stringify({
+            ...meta,
+            grantedAt: new Date().toISOString(),
+          } satisfies OrderMetadata),
+        },
+      });
+      if (claim.count === 0) {
+        throw new WalletError('发放已被并发认领', 'bad_request');
+      }
+      const spec = meta.grant ?? (await resolveTierGrant(tx, order.tierId));
+      if (!spec) {
+        throw new WalletError('档位快照缺失且档位已不存在', 'tier_unavailable');
+      }
+      await applyGrantTx(tx, order.userId, spec, { orderId: order.id });
+    });
+    return true;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'unknown';
+    console.error(`购买发放失败，已到账余额保留（outTradeNo=${order.outTradeNo}）:`, err);
+    logSystemEvent(
+      'recharge.grant.failed',
+      `outTradeNo=${order.outTradeNo} userId=${order.userId} reason=${reason}`
+    );
+    return false;
+  }
+}
+
 /**
  * 幂等到账。分两段事务，确保「钱已落袋」与「档位发放」解耦：
  *  - tx1：条件认领 PaymentOrder（pending→paid 原子 CAS），认领成功才 walletBalanceCents += creditCents
@@ -140,7 +229,8 @@ export async function creditPaidOrder(
   outTradeNo: string,
   providerRef?: string,
   expectedProvider?: PaymentProviderName,
-  paidAmountCents?: number
+  paidAmountCents?: number,
+  paidCurrency?: string
 ): Promise<CreditResult> {
   // tx1：金额对账 → 认领 + 到账（钱先落袋，绝不因后续发放失败而回滚）。
   const claimed = await prisma.$transaction(async (tx) => {
@@ -150,19 +240,42 @@ export async function creditPaidOrder(
         order: null as null,
         meta: {} as OrderMetadata,
         claimedNow: false,
-        amountMismatch: false,
+        reject: null as RejectReason,
       };
     }
     const meta = parseMeta(order.metadataJson);
 
+    // 已退款 / 已拒付的订单绝不再到账（P3-16 的反向通知写 refundedAt）：晚到的重复支付通知
+    // 不能把一笔已经退回去的钱重新发一遍权益。
+    if (order.refundedAt) {
+      return { order, meta, claimedNow: false, reject: 'refunded' as RejectReason };
+    }
+
     // 金额对账（M1/M2）：网关回报的实付金额须等于订单金额，否则拒绝到账（不认领，订单留 pending）。
-    // 无金额的渠道（如 sandbox）paidAmountCents 为空 → 跳过。先读单不破坏幂等：认领仍以 status
-    // pending→paid 的原子 updateMany 为唯一锚点，并发重复回调只有一个 count=1。
+    // 先读单不破坏幂等：认领仍以 status pending→paid 的原子 updateMany 为唯一锚点，并发重复回调
+    // 只有一个 count=1。
+    const amountReported =
+      typeof paidAmountCents === 'number' && Number.isFinite(paidAmountCents);
+    if (amountReported && Math.round(paidAmountCents as number) !== order.amountCents) {
+      return { order, meta, claimedNow: false, reject: 'amount_mismatch' as RejectReason };
+    }
+    // L20：真实网关缺金额字段 = 解析出错或伪造，不能当成「无金额渠道」跳过对账。sandbox 天生
+    // 无金额，仍走跳过。
     if (
-      typeof paidAmountCents === 'number' &&
-      Math.round(paidAmountCents) !== order.amountCents
+      !amountReported &&
+      expectedProvider &&
+      AMOUNT_REQUIRED_PROVIDERS.includes(expectedProvider)
     ) {
-      return { order, meta, claimedNow: false, amountMismatch: true };
+      return { order, meta, claimedNow: false, reject: 'amount_missing' as RejectReason };
+    }
+    // 币种对账（P3-15）：只比金额挡不住跨币种套利——3900「美分」与 3900「分」在 amountCents 上
+    // 完全相等却相差约 7.1 倍。订单币种下单时冻结，回调回报的币种须与之一致（渠道给不出则跳过）。
+    const reportedCurrency = normalizeCurrency(paidCurrency);
+    if (
+      reportedCurrency &&
+      reportedCurrency !== (normalizeCurrency(order.currency) || DEFAULT_ORDER_CURRENCY)
+    ) {
+      return { order, meta, claimedNow: false, reject: 'currency_mismatch' as RejectReason };
     }
 
     const claim = await tx.paymentOrder.updateMany({
@@ -182,7 +295,7 @@ export async function creditPaidOrder(
 
     if (claim.count === 0) {
       // 未认领到：已被处理过（重复回调）或非 pending。幂等，不再到账。
-      return { order, meta, claimedNow: false, amountMismatch: false };
+      return { order, meta, claimedNow: false, reject: null as RejectReason };
     }
 
     // 认领成功 → 进账
@@ -202,18 +315,20 @@ export async function creditPaidOrder(
       },
     });
 
-    return { order, meta, claimedNow: true, amountMismatch: false };
+    return { order, meta, claimedNow: true, reject: null as RejectReason };
   });
 
   const { order, meta } = claimed;
   if (!order) {
     return { ok: false, alreadyProcessed: false };
   }
-  if (claimed.amountMismatch) {
-    // 金额不符：拒绝到账，记录供排障（可能是攻击/网关不一致）。订单保持 pending。
+  if (claimed.reject) {
+    // 对账不通过：拒绝到账，记录供排障（可能是攻击/网关不一致）。订单保持原状态。
     logSystemEvent(
-      'recharge.callback.amount_mismatch',
-      `outTradeNo=${outTradeNo} expected=${order.amountCents} paid=${paidAmountCents}`
+      `recharge.callback.${claimed.reject}`,
+      `outTradeNo=${outTradeNo} expected=${order.amountCents}${
+        normalizeCurrency(order.currency) || DEFAULT_ORDER_CURRENCY
+      } paid=${paidAmountCents}${normalizeCurrency(paidCurrency)} provider=${expectedProvider ?? '-'}`
     );
     return {
       ok: false,
@@ -223,6 +338,12 @@ export async function creditPaidOrder(
     };
   }
   if (!claimed.claimedNow) {
+    // L15：重投的回调也要补做**未完成的发放**——原先这里直接 return，首投发放失败后用户
+    // 付了钱却永远拿不到权益，只剩一条 recharge.grant.failed 等人工。发放闸保证不会重复发。
+    if (order.status === 'paid' && order.kind === 'purchase' && !meta.grantedAt) {
+      const lateGranted = await settleGrantOnce(order, meta);
+      if (lateGranted) void notifyOrderCredited(order.id).catch(() => undefined);
+    }
     return {
       ok: order.status === 'paid',
       alreadyProcessed: true,
@@ -232,27 +353,7 @@ export async function creditPaidOrder(
   }
 
   // tx2：purchase 订单按冻结快照发放（缺快照的旧订单回落读 live 档位）。发放失败不回滚到账。
-  let granted = true;
-  if (order.kind === 'purchase') {
-    try {
-      await prisma.$transaction(async (tx) => {
-        const spec = meta.grant ?? (await resolveTierGrant(tx, order.tierId));
-        if (!spec) {
-          throw new WalletError('档位快照缺失且档位已不存在', 'tier_unavailable');
-        }
-        await applyGrantTx(tx, order.userId, spec, { orderId: order.id });
-      });
-    } catch (err) {
-      // 已到账余额保留（钱不丢），仅记录以便人工补发/退款。网关据 tx1 成功照常收到 ACK、停止重试。
-      granted = false;
-      const reason = err instanceof Error ? err.message : 'unknown';
-      console.error(`购买发放失败，已到账余额保留（outTradeNo=${outTradeNo}）:`, err);
-      logSystemEvent(
-        'recharge.grant.failed',
-        `outTradeNo=${outTradeNo} userId=${order.userId} reason=${reason}`
-      );
-    }
-  }
+  const granted = order.kind === 'purchase' ? await settleGrantOnce(order, meta) : true;
 
   // 订阅/充值成功通知邮件（fire-and-forget，受用户「订阅」偏好与站点营销总开关约束）。
   //
@@ -295,9 +396,13 @@ async function notifyOrderCredited(orderId: string): Promise<void> {
       ? user.roleExpiresAt.toLocaleDateString('zh-CN')
       : null;
 
+  // 报**实际入账额**而非订单应付额（P3-13）：topup 档的 creditCents 与应付额可以不等（赠送），
+  // 也可能被误配成 0 —— 那时报应付额就等于发一封「已充值 ¥100」的假信，而钱包其实一分没进。
+  const creditedCents = Math.max(0, Math.round(meta.creditCents ?? order.amountCents));
+
   await sendSubscriptionSuccessEmail(user, {
     planName,
-    amountLabel: yuan(order.amountCents),
+    amountLabel: yuan(creditedCents),
     expiresLabel,
   });
 }
@@ -385,16 +490,37 @@ async function applyGrantTx(
   opts: { operatorId?: string; orderId?: string }
 ): Promise<void> {
   const priceCents = Math.max(0, Math.round(spec.priceCents));
-  const user = await tx.user.findUnique({
-    where: { id: userId },
-    select: {
-      walletBalanceCents: true,
-      role: true,
-      originalRole: true,
-      roleExpiresAt: true,
-    },
-  });
-  if (!user) throw new WalletError('用户不存在', 'user_not_found');
+  // P3-7：0 元的会员/时长档 = 提款机。下面的扣款守卫是 `walletBalanceCents >= 0`，对 0 元恒真
+  // 恒 count=1，任何人可无限次领永久分钟。档位管理口已挡（tiers 路由要求 >0），这里再挡一道：
+  // 冻结快照可能来自建管口收紧之前的 0 元档。
+  if (priceCents <= 0) {
+    throw new WalletError('档位价格无效（必须大于 0）', 'tier_unavailable');
+  }
+  // 锁读（P3-6）：会员发放对 roleExpiresAt / originalRole 是读-改-写，快照读在并发网关回调下
+  // 必然 lost update —— 两笔各扣一次钱、到期只延一期，且台账看起来完全正常。FOR UPDATE 让第二笔
+  // 排在第一笔提交之后再读（同 quota.ts / chatFileCleanup.ts 的锁读 idiom）。
+  // 顺带把 transcriptionMinutesLimit 一起读出来，供 P1-4 的池结算判断旧上限。
+  const rows = await tx.$queryRaw<
+    Array<{
+      walletBalanceCents: number;
+      role: UserRole;
+      originalRole: UserRole | null;
+      roleExpiresAt: Date | string | null;
+      transcriptionMinutesLimit: number;
+    }>
+  >`
+    SELECT walletBalanceCents, role, originalRole, roleExpiresAt, transcriptionMinutesLimit
+    FROM User WHERE id = ${userId} FOR UPDATE
+  `;
+  const row = rows?.[0];
+  if (!row) throw new WalletError('用户不存在', 'user_not_found');
+  const user = {
+    walletBalanceCents: Number(row.walletBalanceCents),
+    role: row.role,
+    originalRole: row.originalRole,
+    roleExpiresAt: row.roleExpiresAt ? new Date(row.roleExpiresAt) : null,
+    transcriptionMinutesLimit: Number(row.transcriptionMinutesLimit),
+  };
   if (spec.kind === 'membership' && user.role === 'ADMIN') {
     throw new WalletError('管理员无需购买会员', 'admin_no_membership');
   }
@@ -437,13 +563,22 @@ async function applyGrantTx(
     }
     const quotas = await resolveRoleQuotas(grantRole);
     const storageBytesLimit = await resolveRoleStorageBytesLimit(grantRole);
+    // P1-4：买会员会把月度上限改写成角色默认值，这相对**自定义组高限额**或 admin 单用户配额覆盖
+    // 可能是**下调**。不结算就改列，随后的月度重置会拿「旧周期已用 − 新上限」当欠账去扣永久池，
+    // 把用户刚花钱买到的分钟蒸发掉（真库实测 limit 5000/池 500/used 4000 → 买 PRO 后池归 0）。
+    // 必须与本次发放同事务：中途失败不能留下「上限已降、池未结算」的中间态。
+    const oldLimit = user.transcriptionMinutesLimit;
+    const newLimit = quotas.transcriptionMinutesLimit;
+    if (Number.isFinite(oldLimit) && Number.isFinite(newLimit) && newLimit < oldLimit) {
+      await settlePoolOnLimitChange(userId, oldLimit, newLimit, tx);
+    }
     await tx.user.update({
       where: { id: userId },
       data: {
         role: grantRole,
         originalRole,
         roleExpiresAt: newExpiry,
-        // 购买系统角色会员即脱离自定义组，按角色默认配额（升配不触发 Model A 池结算）。
+        // 购买系统角色会员即脱离自定义组，按角色默认配额（上调不触发 Model A 池结算，下调见上）。
         customGroupId: null,
         transcriptionMinutesLimit: quotas.transcriptionMinutesLimit,
         storageHoursLimit: quotas.storageHoursLimit,
@@ -503,7 +638,8 @@ async function spendOnTierTx(
 
 /**
  * 管理员手动调整：余额（amountCentsDelta，有符号）和/或永久时长池（minutesDelta，有符号）。
- * 记 admin_adjust 台账（operatorId=操作管理员）。余额不可调至负数（截 0）。
+ * 记 admin_adjust 台账（operatorId=操作管理员）。余额与时长池都不可调至负数（截 0）。
+ * 返回**实际生效**的增量，供路由记审计日志（P3-18：日志不能记请求值，否则与台账互相矛盾）。
  */
 export async function adminAdjust(input: {
   userId: string;
@@ -511,18 +647,27 @@ export async function adminAdjust(input: {
   minutesDelta?: number;
   note?: string;
   operatorId: string;
-}): Promise<void> {
+}): Promise<{ amountCentsDelta: number; minutesDelta: number }> {
   const amountDelta = Math.round(input.amountCentsDelta ?? 0);
   const minutesDelta = Math.round(input.minutesDelta ?? 0);
   if (amountDelta === 0 && minutesDelta === 0) {
     throw new WalletError('无调整内容', 'bad_request');
   }
-  await prisma.$transaction(async (tx) => {
-    const user = await tx.user.findUnique({
-      where: { id: input.userId },
-      select: { walletBalanceCents: true, purchasedMinutesBalance: true },
-    });
-    if (!user) throw new WalletError('用户不存在', 'user_not_found');
+  return prisma.$transaction(async (tx) => {
+    // 锁读：截断量按「我们真正写进去的那个值」算。快照读 + GREATEST 写会在并发调整下算出与实际
+    // 不符的 effective 值，台账随即失真。
+    const rows = await tx.$queryRaw<
+      Array<{ walletBalanceCents: number; purchasedMinutesBalance: number }>
+    >`
+      SELECT walletBalanceCents, purchasedMinutesBalance
+      FROM User WHERE id = ${input.userId} FOR UPDATE
+    `;
+    const locked = rows?.[0];
+    if (!locked) throw new WalletError('用户不存在', 'user_not_found');
+    const user = {
+      walletBalanceCents: Number(locked.walletBalanceCents),
+      purchasedMinutesBalance: Number(locked.purchasedMinutesBalance),
+    };
 
     // 余额不减到负数：实际增量按当前余额截断。
     const effectiveAmountDelta =
@@ -537,14 +682,12 @@ export async function adminAdjust(input: {
         : minutesDelta;
 
     const data: Prisma.UserUpdateInput = {};
-    if (effectiveAmountDelta !== 0) {
-      data.walletBalanceCents = { increment: effectiveAmountDelta };
+    // 正向两条都能用 increment；负向必须走 raw + GREATEST（见下）。
+    if (amountDelta > 0) {
+      data.walletBalanceCents = { increment: amountDelta };
     }
-    if (minutesDelta !== 0) {
-      // 池子不减到负数：用 GREATEST 护栏（raw），正向用 increment。
-      if (minutesDelta > 0) {
-        data.purchasedMinutesBalance = { increment: minutesDelta };
-      }
+    if (minutesDelta > 0) {
+      data.purchasedMinutesBalance = { increment: minutesDelta };
     }
     let balanceAfter = user.walletBalanceCents + effectiveAmountDelta;
     if (Object.keys(data).length > 0) {
@@ -554,6 +697,17 @@ export async function adminAdjust(input: {
         select: { walletBalanceCents: true },
       });
       balanceAfter = updated.walletBalanceCents;
+    }
+    // P3-17：负向余额调整此前是无护栏的 `increment: 负数`，与时长池那条防护不对称——快照与实际
+    // 余额之间只要有一次并发消费，余额就会被打成负数（负余额一旦落库，所有 `gte` 扣款守卫全部
+    // 失效，且门禁按「有钱」放行）。与时长池同款：raw + GREATEST 兜底。
+    if (amountDelta < 0) {
+      await tx.$executeRaw`
+        UPDATE User
+        SET walletBalanceCents = GREATEST(0, walletBalanceCents - ${-amountDelta})
+        WHERE id = ${input.userId}
+      `;
+      balanceAfter = Math.max(0, user.walletBalanceCents + amountDelta);
     }
     // 负向时长调整用 raw + GREATEST 防负。
     if (minutesDelta < 0) {
@@ -575,6 +729,7 @@ export async function adminAdjust(input: {
         note: input.note ?? null,
       },
     });
+    return { amountCentsDelta: effectiveAmountDelta, minutesDelta: effectiveMinutesDelta };
   });
 }
 

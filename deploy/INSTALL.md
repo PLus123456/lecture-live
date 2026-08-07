@@ -55,7 +55,12 @@ cd lecture-live
 sudo bash deploy/setup.sh
 ```
 
-这会自动安装 Node.js 24、MySQL 8、Redis、Nginx、FFmpeg。
+这会自动安装 Node.js 24、MySQL 8、Redis、Nginx、FFmpeg，并配置防火墙
+（ufw：放行 SSH / 80 / 443，拒绝 3000 / 3001 / 3306 / 6379）。
+
+> **SSH 端口非 22 的注意：** 脚本会从 `sshd -T` 读出真实端口再放行，读不到才退回 22。
+> 若你的 SSH 走的是非常规配置（例如只在 systemd socket 里指定端口），
+> 请先 `LECTURELIVE_SKIP_FIREWALL=1` 跳过，装完再手动配置防火墙，避免把自己关在门外。
 
 ### 4. 配置 MySQL
 
@@ -103,6 +108,10 @@ ENCRYPTION_KEY=<生成的另一个随机字符串>
 
 # 生产环境
 NODE_ENV=production
+
+# 可选：部署引导密钥。配了它，/api/setup 的匿名首次部署窗口就彻底关闭
+# （详见下方「首次部署窗口的安全性」）。不配也可以，见那一节的默认行为。
+# SETUP_BOOTSTRAP_TOKEN=<openssl rand -hex 32>
 ```
 
 > **注意：** `.env` 文件中值可以用引号包裹（`KEY="value"`），`node --env-file` 会正确解析。
@@ -154,6 +163,42 @@ sudo nginx -t && sudo systemctl reload nginx
 ### 10. 验证
 
 浏览器访问 `http://your-domain.com`，看到登录页面即部署成功。
+
+---
+
+## 首次部署窗口的安全性
+
+`/api/setup` 是**公开**端点（中间件不对它鉴权）——服务一起来到你建出第一个管理员之间，
+这条路径对全网开放。默认行为：
+
+| 状态 | 谁能调 `/api/setup` |
+|------|---------------------|
+| 库里还没有管理员 | 任何人（只能走 `step=admin`，且首个管理员的创建有唯一键 CAS，抢不出第二个） |
+| 已有管理员 | 必须是**已登录的 ADMIN**（向导在 `step=admin` 之后自动带上该 cookie） |
+| 设了 `SETUP_BOOTSTRAP_TOKEN` | 带 `x-setup-token: <该值>` 的请求，**或**已登录的 ADMIN |
+
+结论：**先建管理员，再对外放开 80/443**。做不到的话，就在 `.env` 里设
+`SETUP_BOOTSTRAP_TOKEN`，把匿名窗口彻底关掉，然后用 curl 走完向导：
+
+```bash
+TOKEN=$(grep '^SETUP_BOOTSTRAP_TOKEN=' /opt/lecturelive/.env | cut -d= -f2-)
+curl -sS -X POST http://127.0.0.1:3000/api/setup \
+  -H 'Content-Type: application/json' -H "x-setup-token: $TOKEN" \
+  -d '{"step":"admin","email":"admin@example.com","password":"你的密码","displayName":"Admin"}'
+```
+
+> 注意：设了 `SETUP_BOOTSTRAP_TOKEN` 之后，浏览器里的 `/setup` 向导在**还没有管理员**时
+> 会一直 401（页面不会带这个 header）。建好管理员并登录后，向导的后续步骤照常可用。
+
+`step=llm` / `step=soniox` 填写的地址会做私网黑名单校验（与管理后台同一套），
+`step=complete` 要求管理员已存在——避免匿名者抢先把实例标记为「已完成设置」而锁死。
+
+`setup_complete` 全仓只写 `true`、从不写回 `false`，误置位只能连数据库改回来：
+
+```sql
+-- sudo mysql lecturelive
+DELETE FROM SiteSetting WHERE `key` IN ('setup_complete', 'setup_admin_claimed');
+```
 
 ---
 
@@ -296,13 +341,37 @@ sudo systemctl restart lecturelive-web lecturelive-ws
 
 ## 端口说明
 
-| 端口 | 服务 | 说明 |
-|------|------|------|
-| 3000 | Next.js | Web 应用，仅监听 127.0.0.1 |
-| 3001 | Socket.IO | WebSocket 实时通信，仅监听 127.0.0.1 |
-| 80/443 | Nginx | 对外反代 |
+| 端口 | 服务 | 实际监听 | 对外暴露 |
+|------|------|----------|----------|
+| 3000 | Next.js | 127.0.0.1（由 `lecturelive-web.service` 的 `Environment=HOSTNAME=127.0.0.1` 强制） | 否 |
+| 3001 | Socket.IO | 127.0.0.1（由 `lecturelive-ws.service` 的 `Environment=WS_HOST=127.0.0.1` 强制） | 否 |
+| 3306 | MySQL | 取决于 `bind-address`，Ubuntu 默认 127.0.0.1 | 否 |
+| 6379 | Redis | 取决于 `bind`，Debian/Ubuntu 默认 127.0.0.1 | 否 |
+| 80/443 | Nginx | 全部网卡 | 是 |
 
-所有应用端口只监听 localhost，由 Nginx 统一对外暴露。
+> **务必确认防火墙已生效。** `setup.sh` 会安装并启用 ufw（放行 SSH / 80 / 443，
+> 显式拒绝 3000 / 3001 / 3306 / 6379）。3000 / 3001 现在都由 systemd 单元收敛到回环，
+> 防火墙是第二道闸：单元文件没更新（老版本部署）时，公网可直连 3000/3001，绕过
+> `nginx-lecturelive.conf` 里的 `client_max_body_size 100M`、超时以及后续在 nginx 层加的任何限流。
+>
+> Docker 部署不走这两个单元：`websocket.js` 默认监听 0.0.0.0（Docker 的端口转发连的是
+> 容器 IP，不是容器内的 loopback），安全边界由 `docker-compose.yml` 把端口只发布在
+> 宿主 `127.0.0.1` 上保证。
+>
+> 用云厂商安全组代替 ufw 时，可以用 `LECTURELIVE_SKIP_FIREWALL=1 sudo bash deploy/setup.sh`
+> 跳过这一段，但请在安全组里做等价的限制。
+
+检查当前监听情况：
+
+```bash
+sudo ss -tlnp | grep -E ':(3000|3001|3306|6379)\b'
+sudo ufw status verbose
+```
+
+`3000` 与 `3001` 两行都应显示 `127.0.0.1:<端口>`。若显示 `0.0.0.0:` 或 `*:`，
+说明 systemd 单元里的 `Environment=HOSTNAME=127.0.0.1`（web）/ `Environment=WS_HOST=127.0.0.1`（ws）
+没生效（多为老版本单元文件），重新执行 `sudo bash deploy/install.sh` 覆盖单元后
+`systemctl daemon-reload && systemctl restart lecturelive-web lecturelive-ws`。
 
 ---
 

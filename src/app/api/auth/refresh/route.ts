@@ -62,9 +62,12 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: 'User not found' }, { status: 404 });
   }
 
-  // 签发新 token（滑动过期 + 绝对过期：保留初始会话起点）
+  // 签发新 token（滑动过期 + 绝对过期：保留初始会话起点）。
+  // U51：把 exp / cookieMaxAge 一并钳到剩余绝对寿命——会话起点不变，滑动窗不能超过它。
   const siteSettings = await getSiteSettings().catch(() => null);
-  const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry);
+  const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry, {
+    sessionStartedAt: session.token.sessionStartedAt,
+  });
   const newToken = signToken(user, {
     sessionStartedAt: session.token.sessionStartedAt,
     expiresInDays: jwtConfig.expiresInDays,
@@ -135,7 +138,11 @@ async function handleRefreshGrace(req: Request): Promise<NextResponse> {
   }
 
   const siteSettings = await getSiteSettings().catch(() => null);
-  const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry);
+  // 宽限路径同样按该会话的起点钳 cookieMaxAge：graceToken 的 exp 由首个请求签出（已钳），
+  // 这里若发一个更长的 maxAge，cookie 会比 token 活得久，回到「看着有效实则登出」。
+  const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry, {
+    sessionStartedAt: graceSession.token.sessionStartedAt,
+  });
 
   // 幂等：不再 rotate，也不吊销——把已 rotate 出的同一个新 token 原样再发，
   // 让并发/丢包的 Tab 收敛到与首个请求相同的 cookie（全局仍只有一个有效 token）。

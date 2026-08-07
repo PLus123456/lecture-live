@@ -100,11 +100,42 @@ export async function DELETE(
   }
 
   // QUOTED / COMPLETED / FAILED / CANCELED：物理删除
+  //
+  // L22：删行前必须先把欠着的退款结清。TranslationTask 行是这笔待退款的唯一记录
+  //（refundedAt / chargedCents 都在行上），行一删，兜底对账再也找不到它，钱就永久留在
+  // 系统里 —— 而 FAILED/CANCELED 恰恰是「退款曾经失败、refundedAt 被还原成 null」
+  // 最常落脚的两个状态。
+  // COMPLETED 是正常消费不退；QUOTED 尚未扣费（chargedCents=0），refundTaskCharge 自会跳过。
+  if (task.status === 'FAILED' || task.status === 'CANCELED') {
+    await refundTaskCharge(task.id, '删除任务前补退款');
+  }
+
   const deleted = await prisma.translationTask.deleteMany({
-    where: { id: task.id, status: { in: ['QUOTED', 'COMPLETED', 'FAILED', 'CANCELED'] } },
+    where: {
+      id: task.id,
+      status: { in: ['QUOTED', 'COMPLETED', 'FAILED', 'CANCELED'] },
+      // 仍欠退款的行不许删（上面的补退款也失败了）——留给兜底对账继续看得见
+      OR: [
+        { chargedCents: { lte: 0 } },
+        { refundedAt: { not: null } },
+        { status: 'COMPLETED' },
+      ],
+    },
   });
   if (deleted.count > 0) {
     await deleteTaskFiles(task.id).catch(() => undefined);
+    return NextResponse.json({ ok: true, canceled: false });
+  }
+
+  const stillThere = await prisma.translationTask.findUnique({
+    where: { id: task.id },
+    select: { refundedAt: true, chargedCents: true },
+  });
+  if (stillThere && stillThere.chargedCents > 0 && stillThere.refundedAt === null) {
+    return NextResponse.json(
+      { error: '退款尚未完成，请稍后重试删除', code: 'refund_pending' },
+      { status: 409 }
+    );
   }
   return NextResponse.json({ ok: true, canceled: false });
 }

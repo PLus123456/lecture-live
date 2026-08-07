@@ -42,6 +42,12 @@ function buildContentSecurityPolicy() {
   addOriginVariants(connectSrc, process.env.NEXT_PUBLIC_APP_URL);
   addOriginVariants(connectSrc, process.env.NEXT_PUBLIC_WS_URL);
 
+  // Y15/L9 未完成的一半：script-src 仍带 'unsafe-inline'，没有 nonce。
+  // 上 nonce 必须由 middleware 逐请求签发（Next 只认 middleware 设的 CSP 里的 nonce），
+  // 而当前 middleware 的 matcher 只覆盖 /api/* 与 /session/*/view —— 要给 HTML 文档发
+  // nonce 就得把 middleware 扩到全站页面路由，那是另一档风险（每个页面请求都过一遍
+  // middleware，且 hasTraversalAttempt 会对页面路径返回 JSON 400）。故此处保持现状，
+  // 留作独立改动。
   const scriptSrc = ["'self'", "'unsafe-inline'"];
   if (!isProduction) {
     scriptSrc.push("'unsafe-eval'");
@@ -73,8 +79,25 @@ function buildContentSecurityPolicy() {
 
 const securityHeaders = [
   {
+    // Y15/L9：显式声明本站真正用到的强权限，并把其余的关死。
+    // - microphone / display-capture：录音与系统音频采集（audioCapture.ts 的
+    //   getUserMedia / getDisplayMedia）确实需要，所以是 (self) 而不是 ()。
+    //   ⚠️ 原始工单写的是 `display-capture=()`——那会直接打死「系统音频」录制源，不能照抄。
+    // - 不写等于沿用浏览器默认（同样是 self），写出来的收益是：跨源 iframe 一律拿不到，
+    //   而且以后谁想开新权限得先改这一行。
     key: 'Permissions-Policy',
-    value: 'picture-in-picture=(self), camera=(), geolocation=(), payment=()',
+    value: [
+      'picture-in-picture=(self)',
+      'microphone=(self)',
+      'display-capture=(self)',
+      'camera=()',
+      'geolocation=()',
+      'payment=()',
+      'usb=()',
+      'serial=()',
+      'midi=()',
+      'interest-cohort=()',
+    ].join(', '),
   },
   {
     key: 'Content-Security-Policy',

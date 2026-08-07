@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { enforceRateLimit } from '@/lib/rateLimit';
 import {
   deductTranscriptionMinutes,
   recordInterpretUsage,
@@ -12,6 +13,7 @@ import { getBillableMinutes } from '@/lib/billing';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger } from '@/lib/logger';
 import {
+  MAX_INTERPRET_DURATION_MS,
   consumeInterpretAnchor,
   resolveBillableInterpretMs,
 } from '@/lib/interpret/anchor';
@@ -37,6 +39,18 @@ export async function POST(req: Request) {
   const payload = await verifyAuth(req);
   if (!payload) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  // P6-7：按用户限流（口径对齐 temporary-key 的 12/min）。诚实客户端每场只调一次；这里是
+  // 「结算锚点 + 释放整场 mint 预扣」的写入点，脚本刷 start→mint→deduct 循环时它是闸门之一。
+  const rateLimited = await enforceRateLimit(req, {
+    scope: 'interpret:deduct:user',
+    limit: 12,
+    windowMs: 60_000,
+    key: `user:${payload.id}`,
+  });
+  if (rateLimited) {
+    return rateLimited;
   }
 
   const body = (await req.json()) as {
@@ -87,7 +101,6 @@ export async function POST(req: Request) {
     );
   }
 
-  const billableMinutes = getBillableMinutes(effectiveMs);
   const anchorIdForClaim =
     typeof body.anchorId === 'string' ? body.anchorId : null;
 
@@ -98,7 +111,11 @@ export async function POST(req: Request) {
   //  - no_record 且**降级(无 anchorId)**：无法可靠匹配本场、cron 可能已兜底 → 跳过扣费，避免
   //    「cron 已扣 + 这里再扣」双扣（审查 R4）。锚点存在时的 no_record（会话早于部署/边缘）仍正常扣费兜底。
   //  - claimed / no_record(有 anchorId)：正常扣费；claimed 情形回填 billedMinutes（审计）。
-  let result: { charged: boolean; snapshot: Awaited<ReturnType<typeof deductTranscriptionMinutes>> };
+  let result: {
+    charged: boolean;
+    billableMinutes: number;
+    snapshot: Awaited<ReturnType<typeof deductTranscriptionMinutes>>;
+  };
   try {
     result = await prisma.$transaction(async (tx) => {
       const claim = await claimInterpretSessionForDeduct(
@@ -114,20 +131,33 @@ export async function POST(req: Request) {
       // 同事务——预扣是占位，净效果=billableMinutes（billable=0 的空场也要释放，不留悬挂预扣）。
       // already_settled 时 cron 已连锚点带 grants 一并结算；no_record 无锚点行、grants 无键可循，
       // 留给 usage cron 孤儿兜底。
+      let settledActualMs = 0;
       if (claim.outcome === 'claimed' && claim.sessionId) {
-        await settleStreamGrants(
+        const settled = await settleStreamGrants(
           { interpretSessionId: claim.sessionId },
           'interpret_deduct',
           tx
         );
+        settledActualMs = Math.max(0, settled.actualMsTotal);
       }
+
+      // P3-8：降级路径（不带 anchorId）由 claimInterpretSessionForDeduct 按 {userId, settledAt:null}
+      // + startedAt asc **盲认领最旧**未结算锚点，上面这一步随即释放该场**全部** mint 预扣 ——
+      // `{durationMs:1}` 就能把串了 N 小时的场一分钟结掉。这里用被结算 grants 的 Soniox 实测量做
+      // 下限：它是本路径下唯一不可伪造的服务端口径。实测尚未回填时收益仍归零 —— 迟到的 usage-log
+      // 会经 usageReconciliation 的差额补扣补上（P1-2，同一机制）。
+      const chargeMs = Math.min(
+        anchored ? effectiveMs : Math.max(effectiveMs, settledActualMs),
+        MAX_INTERPRET_DURATION_MS
+      );
+      const billableMinutes = getBillableMinutes(chargeMs);
 
       const skip =
         claim.outcome === 'already_settled' ||
         (claim.outcome === 'no_record' && anchorIdForClaim === null) ||
         billableMinutes <= 0;
       if (skip) {
-        return { charged: false, snapshot: null };
+        return { charged: false, billableMinutes: 0, snapshot: null };
       }
 
       const snapshot = await deductTranscriptionMinutes(
@@ -142,7 +172,7 @@ export async function POST(req: Request) {
       // ADMIN 恒不扣费（snapshot.role==='ADMIN' 即 deduct 短路未 increment），不记台账。
       // 台账与扣费同事务：口径 billedMinutes 与实扣一字一致，供对账计入 expected。
       if (snapshot.role !== 'ADMIN') {
-        await recordInterpretUsage(payload.id, billableMinutes, effectiveMs, tx);
+        await recordInterpretUsage(payload.id, billableMinutes, chargeMs, tx);
       }
       if (claim.sessionId) {
         await tx.interpretSession.update({
@@ -150,7 +180,7 @@ export async function POST(req: Request) {
           data: { billedMinutes: billableMinutes },
         });
       }
-      return { charged: true, snapshot };
+      return { charged: true, billableMinutes, snapshot };
     });
   } catch (err) {
     interpretLogger.error(
@@ -168,5 +198,8 @@ export async function POST(req: Request) {
     const snap = await getQuotaSnapshot(payload.id);
     return NextResponse.json({ quotas: snap, deducted: 0 });
   }
-  return NextResponse.json({ quotas: result.snapshot, deducted: billableMinutes });
+  return NextResponse.json({
+    quotas: result.snapshot,
+    deducted: result.billableMinutes,
+  });
 }

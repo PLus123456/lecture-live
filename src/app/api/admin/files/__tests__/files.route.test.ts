@@ -15,6 +15,10 @@ const {
   invalidateFoldersApiCacheMock,
   invalidateShareLinksApiCacheMock,
   cancelAsyncUploadMock,
+  settleAsyncReservationMock,
+  settleFullReservationMock,
+  deleteSessionArtifactsMock,
+  deleteRecordingDraftMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   sessionFindManyMock: vi.fn(),
@@ -29,6 +33,10 @@ const {
   invalidateFoldersApiCacheMock: vi.fn(),
   invalidateShareLinksApiCacheMock: vi.fn(),
   cancelAsyncUploadMock: vi.fn(),
+  settleAsyncReservationMock: vi.fn(),
+  settleFullReservationMock: vi.fn(),
+  deleteSessionArtifactsMock: vi.fn(),
+  deleteRecordingDraftMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({
@@ -47,13 +55,22 @@ vi.mock('@/lib/apiResponseCache', () => ({
 
 vi.mock('@/lib/quota', () => ({
   releaseStorageBytes: releaseStorageBytesMock,
-  // B1/R4：批量删会话前用 settleAsyncReservation / settleFullReservation 原子结算在途预留。桩为 no-op。
-  settleAsyncReservation: vi.fn().mockResolvedValue(0),
-  settleFullReservation: vi.fn().mockResolvedValue(0),
+  // B1/R4：批量删会话前用 settleAsyncReservation / settleFullReservation 原子结算在途预留。
+  // P5-8：结算失败必须跳过该会话不删，故桩要能 reject。
+  settleAsyncReservation: settleAsyncReservationMock,
+  settleFullReservation: settleFullReservationMock,
 }));
 
 vi.mock('@/lib/audio/asyncUploadProcessor', () => ({
   cancelAsyncUpload: cancelAsyncUploadMock,
+}));
+
+// L4：admin 删录音也要物理删产物 + 录音草稿目录（对齐用户侧 DELETE）。
+vi.mock('@/lib/sessionPersistence', () => ({
+  deleteSessionArtifacts: deleteSessionArtifactsMock,
+}));
+vi.mock('@/lib/recordingDraftPersistence', () => ({
+  deleteRecordingDraft: deleteRecordingDraftMock,
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -96,6 +113,10 @@ beforeEach(() => {
     .mockImplementation(async (operations: unknown[]) => Promise.all(operations));
   releaseStorageBytesMock.mockReset().mockResolvedValue(null);
   cancelAsyncUploadMock.mockReset().mockResolvedValue(undefined);
+  settleAsyncReservationMock.mockReset().mockResolvedValue(0);
+  settleFullReservationMock.mockReset().mockResolvedValue(0);
+  deleteSessionArtifactsMock.mockReset().mockResolvedValue(undefined);
+  deleteRecordingDraftMock.mockReset().mockResolvedValue(undefined);
   logActionMock.mockReset();
   invalidateSessionsApiCacheMock.mockReset().mockResolvedValue(undefined);
   invalidateFoldersApiCacheMock.mockReset().mockResolvedValue(undefined);
@@ -179,6 +200,65 @@ describe('DELETE /api/admin/files — 释放附件字节', () => {
 
     expect(res.status).toBe(200);
     expect(releaseStorageBytesMock).not.toHaveBeenCalled();
+  });
+
+  it('L4：删行前物理删除会话产物 + 录音草稿目录（对齐用户侧，否则 Cloudreve 文件永久孤儿）', async () => {
+    sessionFindManyMock.mockResolvedValue([
+      { id: 's1', userId: 'u1', title: 'A', recordingPath: 'recordings/s1.mp3' },
+      { id: 's2', userId: 'u2', title: 'B', recordingPath: null },
+    ]);
+
+    const res = await DELETE(deleteReq(['s1', 's2']));
+
+    expect(res.status).toBe(200);
+    // select 必须带各产物引用列，否则 deleteSessionArtifacts 拿不到路径、删不掉任何东西。
+    const selectArg = sessionFindManyMock.mock.calls[0][0].select;
+    expect(selectArg).toMatchObject({
+      recordingPath: true,
+      enhancedAudioPath: true,
+      transcriptPath: true,
+      summaryPath: true,
+      reportPath: true,
+      fullTranscriptPath: true,
+    });
+    expect(deleteSessionArtifactsMock).toHaveBeenCalledTimes(2);
+    expect(deleteRecordingDraftMock).toHaveBeenCalledTimes(2);
+    // 必须发生在删行之前（行一删便再无 path→owner 关联）。
+    expect(deleteSessionArtifactsMock.mock.invocationCallOrder[0]).toBeLessThan(
+      transactionMock.mock.invocationCallOrder[0]
+    );
+  });
+
+  it('P5-8：某会话结算失败 → 跳过它不删，其余照常删（不再吞掉失败照删造孤儿预留）', async () => {
+    sessionFindManyMock.mockResolvedValue([
+      { id: 's1', userId: 'u1', title: 'A' },
+      { id: 's2', userId: 'u2', title: 'B' },
+    ]);
+    // s1 结算失败，s2 正常。
+    settleAsyncReservationMock.mockRejectedValueOnce(new Error('db down'));
+
+    const res = await DELETE(deleteReq(['s1', 's2']));
+
+    expect(res.status).toBe(200);
+    await expect(readJson<{ deleted: number; skipped?: number }>(res)).resolves.toEqual({
+      deleted: 1,
+      skipped: 1,
+    });
+    // 删除范围只含结算成功的 s2；s1 的行保留（预留还挂在它上面，重试即可结算）。
+    expect(sessionDeleteManyMock).toHaveBeenCalledWith({ where: { id: { in: ['s2'] } } });
+    // s1 的产物也不能删（行还在，用户仍能访问）。
+    expect(deleteSessionArtifactsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('P5-8：全部结算失败 → 500，一行都不删', async () => {
+    sessionFindManyMock.mockResolvedValue([{ id: 's1', userId: 'u1', title: 'A' }]);
+    settleFullReservationMock.mockRejectedValue(new Error('db down'));
+
+    const res = await DELETE(deleteReq(['s1']));
+
+    expect(res.status).toBe(500);
+    expect(transactionMock).not.toHaveBeenCalled();
+    expect(sessionDeleteManyMock).not.toHaveBeenCalled();
   });
 
   it('某用户聚合字节为 0/null 时跳过该用户的 release', async () => {

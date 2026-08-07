@@ -82,9 +82,11 @@ beforeEach(() => {
   getSiteSettingsMock.mockResolvedValue({ async_upload_billing_multiplier: 0.8 });
   deductMock.mockResolvedValue(undefined);
   settleFullMock.mockResolvedValue(0);
-  // $transaction 桩：立即执行回调并传入哑 tx（{}）。
+  // P5-7：终态 CAS 现在在计费事务**内部**执行 → 注入的 tx 必须带 session.updateMany，且复用同一个
+  // sessionUpdateManyMock，使「claim(1) → 终态守卫(2) → 清 Soniox ID(3)」的调用序与断言保持不变。
   transactionMock.mockImplementation(
-    async (run: (tx: unknown) => Promise<unknown>) => run({})
+    async (run: (tx: unknown) => Promise<unknown>) =>
+      run({ session: { updateMany: sessionUpdateManyMock } })
   );
   // P1-17：delete 帮助函数返回「是否确认删除」，默认确认成功。
   deleteFileMock.mockResolvedValue(true);
@@ -106,7 +108,9 @@ describe('finalizeFullTranscription', () => {
 
     // 扣费恰好一次，口径 = ceil(getBillableMinutes(125000)=3 × 0.8=2.4 → ceil 3)。R4：在事务内带 tx 调用。
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('user-1', 3, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('user-1', 3, expect.anything(), {
+      sessionId: 'sess-full',
+    });
     // R4：把入口预留「转」为实扣——finalize 里恰好结算一次该会话的完整版预留（同一事务内、带 tx）。
     expect(settleFullMock).toHaveBeenCalledTimes(1);
     expect(settleFullMock).toHaveBeenCalledWith('sess-full', expect.anything());
@@ -199,9 +203,48 @@ describe('finalizeFullTranscription', () => {
     expect(b.outcome).toBe('claim_lost');
     // 两路径共扣费恰好一次（幂等由两道原子 claim 保证）；R4：在事务内带 tx 调用。
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('user-1', 3, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('user-1', 3, expect.anything(), {
+      sessionId: 'sess-full',
+    });
     // 且预留只结算一次（对应扣费恰一次）。
     expect(settleFullMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('P5-7：终态 CAS 与扣费在同一事务内（CAS 不再先于事务单独提交）', async () => {
+    sessionUpdateManyMock.mockResolvedValue({ count: 1 });
+
+    await finalizeFullTranscription(session as never, sonioxConfig);
+
+    expect(transactionMock).toHaveBeenCalledTimes(1);
+    // 事务开启早于终态守卫的 updateMany（第 2 次）→ 守卫在事务内；旧实现是守卫先提交、事务后开。
+    expect(transactionMock.mock.invocationCallOrder[0]).toBeLessThan(
+      sessionUpdateManyMock.mock.invocationCallOrder[1]
+    );
+  });
+
+  it('P5-7：计费事务失败 → 不留「已 completed 却净扣 0」，回退 transcribing 交下轮重试', async () => {
+    sessionUpdateManyMock.mockResolvedValue({ count: 1 });
+    // 事务整体失败（最现实的是与触发路由构成的 InnoDB 死锁 / 事务超时）
+    transactionMock.mockRejectedValueOnce(
+      Object.assign(new Error('Deadlock found when trying to get lock'), { code: 'P2034' })
+    );
+
+    const result = await finalizeFullTranscription(session as never, sonioxConfig);
+
+    // 旧实现：终态已单独提交 + 计费异常被吞 → outcome 'completed'、净扣 0，且 allowClaimFrom 永不含
+    // 'completed'，再无复扣路径（完整版还会因此把「重跑 N 次」全部变成免费）。
+    expect(result.outcome).toBe('claim_lost');
+    expect(deductMock).not.toHaveBeenCalled();
+    expect(settleFullMock).not.toHaveBeenCalled();
+    // 回退 finalizing → transcribing（带守卫；事务其实已提交时匹配 0 行、绝不回退终态）
+    const revert = sessionUpdateManyMock.mock.calls.at(-1)?.[0];
+    expect(revert).toEqual({
+      where: { id: 'sess-full', fullTranscribeStatus: 'finalizing' },
+      data: { fullTranscribeStatus: 'transcribing' },
+    });
+    // 转录留着重收尾 —— 绝不能删 Soniox 资源。
+    expect(deleteTranscriptionMock).not.toHaveBeenCalled();
+    expect(deleteFileMock).not.toHaveBeenCalled();
   });
 
   it('无 fullSonioxTranscriptionId：直接 claim_lost，不动任何东西', async () => {

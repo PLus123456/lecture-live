@@ -39,6 +39,10 @@ export function hashToken(rawToken: string): string {
 /**
  * 为用户签发一枚指定类型的令牌：先作废该用户同类型所有未消费令牌（一次只留一枚有效，
  * 重发即失效旧链接），再落库新令牌哈希，返回 raw token。
+ *
+ * C57/P6-12：两条语句必须同事务。分开自动提交时，并发签发会交错成
+ * 「作废A → 作废B → 建A → 建B」，两条重置链接同时有效，「一次只留一枚」的口径破功。
+ * forgot-password 路由刻意不 await（`void`），竞态很容易命中。
  */
 export async function createEmailToken(params: {
   userId: string;
@@ -51,20 +55,22 @@ export async function createEmailToken(params: {
   const now = Date.now();
   const expiresAt = new Date(now + EMAIL_TOKEN_TTL_MS[type]);
 
-  // 作废旧的未消费令牌（幂等；不删除以保留审计轨迹）。
-  await prisma.emailToken.updateMany({
-    where: { userId, type, consumedAt: null },
-    data: { consumedAt: new Date(now) },
-  });
+  await prisma.$transaction(async (tx) => {
+    // 作废旧的未消费令牌（幂等；不删除以保留审计轨迹）。
+    await tx.emailToken.updateMany({
+      where: { userId, type, consumedAt: null },
+      data: { consumedAt: new Date(now) },
+    });
 
-  await prisma.emailToken.create({
-    data: {
-      userId,
-      type,
-      tokenHash,
-      expiresAt,
-      requestIp: requestIp ?? null,
-    },
+    await tx.emailToken.create({
+      data: {
+        userId,
+        type,
+        tokenHash,
+        expiresAt,
+        requestIp: requestIp ?? null,
+      },
+    });
   });
 
   return { rawToken, expiresAt };

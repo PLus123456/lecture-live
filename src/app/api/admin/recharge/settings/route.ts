@@ -6,6 +6,7 @@ import {
   getRechargeSettings,
   updateRechargeSettings,
   serializeRechargeSettingsForAdmin,
+  RechargeSettingsError,
   type RechargeSettings,
 } from '@/lib/payment/settings';
 
@@ -32,7 +33,17 @@ export const PUT = withRequestLogging('admin:recharge:settings:update', async (r
     return NextResponse.json({ error: '请求体无效' }, { status: 400 });
   }
 
-  await updateRechargeSettings(body);
+  // P3-10/P3-4：校验类失败（布尔字段收到非布尔、Stripe 密钥与 webhook secret 模式不一致、
+  // 非法币种码等）由 updateRechargeSettings 整批前置校验后抛出，且**一个字段不合法就整批不写**。
+  // 不映射成 400 的话这些会以 500 冒出来 —— 行为仍是 fail-closed，但管理员看不出是自己填错了。
+  try {
+    await updateRechargeSettings(body);
+  } catch (err) {
+    if (err instanceof RechargeSettingsError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
+    throw err;
+  }
   logAction(req, 'admin.recharge.settings.update', {
     user: admin ?? undefined,
     detail: `更新充值配置: ${Object.keys(body).join(', ')}`,

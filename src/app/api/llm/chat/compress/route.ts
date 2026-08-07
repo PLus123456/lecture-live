@@ -81,11 +81,19 @@ export async function POST(req: Request) {
     );
   }
   // 压缩仅对挂录音的 legacy 对话有意义（需 session.targetLang 决定摘要语言）；
-  // 纯 global 对话暂不支持，保持原 404 行为（本批不扩张 compress 范围）。
+  // 纯 global 对话暂不支持（本批不扩张 compress 范围）。
+  //
+  // L3：这里原本复用 404 'Conversation not found'，但对话明明存在且归本人所有——
+  // 前端只能显示「压缩失败 (HTTP 404)」，用户会以为对话被删了，而真实原因是"不支持"。
+  // 改回 409 + 可读 message（与下面 endedAt 同口径），前端 compressActive 会直接展示 message。
   if (!conversation.session) {
     return NextResponse.json(
-      { error: 'Conversation not found' },
-      { status: 404 }
+      {
+        compressed: false,
+        error: 'compression_unsupported',
+        message: '该对话未关联录音，暂不支持主动压缩。上下文吃紧时请新建对话继续。',
+      },
+      { status: 409 }
     );
   }
   if (conversation.endedAt) {

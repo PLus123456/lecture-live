@@ -168,8 +168,11 @@ export async function POST(req: Request) {
   // 锚点时一并结算其 grants。客户端带了 /start 返回的 anchorId 时精确关联（多标签页并发同传时
   // 「复用最近活锚点」的启发式会挂错场，anchorId 消除歧义）；没带或查不到（伪造/DB 曾建行失败）
   // 退回 ensure 启发式。补建失败（DB 抖动）不阻塞：grant 无锚点关联，孤儿交给 usage cron。
+  // P1-1：mint 任何失败都作废这条锚点，**不再区分它是本次补建的还是 /start 建的**。旧实现只作废
+  // `created===true` 的，于是「/start 落锚点 → Soniox 配错/不可达 → mint 全挂」时锚点原地悬挂，
+  // cron 7h 后按墙钟给诚实用户扣满 6h。作废是安全的：这条流一个 key 都没拿到、不可能串流；同锚点
+  // 早前已成功 mint 的 grants 不受影响（settledAt 仍为空，usage cron 按实测转实扣，钱不会丢）。
   let interpretSessionId: string | null = null;
-  let interpretAnchorCreated = false;
   if (kind === 'interpret') {
     const bodyAnchorId =
       typeof body.anchorId === 'string' ? body.anchorId.trim().slice(0, 64) : '';
@@ -186,7 +189,6 @@ export async function POST(req: Request) {
     if (!interpretSessionId) {
       const ensured = await ensureActiveInterpretSession(user.id);
       interpretSessionId = ensured.id;
-      interpretAnchorCreated = ensured.created;
     }
   }
 
@@ -203,14 +205,14 @@ export async function POST(req: Request) {
     });
   } catch (error) {
     console.error('Stream grant reservation error:', error);
-    if (interpretAnchorCreated && interpretSessionId) {
+    if (interpretSessionId) {
       await settleInterpretSessionAsVoid(interpretSessionId, 'mint_failed');
     }
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
   if (!grant.ok) {
-    // 本次新建的空锚点一并作废，防 cron 7h 后按墙钟对「从未串流的锚点」误扣。
-    if (interpretAnchorCreated && interpretSessionId) {
+    // 锚点一并作废：这条流拿不到 key、不可能串流，留着只会被 cron 7h 后误扣。
+    if (interpretSessionId) {
       await settleInterpretSessionAsVoid(interpretSessionId, 'mint_failed');
     }
     if (grant.reason === 'quota_exhausted') {
@@ -249,7 +251,7 @@ export async function POST(req: Request) {
       // 签发失败 = 客户端拿不到 key、不可能串流：立即退预扣（settledBy=mint_failed），
       // 空锚点一并作废。回滚失败不阻塞（usage cron 查无用量会 usage_refund 兜底退）。
       await rollbackStreamGrant(grant.grantId);
-      if (interpretAnchorCreated && interpretSessionId) {
+      if (interpretSessionId) {
         await settleInterpretSessionAsVoid(interpretSessionId, 'mint_failed');
       }
       return NextResponse.json(
@@ -275,7 +277,7 @@ export async function POST(req: Request) {
   } catch (error) {
     console.error('Temporary key error:', error);
     await rollbackStreamGrant(grant.grantId);
-    if (interpretAnchorCreated && interpretSessionId) {
+    if (interpretSessionId) {
       await settleInterpretSessionAsVoid(interpretSessionId, 'mint_failed');
     }
     return NextResponse.json(

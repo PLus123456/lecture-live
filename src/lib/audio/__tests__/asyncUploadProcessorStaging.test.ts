@@ -52,7 +52,18 @@ vi.mock('@/lib/prisma', () => ({
       findUnique: sessionFindUniqueMock,
       updateMany: sessionUpdateManyMock,
     },
+    // P1-3：发布录音产物后有一次「按实测时长回补预留」的事务（见 topUpAsyncReservation）。
+    // 桩：执行回调并注入 tx（$queryRaw 返回入口预留列，session.update 记回补量）。
+    $transaction: (cb: (tx: unknown) => Promise<unknown>) =>
+      cb({
+        $queryRaw: () => Promise.resolve([{ asyncReservedMinutes: 999 }]),
+        session: { update: vi.fn(() => Promise.resolve(undefined)) },
+      }),
   },
+}));
+vi.mock('@/lib/quota', () => ({
+  reserveTranscriptionMinutes: vi.fn(() => Promise.resolve(true)),
+  settleAsyncReservation: vi.fn(() => Promise.resolve(0)),
 }));
 vi.mock('@/lib/apiResponseCache', () => ({ invalidateSessionsApiCache: vi.fn() }));
 vi.mock('@/lib/logger', () => ({

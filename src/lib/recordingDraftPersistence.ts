@@ -33,7 +33,28 @@ interface StoredManifestMetadata {
   // P1-6：维护式近似计数（见上）。缺失（旧版 manifest）时由写入路径一次性扫盘播种。
   chunkCount?: number;
   maxSeq?: number;
+  // P4-1：已落盘字节总数，供总量闸使用。与 chunkCount 同为维护式计数，缺失时扫盘播种。
+  totalBytes?: number;
 }
+
+// P4-1：单会话草稿字节总量上限。
+// 上界依据：webm/opus 默认约 128kbps ⇒ 512MiB ≈ 9.3 小时录音，而 PRO 单场上限 4h（≈230MB）、
+// FREE 2h，合法录音有 2-4× 余量绝不会触顶；旧代码只有「50000 片 × 2MiB = 97.65GiB/会话」的
+// 片数闸，等于没有闸（磁盘先被打爆，finalize 再把主进程 OOM 掉）。
+// 同一常量也守着 merge 的整份分配（见 mergeContiguousChunksSequential）——两处必须同值，
+// 否则「写得进去却合并不出来」= 用户录音永久卡死。
+// 允许用 RECORDING_DRAFT_MAX_TOTAL_BYTES 下调（小盘部署 / 测试）。
+const DEFAULT_MAX_DRAFT_TOTAL_BYTES = 512 * 1024 * 1024;
+
+function resolveMaxDraftTotalBytes(): number {
+  const raw = Number.parseInt(
+    process.env.RECORDING_DRAFT_MAX_TOTAL_BYTES ?? '',
+    10
+  );
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_DRAFT_TOTAL_BYTES;
+}
+
+export const MAX_DRAFT_TOTAL_BYTES = resolveMaxDraftTotalBytes();
 
 /** P0-4：草稿清单摘要，供客户端冷启动/续录前协商起始 seq（nextSeq = 服务端 maxSeq+1）。 */
 export interface RecordingDraftManifestSummary {
@@ -62,6 +83,20 @@ export class RecordingDraftSealedError extends Error {
   constructor() {
     super('Recording draft is sealed; no further chunks accepted');
     this.name = 'RecordingDraftSealedError';
+  }
+}
+
+/** P4-1：草稿总字节数触顶（写入侧）或合并结果超上限（收尾侧），路由据此返回 413。 */
+export class RecordingDraftTooLargeError extends Error {
+  totalBytes: number;
+  limitBytes: number;
+  constructor(totalBytes: number) {
+    super(
+      `Recording draft exceeds ${MAX_DRAFT_TOTAL_BYTES} bytes (would be ${totalBytes})`
+    );
+    this.name = 'RecordingDraftTooLargeError';
+    this.totalBytes = totalBytes;
+    this.limitBytes = MAX_DRAFT_TOTAL_BYTES;
   }
 }
 
@@ -127,6 +162,30 @@ async function scanChunkSeqsOnDisk(
   }
 }
 
+/**
+ * P4-1：扫盘播种维护式计数（片数 / maxSeq / 总字节）。仅在 manifest 缺计数字段时走一次
+ * （旧版 manifest / 服务重启后遇既有草稿），此后由写入路径按增量维护，热路径零 readdir。
+ */
+async function scanChunkStatsOnDisk(
+  session: DraftSessionSource
+): Promise<{ count: number; maxSeq: number; totalBytes: number }> {
+  const seqs = await scanChunkSeqsOnDisk(session);
+  let totalBytes = 0;
+  for (const seq of seqs) {
+    try {
+      const stat = await fs.stat(getChunkFilePath(session, seq));
+      totalBytes += stat.size;
+    } catch {
+      // 分片刚被并发删掉：忽略，计数偏小只会让闸门更宽松，不会误伤合法录音。
+    }
+  }
+  return {
+    count: seqs.length,
+    maxSeq: seqs.length > 0 ? seqs[seqs.length - 1] : -1,
+    totalBytes,
+  };
+}
+
 async function readStoredManifestMetadata(
   session: DraftSessionSource
 ): Promise<StoredManifestMetadata | null> {
@@ -156,10 +215,73 @@ async function readStoredManifestMetadata(
       ...(typeof parsed.sealedAt === 'number' ? { sealedAt: parsed.sealedAt } : {}),
       ...(typeof parsed.chunkCount === 'number' ? { chunkCount: parsed.chunkCount } : {}),
       ...(typeof parsed.maxSeq === 'number' ? { maxSeq: parsed.maxSeq } : {}),
+      ...(typeof parsed.totalBytes === 'number' ? { totalBytes: parsed.totalBytes } : {}),
     };
   } catch {
     return null;
   }
+}
+
+// P7-5：manifest 的 read-modify-write 必须按会话串行。
+// 旧代码「读快照 → 判 sealedAt → 用**陈旧快照**重推 sealedAt → 全量覆盖写回」，落在读与写之间的
+// seal 会被整份抹掉：cron auto-reclaim 正 seal 一个 stale 会话，而无辜客户端此刻仍在增量补传 →
+// seal 被抹 → merge 快照之后到达的分片继续落盘 → deleteRecordingDraft 连锅端 → 用户丢录音尾巴。
+// 注意 PR#225 的 tmp+rename **治不了这条**：原子写解决的是文件撕裂（lost update 与之正交），
+// 反而让被抹掉 sealedAt 的 manifest 成为一份完整合法的文件，更难察觉。
+// 这里用「按会话排队的单写者」把 读→改→写 关进临界区（同进程内 cron 与 HTTP 路由共用本模块）。
+const manifestWriteLocks = new Map<string, Promise<void>>();
+
+async function withManifestLock<T>(
+  session: DraftSessionSource,
+  fn: () => Promise<T>
+): Promise<T> {
+  const key = normalizeSessionId(session.id);
+  const prev = manifestWriteLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  // 前一个写者失败也必须放行队列，否则一次异常会把该会话的写入永久卡死。
+  const chain = prev.then(
+    () => current,
+    () => current
+  );
+  manifestWriteLocks.set(key, chain);
+
+  await prev.catch(() => undefined);
+  try {
+    return await fn();
+  } finally {
+    release();
+    // 队尾仍是自己 ⇒ 无人排在后面，清掉避免 Map 随会话数无限增长。
+    if (manifestWriteLocks.get(key) === chain) {
+      manifestWriteLocks.delete(key);
+    }
+  }
+}
+
+/**
+ * P7-5：临界区内的原子 read-modify-write —— mutator 拿到的一定是**当前**磁盘状态，
+ * 返回 null 表示放弃写入。所有会改 manifest 的路径都必须走这里，不许在锁外读快照再回写。
+ */
+async function updateStoredManifestMetadata<T>(
+  session: DraftSessionSource,
+  mutator: (
+    current: StoredManifestMetadata | null
+  ) => Promise<{ metadata: StoredManifestMetadata; result: T } | null> | {
+    metadata: StoredManifestMetadata;
+    result: T;
+  } | null
+): Promise<T | null> {
+  return withManifestLock(session, async () => {
+    const current = await readStoredManifestMetadata(session);
+    const next = await mutator(current);
+    if (!next) {
+      return null;
+    }
+    await writeStoredManifestMetadata(session, next.metadata);
+    return next.result;
+  });
 }
 
 // 原子写 manifest：先写同目录唯一临时文件，再 rename 覆盖目标（同分区 rename 是原子操作，
@@ -230,16 +352,20 @@ export async function sealRecordingDraft(
   session: DraftSessionSource
 ): Promise<RecordingDraftManifestSummary> {
   const now = Date.now();
-  const existing = await readStoredManifestMetadata(session);
-  const metadata: StoredManifestMetadata = {
-    sessionId: session.id,
-    userId: session.userId,
-    mimeType: existing?.mimeType ?? 'audio/webm',
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
-    sealedAt: existing?.sealedAt ?? now,
-  };
-  await writeStoredManifestMetadata(session, metadata);
+  // P7-5：在锁内读当前 manifest 再写，且**保留**已维护的计数字段——旧实现整份重建元数据，
+  // 把 chunkCount/maxSeq/totalBytes 一并抹掉，seal 之后的写入路径又得扫盘重新播种。
+  await updateStoredManifestMetadata(session, (existing) => ({
+    metadata: {
+      ...(existing ?? {}),
+      sessionId: session.id,
+      userId: session.userId,
+      mimeType: existing?.mimeType ?? 'audio/webm',
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      sealedAt: existing?.sealedAt ?? now,
+    },
+    result: true,
+  }));
   return getRecordingDraftManifestSummary(session);
 }
 
@@ -250,13 +376,14 @@ export async function sealRecordingDraft(
 export async function unsealRecordingDraft(
   session: DraftSessionSource
 ): Promise<void> {
-  const existing = await readStoredManifestMetadata(session);
-  if (!existing || !existing.sealedAt) {
-    return;
-  }
-  const { sealedAt: _sealedAt, ...rest } = existing;
-  void _sealedAt;
-  await writeStoredManifestMetadata(session, { ...rest, updatedAt: Date.now() });
+  await updateStoredManifestMetadata(session, (existing) => {
+    if (!existing || !existing.sealedAt) {
+      return null;
+    }
+    const { sealedAt: _sealedAt, ...rest } = existing;
+    void _sealedAt;
+    return { metadata: { ...rest, updatedAt: Date.now() }, result: true };
+  });
 }
 
 export async function listRecordingDraftSeqs(
@@ -279,65 +406,109 @@ export async function persistRecordingDraftChunk(
 ): Promise<{ idempotent: boolean; chunkCount: number; maxSeq: number }> {
   await ensureDraftDir(session);
 
-  const existing = await readStoredManifestMetadata(session);
+  // P7-5：整段「读 manifest → 判 seal → 写分片 → 回写 manifest」都在同一把会话锁内。
+  // 锁外读快照的旧写法有两个洞：① 回写会抹掉期间落地的 sealedAt（seal 栅栏永久失效）；
+  // ② seal 落在「判 seal」与「写分片」之间时，分片仍会落盘，随后被 deleteRecordingDraft 一起删。
+  const result = await withManifestLock(session, async () => {
+    const existing = await readStoredManifestMetadata(session);
 
-  // P1-7：已封存的草稿拒绝任何新分片（收尾 seal 之后到达的迟到写）。
-  if (existing?.sealedAt) {
-    throw new RecordingDraftSealedError();
-  }
-
-  // P1-6：热路径 O(1) 计数——正常情况下直接沿用 manifest 里维护的 chunkCount/maxSeq；仅当元数据
-  // 缺该计数（旧版 manifest / 服务重启后遇既有草稿）时一次性扫盘播种，此后按增量维护，杜绝旧实现
-  // 每写一片都 readdir+sort 全目录的 O(n²)。
-  let baseCount: number;
-  let baseMaxSeq: number;
-  if (
-    typeof existing?.chunkCount === 'number' &&
-    typeof existing?.maxSeq === 'number'
-  ) {
-    baseCount = existing.chunkCount;
-    baseMaxSeq = existing.maxSeq;
-  } else {
-    const seedSeqs = await scanChunkSeqsOnDisk(session);
-    baseCount = seedSeqs.length;
-    baseMaxSeq = seedSeqs.length > 0 ? seedSeqs[seedSeqs.length - 1] : -1;
-  }
-
-  // P0-4：append-only —— 按 (sessionId, seq) 键写盘，目标 seq 已存在时绝不覆盖：
-  // 内容(长度+字节)完全一致 → 幂等成功（网络重试）；不一致 → 冲突 409。旧代码无条件
-  // writeFile 覆盖，导致冷设备续录从 seq 0 重传时把服务端已有录音开头覆盖损坏（审计 P0-4）。
-  const chunkPath = getChunkFilePath(session, options.seq);
-  const priorChunk = await readChunkIfExists(chunkPath);
-  let idempotent = false;
-  if (priorChunk) {
-    if (priorChunk.length === options.data.length && priorChunk.equals(options.data)) {
-      idempotent = true;
-    } else {
-      throw new RecordingDraftChunkConflictError(options.seq);
+    // P1-7：已封存的草稿拒绝任何新分片（收尾 seal 之后到达的迟到写）。
+    if (existing?.sealedAt) {
+      throw new RecordingDraftSealedError();
     }
-  } else {
-    await fs.writeFile(chunkPath, options.data);
+
+    // P1-6：热路径 O(1) 计数——正常情况下直接沿用 manifest 里维护的 chunkCount/maxSeq；仅当元数据
+    // 缺该计数（旧版 manifest / 服务重启后遇既有草稿）时一次性扫盘播种，此后按增量维护，杜绝旧实现
+    // 每写一片都 readdir+sort 全目录的 O(n²)。
+    let baseCount: number;
+    let baseMaxSeq: number;
+    let baseBytes: number;
+    if (
+      typeof existing?.chunkCount === 'number' &&
+      typeof existing?.maxSeq === 'number' &&
+      typeof existing?.totalBytes === 'number'
+    ) {
+      baseCount = existing.chunkCount;
+      baseMaxSeq = existing.maxSeq;
+      baseBytes = existing.totalBytes;
+    } else {
+      const seeded = await scanChunkStatsOnDisk(session);
+      baseCount = seeded.count;
+      baseMaxSeq = seeded.maxSeq;
+      baseBytes = seeded.totalBytes;
+    }
+
+    // P0-4：append-only —— 按 (sessionId, seq) 键写盘，目标 seq 已存在时绝不覆盖：
+    // 内容(长度+字节)完全一致 → 幂等成功（网络重试）；不一致 → 冲突 409。旧代码无条件
+    // writeFile 覆盖，导致冷设备续录从 seq 0 重传时把服务端已有录音开头覆盖损坏（审计 P0-4）。
+    const chunkPath = getChunkFilePath(session, options.seq);
+    const priorChunk = await readChunkIfExists(chunkPath);
+    let idempotent = false;
+    if (priorChunk) {
+      if (priorChunk.length === options.data.length && priorChunk.equals(options.data)) {
+        idempotent = true;
+      } else {
+        throw new RecordingDraftChunkConflictError(options.seq);
+      }
+    } else {
+      // P4-1：总量闸必须在**落盘之前**判 —— 片数闸（50000×2MiB≈97.65GiB）等于没闸。
+      const projectedBytes = baseBytes + options.data.length;
+      if (projectedBytes > MAX_DRAFT_TOTAL_BYTES) {
+        throw new RecordingDraftTooLargeError(projectedBytes);
+      }
+      await fs.writeFile(chunkPath, options.data);
+    }
+
+    // 新写入的分片才递增计数；幂等重传（seq 已在盘）不重复计。
+    const chunkCount = idempotent ? baseCount : baseCount + 1;
+    const maxSeq = idempotent ? baseMaxSeq : Math.max(baseMaxSeq, options.seq);
+    const totalBytes = idempotent ? baseBytes : baseBytes + options.data.length;
+
+    const now = Date.now();
+    const metadata: StoredManifestMetadata = {
+      sessionId: session.id,
+      userId: session.userId,
+      mimeType: options.mimeType || existing?.mimeType || 'audio/webm',
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      ...(existing?.sealedAt ? { sealedAt: existing.sealedAt } : {}),
+      chunkCount,
+      maxSeq,
+      totalBytes,
+    };
+
+    await writeStoredManifestMetadata(session, metadata);
+
+    return { idempotent, chunkCount, maxSeq };
+  });
+
+  return result;
+}
+
+/**
+ * P4-1：O(1) 读草稿用量（只读 manifest，不扫盘）。供路由在写入前做存储配额准入判定——
+ * 旧代码只在 `seq === 0` 查配额，而 seq 不要求连续，从 seq=1 起传即完全跳过唯一的闸。
+ * `exists=false` 表示这是本会话的第一片（不论 seq 是几），路由据此无条件查配额。
+ */
+export async function getRecordingDraftUsage(
+  session: DraftSessionSource
+): Promise<{ exists: boolean; chunkCount: number; totalBytes: number }> {
+  const metadata = await readStoredManifestMetadata(session);
+  if (!metadata) {
+    return { exists: false, chunkCount: 0, totalBytes: 0 };
   }
-
-  // 新写入的分片才递增计数；幂等重传（seq 已在盘）不重复计。
-  const chunkCount = idempotent ? baseCount : baseCount + 1;
-  const maxSeq = idempotent ? baseMaxSeq : Math.max(baseMaxSeq, options.seq);
-
-  const now = Date.now();
-  const metadata: StoredManifestMetadata = {
-    sessionId: session.id,
-    userId: session.userId,
-    mimeType: options.mimeType || existing?.mimeType || 'audio/webm',
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
-    ...(existing?.sealedAt ? { sealedAt: existing.sealedAt } : {}),
-    chunkCount,
-    maxSeq,
-  };
-
-  await writeStoredManifestMetadata(session, metadata);
-
-  return { idempotent, chunkCount, maxSeq };
+  if (
+    typeof metadata.chunkCount === 'number' &&
+    typeof metadata.totalBytes === 'number'
+  ) {
+    return {
+      exists: true,
+      chunkCount: metadata.chunkCount,
+      totalBytes: metadata.totalBytes,
+    };
+  }
+  const stats = await scanChunkStatsOnDisk(session);
+  return { exists: true, chunkCount: stats.count, totalBytes: stats.totalBytes };
 }
 
 export async function mergeRecordingDraftChunks(
@@ -409,6 +580,13 @@ async function mergeContiguousChunksSequential(
     total += stat.size;
   }
 
+  // P4-1：整份分配前先判总量。收尾链在 merge 之后还要经 normalizeRecordedAudioDuration 的
+  // 数份整份拷贝，2GB 容器上几百 MB 的草稿就够把主进程 OOM 掉——宁可 413 让草稿留在盘上
+  // 等人工/重试处理，也不能把整个进程带走（草稿不删，数据可恢复）。
+  if (total > MAX_DRAFT_TOTAL_BYTES) {
+    throw new RecordingDraftTooLargeError(total);
+  }
+
   const merged = Buffer.allocUnsafe(total);
   let offset = 0;
   for (let i = 0; i < paths.length; i += 1) {
@@ -427,4 +605,67 @@ export async function deleteRecordingDraft(
   session: DraftSessionSource
 ): Promise<void> {
   await fs.rm(getDraftDir(session), { recursive: true, force: true });
+}
+
+/** P4-1：草稿目录清扫的默认年龄阈值（48h）。远大于任何一次合法录音 + 补传窗口。 */
+export const DEFAULT_DRAFT_SWEEP_MAX_AGE_MS = 48 * 60 * 60_000;
+
+/**
+ * P4-1：清扫过期的录音草稿目录。
+ * 全仓此前**没有任何东西**碰 data/recording-drafts：billingMaintenance 的 reclaim 只覆盖
+ * RECORDING/PAUSED/FINALIZING，`CREATED` 会话永不回收 —— 只要不进 RECORDING 就能一直往草稿目录
+ * 里灌字节且永久驻留。这里按 manifest.updatedAt（读不到则退回目录 mtime）删掉超龄草稿。
+ * 只删「久未写入」的目录：正在录/正在补传的草稿每片都会刷新 updatedAt，绝不会被误删。
+ */
+export async function sweepStaleRecordingDrafts(options?: {
+  maxAgeMs?: number;
+  now?: number;
+}): Promise<{ scanned: number; removed: number }> {
+  const maxAgeMs = options?.maxAgeMs ?? DEFAULT_DRAFT_SWEEP_MAX_AGE_MS;
+  const now = options?.now ?? Date.now();
+
+  let entries: string[];
+  try {
+    entries = await fs.readdir(DRAFTS_ROOT);
+  } catch {
+    return { scanned: 0, removed: 0 };
+  }
+
+  let scanned = 0;
+  let removed = 0;
+  for (const entry of entries) {
+    const dir = path.join(DRAFTS_ROOT, entry);
+    let lastTouched: number | null = null;
+    try {
+      const stat = await fs.stat(dir);
+      if (!stat.isDirectory()) continue;
+      lastTouched = stat.mtimeMs;
+    } catch {
+      continue;
+    }
+    scanned += 1;
+
+    try {
+      const raw = await fs.readFile(path.join(dir, 'manifest.json'), 'utf-8');
+      const parsed = JSON.parse(raw) as { updatedAt?: unknown };
+      if (typeof parsed.updatedAt === 'number') {
+        // manifest 与目录 mtime 取较新者：manifest 损坏/陈旧时不至于误删仍在写的草稿。
+        lastTouched = Math.max(lastTouched, parsed.updatedAt);
+      }
+    } catch {
+      // 无 manifest / 解析失败：退回目录 mtime。
+    }
+
+    if (now - lastTouched < maxAgeMs) {
+      continue;
+    }
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // 单个目录删除失败不阻断整轮清扫。
+    }
+  }
+
+  return { scanned, removed };
 }

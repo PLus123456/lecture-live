@@ -82,11 +82,29 @@ export function buildFoldersApiCacheKey(userId: string): string {
   return `folders:user:${userId}:list`;
 }
 
+// P4-4：进入会话列表缓存签名的参数白名单 —— 必须与 sessions/route.ts GET 里真正影响 SQL 的
+// 参数**逐一对应**。旧实现把全部查询串纳入签名，而 SQL 只看这四个：任意垃圾参数
+// （?x=1、?x=2…）都换一个新键、必然 miss、还各自驻留 30 秒，等于一条「一请求一驻留」的
+// 缓存基数爆炸原语（约 400 字节请求 → 数百 KB 驻留，10³-10⁴ 倍放大）。
+const SESSIONS_CACHE_KEY_PARAMS = [
+  'unarchived',
+  'folderId',
+  'limit',
+  'cursor',
+] as const;
+
 export function buildSessionsApiCacheKey(
   userId: string,
   searchParams: URLSearchParams
 ): string {
-  return `sessions:user:${userId}:list:${buildSearchParamsSignature(searchParams)}`;
+  const filtered = new URLSearchParams();
+  for (const name of SESSIONS_CACHE_KEY_PARAMS) {
+    const value = searchParams.get(name);
+    if (value !== null) {
+      filtered.set(name, value);
+    }
+  }
+  return `sessions:user:${userId}:list:${buildSearchParamsSignature(filtered)}`;
 }
 
 export function buildShareLinksApiCacheKey(userId: string): string {

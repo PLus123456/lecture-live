@@ -44,6 +44,11 @@ const CLOUDREVE_API_TIMEOUT_MS = 30_000;
  */
 const CLOUDREVE_TRANSFER_TIMEOUT_MS = 10 * 60_000;
 
+// 必须与 src/lib/siteSettings.ts 的 SETTING_SECRET_MASK 保持一致。
+// 刻意在此复制而非 import：多处单测把整个 siteSettings 模块 mock 成只有 getSiteSettings，
+// 引用缺失的具名导出会在 getConfigFromDb 的 try 里抛错被吞掉 → 静默变成「未配置」。
+const CLOUDREVE_SECRET_MASK = '********';
+
 export type StorageCategory = (typeof STORAGE_CATEGORIES)[number];
 
 /** 与 Session 列一一对应的存储类别；chat-uploads 走独立 chat 模块管理。 */
@@ -112,6 +117,16 @@ async function getConfigFromDb(): Promise<CloudreveOAuthConfig | null> {
     const baseUrl = settings.cloudreve_url?.trim();
     const clientId = settings.cloudreve_client_id?.trim();
     const clientSecret = settings.cloudreve_client_secret?.trim();
+
+    // P2-2：脱敏占位绝不能当凭据用。写入侧本应把 '********' 当「保持原值」跳过，一旦哪天回归
+    // （或凭据由别的路径落库），把占位串当 client_secret 发出去只会得到一次静默失败的 OAuth，
+    // 更糟的是它会在日志/抓包里冒充一个真实凭据。这里 fail-closed：视为未配置。
+    if (clientSecret === CLOUDREVE_SECRET_MASK) {
+      cloudreveLogger.error(
+        'Cloudreve client_secret 落库成了脱敏占位，视为未配置（请重新填写真实密钥）'
+      );
+      return null;
+    }
 
     if (
       settings.storage_mode === 'cloudreve' &&
@@ -340,6 +355,118 @@ export function validateCloudreveBaseUrl(value: string): string {
 
   parsed.pathname = parsed.pathname.replace(/\/+$/, '');
   return parsed.toString().replace(/\/$/, '');
+}
+
+/**
+ * P6-9：对**provider 返回的** URL（下载直链 / 分片上传预签名 URL）套用与 baseUrl 同一套主机校验。
+ * 旧代码对这些 URL 零校验：管理员配了恶意地址、或 Cloudreve 本身失陷时，服务端会照单去 fetch，
+ * 而 storage/download 路由把 upstream.body 直接回流给请求者 —— 等于一条读内网的管道。
+ * ⚠️ 前置条件是「管理员配恶意地址 / Cloudreve 失陷」，不是用户可触发的 SSRF，故定位为纵深防御。
+ */
+export function assertSafeProviderUrl(value: string, label: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`Cloudreve ${label} 不是合法 URL`);
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error(`Cloudreve ${label} 必须是 HTTP/HTTPS`);
+  }
+
+  const usesPrivateHost =
+    Boolean(parsed.username) ||
+    Boolean(parsed.password) ||
+    parsed.hostname === 'localhost' ||
+    parsed.hostname.endsWith('.local') ||
+    parsed.hostname.endsWith('.internal') ||
+    isPrivateIpHost(parsed.hostname);
+
+  if (usesPrivateHost && !allowPrivateCloudreveHost()) {
+    throw new Error(`Cloudreve ${label} 指向私网/本地地址，已拒绝`);
+  }
+
+  return parsed;
+}
+
+/** P6-9：provider 返回的 URL 是否与配置的 baseUrl 同源 —— 只有同源才允许附带 access_token。 */
+function isSameCloudreveOrigin(url: string, baseUrl: string): boolean {
+  try {
+    return new URL(url).origin === new URL(baseUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
+/** 逐跳重定向的上限：正常部署最多一跳（应用 → 存储节点），留 3 跳容错。 */
+const CLOUDREVE_MAX_REDIRECTS = 3;
+
+/**
+ * P6-9：手动逐跳跟随重定向，**每一跳都重跑一次主机校验**。
+ *
+ * 直接 `redirect:'manual'` 然后把 3xx 当失败是不行的 —— Cloudreve 的正常形态就是应用节点 302
+ * 到存储节点（从机模式 / S3 直链），一刀切会把好好的部署打死；而 `redirect:'follow'` 又让
+ * 校验形同虚设（校验过的主机可以 302 到任意内网地址）。所以两者都不取：自己跟，跟之前先校验。
+ *
+ * 跳转后不携带原请求的 Authorization —— 302 的目标按定义已不是我们认证过的那一方。
+ */
+async function fetchFollowingValidatedRedirects(
+  url: string,
+  init: RequestInit & { headers?: Record<string, string> }
+): Promise<Response> {
+  let currentUrl = url;
+  let currentInit = init;
+
+  for (let hop = 0; hop <= CLOUDREVE_MAX_REDIRECTS; hop += 1) {
+    const response = await fetch(currentUrl, {
+      ...currentInit,
+      redirect: 'manual',
+    });
+
+    // 300/304 无 Location 或非重定向语义，交给调用方按普通响应处理。
+    const location =
+      response.status >= 300 && response.status < 400
+        ? response.headers.get('location')
+        : null;
+    if (!location) {
+      return response;
+    }
+
+    await response.body?.cancel().catch(() => undefined);
+
+    if (hop === CLOUDREVE_MAX_REDIRECTS) {
+      throw new Error(
+        `Cloudreve 下载重定向超过 ${CLOUDREVE_MAX_REDIRECTS} 跳，已中止`
+      );
+    }
+
+    // 相对 Location 也要解析成绝对地址后再校验，否则 `/..` 之类可以绕过。
+    const nextUrl = new URL(location, currentUrl).toString();
+    assertSafeProviderUrl(nextUrl, '重定向目标');
+
+    // 跨源跳转必须丢掉 Authorization —— 目标按定义已不是我们认证过的那一方；
+    // 同源跳转（应用内部改写路径）保留，否则正常部署会被打成 401。
+    const headers = { ...(currentInit.headers ?? {}) };
+    if (new URL(nextUrl).origin !== new URL(currentUrl).origin) {
+      delete headers.Authorization;
+    }
+    currentUrl = nextUrl;
+    currentInit = { ...currentInit, headers };
+  }
+
+  // 循环必然从 return 或 throw 退出；此处仅为类型收敛。
+  throw new Error('Cloudreve 下载重定向处理异常');
+}
+
+/** P4-3：上游对不可满足的 Range 回 416。单独成类，让路由直接回 416，不掉进整文件缓冲的回退分支。 */
+export class CloudreveRangeNotSatisfiableError extends Error {
+  contentRange: string | null;
+  constructor(contentRange: string | null) {
+    super('Cloudreve range not satisfiable');
+    this.name = 'CloudreveRangeNotSatisfiableError';
+    this.contentRange = contentRange;
+  }
 }
 
 function validateRemotePath(
@@ -1377,6 +1504,8 @@ export class CloudreveStorage {
         fullUrl = uploadUrl.startsWith('http')
           ? uploadUrl
           : `${config.baseUrl}${uploadUrl}`;
+        // P6-9：provider 指定的绝对 URL 必须过同一套主机校验（相对路径拼在 baseUrl 上，已被校验）。
+        assertSafeProviderUrl(fullUrl, '分片上传地址');
       } else {
         // 本地存储：POST /api/v4/file/upload/{sessionId}/{index}
         const config = await this.getConfig();
@@ -1389,11 +1518,17 @@ export class CloudreveStorage {
       if (session.credential && hasUploadUrls) {
         headers['Authorization'] = `Bearer ${session.credential}`;
       } else if (!headers['Authorization']) {
-        const token = await this.getAccessToken();
-        headers['Authorization'] = `Bearer ${token}`;
+        // P6-9：credential 缺失时旧代码无条件把 access_token 附到 **provider 指定的** URL 上，
+        // 等于把主凭据送给 provider 想要的任何地址。只有与配置 baseUrl 同源时才附带。
+        const config = await this.getConfig();
+        if (isSameCloudreveOrigin(fullUrl, config.baseUrl)) {
+          const token = await this.getAccessToken();
+          headers['Authorization'] = `Bearer ${token}`;
+        }
       }
 
-      const chunkResponse = await fetch(fullUrl, {
+      // P6-9：逐跳跟随 + 逐跳校验。chunk 是内存里的 Buffer，重放安全（S3 预签名直传常有一跳）。
+      const chunkResponse = await fetchFollowingValidatedRedirects(fullUrl, {
         method: 'POST',
         headers,
         body: chunk,
@@ -1478,7 +1613,10 @@ export class CloudreveStorage {
       throw new Error('Cloudreve 未返回下载链接');
     }
 
-    return downloadData.urls[0].url;
+    // P6-9：provider 返回的直链复用同一套主机校验后才允许 fetch。
+    const rawUrl = downloadData.urls[0].url;
+    assertSafeProviderUrl(rawUrl, '下载直链');
+    return rawUrl;
   }
 
   async downloadByRemotePath(
@@ -1486,7 +1624,8 @@ export class CloudreveStorage {
     expectedUserId?: string
   ): Promise<Buffer> {
     const downloadUrl = await this.resolveDownloadUrl(remotePath, expectedUserId);
-    const fileResponse = await fetch(downloadUrl, {
+    // P6-9：逐跳跟随并逐跳校验（Cloudreve 从机模式本就会 302 到存储节点，不能一刀切拒绝）。
+    const fileResponse = await fetchFollowingValidatedRedirects(downloadUrl, {
       signal: AbortSignal.timeout(CLOUDREVE_TRANSFER_TIMEOUT_MS),
     });
     if (!fileResponse.ok) {
@@ -1518,10 +1657,20 @@ export class CloudreveStorage {
       headers['Range'] = options.range;
     }
 
-    const fileResponse = await fetch(downloadUrl, {
+    // P6-9：同 downloadByRemotePath —— 逐跳跟随 + 逐跳校验（Range 头随跳转一起带过去）。
+    const fileResponse = await fetchFollowingValidatedRedirects(downloadUrl, {
       headers,
       signal: AbortSignal.timeout(CLOUDREVE_TRANSFER_TIMEOUT_MS),
     });
+
+    // P4-3：416 单独成类。旧代码把它当普通失败抛出，路由的 catch 会退到 loadSessionAudioArtifact
+    // ——**整段录音进内存**之后才返回 416，一条 `Range: bytes=99999999-` 就能换一次整文件缓冲。
+    if (fileResponse.status === 416) {
+      await fileResponse.body?.cancel().catch(() => undefined);
+      throw new CloudreveRangeNotSatisfiableError(
+        fileResponse.headers.get('content-range')
+      );
+    }
 
     // 206 Partial Content 也算成功（透传 Range 时远程节点会返回 206）
     if (!fileResponse.ok && fileResponse.status !== 206) {

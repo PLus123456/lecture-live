@@ -8,6 +8,12 @@ Type=simple
 User=lecturelive
 Group=lecturelive
 WorkingDirectory=/opt/lecturelive
+# 只监听回环。Next standalone 的 server.js 取 `process.env.HOSTNAME || '0.0.0.0'`，
+# 不设就是全网卡监听 —— 公网 IP 主机上直连 :3000 即绕开 nginx 的 client_max_body_size、
+# 超时与将来任何在 nginx 层加的限流（P6-1）。nginx 与本服务同机，回环足够。
+# 注意：这两行必须排在 ExecStart 之前才对该进程生效。
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3000
 # 使用 node --env-file 加载 .env（正确处理引号），不用 EnvironmentFile
 ExecStart=/usr/bin/node --env-file=/opt/lecturelive/.env server.js
 Restart=always

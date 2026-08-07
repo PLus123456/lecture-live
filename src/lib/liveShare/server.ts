@@ -18,6 +18,7 @@ import {
   extractTokenFromCookieHeader,
   verifyAuthToken,
 } from '@/lib/auth';
+import { loadTranscriptDraft } from '@/lib/transcriptDraftPersistence';
 import type {
   StreamingPreviewText,
   StreamingPreviewTranslation,
@@ -236,33 +237,52 @@ function readSessionTranscriptPath(sessionId: string) {
   return fullPath;
 }
 
+function buildSnapshotFrom(parsed: {
+  segments?: unknown[];
+  translations?: Record<string, string>;
+  summaries?: unknown[];
+  status?: string;
+}): LiveSnapshot {
+  return {
+    segments: Array.isArray(parsed.segments) ? parsed.segments : [],
+    translations:
+      parsed.translations && typeof parsed.translations === 'object'
+        ? parsed.translations
+        : {},
+    summaryBlocks: Array.isArray(parsed.summaries) ? parsed.summaries : [],
+    status: typeof parsed.status === 'string' ? parsed.status : null,
+    previewText: EMPTY_STREAMING_PREVIEW_TEXT,
+    previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
+    sourceLang: null,
+    targetLang: null,
+    translationMode: null,
+    updatedAt: Date.now(),
+  };
+}
+
 async function loadPersistedSnapshot(sessionId: string): Promise<LiveSnapshot> {
   try {
     const fullPath = readSessionTranscriptPath(sessionId);
     const raw = await fs.readFile(fullPath, 'utf-8');
-    const parsed = JSON.parse(raw) as {
-      segments?: unknown[];
-      translations?: Record<string, string>;
-      summaries?: unknown[];
-      status?: string;
-    };
-
-    return {
-      segments: Array.isArray(parsed.segments) ? parsed.segments : [],
-      translations:
-        parsed.translations && typeof parsed.translations === 'object'
-          ? parsed.translations
-          : {},
-      summaryBlocks: Array.isArray(parsed.summaries) ? parsed.summaries : [],
-      status: typeof parsed.status === 'string' ? parsed.status : null,
-      previewText: EMPTY_STREAMING_PREVIEW_TEXT,
-      previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
-      sourceLang: null,
-      targetLang: null,
-      translationMode: null,
-      updatedAt: Date.now(),
-    };
+    return buildSnapshotFrom(
+      JSON.parse(raw) as Parameters<typeof buildSnapshotFrom>[0]
+    );
   } catch {
+    // C16：data/transcripts/ 只有**收尾之后**才有文件；直播进行中转录稿在
+    // data/transcript-drafts/。冷开分享（先录一段再点分享）时前者必然不存在，
+    // 只读它就等于观众永远拿不到开分享前的内容。故回退读草稿。
+    try {
+      const draft = await loadTranscriptDraft({ id: sessionId, userId: '' });
+      if (draft) {
+        return buildSnapshotFrom({
+          segments: draft.segments,
+          translations: draft.translations,
+          summaries: draft.summaries,
+        });
+      }
+    } catch {
+      // 草稿不可读也不算错：继续回退到空快照
+    }
     return buildEmptySnapshot();
   }
 }
@@ -274,6 +294,13 @@ async function getSessionSnapshot(sessionId: string): Promise<LiveSnapshot> {
   }
 
   const persisted = await loadPersistedSnapshot(sessionId);
+  // C16：读盘期间主播的首帧 sync_snapshot 可能已经落进内存（鉴权刚完成、initial_state
+  // 还在读盘的窗口正好重叠）。这里若无条件 set，就把刚到的全量快照抹回空盘态——
+  // 冷开分享的首帧正是这样丢的。重查一次，已有则以内存为准。
+  const current = snapshots.get(sessionId);
+  if (current) {
+    return current;
+  }
   snapshots.set(sessionId, persisted);
   return persisted;
 }
@@ -616,6 +643,117 @@ export async function revalidateAllLiveRooms(io: SocketIO): Promise<void> {
   }
 }
 
+// sync_snapshot / broadcast 的处理体。抽成模块级函数，是为了让 C16 的监听器能在
+// 鉴权 await 之前同步注册（见 setupLiveShare 里的注释），逻辑本身与此前逐字一致。
+function handleSyncSnapshot(
+  socket: Socket,
+  emitError: (message: string) => void,
+  payload: Partial<LiveSnapshot>
+) {
+  if (!socket.data.isHost) {
+    emitError('Only the broadcaster may sync snapshots');
+    return;
+  }
+
+  const sessionId = socket.data.sessionId as string;
+  const ext = payload as {
+    previewText?: StreamingPreviewText | string;
+    previewTranslation?: StreamingPreviewTranslation | string;
+    sourceLang?: string;
+    targetLang?: string;
+    translationMode?: string;
+  };
+
+  const rawSegmentCount = Array.isArray(payload.segments)
+    ? payload.segments.length
+    : 0;
+  const rawSummaryCount = Array.isArray(payload.summaryBlocks)
+    ? payload.summaryBlocks.length
+    : 0;
+  const rawTranslationCount =
+    payload.translations && typeof payload.translations === 'object'
+      ? Object.keys(payload.translations).length
+      : 0;
+  if (
+    rawSegmentCount > MAX_SNAPSHOT_SEGMENTS ||
+    rawSummaryCount > MAX_SNAPSHOT_SUMMARY_BLOCKS ||
+    rawTranslationCount > MAX_SNAPSHOT_TRANSLATIONS
+  ) {
+    liveShareLogger.warn(
+      {
+        socketId: socket.id,
+        sessionId,
+        rawSegmentCount,
+        rawSummaryCount,
+        rawTranslationCount,
+      },
+      'sync_snapshot exceeded size limits; snapshot truncated'
+    );
+  }
+
+  const nextSnapshot: LiveSnapshot = {
+    segments: clampArray(payload.segments, MAX_SNAPSHOT_SEGMENTS).map(
+      sanitizeSegment
+    ),
+    translations: sanitizeSnapshotTranslations(payload.translations),
+    summaryBlocks: clampArray(
+      payload.summaryBlocks,
+      MAX_SNAPSHOT_SUMMARY_BLOCKS
+    ).map(sanitizeSummaryBlock),
+    status: typeof payload.status === 'string' ? payload.status : null,
+    previewText: ext.previewText
+      ? normalizePreviewText(ext.previewText)
+      : EMPTY_STREAMING_PREVIEW_TEXT,
+    previewTranslation: ext.previewTranslation
+      ? normalizePreviewTranslation(ext.previewTranslation)
+      : EMPTY_STREAMING_PREVIEW_TRANSLATION,
+    sourceLang: typeof ext.sourceLang === 'string' ? ext.sourceLang : null,
+    targetLang: typeof ext.targetLang === 'string' ? ext.targetLang : null,
+    translationMode:
+      typeof ext.translationMode === 'string' ? ext.translationMode : null,
+    updatedAt: Date.now(),
+  };
+
+  snapshots.set(sessionId, nextSnapshot);
+}
+
+async function handleBroadcast(
+  socket: Socket,
+  emitError: (message: string) => void,
+  event: LiveEventPayload
+) {
+  if (!socket.data.isHost) {
+    emitError('Only the broadcaster may publish events');
+    return;
+  }
+
+  if (
+    !event ||
+    typeof event !== 'object' ||
+    typeof event.type !== 'string' ||
+    typeof event.timestamp !== 'number'
+  ) {
+    emitError('Invalid broadcast payload');
+    return;
+  }
+
+  const sessionId = socket.data.sessionId as string;
+  const snapshot = await getSessionSnapshot(sessionId);
+  mergeEventIntoSnapshot(snapshot, event);
+  snapshots.set(sessionId, snapshot);
+
+  liveShareLogger.debug(
+    {
+      socketId: socket.id,
+      sessionId,
+      eventType: event.type,
+    },
+    'Broadcasted live share event'
+  );
+
+  socket.to(getRoomId(sessionId)).emit(event.type, event.payload);
+}
+
 /**
  * 装载实时分享逻辑，返回一个 teardown 函数：清掉 U61 的 TTL 清扫定时器与所有
  * 未决的 host 下线宽限计时，并清空快照 Map。生产环境 setupLiveShare 仅调用一次，
@@ -638,9 +776,42 @@ export function setupLiveShare(io: SocketIO): () => void {
   io.on('connection', async (socket) => {
     const emitError = createShareErrorHandler(socket);
 
-    if ((socket.handshake.auth as BroadcasterAuthPayload | undefined)?.token) {
+    // C16：主播客户端在底层 'connect' 触发的同一刻就补发 sync_snapshot，而鉴权是异步的
+    // （verifyAuthToken + 两次 DB 查询）。若把 socket.on 注册在 await 之后，这一帧会落在
+    // 「零监听器」窗口被 socket.io 直接丢弃 —— 冷开分享的观众因此永远拿不到开分享前的
+    // 全部转录/摘要。故：鉴权 promise 先起、监听器**同步**注册（本函数到此没有 await，
+    // 不存在丢帧窗口），handler 内部再 await 同一个 promise，既不丢帧也不放行未鉴权 socket。
+    const hasBroadcasterAuth = Boolean(
+      (socket.handshake.auth as BroadcasterAuthPayload | undefined)?.token
+    );
+    const broadcasterAuth = hasBroadcasterAuth
+      ? authenticateBroadcaster(socket)
+      : null;
+    // 下面 await 之前若先 reject 会触发 unhandledRejection；挂一个空 catch 占位，
+    // 真正的失败处理仍在下面的 try/catch 里（同一个 promise 可被多次 await）。
+    broadcasterAuth?.catch(() => undefined);
+    const awaitBroadcasterAuth = async () => {
+      if (!broadcasterAuth) return;
       try {
-        await authenticateBroadcaster(socket);
+        await broadcasterAuth;
+      } catch {
+        // 鉴权失败：isHost 保持未置位，由各 handler 的 isHost 守卫拒绝
+      }
+    };
+
+    socket.on('sync_snapshot', async (payload: Partial<LiveSnapshot>) => {
+      await awaitBroadcasterAuth();
+      handleSyncSnapshot(socket, emitError, payload);
+    });
+
+    socket.on('broadcast', async ({ event }: { event: LiveEventPayload }) => {
+      await awaitBroadcasterAuth();
+      await handleBroadcast(socket, emitError, event);
+    });
+
+    if (hasBroadcasterAuth) {
+      try {
+        await broadcasterAuth;
         const sessionId = socket.data.sessionId as string;
         liveShareLogger.info(
           {
@@ -715,106 +886,6 @@ export function setupLiveShare(io: SocketIO): () => void {
         );
         emitError(error instanceof Error ? error.message : 'Failed to join live share');
       }
-    });
-
-    socket.on('sync_snapshot', async (payload: Partial<LiveSnapshot>) => {
-      if (!socket.data.isHost) {
-        emitError('Only the broadcaster may sync snapshots');
-        return;
-      }
-
-      const sessionId = socket.data.sessionId as string;
-      const ext = payload as {
-        previewText?: StreamingPreviewText | string;
-        previewTranslation?: StreamingPreviewTranslation | string;
-        sourceLang?: string;
-        targetLang?: string;
-        translationMode?: string;
-      };
-
-      const rawSegmentCount = Array.isArray(payload.segments)
-        ? payload.segments.length
-        : 0;
-      const rawSummaryCount = Array.isArray(payload.summaryBlocks)
-        ? payload.summaryBlocks.length
-        : 0;
-      const rawTranslationCount =
-        payload.translations && typeof payload.translations === 'object'
-          ? Object.keys(payload.translations).length
-          : 0;
-      if (
-        rawSegmentCount > MAX_SNAPSHOT_SEGMENTS ||
-        rawSummaryCount > MAX_SNAPSHOT_SUMMARY_BLOCKS ||
-        rawTranslationCount > MAX_SNAPSHOT_TRANSLATIONS
-      ) {
-        liveShareLogger.warn(
-          {
-            socketId: socket.id,
-            sessionId,
-            rawSegmentCount,
-            rawSummaryCount,
-            rawTranslationCount,
-          },
-          'sync_snapshot exceeded size limits; snapshot truncated'
-        );
-      }
-
-      const nextSnapshot: LiveSnapshot = {
-        segments: clampArray(payload.segments, MAX_SNAPSHOT_SEGMENTS).map(
-          sanitizeSegment
-        ),
-        translations: sanitizeSnapshotTranslations(payload.translations),
-        summaryBlocks: clampArray(
-          payload.summaryBlocks,
-          MAX_SNAPSHOT_SUMMARY_BLOCKS
-        ).map(sanitizeSummaryBlock),
-        status: typeof payload.status === 'string' ? payload.status : null,
-        previewText: ext.previewText
-          ? normalizePreviewText(ext.previewText)
-          : EMPTY_STREAMING_PREVIEW_TEXT,
-        previewTranslation: ext.previewTranslation
-          ? normalizePreviewTranslation(ext.previewTranslation)
-          : EMPTY_STREAMING_PREVIEW_TRANSLATION,
-        sourceLang: typeof ext.sourceLang === 'string' ? ext.sourceLang : null,
-        targetLang: typeof ext.targetLang === 'string' ? ext.targetLang : null,
-        translationMode: typeof ext.translationMode === 'string' ? ext.translationMode : null,
-        updatedAt: Date.now(),
-      };
-
-      snapshots.set(sessionId, nextSnapshot);
-    });
-
-    socket.on('broadcast', async ({ event }: { event: LiveEventPayload }) => {
-      if (!socket.data.isHost) {
-        emitError('Only the broadcaster may publish events');
-        return;
-      }
-
-      if (
-        !event ||
-        typeof event !== 'object' ||
-        typeof event.type !== 'string' ||
-        typeof event.timestamp !== 'number'
-      ) {
-        emitError('Invalid broadcast payload');
-        return;
-      }
-
-      const sessionId = socket.data.sessionId as string;
-      const snapshot = await getSessionSnapshot(sessionId);
-      mergeEventIntoSnapshot(snapshot, event);
-      snapshots.set(sessionId, snapshot);
-
-      liveShareLogger.debug(
-        {
-          socketId: socket.id,
-          sessionId,
-          eventType: event.type,
-        },
-        'Broadcasted live share event'
-      );
-
-      socket.to(getRoomId(sessionId)).emit(event.type, event.payload);
     });
 
     socket.on('disconnect', async () => {

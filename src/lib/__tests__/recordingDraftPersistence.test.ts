@@ -1,4 +1,5 @@
 import fs from 'fs/promises';
+import type { PathLike } from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -301,6 +302,204 @@ describe('recordingDraftPersistence', () => {
     // 旧实现 Promise.all(seqs.map(readFile)) 会让 30 个读并发在飞（maxActive=30，数万分片时 EMFILE）；
     // 新实现逐片顺序读，任一时刻最多 1 个读在飞。
     expect(maxActive).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------
+  // P7-5：seal TOCTOU —— 分片回写抹掉并发落地的 sealedAt（lost update）
+  // ---------------------------------------------------------------------
+  it('P7-5 并发 seal 不会被分片回写抹掉（读快照→回写的 lost update）', async () => {
+    const mod = await loadModule(tmpDir);
+    await mod.persistRecordingDraftChunk(session, {
+      seq: 0,
+      mimeType: 'audio/webm',
+      data: mkChunk(0),
+    });
+
+    // 把「分片写回 manifest」这一步拖慢，制造 读快照 → (seal 落地) → 回写 的窗口。
+    // 旧实现：回写用的是陈旧快照（无 sealedAt），seal 被整份覆盖抹掉。
+    const originalRename = fs.rename.bind(fs);
+    let delayedOnce = false;
+    const renameSpy = vi
+      .spyOn(fs, 'rename')
+      .mockImplementation((async (from: PathLike, to: PathLike) => {
+        if (!delayedOnce && String(to).endsWith('manifest.json')) {
+          delayedOnce = true;
+          await new Promise((resolve) => setTimeout(resolve, 60));
+        }
+        return originalRename(from, to);
+      }) as typeof fs.rename);
+
+    const writing = mod.persistRecordingDraftChunk(session, {
+      seq: 1,
+      mimeType: 'audio/webm',
+      data: mkChunk(1),
+    });
+    // 让分片写入先进入临界区，再发起 seal（模拟 cron auto-reclaim 与客户端补传撞车）。
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const sealing = mod.sealRecordingDraft(session);
+
+    await Promise.allSettled([writing, sealing]);
+    renameSpy.mockRestore();
+
+    // seal 必须留存：否则 finalize 之后到达的分片继续落盘，再被 deleteRecordingDraft 连锅端。
+    expect(await mod.isRecordingDraftSealed(session)).toBe(true);
+    const summary = await mod.getRecordingDraftManifestSummary(session);
+    expect(summary.sealed).toBe(true);
+    // 栅栏仍然有效：seal 之后的写入被拒。
+    await expect(
+      mod.persistRecordingDraftChunk(session, {
+        seq: 2,
+        mimeType: 'audio/webm',
+        data: mkChunk(2),
+      })
+    ).rejects.toBeInstanceOf(mod.RecordingDraftSealedError);
+  });
+
+  it('P7-5 seal 不清空维护式计数（chunkCount/maxSeq/totalBytes 原样保留）', async () => {
+    const mod = await loadModule(tmpDir);
+    for (const seq of [0, 1, 2]) {
+      await mod.persistRecordingDraftChunk(session, {
+        seq,
+        mimeType: 'audio/webm',
+        data: mkChunk(seq),
+      });
+    }
+    await mod.sealRecordingDraft(session);
+    const usage = await mod.getRecordingDraftUsage(session);
+    expect(usage.exists).toBe(true);
+    expect(usage.chunkCount).toBe(3);
+    expect(usage.totalBytes).toBe(mkChunk(0).length * 3);
+  });
+
+  // ---------------------------------------------------------------------
+  // P4-1：总字节闸 + 用量读数 + 过期草稿清扫
+  // ---------------------------------------------------------------------
+  describe('P4-1 草稿总量闸', () => {
+    const originalLimit = process.env.RECORDING_DRAFT_MAX_TOTAL_BYTES;
+
+    beforeEach(() => {
+      process.env.RECORDING_DRAFT_MAX_TOTAL_BYTES = '2048';
+    });
+
+    afterEach(() => {
+      if (originalLimit === undefined) {
+        delete process.env.RECORDING_DRAFT_MAX_TOTAL_BYTES;
+      } else {
+        process.env.RECORDING_DRAFT_MAX_TOTAL_BYTES = originalLimit;
+      }
+    });
+
+    it('写入超过总字节上限时抛 RecordingDraftTooLargeError 且该片不落盘', async () => {
+      const mod = await loadModule(tmpDir);
+      const big = Buffer.alloc(1024, 1);
+      await mod.persistRecordingDraftChunk(session, {
+        seq: 0,
+        mimeType: 'audio/webm',
+        data: big,
+      });
+      await mod.persistRecordingDraftChunk(session, {
+        seq: 1,
+        mimeType: 'audio/webm',
+        data: big,
+      });
+
+      // 第三片会把总量顶到 3072 > 2048：旧代码只有片数闸（50000 片），这里必须直接拒。
+      await expect(
+        mod.persistRecordingDraftChunk(session, {
+          seq: 2,
+          mimeType: 'audio/webm',
+          data: big,
+        })
+      ).rejects.toBeInstanceOf(mod.RecordingDraftTooLargeError);
+
+      expect(await mod.listRecordingDraftSeqs(session)).toEqual([0, 1]);
+      const usage = await mod.getRecordingDraftUsage(session);
+      expect(usage.totalBytes).toBe(2048);
+    });
+
+    it('merge 在整份分配前判总量（超限抛错，绝不 allocUnsafe 打爆内存）', async () => {
+      const mod = await loadModule(tmpDir);
+      // 绕过写入闸直接把超量分片摆到盘上（模拟上调过上限、或旧版本留下的大草稿）。
+      const chunksDir = path.join(
+        tmpDir,
+        'data',
+        'recording-drafts',
+        'sess-1',
+        'chunks'
+      );
+      await fs.mkdir(chunksDir, { recursive: true });
+      for (let seq = 0; seq < 4; seq += 1) {
+        await fs.writeFile(
+          path.join(chunksDir, `${String(seq).padStart(8, '0')}.chunk`),
+          Buffer.alloc(1024, 2)
+        );
+      }
+      await fs.writeFile(
+        path.join(tmpDir, 'data', 'recording-drafts', 'sess-1', 'manifest.json'),
+        JSON.stringify({
+          sessionId: 'sess-1',
+          userId: 'user-1',
+          mimeType: 'audio/webm',
+          createdAt: 1,
+          updatedAt: 2,
+        }),
+        'utf-8'
+      );
+
+      await expect(mod.mergeRecordingDraftChunks(session)).rejects.toBeInstanceOf(
+        mod.RecordingDraftTooLargeError
+      );
+    });
+
+    it('getRecordingDraftUsage：无草稿时 exists=false（供路由识别「本会话第一片」）', async () => {
+      const mod = await loadModule(tmpDir);
+      expect(await mod.getRecordingDraftUsage(session)).toEqual({
+        exists: false,
+        chunkCount: 0,
+        totalBytes: 0,
+      });
+      await mod.persistRecordingDraftChunk(session, {
+        seq: 7,
+        mimeType: 'audio/webm',
+        data: mkChunk(7),
+      });
+      const usage = await mod.getRecordingDraftUsage(session);
+      expect(usage.exists).toBe(true);
+      expect(usage.chunkCount).toBe(1);
+    });
+  });
+
+  it('P4-1 sweepStaleRecordingDrafts 删掉超龄草稿、保留仍在写的', async () => {
+    const mod = await loadModule(tmpDir);
+    await mod.persistRecordingDraftChunk(
+      { id: 'stale-sess', userId: 'user-1' },
+      { seq: 0, mimeType: 'audio/webm', data: mkChunk(0) }
+    );
+    await mod.persistRecordingDraftChunk(session, {
+      seq: 0,
+      mimeType: 'audio/webm',
+      data: mkChunk(0),
+    });
+
+    // 把 stale 会话的 manifest 与目录时间都推到 72 小时前。
+    const staleDir = path.join(tmpDir, 'data', 'recording-drafts', 'stale-sess');
+    const staleManifest = path.join(staleDir, 'manifest.json');
+    const old = Date.now() - 72 * 60 * 60_000;
+    const parsed = JSON.parse(await fs.readFile(staleManifest, 'utf-8'));
+    await fs.writeFile(
+      staleManifest,
+      JSON.stringify({ ...parsed, updatedAt: old }),
+      'utf-8'
+    );
+    await fs.utimes(staleDir, new Date(old), new Date(old));
+
+    const result = await mod.sweepStaleRecordingDrafts({ maxAgeMs: 48 * 60 * 60_000 });
+    expect(result.removed).toBe(1);
+    // 仍在写的会话（CREATED 也算）绝不能被误删。
+    expect(await mod.listRecordingDraftSeqs(session)).toEqual([0]);
+    expect(
+      await mod.listRecordingDraftSeqs({ id: 'stale-sess', userId: 'user-1' })
+    ).toEqual([]);
   });
 
   it('deleteRecordingDraft 同时清掉 manifest 和全部 chunks', async () => {

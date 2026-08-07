@@ -23,6 +23,10 @@ import {
 import { parseWorkerUrls } from '@/lib/audio/enhanceWorkerClient';
 import { isValidEmailAddress, parseDomainListDetailed } from '@/lib/email/domains';
 import { invalidateMailer } from '@/lib/email/mailer';
+import {
+  requiresSecretReentry,
+  retargetErrorMessage,
+} from '@/lib/credentialRetarget';
 
 // 获取所有站点设置
 export async function GET(req: Request) {
@@ -282,6 +286,74 @@ export async function PUT(req: Request) {
 
     // 记录切换前的存储模式，用于检测是否需要迁移
     const previousSettings = await getSiteSettings({ fresh: true });
+
+    // ── 改端点必须重填凭据（P2-1 / P2-2）──
+    // 上面「空/掩码 = 保留原密文」的语义，配上「端点键随便改」，本身就是一条外带通道：
+    // 一次 PUT {smtp_host: 攻击者, smtp_password: '********'} 就换了靶且留住原口令，
+    // 紧接着的 invalidateMailer() 让下一封信立刻对新 host 跑 AUTH LOGIN —— 明文口令随之送出。
+    // mailer.resolveConfigWithOverride 里本来就有这条规则，但它只覆盖后台「测试连接」；
+    // 生产发信 sendMail() 直接读落库配置、零校验，所以闸必须落在**写入侧**。
+    // Cloudreve / 音频增强 worker 是同一形状（改地址 → 凭据随下一次调用送到新地址），一并挡。
+    const submitted = new Map<string, unknown>(filteredEntries);
+    // worker 地址是「逗号/换行分隔多台」，两侧都按 parseWorkerUrls 归一，避免仅空格差异被误判改靶
+    const normalizeFleet = (raw: unknown) =>
+      parseWorkerUrls(typeof raw === 'string' ? raw : '').join(',');
+    if (submitted.has('audio_enhance_worker_url')) {
+      submitted.set(
+        'audio_enhance_worker_url',
+        normalizeFleet(submitted.get('audio_enhance_worker_url'))
+      );
+    }
+    const prevEndpoints: Record<string, unknown> = {
+      ...previousSettings,
+      audio_enhance_worker_url: normalizeFleet(
+        previousSettings.audio_enhance_worker_url
+      ),
+    };
+    const retargetGuards: Array<{
+      secretKey: string;
+      endpointKeys: string[];
+      endpointLabel: string;
+      secretLabel: string;
+    }> = [
+      {
+        secretKey: 'smtp_password',
+        endpointKeys: ['smtp_host', 'smtp_port', 'smtp_user'],
+        endpointLabel: 'SMTP 主机 / 端口 / 账号',
+        secretLabel: 'SMTP 密码',
+      },
+      {
+        secretKey: 'cloudreve_client_secret',
+        endpointKeys: ['cloudreve_url', 'cloudreve_client_id'],
+        endpointLabel: 'Cloudreve 地址 / Client ID',
+        secretLabel: 'Client Secret',
+      },
+      {
+        secretKey: 'audio_enhance_worker_token',
+        endpointKeys: ['audio_enhance_worker_url'],
+        endpointLabel: '音频增强 worker 地址',
+        secretLabel: 'worker token',
+      },
+    ];
+    for (const guard of retargetGuards) {
+      if (
+        requiresSecretReentry({
+          endpoint: guard.endpointKeys.map((key) => ({
+            current: prevEndpoints[key],
+            next: submitted.get(key),
+          })),
+          hasStoredSecret: Boolean(prevEndpoints[guard.secretKey]),
+          suppliedSecret: submitted.get(guard.secretKey),
+        })
+      ) {
+        return NextResponse.json(
+          {
+            error: retargetErrorMessage(guard.endpointLabel, guard.secretLabel),
+          },
+          { status: 400 }
+        );
+      }
+    }
 
     const normalizedEntries = entries.flatMap(([key, value]) => {
       const normalizedValue =

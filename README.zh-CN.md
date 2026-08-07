@@ -279,9 +279,9 @@ LectureLive 接入 Cloudreve 存储时，使用的是 Cloudreve v4 的 OAuth 授
 | `npm run db:migrate` | 执行 Prisma 开发迁移 |
 | `npm run db:migrate:deploy` | 执行生产迁移 |
 | `npm run db:studio` | 打开 Prisma Studio |
-| `npm run billing:reset-quotas` | 重置月度转录配额 |
-| `npm run billing:reconcile` | 对账转录使用量 |
-| `npm run billing:maintenance` | 执行计费维护任务 |
+| `npm run billing:reset-quotas` | 重置月度转录配额（含购买时长池结算与在途预留清理） |
+| `npm run billing:reconcile` | 打印只读的转录用量 drift 报表 |
+| `npm run billing:maintenance` | 执行计费维护任务（含上面两项，另加会话/预留回收 —— cron 首选这条） |
 | `npm run security:reencrypt-llm-keys` | 重新加密已存储的 LLM 密钥 |
 
 ## 参与贡献

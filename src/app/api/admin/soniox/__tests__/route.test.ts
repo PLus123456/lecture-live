@@ -150,4 +150,69 @@ describe('PUT /api/admin/soniox', () => {
       'https://api.soniox.example'
     );
   });
+
+  // P2-2：只改 wsUrl/restUrl、apiKey 留空 = 保留已存密钥 → 下一次转录就带着真密钥
+  // 连到新地址（Soniox 密钥随握手直接送出）。
+  describe('改端点必须重填密钥', () => {
+    beforeEach(() => {
+      siteSettingFindManyMock.mockResolvedValue([
+        { key: 'soniox_US_api_key', value: 'enc:real-soniox-key' },
+        { key: 'soniox_US_ws_url', value: 'wss://stt-rt.soniox.example' },
+        { key: 'soniox_US_rest_url', value: 'https://api.soniox.example' },
+      ]);
+    });
+
+    it('只改 wsUrl、apiKey 不传 → 400，且一个字都不落库', async () => {
+      const res = await PUT(
+        makeRequest({ regions: { us: { wsUrl: 'wss://attacker.tld/ws' } } })
+      );
+      expect(res.status).toBe(400);
+      expect(siteSettingUpsertMock).not.toHaveBeenCalled();
+      expect(transactionMock).not.toHaveBeenCalled();
+    });
+
+    it('只改 restUrl、apiKey 不传 → 同样 400', async () => {
+      const res = await PUT(
+        makeRequest({ regions: { us: { restUrl: 'https://attacker.tld' } } })
+      );
+      expect(res.status).toBe(400);
+      expect(transactionMock).not.toHaveBeenCalled();
+    });
+
+    it('改地址同时重填 apiKey → 放行', async () => {
+      const res = await PUT(
+        makeRequest({
+          regions: {
+            us: { wsUrl: 'wss://stt-rt.newvendor.example', apiKey: 'k2' },
+          },
+        })
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it('改地址同时显式清空 apiKey（同事务删除，无凭据可外带）→ 放行', async () => {
+      const res = await PUT(
+        makeRequest({
+          regions: { us: { wsUrl: 'wss://stt-rt.newvendor.example', apiKey: '' } },
+        })
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it('地址原样回填（仅尾斜杠差异）→ 不算改靶', async () => {
+      const res = await PUT(
+        makeRequest({
+          regions: { us: { wsUrl: 'wss://stt-rt.soniox.example/' } },
+        })
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it('该区域没存密钥 → 改地址不拦（没东西可外带）', async () => {
+      const res = await PUT(
+        makeRequest({ regions: { eu: { wsUrl: 'wss://stt-rt.eu.example' } } })
+      );
+      expect(res.status).toBe(200);
+    });
+  });
 });

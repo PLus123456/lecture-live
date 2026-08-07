@@ -8,6 +8,8 @@ import {
   mergeRecordingDraftChunks,
   sealRecordingDraft,
   unsealRecordingDraft,
+  MAX_DRAFT_TOTAL_BYTES,
+  RecordingDraftTooLargeError,
 } from '@/lib/recordingDraftPersistence';
 import {
   stageSessionAudioArtifact,
@@ -19,6 +21,10 @@ import {
   resolveExpectedRecordingDurationMs,
 } from '@/lib/audio/recordingDuration';
 import { clampSessionDurationMs } from '@/lib/billing';
+
+// P4-1：超过此体量就不再做 webm 时长修正（该函数是数份整份拷贝，峰值 ≈4× 合并结果）。
+// 128MiB 对应 128kbps 下约 2.3 小时录音，绝大多数会话都在阈值内、行为完全不变。
+const MAX_DURATION_FIX_BYTES = 128 * 1024 * 1024;
 
 export async function POST(
   req: Request,
@@ -94,11 +100,23 @@ export async function POST(
       await resolveExpectedRecordingDurationMs(session),
       user.role
     );
-    const normalizedBuffer = await normalizeRecordedAudioDuration({
-      buffer: merged.buffer,
-      mimeType: merged.manifest.mimeType,
-      durationMs,
-    });
+    // P4-1：normalizeRecordedAudioDuration 会在合并结果之上再做 3-4 份整份拷贝（切段 → Blob →
+    // arrayBuffer → concat），几百 MB 的录音就足以把 2GB 容器的主进程 OOM 掉。超过阈值时跳过
+    // 时长修正：webm 时长头缺失只影响进度条/拖动的精度，浏览器照样能播；进程被打死则全站受害。
+    const normalizedBuffer =
+      merged.buffer.length > MAX_DURATION_FIX_BYTES
+        ? merged.buffer
+        : await normalizeRecordedAudioDuration({
+            buffer: merged.buffer,
+            mimeType: merged.manifest.mimeType,
+            durationMs,
+          });
+    if (merged.buffer.length > MAX_DURATION_FIX_BYTES) {
+      console.warn(
+        `[draftFinalize] 合并结果 ${merged.buffer.length} 字节超过 ${MAX_DURATION_FIX_BYTES}，` +
+          `跳过 webm 时长修正以避免整份拷贝打爆内存，session=${id}`
+      );
+    }
 
     // P0-6：先写版本化临时对象；DB CAS 成功后才发布（删旧 recordingPath）；CAS 失败回滚删临时对象、
     // 绝不触碰已定稿录音。换容器格式定稿时旧物理文件由 finalizeStagedArtifactPublish 删除，避免孤儿。
@@ -140,6 +158,17 @@ export async function POST(
   } catch (error) {
     // 出错未提交：释放封存，避免草稿被永久 seal 挡住后续补传/重试。
     await unsealRecordingDraft(session).catch(() => undefined);
+    // P4-1：草稿超总量上限 —— 明确 413 而非 500，草稿原样留盘（可人工取回），绝不 OOM 主进程。
+    if (error instanceof RecordingDraftTooLargeError) {
+      return NextResponse.json(
+        {
+          error: `Recording draft too large to finalize (max ${MAX_DRAFT_TOTAL_BYTES} bytes)`,
+          limitExceeded: true,
+          maxTotalBytes: MAX_DRAFT_TOTAL_BYTES,
+        },
+        { status: 413 }
+      );
+    }
     console.error('Finalize draft audio error:', error);
     return NextResponse.json(
       { error: 'Failed to finalize recording draft' },

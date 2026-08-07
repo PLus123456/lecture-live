@@ -10,7 +10,11 @@ import {
   resolveRoleQuotas,
   resolveRoleStorageBytesLimit,
 } from '@/lib/userRoles';
-import { releaseStorageBytes, settlePoolOnLimitChange } from '@/lib/quota';
+import {
+  releaseStorageBytes,
+  settlePoolOnLimitChange,
+  settlePoolOnUsageReset,
+} from '@/lib/quota';
 import { deleteCloudreveAttachmentFiles } from '@/lib/storage/cloudreveFileDelete';
 import { invalidateUserEmailTokens } from '@/lib/email/tokens';
 
@@ -622,10 +626,14 @@ export async function PATCH(req: Request) {
       data.storageHoursLimit = raw;
     }
 
-    // 一键重置本月已用转录时长。仅清零已用量列，不动 quotaResetAt（下次月度重置点不变）。
-    // 存储用量不可在此重置（它是 SUM(session.durationMs) 的实时占用，只随删录音回落）。
+    // 一键重置本月已用转录时长。存储用量不可在此重置（它是 SUM(session.durationMs) 的实时占用，
+    // 只随删录音回落）。
+    // P5-2：清零 used 必须同时写 transcriptionUsageReconcileFrom = now。否则对账侧仍按本周期
+    // 全部 COMPLETED session 重算 expected，而 used 已被人为压到 0 → 每轮对账都对该用户虚报
+    // 正向 drift，管理员一点「修复」就把刚清掉的用量原样写回去，重置等于白做。
     if (fields.resetTranscriptionUsage === true) {
       data.transcriptionMinutesUsed = 0;
+      data.transcriptionUsageReconcileFrom = new Date();
     }
 
     // 充值系统（Model A）：若本次下调了转录分钟上限（角色/组/显式覆盖任一路径已写入 data），
@@ -640,6 +648,18 @@ export async function PATCH(req: Request) {
         existing.transcriptionMinutesLimit,
         data.transcriptionMinutesLimit
       );
+    }
+
+    // P5-2：清零 used 之前，持池用户必须先按**当前**上限结算池子——否则本周期已动用的池分钟
+    // 被一键抹掉、永久免费。放在限额结算之后：若同一次 PATCH 既下调上限又重置用量，前者已用旧
+    // 上限结清并把 used 归零，这里读到 used=0 自然 no-op（幂等）。
+    if (
+      fields.resetTranscriptionUsage === true &&
+      existing.purchasedMinutesBalance > 0
+    ) {
+      // 按**本周期实际生效的旧上限**结算（不是本次 PATCH 写入的新上限）：上限调高时用新上限
+      // 会把 owed 算小、少扣池；调低那条路已在上面用旧上限结清过。
+      await settlePoolOnUsageReset(userId, existing.transcriptionMinutesLimit);
     }
 
     if (Object.keys(data).length === 0) {

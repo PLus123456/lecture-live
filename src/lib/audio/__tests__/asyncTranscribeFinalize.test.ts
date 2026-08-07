@@ -118,10 +118,14 @@ describe('finalizeAsyncTranscription', () => {
     deductMock.mockResolvedValue(undefined);
     settleMock.mockResolvedValue(0);
     sessionTxUpdateMock.mockResolvedValue(undefined);
-    // 默认 $transaction 实现：执行回调并注入带 session.update 的 tx
+    // P5-7：终态 CAS 现在在计费事务**内部**执行，故注入的 tx 必须带 session.updateMany，
+    // 且复用同一个 sessionUpdateManyMock —— 这样「claim(1) → 终态守卫(2) → 清 Soniox ID(3)」
+    // 的调用序与 mockResolvedValueOnce 链保持不变，用例只关心口径不关心它在哪个客户端上调。
     transactionMock.mockImplementation(
       async (cb: (tx: unknown) => Promise<unknown>) =>
-        cb({ session: { update: sessionTxUpdateMock } })
+        cb({
+          session: { update: sessionTxUpdateMock, updateMany: sessionUpdateManyMock },
+        })
     );
     // P1-17：delete 帮助函数返回「是否确认删除」，默认确认成功。
     deleteSonioxFileMock.mockResolvedValue(true);
@@ -167,7 +171,9 @@ describe('finalizeAsyncTranscription', () => {
 
     // 计费恰好一次，口径 = ceil(ceil(600000/60000) × 0.8) = ceil(8) = 8（第三参为事务 tx）
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything(), {
+      sessionId: 's1',
+    });
 
     expect(runBackgroundLLMTasksMock).toHaveBeenCalledTimes(1);
     // P1-17：先删 transcription 再删 file，确认删除后清对应 DB 外部 ID（第 3 次 updateMany）。
@@ -221,7 +227,7 @@ describe('finalizeAsyncTranscription', () => {
     ).toBeLessThan(deleteSonioxFileMock.mock.invocationCallOrder[0]);
   });
 
-  it('onCompleted 钩子在 finalize 守卫成功后、扣费前调用', async () => {
+  it('P5-7：onCompleted 钩子改到「终态+计费」事务提交之后才调用（回滚了就不该失效缓存）', async () => {
     sessionUpdateManyMock
       .mockResolvedValueOnce({ count: 1 })
       .mockResolvedValueOnce({ count: 1 });
@@ -239,7 +245,56 @@ describe('finalizeAsyncTranscription', () => {
     });
 
     expect(onCompleted).toHaveBeenCalledTimes(1);
-    expect(order).toEqual(['onCompleted', 'deduct']);
+    // 旧口径是 ['onCompleted','deduct']（计费在独立事务里、还可能整体失败）。
+    expect(order).toEqual(['deduct', 'onCompleted']);
+  });
+
+  it('P5-7：终态 CAS 与扣费在同一事务内（CAS 不再先于事务单独提交）', async () => {
+    sessionUpdateManyMock
+      .mockResolvedValueOnce({ count: 1 }) // claim（事务外）
+      .mockResolvedValueOnce({ count: 1 }); // 终态守卫（必须在事务内）
+
+    await finalizeAsyncTranscription(makeSession(), CONFIG, {
+      allowClaimFrom: ['transcribing'],
+    });
+
+    // 事务开启早于终态守卫的 updateMany → 守卫在事务内；旧实现是守卫先提交、事务后开。
+    expect(transactionMock).toHaveBeenCalledTimes(1);
+    expect(transactionMock.mock.invocationCallOrder[0]).toBeLessThan(
+      sessionUpdateManyMock.mock.invocationCallOrder[1]
+    );
+    // 且扣费/结算都发生在同一事务内（tx 作第三参）。
+    expect(deductMock).toHaveBeenCalledTimes(1);
+    expect(settleMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('P5-7：计费事务失败 → 不留「已 completed 却净扣 0」，回退 transcribing 交下轮重试', async () => {
+    sessionUpdateManyMock.mockResolvedValueOnce({ count: 1 }); // claim 抢到
+    // 事务整体失败（最现实的是与 init 路由构成的 InnoDB 死锁 / 事务超时）
+    transactionMock.mockRejectedValueOnce(
+      Object.assign(new Error('Deadlock found when trying to get lock'), {
+        code: 'P2034',
+      })
+    );
+
+    const result = await finalizeAsyncTranscription(makeSession(), CONFIG, {
+      allowClaimFrom: ['transcribing'],
+    });
+
+    // 旧实现：终态已单独提交 + 计费异常被吞 → outcome 'completed'、净扣 0、且 allowClaimFrom 永不含
+    // 'completed'，再无复扣路径。现在必须整体回滚并交回重试。
+    expect(result).toEqual({ outcome: 'claim_lost' });
+    expect(deductMock).not.toHaveBeenCalled();
+    // 回退 finalizing → transcribing（带守卫，事务其实已提交时匹配 0 行、绝不回退终态）
+    const revert = sessionUpdateManyMock.mock.calls.at(-1)?.[0];
+    expect(revert).toEqual({
+      where: { id: 's1', asyncTranscribeStatus: 'finalizing' },
+      data: { asyncTranscribeStatus: 'transcribing' },
+    });
+    // 转录还要留着重收尾 —— 绝不能删 Soniox 资源。
+    expect(deleteSonioxTranscriptionMock).not.toHaveBeenCalled();
+    expect(deleteSonioxFileMock).not.toHaveBeenCalled();
+    expect(runBackgroundLLMTasksMock).not.toHaveBeenCalled();
   });
 
   it('拉 transcript 抛错：不吞异常（交调用方判定瞬时/永久），claim 已抢到但未扣费', async () => {
@@ -283,7 +338,9 @@ describe('finalizeAsyncTranscription', () => {
       })
     );
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything(), {
+      sessionId: 's1',
+    });
   });
 
   it('B1 结算：同一事务内 deduct 实扣(8) + settleAsyncReservation 原子转/清入口预留', async () => {
@@ -298,7 +355,9 @@ describe('finalizeAsyncTranscription', () => {
     // deduct 实扣 8（ceil(10×0.8)）+ settleAsyncReservation(sessionId, tx)：读当前列并原子释放，
     // 二者同一事务 tx。预留的具体释放/清列逻辑在 settleAsyncReservation 内（其自有单测）。
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything(), {
+      sessionId: 's1',
+    });
     expect(settleMock).toHaveBeenCalledTimes(1);
     expect(settleMock).toHaveBeenCalledWith('s1', expect.anything());
   });

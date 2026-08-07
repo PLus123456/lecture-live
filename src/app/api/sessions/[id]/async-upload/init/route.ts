@@ -25,33 +25,48 @@ const MAX_CHUNK_BYTES = 20 * 1024 * 1024;
 const MIN_CHUNK_BYTES = 64 * 1024;
 const ACCEPTED_MEDIA_RE = /^(audio|video)\//i;
 
-// 按文件大小粗估时长的 fallback（与前端 UploadTranscribeModal 的口径一致）：
-// 视频 ~5MB/min、音频 ~1MB/min。仅当前端未声明 estimatedDurationMs 时使用。
-const VIDEO_BYTES_PER_MIN = 5 * 1024 * 1024;
-const AUDIO_BYTES_PER_MIN = 1 * 1024 * 1024;
+// 按文件大小折算「时长下界」用的**码率上限**表（P5-19）。
+//
+// 关键口径：size floor 是真实时长的**下界**，故除数必须取该格式的**最高**可能码率。旧实现用的是
+// 「典型码率」（音频恒 1MB/min≈133kbps、视频 5MB/min），对无损音频恒大于真实时长——10MB/min 的
+// 44.1kHz/16bit WAV 被折成 10 倍时长，额度充足的诚实用户照样被误 403（U22 的真正成因，只补客户端
+// 字段修不掉）。下界方向宁可宽松：谎报 MIME 的超额准入已由 asyncUploadProcessor 的「实测时长回补
+// 预留」堵死（P1-3），那里在上传 Soniox **之前**按 ffprobe 真值补足差额，补不上直接失败。
+const VIDEO_MAX_BYTES_PER_MIN = 150 * 1024 * 1024; // ≈20 Mbps：高码率 1080p/4K 录屏的上限
+const LOSSLESS_AUDIO_MAX_BYTES_PER_MIN = 36 * 1024 * 1024; // 24bit/96kHz 立体声 PCM 的上限
+const COMPRESSED_AUDIO_MAX_BYTES_PER_MIN = Math.round(2.5 * 1024 * 1024); // 320kbps 有损上限
+// 无损/未压缩音频容器（其余 audio/* 一律按有损上限算）。
+const LOSSLESS_AUDIO_RE =
+  /^audio\/(wav|wave|x-wav|x-pn-wav|vnd\.wave|aiff|x-aiff|flac|x-flac|l16|l24|basic|alac)$/i;
+
+function maxBytesPerMinute(originalMimeType: string): number {
+  if (/^video\//i.test(originalMimeType)) return VIDEO_MAX_BYTES_PER_MIN;
+  if (LOSSLESS_AUDIO_RE.test(originalMimeType)) return LOSSLESS_AUDIO_MAX_BYTES_PER_MIN;
+  return COMPRESSED_AUDIO_MAX_BYTES_PER_MIN;
+}
 
 /**
  * 估算本次异步上传的计费分钟，用于入口处的原子配额预留（投影后判 limit）。
- * 优先用前端声明的 estimatedDurationMs；缺失时按 originalSize/MIME 粗估，与前端 fallback 同口径。
- * 始终向上取整为整分钟，宁可略高估也不低估（低估会让接近耗尽的用户击穿额度）。
+ * 优先用前端声明的 estimatedDurationMs；缺失时按 originalSize/MIME 折出时长下界。
+ * 始终向上取整为整分钟。
  */
 function estimateBillableMinutes(
   estimatedDurationMs: number | null,
   originalSize: number,
   originalMimeType: string
 ): number {
-  const bytesPerMin = /^video\//i.test(originalMimeType)
-    ? VIDEO_BYTES_PER_MIN
-    : AUDIO_BYTES_PER_MIN;
-  // 按文件大小估算的分钟 —— 服务端可信下界（originalSize 已在上游 parsePositiveInteger 校验）。
-  const sizeFloorMinutes = Math.max(1, Math.ceil(originalSize / bytesPerMin));
+  // 按文件大小折出的时长下界（originalSize 已在上游 parsePositiveInteger 校验）。
+  const sizeFloorMinutes = Math.max(
+    1,
+    Math.ceil(originalSize / maxBytesPerMinute(originalMimeType))
+  );
   const declaredMinutes =
     estimatedDurationMs != null && estimatedDurationMs > 0
       ? getBillableMinutes(estimatedDurationMs)
       : 0;
-  // B2：门禁预估取「客户端声明」与「按文件大小估算」的较大者。客户端声明的 estimatedDurationMs
-  // 不可信（可恶意压到 1ms 骗过门禁上传超大文件），故以 size floor 兜底，宁高估勿低估——
-  // 高估至多误拒一次上传，低估则让接近耗尽的用户击穿额度。
+  // B2：门禁预估取「客户端声明」与「按文件大小折的下界」的较大者。客户端声明的 estimatedDurationMs
+  // 不可信（可恶意压到 1ms 骗过门禁上传超大文件），故以 size floor 兜底；floor 本身也只是下界，
+  // 谎报 MIME 仍能压低它——真正的足额门禁在 asyncUploadProcessor 的实测回补（P1-3）。
   return Math.max(declaredMinutes, sizeFloorMinutes);
 }
 

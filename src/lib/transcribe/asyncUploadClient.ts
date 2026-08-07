@@ -26,6 +26,12 @@ interface StartOptions {
   file: File;
   sessionId: string;
   authToken: string;
+  /**
+   * U22/P5-19：浏览器实测的媒体时长（毫秒），拿不到时留空。
+   * init 端点的配额门禁取 max(本值, 按文件大小折的时长下界)——不传就只剩下界，无损音频/高码率文件
+   * 的下界会显著高于真实时长，额度充足的用户也会被误 403。拿不到就别传（服务端自行回落下界）。
+   */
+  estimatedDurationMs?: number;
   onUploadProgress?: (fraction: number) => void;
   /** 后端处理阶段（目前仅 transcoding）的子进度 0~1，由 status route 推送 */
   onProcessingProgress?: (fraction: number) => void;
@@ -76,6 +82,10 @@ export function startAsyncUpload(opts: StartOptions): {
           originalSize: opts.file.size,
           totalChunks,
           chunkSize: CHUNK_SIZE,
+          // 只在真实测到时长时才带上（0/undefined 一律省略，让服务端回落到大小下界）。
+          ...(opts.estimatedDurationMs && opts.estimatedDurationMs > 0
+            ? { estimatedDurationMs: Math.round(opts.estimatedDurationMs) }
+            : {}),
         }),
         signal: composed,
       },

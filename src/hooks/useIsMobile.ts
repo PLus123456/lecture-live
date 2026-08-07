@@ -55,7 +55,18 @@ export function useIsMobile(): boolean {
   useEffect(() => {
     setIsMobile(detectMobile());
 
-    const handleChange = () => setIsMobile(detectMobile());
+    // L12：resize 在拖窗口 / 移动端地址栏收放 / 软键盘弹出时会每帧连发数十次，
+    // 而 detectMobile 每次都读 innerWidth + screen + navigator（强制同步布局）再 setState，
+    // 于是每个用到本 hook 的组件都跟着重渲染。用 rAF 合并成「每帧至多跑一次」——
+    // 比定时器节流更贴帧，也不会在停下来后漏掉最后一次（末帧一定会执行）。
+    let frame = 0;
+    const handleChange = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        setIsMobile(detectMobile());
+      });
+    };
 
     window.addEventListener('resize', handleChange);
 
@@ -65,6 +76,7 @@ export function useIsMobile(): boolean {
     }
 
     return () => {
+      if (frame) cancelAnimationFrame(frame);
       window.removeEventListener('resize', handleChange);
       if (window.screen?.orientation) {
         window.screen.orientation.removeEventListener('change', handleChange);

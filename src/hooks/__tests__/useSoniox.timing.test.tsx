@@ -528,6 +528,61 @@ describe('R1278：长暂停后继续应重建连接而非复用可能已死的�
     nowSpy.mockRestore();
   });
 
+  // L6/U58：复用分支不重置延迟基准 → token.end_ms 不含暂停墙钟，之后每个样本都被
+  // 整段暂停时长虚高，EMA 永久卡在虚值（15s 暂停仍在 30s 合理阈值内，不会被丢弃）。
+  it('短暂停后继续，出字延迟不被暂停时长污染（复用分支也要重置延迟基准）', async () => {
+    const nowSpy = vi.spyOn(Date, 'now');
+    const t0 = 3_000_000;
+    nowSpy.mockReturnValue(t0);
+    const { result } = renderHook(() =>
+      useSoniox('sess-latency', { idleTimeoutMs: 999_999_999 })
+    );
+    await act(async () => {
+      await result.current.start();
+    });
+    const cb = () => capturedCallbacks[capturedCallbacks.length - 1];
+    act(() => {
+      cb().onConnectionChange('connected');
+    });
+
+    // 暂停前：音频 1000ms 处的词在 t0+1500 到达 → 延迟 500ms
+    nowSpy.mockReturnValue(t0 + 1_500);
+    act(() => {
+      cb().onPartialResult([
+        { text: 'a', is_final: true, start_ms: 0, end_ms: 1_000, confidence: 1, language: 'en' },
+      ]);
+    });
+    expect(
+      useTranscriptStore.getState().connectionMeta.transcriptionLatencyMs
+    ).toBe(500);
+
+    // t0+2000 暂停，t0+12000 继续（10s < 15s → 走复用分支，不重建连接）
+    nowSpy.mockReturnValue(t0 + 2_000);
+    act(() => {
+      result.current.pause();
+    });
+    nowSpy.mockReturnValue(t0 + 12_000);
+    await act(async () => {
+      await result.current.start();
+    });
+    expect(useTranscriptStore.getState().recordingState).toBe('recording');
+
+    // 续录：音频时钟只走到 2500ms（暂停期间不推进），该词在 t0+12800 到达 → 真实延迟 300ms
+    nowSpy.mockReturnValue(t0 + 12_800);
+    act(() => {
+      cb().onPartialResult([
+        { text: 'b', is_final: true, start_ms: 2_000, end_ms: 2_500, confidence: 1, language: 'en' },
+      ]);
+    });
+
+    // 旧实现：latency = 12800 - 2500 = 10300 → EMA 被拉到 3440，徽标永久虚高
+    expect(
+      useTranscriptStore.getState().connectionMeta.transcriptionLatencyMs
+    ).toBe(300);
+
+    nowSpy.mockRestore();
+  });
+
   it('短暂停(<15s)后继续复用现有句柄，不重建', async () => {
     const nowSpy = vi.spyOn(Date, 'now');
     nowSpy.mockReturnValue(2_000_000);

@@ -237,3 +237,98 @@ describe('GET /api/auth/refresh — 并发幂等与安全属性 (v3-R7)', () => 
     expect(res.status).toBe(401);
   });
 });
+
+/**
+ * U51 / P6-5：refresh 保留原 sessionStartedAt，但旧实现的 exp / cookieMaxAge 是从「当下」
+ * 起算 jwt_expiry 天，完全不看已用掉的寿命 → jwt_expiry=90、day-10 刷新会发出 exp=day40
+ * 的 cookie，而 verifyToken 在 sessionStartedAt+30d 处硬杀。表现为「cookie 看着有效、
+ * 用户中途被登出」，且每次刷新都复现。
+ */
+describe('GET /api/auth/refresh — exp 钳到剩余绝对寿命 (U51 / P6-5)', () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const ABSOLUTE_LIFETIME_MS = 30 * DAY_MS;
+
+  beforeEach(() => {
+    resetInMemoryStores();
+    getRedisClientMock.mockReturnValue(null);
+    enforceRateLimitMock.mockResolvedValue(null);
+    userFindUniqueMock.mockResolvedValue(ACTIVE_USER);
+  });
+
+  function readCookieMaxAge(response: Response): number | null {
+    const setCookie = response.headers.get('set-cookie');
+    const match = setCookie?.match(/Max-Age=(\d+)/i);
+    return match ? Number(match[1]) : null;
+  }
+
+  it('jwt_expiry=90、会话已用 10 天：新 token 的 exp 不越过绝对上限', async () => {
+    getSiteSettingsMock.mockResolvedValue({ jwt_expiry: 90 });
+    const sessionStartedAt = Date.now() - 10 * DAY_MS;
+    const oldToken = signToken(ACTIVE_USER, { sessionStartedAt });
+
+    const res = await GET(makeRequest(oldToken));
+    expect(res.status).toBe(200);
+
+    const newToken = readSetCookieToken(res) as string;
+    const decoded = jwt.verify(newToken, JWT_SECRET) as {
+      exp: number;
+      sessionStartedAt: number;
+    };
+    expect(decoded.sessionStartedAt).toBe(sessionStartedAt);
+
+    const absoluteDeadlineSec = Math.floor(
+      (sessionStartedAt + ABSOLUTE_LIFETIME_MS) / 1000
+    );
+    expect(decoded.exp).toBeLessThanOrEqual(absoluteDeadlineSec);
+    // 且不能被钳过头：剩余 20 天应基本用满（容忍几秒执行漂移）
+    expect(decoded.exp).toBeGreaterThan(absoluteDeadlineSec - 10);
+  });
+
+  it('cookie 的 Max-Age 同样不越过绝对上限', async () => {
+    getSiteSettingsMock.mockResolvedValue({ jwt_expiry: 90 });
+    const sessionStartedAt = Date.now() - 25 * DAY_MS;
+
+    const res = await GET(
+      makeRequest(signToken(ACTIVE_USER, { sessionStartedAt }))
+    );
+    expect(res.status).toBe(200);
+
+    const maxAge = readCookieMaxAge(res);
+    expect(maxAge).not.toBeNull();
+    // 剩余 5 天；旧实现会写 30 天（钳到绝对上限常量后的值）
+    expect(maxAge as number).toBeLessThanOrEqual(5 * 24 * 60 * 60 + 5);
+    expect(maxAge as number).toBeGreaterThan(5 * 24 * 60 * 60 - 60);
+  });
+
+  it('默认 7 天配置、会话已用 25 天：也只签剩下的 5 天', async () => {
+    getSiteSettingsMock.mockResolvedValue({ jwt_expiry: 7 });
+    const sessionStartedAt = Date.now() - 25 * DAY_MS;
+
+    const res = await GET(
+      makeRequest(signToken(ACTIVE_USER, { sessionStartedAt }))
+    );
+    expect(res.status).toBe(200);
+
+    const decoded = jwt.verify(readSetCookieToken(res) as string, JWT_SECRET) as {
+      exp: number;
+    };
+    const absoluteDeadlineSec = Math.floor(
+      (sessionStartedAt + ABSOLUTE_LIFETIME_MS) / 1000
+    );
+    expect(decoded.exp).toBeLessThanOrEqual(absoluteDeadlineSec);
+  });
+
+  it('新会话（刚开始）不受影响：仍按配置签满 7 天', async () => {
+    getSiteSettingsMock.mockResolvedValue({ jwt_expiry: 7 });
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    const res = await GET(makeRequest(signToken(ACTIVE_USER)));
+    expect(res.status).toBe(200);
+
+    const decoded = jwt.verify(readSetCookieToken(res) as string, JWT_SECRET) as {
+      exp: number;
+    };
+    expect(decoded.exp).toBeGreaterThanOrEqual(nowSec + 7 * 24 * 60 * 60 - 10);
+    expect(decoded.exp).toBeLessThanOrEqual(nowSec + 7 * 24 * 60 * 60 + 10);
+  });
+});

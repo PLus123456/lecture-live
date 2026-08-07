@@ -26,6 +26,17 @@ export const GET = withRequestLogging('sessions:list', async (req: Request) => {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  // P4-4：GET 此前**无限流**（同文件的 POST 有），而每次 miss 都要跑 findMany + count +
+  // aggregate 并把整行 JSON 化驻留 30 秒。按用户分桶限流，把「一请求一驻留」的放大器封住。
+  const rateLimited = await enforceApiRateLimit(req, {
+    scope: 'sessions:list',
+    windowMs: 60_000,
+    key: `user:${user.id}`,
+  });
+  if (rateLimited) {
+    return rateLimited;
+  }
+
   const url = new URL(req.url);
   const unarchived = url.searchParams.get('unarchived') === 'true';
   const folderId = url.searchParams.get('folderId');

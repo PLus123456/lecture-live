@@ -7,6 +7,15 @@ import type { Session } from '@prisma/client';
 
 const DRAFTS_ROOT = path.join(process.cwd(), 'data', 'transcript-drafts');
 
+// P4-5：冲突备份保留份数上限。
+// 单调守卫把「段数变少」判为冲突，处理方式是把**整份载荷**写进一个带时间戳的新备份文件并回 200。
+// PUT 无限流、单个 segment 体积零校验、落盘还 pretty-print —— 先 PUT 10000 个 1 字节 segment
+// 顶满 segmentCount，之后每次 PUT 9999 个巨型 segment 必命中冲突分支，备份文件无限堆积；
+// 而 CREATED 会话永不回收，这些文件永久驻留。保留最近 N 份足够事后排查，其余滚动删除。
+const MAX_CONFLICT_BACKUPS = 3;
+
+const CONFLICT_BACKUP_RE = /^transcript\.conflict-(\d+)\.json$/;
+
 export interface TranscriptDraftPayload {
   segments: unknown[];
   summaries: unknown[];
@@ -80,6 +89,32 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
+/**
+ * P4-5：只保留最近 MAX_CONFLICT_BACKUPS 份冲突备份（按文件名里的时间戳降序），其余删除。
+ * 目录读不到或删不掉都静默略过 —— 清理失败绝不能影响主草稿的写入语义。
+ */
+async function pruneConflictBackups(session: DraftSessionSource): Promise<void> {
+  const dir = getDraftDir(session);
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return;
+  }
+
+  const backups = entries
+    .map((name) => {
+      const match = name.match(CONFLICT_BACKUP_RE);
+      return match ? { name, ts: Number.parseInt(match[1], 10) } : null;
+    })
+    .filter((item): item is { name: string; ts: number } => item !== null)
+    .sort((a, b) => b.ts - a.ts);
+
+  for (const stale of backups.slice(MAX_CONFLICT_BACKUPS)) {
+    await fs.rm(path.join(dir, stale.name), { force: true }).catch(() => {});
+  }
+}
+
 /** 保存或覆盖转录稿草稿（整体快照） */
 export async function persistTranscriptDraft(
   session: DraftSessionSource,
@@ -104,6 +139,9 @@ export async function persistTranscriptDraft(
         JSON.stringify(payload, null, 2),
         'utf-8'
       );
+      // P4-5：写完立刻滚动清理，保留最近 MAX_CONFLICT_BACKUPS 份 —— 否则每次冲突 PUT 都留一份
+      // 全量副本，无上限增长且随会话永久驻留。
+      await pruneConflictBackups(session);
     } catch {
       // 备份失败不阻断：主草稿不动即可，本次 PUT 视为「已保护地忽略」
     }

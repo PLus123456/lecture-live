@@ -11,14 +11,41 @@
 
 import { encode } from 'gpt-tokenizer';
 
+// P4-2：超过此长度就不再跑真 BPE encode，改用便宜估算。
+// encode() 是**同步** CPU：60K 字符 ≈ 5ms，线性外推 32MB（Next 的实际 body 上限）≈ 2.6 秒，
+// 一个请求就把事件循环钉死，而且这发生在任何 LLM 调用**之前**（extract-keywords 对整份输入
+// encode 一次、chunkText 再对每个句子各 encode 一次）。
+// 200K 字符 ≈ 17ms，超过这个量级的文本对任何上下文预算都已经是「远超上限」，精确值毫无意义。
+const EXACT_ENCODE_MAX_CHARS = 200_000;
+
+// CJK（含中日韩统一表意文字、假名、谚文）判定：cl100k 是 UTF-8 字节级 BPE，一个汉字通常
+// 编成 1-2 个 token，而英文约 4 字符/token。两类字符必须分开算，否则中文会被严重低估。
+const CJK_RE = /[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]/gu;
+
+/**
+ * P4-2：便宜估算（O(n) 扫描，无 BPE）。刻意**高估**：预算判定里高估只会多走一次截断/切块，
+ * 低估则会把超限内容送进模型（真超限），故按 CJK 1.6 token/字、其余 1/3.5 字符/token 取上界。
+ */
+function estimateTokensFast(text: string): number {
+  CJK_RE.lastIndex = 0;
+  const cjkCount = (text.match(CJK_RE) ?? []).length;
+  const rest = text.length - cjkCount;
+  return Math.ceil(cjkCount * 1.6 + rest / 3.5);
+}
+
 /**
  * 估算字符串的 token 数。空串返回 0。
  *
  * 性能参考（M1 Mac）：60K 字符 transcript ≈ 5ms。
  * 浏览器端配合 debounce 使用，不要每个 keystroke 都跑。
+ *
+ * P4-2：超长输入短路成便宜估算，杜绝「一个请求同步 encode 数十 MB 把进程钉死」。
  */
 export function estimateTokens(text: string): number {
   if (!text) return 0;
+  if (text.length > EXACT_ENCODE_MAX_CHARS) {
+    return estimateTokensFast(text);
+  }
   return encode(text).length;
 }
 
@@ -39,13 +66,19 @@ export function estimateTokensJoined(parts: readonly string[], separator = '\n')
  */
 export function truncateToTokensFromEnd(text: string, maxTokens: number): string {
   if (maxTokens <= 0 || !text) return '';
-  const tokens = encode(text);
-  if (tokens.length <= maxTokens) return text;
+  // P4-2：先按「最坏 8 字符/token」粗切尾部，把 encode 的工作量钉死在 maxTokens 量级，
+  // 而不是随输入长度线性增长（几十 MB 的输入会同步 encode 数秒）。粗切只多留不少留，
+  // 下面的精确按比例回切照常生效。
+  const coarseMaxChars = Math.max(EXACT_ENCODE_MAX_CHARS, maxTokens * 8);
+  const source =
+    text.length > coarseMaxChars ? text.slice(text.length - coarseMaxChars) : text;
+  const tokens = encode(source);
+  if (tokens.length <= maxTokens) return source;
 
   // 简单近似：按 token 比例反推字符位置，从尾部取
   const ratio = maxTokens / tokens.length;
-  const charStart = Math.max(0, Math.floor(text.length * (1 - ratio)));
-  return text.slice(charStart);
+  const charStart = Math.max(0, Math.floor(source.length * (1 - ratio)));
+  return source.slice(charStart);
 }
 
 /**
@@ -54,5 +87,9 @@ export function truncateToTokensFromEnd(text: string, maxTokens: number): string
  */
 export function isWithinTokens(text: string, limit: number): boolean {
   if (!text) return true;
+  // P4-2：超长输入不 encode——它必然超限（便宜估算是高估，判 false 是安全方向）。
+  if (text.length > EXACT_ENCODE_MAX_CHARS) {
+    return estimateTokensFast(text) <= limit;
+  }
   return encode(text).length <= limit;
 }

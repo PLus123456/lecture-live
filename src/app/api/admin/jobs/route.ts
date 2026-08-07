@@ -2,7 +2,13 @@ import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { logAction } from '@/lib/auditLog';
 import { prisma } from '@/lib/prisma';
-import { queryJobs, retryJob, JOB_TYPE, JOB_STATUS } from '@/lib/jobQueue';
+import {
+  queryJobs,
+  retryJob,
+  isJobTypeRetryable,
+  JOB_TYPE,
+  JOB_STATUS,
+} from '@/lib/jobQueue';
 import {
   validateJobCleanupParams,
   olderThanDaysToCutoff,
@@ -92,10 +98,17 @@ export async function POST(req: Request) {
 
     const ok = await retryJob(jobId);
     if (!ok) {
-      return NextResponse.json(
-        { error: '无法重试：任务不存在、未失败或已达最大重试次数' },
-        { status: 409 },
-      );
+      // L10/P5-16：retryJob 现在还会为「该类型没有消费者」和「同会话已有活跃任务占着 activeKey」
+      // 返回 false。都用同一句「未失败或已达上限」会把管理员引到错误的排查方向，所以先按类型分流。
+      const job = await prisma.jobQueue.findUnique({
+        where: { id: jobId },
+        select: { type: true },
+      });
+      const message =
+        job && !isJobTypeRetryable(job.type)
+          ? `无法重试：任务类型 ${job.type} 由系统自动调度，没有可重投的消费者`
+          : '无法重试：任务不存在、未失败、已达最大重试次数，或同会话已有进行中的同类任务';
+      return NextResponse.json({ error: message }, { status: 409 });
     }
 
     logAction(req, 'admin.job.retry', {

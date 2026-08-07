@@ -4,6 +4,10 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { logAction } from '@/lib/auditLog';
 import { encrypt } from '@/lib/crypto';
 import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
+import {
+  requiresSecretReentry,
+  retargetErrorMessage,
+} from '@/lib/credentialRetarget';
 
 export const runtime = 'nodejs';
 
@@ -57,6 +61,22 @@ export async function PATCH(
       data.status = 'UNVERIFIED';
       data.lastError = null;
     }
+
+    // 改端点必须重填 token（P2-2）：只改 baseUrl、token 留空 = 沿用已存 token，
+    // 之后调度器和 verify 都会把解密后的真实 token 以 Authorization: Bearer 发到新地址。
+    if (
+      requiresSecretReentry({
+        endpoint: [{ current: existing.baseUrl, next: data.baseUrl }],
+        hasStoredSecret: Boolean(existing.token),
+        suppliedSecret: body.token,
+      })
+    ) {
+      return NextResponse.json(
+        { error: retargetErrorMessage('worker 地址', 'worker token') },
+        { status: 400 }
+      );
+    }
+
     if (typeof body.enabled === 'boolean') data.enabled = body.enabled;
     if (body.concurrency !== undefined) data.concurrency = clampInt(body.concurrency, existing.concurrency, 1, 8);
     if (body.weight !== undefined) data.weight = clampInt(body.weight, existing.weight, 1, 100);

@@ -406,3 +406,42 @@ describe('U41 混合维度缓存自愈（变动 chunk 在最前时守卫仍生�
     expect(out).toContain('seg2 gamma topic');
   });
 });
+
+describe('L2 超长单段二次切分', () => {
+  it('单段远超 CHUNK_MAX_TOKENS → 拆成多个 ≤250「token」的 chunk，不再产出巨块', async () => {
+    // estimateTokens 被 stub 成字符数 → 2000 字符 = 2000「token」，远超 CHUNK_MAX_TOKENS=250。
+    // 真实来源：异步上传/完整版转录的 converter 在长时间无停顿、不换人时会吐出这种巨段。
+    const huge = 'gamma '.repeat(340).trim(); // ~2039 字符，全程无换行
+    await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-oversized',
+      query: 'gamma',
+      transcript: makeSegments([huge]),
+      maxTokens: 100_000,
+    });
+
+    const embedded = callEmbeddingMock.mock.calls[0][0];
+    expect(embedded.length).toBeGreaterThan(1);
+    for (const chunk of embedded) {
+      expect(chunk.length).toBeLessThanOrEqual(250);
+    }
+    // 内容不得丢失：所有片拼回去应覆盖原文的全部非空白字符
+    const rejoined = embedded.join(' ').replace(/\s+/g, '');
+    expect(rejoined).toBe(huge.replace(/\s+/g, ''));
+  });
+
+  it('超长段之后的正常段，chunk 起点时间取自它自己而非前一段', async () => {
+    const huge = 'alpha '.repeat(200).trim(); // ~1199 字符
+    const out = await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-oversized-2',
+      query: 'beta',
+      transcript: [
+        { text: huge, startMs: 0 },
+        { text: 'beta tail segment', startMs: 600_000 },
+      ],
+      maxTokens: 100_000,
+    });
+    // 命中的 beta 块带的时间标签应是 10:00（600s），不是 00:00
+    expect(out).toContain('beta tail segment');
+    expect(out).not.toMatch(/\[00:00[^\]]*\][^[]*beta tail segment/);
+  });
+});

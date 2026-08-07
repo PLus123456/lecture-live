@@ -29,11 +29,11 @@ interface SnapshotPayload {
 export class LiveBroadcaster {
   private socket: Socket;
   private sessionId: string;
-  // C16/U11：缓存最近一次同步的全量快照。直播中途开分享时，服务端的 sync_snapshot
-  // 监听器要等 await authenticateBroadcaster 之后才注册；若首帧快照在监听器就位前
-  // 到达会被丢弃，导致晚加入观众丢失开分享前的全部转录/摘要。故在底层 socket 每次
-  // 'connect'（含自动重连）触发时，若已有缓存快照则补发一次，保证监听器无论注册多晚、
-  // 无论是否重连，主播都会在连上后向服务端补齐全量快照。
+  // C16/U11：缓存最近一次同步的全量快照，并在底层 socket 每次 'connect'（含自动
+  // 重连）时补发一次，保证主播无论怎么抖动，服务端内存里始终是完整历史。
+  // 服务端已把 sync_snapshot 监听器提到鉴权之前注册（server.ts），这里的补发是第二道
+  // 保险，也是**重连后**对齐服务端的唯一手段（重连的 socket 没有首帧快照）。
+  // 关键：增量必须折回本字段，否则补发的是开分享瞬间的旧态（见 foldIntoSnapshot）。
   private lastSnapshot: SnapshotPayload | null = null;
 
   constructor(
@@ -78,7 +78,36 @@ export class LiveBroadcaster {
     this.socket.emit('sync_snapshot', snapshot);
   }
 
+  /**
+   * U11：把增量折回缓存快照。调用方只在开分享那一刻 syncSnapshot 一次，之后全靠
+   * 增量；若增量不折回，'connect' 补发的就是「开分享瞬间」的旧快照——而服务端
+   * sync_snapshot 是**全量覆盖**语义，主播抖动重连后这份旧快照会把服务端累积的
+   * 增量整个抹掉，晚加入的观众只看到残缺 backlog（主播离线 >20s 更是空的）。
+   * 与服务端 mergeEventIntoSnapshot 同口径：按 id 原地替换，无则追加。
+   *
+   * lastSnapshot 为空（尚未 syncSnapshot）时不凭空造一份：残缺快照一旦补发，
+   * 反而会覆盖掉服务端从草稿恢复出的完整历史。
+   */
+  private foldIntoSnapshot(mutate: (snapshot: SnapshotPayload) => void) {
+    if (!this.lastSnapshot) return;
+    mutate(this.lastSnapshot);
+  }
+
   broadcastTranscriptDelta(delta: Partial<TranscriptSegment>) {
+    this.foldIntoSnapshot((snapshot) => {
+      const id = delta.id;
+      const index = id
+        ? snapshot.segments.findIndex((segment) => segment.id === id)
+        : -1;
+      if (index === -1) {
+        snapshot.segments = [...snapshot.segments, delta as TranscriptSegment];
+      } else {
+        snapshot.segments = snapshot.segments.map((segment, i) =>
+          i === index ? (delta as TranscriptSegment) : segment
+        );
+      }
+    });
+
     this.socket.emit('broadcast', {
       sessionId: this.sessionId,
       event: {
@@ -99,6 +128,16 @@ export class LiveBroadcaster {
       ? translation.slice(0, MAX_TRANSLATION_LENGTH)
       : translation;
 
+    this.foldIntoSnapshot((snapshot) => {
+      snapshot.translations = {
+        ...snapshot.translations,
+        [segmentId]: safeTrans,
+      };
+      if (meta?.sourceLang) snapshot.sourceLang = meta.sourceLang;
+      if (meta?.targetLang) snapshot.targetLang = meta.targetLang;
+      if (meta?.translationMode) snapshot.translationMode = meta.translationMode;
+    });
+
     this.socket.emit('broadcast', {
       sessionId: this.sessionId,
       event: {
@@ -110,6 +149,27 @@ export class LiveBroadcaster {
   }
 
   broadcastSummaryUpdate(summaryBlock: SummaryBlock) {
+    this.foldIntoSnapshot((snapshot) => {
+      // 与服务端 mergeSummaryBlock 一致：优先按 id 匹配，缺 id 时退到 blockIndex
+      const index = snapshot.summaryBlocks.findIndex((block) => {
+        if (summaryBlock.id && block.id) return block.id === summaryBlock.id;
+        if (
+          typeof summaryBlock.blockIndex === 'number' &&
+          typeof block.blockIndex === 'number'
+        ) {
+          return block.blockIndex === summaryBlock.blockIndex;
+        }
+        return false;
+      });
+      if (index === -1) {
+        snapshot.summaryBlocks = [...snapshot.summaryBlocks, summaryBlock];
+      } else {
+        snapshot.summaryBlocks = snapshot.summaryBlocks.map((block, i) =>
+          i === index ? summaryBlock : block
+        );
+      }
+    });
+
     this.socket.emit('broadcast', {
       sessionId: this.sessionId,
       event: {
@@ -125,6 +185,11 @@ export class LiveBroadcaster {
     previewText: StreamingPreviewText;
     previewTranslation: StreamingPreviewTranslation;
   }) {
+    this.foldIntoSnapshot((snapshot) => {
+      snapshot.previewText = payload.previewText;
+      snapshot.previewTranslation = payload.previewTranslation;
+    });
+
     this.socket.emit('broadcast', {
       sessionId: this.sessionId,
       event: {
@@ -136,6 +201,10 @@ export class LiveBroadcaster {
   }
 
   broadcastStatusUpdate(status: string) {
+    this.foldIntoSnapshot((snapshot) => {
+      snapshot.status = status;
+    });
+
     this.socket.emit('broadcast', {
       sessionId: this.sessionId,
       event: {

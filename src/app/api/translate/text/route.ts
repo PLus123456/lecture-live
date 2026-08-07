@@ -73,6 +73,50 @@ export async function POST(req: Request) {
       );
     }
 
+    // L21：模型解析与鉴权必须排在计费**之前**。原顺序是「先扣钱再鉴权」，per_char 模式下
+    // 组绑定模型不在 allowedModels 时必现：/api/translate/models 会把组绑定模型当默认项
+    // 下发给前端（管理员决策可越过 allowedModels），前端把它当 modelId 回传，这里却按
+    // allowedModels 判 403 —— 钱已经扣了。再叠加自动翻译 800ms 防抖，用户每敲一次键盘
+    // 就被扣一次、一次译文也拿不到。
+    //
+    // 模型优先级：用户显式选择（须挂 TRANSLATION 用途；allowedModels 门禁，组绑定模型豁免）>
+    // 组绑定翻译模型（管理员决策，可越过 allowedModels）> 全局 TRANSLATION 默认
+    const groupModelId = await resolveUserTranslationModelId(selection.user).catch(
+      () => null
+    );
+    let routing: { modelId: string } | { purpose: LlmPurpose } = {
+      purpose: 'TRANSLATION',
+    };
+    if (requestedModelId) {
+      const cfg = await getModelById(requestedModelId).catch(() => null);
+      const purposeOk = cfg?.dbModelId === requestedModelId && cfg.purpose === 'TRANSLATION';
+      // allowedModels 门禁与 /api/llm/models 同口径：'*' 全允许；token 命中 DB id/底层 modelId/网关名
+      const allowedTokens = selection.user.allowedModels
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const accessOk =
+        purposeOk &&
+        cfg !== null &&
+        (selection.user.role === 'ADMIN' ||
+          selection.user.allowedModels === '*' ||
+          // L21：组绑定模型就是 /api/translate/models 下发的默认项，必须与那边同口径放行，
+          // 否则「按默认值提交」这条最常见路径恒 403。
+          requestedModelId === groupModelId ||
+          allowedTokens.some(
+            (tkn) => tkn === requestedModelId || tkn === cfg.model || tkn === cfg.name
+          ));
+      if (!accessOk) {
+        return NextResponse.json(
+          { error: '所选模型不可用或未授权' },
+          { status: 403 }
+        );
+      }
+      routing = { modelId: requestedModelId };
+    } else {
+      routing = (await resolveGroupBoundModel(groupModelId, 'TRANSLATION')).routing;
+    }
+
     // 计费：free=每日额度（请求时预消耗，彻底失败回滚）；per_char=钱包按千字符扣分
     let chargedCents = 0;
     if (settings.translation_text_billing_mode === 'per_char') {
@@ -114,40 +158,6 @@ export async function POST(req: Request) {
         );
       }
       quotaConsumed = quota.limit > 0;
-    }
-
-    // 模型优先级：用户显式选择（校验挂在 TRANSLATION 用途 + allowedModels 门禁）>
-    // 组绑定翻译模型（管理员决策，可越过 allowedModels）> 全局 TRANSLATION 默认
-    let routing: { modelId: string } | { purpose: LlmPurpose } = {
-      purpose: 'TRANSLATION',
-    };
-    if (requestedModelId) {
-      const cfg = await getModelById(requestedModelId).catch(() => null);
-      const purposeOk = cfg?.dbModelId === requestedModelId && cfg.purpose === 'TRANSLATION';
-      // allowedModels 门禁与 /api/llm/models 同口径：'*' 全允许；token 命中 DB id/底层 modelId/网关名
-      const allowedTokens = selection.user.allowedModels
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const accessOk =
-        purposeOk &&
-        cfg !== null &&
-        (selection.user.role === 'ADMIN' ||
-          selection.user.allowedModels === '*' ||
-          allowedTokens.some(
-            (tkn) => tkn === requestedModelId || tkn === cfg.model || tkn === cfg.name
-          ));
-      if (!accessOk) {
-        if (quotaConsumed) await releaseDailyTextQuota(user.id);
-        return NextResponse.json(
-          { error: '所选模型不可用或未授权' },
-          { status: 403 }
-        );
-      }
-      routing = { modelId: requestedModelId };
-    } else {
-      const groupModelId = await resolveUserTranslationModelId(selection.user);
-      routing = (await resolveGroupBoundModel(groupModelId, 'TRANSLATION')).routing;
     }
 
     const { system, user: userMsg } = buildTextTranslationPrompt(

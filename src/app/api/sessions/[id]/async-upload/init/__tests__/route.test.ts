@@ -179,7 +179,7 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
   });
 
   it('B2：客户端把 estimatedDurationMs 压到 1ms 骗门禁 → 仍按文件大小 floor 预留（堵少报绕过）', async () => {
-    // 300MB 音频（size floor = 300），声明 1ms → max(ceil(1/60000)=1, 300)=300
+    // 300MB 有损音频（floor = ceil(300/2.5) = 120），声明 1ms → max(1, 120)=120
     await POST(
       makeReq(
         validBody({
@@ -191,7 +191,7 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
       { params }
     );
 
-    expect(reserveTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 300);
+    expect(reserveTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 120);
   });
 
   it('B1 re-init：claim 事务在锁内读到旧预留(12) → 同一事务释放它，净预留=本次', async () => {
@@ -200,10 +200,10 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
       { asyncTranscribeStatus: 'failed', asyncReservedMinutes: 12 },
     ]);
 
-    await POST(makeReq(validBody()), { params }); // 30MB → 本次预留 30
+    await POST(makeReq(validBody()), { params }); // 30MB mp3 → 本次预留 ceil(30/2.5)=12
 
-    // 本次 reserve 30；在 claim 事务内释放旧预留 12（第三参为事务 tx）
-    expect(reserveTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 30);
+    // 本次 reserve 12；在 claim 事务内释放旧预留 12（第三参为事务 tx）
+    expect(reserveTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 12);
     expect(releaseTranscriptionMinutesMock).toHaveBeenCalledWith(
       'user-1',
       12,
@@ -211,12 +211,13 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
     );
   });
 
-  it('无声明时长：按文件大小粗估（音频 ~1MB/min）→ 30MB ≈ 30 分钟', async () => {
+  it('P5-19：无声明时长时 floor 按「格式码率上限」折算（有损音频 2.5MB/min）→ 30MB = 12 分钟', async () => {
+    // 旧口径按「典型码率」1MB/min → 30 分钟，是真实时长的上界而非下界，无损/高码率文件必然误拒。
     await POST(makeReq(validBody()), { params });
-    expect(reserveTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 30);
+    expect(reserveTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 12);
   });
 
-  it('视频无声明时长：按 ~5MB/min 粗估 → 50MB ≈ 10 分钟', async () => {
+  it('P5-19：视频 floor 按 150MB/min 上限折算 → 50MB = 1 分钟（下界，不是估计值）', async () => {
     await POST(
       makeReq(
         validBody({
@@ -227,7 +228,26 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
       ),
       { params }
     );
-    expect(reserveTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 10);
+    expect(reserveTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 1);
+  });
+
+  it('P5-19（核心）：无损 WAV 声明真实 5 分钟 → 预留 5，不再被 size floor 顶成误 403', async () => {
+    // 5 分钟 44.1kHz/16bit 立体声 WAV ≈ 50MB。旧口径 floor = ceil(50/1) = 50 分钟 → 额度只剩 10 分钟
+    // 的诚实用户直接 403（U22 的真正成因：只补客户端字段修不掉）。新口径 floor = ceil(50/36) = 2，
+    // 取 max(声明 5, 2) = 5。
+    await POST(
+      makeReq(
+        validBody({
+          originalFileName: 'lecture.wav',
+          originalMimeType: 'audio/wav',
+          originalSize: 50 * 1024 * 1024,
+          totalChunks: 3,
+          estimatedDurationMs: 5 * 60_000,
+        })
+      ),
+      { params }
+    );
+    expect(reserveTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 5);
   });
 
   it('initAsyncUpload 抛错 → 500，退回 failed + settleAsyncReservation 原子结算本次预留', async () => {
@@ -256,8 +276,8 @@ describe('POST async-upload/init — 原子配额预留门禁', () => {
 
     expect(res.status).toBe(409);
     expect(initAsyncUploadMock).not.toHaveBeenCalled();
-    // 撤销本次预留（reserve 已发生）：release 一次，30 分钟
-    expect(releaseTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 30);
+    // 撤销本次预留（reserve 已发生）：release 一次，12 分钟（30MB mp3 的 floor）
+    expect(releaseTranscriptionMinutesMock).toHaveBeenCalledWith('user-1', 12);
   });
 
   it('P0-6：会话已收尾(COMPLETED)→409 session_finalized，绝不预留/建 manifest（防覆盖最终录音）', async () => {

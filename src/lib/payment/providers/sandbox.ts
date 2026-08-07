@@ -34,6 +34,7 @@ export class SandboxProvider implements PaymentProvider {
     if (!outTradeNo) return null;
     const action =
       url.searchParams.get('action') ?? bodyParams.get('action') ?? 'pay';
+    // 沙箱不回报金额，也不回报币种 → 上层跳过 (amount, currency) 对账（同 amountCents 的口径）。
     return {
       outTradeNo,
       paid: action !== 'cancel',

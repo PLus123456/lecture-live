@@ -9,6 +9,10 @@ import {
 import { serializeProviderForAdmin } from '@/lib/llm/providerAdmin';
 import { logAction } from '@/lib/auditLog';
 import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
+import {
+  requiresSecretReentry,
+  retargetErrorMessage,
+} from '@/lib/credentialRetarget';
 
 // 更新 LLM 供应商
 export async function PATCH(
@@ -66,6 +70,23 @@ export async function PATCH(
         );
       }
     }
+
+    // 改端点必须重填密钥（P2-2）：只改 apiBase、apiKey 留空 = 沿用已存密钥，
+    // 之后每一次 LLM 调用都会把解密后的真实 apiKey 以 Authorization 发到新地址。
+    // 上面的私网黑名单只挡内网，公网的攻击者地址照样过 —— 换靶这一层必须单独挡。
+    if (
+      requiresSecretReentry({
+        endpoint: [{ current: existing.apiBase, next: updateData.apiBase }],
+        hasStoredSecret: Boolean(existing.apiKey),
+        suppliedSecret: body.apiKey,
+      })
+    ) {
+      return NextResponse.json(
+        { error: retargetErrorMessage('API Base', 'API Key') },
+        { status: 400 }
+      );
+    }
+
     if (body.isAnthropic !== undefined) updateData.isAnthropic = body.isAnthropic;
     if (body.sortOrder !== undefined) updateData.sortOrder = body.sortOrder;
 

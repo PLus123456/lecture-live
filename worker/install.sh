@@ -71,14 +71,40 @@ else
         x86_64)        TARGETS=("x86_64-unknown-linux-musl" "x86_64-unknown-linux-gnu") ;;
         *)             TARGETS=() ;;
     esac
+    # C39/P6-11：下载落到**私有临时目录**而不是固定的 /tmp/deep-filter.dl。
+    # 固定路径可被本机任意用户提前创建（软链/占位），随后被 install 成 root 拥有的
+    # 可执行文件。mktemp -d 生成不可预测目录，权限 0700，trap 保证异常路径也清干净。
+    DF_TMPDIR="$(mktemp -d /tmp/lecturelive-deepfilter.XXXXXXXX)"
+    chmod 700 "$DF_TMPDIR"
+    trap 'rm -rf "$DF_TMPDIR"' EXIT
+    DF_DL="$DF_TMPDIR/deep-filter.dl"
+
     DF_OK=""
     for TARGET in "${TARGETS[@]:-}"; do
         [[ -n "$TARGET" ]] || continue
         URL="https://github.com/Rikorose/DeepFilterNet/releases/download/v${DEEP_FILTER_VERSION}/deep-filter-${DEEP_FILTER_VERSION}-${TARGET}"
         info "尝试下载 deep-filter: $URL"
-        if curl -fsSL --connect-timeout 15 -o /tmp/deep-filter.dl "$URL"; then
-            install -m 0755 /tmp/deep-filter.dl /usr/local/bin/deep-filter
-            rm -f /tmp/deep-filter.dl
+        if curl -fsSL --connect-timeout 15 -o "$DF_DL" "$URL"; then
+            # 校验和：优先用环境变量 DEEP_FILTER_SHA256 提供的钉子（可按 target 分别提供
+            # DEEP_FILTER_SHA256_<TARGET 中的连字符转下划线>）。给了就必须对得上，否则拒装；
+            # 没给就把实测值打出来，运维可以钉进部署流程再复跑。
+            DF_ACTUAL_SHA="$(sha256sum "$DF_DL" | awk '{print $1}')"
+            TARGET_VAR="DEEP_FILTER_SHA256_${TARGET//-/_}"
+            DF_EXPECTED_SHA="${!TARGET_VAR:-${DEEP_FILTER_SHA256:-}}"
+            if [[ -n "$DF_EXPECTED_SHA" ]]; then
+                if [[ "$DF_ACTUAL_SHA" != "$DF_EXPECTED_SHA" ]]; then
+                    warn "deep-filter 校验和不符（期望 $DF_EXPECTED_SHA，实际 $DF_ACTUAL_SHA），拒绝安装"
+                    rm -f "$DF_DL"
+                    continue
+                fi
+                info "deep-filter 校验和匹配"
+            else
+                warn "未提供 DEEP_FILTER_SHA256（或 ${TARGET_VAR}），本次下载未做完整性校验"
+                warn "实测 sha256=${DF_ACTUAL_SHA}，建议钉进部署流程后重跑本脚本"
+            fi
+
+            install -m 0755 "$DF_DL" /usr/local/bin/deep-filter
+            rm -f "$DF_DL"
             if deep-filter --version &>/dev/null || deep-filter --help &>/dev/null; then
                 DF_OK=1
                 info "deep-filter 安装成功: /usr/local/bin/deep-filter"
@@ -88,6 +114,9 @@ else
             rm -f /usr/local/bin/deep-filter
         fi
     done
+
+    rm -rf "$DF_TMPDIR"
+    trap - EXIT
     if [[ -z "$DF_OK" ]]; then
         warn "deep-filter 自动安装失败——worker 仍可运行，降噪将回落 ffmpeg afftdn（效果较弱）。"
         warn "可稍后手动安装（见 worker/README.md），装好后 systemctl restart ${SERVICE_NAME} 即可生效。"

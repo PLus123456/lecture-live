@@ -60,5 +60,11 @@ RUN mkdir -p /app/node_modules/.bin \
 USER nextjs
 EXPOSE 3000 3001
 ENV PORT=3000
+# L7：本镜像是单容器（entrypoint 同时拉起 Next 与 WS），WS 挂了整个容器就不该报健康。
+# health.ts 见此变量才把 websocket down 从 degraded 升级成 down（→ /api/health 回 503
+# → 下面的 HEALTHCHECK 转红，编排器/负载均衡据此摘流量）。真正的重启由 entrypoint 负责：
+# 任一子进程退出即整体退出，交给 restart policy——原生 docker 的 restart policy 只看退出，
+# 不看 health 状态。分体部署不设本变量，避免 WS 抖动把 Web 摘出负载均衡。
+ENV HEALTH_WS_REQUIRED=1
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD wget -qO- http://127.0.0.1:3000/api/health >/dev/null || exit 1
 CMD ["./docker-entrypoint.sh"]

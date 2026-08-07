@@ -10,7 +10,7 @@ import {
   enqueueAudioEnhance,
   runAudioEnhanceTick,
 } from '@/lib/audio/enhanceProcessor';
-import { JOB_TYPE, JOB_STATUS } from '@/lib/jobQueue';
+import { audioEnhanceActiveKey } from '@/lib/jobQueue';
 
 // 手动触发录音音频增强（响度归一化 + 降噪，外部 worker 异步处理）。
 // 免费增值路径：不扣配额、不预留分钟；重资源消耗由站点开关 + 用户组能力开关双重门禁。
@@ -77,13 +77,12 @@ export const POST = withRequestLogging(
       );
     }
 
-    // 幂等：已有在途任务直接返回现状（enqueueAudioEnhance 内部同样兜底，这里提早给出准确响应）
+    // 幂等：已有在途任务直接返回现状。
+    // P5-16：改查 activeKey（唯一索引，非终态期间持有）而不是「type+sessionId+status in [...]」——
+    // 后者是纯读，两个并发请求会双双查空、各建一行；真正的互斥由 enqueueAudioEnhance 里的
+    // 唯一键插入冲突保证，这里只是提早给出准确响应。
     const active = await prisma.jobQueue.findFirst({
-      where: {
-        type: JOB_TYPE.AUDIO_ENHANCE,
-        sessionId: id,
-        status: { in: [JOB_STATUS.SUBMITTED, JOB_STATUS.PROCESSING] },
-      },
+      where: { activeKey: audioEnhanceActiveKey(id) },
       select: { id: true },
     });
     if (active) {

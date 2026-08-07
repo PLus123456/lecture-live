@@ -44,8 +44,9 @@ export const POST = withRequestLogging('admin:recharge:adjust', async (req: Requ
   const amountCentsDelta = Number(body.amountCentsDelta ?? 0);
   const minutesDelta = Number(body.minutesDelta ?? 0);
 
+  let effective: { amountCentsDelta: number; minutesDelta: number };
   try {
-    await adminAdjust({
+    effective = await adminAdjust({
       userId,
       amountCentsDelta: Number.isFinite(amountCentsDelta) ? amountCentsDelta : 0,
       minutesDelta: Number.isFinite(minutesDelta) ? minutesDelta : 0,
@@ -60,9 +61,16 @@ export const POST = withRequestLogging('admin:recharge:adjust', async (req: Requ
     return NextResponse.json({ error: '调整失败' }, { status: 500 });
   }
 
+  // 记**实际生效**值（P3-18）：调整会按余额/池余额截断，记请求值会和台账里的截断值互相矛盾，
+  // 事后没人分得清哪个是真的。请求值另行附上，便于看出被截断了多少。
   logAction(req, 'admin.recharge.adjust', {
     user: admin,
-    detail: `调整用户 ${userId}: 余额${amountCentsDelta}分, 时长${minutesDelta}分钟`,
+    detail:
+      `调整用户 ${userId}: 余额${effective.amountCentsDelta}分, 时长${effective.minutesDelta}分钟` +
+      (effective.amountCentsDelta !== amountCentsDelta ||
+      effective.minutesDelta !== minutesDelta
+        ? `（请求值 余额${amountCentsDelta}分/时长${minutesDelta}分钟，已按余额截断）`
+        : ''),
   });
 
   const summary = await getWalletSummary(userId);

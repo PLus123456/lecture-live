@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
+import { enforceRateLimit } from '@/lib/rateLimit';
 import { checkQuota } from '@/lib/quota';
 import { createInterpretAnchor } from '@/lib/interpret/anchor';
 import { createInterpretSession } from '@/lib/interpret/session';
@@ -13,6 +14,18 @@ export async function POST(req: Request) {
   const payload = await verifyAuth(req);
   if (!payload) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  // P6-7：按用户限流（口径对齐 temporary-key 的 12/min）。每次调用都写一行 Redis 锚点 +
+  // 一行 InterpretSession，无闸门时脚本可无成本刷库；也是 start→mint→deduct 循环的第一道闸。
+  const rateLimited = await enforceRateLimit(req, {
+    scope: 'interpret:start:user',
+    limit: 12,
+    windowMs: 60_000,
+    key: `user:${payload.id}`,
+  });
+  if (rateLimited) {
+    return rateLimited;
   }
 
   const quotaOk = await checkQuota(payload.id, 'transcription_minutes');

@@ -45,6 +45,62 @@ describe('auth helpers', () => {
   });
 });
 
+describe('getJwtExpiryConfig 钳到剩余绝对寿命 (U51 / P6-5)', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const NOW = 1_800_000_000_000;
+
+  it('不传 sessionStartedAt 时只钳 30 天绝对上限（老口径不变）', () => {
+    expect(getJwtExpiryConfig(90)).toEqual({
+      expiresInDays: 30,
+      cookieMaxAge: 30 * 24 * 60 * 60,
+    });
+  });
+
+  it('会话已用 10 天时，jwt_expiry=90 只签剩下的 20 天', () => {
+    const config = getJwtExpiryConfig(90, {
+      sessionStartedAt: NOW - 10 * DAY,
+      now: NOW,
+    });
+    expect(config.expiresInDays).toBeCloseTo(20, 6);
+    expect(config.cookieMaxAge).toBe(20 * 24 * 60 * 60);
+  });
+
+  it('默认 7 天且会话已用 25 天时，只签剩下的 5 天', () => {
+    const config = getJwtExpiryConfig(undefined, {
+      sessionStartedAt: NOW - 25 * DAY,
+      now: NOW,
+    });
+    expect(config.expiresInDays).toBeCloseTo(5, 6);
+    expect(config.cookieMaxAge).toBe(5 * 24 * 60 * 60);
+  });
+
+  it('剩余寿命大于配置值时不放大（仍取较小者）', () => {
+    const config = getJwtExpiryConfig(7, {
+      sessionStartedAt: NOW - 1 * DAY,
+      now: NOW,
+    });
+    expect(config.expiresInDays).toBe(7);
+  });
+
+  it('会话已超绝对上限时钳到 0，不发未来时刻的 cookie', () => {
+    const config = getJwtExpiryConfig(30, {
+      sessionStartedAt: NOW - 31 * DAY,
+      now: NOW,
+    });
+    expect(config.expiresInDays).toBe(0);
+    expect(config.cookieMaxAge).toBe(0);
+  });
+
+  it('signToken 按（可能为小数的）天数签出对应的 exp', () => {
+    const halfDay = 0.5;
+    const before = Math.floor(Date.now() / 1000);
+    const token = signToken(SAMPLE_USER, { expiresInDays: halfDay });
+    const decoded = jwt.verify(token, JWT_SECRET) as { exp: number };
+    expect(decoded.exp).toBeGreaterThanOrEqual(before + 12 * 60 * 60 - 2);
+    expect(decoded.exp).toBeLessThanOrEqual(before + 12 * 60 * 60 + 2);
+  });
+});
+
 describe('刷新幂等辅助 (v3-R7)', () => {
   beforeEach(() => {
     // 无 REDIS_URL → getRedisClient 返回 null → 走内存宽限存储；每例前清空。

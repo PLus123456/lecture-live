@@ -170,6 +170,9 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
         file,
         sessionId: session.id,
         authToken: token,
+        // U22/P5-19：把浏览器实测时长交给 init 的配额门禁（探测失败为 0 → 不传，服务端回落大小下界）。
+        // 注意别传 effectiveDurationMs：那是按文件大小的粗估，与服务端下界同源，传了等于没传。
+        estimatedDurationMs: audioDurationMs > 0 ? audioDurationMs : undefined,
         onUploadProgress: (p) => uploadJobs.update(id, { uploadProgress: p }),
         onProcessingProgress: (p) =>
           uploadJobs.update(id, { processingProgress: p }),

@@ -115,6 +115,11 @@ model Session {
   // 归期会把它算错周期、虚报 drift。与 InterpretUsage.chargedAt 同一"按扣费时刻归期"口径。
   // 多笔扣费(realtime + 完整版补全)时为最后一笔的时刻(last-write)；同周期常态无碍。
   billedAt           DateTime?
+  // P5-5：本会话累计实扣分钟（只增不改的计费台账列，口径与 deductTranscriptionMinutes 一字一致）。
+  // 对账 expected 直接读这一列，不再从可变的 durationMs/fullTranscribeStatus + 当前倍率重算——
+  // 后者会因「改倍率」全站失真、也会把「完整版转录重跑 N 次真扣 N 笔」只算成 1 笔。
+  // 与 InterpretUsage.billedMinutes / SonioxStreamGrant.billedMinutes 同一追加型台账惯例。
+  billedMinutes      Int           @default(0)
 
   // v2.1: 音频源 & 区域
   audioSource  String @default("microphone") // "microphone" | "system_audio"
@@ -471,6 +476,10 @@ model JobQueue {
   createdAt   DateTime  @default(now())
   startedAt   DateTime? // 开始处理时间
   completedAt DateTime? // 处理完成时间
+  // P5-16：活跃任务互斥键，形如 "audio_enhance:{sessionId}"。仅在非终态时持有，落终态即置 null。
+  // MySQL 允许 NULL 重复，故这一列的 @unique 天然等价于「每个 key 至多一个活跃任务」的部分唯一索引，
+  // 把 check-then-act 的幂等判定收敛成一次插入冲突。
+  activeKey   String?   @unique
 
   @@index([type])
   @@index([status])
@@ -593,8 +602,13 @@ model PaymentOrder {
   outTradeNo   String    @unique // 我方订单号（传给网关、回调据此认领）
   providerRef  String? // 网关侧订单号/流水号（审计）
   amountCents  Int // 应付金额（分）
-  status       String    @default("pending") // pending | paid | failed | expired | canceled
+  // P3-15：下单时锁定的 ISO-4217 币种码（大写）。回调必须比对 (amount, currency) 二元组——
+  // 只比金额时 Stripe 侧「¥39 当成 $39」这类跨币种套利会静默过账。历史行只有金额，默认 CNY。
+  currency     String    @default("CNY")
+  status       String    @default("pending") // pending | paid | failed | expired | canceled | refunded
   paidAt       DateTime?
+  // P3-16：退款/拒付到账时刻。非 null 即表示这笔订单已被反向，权益应已冻结。
+  refundedAt   DateTime?
   metadataJson String?   @db.Text // 快照（档位内容/赠送等），审计
   createdAt    DateTime  @default(now())
   expiresAt    DateTime? // 超时未支付则由 cron 置 expired

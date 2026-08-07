@@ -6,7 +6,10 @@ const {
   sessionFindUniqueMock,
   sessionUpdateMock,
   sessionUpdateManyMock,
-  sessionCountMock,
+  txQueryRawMock,
+  txSessionUpdateManyMock,
+  settleAsyncReservationMock,
+  settleFullReservationMock,
   userFindUniqueMock,
   folderSessionDeleteManyMock,
   shareLinkDeleteManyMock,
@@ -25,7 +28,10 @@ const {
   sessionFindUniqueMock: vi.fn(),
   sessionUpdateMock: vi.fn(),
   sessionUpdateManyMock: vi.fn(),
-  sessionCountMock: vi.fn(),
+  txQueryRawMock: vi.fn(),
+  txSessionUpdateManyMock: vi.fn(),
+  settleAsyncReservationMock: vi.fn(),
+  settleFullReservationMock: vi.fn(),
   userFindUniqueMock: vi.fn(),
   folderSessionDeleteManyMock: vi.fn(),
   shareLinkDeleteManyMock: vi.fn(),
@@ -45,6 +51,11 @@ vi.mock('@/lib/auth', () => ({
   verifyAuth: verifyAuthMock,
 }));
 
+// P5-15 附带：PATCH 加了宽松的按用户限流。单测里恒放行（限流本身有独立单测）。
+vi.mock('@/lib/rateLimit', () => ({
+  enforceRateLimit: vi.fn().mockResolvedValue(null),
+}));
+
 vi.mock('@/lib/prisma', () => ({
   prisma: {
     session: {
@@ -52,7 +63,6 @@ vi.mock('@/lib/prisma', () => ({
       update: sessionUpdateMock,
       updateMany: sessionUpdateManyMock,
       delete: sessionDeleteMock,
-      count: sessionCountMock,
     },
     // B4：并发上限校验前会取一次 owner.customGroupId 以解析用户组 cap。
     user: {
@@ -92,9 +102,10 @@ vi.mock('@/lib/audio/asyncUploadProcessor', () => ({
 
 // B1/R4：DELETE 删会话前用 settleAsyncReservation / settleFullReservation 原子结算在途预留。桩为
 // no-op，避免它内部自开 prisma.$transaction 干扰本用例对删除级联事务次数的断言。
+// P5-8：结算失败必须拒删，故要能让桩 reject。
 vi.mock('@/lib/quota', () => ({
-  settleAsyncReservation: vi.fn().mockResolvedValue(0),
-  settleFullReservation: vi.fn().mockResolvedValue(0),
+  settleAsyncReservation: settleAsyncReservationMock,
+  settleFullReservation: settleFullReservationMock,
 }));
 
 // B4：并发上限由用户组解析。桩返回固定 3，让这些用例的数值假设（<3 放行 / =3 拒）稳定，
@@ -125,8 +136,11 @@ describe('session detail route', () => {
     folderSessionDeleteManyMock.mockResolvedValue({ count: 1 });
     shareLinkDeleteManyMock.mockResolvedValue({ count: 1 });
     sessionDeleteMock.mockResolvedValue({ id: 'session-1' });
-    // B4：并发在途录音计数默认 0（未达上限）；具体 cap 用例单独 override。
-    sessionCountMock.mockReset().mockResolvedValue(0);
+    // P5-15：并发计数改为事务内的 `SELECT ... FOR UPDATE`（锁定读），默认无在途录音。
+    txQueryRawMock.mockReset().mockResolvedValue([]);
+    txSessionUpdateManyMock.mockReset().mockResolvedValue({ count: 1 });
+    settleAsyncReservationMock.mockReset().mockResolvedValue(0);
+    settleFullReservationMock.mockReset().mockResolvedValue(0);
     // B4：owner.customGroupId 默认 null（走系统角色 cap）；组 cap 桩默认 3（与旧硬编码上限一致）。
     userFindUniqueMock.mockReset().mockResolvedValue({ customGroupId: null });
     resolveMaxConcurrentMock.mockReset().mockResolvedValue(3);
@@ -137,7 +151,15 @@ describe('session detail route', () => {
     deleteRecordingDraftMock.mockReset().mockResolvedValue(undefined);
     deleteConversationsCascadeMock.mockReset().mockResolvedValue(0);
     cancelAsyncUploadMock.mockReset().mockResolvedValue(undefined);
-    transactionMock.mockImplementation(async (operations: unknown[]) => Promise.all(operations));
+    // $transaction 有两种调用形态：DELETE 传操作数组；PATCH 的并发闸传回调（注入 tx）。
+    transactionMock.mockImplementation(async (arg: unknown) =>
+      typeof arg === 'function'
+        ? (arg as (tx: unknown) => Promise<unknown>)({
+            $queryRaw: (...a: unknown[]) => txQueryRawMock(...a),
+            session: { updateMany: (...a: unknown[]) => txSessionUpdateManyMock(...a) },
+          })
+        : Promise.all(arg as unknown[])
+    );
   });
 
   it('返回当前用户拥有的会话详情', async () => {
@@ -172,8 +194,8 @@ describe('session detail route', () => {
     expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
-  it('B4：CREATED→RECORDING 且并发在途 < 上限 → 放行（按 RECORDING/PAUSED 计数）', async () => {
-    sessionCountMock.mockResolvedValueOnce(2); // 未达上限(3)
+  it('B4/P5-15：CREATED→RECORDING 且并发在途 < 上限 → 放行，且计数与写库在同一事务内', async () => {
+    txQueryRawMock.mockResolvedValueOnce([{ id: 'a' }, { id: 'b' }]); // 2 条在途，未达上限(3)
 
     const response = await PATCH(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {
@@ -184,14 +206,24 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(sessionCountMock).toHaveBeenCalledWith({
-      where: { userId: 'user-1', status: { in: ['RECORDING', 'PAUSED'] } },
+    // P5-15：计数必须是事务内的锁定读（FOR UPDATE），否则两个并发请求各自读到快照都放行。
+    expect(transactionMock).toHaveBeenCalledTimes(1);
+    expect(txQueryRawMock).toHaveBeenCalledTimes(1);
+    const sql = String(txQueryRawMock.mock.calls[0][0]);
+    expect(sql).toMatch(/FOR UPDATE/);
+    expect(sql).toMatch(/RECORDING/);
+    expect(sql).toMatch(/PAUSED/);
+    // 状态迁移写库也在同一事务内（tx.session.updateMany），而不是事务外的 prisma.session.updateMany。
+    expect(txSessionUpdateManyMock).toHaveBeenCalledTimes(1);
+    expect(txSessionUpdateManyMock.mock.calls[0][0].where).toEqual({
+      id: 'session-1',
+      status: 'CREATED',
     });
-    expect(sessionUpdateManyMock).toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
-  it('B4：CREATED→RECORDING 但并发在途已达上限 → 409，不写库', async () => {
-    sessionCountMock.mockResolvedValueOnce(3); // 已达上限
+  it('B4/P5-15：CREATED→RECORDING 但并发在途已达上限 → 409，事务内不写库', async () => {
+    txQueryRawMock.mockResolvedValueOnce([{ id: 'a' }, { id: 'b' }, { id: 'c' }]); // 已达上限
 
     const response = await PATCH(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {
@@ -202,6 +234,7 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(409);
+    expect(txSessionUpdateManyMock).not.toHaveBeenCalled();
     expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
@@ -255,7 +288,8 @@ describe('session detail route', () => {
       serverStartedAt: new Date('2026-07-11T00:00:00.000Z'),
       serverPausedAt: null,
     });
-    sessionCountMock.mockResolvedValue(99); // 即便很多在途，恢复也放行
+    // 即便很多在途，恢复暂停也放行 —— 根本不进并发闸事务。
+    txQueryRawMock.mockResolvedValue(Array.from({ length: 99 }, (_, i) => ({ id: `s${i}` })));
 
     const response = await PATCH(
       createJsonRequest('http://localhost:3000/api/sessions/session-1', {
@@ -266,7 +300,8 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(sessionCountMock).not.toHaveBeenCalled();
+    expect(txQueryRawMock).not.toHaveBeenCalled();
+    expect(transactionMock).not.toHaveBeenCalled();
   });
 
   it('C4: PATCH 无法把 FINALIZING 推到 COMPLETED（只能经 finalize 端点）', async () => {
@@ -519,6 +554,38 @@ describe('session detail route', () => {
       expect(cancelAsyncUploadMock).not.toHaveBeenCalled();
     }
   );
+
+  it('P5-8：在途预留结算失败 → 500 拒删，绝不删行（预留是行上的列，删了就成谁也够不到的孤儿）', async () => {
+    settleAsyncReservationMock.mockRejectedValueOnce(new Error('db down'));
+
+    const response = await DELETE(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'DELETE',
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(500);
+    // 旧实现 .catch(()=>undefined) 吞掉后照常删行 → 预留永久占着 transcriptionMinutesUsed，
+    // 兜底 cron 只扫存活行、永远扫不到；持池用户还会被 computePoolOwed 多扣池子。
+    expect(sessionDeleteMock).not.toHaveBeenCalled();
+    expect(transactionMock).not.toHaveBeenCalled();
+    expect(deleteSessionArtifactsMock).not.toHaveBeenCalled();
+  });
+
+  it('P5-8：完整版预留结算失败同样拒删', async () => {
+    settleFullReservationMock.mockRejectedValueOnce(new Error('db down'));
+
+    const response = await DELETE(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'DELETE',
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(500);
+    expect(sessionDeleteMock).not.toHaveBeenCalled();
+  });
 
   it('U8: 删除会话时 legacy 对话经 deleteConversationsCascade 删干净（含 Cloudreve 物理文件 + 释放字节）', async () => {
     conversationFindManyMock.mockResolvedValue([{ id: 'conv-1' }, { id: 'conv-2' }]);

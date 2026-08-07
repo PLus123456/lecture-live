@@ -214,8 +214,15 @@ startCloudreveTokenRefreshLoop();
 startAudioEnhanceLoop();
 startDocTranslateLoop();
 
-httpServer.listen(PORT, () => {
-  wsLogger.info({ port: PORT }, 'WebSocket server listening');
+// P6-1：监听地址可收敛。裸机 systemd 部署里 nginx 与本进程同机，systemd 单元会传
+// WS_HOST=127.0.0.1，3001 不再暴露到公网（此前只能靠防火墙兜底）。
+// 默认仍是 0.0.0.0：容器里 Docker 的端口转发是连**容器 IP**、不是容器内的 loopback，
+// 默认改成 127.0.0.1 会让 compose 的 `127.0.0.1:3001:3001` 直接连不通。
+// 容器侧的安全边界由 compose 把端口只发布在宿主 loopback 上保证。
+const HOST = process.env.WS_HOST || '0.0.0.0';
+
+httpServer.listen(PORT, HOST, () => {
+  wsLogger.info({ port: PORT, host: HOST }, 'WebSocket server listening');
 });
 
 async function shutdown(signal: string) {

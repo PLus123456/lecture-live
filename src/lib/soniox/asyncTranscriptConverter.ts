@@ -17,7 +17,11 @@
  */
 import type { RealtimeToken } from '@/types/soniox';
 import type { SessionConfig, TranscriptSegment } from '@/types/transcript';
-import { TokenProcessor } from './tokenProcessor';
+import {
+  TRANSLATION_MATCH_TOLERANCE_MS,
+  TokenProcessor,
+  distanceToRange,
+} from './tokenProcessor';
 import type { SonioxAsyncToken } from './asyncFile';
 
 /** 提取 translation 时只用到 segment 的 id + 时间区间，复用 TranscriptSegment 的形状 */
@@ -94,15 +98,41 @@ export function convertAsyncTokensToSegments(
 }
 
 /**
+ * 精确区间未命中时的兜底：取时间距离最近的段，超出容差返回 -1（真丢弃）。
+ * 距离相等时取更早的段（gap 正中间的 token 归左段，与"翻译落后于原文"的实际时序一致）。
+ */
+function findNearestSegmentIndex(
+  startMs: number,
+  segments: TranslationSegmentBounds[]
+): number {
+  let bestIdx = -1;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < segments.length; i++) {
+    const distance = distanceToRange(
+      startMs,
+      segments[i].startMs,
+      segments[i].endMs
+    );
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIdx = i;
+      if (distance === 0) break;
+    }
+  }
+  return bestDistance <= TRANSLATION_MATCH_TOLERANCE_MS ? bestIdx : -1;
+}
+
+/**
  * 从 Soniox 原始 tokens 里抽出翻译 token（translation_status === 'translation'），
  * 按 start_ms 归属到对应 segment，并拼接成每段的完整翻译文本。
  *
- * 归属规则：半开区间 [startMs, endMs)，最后一个 segment 双端闭合。这样相邻 segment
- * 的边界 token（start_ms === seg.endMs）会归到右边的 segment，与 realtime 路径
- * "按时间最近匹配"的语义一致。
+ * 归属规则：先按半开区间 [startMs, endMs) 精确命中（最后一个 segment 双端闭合），
+ * 这样相邻 segment 的边界 token（start_ms === seg.endMs）仍归右边的 segment。
  *
- * 落在 segment gap 里（说话人停顿/标点切段后的空隙）的 token 会安静跳过 —— 允许少量
- * 丢失，下游 UI 仍能正常渲染。
+ * V1a：精确命中失败时**不再直接丢弃**，改为退到「时间距离最近且在容差内」的段
+ * （复用 realtime 的 distanceToRange + TRANSLATION_MATCH_TOLERANCE_MS）。零容差下
+ * 落在段间空隙（停顿切段留下的 gap）或末段尾巴之后一点点的翻译 token 会被静默丢掉，
+ * 整段译文凭空缺失。超出容差的才真正跳过。
  *
  * 翻译 token 之间在中文/中英混合场景下通常没有空格，直接 join('') 拼接即可。
  */
@@ -118,11 +148,14 @@ export function extractTranslationsByTokens(
     if (token.translation_status !== 'translation') continue;
 
     const startMs = token.start_ms;
-    const segIdx = segments.findIndex((s, i) =>
+    let segIdx = segments.findIndex((s, i) =>
       i === lastIndex
         ? startMs >= s.startMs && startMs <= s.endMs
         : startMs >= s.startMs && startMs < s.endMs
     );
+    if (segIdx === -1) {
+      segIdx = findNearestSegmentIndex(startMs, segments);
+    }
     if (segIdx === -1) continue;
 
     (parts[segments[segIdx].id] ??= []).push(token.text);

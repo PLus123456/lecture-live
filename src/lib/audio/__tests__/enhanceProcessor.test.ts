@@ -137,21 +137,43 @@ beforeEach(() => {
 });
 
 describe('enqueueAudioEnhance', () => {
-  it('已有在途任务时幂等返回其 id，不重复创建', async () => {
+  /** Prisma 唯一键冲突（activeKey 已被在途任务占用）。 */
+  function uniqueConflict() {
+    return Object.assign(new Error('Unique constraint failed'), {
+      code: 'P2002',
+      meta: { target: ['activeKey'] },
+    });
+  }
+
+  it('P5-16：幂等靠 activeKey 唯一键，先建行、冲突才回查在途任务', async () => {
+    prismaMock.jobQueue.create.mockRejectedValue(uniqueConflict());
     prismaMock.jobQueue.findFirst.mockResolvedValue({ id: 'existing' });
+
     const jobId = await enqueueAudioEnhance({ sessionId: 'sess-1', userId: 'user-1' });
+
     expect(jobId).toBe('existing');
-    expect(prismaMock.jobQueue.create).not.toHaveBeenCalled();
+    // 关键：互斥必须由插入冲突判定 —— 只读的 findFirst 不能排在 create 前面，
+    // 否则两个并发请求会双双查空、各建一行（同一录音被两台 worker 同时增强）。
+    expect(prismaMock.jobQueue.create).toHaveBeenCalled();
+    expect(prismaMock.jobQueue.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { activeKey: 'audio_enhance:sess-1' } })
+    );
+    // 冲突路径不得把会话状态改回 pending（在途任务的状态由它自己维护）
+    expect(prismaMock.session.updateMany).not.toHaveBeenCalled();
   });
 
-  it('新任务：createJob(maxAttempts=3) 并把会话标记 pending', async () => {
+  it('新任务：createJob(maxAttempts=3, activeKey) 并把会话标记 pending', async () => {
     prismaMock.jobQueue.findFirst.mockResolvedValue(null);
     prismaMock.jobQueue.create.mockResolvedValue({ id: 'job-new' });
     const jobId = await enqueueAudioEnhance({ sessionId: 'sess-1', userId: 'user-1' });
     expect(jobId).toBe('job-new');
     expect(prismaMock.jobQueue.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ type: 'audio_enhance', maxAttempts: 3 }),
+        data: expect.objectContaining({
+          type: 'audio_enhance',
+          maxAttempts: 3,
+          activeKey: 'audio_enhance:sess-1',
+        }),
       })
     );
     expect(prismaMock.session.updateMany).toHaveBeenCalledWith(
@@ -259,6 +281,8 @@ describe('runAudioEnhanceTick — 派发', () => {
       (c) => c[0]?.data?.status === 'FAILED'
     );
     expect(failUpdate).toBeTruthy();
+    // P5-16：失败同样是终态，activeKey 必须释放（可重试任务由 retryJob 回炉时重新取键）
+    expect(failUpdate![0].data.activeKey).toBeNull();
     expect(failUpdate![0].data.params).toBe(JSON.stringify({}));
   });
 
@@ -338,6 +362,8 @@ describe('runAudioEnhanceTick — 确定性 4xx 快速终态', () => {
       (c) => c[0]?.data?.status === 'FAILED'
     );
     expect(failUpdate).toBeTruthy();
+    // P5-16：失败同样是终态，activeKey 必须释放（可重试任务由 retryJob 回炉时重新取键）
+    expect(failUpdate![0].data.activeKey).toBeNull();
     // 确定性失败：不安排自动重试
     expect(JSON.parse(failUpdate![0].data.params).nextRetryAt).toBeUndefined();
     expect(prismaMock.session.updateMany).toHaveBeenCalledWith(
@@ -373,6 +399,8 @@ describe('runAudioEnhanceTick — 确定性 4xx 快速终态', () => {
       (c) => c[0]?.data?.status === 'FAILED'
     );
     expect(failUpdate).toBeTruthy();
+    // P5-16：失败同样是终态，activeKey 必须释放（可重试任务由 retryJob 回炉时重新取键）
+    expect(failUpdate![0].data.activeKey).toBeNull();
     expect(typeof JSON.parse(failUpdate![0].data.params).nextRetryAt).toBe('string');
     expect(prismaMock.session.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -514,8 +542,11 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
       })
     );
     expect(persistenceMock.finalizeStagedArtifactPublish).toHaveBeenCalled();
+    // P5-16：落终态必须同时释放 activeKey，否则该会话再也入不了新队
     expect(prismaMock.jobQueue.update).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ status: 'SUCCESS' }) })
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'SUCCESS', activeKey: null }),
+      })
     );
     expect(workerMock.deleteEnhanceJob).toHaveBeenCalledWith(expect.anything(), 'job-1');
   });
@@ -564,6 +595,8 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
       (c) => c[0]?.data?.status === 'FAILED'
     );
     expect(failUpdate).toBeTruthy();
+    // P5-16：失败同样是终态，activeKey 必须释放（可重试任务由 retryJob 回炉时重新取键）
+    expect(failUpdate![0].data.activeKey).toBeNull();
     const params = JSON.parse(failUpdate![0].data.params);
     expect(typeof params.nextRetryAt).toBe('string');
     expect(prismaMock.session.updateMany).toHaveBeenCalledWith(
@@ -630,6 +663,8 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
       (c) => c[0]?.data?.status === 'FAILED'
     );
     expect(failUpdate).toBeTruthy();
+    // P5-16：失败同样是终态，activeKey 必须释放（可重试任务由 retryJob 回炉时重新取键）
+    expect(failUpdate![0].data.activeKey).toBeNull();
   });
 });
 

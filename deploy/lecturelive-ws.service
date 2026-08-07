@@ -8,6 +8,10 @@ Type=simple
 User=lecturelive
 Group=lecturelive
 WorkingDirectory=/opt/lecturelive/ws-server
+# P6-1：与 web 一样把监听地址收敛到回环 —— nginx 与本进程同机，3001 无需对外可见。
+# （websocket.js 默认仍是 0.0.0.0，因为容器部署里 Docker 转发连的是容器 IP 而非容器内 loopback。）
+# 必须排在 ExecStart 之前：node --env-file 不会覆盖已存在的进程环境变量。
+Environment=WS_HOST=127.0.0.1
 # 使用 node --env-file 加载 .env（正确处理引号），不用 EnvironmentFile
 # websocket.js 是 esbuild 编译的产物，不再依赖 ts-node
 ExecStart=/usr/bin/node --env-file=/opt/lecturelive/.env websocket.js

@@ -36,6 +36,16 @@ vi.mock('fs/promises', () => {
           if (k.startsWith(p)) mockFiles.delete(k);
         }
       }),
+      readdir: vi.fn(async (dir: string) => {
+        const prefix = dir.endsWith('/') ? dir : `${dir}/`;
+        const names = new Set<string>();
+        for (const key of mockFiles.keys()) {
+          if (!key.startsWith(prefix)) continue;
+          const rest = key.slice(prefix.length);
+          if (!rest.includes('/')) names.add(rest);
+        }
+        return Array.from(names);
+      }),
     },
   };
 });
@@ -95,5 +105,33 @@ describe('persistTranscriptDraft 单调守卫（转录 draft 防覆盖）', () =
     const result = await persistTranscriptDraft(session, mkPayload(2));
     expect(result.segmentCount).toBe(2);
     expect((await loadTranscriptDraft(session))?.segments.length).toBe(2);
+  });
+
+  // P4-5：冲突分支每次都写一份**全量**备份且从不清理。构造：顶满 segmentCount 之后，
+  // 之后每次少一段的 PUT 必命中冲突分支 → 备份文件无上限增长，而 CREATED 会话永不回收。
+  it('P4-5 冲突备份只保留最近 3 份（不再无上限堆积）', async () => {
+    // 让每次写入拿到递增的时间戳，避免同毫秒备份重名。
+    let clock = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => (clock += 1000));
+
+    await persistTranscriptDraft(session, mkPayload(10));
+    for (let i = 0; i < 8; i += 1) {
+      await persistTranscriptDraft(session, mkPayload(9));
+    }
+
+    const conflictKeys = Array.from(mockFiles.keys()).filter((k) =>
+      k.includes('transcript.conflict-')
+    );
+    expect(conflictKeys.length).toBe(3);
+
+    // 保留的必须是最近的三份（时间戳最大）。
+    const kept = conflictKeys
+      .map((k) => Number(k.match(/transcript\.conflict-(\d+)\.json$/)?.[1]))
+      .sort((a, b) => a - b);
+    expect(kept[0]).toBeGreaterThan(1_700_000_000_000);
+
+    // 主草稿仍是更完整的那份，清理不得伤及正稿。
+    expect((await loadTranscriptDraft(session))?.segments.length).toBe(10);
+    nowSpy.mockRestore();
   });
 });

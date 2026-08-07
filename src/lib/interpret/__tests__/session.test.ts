@@ -205,11 +205,13 @@ describe('claimInterpretSessionForDeduct', () => {
 });
 
 describe('reclaimStaleInterpretSessions', () => {
-  it('扫 settledAt=null 且 startedAt 超阈值；认领成功→按服务端墙钟(封顶6h)扣费+记台账', async () => {
-    // startedAt = now - 8h → elapsed 封顶 6h → billable 360
+  it('P1-1：无任何 grant 实测量（锚点从未串流）→ 按 0 结算，绝不回落墙钟扣 6h', async () => {
+    // startedAt = now - 8h。旧行为：墙钟被夹到 MAX_INTERPRET(6h) → 扣 360 分钟（诚实用户被凭空计费：
+    // /start 在建流前就落锚点，麦克风被拒 / Soniox 不可达时前端只置 error、永不调 deduct）。
     const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
-    updateManyMock.mockResolvedValueOnce({ count: 1 }); // 认领成功
+    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: null } });
+    updateManyMock.mockResolvedValueOnce({ count: 1 });
 
     const n = await reclaimStaleInterpretSessions(NOW);
 
@@ -219,18 +221,43 @@ describe('reclaimStaleInterpretSessions', () => {
       settledAt: null,
       startedAt: { lte: new Date(NOW.getTime() - INTERPRET_RECLAIM_STALE_MS) },
     });
-    // 封顶 6h → 360 分钟
+    // 走 settleInterpretSessionAsVoid：billedMinutes=0、settledBy 区分于正常兜底
     expect(updateManyMock).toHaveBeenCalledWith({
       where: { id: 's1', settledAt: null },
-      data: { settledAt: NOW, settledBy: 'cron_reclaim', billedMinutes: 360 },
+      data: {
+        settledAt: expect.any(Date),
+        settledBy: 'cron_reclaim_void',
+        billedMinutes: 0,
+      },
     });
-    expect(deductMock).toHaveBeenCalledWith('u1', 360, expect.anything());
-    expect(recordUsageMock).toHaveBeenCalledWith(
-      'u1',
-      360,
-      6 * 60 * 60_000,
-      expect.anything()
-    );
+    // 一分钱都不能扣（墙钟口径彻底不参与）
+    expect(transactionMock).not.toHaveBeenCalled();
+    expect(deductMock).not.toHaveBeenCalled();
+    expect(recordUsageMock).not.toHaveBeenCalled();
+  });
+
+  it('P1-1：grants 存在但 actualMs 全为 0（usage-logs 未回填）→ 同样按 0 结算', async () => {
+    const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
+    findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
+    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 0 } });
+    updateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    const n = await reclaimStaleInterpretSessions(NOW);
+
+    expect(n).toBe(1);
+    expect(deductMock).not.toHaveBeenCalled();
+  });
+
+  it('P1-1：作废时输给 deduct（count=0）→ 不计入 reclaimed', async () => {
+    const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
+    findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
+    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: null } });
+    updateManyMock.mockResolvedValueOnce({ count: 0 });
+
+    const n = await reclaimStaleInterpretSessions(NOW);
+
+    expect(n).toBe(0);
+    expect(deductMock).not.toHaveBeenCalled();
   });
 
   it('R1-L2：grants 有 usage-logs 实测 → 按 sum(actualMs) 计费（精确口径取代墙钟封顶）+ 事务内结算 grants', async () => {
@@ -274,6 +301,7 @@ describe('reclaimStaleInterpretSessions', () => {
   it('认领输给 deduct(count=0) → 跳过、不扣费（互斥，不双扣）', async () => {
     const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
+    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 20 * 60_000 } });
     updateManyMock.mockResolvedValueOnce({ count: 0 }); // deduct 抢先结算
 
     const n = await reclaimStaleInterpretSessions(NOW);
@@ -286,6 +314,7 @@ describe('reclaimStaleInterpretSessions', () => {
   it('ADMIN 用户：deduct 返回 role ADMIN → 不记台账', async () => {
     const startedAt = new Date(NOW.getTime() - 7.5 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'admin', startedAt }]);
+    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 20 * 60_000 } });
     updateManyMock.mockResolvedValueOnce({ count: 1 });
     deductMock.mockResolvedValueOnce({ role: 'ADMIN' });
 

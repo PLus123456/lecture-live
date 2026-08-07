@@ -1,12 +1,11 @@
 import 'server-only';
 
+import { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { deleteCloudreveAttachmentFiles } from '@/lib/storage/cloudreveFileDelete';
 import { deleteConversationImages } from '@/lib/llm/chatImageStorage';
-import { releaseStorageBytes } from '@/lib/quota';
-import { logger, serializeError } from '@/lib/logger';
-
-const cascadeLogger = logger.child({ component: 'conversation-cascade' });
+// P5-13：配额释放改走 chatFileCleanup 的 raw-in-tx 写法（见下方步骤 4 注释）。
+import { releaseUserStorageBytesRaw } from '@/lib/chatFileCleanup';
 
 /**
  * 物理删除一批对话 + 连带清理其全部附属资源。
@@ -22,8 +21,8 @@ const cascadeLogger = logger.child({ component: 'conversation-cascade' });
  *   1. 查出这些对话的全部 ChatAttachment（拿 path + bytes + owner）
  *   2. 事务外 best-effort 删 Cloudreve 物理文件（原文件 + 抽取的 .txt）
  *   3. 事务外 best-effort 删本地 data/chatimages/<id>/ 目录
- *   4. 单事务内显式按 FK 顺序删子表 + 对话本体（不依赖级联触发时序）
- *   5. 事务后按 owner 聚合 releaseStorageBytes 释放配额（GREATEST(0,…) clamp，best-effort）
+ *   4. 单事务内：FOR UPDATE 锁住附件行 → 按 owner 释放配额 → 按 FK 顺序删子表 + 对话本体
+ *      （不依赖级联触发时序）
  *
  * 注：不需要 invalidate RAG 缓存——删对话不改动任何 transcript，缓存的 transcript embedding
  * 仍然有效（RAG 缓存键是 sessionId 而非 conversationId，见 transcriptRag ADR-009）。
@@ -55,37 +54,47 @@ export async function deleteConversationsCascade(
     await deleteConversationImages(id);
   }
 
-  // 4. 单事务内按 FK 依赖顺序删除（子表虽 onDelete: Cascade，仍显式先删更稳）
-  const txResults = await prisma.$transaction([
-    prisma.chatAttachment.deleteMany({ where: { conversationId: { in: ids } } }),
-    prisma.conversationMessage.deleteMany({
-      where: { conversationId: { in: ids } },
-    }),
-    prisma.conversationSession.deleteMany({
-      where: { conversationId: { in: ids } },
-    }),
-    prisma.conversation.deleteMany({ where: { id: { in: ids } } }),
-  ]);
-  const deletedCount = txResults[txResults.length - 1].count;
+  // 4. 单事务内：先 FOR UPDATE 锁行再释放配额，最后按 FK 依赖顺序删除
+  //    （子表虽 onDelete: Cascade，仍显式先删更稳）
+  //
+  // P5-13（防重复退额度）：释放口径必须是「本事务真正锁到并删掉的行」，而非事务外快照
+  // `attachments`。此前两个并发删同一批对话（如用户点两次 / 批量删与单删撞车）各自按自己的
+  // 快照无条件退一份，同一附件的字节被退两次，用户凭空多出配额，直到次日字节对账才纠正。
+  // 与 chatFileCleanup.ts:201-207 同一范式：后到者的 SELECT ... FOR UPDATE 会阻塞到先到者
+  // 提交，其后锁定结果为空 → 不再退。释放与删行同事务，也不留「提交后崩溃就漏退」的窗口。
+  let deletedCount = 0;
+  await prisma.$transaction(async (tx) => {
+    const lockedRows = await tx.$queryRaw<
+      Array<{ id: string; userId: string; bytes: bigint }>
+    >(Prisma.sql`
+      SELECT id, userId, bytes FROM ChatAttachment
+      WHERE conversationId IN (${Prisma.join(ids)})
+      FOR UPDATE
+    `);
 
-  // 5. 按 owner 聚合释放字节配额（best-effort；失败留给每日字节对账兜底）
-  const bytesByOwner = new Map<string, bigint>();
-  for (const att of attachments) {
-    bytesByOwner.set(
-      att.userId,
-      (bytesByOwner.get(att.userId) ?? BigInt(0)) + att.bytes
-    );
-  }
-  for (const [ownerId, bytes] of bytesByOwner) {
-    if (bytes > BigInt(0)) {
-      await releaseStorageBytes(ownerId, Number(bytes)).catch((err) => {
-        cascadeLogger.warn(
-          { ownerId, bytes: bytes.toString(), err: serializeError(err) },
-          'releaseStorageBytes 失败；字节对账会兜底'
-        );
-      });
+    const bytesByOwner = new Map<string, bigint>();
+    for (const row of lockedRows) {
+      bytesByOwner.set(
+        row.userId,
+        (bytesByOwner.get(row.userId) ?? BigInt(0)) + row.bytes
+      );
     }
-  }
+    for (const [ownerId, bytes] of bytesByOwner) {
+      if (bytes > BigInt(0)) {
+        await releaseUserStorageBytesRaw(tx, ownerId, bytes);
+      }
+    }
+
+    await tx.chatAttachment.deleteMany({ where: { conversationId: { in: ids } } });
+    await tx.conversationMessage.deleteMany({
+      where: { conversationId: { in: ids } },
+    });
+    await tx.conversationSession.deleteMany({
+      where: { conversationId: { in: ids } },
+    });
+    const deleted = await tx.conversation.deleteMany({ where: { id: { in: ids } } });
+    deletedCount = deleted.count;
+  });
 
   return deletedCount;
 }

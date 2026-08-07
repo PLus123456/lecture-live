@@ -16,8 +16,10 @@ function makeFile(bytes: number, type: string) {
  * 让 init 请求本身失败：调用参数已被记录，管线随即抛出，用例无需等待分片重试退避。
  */
 function fetchStub() {
-  return vi.fn(
-    async (): Promise<Response> => {
+  // 签名写在泛型上而不是形参上：形参会变成「声明了却没用」的 lint 噪音，但去掉形参又会让
+  // mock.calls 退化成空元组，断言里的 c[0]/c[1] 就成了越界索引（TS2493）。泛型两头都满足。
+  return vi.fn<(url: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+    async () => {
       throw new TypeError('stop-at-init');
     }
   );

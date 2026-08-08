@@ -8,6 +8,7 @@ import {
   invalidateShareLinksApiCache,
 } from '@/lib/apiResponseCache';
 import { jsonWithCache } from '@/lib/httpCache';
+import { enforceRateLimit } from '@/lib/rateLimit';
 import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { logAction } from '@/lib/auditLog';
 import {
@@ -84,6 +85,16 @@ export async function PATCH(
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  // P5-15 附带：本路由此前全文无限流。PATCH 是纯事件驱动（开始/暂停/继续/收尾/改名/换区），
+  // 一场录音个位数次；宽松上限只挡脚本对状态机与并发闸的高频冲击，正常录制碰不到。
+  const rateLimited = await enforceRateLimit(req, {
+    scope: 'sessions:patch',
+    limit: 120,
+    windowMs: 60_000,
+    key: `user:${user.id}`,
+  });
+  if (rateLimited) return rateLimited;
+
   const session = await prisma.session.findUnique({
     where: { id: id },
   });
@@ -111,6 +122,9 @@ export async function PATCH(
   }
 
   const nextStatus = nextStatusInput as PrismaSessionStatus | undefined;
+
+  // B4/P5-15：仅「新开录音」(CREATED→RECORDING) 需要并发闸；非 null 即表示要在写库事务内计数。
+  let concurrencyLimit: number | null = null;
 
   // v2.1: validate status transitions — strict one-way lifecycle
   if (nextStatus) {
@@ -144,25 +158,15 @@ export async function PATCH(
     if (nextStatus === 'RECORDING' && session.status === 'CREATED') {
       // 按用户组解析并发上限（ADMIN 恒 999，视为不限）。customGroupId 不在 JWT payload 里，
       // 单独取一次；这是「开新录音」的低频路径，一次轻量 select 可接受。
+      // 上限解析放在事务外：只读、且不参与并发判定的原子性（真正的闸在下方锁内计数）。
       const owner = await prisma.user.findUnique({
         where: { id: user.id },
         select: { customGroupId: true },
       });
-      const maxConcurrent = await resolveUserMaxConcurrentSessions({
+      concurrencyLimit = await resolveUserMaxConcurrentSessions({
         role: user.role,
         customGroupId: owner?.customGroupId ?? null,
       });
-      const inflight = await prisma.session.count({
-        where: { userId: user.id, status: { in: ['RECORDING', 'PAUSED'] } },
-      });
-      if (inflight >= maxConcurrent) {
-        return NextResponse.json(
-          {
-            error: `Too many concurrent recordings in progress (max ${maxConcurrent}). Finish or discard an existing recording first.`,
-          },
-          { status: 409 }
-        );
-      }
     }
   }
 
@@ -257,17 +261,54 @@ export async function PATCH(
   // P0-6 契约4：状态迁移用「期望旧 status」做 CAS（updateMany 判 count），杜绝旧代码裸
   // update({where:{id}}) 把终态回退 —— 如 PAUSE/RESUME 请求读到 RECORDING 后 finalize 先完成，
   // 该请求仍把 COMPLETED 覆盖回 PAUSED/RECORDING。0 行更新 → 会话已被并发改动 → 409 + 最新状态。
-  const casResult = await prisma.session.updateMany({
-    where: { id: id, status: session.status },
-    data: buildSessionUpdateData({
-      session,
-      nextStatus,
-      durationMs,
-      title,
-      audioSource,
-      sonioxRegion,
-    }),
+  const updateData = buildSessionUpdateData({
+    session,
+    nextStatus,
+    durationMs,
+    title,
+    audioSource,
+    sonioxRegion,
   });
+
+  // P5-15：并发上限旧实现是 check-then-act —— 先 count 再另一条语句写库，两条之间毫无串行化，
+  // N 个标签页同时 CREATED→RECORDING 都读到「未达上限」后各自写成功，上限形同虚设（B4 想封住的
+  // 并发扣费溢出照样发生）。现在把计数与状态迁移放进**同一事务**，且计数用 `SELECT ... FOR UPDATE`：
+  // 走 @@index([userId]) 扫该用户的会话行并持有行锁到提交，同一用户的并发「开新录音」被真正串行化
+  // （后到者阻塞→读到前者已提交的 RECORDING→超限即拒）。裸 count 即使包进事务也无用：非锁定读走
+  // MVCC 快照，两个事务互相看不见对方。
+  // 锁序 Session → （无 User 写），与 async-upload init / finalize 的 Session→User 同向，不成环。
+  // const 快照：闭包内要用到收窄后的类型（let 的收窄在回调里会失效）。
+  const gateLimit = concurrencyLimit;
+  const casResult =
+    gateLimit === null
+      ? await prisma.session.updateMany({
+          where: { id: id, status: session.status },
+          data: updateData,
+        })
+      : await prisma.$transaction(async (tx) => {
+          const inflight = await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT id FROM Session
+            WHERE userId = ${user.id} AND status IN ('RECORDING', 'PAUSED')
+            FOR UPDATE
+          `;
+          // -1 是「并发超限」的哨兵（updateMany 的 count 恒 >=0），避免为一条分支多开一层类型。
+          if (inflight.length >= gateLimit) {
+            return { count: -1 };
+          }
+          return tx.session.updateMany({
+            where: { id: id, status: session.status },
+            data: updateData,
+          });
+        });
+
+  if (casResult.count === -1) {
+    return NextResponse.json(
+      {
+        error: `Too many concurrent recordings in progress (max ${gateLimit}). Finish or discard an existing recording first.`,
+      },
+      { status: 409 }
+    );
+  }
 
   if (casResult.count === 0) {
     const latest = await prisma.session.findUnique({ where: { id: id } });
@@ -322,17 +363,25 @@ export async function DELETE(
     await cancelAsyncUpload(session).catch(() => undefined);
   }
 
-  // B1：删会话前原子结算该会话遗留的异步上传预留。行一删，cron 兜底扫描便再也找不到这行
-  // → 预留永久占着 transcriptionMinutesUsed 泄漏，故必须 inline 释放。用 settleAsyncReservation
-  // （FOR UPDATE 读当前列并释放）而非按请求开头快照裸减：与并发 finalize 结算 / cron 兜底 互斥、
-  // 恰好释放一次，杜绝审查发现的「快照双释放」（例如收尾已释放后本处按陈旧快照再退一次）。
-  await settleAsyncReservation(session.id).catch(() => undefined);
-
-  // R4：同理释放该会话遗留的完整版补全转录预留（fullReservedMinutes）。行一删，cron
-  // releaseOrphanFullReservations 便再也扫不到 → 预留永久占着 transcriptionMinutesUsed 泄漏，故必须
-  // inline 释放。settleFullReservation（FOR UPDATE 读当前列并释放）与并发 finalize 结算 / cron 兜底互斥、
-  // 恰好释放一次。
-  await settleFullReservation(session.id).catch(() => undefined);
+  // B1/R4：删会话前原子结算该会话遗留的在途预留（异步上传 asyncReservedMinutes + 完整版补全
+  // fullReservedMinutes）。行一删，cron 兜底扫描便再也找不到这行 → 预留永久占着
+  // transcriptionMinutesUsed 泄漏，故必须 inline 释放。用 settle*（FOR UPDATE 读当前列并释放）而非
+  // 按请求开头快照裸减：与并发 finalize 结算 / cron 兜底互斥、恰好释放一次，杜绝「快照双释放」。
+  //
+  // P5-8：结算失败**必须拒绝删除**，绝不能像旧实现那样 .catch(()=>undefined) 吞掉后照常删行——
+  // 预留是 Session 行上的**列**，行一删就没有载体，兜底 cron 只扫存活行、永远扫不到；持池用户更糟：
+  // computePoolOwed 的 used 含这笔孤儿预留，而在途聚合已找不到被删的 Session → owed 抬高、多扣池子
+  // 且不可自愈。这里改为直接 500 拒删（settle 幂等，用户重试即可）。
+  try {
+    await settleAsyncReservation(session.id);
+    await settleFullReservation(session.id);
+  } catch (settleErr) {
+    console.error('Settle transcription reservations failed; session not deleted:', settleErr);
+    return NextResponse.json(
+      { error: 'Failed to settle pending transcription reservations; session was not deleted' },
+      { status: 500 }
+    );
+  }
 
   // 完整版补全转录进行中时删会话：与异步上传同理，Soniox 上的 file + transcription 会随行消失而
   // 永久泄漏（行一删便无 id→owner 关联，reclaim cron 也无从查起）。best-effort 清 Soniox 资源

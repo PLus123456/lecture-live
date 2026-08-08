@@ -289,16 +289,25 @@ export default function FilesPanel() {
           t('common.deleteSuccess'),
           t('adminFiles.deletedCount', { n: data.deleted }),
         );
+        // 先本地摘掉已删行，让 UI 立刻有反馈
         setFiles((prev) => prev.filter((f) => !ids.includes(f.id)));
         setSelected((prev) => {
           const next = new Set(prev);
           ids.forEach((id) => next.delete(id));
           return next;
         });
-        setPagination((prev) => ({
-          ...prev,
-          total: Math.max(0, prev.total - data.deleted),
-        }));
+
+        // L5：本地 filter 之后必须重新拉当前页。原来只把 total 减了 deleted，
+        // totalPages 保持旧值 —— 于是（a）本页留下空洞，后面页的行不会补上来；
+        // （b）删空最后一页后分页器仍显示旧的 totalPages，翻过去是空列表且
+        //  「下一页」按钮的 disabled 判据（page >= totalPages）也失准。
+        // 这里按新 total 重算页数并把当前页钳进合法区间再刷。
+        const nextTotal = Math.max(0, pagination.total - data.deleted);
+        const nextTotalPages = Math.max(
+          1,
+          Math.ceil(nextTotal / (pagination.pageSize || 20)),
+        );
+        await fetchFiles(Math.min(pagination.page, nextTotalPages));
       } else {
         const errData = await res.json().catch(() => null);
         toast.error(t('common.deleteFailed'), errData?.error);

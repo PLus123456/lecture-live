@@ -11,10 +11,15 @@
  */
 import path from 'path';
 import fs from 'fs/promises';
-import type { Session } from '@prisma/client';
+import { Prisma, type Session } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { logger } from '@/lib/logger';
+import { getBillableMinutes } from '@/lib/billing';
+import {
+  reserveTranscriptionMinutes,
+  settleAsyncReservation,
+} from '@/lib/quota';
 import {
   deleteAsyncUpload,
   loadAsyncUploadManifest,
@@ -107,6 +112,54 @@ async function setStatus(
     },
   });
   return result.count === 1;
+}
+
+/**
+ * P1-3：按 ffprobe 实测时长把入口预留**回补到足额**。
+ *
+ * 入口 init 的预留额只能靠「客户端声明时长 + 按客户端声明 MIME 的大小下界」估算，两者都不可信：
+ * 谎报 `video/mp4` 能把 300 分钟 12kbps opus 的预留压到 6 分钟（50 倍白嫖），且非持池用户的月度
+ * 重置无条件把 transcriptionMinutesUsed 归零 → 超用**每月复发**，不是一次性欠账。
+ *
+ * 这里是**唯一**能拿到服务端可信时长的时点（转码后 probe MP3），且**排在上传 Soniox 之前**：
+ * 差额补不上就直接失败，用户拿不到任何转录，白嫖窗口被彻底关死。
+ *
+ * 事务口径：FOR UPDATE 锁本 Session 行 → 读**当前**预留列 → reserve 差额 → `increment` 回写。
+ * 用 increment 而非「旧值+差额」赋值：reserve 内部 ensureQuotaWindow 若刚触发月度重置会把本列清零、
+ * 同时 used 归零，赋值会凭空复活一笔 used 里并不存在的预留、结算时超额释放。
+ * 锁序 Session → User，与 init 路由一致（避免 InnoDB 死锁环，见 P5-7）。
+ *
+ * @returns ok=true 表示额度足够或无需回补；ok=false 时 shortfallMinutes 为补不上的差额。
+ */
+async function topUpAsyncReservation(
+  sessionId: string,
+  userId: string,
+  durationMs: number
+): Promise<{ ok: boolean; shortfallMinutes: number }> {
+  const trueMinutes = getBillableMinutes(durationMs);
+  if (trueMinutes <= 0) return { ok: true, shortfallMinutes: 0 };
+
+  return prisma.$transaction(async (tx) => {
+    const rows = await tx.$queryRaw<Array<{ asyncReservedMinutes: number }>>(
+      Prisma.sql`SELECT asyncReservedMinutes FROM Session WHERE id = ${sessionId} FOR UPDATE`
+    );
+    const row = rows[0];
+    if (!row) return { ok: true, shortfallMinutes: 0 };
+    const reservedRaw = Number(row.asyncReservedMinutes ?? 0);
+    const reserved = Number.isFinite(reservedRaw) ? Math.max(0, reservedRaw) : 0;
+    const shortfall = trueMinutes - reserved;
+    if (shortfall <= 0) return { ok: true, shortfallMinutes: 0 };
+
+    const granted = await reserveTranscriptionMinutes(userId, shortfall, tx);
+    if (!granted) {
+      return { ok: false, shortfallMinutes: shortfall };
+    }
+    await tx.session.update({
+      where: { id: sessionId },
+      data: { asyncReservedMinutes: { increment: shortfall } },
+    });
+    return { ok: true, shortfallMinutes: shortfall };
+  });
 }
 
 /**
@@ -232,6 +285,18 @@ export async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     await finalizeStagedArtifactPublish(session, staged).catch(() => undefined);
     await invalidateSessionsApiCache(session.userId);
 
+    // ── 4b. 按实测时长回补入口预留（P1-3）──
+    // 必须排在上传 Soniox 之前：入口预留由客户端声明的 MIME/时长决定（可被压到真实值的 1/50），
+    // 此刻才第一次拿到服务端可信时长。补不上差额即拒绝继续，绝不让「预留 6 分钟、实转 300 分钟」
+    // 的文件进 Soniox —— 那笔超用会在 finalize 被足额实扣，但月度重置无条件清零 used，使其月月复发。
+    const topUp = await topUpAsyncReservation(session.id, session.userId, durationMs);
+    if (!topUp.ok) {
+      throw new Error(
+        `Transcription quota exceeded: file is ${getBillableMinutes(durationMs)} min, ` +
+          `${topUp.shortfallMinutes} more minute(s) needed than reserved`
+      );
+    }
+
     // ── 5. upload to Soniox ──
     // P1-16：任务开始时按 session 选择的 region 解析并**持久化实际 region** 到 session.sonioxRegion，
     // 之后 poll/finalize/cancel/maintenance 全部读该字段解析同一 region，绝不再落回可变默认 region。
@@ -305,7 +370,15 @@ export async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     );
     // setStatus 自带 notIn guard：如果用户已经取消，这里不会把 canceled 改成 failed
     try {
-      await setStatus(session.id, 'failed', { asyncTranscribeError: message });
+      const marked = await setStatus(session.id, 'failed', {
+        asyncTranscribeError: message,
+      });
+      // P1-3：抢到 failed 终态（恰好一次）→ inline 释放入口预留，与 fullTranscribeProcessor 同口径。
+      // 此刻会话尚未进入 transcribing，不存在并发 finalize 结算，settleAsyncReservation 又是原子
+      // 恰好一次；不 inline 释放就要等 cron 的 30 分钟陈旧门槛，白占用户额度（额度不足时尤其伤）。
+      if (marked) {
+        await settleAsyncReservation(session.id).catch(() => undefined);
+      }
     } catch (innerErr) {
       logger.error({ innerErr }, 'failed to mark session as failed');
     }

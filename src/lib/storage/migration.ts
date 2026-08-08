@@ -4,6 +4,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { prisma } from '@/lib/prisma';
+import { assertWithinRoot } from '@/lib/security';
 import {
   CloudreveStorage,
   isCloudreveConfiguredAsync,
@@ -35,14 +36,24 @@ export interface CleanupResult {
 }
 
 /**
- * 解析 local: 引用，返回本地文件绝对路径
+ * 解析 local: 引用，返回本地文件绝对路径。
+ *
+ * Y8/P6-6：remainder 直接来自 DB 的 path 列，裸 path.join 会让 `local:../../etc/passwd`
+ * 被读出来上传到 Cloudreve（迁移是把文件整个读走再上传的）。越界一律返回 null，
+ * 调用方按「文件不存在」跳过。
  */
 function resolveLocalPath(reference: string): string | null {
   if (!reference.startsWith('local:')) return null;
   const remainder = reference.slice('local:'.length);
   if (!remainder) return null;
   // local:recordings/xxx.webm → data/recordings/xxx.webm
-  return path.join(DATA_ROOT, remainder);
+  const fullPath = path.join(DATA_ROOT, remainder);
+  try {
+    assertWithinRoot(fullPath, DATA_ROOT);
+  } catch {
+    return null;
+  }
+  return fullPath;
 }
 
 /**
@@ -191,7 +202,17 @@ export async function cleanupExpiredLocalFiles(
       if (parts.length !== 3) continue;
       const [, , fileName] = parts;
 
-      const localPath = path.join(DATA_ROOT, category, fileName);
+      // Y8/P6-6：fileName 同样来自 DB，单个路径段仍可能是 `..`（→ 拼出 data/ 本身）。
+      // 这里要求落在 data/<category>/ 内——unlink 的目标只该是那一层里的文件。
+      const categoryRoot = path.join(DATA_ROOT, category);
+      const localPath = path.join(categoryRoot, fileName);
+      try {
+        assertWithinRoot(localPath, categoryRoot);
+      } catch {
+        result.errorCount++;
+        result.errors.push(`${ref}: 引用越界，已跳过`);
+        continue;
+      }
       if (!(await fileExists(localPath))) continue;
 
       try {

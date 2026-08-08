@@ -9,6 +9,8 @@ import type {
 import type { RechargeSettings } from '@/lib/payment/settings';
 
 const WECHAT_API_BASE = 'https://api.mch.weixin.qq.com';
+/** 微信境内收单固定人民币。 */
+const WECHAT_CURRENCY = 'CNY';
 
 /**
  * 微信支付渠道（Native 扫码，API v3）。
@@ -39,6 +41,10 @@ export class WechatProvider implements PaymentProvider {
   }
 
   async createCharge(params: CreateChargeParams): Promise<CreateChargeResult> {
+    // 微信境内收单只做人民币；币种不符必须当场炸，绝不静默按 CNY 收（P3-15）。
+    if (params.currency !== WECHAT_CURRENCY) {
+      throw new Error(`Wechat only settles ${WECHAT_CURRENCY}, got ${params.currency}`);
+    }
     const urlPath = '/v3/pay/transactions/native';
     const body = JSON.stringify({
       appid: this.appId,
@@ -46,7 +52,10 @@ export class WechatProvider implements PaymentProvider {
       description: params.subject,
       out_trade_no: params.outTradeNo,
       notify_url: params.notifyUrl,
-      amount: { total: Math.max(0, Math.round(params.amountCents)), currency: 'CNY' },
+      amount: {
+        total: Math.max(0, Math.round(params.amountCents)),
+        currency: WECHAT_CURRENCY,
+      },
     });
     const authorization = this.buildAuthHeader('POST', urlPath, body);
     const res = await fetch(`${WECHAT_API_BASE}${urlPath}`, {
@@ -72,29 +81,43 @@ export class WechatProvider implements PaymentProvider {
     if (!timestamp || !nonce || !signature || !this.platformCertPem) return null;
 
     // 时间戳容差（防重放）：拒绝签名时间超过 5 分钟的通知（微信推荐；到账 CAS 另有幂等兜底）。
+    // P6-14：非数字**直接拒**。旧写法 `if (isFinite(t) && …)` 在 t 非数字时跳过整条校验（极性写反）。
     const tSec = Number(timestamp);
-    if (Number.isFinite(tSec) && Math.abs(Date.now() / 1000 - tSec) > 300) {
+    if (!Number.isFinite(tSec) || Math.abs(Date.now() / 1000 - tSec) > 300) {
       return null;
     }
 
     // 1) 验签：message = `${timestamp}\n${nonce}\n${rawBody}\n`，用平台证书公钥验 RSA-SHA256。
+    //    L18：证书轮换期微信会用新证书签名（Wechatpay-Serial 指明是哪一张），所以配置项允许
+    //    粘贴多张证书，这里按序列号挑；挑不中就逐张试，别让真实回调在轮换窗口里被拒。
     if (
       !verifyWechatSignature(
         `${timestamp}\n${nonce}\n${rawBody}\n`,
         signature,
-        this.platformCertPem
+        this.platformCertPem,
+        req.headers.get('wechatpay-serial')
       )
     ) {
       return null;
     }
 
-    // 2) 解密 resource（AES-256-GCM，APIv3 密钥）。
-    let notify: { resource?: WechatResource };
+    let notify: { resource?: WechatResource; event_type?: string };
     try {
       notify = JSON.parse(rawBody);
     } catch {
       return null;
     }
+
+    // 2) 事件分流（P6-13）。旧实现不看事件类型：退款/合单等非交易通知一律 paid=false
+    //    → ACK 500 → 微信按 15 次/24h 重推，永远推不成功。验签已过 = 确认来自微信，
+    //    对我们不处理的事件回成功 ACK 才是正确应答。
+    const eventType = notify.event_type ?? '';
+    const isRefundEvent = eventType.startsWith('REFUND.');
+    if (eventType && !eventType.startsWith('TRANSACTION.') && !isRefundEvent) {
+      return { outTradeNo: '', paid: false, acknowledged: true, rawStatus: eventType };
+    }
+
+    // 3) 解密 resource（AES-256-GCM，APIv3 密钥）。
     const resource = notify.resource;
     if (!resource) return null;
     const decrypted = decryptWechatResource(resource, this.apiV3Key);
@@ -103,8 +126,10 @@ export class WechatProvider implements PaymentProvider {
     let payload: {
       out_trade_no?: string;
       trade_state?: string;
+      refund_status?: string;
       transaction_id?: string;
-      amount?: { total?: number; payer_total?: number };
+      refund_id?: string;
+      amount?: { total?: number; payer_total?: number; currency?: string };
     };
     try {
       payload = JSON.parse(decrypted);
@@ -116,10 +141,28 @@ export class WechatProvider implements PaymentProvider {
     // 微信 amount.total 以「分」为单位，与订单 amountCents 同口径，供上层对账。
     const amountCents =
       typeof payload.amount?.total === 'number' ? payload.amount.total : undefined;
+    const currency = (payload.amount?.currency || WECHAT_CURRENCY).toUpperCase();
+
+    if (isRefundEvent) {
+      // 退款成功 → 反向流程；REFUND.ABNORMAL / REFUND.CLOSED 表示退款并未完成，
+      // 只回 ACK 不冻结权益（据此冻结会误伤没退成的订单）。
+      const refunded =
+        eventType === 'REFUND.SUCCESS' || payload.refund_status === 'SUCCESS';
+      return {
+        outTradeNo,
+        paid: false,
+        ...(refunded ? { reversal: true } : { acknowledged: true }),
+        currency,
+        providerRef: payload.refund_id ?? payload.transaction_id,
+        rawStatus: eventType || payload.refund_status,
+      };
+    }
+
     return {
       outTradeNo,
       paid: payload.trade_state === 'SUCCESS',
       amountCents,
+      currency,
       providerRef: payload.transaction_id,
       rawStatus: payload.trade_state,
     };
@@ -156,21 +199,64 @@ interface WechatResource {
   algorithm?: string;
 }
 
-/** 用微信支付平台证书公钥验签。导出供单测。 */
+/**
+ * 用微信支付平台证书公钥验签。导出供单测。
+ *
+ * L18：`platformCertPem` 允许**依次粘贴多张证书**（轮换期新旧并存）。给了 `serial`
+ * 就优先用序列号匹配的那张，匹配不到再逐张试——只能存一份证书时，轮换窗口里
+ * 微信用新证书签的**真实**回调会被全部拒掉。
+ */
 export function verifyWechatSignature(
   message: string,
   signatureBase64: string,
-  platformCertPem: string
+  platformCertPem: string,
+  serial?: string | null
 ): boolean {
-  try {
-    const publicKey = new crypto.X509Certificate(platformCertPem).publicKey;
-    return crypto
-      .createVerify('RSA-SHA256')
-      .update(message, 'utf8')
-      .verify(publicKey, signatureBase64, 'base64');
-  } catch {
-    return false;
+  const certs = splitPemCertificates(platformCertPem);
+  if (certs.length === 0) return false;
+
+  const parsed: Array<{ cert: crypto.X509Certificate; serial: string }> = [];
+  for (const pem of certs) {
+    try {
+      const cert = new crypto.X509Certificate(pem);
+      parsed.push({ cert, serial: normalizeSerial(cert.serialNumber) });
+    } catch {
+      // 单张解析失败不该拖垮其余证书。
+    }
   }
+
+  const wanted = serial ? normalizeSerial(serial) : '';
+  const ordered = wanted
+    ? [...parsed].sort((a, b) => Number(b.serial === wanted) - Number(a.serial === wanted))
+    : parsed;
+
+  for (const { cert } of ordered) {
+    try {
+      const ok = crypto
+        .createVerify('RSA-SHA256')
+        .update(message, 'utf8')
+        .verify(cert.publicKey, signatureBase64, 'base64');
+      if (ok) return true;
+    } catch {
+      // 换下一张。
+    }
+  }
+  return false;
+}
+
+/** 把一段可能含多张证书的 PEM 文本拆成单张。 */
+function splitPemCertificates(pem: string): string[] {
+  const matches = (pem || '').match(
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g
+  );
+  if (matches && matches.length > 0) return matches;
+  const trimmed = (pem || '').trim();
+  return trimmed ? [trimmed] : [];
+}
+
+/** 序列号归一：去前导 0、统一大写（Node 与微信侧的十六进制写法不完全一致）。 */
+function normalizeSerial(v: string): string {
+  return v.replace(/^0+/, '').toUpperCase();
 }
 
 /** AES-256-GCM 解密回调 resource（APIv3 密钥为 32 字节）。返回明文 JSON 串或 null。导出供单测。 */

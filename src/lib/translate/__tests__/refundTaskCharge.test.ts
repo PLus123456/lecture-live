@@ -1,12 +1,20 @@
 // refundTaskCharge 幂等闸单测：refundedAt 条件 CAS 抢占（防双退）、
-// 入账失败还原闸（下一轮可兜底重试）。这是翻译计费最关键的钱路径。
+// 入账失败整体回滚（下一轮可兜底重试）、代次守卫（不退掉用户重试后新扣的钱）。
+// 这是翻译计费最关键的钱路径。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { taskUpdateManyMock, taskFindUniqueMock, refundWalletCentsMock } = vi.hoisted(() => ({
-  taskUpdateManyMock: vi.fn(),
-  taskFindUniqueMock: vi.fn(),
-  refundWalletCentsMock: vi.fn(),
-}));
+const { taskUpdateManyMock, taskFindUniqueMock, refundWalletCentsMock, transactionMock } =
+  vi.hoisted(() => ({
+    taskUpdateManyMock: vi.fn(),
+    taskFindUniqueMock: vi.fn(),
+    refundWalletCentsMock: vi.fn(),
+    transactionMock: vi.fn(),
+  }));
+
+/** 事务替身：把 callback 交给同一组 mock；回调抛出即视为整体回滚。 */
+const txClient = {
+  translationTask: { updateMany: taskUpdateManyMock, findUnique: taskFindUniqueMock },
+};
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
@@ -14,8 +22,10 @@ vi.mock('@/lib/prisma', () => ({
       updateMany: taskUpdateManyMock,
       findUnique: taskFindUniqueMock,
       update: vi.fn(),
+      findMany: vi.fn(),
     },
     jobQueue: { findMany: vi.fn(), updateMany: vi.fn(), update: vi.fn(), findUnique: vi.fn() },
+    $transaction: transactionMock,
   },
 }));
 vi.mock('@/lib/wallet', () => ({ refundWalletCents: refundWalletCentsMock }));
@@ -55,6 +65,8 @@ beforeEach(() => {
   taskUpdateManyMock.mockReset();
   taskFindUniqueMock.mockReset();
   refundWalletCentsMock.mockReset();
+  transactionMock.mockReset();
+  transactionMock.mockImplementation((cb: (tx: unknown) => unknown) => cb(txClient));
 });
 
 describe('refundTaskCharge', () => {
@@ -70,13 +82,16 @@ describe('refundTaskCharge', () => {
       where: { id: 't1', refundedAt: null, chargedCents: { gt: 0 } },
       data: { refundedAt: expect.any(Date) },
     });
+    // L22：入账必须走同一个事务客户端（第二个参数），否则「闸已置位、钱没到账」会永久卡死
     expect(refundWalletCentsMock).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: 'u1',
         amountCents: 120,
         type: 'translation_refund',
-      })
+      }),
+      txClient
     );
+    expect(transactionMock).toHaveBeenCalledTimes(1);
   });
 
   it('闸已被占（count=0，已退过/未扣费）→ 不再入账（幂等防双退）', async () => {
@@ -86,18 +101,36 @@ describe('refundTaskCharge', () => {
     expect(refundWalletCentsMock).not.toHaveBeenCalled();
   });
 
-  it('入账失败 → 还原退款闸（refundedAt 置回 null），等下一轮兜底', async () => {
-    taskUpdateManyMock
-      .mockResolvedValueOnce({ count: 1 }) // 抢闸成功
-      .mockResolvedValueOnce({ count: 1 }); // 还原闸
+  it('L22：入账失败 → 事务整体回滚（不再靠补偿写还原闸），且不抛给调用方', async () => {
+    taskUpdateManyMock.mockResolvedValue({ count: 1 });
     taskFindUniqueMock.mockResolvedValue({ userId: 'u1', chargedCents: 120 });
     refundWalletCentsMock.mockRejectedValue(new Error('db down'));
 
-    await refundTaskCharge('t1', '翻译失败自动退款');
+    await expect(refundTaskCharge('t1', '翻译失败自动退款')).resolves.toBeUndefined();
 
-    expect(taskUpdateManyMock).toHaveBeenLastCalledWith({
-      where: { id: 't1' },
-      data: { refundedAt: null },
+    // 抢闸与入账在同一事务里，失败即回滚 —— 不该再有「补偿性地把 refundedAt 写回 null」
+    // 这一条独立语句（它自己也可能挂，挂了这笔钱就永久消失）
+    const compensating = taskUpdateManyMock.mock.calls.find(
+      (c) => c[0]?.data?.refundedAt === null
+    );
+    expect(compensating).toBeUndefined();
+  });
+
+  it('L24：带代次守卫时，CAS 谓词必须带上 jobQueueId', async () => {
+    taskUpdateManyMock.mockResolvedValue({ count: 0 });
+
+    await refundTaskCharge('t1', '翻译失败自动退款', 'job-1');
+
+    expect(taskUpdateManyMock).toHaveBeenCalledWith({
+      where: {
+        id: 't1',
+        refundedAt: null,
+        chargedCents: { gt: 0 },
+        jobQueueId: 'job-1',
+      },
+      data: { refundedAt: expect.any(Date) },
     });
+    // 任务已换代（谓词不命中）→ 不得退掉新一代刚扣的钱
+    expect(refundWalletCentsMock).not.toHaveBeenCalled();
   });
 });

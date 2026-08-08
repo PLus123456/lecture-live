@@ -29,6 +29,52 @@ export const JOB_STATUS = {
 
 export type JobStatus = (typeof JOB_STATUS)[keyof typeof JOB_STATUS];
 
+/**
+ * L10：只有这两类任务真的有消费者会去捞 SUBMITTED 行执行
+ * （enhanceProcessor.tick / translateProcessor.tick）。其余 10 个 JOB_TYPE 都是
+ * trackJob 包在请求内同步跑完的「执行记录」，把行改回 SUBMITTED 之后没有任何调度器
+ * 会执行它 —— admin 点「重试」拿到成功提示、任务却永远停在 SUBMITTED，纯误导。
+ */
+export const RETRYABLE_JOB_TYPES: ReadonlySet<string> = new Set<string>([
+  JOB_TYPE.AUDIO_ENHANCE,
+  JOB_TYPE.DOC_TRANSLATE,
+]);
+
+export function isJobTypeRetryable(type: string): boolean {
+  return RETRYABLE_JOB_TYPES.has(type);
+}
+
+/**
+ * P5-16：「每会话至多一个在途 audio_enhance」的排他键。
+ *
+ * 原来靠「先 findFirst 有没有 SUBMITTED/PROCESSING，没有再 createJob」这种 check-then-act，
+ * 两个并发请求（双击按钮 / finalize 自动入队撞上用户手动触发）会各自查到空、各建一行，
+ * 同一份录音被两台 worker 同时增强 + 两次回存互相覆盖。
+ *
+ * 改用 JobQueue.activeKey 的唯一索引：非终态期间持键，落终态（SUCCESS/FAILED）时置 null。
+ * MySQL 允许重复 NULL，所以这个唯一索引等价于部分唯一索引 —— 把 check-then-act 压成
+ * 一次插入冲突。
+ */
+export function audioEnhanceActiveKey(sessionId: string): string {
+  return `audio_enhance:${sessionId}`;
+}
+
+/** activeKey 已被在途任务占用。让调用方区分「已有在途任务」与「建行失败」。 */
+export class ActiveJobConflictError extends Error {
+  constructor(readonly activeKey: string) {
+    super(`Active job already exists for ${activeKey}`);
+    this.name = 'ActiveJobConflictError';
+  }
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'P2002'
+  );
+}
+
 // ─── 创建任务 ───
 interface CreateJobOptions {
   type: JobType;
@@ -37,6 +83,8 @@ interface CreateJobOptions {
   triggeredBy?: string;
   params?: Record<string, unknown>;
   maxAttempts?: number;
+  /** 排他键：同一 key 同时只允许一个非终态任务。冲突时抛 ActiveJobConflictError。 */
+  activeKey?: string;
 }
 
 export async function createJob(options: CreateJobOptions): Promise<string> {
@@ -50,10 +98,15 @@ export async function createJob(options: CreateJobOptions): Promise<string> {
         triggeredBy: options.triggeredBy ?? 'system',
         params: options.params ? JSON.stringify(options.params) : null,
         maxAttempts: options.maxAttempts ?? 1,
+        activeKey: options.activeKey ?? null,
       },
     });
     return job.id;
   } catch (error) {
+    // P5-16：排他键冲突不是"建行失败"，而是"已有在途任务"，必须让调用方能分辨。
+    if (options.activeKey && isUniqueConstraintError(error)) {
+      throw new ActiveJobConflictError(options.activeKey);
+    }
     console.error('[jobQueue] createJob failed:', error);
     return '';
   }
@@ -82,6 +135,8 @@ export function markJobSuccess(
         status: JOB_STATUS.SUCCESS,
         result: result ? JSON.stringify(result) : null,
         completedAt: new Date(),
+        // P5-16：落终态即释放排他键（重复 NULL 不受唯一索引约束）。
+        activeKey: null,
       },
     })
     .catch((err) => console.error('[jobQueue] markSuccess failed:', err));
@@ -98,6 +153,7 @@ export function markJobFailed(jobId: string, error: unknown): void {
         status: JOB_STATUS.FAILED,
         error: message,
         completedAt: new Date(),
+        activeKey: null,
       },
     })
     .catch((err) => console.error('[jobQueue] markFailed failed:', err));
@@ -178,20 +234,39 @@ export async function queryJobs(filters: QueryJobsFilters) {
 export async function retryJob(jobId: string): Promise<boolean> {
   const job = await prisma.jobQueue.findUnique({ where: { id: jobId } });
   if (!job) return false;
+  // L10：无消费者的类型不能假装重试成功（见 RETRYABLE_JOB_TYPES）。
+  if (!isJobTypeRetryable(job.type)) return false;
   if (job.status !== JOB_STATUS.FAILED) return false;
   if (job.attempt >= job.maxAttempts && job.maxAttempts > 1) return false;
 
-  await prisma.jobQueue.update({
-    where: { id: jobId },
-    data: {
-      status: JOB_STATUS.SUBMITTED,
-      attempt: { increment: 1 },
-      error: null,
-      result: null,
-      startedAt: null,
-      completedAt: null,
-    },
-  });
+  // P5-16：回炉即重新进入非终态，必须把 activeKey 拿回来（落终态时已被释放为 null），
+  // 否则回炉后的 SUBMITTED 行不持键，并发入队会给同一会话再建一行。
+  // 若此时该会话已有另一个在途任务持键 → P2002 → 本次重试直接判失败（语义正确：
+  // 同会话已在处理中，不该再复活一个旧任务）。
+  const reacquire =
+    job.activeKey === null &&
+    job.type === JOB_TYPE.AUDIO_ENHANCE &&
+    job.sessionId
+      ? { activeKey: audioEnhanceActiveKey(job.sessionId) }
+      : {};
+
+  try {
+    await prisma.jobQueue.update({
+      where: { id: jobId },
+      data: {
+        status: JOB_STATUS.SUBMITTED,
+        attempt: { increment: 1 },
+        error: null,
+        result: null,
+        startedAt: null,
+        completedAt: null,
+        ...reacquire,
+      },
+    });
+  } catch (error) {
+    if (isUniqueConstraintError(error)) return false;
+    throw error;
+  }
 
   return true;
 }
@@ -222,6 +297,8 @@ export async function reclaimStaleProcessingJobs(
       status: JOB_STATUS.FAILED,
       error: `自动回收：任务卡在 PROCESSING 超过 ${thresholdHours} 小时（疑似进程中断）`,
       completedAt: now,
+      // P5-16：僵尸回收是排他键的安全阀 —— 不释放的话该会话再也入不了队。
+      activeKey: null,
     },
   });
   return result.count;

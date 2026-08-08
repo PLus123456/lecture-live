@@ -175,11 +175,17 @@ export function useSoniox(
 
       // 429 退避窗口内直接短路，不发网络请求 —— 避免「无退避重传 → 更多 429」的正反馈风暴。
       if (Date.now() < chunkBackoffUntilRef.current) {
+        // P4-1：Infinity = 413/402 的终态停传，不是限流退避。这里若照常报「限流退避中」，
+        // 下一次调用就会把真正的原因盖掉，用户永远等一个不会到来的恢复。
+        const stoppedPermanently =
+          chunkBackoffUntilRef.current === Number.POSITIVE_INFINITY;
         publishBackupMeta({
           localChunkCount,
           remoteChunkCount: remoteDraftSeqsRef.current.size,
-          syncState: 'pending',
-          lastError: 'Backup upload is backing off after rate limiting',
+          syncState: stoppedPermanently ? 'error' : 'pending',
+          lastError: stoppedPermanently
+            ? 'Cloud backup stopped. Recording continues locally.'
+            : 'Backup upload is backing off after rate limiting',
         });
         return false;
       }
@@ -215,6 +221,22 @@ export function useSoniox(
                 ? retryAfter * 1000
                 : CHUNK_BACKOFF_BASE_MS;
             chunkBackoffUntilRef.current = Date.now() + backoffMs;
+          }
+          // P4-1：413（草稿总量超限）/ 402（存储配额不足）是**终态拒绝**，不是暂时性故障。
+          // 当成普通失败会永远重传下去：既刷服务端日志，也让用户一直看着「等待上传」却永不完成。
+          // 这里改成停止重传并给出可行动的文案（草稿仍在服务端保留，本地音频也不丢）。
+          if (response.status === 413 || response.status === 402) {
+            chunkBackoffUntilRef.current = Number.POSITIVE_INFINITY;
+            publishBackupMeta({
+              localChunkCount,
+              remoteChunkCount: remoteDraftSeqsRef.current.size,
+              syncState: 'error',
+              lastError:
+                response.status === 402
+                  ? 'Cloud backup stopped: storage quota is full. Recording continues locally.'
+                  : 'Cloud backup stopped: this recording exceeded the draft size limit. Recording continues locally.',
+            });
+            return false;
           }
           publishBackupMeta({
             localChunkCount,
@@ -1635,6 +1657,15 @@ export function useSoniox(
     if (recordingRef.current && recordingState === 'paused') {
       autoPauseReasonRef.current = null;
       shouldReconnectRef.current = false;
+      // U58：这条分支复用同一条 Soniox WS，不会走 onConnectionChange('connected')，
+      // 也就没人重置延迟基准。而 SDK resume 后 token.end_ms 不含暂停这段墙钟时间，
+      // 若不把会话起点同样往后推，之后每个样本的 latency 都被整段暂停虚高，EMA 永久
+      // 卡在虚值（暂停久到超过 MAX_PLAUSIBLE_LATENCY_MS 则样本全被丢、徽标定格）。
+      // 与重连路径（:974-975 / :1273-1274）的重置口径一致。
+      if (sessionStartWallClockRef.current != null && pausedForMs > 0) {
+        sessionStartWallClockRef.current += pausedForMs;
+      }
+      latencyEmaRef.current = null;
       recordingRef.current.recording.resume?.();
       await archiveManagerRef.current?.resume();
       accumulatePausedTime();

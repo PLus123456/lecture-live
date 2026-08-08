@@ -198,6 +198,7 @@ vi.mock('@/lib/llm/chatImageStorage', async () => {
 });
 
 import { POST } from '@/app/api/llm/chat/route';
+import { ChatContextEOLError } from '@/lib/llm/chatContextBuilder';
 import { __resetConversationTurnLocks } from '@/lib/llm/conversationTurnLock';
 
 interface DoneEvent {
@@ -991,6 +992,87 @@ describe('POST /api/llm/chat (mode routing)', () => {
           data: expect.objectContaining({ role: 'user' }),
         })
       );
+    });
+  });
+
+  // ── L1：EOL 不该再触发外层降级空转 ──
+  describe('EOL 一次到位（L1）', () => {
+    it('buildChatContext 抛 ChatContextEOLError → 只调一次 builder，直接回 contextFull', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-eol',
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        endedAt: null,
+        degradationLevel: 1,
+        session: { id: 'sess-1', userId: 'user-1', targetLang: 'zh' },
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+
+      // builder 内部已从 currentLevel 试到 MAX 全部塞不下 → EOL。
+      // 外层若再抬级重试，每轮都会重新 compressHistory（一次真实 LLM 调用）。
+      buildChatContextMock.mockRejectedValue(
+        new ChatContextEOLError({
+          systemPrompt: 0,
+          timeAnchor: 0,
+          transcript: 0,
+          summary: 0,
+          history: 0,
+          userInput: 0,
+          total: 999_999,
+        })
+      );
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-eol',
+          question: 'q',
+          transcript: [{ text: 'live', startMs: 0 }],
+        },
+      });
+      const res = await POST(req, {} as never);
+      const { events } = await consumeSseEvents(res);
+
+      const errEvent = events.find((e) => e.event === 'error');
+      expect(errEvent?.data.contextFull).toBe(true);
+      // 关键断言：一次即止，不再 1→7 空转 7 轮
+      expect(buildChatContextMock).toHaveBeenCalledTimes(1);
+      expect(callLLMWithHistoryStreamMock).not.toHaveBeenCalled();
+    });
+
+    it('provider 侧超长报错（非 EOL）仍逐级降级重试', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-degrade',
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        endedAt: null,
+        degradationLevel: 1,
+        session: { id: 'sess-1', userId: 'user-1', targetLang: 'zh' },
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+
+      // 第一轮 provider 报 context_length（我们的预估偏乐观）→ 降一级后成功。
+      callLLMWithHistoryStreamMock.mockImplementationOnce(async () => {
+        throw new Error('This model maximum context length is 200000 tokens');
+      });
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-degrade',
+          question: 'q',
+          transcript: [{ text: 'live', startMs: 0 }],
+        },
+      });
+      const res = await POST(req, {} as never);
+      await consumeSseEvents(res);
+
+      expect(buildChatContextMock).toHaveBeenCalledTimes(2);
+      expect(buildChatContextMock.mock.calls[1][0]).toMatchObject({ minLevel: 2 });
     });
   });
 });

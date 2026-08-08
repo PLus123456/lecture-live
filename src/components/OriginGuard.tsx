@@ -1,11 +1,17 @@
 'use client';
 
 /**
- * OriginGuard — 前端域名二进制校验组件
+ * OriginGuard — 前端域名提示组件
  *
  * 从 /api/site-config 获取 site_url 和 site_url_backups，
  * 将允许的 origin 和当前 window.location.origin 编码为 UTF-8 字节序列，
- * 逐字节比较（"二进制体操"），不匹配则显示 403 拒绝页面。
+ * 逐字节比较，不匹配则显示提示页而不渲染子树。
+ *
+ * ⚠️ C50/P6-10：这**不是**访问控制。它是 'use client' 组件，只在浏览器里跑；
+ * 配置加载失败 / 未配置 / 网络错误三处都刻意 fail-open（避免后端抖动锁住全站），
+ * 而 `site_url_backups` 在服务端没有任何消费者——直接调 API 完全不经过这里。
+ * 真正的域名限制请在反向代理 / 防火墙层做。管理端文案（i18n `backupUrlsDesc`）
+ * 已按这个口径改过，别再改回「将被拦截」。
  */
 
 import { useEffect, useState } from 'react';

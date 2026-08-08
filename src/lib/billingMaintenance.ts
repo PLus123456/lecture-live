@@ -6,6 +6,7 @@ import { logger, serializeError } from '@/lib/logger';
 import { trackJob, createJob, markJobProcessing, markJobSuccess, markJobFailed, JOB_TYPE, reclaimStaleProcessingJobs } from '@/lib/jobQueue';
 import {
   loadRecordingDraftManifest,
+  sweepStaleRecordingDrafts,
 } from '@/lib/recordingDraftPersistence';
 import {
   loadTranscriptDraftManifest,
@@ -90,6 +91,7 @@ export interface BillingMaintenanceSummary {
   releasedOrphanReservations: number;
   releasedOrphanFullReservations: number;
   cleanedOrphanSoniox: number;
+  sweptRecordingDrafts: number;
   reclaimedInterpretSessions: number;
   sonioxUsageReconciliation: {
     regionsPolled: number;
@@ -282,6 +284,22 @@ export async function runBillingMaintenance(options?: {
     // 不 rethrow —— 其他维护任务结果仍要返回
   }
 
+  // P4-1 兜底：清扫 data/recording-drafts 下的陈旧草稿目录。
+  // 在此之前**全仓没有任何东西碰这个目录**：reclaimStaleSessions 只覆盖 RECORDING/PAUSED/FINALIZING，
+  // CREATED 会话永不回收，于是它们的分片目录（上限 512 MiB/会话）在盘上不朽。
+  // 失败仅 log 不 rethrow。
+  let sweptRecordingDrafts = 0;
+  try {
+    const swept = await sweepStaleRecordingDrafts({ now: now.getTime() });
+    sweptRecordingDrafts = swept.removed;
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'sweep stale recording drafts failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
   // P1-17 兜底：重试删除终态会话上仍残留的 Soniox 外部资源（收尾/取消时 DELETE 未确认成功的孤儿）。
   // 用会话行 ID 列本身当 outbox，确认删除才清 ID。失败仅 log 不 rethrow。
   let cleanedOrphanSoniox = 0;
@@ -459,6 +477,7 @@ export async function runBillingMaintenance(options?: {
         releasedOrphanReservations,
         releasedOrphanFullReservations,
         cleanedOrphanSoniox,
+        sweptRecordingDrafts,
         reclaimedInterpretSessions,
         sonioxUsageReconciliation,
         storageBytesReconciled,
@@ -479,6 +498,7 @@ export async function runBillingMaintenance(options?: {
     releasedOrphanReservations,
     releasedOrphanFullReservations,
     cleanedOrphanSoniox,
+    sweptRecordingDrafts,
     reclaimedInterpretSessions,
     sonioxUsageReconciliation,
     storageBytesReconciled,
@@ -1348,43 +1368,60 @@ export async function expireRoleDowngrades(now: Date): Promise<number> {
       resolveRoleStorageBytesLimit(targetRole),
     ]);
 
-    // 条件原子降级：再次确认仍过期且 originalRole 未被清空（避免与 admin 续费竞争误降级）
-    const result = await prisma.user.updateMany({
-      where: {
-        id: user.id,
-        roleExpiresAt: { lte: now },
-        originalRole: { not: null },
-      },
-      data: {
-        role: targetRole,
-        originalRole: null,
-        roleExpiresAt: null,
-        // 到期同时清掉自定义组绑定：否则用户 role/配额已回落系统角色，customGroupId 却仍指向
-        // 旧自定义组 → resolveUserFeatureFlags 仍读组的能力开关、UI 徽章仍显示组名，与已重置的
-        // 配额列不一致（漂移）。回落目标是系统角色，本就不应保留自定义组归属。
-        customGroupId: null,
-        transcriptionMinutesLimit: quotas.transcriptionMinutesLimit,
-        storageHoursLimit: quotas.storageHoursLimit,
-        allowedModels: quotas.allowedModels,
-        storageBytesLimit,
-        // 自增 tokenVersion 让旧 JWT 失效，把降级用户踢下线（下次请求按新角色重新签发）
-        tokenVersion: { increment: 1 },
-      },
-    });
+    // P5-3：结算池 + 降级必须**同一事务、结算在前**（与 admin/groups/route.ts 的正确范式一致）。
+    // 旧写法是 updateMany 独立提交、settle 另起事务且外层只 log 不 rethrow —— settle 一抛错，该用户
+    // 的 originalRole 已被置 null，候选查询要求 `originalRole: { not: null }`，此后永远捞不到他。
+    // 危害不是「漏一次结算」：下次月度重置的 computePoolOwed 会用**已降下来的新 limit** 算
+    // owed = used − inflight − newLimit，一次性超额扣池，上限 = oldLimit − newLimit
+    //（PRO 600 → FREE 60 且当月用满时一次多扣 540 分钟，可清空池子）。
+    // settlePoolOnLimitChangeTx 的 old/new limit 是显式入参、不读行上的 limit 列，故与 updateMany
+    // 同事务无先后依赖；仍按 settle 在前排列以对齐范式。
+    // 降级条件不满足（admin 抢先续费）时抛 SkipDowngrade 回滚整个事务：既不降级也不结算。
+    const result = await prisma
+      .$transaction(async (tx) => {
+        if (user.purchasedMinutesBalance > 0) {
+          await settlePoolOnLimitChange(
+            user.id,
+            user.transcriptionMinutesLimit,
+            quotas.transcriptionMinutesLimit,
+            tx
+          );
+        }
+        // 条件原子降级：再次确认仍过期且 originalRole 未被清空（避免与 admin 续费竞争误降级）
+        const r = await tx.user.updateMany({
+          where: {
+            id: user.id,
+            roleExpiresAt: { lte: now },
+            originalRole: { not: null },
+          },
+          data: {
+            role: targetRole,
+            originalRole: null,
+            roleExpiresAt: null,
+            // 到期同时清掉自定义组绑定：否则用户 role/配额已回落系统角色，customGroupId 却仍指向
+            // 旧自定义组 → resolveUserFeatureFlags 仍读组的能力开关、UI 徽章仍显示组名，与已重置的
+            // 配额列不一致（漂移）。回落目标是系统角色，本就不应保留自定义组归属。
+            customGroupId: null,
+            transcriptionMinutesLimit: quotas.transcriptionMinutesLimit,
+            storageHoursLimit: quotas.storageHoursLimit,
+            allowedModels: quotas.allowedModels,
+            storageBytesLimit,
+            // 自增 tokenVersion 让旧 JWT 失效，把降级用户踢下线（下次请求按新角色重新签发）
+            tokenVersion: { increment: 1 },
+          },
+        });
+        if (r.count !== 1) throw new SkipDowngradeError();
+        return r;
+      })
+      .catch((err) => {
+        if (err instanceof SkipDowngradeError) return { count: 0 };
+        throw err;
+      });
 
     if (result.count !== 1) {
       continue;
     }
     downgraded += 1;
-    // 充值系统（Model A）：降级把 limit 调低而不动 used。用捕获的旧上限按旧口径结算持池用户的时长池
-    //（并整周期重置），仅在降级已成功后执行、且仅对持池用户，避免误扣未真正降级的用户。
-    if (user.purchasedMinutesBalance > 0) {
-      await settlePoolOnLimitChange(
-        user.id,
-        user.transcriptionMinutesLimit,
-        quotas.transcriptionMinutesLimit
-      );
-    }
     billingLogger.info(
       { userId: user.id, from: user.role, to: targetRole },
       'expired membership downgraded to original role'
@@ -1393,6 +1430,10 @@ export async function expireRoleDowngrades(now: Date): Promise<number> {
 
   return downgraded;
 }
+
+/** expireRoleDowngrades 内部：降级条件在事务内不再成立（admin 抢先续费）时用它回滚整笔。 */
+class SkipDowngradeError extends Error {}
+
 
 async function isSessionStale(
   session: {
@@ -1423,7 +1464,33 @@ async function isSessionStale(
   return now.getTime() - lastActivityMs >= threshold;
 }
 
-async function maybeRunDailyReconciliation(now: Date): Promise<string | null> {
+/**
+ * L8：原子抢占「今天的对账」。返回 true 表示本实例抢到、应当去跑。
+ *
+ * 旧写法是「先读 lastRun 判日期 → 跑完整场对账 → 才 upsert 写日期」，中间的窗口正好等于**整场
+ * 对账的时长**（全量遍历用户 + 逐用户多次聚合），多实例/多次触发都会读到旧值而各跑一遍：重复的
+ * ReconciliationRun 记录 + 成倍的 DB 压力。改成先用条件写抢占、抢到才跑，窗口收敛到单条语句。
+ */
+async function claimReconciliationDay(todayUtc: string): Promise<boolean> {
+  // 行已存在：条件写（value != 今天）保证并发中只有一个 updateMany 影响到 1 行。
+  const claimed = await prisma.siteSetting.updateMany({
+    where: { key: RECONCILIATION_LAST_RUN_KEY, value: { not: todayUtc } },
+    data: { value: todayUtc },
+  });
+  if (claimed.count === 1) return true;
+  // 行还不存在（首次运行）：靠 key 的唯一约束让并发中只有一个 create 成功，其余唯一冲突 → 抢占失败。
+  try {
+    await prisma.siteSetting.create({
+      data: { key: RECONCILIATION_LAST_RUN_KEY, value: todayUtc },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 导出仅为单测直接覆盖 L8 的抢占语义（生产路径只由 runBillingMaintenance 调用）。
+export async function maybeRunDailyReconciliation(now: Date): Promise<string | null> {
   const todayUtc = now.toISOString().slice(0, 10);
   const lastRun = await prisma.siteSetting.findUnique({
     where: { key: RECONCILIATION_LAST_RUN_KEY },
@@ -1431,6 +1498,11 @@ async function maybeRunDailyReconciliation(now: Date): Promise<string | null> {
   });
 
   if (lastRun?.value === todayUtc) {
+    return null;
+  }
+
+  // L8：抢占放在**跑之前**，抢不到直接退出（另一个实例正在跑或已跑完）。
+  if (!(await claimReconciliationDay(todayUtc))) {
     return null;
   }
 
@@ -1444,15 +1516,17 @@ async function maybeRunDailyReconciliation(now: Date): Promise<string | null> {
       source: 'scheduler',
     });
 
-    await prisma.siteSetting.upsert({
-      where: { key: RECONCILIATION_LAST_RUN_KEY },
-      create: { key: RECONCILIATION_LAST_RUN_KEY, value: todayUtc },
-      update: { value: todayUtc },
-    });
-
     if (jobId) markJobSuccess(jobId, { reconciliationRunId: run.id });
     return run.id;
   } catch (err) {
+    // 抢占已提前写下了今天的日期；对账失败必须把它释放掉，否则今天的对账被永久跳过。
+    // 条件写（仍等于今天才回退）避免覆盖后来者写入的值。
+    await prisma.siteSetting
+      .updateMany({
+        where: { key: RECONCILIATION_LAST_RUN_KEY, value: todayUtc },
+        data: { value: lastRun?.value ?? '' },
+      })
+      .catch(() => undefined);
     if (jobId) markJobFailed(jobId, err);
     throw err;
   }

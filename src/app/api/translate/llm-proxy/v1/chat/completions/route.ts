@@ -14,6 +14,19 @@ const proxyLogger = logger.child({ component: 'translate-llm-proxy' });
 const MAX_PROMPT_CHARS = 120_000;
 
 /**
+ * L25：任务级**累计** token 预算（纵深防御，需先攻陷 worker 才够得着）。
+ *
+ * 代理凭据在任务处于 TRANSLATING 期间一直有效，此前除了 900/min 的限速外没有任何总量约束：
+ * 单次请求限 120K 字符 × 900 次/分 = 一台被攻陷的 worker 可以拿它当免费 LLM 无限刷，
+ * 账单记在站点头上，而用户只按页数付过一次费。
+ *
+ * 按页数给宽裕预算：pdf2zh 每页正常消耗在几千 token 量级，这里放到 40k/页 + 100k 起步
+ * （约正常用量的一个数量级以上），正常任务永远撞不到，被滥用时能兜住。
+ */
+const PROXY_TOKEN_BUDGET_BASE = 100_000;
+const PROXY_TOKEN_BUDGET_PER_PAGE = 40_000;
+
+/**
  * POST /api/translate/llm-proxy/v1/chat/completions — 文档翻译 worker 的 LLM 回流代理。
  *
  * pdf2zh 的 OpenAICompatible 后端把 base_url 指到这里，所有翻译 LLM 流量回流主应用网关：
@@ -38,11 +51,34 @@ export async function POST(req: Request) {
       id: true,
       status: true,
       modelId: true,
+      pageCount: true,
+      llmInputTokens: true,
+      llmOutputTokens: true,
       user: { select: { role: true, customGroupId: true } },
     },
   });
   if (!task || task.status !== 'TRANSLATING') {
     return NextResponse.json({ error: { message: 'Unauthorized' } }, { status: 401 });
+  }
+
+  // L25：累计 token 预算闸。llm*Tokens 本来只是「成本可视」的统计列，这里顺带当额度用。
+  const spentTokens = task.llmInputTokens + task.llmOutputTokens;
+  const tokenBudget =
+    PROXY_TOKEN_BUDGET_BASE + Math.max(0, task.pageCount) * PROXY_TOKEN_BUDGET_PER_PAGE;
+  if (spentTokens >= tokenBudget) {
+    proxyLogger.warn(
+      { taskId: task.id, spentTokens, tokenBudget },
+      '翻译代理累计 token 超出任务预算，拒绝继续调用'
+    );
+    return NextResponse.json(
+      {
+        error: {
+          message: 'translation token budget exceeded',
+          type: 'insufficient_quota',
+        },
+      },
+      { status: 429 }
+    );
   }
 
   // 防滥用限速（宽松固定 900/min：pdf2zh 侧已有 --qps 限速，这里只挡异常流量）

@@ -1,23 +1,39 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { verifyAuth } from '@/lib/auth';
 import { getRechargeSettings } from '@/lib/payment/settings';
 import { formatCurrencyCents } from '@/lib/format';
 
 /**
  * 沙箱支付确认页（仅当 sandbox 渠道启用时可用）。展示订单金额，
  * 提供「确认支付 / 取消」两个链接，指向沙箱回调路由完成到账/取消。开发/测试用。
+ *
+ * 这条路径被 middleware 整段放行（回调也在同一前缀下），所以鉴权必须自己做（P3-12）：
+ * 从前只凭一个订单号就能拿到任意用户的订单金额与单号，是无鉴权的信息泄露。
  */
 export async function GET(req: Request) {
+  // 硬护栏：沙箱页在生产一律不存在，不管 sandboxEnabled 被谁误开。
+  // （到账侧已被 payment/index.ts 的 NODE_ENV 判断挡死，这里补上展示侧。）
+  if (process.env.NODE_ENV === 'production') {
+    return new NextResponse('Not found', { status: 404 });
+  }
+
   const settings = await getRechargeSettings();
   if (!settings.sandboxEnabled) {
     return new NextResponse('Sandbox channel disabled', { status: 404 });
   }
 
+  const payload = await verifyAuth(req);
+  if (!payload) return new NextResponse('Unauthorized', { status: 401 });
+
   const outTradeNo = new URL(req.url).searchParams.get('out_trade_no') ?? '';
   const order = outTradeNo
     ? await prisma.paymentOrder.findUnique({ where: { outTradeNo } })
     : null;
-  if (!order) return new NextResponse('Order not found', { status: 404 });
+  // 越权与不存在回同一个 404：别让攻击者用状态码区分「单号存在但不是我的」。
+  if (!order || order.userId !== payload.id) {
+    return new NextResponse('Order not found', { status: 404 });
+  }
 
   const esc = (s: string) => s.replace(/[<>&"]/g, (c) => `&#${c.charCodeAt(0)};`);
   const no = esc(order.outTradeNo);

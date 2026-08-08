@@ -121,18 +121,46 @@ describe('extractTranslationsByTokens', () => {
     });
   });
 
-  it('翻译 token 落在 segment gap 里 → 安静跳过，不抛错', () => {
+  // V1a：零容差归属会把落在段间 gap 的翻译 token 静默丢掉（整段译文凭空缺失）。
+  // 现在精确区间未命中时退到「时间最近且在 250ms 容差内」的段，超出容差才丢。
+  it('翻译 token 落在 gap 里但在容差内 → 归到时间最近的段', () => {
     const tokens = [
       origToken('你好', 0, 500),
       origToken('世界', 1000, 1500),
-      // 翻译 token 落在 [500, 1000) 这个 gap 里
-      transToken('orphan', 600, 800),
-      // 这个能匹配
       transToken('hello', 0, 500),
+      // 落在 [500, 1000) 的 gap 里，但距 seg-1 尾部仅 100ms（≤250ms 容差）
+      transToken(' tail', 600, 800),
     ];
     const segments = [bounds('seg-1', 0, 500), bounds('seg-2', 1000, 1500)];
     expect(extractTranslationsByTokens(tokens, segments)).toEqual({
+      'seg-1': 'hello tail',
+    });
+  });
+
+  it('翻译 token 落在 gap 正中、两侧都超出容差 → 安静跳过，不抛错', () => {
+    const tokens = [
+      origToken('你好', 0, 500),
+      origToken('世界', 3000, 3500),
+      // 距 seg-1 尾 1000ms、距 seg-2 头 1500ms，两侧都 >250ms
+      transToken('orphan', 1500, 1800),
+      transToken('hello', 0, 500),
+    ];
+    const segments = [bounds('seg-1', 0, 500), bounds('seg-2', 3000, 3500)];
+    expect(extractTranslationsByTokens(tokens, segments)).toEqual({
       'seg-1': 'hello',
+    });
+  });
+
+  it('末段之后一点点的翻译 token（翻译滞后于原文）不再被丢弃', () => {
+    const tokens = [
+      origToken('你好', 0, 500),
+      origToken('世界', 500, 1000),
+      // start_ms 比末段 endMs 晚 200ms —— 零容差下整条被丢，译文缺失
+      transToken('late tail', 1200, 1400),
+    ];
+    const segments = [bounds('seg-1', 0, 500), bounds('seg-2', 500, 1000)];
+    expect(extractTranslationsByTokens(tokens, segments)).toEqual({
+      'seg-2': 'late tail',
     });
   });
 

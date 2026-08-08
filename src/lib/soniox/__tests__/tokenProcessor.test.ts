@@ -60,6 +60,54 @@ describe('TokenProcessor', () => {
     expect(segments[0]?.text).toBe('你们');
   });
 
+  // C11：自动截断曾把「终态 + 非终态尾巴」一起成段并清空两者；Soniox 随后把那批
+  // 非终态 token 原样重发、终态化后落进下一段 → 同一句跨两段重复。
+  describe('C11：自动截断只结算终态 token，非终态尾巴顺延', () => {
+    it('尾巴终态化后只出现一次，不跨段重复', () => {
+      const segments: TranscriptSegment[] = [];
+      const processor = new TokenProcessor({
+        onSegmentFinalized: (segment) => segments.push(segment),
+      });
+      processor.setMaxSegmentChars(5);
+
+      // 一帧里：'你好' 已终态，'世界。' 仍是非终态尾巴。
+      // 旧实现看合并文本（'你好世界。'，够长且以句号结尾）就切段，把尾巴一起成段。
+      processor.processTokens([
+        buildToken('你好', { is_final: true, start_ms: 0, end_ms: 400 }),
+        buildToken('世界。', { start_ms: 400, end_ms: 900 }),
+      ]);
+
+      // Soniox 把同一批尾巴 token 终态化后重发（真实协议行为）
+      processor.processTokens([
+        buildToken('世界。', { is_final: true, start_ms: 400, end_ms: 900 }),
+      ]);
+      processor.onEndpoint();
+
+      // 旧实现会得到 ['你好世界。', '世界。'] —— '世界。' 重复
+      expect(segments.map((segment) => segment.text)).toEqual(['你好世界。']);
+    });
+
+    it('终态文本自身达上限即切段，未定稿尾巴留在预览里而不是被吞进段落', () => {
+      const previews: StreamingPreviewText[] = [];
+      const segments: TranscriptSegment[] = [];
+      const processor = new TokenProcessor({
+        onPreviewUpdate: (preview) => previews.push(preview),
+        onSegmentFinalized: (segment) => segments.push(segment),
+      });
+      processor.setMaxSegmentChars(5);
+
+      processor.processTokens([
+        buildToken('你好世界。', { is_final: true, start_ms: 0, end_ms: 900 }),
+        buildToken('接下来', { start_ms: 900, end_ms: 1200 }),
+      ]);
+
+      // 旧实现用合并文本判定（末尾是 '接下来'，不匹配句末标点）→ 根本不切段
+      expect(segments.map((segment) => segment.text)).toEqual(['你好世界。']);
+      // 尾巴既没进段落，也没被清掉，仍在流式预览里等定稿
+      expect(previews.at(-1)).toEqual({ finalText: '', nonFinalText: '接下来' });
+    });
+  });
+
   it('会显示翻译等待态，并用最新 non-final 翻译覆盖旧值', () => {
     const previewTranslations: StreamingPreviewTranslation[] = [];
     const translationUpdates: Array<{

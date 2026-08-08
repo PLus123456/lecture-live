@@ -21,6 +21,9 @@ interface TierInput {
 }
 
 function intOrNull(v: unknown): number | null {
+  // null / undefined / 空串 = 「没给」，必须回 null 而不是 0：`Number(null) === 0` 会把
+  // 「没填到账额」的全价 topup 档静默变成到账 0 分（P3-13：用户付全款、钱包一分不进）。
+  if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
   // 负数与超 32 位（Int 列上限）视为无效 → 返回 null（让上层回 400 或回退默认），不再截 0：
   // 否则 priceCents=-100 会被静默截成 ¥0 档（L3），超大值写库时 Int 溢出 500 而非干净的 400。
@@ -28,23 +31,80 @@ function intOrNull(v: unknown): number | null {
   return Math.floor(n);
 }
 
-/** 校验并归一化档位输入；返回 { data } 或 { error }。 */
-function normalizeTier(body: TierInput): { data?: Record<string, unknown>; error?: string } {
-  const kind = body.kind;
+/** body 里显式出现的键才算「要改」；undefined = 不改（PATCH 局部更新的判据）。 */
+const TIER_KEYS = [
+  'kind',
+  'name',
+  'priceCents',
+  'active',
+  'sortOrder',
+  'grantRole',
+  'durationDays',
+  'grantMinutes',
+  'creditCents',
+] as const;
+
+/** 换 kind 时这四列是**派生**的（按新 kind 重算/置空），必须跟着写，否则残留旧 kind 的值。 */
+const KIND_DERIVED_KEYS = ['grantRole', 'durationDays', 'grantMinutes', 'creditCents'];
+
+interface TierRow {
+  kind: string;
+  name: string;
+  priceCents: number;
+  grantRole: string | null;
+  durationDays: number | null;
+  grantMinutes: number | null;
+  creditCents: number | null;
+  active: boolean;
+  sortOrder: number;
+}
+
+/**
+ * 校验并归一化档位输入；返回 { data } 或 { error }。
+ *
+ * 传 `current`（PATCH）时走**局部更新**：缺省字段以现有行参与校验，且只回 body 里显式出现的键。
+ * 从前 PATCH 复用整套「缺省即默认值」的逻辑，改个名字就把 `active`/`sortOrder`/`grantRole`/
+ * `creditCents` 静默重置成默认值（停用的档位被改回上架、卖 FREE 的档位被改成卖 PRO）——P3-9。
+ */
+function normalizeTier(
+  body: TierInput,
+  current?: TierRow
+): { data?: Record<string, unknown>; error?: string } {
+  const partial = current != null;
+  const given = (k: (typeof TIER_KEYS)[number]) => body[k] !== undefined;
+  // 校验用的「合并后完整档位」：PATCH 缺省沿用现有行的值。
+  const merged: TierInput = {
+    kind: given('kind') ? body.kind : current?.kind,
+    name: given('name') ? body.name : current?.name,
+    priceCents: given('priceCents') ? body.priceCents : current?.priceCents,
+    grantRole: given('grantRole') ? body.grantRole : current?.grantRole,
+    durationDays: given('durationDays') ? body.durationDays : current?.durationDays,
+    grantMinutes: given('grantMinutes') ? body.grantMinutes : current?.grantMinutes,
+    creditCents: given('creditCents') ? body.creditCents : current?.creditCents,
+    active: given('active') ? body.active : current?.active ?? true,
+    sortOrder: given('sortOrder') ? body.sortOrder : current?.sortOrder ?? 0,
+  };
+
+  const kind = merged.kind;
   if (!kind || !TIER_KINDS.includes(kind as TierKind)) {
     return { error: '档位类型无效（membership | minutes | topup）' };
   }
-  const name = (body.name ?? '').trim();
+  const name = (merged.name ?? '').trim();
   if (!name) return { error: '档位名称不能为空' };
-  const priceCents = intOrNull(body.priceCents);
+  const priceCents = intOrNull(merged.priceCents);
   if (priceCents == null) return { error: '价格必须为非负整数（分）' };
+  // P3-7：¥0 的会员/时长档 = 无限提款机（applyGrantTx 的余额守卫对 0 恒真），一个「0 元体验档」
+  // 建完即成提款机。只对**本次请求带来的价格**设限——否则历史遗留的 0 元档连「停用」都改不动。
+  if (kind !== 'topup' && priceCents <= 0 && (!partial || given('priceCents'))) {
+    return { error: '会员/时间档位价格必须大于 0（¥0 档位等同无限领取）' };
+  }
 
   const data: Record<string, unknown> = {
     kind,
     name,
     priceCents,
-    active: body.active ?? true,
-    sortOrder: intOrNull(body.sortOrder) ?? 0,
+    active: merged.active ?? true,
+    sortOrder: intOrNull(merged.sortOrder) ?? 0,
     grantRole: null,
     durationDays: null,
     grantMinutes: null,
@@ -52,22 +112,44 @@ function normalizeTier(body: TierInput): { data?: Record<string, unknown>; error
   };
 
   if (kind === 'membership') {
-    const role = (body.grantRole ?? 'PRO') as UserRole;
+    const role = (merged.grantRole ?? 'PRO') as UserRole;
     if (!['ADMIN', 'PRO', 'FREE'].includes(role)) return { error: '授予角色无效' };
-    const days = intOrNull(body.durationDays);
+    const days = intOrNull(merged.durationDays);
     if (!days || days <= 0) return { error: '会员档位必须设置正的时长天数' };
     data.grantRole = role;
     data.durationDays = days;
   } else if (kind === 'minutes') {
-    const minutes = intOrNull(body.grantMinutes);
+    const minutes = intOrNull(merged.grantMinutes);
     if (!minutes || minutes <= 0) return { error: '时间档位必须设置正的赠送分钟数' };
     data.grantMinutes = minutes;
   } else {
     // topup：creditCents 可空（默认等于 priceCents，在结算时兜底）
-    const credit = intOrNull(body.creditCents);
+    const credit = intOrNull(merged.creditCents);
     data.creditCents = credit ?? priceCents;
   }
-  return { data };
+
+  if (!partial) return { data };
+
+  const kindChanged = given('kind') && body.kind !== current?.kind;
+  const patch: Record<string, unknown> = {};
+  for (const k of TIER_KEYS) {
+    if (given(k) || (kindChanged && KIND_DERIVED_KEYS.includes(k))) patch[k] = data[k];
+  }
+  return { data: patch };
+}
+
+/**
+ * 审计流水里的档位描述。**必须带 grantRole**（P6-15）：只写 name + kind 的话，一个卖 ADMIN 的
+ * 会员档和一个卖 PRO 的在流水里长得一模一样 —— 这正是「档位偷偷改成授予 ADMIN」事后查不出来的原因。
+ */
+function describeTier(tier: {
+  name: string;
+  kind: string;
+  grantRole: string | null;
+  priceCents: number;
+}): string {
+  const role = tier.grantRole ? ` grantRole=${tier.grantRole}` : '';
+  return `${tier.name} (${tier.kind}${role}, ${tier.priceCents}分)`;
 }
 
 // 列出所有档位
@@ -98,7 +180,7 @@ export const POST = withRequestLogging('admin:recharge:tiers:create', async (req
   const tier = await prisma.rechargeTier.create({ data: data as never });
   logAction(req, 'admin.recharge.tier.create', {
     user: admin,
-    detail: `新建档位: ${tier.name} (${tier.kind})`,
+    detail: `新建档位: ${describeTier(tier)}`,
   });
   return NextResponse.json({ tier });
 });
@@ -117,13 +199,16 @@ export const PATCH = withRequestLogging('admin:recharge:tiers:update', async (re
     return NextResponse.json({ error: '请求体无效' }, { status: 400 });
   }
   if (!body.id) return NextResponse.json({ error: '缺少档位 id' }, { status: 400 });
-  const { data, error } = normalizeTier(body);
+  // 局部更新须以现有行为基准（P3-9）：先读，缺省字段沿用当前值而不是回落到「新建默认值」。
+  const current = await prisma.rechargeTier.findUnique({ where: { id: body.id } });
+  if (!current) return NextResponse.json({ error: '档位不存在' }, { status: 404 });
+  const { data, error } = normalizeTier(body, current as unknown as TierRow);
   if (error) return NextResponse.json({ error }, { status: 400 });
   try {
     const tier = await prisma.rechargeTier.update({ where: { id: body.id }, data: data as never });
     logAction(req, 'admin.recharge.tier.update', {
       user: admin,
-      detail: `更新档位: ${tier.name} (${tier.kind})`,
+      detail: `更新档位: ${describeTier(tier)}（原 ${describeTier(current)}）`,
     });
     return NextResponse.json({ tier });
   } catch {
@@ -144,7 +229,7 @@ export const DELETE = withRequestLogging('admin:recharge:tiers:delete', async (r
     const tier = await prisma.rechargeTier.delete({ where: { id } });
     logAction(req, 'admin.recharge.tier.delete', {
       user: admin,
-      detail: `删除档位: ${tier.name} (${tier.kind})`,
+      detail: `删除档位: ${describeTier(tier)}`,
     });
     return NextResponse.json({ ok: true });
   } catch {

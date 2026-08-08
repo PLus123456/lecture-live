@@ -52,6 +52,12 @@ const MAX_WORKER_RUNTIME_MS = 180 * 60_000;
 /** 自动重试退避（按已消耗 attempt 索引） */
 const RETRY_BACKOFF_MS = [5 * 60_000, 20 * 60_000, 45 * 60_000];
 const DEFAULT_MAX_ATTEMPTS = 3;
+/**
+ * L23：孤儿任务（PENDING 但没有调度行）的补入队宽限期。
+ * 正常路径里「扣费事务提交 → enqueueDocTranslate 写回 jobQueueId」只隔几十毫秒，
+ * 取 2 分钟足以避开正常窗口，又不至于让真正的孤儿等太久。
+ */
+const ORPHAN_TASK_GRACE_MS = 2 * 60_000;
 
 interface TranslateJobParams {
   /** 业务行 id（TranslationTask） */
@@ -112,10 +118,26 @@ export async function enqueueDocTranslate(taskId: string, userId: string): Promi
       maxAttempts: DEFAULT_MAX_ATTEMPTS,
     });
     if (!jobId) return null;
-    await prisma.translationTask.update({
-      where: { id: taskId },
+    // L23：绑定失败（任务被并发取消/删除、或状态已不是 PENDING）时必须把刚建的调度行
+    // 就地终态化。原来用的是会抛的 prisma.update：抛出后外层 catch 只 return null，
+    // 那行永远留在 SUBMITTED 里，每轮 tick 都被捞进 take(totalSlots)、白占一个全局派发槽。
+    const bound = await prisma.translationTask.updateMany({
+      where: { id: taskId, status: 'PENDING' },
       data: { jobQueueId: jobId },
     });
+    if (bound.count === 0) {
+      await prisma.jobQueue
+        .updateMany({
+          where: { id: jobId, status: JOB_STATUS.SUBMITTED },
+          data: {
+            status: JOB_STATUS.FAILED,
+            error: '入队时任务状态已变化',
+            completedAt: new Date(),
+          },
+        })
+        .catch(() => undefined);
+      return null;
+    }
     return jobId;
   } catch (error) {
     translateLogger.warn({ taskId, err: serializeError(error) }, '翻译任务入队失败');
@@ -184,6 +206,29 @@ async function executeTick(): Promise<void> {
         '文档翻译任务自动重试回炉'
       );
     }
+  }
+
+  // 2.5) L23：捞回「扣了费但没有调度行」的孤儿任务。
+  // 扣费必须先于建行（建行的 params 需要 taskId），confirm/retry 两条路由都是
+  // 「事务里扣费 → 事务外 enqueueDocTranslate」。进程在这两步之间挂掉（部署/OOM）时，
+  // 任务永久停在 PENDING + jobQueueId=null：钱扣了、没有任何调度器认识它、
+  // 用户界面上是一个永远转圈的任务。宽限期避开正常请求内那几十毫秒的窗口。
+  const orphanedTasks = await prisma.translationTask.findMany({
+    where: {
+      status: 'PENDING',
+      jobQueueId: null,
+      updatedAt: { lt: new Date(Date.now() - ORPHAN_TASK_GRACE_MS) },
+    },
+    select: { id: true, userId: true },
+    orderBy: { updatedAt: 'asc' },
+    take: 20,
+  });
+  for (const orphan of orphanedTasks) {
+    const jobId = await enqueueDocTranslate(orphan.id, orphan.userId);
+    translateLogger.warn(
+      { taskId: orphan.id, jobId },
+      jobId ? '补入队已扣费但无调度行的翻译任务' : '孤儿翻译任务补入队失败（下轮重试）'
+    );
   }
 
   // 3) 派发：总槽位 = Σ每台 concurrency − 全部在途
@@ -312,6 +357,8 @@ async function loadTask(taskId: string | undefined) {
       refundedAt: true,
       pageCount: true,
       modelId: true,
+      // L24：代次令牌 —— 清盘/退款前必须确认任务仍绑在当前这一代调度行上
+      jobQueueId: true,
       user: { select: { role: true, customGroupId: true } },
     },
   });
@@ -515,7 +562,12 @@ async function reconcileProcessingJob(
   if (!task || task.status === 'CANCELED') {
     const bound = workerById(fleet, params.workerId);
     if (bound) await deleteTranslateJob(bound, job.id).catch(() => undefined);
-    if (task) await deleteTaskFiles(task.id).catch(() => undefined);
+    // L24：deleteTaskFiles 是对整个任务目录的 `rm -rf`（含源文件）。用户「取消 → 重试」
+    // 之后源文件必须留着给新一代用，而上一代的对账可能才刚跑到这里读到 CANCELED 快照。
+    // 只有任务仍绑在本代调度行上时才允许清盘。
+    if (task && task.jobQueueId === job.id) {
+      await deleteTaskFiles(task.id).catch(() => undefined);
+    }
     await prisma.jobQueue.updateMany({
       where: { id: job.id, status: JOB_STATUS.PROCESSING },
       data: {
@@ -628,7 +680,10 @@ async function harvestJob(
   });
   if (updated.count === 0) {
     // 任务在下载期间被取消/删除：清落盘产物，调度行终态
-    await deleteTaskFiles(task.id).catch(() => undefined);
+    // L24：同上，只清本代的盘（用户可能已经 retry，新一代还要用源文件）
+    if (task.jobQueueId === jobId) {
+      await deleteTaskFiles(task.id).catch(() => undefined);
+    }
     await prisma.jobQueue.updateMany({
       where: { id: jobId, status: JOB_STATUS.PROCESSING },
       data: { status: JOB_STATUS.FAILED, error: '任务已取消', completedAt: new Date() },
@@ -696,27 +751,39 @@ async function failJob(
 
   const taskId = params.taskId;
   if (taskId) {
+    // L24：所有对 TranslationTask 的写都带 `jobQueueId: jobId` 代次谓词。
+    // 用户 retry 会把任务重置回 PENDING + 重新扣一次费 + 换一条新调度行，此时若上一代的
+    // failJob 才姗姗来迟，它会把刚重试的任务打成 FAILED 并退掉**新一代**的钱
+    //（refundedAt 被 retry 清成 null，幂等闸拦不住）——用户白拿一次翻译。
+    // TranslationTask.jobQueueId 就是天然的代次令牌：retry 事务里先置 null，
+    // 再由 enqueueDocTranslate 绑到新行，旧代次的谓词永远匹配不上。
     if (canRetry) {
       // 等待自动重试期间对用户仍显示「翻译中」，不闪失败
       await prisma.translationTask
         .updateMany({
-          where: { id: taskId, status: 'TRANSLATING' },
+          where: { id: taskId, jobQueueId: jobId, status: 'TRANSLATING' },
           data: { errorMessage: null },
         })
         .catch(() => undefined);
     } else {
-      await prisma.translationTask
+      const marked = await prisma.translationTask
         .updateMany({
-          where: { id: taskId, status: { in: ['PENDING', 'TRANSLATING'] } },
+          where: {
+            id: taskId,
+            jobQueueId: jobId,
+            status: { in: ['PENDING', 'TRANSLATING'] },
+          },
           data: {
             status: 'FAILED',
             errorMessage: message.slice(0, 500),
             proxyTokenHash: null,
           },
         })
-        .catch(() => undefined);
-      await refundTaskCharge(taskId, '翻译失败自动退款');
-      notifyTaskFinished(taskId, 'failed');
+        .catch(() => ({ count: 0 }));
+      if (marked.count > 0) {
+        await refundTaskCharge(taskId, '翻译失败自动退款', jobId);
+        notifyTaskFinished(taskId, 'failed');
+      }
     }
   }
   translateLogger.warn(
@@ -728,33 +795,52 @@ async function failJob(
 /**
  * 终态失败/取消的全额退款。幂等闸：refundedAt 的条件 CAS 抢占（赢家才真正入账），
  * 杜绝「对账与取消路由并发都退一次」的双退。chargedCents=0（未扣费）直接跳过。
+ *
+ * L22：CAS 抢占 + 读金额 + 钱包入账三步必须同事务。原来是三条独立语句，
+ * 中间任一步挂掉都会留下「refundedAt 已写、钱没到账」的状态 —— 幂等闸从此挡住所有重试，
+ * 这笔钱永久消失（补偿写 refundedAt=null 本身也可能挂）。refundWalletCents 本就收
+ * 可选 tx 参数，包进来后失败即整体回滚，refundedAt 自动还原，不需要任何补偿写。
+ *
+ * L24：可选的 expectJobQueueId 代次守卫 —— 只有当任务仍绑在发起方那一代调度行上时才退，
+ * 防止上一代的迟到失败退掉用户重试后新扣的那笔钱。
  */
-export async function refundTaskCharge(taskId: string, note: string): Promise<void> {
-  const claimed = await prisma.translationTask.updateMany({
-    where: { id: taskId, refundedAt: null, chargedCents: { gt: 0 } },
-    data: { refundedAt: new Date() },
-  });
-  if (claimed.count === 0) return;
-  const task = await prisma.translationTask.findUnique({
-    where: { id: taskId },
-    select: { userId: true, chargedCents: true },
-  });
-  if (!task) return;
+export async function refundTaskCharge(
+  taskId: string,
+  note: string,
+  expectJobQueueId?: string
+): Promise<void> {
   try {
-    await refundWalletCents({
-      userId: task.userId,
-      amountCents: task.chargedCents,
-      type: 'translation_refund',
-      note: `${note} doc-translate:${taskId}`,
+    await prisma.$transaction(async (tx) => {
+      const claimed = await tx.translationTask.updateMany({
+        where: {
+          id: taskId,
+          refundedAt: null,
+          chargedCents: { gt: 0 },
+          ...(expectJobQueueId ? { jobQueueId: expectJobQueueId } : {}),
+        },
+        data: { refundedAt: new Date() },
+      });
+      if (claimed.count === 0) return;
+      const task = await tx.translationTask.findUnique({
+        where: { id: taskId },
+        select: { userId: true, chargedCents: true },
+      });
+      if (!task) return;
+      await refundWalletCents(
+        {
+          userId: task.userId,
+          amountCents: task.chargedCents,
+          type: 'translation_refund',
+          note: `${note} doc-translate:${taskId}`,
+        },
+        tx
+      );
     });
   } catch (error) {
-    // 入账失败则收回幂等闸，让下一轮兜底重试
-    await prisma.translationTask
-      .updateMany({ where: { id: taskId }, data: { refundedAt: null } })
-      .catch(() => undefined);
+    // 事务已整体回滚（refundedAt 自动还原），兜底路径下轮重试
     translateLogger.error(
       { taskId, err: serializeError(error) },
-      '翻译退款入账失败（已还原退款闸，等待重试）'
+      '翻译退款入账失败（事务已回滚，等待重试）'
     );
   }
 }

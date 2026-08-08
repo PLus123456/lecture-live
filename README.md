@@ -280,9 +280,9 @@ LectureLive uses the Cloudreve v4 OAuth authorization code flow with PKCE for st
 | `npm run db:migrate` | Run Prisma development migrations |
 | `npm run db:migrate:deploy` | Apply production migrations |
 | `npm run db:studio` | Open Prisma Studio |
-| `npm run billing:reset-quotas` | Reset monthly transcription quotas |
-| `npm run billing:reconcile` | Reconcile transcription usage |
-| `npm run billing:maintenance` | Run billing maintenance tasks |
+| `npm run billing:reset-quotas` | Reset monthly transcription quotas (settles purchased-minute pools and clears in-flight reservations) |
+| `npm run billing:reconcile` | Print a read-only transcription usage drift report |
+| `npm run billing:maintenance` | Run billing maintenance tasks (includes both of the above plus session/reservation reclamation — prefer this for cron) |
 | `npm run security:reencrypt-llm-keys` | Re-encrypt stored LLM provider keys |
 
 ## Contributing

@@ -1,7 +1,14 @@
 import 'server-only';
 
 import { prisma } from '@/lib/prisma';
-import { JOB_TYPE, JOB_STATUS, createJob, retryJob } from '@/lib/jobQueue';
+import {
+  JOB_TYPE,
+  JOB_STATUS,
+  ActiveJobConflictError,
+  audioEnhanceActiveKey,
+  createJob,
+  retryJob,
+} from '@/lib/jobQueue';
 import {
   loadSessionAudioArtifact,
   stageArtifact,
@@ -91,19 +98,8 @@ export interface EnqueueEnhanceOptions {
 export async function enqueueAudioEnhance(
   options: EnqueueEnhanceOptions
 ): Promise<string | null> {
+  const activeKey = audioEnhanceActiveKey(options.sessionId);
   try {
-    const existing = await prisma.jobQueue.findFirst({
-      where: {
-        type: JOB_TYPE.AUDIO_ENHANCE,
-        sessionId: options.sessionId,
-        status: { in: [JOB_STATUS.SUBMITTED, JOB_STATUS.PROCESSING] },
-      },
-      select: { id: true },
-    });
-    if (existing) {
-      return existing.id;
-    }
-
     // 剥掉同会话 FAILED 残留任务的自动重试标记：马上要建新任务，旧失败任务若到期
     // 自动复活会与新任务并行处理同一会话（双份上传 + 双次收割竞态）。
     const staleFailed = await prisma.jobQueue.findMany({
@@ -122,13 +118,30 @@ export async function enqueueAudioEnhance(
       }
     }
 
-    const jobId = await createJob({
-      type: JOB_TYPE.AUDIO_ENHANCE,
-      sessionId: options.sessionId,
-      userId: options.userId,
-      triggeredBy: options.triggeredBy ?? 'system',
-      maxAttempts: DEFAULT_MAX_ATTEMPTS,
-    });
+    // P5-16：幂等由 activeKey 唯一索引兜底，不再靠「先查在途再建行」的 check-then-act
+    // （双击按钮 / finalize 自动入队撞上手动触发时会各查到空、各建一行，
+    //  同一份录音被两台 worker 同时增强、两次回存互相覆盖）。
+    let jobId: string;
+    try {
+      jobId = await createJob({
+        type: JOB_TYPE.AUDIO_ENHANCE,
+        sessionId: options.sessionId,
+        userId: options.userId,
+        triggeredBy: options.triggeredBy ?? 'system',
+        maxAttempts: DEFAULT_MAX_ATTEMPTS,
+        activeKey,
+      });
+    } catch (error) {
+      if (error instanceof ActiveJobConflictError) {
+        // 已有在途任务持键 → 复用它（幂等语义与原实现一致）
+        const existing = await prisma.jobQueue.findFirst({
+          where: { activeKey },
+          select: { id: true },
+        });
+        return existing?.id ?? null;
+      }
+      throw error;
+    }
     if (!jobId) {
       return null;
     }
@@ -624,6 +637,8 @@ async function harvestJob(
       where: { id: jobId },
       data: {
         status: JOB_STATUS.SUCCESS,
+        // P5-16：落终态即释放 activeKey，否则该会话永远入不了新队。
+        activeKey: null,
         result: JSON.stringify({
           enhancedAudioPath: staged.reference,
           bytes: output.data.length,
@@ -673,6 +688,8 @@ async function failJob(
         error: message.slice(0, 1000),
         params: JSON.stringify(params),
         completedAt: new Date(),
+        // P5-16：落终态即释放 activeKey；可自动重试的任务由 retryJob 回炉时重新取键。
+        activeKey: null,
       },
     })
     .catch((err) =>

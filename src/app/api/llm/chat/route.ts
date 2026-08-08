@@ -434,7 +434,16 @@ function streamChatResponse(
           } catch (err) {
             if (emittedBytes) throw err;
             if (isContextLengthError(err)) {
-              if (currentLevel >= DEGRADATION_MAX_LEVEL) {
+              // L1：ChatContextEOLError 表示 buildChatContext **内部已经从 currentLevel
+              // 一路试到 DEGRADATION_MAX_LEVEL 全部塞不下**，外层再抬一级只会让它重跑同一段
+              // 更短的区间、再抛同样的 EOL。而每次重跑都会因 state 是新对象而重新
+              // compressHistory（chatContextBuilder.ts:430-438）—— 从 L1 起算白白多打 6 次
+              // 压缩 LLM 调用、多等 6 轮，用户最终看到的还是同一句 contextFull。
+              // 故 EOL 直接终结循环；只有 provider 侧的超长报错（预估 token 偏乐观）才值得降级重试。
+              const eol =
+                err instanceof ChatContextEOLError ||
+                currentLevel >= DEGRADATION_MAX_LEVEL;
+              if (eol) {
                 chatLogger.warn(
                   {
                     conversationId: args.conversationId,

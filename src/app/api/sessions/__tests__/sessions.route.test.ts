@@ -143,6 +143,26 @@ describe('sessions route', () => {
     await expect(response.text()).resolves.toBe('');
   });
 
+  // P4-4：GET 此前无限流（同文件的 POST 有）。每次 miss 都要跑 findMany + count + aggregate
+  // 并把整行 JSON 化驻留 30 秒，配合「垃圾参数换缓存键」就是一条直通数据库的放大器。
+  it('P4-4：GET 按用户限流，429 时不查库', async () => {
+    enforceApiRateLimitMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Too many requests' }), { status: 429 })
+    );
+
+    const response = await GET(
+      createJsonRequest('http://localhost:3000/api/sessions'),
+      {} as never
+    );
+
+    expect(response.status).toBe(429);
+    expect(sessionFindManyMock).not.toHaveBeenCalled();
+    expect(enforceApiRateLimitMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ scope: 'sessions:list', key: 'user:user-1' })
+    );
+  });
+
   it('创建会话时校验文件夹归属并规范化字段', async () => {
     folderFindUniqueMock.mockResolvedValue({
       id: 'folder-1',

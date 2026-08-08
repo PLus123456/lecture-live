@@ -2,6 +2,7 @@ import 'server-only';
 
 import { prisma } from '@/lib/prisma';
 import { decrypt } from '@/lib/crypto';
+import { SECRET_MASK } from '@/lib/credentialRetarget';
 
 /**
  * 需要「静态加密落库 + 管理后台 GET 脱敏」的敏感设置键。
@@ -16,8 +17,9 @@ export const SENSITIVE_SETTING_KEYS = [
 /**
  * 脱敏占位符。管理后台 GET 时已设置的敏感值回传它（表示"已配置但隐藏"）；
  * PUT 收到它（或空串）表示"保持原值不变"，避免脱敏值被回存导致密钥被清空。
+ * 唯一定义在 credentialRetarget（那里的「改靶必须重填凭据」判定要用同一个占位符）。
  */
-export const SETTING_SECRET_MASK = '********';
+export const SETTING_SECRET_MASK = SECRET_MASK;
 
 /** 读取敏感设置：解密落库值（明文/未加密值原样返回，兼容历史数据）。 */
 function decryptSensitiveSetting(value: string | undefined): string {

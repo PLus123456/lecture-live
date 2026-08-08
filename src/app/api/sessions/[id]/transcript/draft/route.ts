@@ -10,6 +10,15 @@ import {
   type TranscriptDraftPayload,
 } from '@/lib/transcriptDraftPersistence';
 import { isRecordingDraftSealed } from '@/lib/recordingDraftPersistence';
+import { enforceRateLimit } from '@/lib/rateLimit';
+
+// P4-5：草稿载荷字节上限。旧代码只有元素**个数**上限（MAX_SEGMENTS 等），对单个 segment 的
+// 体积零校验 —— 10000 个巨型 segment 完全合法，落盘还 pretty-print 撑得更大。
+// 8MiB 对「10000 段 + 翻译」的真实草稿有数倍余量。
+const MAX_DRAFT_BODY_BYTES = 8 * 1024 * 1024;
+
+// P4-5：PUT 限流。客户端每数秒冲刷一次快照，120 次/分钟远高于正常节奏（含 unload keepalive 冲刷）。
+const DRAFT_PUT_RATE_LIMIT_PER_MIN = 120;
 
 async function loadOwnedSession(req: Request, sessionId: string) {
   const user = await verifyAuth(req);
@@ -44,6 +53,18 @@ export async function PUT(
     return result.error;
   }
 
+  // P4-5：按 user+session 分桶限流（认证之后，故拿得到 userId；IP 在 TRUSTED_PROXY 缺省时是
+  // 全站一个桶）。这是「冲突分支每次都写一份全量备份」放大器的第一道闸。
+  const rateLimited = await enforceRateLimit(req, {
+    scope: 'sessions:transcript-draft',
+    limit: DRAFT_PUT_RATE_LIMIT_PER_MIN,
+    windowMs: 60_000,
+    key: `user:${result.session.userId}:session:${id}`,
+  });
+  if (rateLimited) {
+    return rateLimited;
+  }
+
   // 终态守卫：会话已 COMPLETED/ARCHIVED 后拒绝草稿写入，否则 finalize 删草稿之后迟到的
   // keepalive PUT（unload 冲刷）会重新创建草稿目录、永不再被清理（磁盘泄漏 + 冷恢复误读）。
   // 放行 FINALIZING —— 收尾流程在 finalize 前的最后一次 draft PUT 仍需落盘（审计 low）。
@@ -64,7 +85,19 @@ export async function PUT(
   }
 
   try {
-    const body = await req.json();
+    // P4-5：先按字节量闸，再 JSON.parse —— 数量闸挡不住「10000 个巨型 segment」，
+    // 而 parse 本身也是同步 CPU，先量后解能一起挡住。
+    const raw = await req.text();
+    if (raw.length > MAX_DRAFT_BODY_BYTES) {
+      return NextResponse.json(
+        {
+          error: `Draft payload too large (max ${MAX_DRAFT_BODY_BYTES} bytes)`,
+          maxBytes: MAX_DRAFT_BODY_BYTES,
+        },
+        { status: 413 }
+      );
+    }
+    const body = JSON.parse(raw);
 
     const segments = Array.isArray(body.segments) ? body.segments : [];
     const summaries = Array.isArray(body.summaries) ? body.summaries : [];

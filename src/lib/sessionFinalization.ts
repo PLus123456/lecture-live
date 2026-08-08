@@ -256,13 +256,15 @@ export async function finalizeSession(
     // now 的墙钟含全部暂停/挂机空闲，客户端没能上报暂停时会把空闲整段当录音计费、超额扣配额
     // （审计 medium）。此路径改以实际转录覆盖的时长为准（更接近真实录音量，宁少勿多）。
     const isAutoReclaim = options.finalizeSource === 'system_auto_reclaim';
-    // R1-L2：但「宁少勿多」不能少过 Soniox 实测串流量——改装客户端直连串流、不回传任何转录内容，
-    // 挂到 reclaim 时 transcript/durationMs 皆 0，若只按内容口径就整场免单。usage cron 已把该
-    // session 各 grant 的 usage-logs 实测毫秒回填到 actualMs（真实产生转录成本的量，不含挂机
-    // 空闲——流断即停表），auto-reclaim 用它作时长下限。诚实用户正常收尾不走此分支，口径不变。
-    const grantActualMs = isAutoReclaim
-      ? await sumSessionGrantActualMs(options.sessionId).catch(() => 0)
-      : 0;
+    // R1-L2 + P5-6：「宁少勿多」不能少过 Soniox 实测串流量——改装客户端直连串流、不回传任何转录
+    // 内容，收尾时 transcript/durationMs 皆 0，若只按内容口径就整场免单。usage cron 已把该 session
+    // 各 grant 的 usage-logs 实测毫秒回填到 actualMs（真实产生转录成本的量，不含挂机空闲——流断即
+    // 停表）。**所有** finalize 路径都要取它：旧实现只在 auto-reclaim 时算、正常收尾硬编码 0，而
+    // 用户侧「结束录音」才是攻击者会走的那条路；且截断后的值写回 Session.durationMs、对账 expected
+    // 又按同一个值重算 → drift 恒 0，账面上完全看不见。诚实用户的 durationMs 恒 ≥ 实测量，口径不变。
+    const grantActualMs = await sumSessionGrantActualMs(options.sessionId).catch(
+      () => 0
+    );
     const resolvedDurationMs = Math.max(
       session.durationMs ?? 0,
       transcriptDurationMs,
@@ -404,7 +406,11 @@ export async function finalizeSession(
         // 走 deductTranscriptionMinutes（内含 ensureQuotaWindow 跨月度重置点窗口校正，
         // 修正裸 increment 把分钟加到未重置旧窗口的隐性 drift）；传入 tx 使"扣减 ⟺
         // status→COMPLETED"在同一事务原子提交（失败一起回滚，杜绝并发/重试双扣或漏扣）。
-        await deductTranscriptionMinutes(session.userId, billableMinutes, tx);
+        // P5-5：带上 sessionId，同事务把这笔实扣追加进 Session.billedMinutes 不可变台账——
+        // 对账 expected 从此对台账求和，不再按「当前 durationMs × 当前倍率」重算。
+        await deductTranscriptionMinutes(session.userId, billableMinutes, tx, {
+          sessionId: options.sessionId,
+        });
       }
 
       const updated = await tx.session.findUnique({

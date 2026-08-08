@@ -4,6 +4,10 @@ import { useCallback } from 'react';
 import { useAuthStore } from '@/stores/authStore';
 import { useConversationListStore } from '@/stores/conversationListStore';
 import { useChatStore } from '@/stores/chatStore';
+import {
+  SHARED_LINKS_STORAGE_KEY,
+  useSharedLinksStore,
+} from '@/stores/sharedLinksStore';
 
 export function useAuth() {
   const { user, token, quotas, sessionChecked, setAuth, setQuotas, setSessionChecked, logout: clearStore } = useAuthStore();
@@ -96,15 +100,28 @@ export function useAuth() {
     // 清空聊天运行时 + 模型列表：否则新账号会短暂看到旧账号的消息切片，且因 modelsLoaded
     // 常驻 true 而继续沿用旧账号的（按组授权的）模型列表，直到整页刷新。
     useChatStore.getState().resetForAccountSwitch();
+    // C47/L27：已浏览的分享链接（含 share token）也是账号相关的本机残留，一并清掉。
+    useSharedLinksStore.getState().clearViewedLinks();
 
     // 2. 显式清除 localStorage 中 persist 的数据，防止刷新后恢复
     try {
       localStorage.removeItem('lecture-live-auth');
+      localStorage.removeItem(SHARED_LINKS_STORAGE_KEY);
     } catch {
       // SSR 或 localStorage 不可用时忽略
     }
 
-    // 3. 调用服务端清除 HttpOnly cookie
+    // 3. 清扫 IndexedDB 里的本地录音归档（C51/P6-8）。
+    //    不清的话，下一个在本机登录的账号会看到（并可能上传）上一个账号的音频。
+    //    尽力而为，且不阻塞登出：失败不影响下面的 cookie 清除。
+    try {
+      const { clearAllAudioArchives } = await import('@/lib/audio/audioChunkStore');
+      await clearAllAudioArchives();
+    } catch {
+      // IndexedDB 不可用 / 清理失败时忽略
+    }
+
+    // 4. 调用服务端清除 HttpOnly cookie
     try {
       await fetch('/api/auth/logout', {
         method: 'POST',

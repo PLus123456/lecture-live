@@ -14,6 +14,8 @@ import {
   settleFullReservation,
 } from '@/lib/quota';
 import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
+import { deleteSessionArtifacts } from '@/lib/sessionPersistence';
+import { deleteRecordingDraft } from '@/lib/recordingDraftPersistence';
 
 type StatusFilter = '' | 'has-recording' | 'no-recording' | 'completed' | 'archived' | 'recording';
 
@@ -154,8 +156,12 @@ export async function GET(req: Request) {
 /**
  * 管理员：删除录音/会话（单个或批量）
  * 删除数据库中的 Session 记录 + 关联表（FolderSession / ShareLink）。
- * 不会主动删除 Cloudreve 远程文件——上传后 Cloudreve 会按其配置回收，
- * 单独删除远端文件需要 OAuth 上下文，避免在 admin 删除路径里引入。
+ *
+ * L4：删行前**物理删除**会话产物（本地 data/ + Cloudreve 录音/转录/摘要/报告/完整版转录）
+ * 与录音草稿分片目录，与用户侧 DELETE 口径一致。旧注释「不会主动删除 Cloudreve 远程文件」是
+ * 用户侧修好前的旧结论——行一删便再无 path→owner 关联，没有任何 cron 能回收这些文件。
+ *
+ * P5-8：在途预留结算失败则**跳过该会话不删**（预留是 Session 行上的列，行一删就没有载体）。
  */
 export async function DELETE(req: Request) {
   const { user: admin, response } = await requireAdminAccess(req, {
@@ -192,14 +198,19 @@ export async function DELETE(req: Request) {
         // 与用户侧 sessions/[id] DELETE 的区域感知 + transcription-before-file 清理口径对齐。
         sonioxRegion: true,
         sonioxTranscriptionId: true,
+        // L4：物理删产物需要各引用列（deleteSessionArtifacts 按引用逐个删本地/Cloudreve 对象）。
+        recordingPath: true,
+        enhancedAudioPath: true,
+        transcriptPath: true,
+        summaryPath: true,
+        reportPath: true,
+        fullTranscriptPath: true,
       },
     });
 
     if (targets.length === 0) {
       return NextResponse.json({ error: '未找到目标会话' }, { status: 404 });
     }
-
-    const targetIds = targets.map((t) => t.id);
 
     // U12：删行前取消进行中的异步上传转录，对齐用户侧 DELETE。否则本地分片/合并/mp3
     // （可达 ~5GB）+ Soniox 远端文件会随 session 行消失而失去关联、永久泄漏（回收 cron 只
@@ -218,10 +229,31 @@ export async function DELETE(req: Request) {
     // B1/R4：删行前原子结算每个会话遗留的在途预留 —— 异步上传（asyncReservedMinutes）+ 完整版补全
     //（fullReservedMinutes）。行一删，回收 cron 只扫现存 Session 行、再也找不到 → 预留永久占着
     // transcriptionMinutesUsed 泄漏。对齐用户侧 DELETE；settle* 幂等、恰好释放一次（与并发结算/回收互斥）。
-    for (const id of targetIds) {
-      await settleAsyncReservation(id).catch(() => undefined);
-      await settleFullReservation(id).catch(() => undefined);
+    //
+    // P5-8：结算失败**不再吞掉后照删**——那会造出谁也够不到的孤儿预留（持池用户还会因 computePoolOwed
+    // 的 used 含孤儿预留、在途聚合又找不到该行而被多扣池子，不可自愈）。失败的会话本轮跳过、保留其行，
+    // 管理员重试即可（settle 幂等）；其余会话照常删，批量不因个别失败整体卡死。
+    const deletableIds: string[] = [];
+    const skippedIds: string[] = [];
+    for (const session of targets) {
+      try {
+        await settleAsyncReservation(session.id);
+        await settleFullReservation(session.id);
+        deletableIds.push(session.id);
+      } catch (settleErr) {
+        console.error('结算在途预留失败，跳过删除该会话:', session.id, settleErr);
+        skippedIds.push(session.id);
+      }
     }
+
+    if (deletableIds.length === 0) {
+      return NextResponse.json(
+        { error: '结算在途转录预留失败，未删除任何会话', skipped: skippedIds.length },
+        { status: 500 },
+      );
+    }
+
+    const deletable = targets.filter((t) => deletableIds.includes(t.id));
 
     // 删 session 会级联删 legacy 单录音对话(Conversation.sessionId 命中)及其 ChatAttachment
     // (schema onDelete: Cascade)。这些字节必须释放，否则永久"鬼占"用户配额、只增不减。
@@ -230,15 +262,23 @@ export async function DELETE(req: Request) {
     // 对照用户侧实现：src/app/api/sessions/[id]/route.ts。
     const releasableBytes = await prisma.chatAttachment.groupBy({
       by: ['userId'],
-      where: { conversation: { sessionId: { in: targetIds } } },
+      where: { conversation: { sessionId: { in: deletableIds } } },
       _sum: { bytes: true },
     });
 
+    // L4：删行前 best-effort 物理清理产物（本地 data/ + Cloudreve 录音/增强音频/转录/摘要/报告/
+    // 完整版转录）+ 录音草稿分片目录，对齐用户侧 DELETE。行一删便再无 path→owner 关联、没有任何
+    // cron 能回收这些文件 —— 此前 admin 删录音只删 DB 行，Cloudreve 上的录音永久残留。
+    for (const session of deletable) {
+      await deleteSessionArtifacts(session).catch(() => undefined);
+      await deleteRecordingDraft(session).catch(() => undefined);
+    }
+
     // 事务：删除外键关联，再删 session 本体
     await prisma.$transaction([
-      prisma.folderSession.deleteMany({ where: { sessionId: { in: targetIds } } }),
-      prisma.shareLink.deleteMany({ where: { sessionId: { in: targetIds } } }),
-      prisma.session.deleteMany({ where: { id: { in: targetIds } } }),
+      prisma.folderSession.deleteMany({ where: { sessionId: { in: deletableIds } } }),
+      prisma.shareLink.deleteMany({ where: { sessionId: { in: deletableIds } } }),
+      prisma.session.deleteMany({ where: { id: { in: deletableIds } } }),
     ]);
 
     // session 删除成功后释放字节配额（best-effort；失败留给字节对账兜底）
@@ -250,7 +290,7 @@ export async function DELETE(req: Request) {
     }
 
     // 失效所有受影响用户的缓存
-    const ownerIds = [...new Set(targets.map((t) => t.userId))];
+    const ownerIds = [...new Set(deletable.map((t) => t.userId))];
     await Promise.all(
       ownerIds.flatMap((id) => [
         invalidateSessionsApiCache(id),
@@ -261,10 +301,17 @@ export async function DELETE(req: Request) {
 
     logAction(req, 'admin.files.delete', {
       user: admin,
-      detail: `删除 ${targets.length} 个会话/录音 (ids: ${targets.map((t) => t.id.slice(0, 8)).join(', ')})`,
+      detail:
+        `删除 ${deletable.length} 个会话/录音 (ids: ${deletable.map((t) => t.id.slice(0, 8)).join(', ')})` +
+        (skippedIds.length > 0
+          ? ` | 结算失败跳过 ${skippedIds.length} 个: ${skippedIds.map((s) => s.slice(0, 8)).join(', ')}`
+          : ''),
     });
 
-    return NextResponse.json({ deleted: targets.length });
+    return NextResponse.json({
+      deleted: deletable.length,
+      ...(skippedIds.length > 0 ? { skipped: skippedIds.length } : {}),
+    });
   } catch (err) {
     console.error('删除会话失败:', err);
     return NextResponse.json({ error: '删除失败' }, { status: 500 });

@@ -65,6 +65,41 @@ function evictLRU() {
 }
 
 /**
+ * L2：把「单段本身就超上限」的文本二次切开。
+ *
+ * 累积式切分只能在段与段之间断，段内断不了 —— 异步上传 / 完整版转录的 converter
+ * 完全可能吐出数千字符的单段（长时间无停顿无换人），这种段会原样变成一个巨 chunk：
+ * embedding 语义被稀释到检索近乎失效，命中后拼进上下文还会一次性顶爆预算。
+ *
+ * 切法：用**本段实测的字符/token 比**反推窗口长度（CJK 与拉丁比例差很远，写死常数不稳），
+ * 窗口取 CHUNK_TARGET_TOKENS 而非 MAX，留 ~40% 余量吸收比例误差，从而不必对每片重新
+ * encode（estimateTokens 是真 BPE，逐片重估会退化成 O(n²)）。
+ * 断点优先取窗口末 20% 内的空白（拉丁受益）；CJK 无空白就硬切。
+ */
+function splitOversizedSegmentText(text: string, tokens: number): string[] {
+  if (tokens <= CHUNK_MAX_TOKENS || text.length === 0) return [text];
+  const charsPerToken = Math.max(1, text.length / tokens);
+  const window = Math.max(1, Math.floor(CHUNK_TARGET_TOKENS * charsPerToken));
+  const pieces: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    let end = Math.min(text.length, i + window);
+    if (end < text.length) {
+      const minBreak = i + Math.floor(window * 0.8);
+      for (let j = end; j > minBreak; j--) {
+        if (/\s/.test(text[j - 1])) {
+          end = j;
+          break;
+        }
+      }
+    }
+    pieces.push(text.slice(i, end));
+    i = end;
+  }
+  return pieces;
+}
+
+/**
  * 把 transcript segments 按 token 目标累积切成 chunk。
  * 每个 chunk 自然记录 startMs/endMs，方便上层加时间标签。
  */
@@ -93,14 +128,37 @@ function chunkSegments(
 
   for (const seg of segments) {
     const segTokens = estimateTokens(seg.text);
+
+    // L2：单段超上限时累积条件救不了它（buffer 空 → `bufferTokens > 0` 不成立，
+    // 整段照收后 flush 出一个远超 CHUNK_MAX_TOKENS 的巨块）。先把在手的 buffer 收掉，
+    // 再把这一段拆成若干片各自成块。
+    if (segTokens > CHUNK_MAX_TOKENS) {
+      flush();
+      for (const piece of splitOversizedSegmentText(seg.text, segTokens)) {
+        const text = piece.trim();
+        if (!text) continue;
+        chunks.push({
+          text,
+          // 段内没有更细的时间信息，各片共用该段起点。
+          startMs: seg.startMs,
+          endMs: seg.startMs,
+          tokens: estimateTokens(text),
+        });
+      }
+      bufferEnd = seg.startMs;
+      continue;
+    }
+
     if (
       bufferTokens > 0 &&
       (bufferTokens + segTokens > CHUNK_TARGET_TOKENS ||
         bufferTokens + segTokens > CHUNK_MAX_TOKENS)
     ) {
       flush();
-      bufferStart = seg.startMs;
     }
+    // 新块起点 = 其首段时间。原来只在 flush 分支里更新，超长段路径 flush 后
+    // 会把下一块的 startMs 留在旧值上，故统一改成「buffer 为空即取当前段」。
+    if (!bufferText) bufferStart = seg.startMs;
     bufferText += (bufferText ? ' ' : '') + seg.text;
     bufferTokens += segTokens;
     bufferEnd = seg.startMs;

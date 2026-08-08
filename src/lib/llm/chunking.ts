@@ -27,9 +27,17 @@ export interface ChunkOptions {
   chunkMaxTokens?: number;
   /** 块间重叠 token 数（默认 0）。RAG 场景下设 50-100 可保留跨块上下文 */
   overlapTokens?: number;
+  /**
+   * P4-2：最多产出多少块（默认 DEFAULT_MAX_CHUNKS）。达到上限后**停止切块并丢弃剩余文本**。
+   * 调用方每块通常对应一次 LLM 调用，块数就是扇出倍数；没有这道闸时一份超长输入
+   * 会被切成数千块 → 数千次不计费的 LLM 调用（成本全落平台厂商 key）。
+   */
+  maxChunks?: number;
 }
 
 const DEFAULT_TARGET = 800;
+// 800 token/块 × 500 块 = 40 万 token，任何单次「整篇提取」的合法用法都远在其下。
+const DEFAULT_MAX_CHUNKS = 500;
 
 // 句子边界：中英文标点。注意 \n\n（段落）优先级高于句号。
 const SENTENCE_BOUNDARIES = /([。！？!?]+["」』）)]?\s*|\n{2,}|\.\s+(?=[A-Z]))/g;
@@ -71,6 +79,7 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
   const target = options.chunkTargetTokens ?? DEFAULT_TARGET;
   const max = options.chunkMaxTokens ?? Math.round(target * 1.25);
   const overlap = options.overlapTokens ?? 0;
+  const maxChunks = Math.max(1, options.maxChunks ?? DEFAULT_MAX_CHUNKS);
 
   if (!text) return [];
 
@@ -107,6 +116,13 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
   };
 
   for (const sentence of sentences) {
+    // P4-2：块数触顶就整体停手（连带停掉「每句一次 estimateTokens」的同步 BPE 开销）——
+    // 这道 break 同时是扇出闸与 CPU 闸，务必留在循环最前面。
+    if (chunks.length >= maxChunks) {
+      buffer = '';
+      break;
+    }
+
     const sentTokens = estimateTokens(sentence);
     cursor += sentence.length;
 
@@ -117,7 +133,7 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
       const sliceLen = Math.max(1, Math.floor(sentence.length * ratio));
       let pos = 0;
       const sentenceStart = cursor - sentence.length;
-      while (pos < sentence.length) {
+      while (pos < sentence.length && chunks.length < maxChunks) {
         const piece = sentence.slice(pos, pos + sliceLen);
         chunks.push({
           text: piece,
@@ -141,6 +157,8 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
     bufferTokens += sentTokens;
   }
 
-  flush(cursor);
+  if (chunks.length < maxChunks) {
+    flush(cursor);
+  }
   return chunks;
 }

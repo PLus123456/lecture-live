@@ -21,6 +21,8 @@ import { formatCurrencyCents } from '@/lib/format';
 // ─── 类型 ───
 interface RechargeSettings {
   enabled: boolean;
+  /** ISO-4217 结算币种码（下拉选择，非自由文本）。见 CURRENCY_OPTIONS。 */
+  currency?: string;
   currencySymbol: string;
   alipayEnabled: boolean;
   wechatEnabled: boolean;
@@ -29,6 +31,7 @@ interface RechargeSettings {
   alipayAppId: string;
   alipayPrivateKey: string;
   alipayPublicKey: string;
+  alipaySellerId: string;
   alipayGateway: string;
   wechatAppId: string;
   wechatMchId: string;
@@ -77,6 +80,26 @@ interface Transaction {
 }
 
 type SubTab = 'settings' | 'tiers' | 'ledger';
+
+/**
+ * 结算币种候选（ISO-4217 码 + 展示符号）。
+ *
+ * 币种从前是一个自由文本的「货币符号」框，Stripe 侧再拿它反推币种、推不出就落 usd —— 管理员
+ * 填「元 / CNY / RMB」即静默按美元收款，约 7.1× 超收（P3-15）。这里改成下拉：码是唯一真源，
+ * 符号随码确定，人手打不出非法值。
+ */
+const CURRENCY_OPTIONS: { code: string; symbol: string; label: string }[] = [
+  { code: 'CNY', symbol: '¥', label: 'CNY · 人民币' },
+  { code: 'USD', symbol: '$', label: 'USD · US Dollar' },
+  { code: 'EUR', symbol: '€', label: 'EUR · Euro' },
+  { code: 'GBP', symbol: '£', label: 'GBP · Pound' },
+  { code: 'JPY', symbol: '¥', label: 'JPY · Yen' },
+  { code: 'HKD', symbol: 'HK$', label: 'HKD · HK Dollar' },
+  { code: 'TWD', symbol: 'NT$', label: 'TWD · New Taiwan Dollar' },
+  { code: 'SGD', symbol: 'S$', label: 'SGD · Singapore Dollar' },
+  { code: 'AUD', symbol: 'A$', label: 'AUD · Australian Dollar' },
+  { code: 'CAD', symbol: 'C$', label: 'CAD · Canadian Dollar' },
+];
 
 const CARD = 'bg-white dark:bg-charcoal-800 rounded-xl border border-cream-200 dark:border-charcoal-700';
 const INPUT =
@@ -181,10 +204,15 @@ function SettingsSection() {
   const set = <K extends keyof RechargeSettings>(k: K, v: RechargeSettings[K]) =>
     setSettings({ ...settings, [k]: v });
 
+  // label 与 input 用 htmlFor/id 绑定：此前两者毫无关联，读屏软件念不出字段名，
+  // 测试也只能靠位置去点。id 取配置键，天然唯一且稳定。
   const field = (label: string, key: keyof RechargeSettings, secret = false) => (
     <div>
-      <label className={LABEL}>{label}</label>
+      <label className={LABEL} htmlFor={`recharge-${key}`}>
+        {label}
+      </label>
       <input
+        id={`recharge-${key}`}
         type={secret ? 'password' : 'text'}
         className={INPUT}
         value={String(settings[key] ?? '')}
@@ -193,6 +221,12 @@ function SettingsSection() {
       />
     </div>
   );
+
+  // 现有配置里的币种码；老站点只存过符号（无 currency 键）时按符号回推一次，回推不出落 CNY。
+  const currencyCode =
+    CURRENCY_OPTIONS.find((c) => c.code === (settings.currency ?? '').toUpperCase())?.code ??
+    CURRENCY_OPTIONS.find((c) => c.symbol === settings.currencySymbol)?.code ??
+    'CNY';
 
   const toggle = (label: string, key: keyof RechargeSettings, desc?: string) => (
     <label className="flex items-start gap-2 cursor-pointer">
@@ -214,13 +248,34 @@ function SettingsSection() {
       <div className={`${CARD} p-4 space-y-4`}>
         <div className="flex items-center justify-between">
           {toggle(t('adminRecharge.masterEnable'), 'enabled', t('adminRecharge.masterEnableDesc'))}
-          <div className="w-28">
-            <label className={LABEL}>{t('adminRecharge.currencySymbol')}</label>
-            <input
+          <div className="w-48">
+            <label className={LABEL} htmlFor="recharge-currency">
+              {t('adminRecharge.currencyCode')}
+            </label>
+            <select
+              id="recharge-currency"
               className={INPUT}
-              value={settings.currencySymbol}
-              onChange={(e) => set('currencySymbol', e.target.value)}
-            />
+              value={currencyCode}
+              onChange={(e) => {
+                // 码与符号一起写：符号只是展示派生物，绝不允许它和结算币种各说各话。
+                const picked =
+                  CURRENCY_OPTIONS.find((c) => c.code === e.target.value) ?? CURRENCY_OPTIONS[0];
+                setSettings({
+                  ...settings,
+                  currency: picked.code,
+                  currencySymbol: picked.symbol,
+                });
+              }}
+            >
+              {CURRENCY_OPTIONS.map((c) => (
+                <option key={c.code} value={c.code}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+            <span className="block text-xs text-charcoal-400 mt-1">
+              {t('adminRecharge.currencyCodeDesc')}
+            </span>
           </div>
         </div>
       </div>
@@ -248,7 +303,13 @@ function SettingsSection() {
           {field(t('adminRecharge.alipayGateway'), 'alipayGateway')}
           {field(t('adminRecharge.alipayPrivateKey'), 'alipayPrivateKey', true)}
           {field(t('adminRecharge.alipayPublicKey'), 'alipayPublicKey')}
+          {/* L17：seller_id 绑定。代码侧已强制（alipay.ts 收到不匹配的 seller_id 直接拒绝到账），
+              此前没有入口 → 只能手改 DB 行才能启用，等于这道校验默认永远是关的。 */}
+          {field(t('adminRecharge.alipaySellerId'), 'alipaySellerId')}
         </div>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          {t('adminRecharge.alipaySellerIdHint')}
+        </p>
       </div>
 
       {/* 微信 */}
@@ -285,7 +346,9 @@ const EMPTY_TIER: Partial<Tier> = {
   grantRole: 'PRO',
   durationDays: 30,
   grantMinutes: 60,
-  creditCents: 0,
+  // 不能是 0（P3-13）：0 会被当成「到账 0 元」原样提交，建出一个收全款却一分不到账的档位。
+  // undefined = 「没填」，后端据此回落成 creditCents = priceCents。
+  creditCents: undefined,
   active: true,
   sortOrder: 0,
 };
@@ -426,9 +489,12 @@ function TierForm({
   kindLabel: (k: string) => string;
 }) {
   const { t } = useI18n();
-  const set = <K extends keyof Tier>(k: K, v: Tier[K]) => setEditing({ ...editing, [k]: v });
+  const set = <K extends keyof Tier>(k: K, v: Tier[K] | undefined) =>
+    setEditing({ ...editing, [k]: v });
   const priceYuan = ((editing.priceCents ?? 0) / 100).toString();
-  const creditYuan = ((editing.creditCents ?? 0) / 100).toString();
+  // 留空 = 「没填」，提交时该键整个缺席，后端回落成 = 价格。显示成 0 会诱导管理员把它当成
+  // 「到账 0 元」原样存下去（P3-13）。
+  const creditYuan = editing.creditCents == null ? '' : (editing.creditCents / 100).toString();
 
   return (
     <div className={`${CARD} p-4 space-y-3`}>
@@ -510,7 +576,13 @@ function TierForm({
               type="number"
               className={INPUT}
               value={creditYuan}
-              onChange={(e) => set('creditCents', Math.round(Number(e.target.value) * 100))}
+              placeholder={priceYuan}
+              onChange={(e) =>
+                set(
+                  'creditCents',
+                  e.target.value === '' ? undefined : Math.round(Number(e.target.value) * 100)
+                )
+              }
             />
           </div>
         )}
@@ -723,30 +795,52 @@ function AdjustForm({ onDone }: { onDone: () => void }) {
   const [minutes, setMinutes] = useState('');
   const [note, setNote] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
+  // 调整没有幂等键：一次点击就是一笔真实台账。按钮必须自带 in-flight 闸（对照本文件里保存渠道
+  // 配置的 disabled={saving}、删除档位的 confirm），否则手抖双击 = 加两次钱（P3-18）。
+  const [submitting, setSubmitting] = useState(false);
 
   const submit = async () => {
+    if (submitting) return;
+    const amountCentsDelta = amountYuan ? Math.round(Number(amountYuan) * 100) : 0;
+    const minutesDelta = minutes ? Math.floor(Number(minutes)) : 0;
+    if (
+      !confirm(
+        t('adminRecharge.confirmAdjust', {
+          email: email.trim(),
+          amount: (amountCentsDelta / 100).toString(),
+          minutes: minutesDelta.toString(),
+        })
+      )
+    ) {
+      return;
+    }
+    setSubmitting(true);
     setMsg(null);
-    const res = await fetch('/api/admin/recharge/adjust', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-      body: JSON.stringify({
-        email: email.trim(),
-        amountCentsDelta: amountYuan ? Math.round(Number(amountYuan) * 100) : 0,
-        minutesDelta: minutes ? Math.floor(Number(minutes)) : 0,
-        note: note.trim() || undefined,
-      }),
-    });
-    if (res.ok) {
-      setMsg(t('adminRecharge.adjustDone'));
-      setAmountYuan('');
-      setMinutes('');
-      setNote('');
-      onDone();
-    } else {
-      setMsg((await res.json()).error ?? t('common.saveFailed'));
+    try {
+      const res = await fetch('/api/admin/recharge/adjust', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          email: email.trim(),
+          amountCentsDelta,
+          minutesDelta,
+          note: note.trim() || undefined,
+        }),
+      });
+      if (res.ok) {
+        setMsg(t('adminRecharge.adjustDone'));
+        setAmountYuan('');
+        setMinutes('');
+        setNote('');
+        onDone();
+      } else {
+        setMsg((await res.json()).error ?? t('common.saveFailed'));
+      }
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -787,8 +881,8 @@ function AdjustForm({ onDone }: { onDone: () => void }) {
         </div>
       </div>
       <div className="flex items-center gap-3">
-        <button className={BTN_PRIMARY} onClick={submit} disabled={!email.trim()}>
-          {t('adminRecharge.applyAdjust')}
+        <button className={BTN_PRIMARY} onClick={submit} disabled={!email.trim() || submitting}>
+          {submitting ? t('common.saving') : t('adminRecharge.applyAdjust')}
         </button>
         {msg && <span className="text-sm text-charcoal-500">{msg}</span>}
       </div>

@@ -150,4 +150,70 @@ describe('PUT /api/admin/soniox', () => {
       'https://api.soniox.example'
     );
   });
+
+  // P2-2：只改 wsUrl/restUrl、apiKey 留空 = 保留已存密钥 → 下一次转录就带着真密钥
+  // 连到新地址（Soniox 密钥随握手直接送出）。
+  describe('换靶闸范围：Soniox 不设闸（只保 SMTP）', () => {
+    beforeEach(() => {
+      siteSettingFindManyMock.mockResolvedValue([
+        { key: 'soniox_US_api_key', value: 'enc:real-soniox-key' },
+        { key: 'soniox_US_ws_url', value: 'wss://stt-rt.soniox.example' },
+        { key: 'soniox_US_rest_url', value: 'https://api.soniox.example' },
+      ]);
+    });
+
+    // ↓ 这条固化的是「换靶闸只保 SMTP」这个刻意的范围决定（见 admin/settings/route.ts 的说明）。
+    //   若有人把这道闸加回来，它会立刻转红 —— 那时应先回到范围决定本身重新讨论。
+    it('只改 wsUrl、apiKey 不传 → 放行并落库', async () => {
+      const res = await PUT(
+        makeRequest({ regions: { us: { wsUrl: 'wss://stt-rt2.soniox.example/ws' } } })
+      );
+      expect(res.status).toBe(200);
+      expect(transactionMock).toHaveBeenCalled();
+    });
+
+    it('只改 restUrl、apiKey 不传 → 同样放行', async () => {
+      const res = await PUT(
+        makeRequest({ regions: { us: { restUrl: 'https://api2.soniox.example' } } })
+      );
+      expect(res.status).toBe(200);
+      expect(transactionMock).toHaveBeenCalled();
+    });
+
+    it('改地址同时重填 apiKey → 放行', async () => {
+      const res = await PUT(
+        makeRequest({
+          regions: {
+            us: { wsUrl: 'wss://stt-rt.newvendor.example', apiKey: 'k2' },
+          },
+        })
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it('改地址同时显式清空 apiKey（同事务删除，无凭据可外带）→ 放行', async () => {
+      const res = await PUT(
+        makeRequest({
+          regions: { us: { wsUrl: 'wss://stt-rt.newvendor.example', apiKey: '' } },
+        })
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it('地址原样回填（仅尾斜杠差异）→ 不算改靶', async () => {
+      const res = await PUT(
+        makeRequest({
+          regions: { us: { wsUrl: 'wss://stt-rt.soniox.example/' } },
+        })
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it('该区域没存密钥 → 改地址不拦（没东西可外带）', async () => {
+      const res = await PUT(
+        makeRequest({ regions: { eu: { wsUrl: 'wss://stt-rt.eu.example' } } })
+      );
+      expect(res.status).toBe(200);
+    });
+  });
 });

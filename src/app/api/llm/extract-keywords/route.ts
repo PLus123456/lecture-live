@@ -19,6 +19,16 @@ import {
 const keywordLogger = logger.child({ component: 'extract-keywords' });
 const KEYWORD_MAP_REDUCE_CONCURRENCY = 3;
 
+// P4-2：输入字符上限。
+// `text` 分支此前**零长度校验**（50MiB 上限只约束 `file` 分支），真上限是 Next 的 32MB 且是
+// 静默截断而非拒绝 → 约 3200 块 × (一次 callLLM + 一次 merge)，而 gateway 全程不扣用户配额、
+// 不动钱包，成本 100% 落在平台厂商 key 上。
+// 40 万字符 ≈ 4 小时讲座转录的两倍，合法用法有充足余量。
+const MAX_KEYWORD_SOURCE_CHARS = 400_000;
+
+// P4-2：map 阶段的块数硬顶 = 单请求 LLM 调用次数硬顶。
+const MAX_KEYWORD_CHUNKS = 60;
+
 /**
  * 上传文件 MIME → KeywordSourceType 映射。之前恒用 'transcript'，导致 PPTX/DOCX/PDF/TXT
  * 都套用转录稿 prompt 提示、prompts.ts 里的按类型分支成了死代码（v3 finding U53）。
@@ -122,18 +132,22 @@ async function mergeKeywordLists(
 }
 
 export async function POST(req: Request) {
+  // P4-2：先认证再限流，且按用户分桶。
+  // 旧顺序（限流在前、无 key）走的是 IP 桶，而 TRUSTED_PROXY 缺省时 resolveRequestClientIp
+  // 恒返回 'unknown' → 全站共用一个 20/分钟的桶：任何一个用户跑满就把所有人锁死（DoS）。
+  const user = await verifyAuth(req);
+  if (!user) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   const rateLimited = await enforceRateLimit(req, {
     scope: 'llm:extract-keywords',
     limit: 20,
     windowMs: 60_000,
+    key: `user:${user.id}`,
   });
   if (rateLimited) {
     return rateLimited;
-  }
-
-  const user = await verifyAuth(req);
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   try {
@@ -171,7 +185,26 @@ export async function POST(req: Request) {
 
       sourceType = mimeToKeywordSourceType(file.type);
       sourceText = await extractTextFromFile(file);
+      // P4-2：抽出的正文同样要封顶（50MB 的 PPTX/PDF 能解出几 MB 文本）。文件分支已过大小闸，
+      // 这里截断而非 400，避免把「体积合法只是话多」的文档整份拒掉。
+      if (sourceText.length > MAX_KEYWORD_SOURCE_CHARS) {
+        keywordLogger.warn(
+          { chars: sourceText.length, limit: MAX_KEYWORD_SOURCE_CHARS },
+          '上传文件正文超长，截断后再抽关键词'
+        );
+        sourceText = sourceText.slice(0, MAX_KEYWORD_SOURCE_CHARS);
+      }
     } else if (textInput) {
+      // P4-2：`text` 分支直接拒 —— 长度完全由客户端控制，截断只会掩盖问题。
+      if (textInput.length > MAX_KEYWORD_SOURCE_CHARS) {
+        return NextResponse.json(
+          {
+            error: `Text too long (max ${MAX_KEYWORD_SOURCE_CHARS} characters)`,
+            maxChars: MAX_KEYWORD_SOURCE_CHARS,
+          },
+          { status: 413 }
+        );
+      }
       sourceText = textInput;
     } else {
       return NextResponse.json(
@@ -207,8 +240,10 @@ export async function POST(req: Request) {
       keywords = parseKeywordExtractionResult(result);
     } else {
       // Map-reduce：按段独立提取后合并去重
+      // P4-2：块数封顶 —— 每块一次 callLLM，块数就是单请求的 LLM 扇出倍数。
       const chunks = chunkText(sourceText, {
         chunkTargetTokens: Math.min(2500, Math.floor(inputBudget * 0.6)),
+        maxChunks: MAX_KEYWORD_CHUNKS,
       });
       keywordLogger.info(
         {

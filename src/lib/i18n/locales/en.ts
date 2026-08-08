@@ -1058,7 +1058,7 @@ export default {
     siteUrl: 'Site URL',
     siteUrlDesc: 'Main site URL used for communicating with external services and receiving callbacks (e.g. payments, storage providers). Use a publicly accessible URL.',
     backupUrls: 'Backup URLs',
-    backupUrlsDesc: 'Additional allowed site access URLs. Requests from origins not in this list will be blocked. Up to 10.',
+    backupUrlsDesc: 'Additional allowed site access URLs, up to 10. Browser-side only: opening the app from an origin outside this list shows a notice page. This is not server-side access control — the server does not check request origin, so calling the API directly still works. Use your reverse proxy or firewall for real domain restrictions.',
     addBackupUrl: 'Add backup URL',
     backupUrlLimitReached: 'Maximum of 10 backup URLs reached',
     invalidBackupUrl: 'One or more backup URLs are invalid. Please check and retry.',
@@ -1416,6 +1416,8 @@ export default {
     masterEnable: 'Enable recharge system',
     masterEnableDesc: 'Master switch. When off, the recharge entry is hidden from users.',
     currencySymbol: 'Currency symbol',
+    currencyCode: 'Settlement currency',
+    currencyCodeDesc: 'Settled by ISO-4217 code; the display symbol follows from it.',
     sandbox: 'Sandbox (dev/testing)',
     sandboxDesc: 'A fake channel with no real gateway — completes the full flow locally. Disable in production.',
     alipay: 'Alipay',
@@ -1426,6 +1428,8 @@ export default {
     alipayGateway: 'Gateway URL',
     alipayPrivateKey: 'App Private Key',
     alipayPublicKey: 'Alipay Public Key',
+    alipaySellerId: 'Merchant PID (seller_id)',
+    alipaySellerIdHint: 'Leave empty to skip payee validation. Once set, callbacks whose seller_id does not match are rejected.',
     wechatMchId: 'Merchant ID (mchid)',
     wechatSerialNo: 'Cert Serial No.',
     wechatApiV3Key: 'APIv3 Key',
@@ -1468,6 +1472,7 @@ export default {
     adjustAmountYuan: 'Balance Δ',
     adjustMinutes: 'Minutes Δ',
     applyAdjust: 'Apply Adjustment',
+    confirmAdjust: 'Adjust {email} by {amount} in balance and {minutes} minutes? This takes effect immediately.',
     adjustDone: 'Adjusted',
     txType_topup: 'Top-up',
     txType_purchase_membership: 'Buy Membership',
@@ -1616,6 +1621,10 @@ export default {
     overCharged: 'Over',
     underCharged: 'Under',
     total: '{n} records total',
+    inflightWarning:
+      'This user currently holds {n} minutes of in-flight reservations (async upload / full re-transcription / unsettled live stream). Reservations count towards usage at entry but are excluded from reconciliation, so this negative drift is most likely bogus — fixing it would erase the reservation from usage and hand out free quota. Re-run reconciliation once the in-flight work has finished.',
+    inflightWarningAll:
+      '{n} mismatches in this run belong to users that still hold in-flight reservations (async upload / full re-transcription / unsettled live stream). Reservations count towards usage but are excluded from reconciliation, so those mismatches are most likely bogus and fixing them hands out free quota. Re-run reconciliation once the in-flight work has finished.',
   },
 
   // Job Queue

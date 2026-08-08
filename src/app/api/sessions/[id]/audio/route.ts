@@ -23,10 +23,11 @@ import {
 import { CloudreveStorage } from '@/lib/storage/cloudreve';
 import {
   normalizeRecordedAudioDuration,
+  probeAudioDurationMsFromBuffer,
   resolveExpectedRecordingDurationMs,
 } from '@/lib/audio/recordingDuration';
 import { clampSessionDurationMs } from '@/lib/billing';
-import { checkQuota } from '@/lib/quota';
+import { checkQuota, releaseStorageBytes, reserveStorageBytes } from '@/lib/quota';
 
 // Save audio recording
 export async function POST(
@@ -119,15 +120,59 @@ export async function POST(
     // G2/G3：durationMs 派生自可被伪造的 transcript globalEndMs（resolveTranscriptDurationMs
     // 会 Math.max 进来），必须按角色上界 clamp 后再落库，否则 SUM(durationMs)/3600000 存储
     // 小时用量可被撑到 Int 上界。
-    const durationMs = clampSessionDurationMs(
+    let durationMs = clampSessionDurationMs(
       await resolveExpectedRecordingDurationMs(session),
       user.role
     );
+    if (durationMs <= 0) {
+      // P5-14：三个来源（session.durationMs / transcript / serverStartedAt）都建立在
+      // 「走过实时链路」的前提上。直传口可以往一个从没连过 WS 的会话灌音频，那时三者同时为 0，
+      // 这段录音对 storage_hours 的贡献恒为 0 —— 等于绕开存储小时额度。用 ffprobe 兜底读真时长。
+      durationMs = clampSessionDurationMs(
+        await probeAudioDurationMsFromBuffer(buffer, normalizedMimeType),
+        user.role
+      );
+    }
+
     const normalizedBuffer = await normalizeRecordedAudioDuration({
       buffer,
       mimeType: normalizedMimeType,
       durationMs,
     });
+
+    // P5-14：直传录音此前**完全不入 storage_bytes**（只过了 storage_hours 那道读时闸），
+    // 于是 32MB × 20 次/小时/用户 的字节量对字节配额完全隐形。这里补上净增量预留。
+    //
+    // 「净增量」而不是「全额」：同一会话在非终态期间可以反复 re-POST，全额累加会把用户额度
+    // 吃空且没有释放路径。旧录音大小只有本地存储能低成本拿到（stat）；Cloudreve 拿不到，
+    // 那种情况下跳过预留 —— 宁可漏计一次覆盖，也不能凭空永久吃掉用户额度。
+    const previousLocation = await resolveSessionAudioLocation(session).catch(
+      () => null
+    );
+    let reservedBytes = 0;
+    if (!previousLocation) {
+      reservedBytes = normalizedBuffer.length;
+    } else if (previousLocation.kind === 'local') {
+      reservedBytes = Math.max(0, normalizedBuffer.length - previousLocation.size);
+    }
+    if (reservedBytes > 0) {
+      const gotBytes = await reserveStorageBytes(user.id, reservedBytes);
+      if (!gotBytes) {
+        return NextResponse.json(
+          {
+            error: 'Storage quota exceeded; cannot save recording',
+            quota: 'storage_bytes',
+          },
+          { status: 402 }
+        );
+      }
+    }
+    /** 任何失败路径都要把刚预留的字节还回去。 */
+    const releaseReservedBytes = async () => {
+      if (reservedBytes > 0) {
+        await releaseStorageBytes(user.id, reservedBytes).catch(() => undefined);
+      }
+    };
 
     // P0-6：先写版本化临时对象（绝不覆盖旧固定 key），DB CAS 成功后才发布（删旧）；
     // CAS 失败则回滚删掉临时对象、绝不触碰已定稿的旧录音。
@@ -135,7 +180,10 @@ export async function POST(
       session,
       normalizedBuffer,
       normalizedMimeType
-    );
+    ).catch(async (error) => {
+      await releaseReservedBytes();
+      throw error;
+    });
 
     // G3：原子条件更新，仅在会话仍处于非终态时写入 recordingPath，杜绝并发下
     // finalize 已把会话推到 COMPLETED 后本请求再覆写录音。
@@ -152,10 +200,18 @@ export async function POST(
 
     if (persisted.count === 0) {
       await rollbackStagedArtifact(session, staged);
+      await releaseReservedBytes();
       return NextResponse.json(
         { error: 'Cannot overwrite recording of a finalized session' },
         { status: 409 }
       );
+    }
+    // 本地覆盖且新录音更小：把腾出来的字节还给用户（预留只算了正向增量）。
+    if (previousLocation?.kind === 'local') {
+      const freed = previousLocation.size - normalizedBuffer.length;
+      if (freed > 0) {
+        await releaseStorageBytes(user.id, freed).catch(() => undefined);
+      }
     }
     const stored = await finalizeStagedArtifactPublish(session, staged);
     await invalidateSessionsApiCache(user.id);

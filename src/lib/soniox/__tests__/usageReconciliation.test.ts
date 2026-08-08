@@ -15,9 +15,12 @@ const {
   grantUpdateManyMock,
   grantFindUniqueMock,
   grantFindManyMock,
+  txGrantFindManyMock,
   grantUpdateMock,
   sessionFindUniqueMock,
+  txSessionFindUniqueMock,
   interpretFindUniqueMock,
+  txInterpretFindUniqueMock,
   transactionMock,
   deductMock,
   regionConfigMock,
@@ -28,24 +31,40 @@ const {
 } = vi.hoisted(() => {
   const grantUpdateMock = vi.fn();
   const grantUpdateManyMock = vi.fn();
+  const grantFindUniqueMock = vi.fn();
+  // tx 侧与 prisma 侧分开两组 mock：孤儿扫描走 prisma，回填/差额补扣走 tx，断言互不串扰。
+  const txGrantFindManyMock = vi.fn();
+  const txSessionFindUniqueMock = vi.fn();
+  const txInterpretFindUniqueMock = vi.fn();
   return {
     siteFindUniqueMock: vi.fn(),
     siteUpsertMock: vi.fn(),
     grantUpdateManyMock,
-    grantFindUniqueMock: vi.fn(),
+    grantFindUniqueMock,
     grantFindManyMock: vi.fn(),
+    txGrantFindManyMock,
     grantUpdateMock,
     sessionFindUniqueMock: vi.fn(),
+    txSessionFindUniqueMock,
     interpretFindUniqueMock: vi.fn(),
+    txInterpretFindUniqueMock,
     transactionMock: vi.fn(),
     deductMock: vi.fn(),
     regionConfigMock: vi.fn(),
     settleGrantsMock: vi.fn(),
     logSystemEventMock: vi.fn(),
     fetchMock: vi.fn(),
-    // $transaction 注入的 tx：迟到补扣/孤儿转扣在事务内写 grant 台账。
+    // $transaction 注入的 tx。P5-17 后**回填 CAS 也在事务内**，故 tx 要带回填/读取的全部方法；
+    // 差额补扣（P1-2）还要按实体读锚点/会话。
     TX: {
-      sonioxStreamGrant: { update: grantUpdateMock, updateMany: grantUpdateManyMock },
+      sonioxStreamGrant: {
+        update: grantUpdateMock,
+        updateMany: grantUpdateManyMock,
+        findUnique: grantFindUniqueMock,
+        findMany: txGrantFindManyMock,
+      },
+      interpretSession: { findUnique: txInterpretFindUniqueMock },
+      session: { findUnique: txSessionFindUniqueMock },
     },
   };
 });
@@ -65,6 +84,7 @@ vi.mock('@/lib/prisma', () => ({
   },
 }));
 vi.mock('@/lib/quota', () => ({ deductTranscriptionMinutes: deductMock }));
+// billing 是纯函数模块，不 mock —— clamp/ceil 的真实口径正是补扣正确性的一部分。
 vi.mock('@/lib/soniox/env', () => ({ getRegionConfigAsync: regionConfigMock }));
 vi.mock('@/lib/soniox/streamGrant', () => ({ settleStreamGrants: settleGrantsMock }));
 vi.mock('@/lib/auditLog', () => ({ logSystemEvent: logSystemEventMock }));
@@ -121,9 +141,12 @@ beforeEach(() => {
   grantUpdateManyMock.mockReset();
   grantFindUniqueMock.mockReset();
   grantFindManyMock.mockReset();
+  txGrantFindManyMock.mockReset();
   grantUpdateMock.mockReset();
   sessionFindUniqueMock.mockReset();
+  txSessionFindUniqueMock.mockReset();
   interpretFindUniqueMock.mockReset();
+  txInterpretFindUniqueMock.mockReset();
   transactionMock.mockReset();
   deductMock.mockReset();
   regionConfigMock.mockReset();
@@ -141,9 +164,12 @@ beforeEach(() => {
   grantUpdateManyMock.mockResolvedValue({ count: 0 });
   grantFindUniqueMock.mockResolvedValue(null);
   grantFindManyMock.mockResolvedValue([]); // 默认无孤儿候选
+  txGrantFindManyMock.mockResolvedValue([]);
   grantUpdateMock.mockResolvedValue({});
   sessionFindUniqueMock.mockResolvedValue(null);
+  txSessionFindUniqueMock.mockResolvedValue(null);
   interpretFindUniqueMock.mockResolvedValue(null);
+  txInterpretFindUniqueMock.mockResolvedValue(null);
   transactionMock.mockImplementation(
     async (cb: (tx: unknown) => Promise<unknown>) => cb(TX)
   );
@@ -157,7 +183,7 @@ beforeEach(() => {
 });
 
 describe('回填（usage-logs → grant.actualMs，CAS 恰好一次）', () => {
-  it('回填成功且 grant 已被权威路径结算 → 只回填不补扣，推进 watermark', async () => {
+  it('回填成功且 finalize 扣费已覆盖实测量 → 只回填不补扣，推进 watermark', async () => {
     fetchMock.mockResolvedValueOnce(
       usagePage([
         { uuid: 'log1', client_reference_id: 'rt:u1:g1', input_audio_duration_ms: 20017 },
@@ -166,9 +192,21 @@ describe('回填（usage-logs → grant.actualMs，CAS 恰好一次）', () => {
     grantUpdateManyMock.mockResolvedValueOnce({ count: 1 });
     grantFindUniqueMock.mockResolvedValueOnce({
       userId: 'u1',
+      sessionId: 's1',
+      interpretSessionId: null,
       settledAt: new Date('2026-07-16T11:00:00.000Z'),
       settledBy: 'session_finalize',
       maxSessionSeconds: 900,
+      billedMinutes: null,
+    });
+    txGrantFindManyMock.mockResolvedValueOnce([
+      { actualMs: 20017, maxSessionSeconds: 900, billedMinutes: null },
+    ]);
+    // 本场 finalize 已按 30 分钟扣过，实测 1 分钟 → 差额 0
+    txSessionFindUniqueMock.mockResolvedValueOnce({
+      durationMs: 30 * 60_000,
+      billedMinutes: 30,
+      user: { role: 'FREE' },
     });
 
     const stats = await reconcileSonioxStreamUsage(NOW);
@@ -178,9 +216,9 @@ describe('回填（usage-logs → grant.actualMs，CAS 恰好一次）', () => {
       where: { id: 'g1', userId: 'u1', actualMs: null },
       data: { actualMs: 20017, usageLogUuid: 'log1' },
     });
-    // 已被 finalize 结算（非退款）→ 不逐 grant 补扣
-    expect(transactionMock).not.toHaveBeenCalled();
+    // 差额 0 → 不扣、不改台账
     expect(deductMock).not.toHaveBeenCalled();
+    expect(grantUpdateMock).not.toHaveBeenCalled();
     // 整窗成功 → watermark 推进到 now
     expect(siteUpsertMock).toHaveBeenCalledWith({
       where: { key: WATERMARK_KEY },
@@ -197,6 +235,35 @@ describe('回填（usage-logs → grant.actualMs，CAS 恰好一次）', () => {
     });
   });
 
+  it('P5-17：回填 CAS 在事务内 —— 事务开不起来时 CAS 根本不发生（旧实现裸 prisma 先自动提交）', async () => {
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'rt:u1:g1', input_audio_duration_ms: 20017 },
+      ])
+    );
+    transactionMock.mockRejectedValueOnce(new Error('deadlock'));
+
+    await reconcileSonioxStreamUsage(NOW);
+
+    // 旧实现：actualMs 已被自动提交的 updateMany 写死 → 重叠窗重拉被 CAS 挡掉，补扣永远没有第二次机会
+    expect(grantUpdateManyMock).not.toHaveBeenCalled();
+  });
+
+  it('P5-17：条目处理失败 → 不推进 watermark（旧实现照推，落在重叠窗之外的条目永久丢账）', async () => {
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'rt:u1:g1', input_audio_duration_ms: 20017 },
+      ])
+    );
+    transactionMock.mockRejectedValueOnce(new Error('deadlock'));
+
+    const stats = await reconcileSonioxStreamUsage(NOW);
+
+    expect(siteUpsertMock).not.toHaveBeenCalled();
+    expect(stats.regionsPolled).toBe(1);
+    expect(stats.backfilled).toBe(0);
+  });
+
   it('迟到补扣：曾按无用量退款（usage_refund）的 grant 冒出用量 → 事务内补扣实测分钟并改写台账', async () => {
     fetchMock.mockResolvedValueOnce(
       usagePage([
@@ -206,9 +273,12 @@ describe('回填（usage-logs → grant.actualMs，CAS 恰好一次）', () => {
     grantUpdateManyMock.mockResolvedValueOnce({ count: 1 });
     grantFindUniqueMock.mockResolvedValueOnce({
       userId: 'u1',
+      sessionId: 's1',
+      interpretSessionId: null,
       settledAt: new Date('2026-07-16T10:00:00.000Z'),
       settledBy: 'usage_refund',
       maxSessionSeconds: 900,
+      billedMinutes: null,
     });
 
     const stats = await reconcileSonioxStreamUsage(NOW);
@@ -234,6 +304,202 @@ describe('回填（usage-logs → grant.actualMs，CAS 恰好一次）', () => {
     });
   });
 
+  it('grant 尚未结算 → 只回填，等权威路径/孤儿扫描按刚回填的实测量结算', async () => {
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'it:u1:g1', input_audio_duration_ms: 900_000 },
+      ])
+    );
+    grantUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    grantFindUniqueMock.mockResolvedValueOnce({
+      userId: 'u1',
+      sessionId: null,
+      interpretSessionId: 'i1',
+      settledAt: null,
+      settledBy: null,
+      maxSessionSeconds: 900,
+      billedMinutes: null,
+    });
+
+    const stats = await reconcileSonioxStreamUsage(NOW);
+
+    expect(deductMock).not.toHaveBeenCalled();
+    expect(stats.backfilled).toBe(1);
+    expect(stats.lateCharged).toBe(0);
+  });
+});
+
+describe('P1-2 迟到差额补扣（提前结算后继续串流的兜底）', () => {
+  /** interpret grant：被 deduct 提前结算，锚点只记了 chargedMinutes 分钟。 */
+  function interpretGrantSettledByDeduct(chargedMinutes: number | null) {
+    grantUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    grantFindUniqueMock.mockResolvedValueOnce({
+      userId: 'u1',
+      sessionId: null,
+      interpretSessionId: 'i1',
+      settledAt: new Date('2026-07-16T11:50:00.000Z'),
+      settledBy: 'interpret_deduct',
+      maxSessionSeconds: 900,
+      billedMinutes: null,
+    });
+    txInterpretFindUniqueMock.mockResolvedValueOnce({
+      billedMinutes: chargedMinutes,
+    });
+  }
+
+  it('interpret：/start → mint → deduct{durationMs:0} 提前结算后串满 15 分钟 → 补扣 15', async () => {
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'it:u1:g1', input_audio_duration_ms: 900_000 },
+      ])
+    );
+    interpretGrantSettledByDeduct(0);
+    txGrantFindManyMock.mockResolvedValueOnce([
+      { actualMs: 900_000, maxSessionSeconds: 900, billedMinutes: null },
+    ]);
+
+    const stats = await reconcileSonioxStreamUsage(NOW);
+
+    expect(txGrantFindManyMock).toHaveBeenCalledWith({
+      where: { interpretSessionId: 'i1' },
+      select: { actualMs: true, maxSessionSeconds: true, billedMinutes: true },
+    });
+    expect(deductMock).toHaveBeenCalledWith('u1', 15, TX);
+    // settledBy 保留 interpret_deduct（审计流水要看得出这场最初是谁结的）
+    expect(grantUpdateMock).toHaveBeenCalledWith({
+      where: { id: 'g1' },
+      data: { billedMinutes: 15 },
+    });
+    expect(stats.lateCharged).toBe(1);
+  });
+
+  it('interpret：一场多条流时按**整场**算差额，不逐 grant 重复补', async () => {
+    // 锚点已扣 0；两条流各 15 分钟，其中 g0 早前已补扣 15 → 本次只该再补 15（不是 30）
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'it:u1:g1', input_audio_duration_ms: 900_000 },
+      ])
+    );
+    interpretGrantSettledByDeduct(0);
+    txGrantFindManyMock.mockResolvedValueOnce([
+      { actualMs: 900_000, maxSessionSeconds: 900, billedMinutes: 15 },
+      { actualMs: 900_000, maxSessionSeconds: 900, billedMinutes: null },
+    ]);
+
+    await reconcileSonioxStreamUsage(NOW);
+
+    expect(deductMock).toHaveBeenCalledWith('u1', 15, TX);
+  });
+
+  it('interpret：deduct 已按整场足额扣过 → 差额 0，不补扣（诚实用户不被重复收）', async () => {
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'it:u1:g1', input_audio_duration_ms: 900_000 },
+      ])
+    );
+    interpretGrantSettledByDeduct(40);
+    txGrantFindManyMock.mockResolvedValueOnce([
+      { actualMs: 900_000, maxSessionSeconds: 900, billedMinutes: null },
+    ]);
+
+    const stats = await reconcileSonioxStreamUsage(NOW);
+
+    expect(deductMock).not.toHaveBeenCalled();
+    expect(grantUpdateMock).not.toHaveBeenCalled();
+    expect(stats.lateCharged).toBe(0);
+    expect(stats.backfilled).toBe(1);
+  });
+
+  it('realtime：usage-log 落在 finalize 之后（finalize 只按内容口径扣了 0）→ 按实测补扣', async () => {
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'rt:u1:g1', input_audio_duration_ms: 900_000 },
+      ])
+    );
+    grantUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    grantFindUniqueMock.mockResolvedValueOnce({
+      userId: 'u1',
+      sessionId: 's1',
+      interpretSessionId: null,
+      settledAt: new Date('2026-07-16T11:50:00.000Z'),
+      settledBy: 'session_finalize',
+      maxSessionSeconds: 900,
+      billedMinutes: null,
+    });
+    txGrantFindManyMock.mockResolvedValueOnce([
+      { actualMs: 900_000, maxSessionSeconds: 900, billedMinutes: null },
+    ]);
+    txSessionFindUniqueMock.mockResolvedValueOnce({
+      durationMs: 0,
+      billedMinutes: 0,
+      user: { role: 'FREE' },
+    });
+
+    const stats = await reconcileSonioxStreamUsage(NOW);
+
+    expect(deductMock).toHaveBeenCalledWith('u1', 15, TX);
+    expect(stats.lateCharged).toBe(1);
+  });
+
+  it('realtime：角色时长上限（FREE 2h）是刻意保护，补扣不得绕过它', async () => {
+    // 实测 3h（多条流合计），FREE clamp 到 2h=120 分钟；finalize 已按 clamp 后的 120 扣过 → 差额 0
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'rt:u1:g1', input_audio_duration_ms: 900_000 },
+      ])
+    );
+    grantUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    grantFindUniqueMock.mockResolvedValueOnce({
+      userId: 'u1',
+      sessionId: 's1',
+      interpretSessionId: null,
+      settledAt: new Date('2026-07-16T11:50:00.000Z'),
+      settledBy: 'session_finalize',
+      maxSessionSeconds: 900,
+      billedMinutes: null,
+    });
+    txGrantFindManyMock.mockResolvedValueOnce(
+      Array.from({ length: 12 }, () => ({
+        actualMs: 900_000,
+        maxSessionSeconds: 900,
+        billedMinutes: null,
+      }))
+    );
+    txSessionFindUniqueMock.mockResolvedValueOnce({
+      durationMs: 2 * 60 * 60_000,
+      billedMinutes: 120,
+      user: { role: 'FREE' },
+    });
+
+    const stats = await reconcileSonioxStreamUsage(NOW);
+
+    expect(deductMock).not.toHaveBeenCalled();
+    expect(stats.lateCharged).toBe(0);
+  });
+
+  it('ADMIN：deduct 短路不扣费 → grant 台账不虚记分钟', async () => {
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'it:u1:g1', input_audio_duration_ms: 900_000 },
+      ])
+    );
+    interpretGrantSettledByDeduct(0);
+    txGrantFindManyMock.mockResolvedValueOnce([
+      { actualMs: 900_000, maxSessionSeconds: 900, billedMinutes: null },
+    ]);
+    deductMock.mockResolvedValueOnce({ role: 'ADMIN' });
+
+    await reconcileSonioxStreamUsage(NOW);
+
+    expect(grantUpdateMock).toHaveBeenCalledWith({
+      where: { id: 'g1' },
+      data: { billedMinutes: 0 },
+    });
+  });
+
+});
+
+describe('拉取、分页与幂等', () => {
   it('client_reference_id 非 grant 格式（旧 interpret 格式）→ 跳过，不碰 grant', async () => {
     fetchMock.mockResolvedValueOnce(
       usagePage([

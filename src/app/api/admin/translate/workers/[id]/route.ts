@@ -57,6 +57,11 @@ export async function PATCH(
       data.status = 'UNVERIFIED';
       data.lastError = null;
     }
+
+    // 注：这里**刻意不做**「改 baseUrl 必须重填 token」的换靶闸（P2-2 已收窄为只保 SMTP）。
+    // worker 是自建服务，换机器/换 IP 是常规运维动作，不该每次都逼着去翻 token。
+    // 残余风险与收口方向见 admin/settings/route.ts 里的说明。
+
     if (typeof body.enabled === 'boolean') data.enabled = body.enabled;
     if (body.concurrency !== undefined) data.concurrency = clampInt(body.concurrency, existing.concurrency, 1, 8);
     if (body.weight !== undefined) data.weight = clampInt(body.weight, existing.weight, 1, 100);

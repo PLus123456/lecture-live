@@ -327,11 +327,17 @@ export async function checkQuota(
  *
  * @param db 可选事务客户端。实时 finalize 传入 `$transaction` 的 tx，使"扣减 ⟺ session
  *   置 COMPLETED"在同一事务原子提交（失败一起回滚，杜绝并发/重试双扣或漏扣）。
+ * @param opts.sessionId 计费台账锚点（P5-5）。传入则在同一 db/tx 内把本次实扣分钟累加到
+ *   `Session.billedMinutes`——不可变追加型台账，口径同 InterpretUsage/SonioxStreamGrant。
+ *   对账据此求和而非按当前状态 + 当前倍率重算，于是：改 async 倍率不再追溯全站失真；
+ *   完整版转录重跑 N 次（N 笔真扣）不再被对账算成一笔而诱导 admin 退掉 N−1 笔。
+ *   用 updateMany（非 update）：会话行可能已被删/不存在，缺行只影响台账、绝不能把扣费整体炸掉。
  */
 export async function deductTranscriptionMinutes(
   userId: string,
   minutes: number,
-  db: QuotaDbClient = prisma
+  db: QuotaDbClient = prisma,
+  opts?: { sessionId?: string }
 ): Promise<UserQuotaSnapshot | null> {
   const user = await ensureQuotaWindow(userId, new Date(), db);
   if (!user) {
@@ -357,6 +363,14 @@ export async function deductTranscriptionMinutes(
     },
     select: QUOTA_USER_SELECT,
   });
+
+  // P5-5 计费台账：与扣费同 db/tx 累加，保证「扣了 ⟺ 台账记了」不可分。
+  if (opts?.sessionId) {
+    await db.session.updateMany({
+      where: { id: opts.sessionId },
+      data: { billedMinutes: { increment: normalizedMinutes } },
+    });
+  }
 
   return toQuotaSnapshot(updated);
 }
@@ -419,19 +433,31 @@ export async function resetExpiredTranscriptionQuotas(
   let poolResetCount = 0;
   const poolHolders = await prisma.user.findMany({
     where: { quotaResetAt: { lte: now }, purchasedMinutesBalance: { gt: 0 } },
-    select: {
-      id: true,
-      transcriptionMinutesUsed: true,
-      transcriptionMinutesLimit: true,
-    },
+    select: { id: true },
   });
   for (const ph of poolHolders) {
-    const owed = await computePoolOwed(
-      ph.id,
-      ph.transcriptionMinutesUsed,
-      ph.transcriptionMinutesLimit,
-      prisma
-    );
+    // P5-11 同龄读：owed 的两个输入（used 与在途预留）必须取自**同一时点**。原先 used 来自循环外
+    // 的 findMany 快照、inflight 在循环里逐个 aggregate（持池用户多时可差数秒），期间新建的预留
+    // 只进 inflight 不进那份陈旧的 used → committedUsed 偏小 → owed 偏小 → 少扣池（利用户但账不平）。
+    // 放进同一交互式事务：InnoDB REPEATABLE READ 下同事务的一致性读共享同一快照，两个量天然同龄。
+    const owed = await prisma.$transaction(async (tx) => {
+      const fresh = await tx.user.findUnique({
+        where: { id: ph.id },
+        select: {
+          transcriptionMinutesUsed: true,
+          transcriptionMinutesLimit: true,
+        },
+      });
+      if (!fresh) return null;
+      return computePoolOwed(
+        ph.id,
+        fresh.transcriptionMinutesUsed,
+        fresh.transcriptionMinutesLimit,
+        tx
+      );
+    });
+    // 用户在本轮中途被删 → 跳过（后续批量重置的 WHERE 自然也捞不到）
+    if (owed === null) continue;
     // 先清该用户在途预留列（与 ensureQuotaWindow 同序：先清列再归零 used，防跨周期二次释放）。
     await prisma.session.updateMany({
       where: {
@@ -597,6 +623,36 @@ async function settlePoolOnLimitChangeTx(
 }
 
 /**
+ * P5-2：admin「一键重置本月已用转录时长」时的池结算。
+ *
+ * 语义与限额下调结算完全一致：按**当前**上限算出本周期真正动用的池子分钟（owed，已排除在途预留）
+ * 并从 gross 池扣掉，再整周期重置（清预留列 → used 归零 → 推进 quotaResetAt → 记
+ * transcriptionUsageReconcileFrom）。不这么做的话，裸把 used 清零等于把本周期已动用的池分钟
+ * 变成永久免费，且因为对账重算的 expected 仍含那些 session，会持续制造假 drift 喂给对账「修复」按钮。
+ *
+ * 复用 settlePoolOnLimitChangeTx（newLimit=0 表示「本周期额度就此清空」）；不走
+ * settlePoolOnLimitChange，是因为它有 `newLimit >= oldLimit 直接返回` 的前置——上限本就为 0 的
+ * 持池用户会被那条前置漏掉，而那恰恰是「用量全部来自池子」的情形。
+ */
+export async function settlePoolOnUsageReset(
+  userId: string,
+  currentLimit: number,
+  db: QuotaDbClient = prisma
+): Promise<void> {
+  if (!Number.isFinite(currentLimit)) return;
+  const maybeTx = db as {
+    $transaction?: (fn: (tx: QuotaDbClient) => Promise<void>) => Promise<void>;
+  };
+  if (typeof maybeTx.$transaction === 'function') {
+    await maybeTx.$transaction((tx) =>
+      settlePoolOnLimitChangeTx(tx, userId, currentLimit, 0)
+    );
+  } else {
+    await settlePoolOnLimitChangeTx(db, userId, currentLimit, 0);
+  }
+}
+
+/**
  * 充值系统（Model A）：给用户的购买时长池加分钟（买时间到账）。gross 池只在此处与月度重置结算两处变更。
  * 应在钱包结算事务内调用（与扣余额同事务）；随 PaymentOrder 认领的 pending→paid CAS 幂等，不会重复到账。
  */
@@ -639,6 +695,12 @@ export async function grantPurchasedMinutes(
  * 「修复」会把这笔真实扣费退掉。现对 fullTranscribeStatus==='completed' 的 session 按同一确定性
  * 口径（与扣费侧一字一致）计入 expected，消除虚报。完整版扣费是确定性的（由 durationMs 唯一决定），
  * 故无须像 interpret 那样引入台账，直接按 completed 状态重算即可。
+ *
+ * P5-5 计费台账（本轮）：Session 现有不可变累加列 `billedMinutes`（deduct 时同事务累加）。
+ * expected 优先对它求和，**只有** billedMinutes=0 的历史行（该列上线前的数据）才走上面那套重算。
+ * 重算口径的两个致命面因此关闭：① 改 async_upload_billing_multiplier 会追溯改变全站 expected
+ *（0.8→0.5 全站负 drift，一点「修复」白送已收费用）；② 完整版转录终态可反复触发、每次真扣一笔，
+ * 而按 fullTranscribeStatus 重算恒只算一笔 → drift=1−N，admin「修复」会退掉 N−1 笔真实扣费。
  */
 export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
   const users = await prisma.user.findMany({
@@ -681,12 +743,18 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
         },
         select: {
           durationMs: true,
+          billedMinutes: true,
           asyncTranscribeStatus: true,
           fullTranscribeStatus: true,
         },
       });
 
       const sessionMinutes = sessions.reduce((total, session) => {
+        // P5-5：有台账就认台账（不可变、扣多少记多少），只有 billedMinutes=0 的历史行才回退重算。
+        // 重算口径读的是**当前**状态与**当前**倍率，故倍率一改即全站追溯失真、完整版重跑 N 次只算一笔。
+        if (session.billedMinutes > 0) {
+          return total + session.billedMinutes;
+        }
         if (!session.durationMs || session.durationMs <= 0) {
           return total;
         }
@@ -802,10 +870,42 @@ export async function reconcileStorageBytes(): Promise<{
  */
 
 /**
+ * P5-12：在途上传已占用、但 durationMs 尚未落库的录音分钟（用户维度）。
+ *
+ * 纯 SUM(durationMs) 口径的坏窗口不是毫秒级 TOCTOU，而是**整个上传+转码时长**——durationMs 要到
+ * 转码完成才写入，其间该会话对存储闸恒计 0，于是串行连开 N 个 init 也全都读到同一个旧占用值、
+ * 全部放行。对买了时长池的用户尤其致命：转录闸含 `+ purchasedMinutesBalance` 已被放宽，存储闸
+ * 成了唯一且形同虚设的闸。
+ *
+ * init 在 claim 事务里就把本次预估写进了 `asyncReservedMinutes`（且该列是**未乘计费倍率的媒体
+ * 分钟**，正是存储口径要的量），所以它就是现成的在途台账，无须新增 schema 列。
+ *  - 只取 `durationMs <= 0` 的行：转码完成后 durationMs 已进 SUM，再算预留就是双计。
+ *  - 只取 asyncReservedMinutes：fullReservedMinutes 是对**已存储**会话的补全转录再计费，其
+ *    durationMs 早已进 SUM，计入即双计。
+ *  - 排除本次会话自身：re-init 会顶替旧预留，把自己算进来等于对同一文件收两次存储。
+ */
+async function getInflightStorageMinutes(
+  userId: string,
+  excludeSessionId: string
+): Promise<number> {
+  const agg = await prisma.session.aggregate({
+    where: {
+      userId,
+      id: { not: excludeSessionId },
+      asyncReservedMinutes: { gt: 0 },
+      durationMs: { lte: 0 },
+    },
+    _sum: { asyncReservedMinutes: true },
+  });
+  const minutes = agg._sum.asyncReservedMinutes ?? 0;
+  return Number.isFinite(minutes) && minutes > 0 ? minutes : 0;
+}
+
+/**
  * 读时校验预留存储分钟。超限返回 ok:false（**不抛**）。
  *
- * @param sessionId 保留在签名里以对齐契约6 固定签名、便于将来升级为持久 per-session 预留；当前降级实现
- *   不按 session 落预留，仅按用户维度读时校验。
+ * @param sessionId 本次入口对应的会话；用于把**它自己**的在途预留排除在占用之外（re-init 顶替旧预留，
+ *   算进来等于对同一文件收两次存储）。
  * @param estimatedMinutes 本次将新增占用的录音分钟（async 上传按声明时长投影；realtime 录音入口按预估）。
  * @returns { ok, remaining } remaining 为当前剩余可用分钟（floor）。
  */
@@ -814,7 +914,6 @@ export async function reserveStorageMinutes(
   sessionId: string,
   estimatedMinutes: number
 ): Promise<{ ok: boolean; remaining: number }> {
-  void sessionId; // 降级实现未按 session 持久化预留（见上方注释）；保留形参以对齐契约6 签名
   const user = await getQuotaSnapshot(userId);
   if (!user) {
     return { ok: false, remaining: 0 };
@@ -824,11 +923,15 @@ export async function reserveStorageMinutes(
   }
 
   const limitHours = user.storageHoursLimit;
-  const usedHours = await getStorageHoursUsed(userId);
+  // P5-12：占用 = 已落库 SUM(durationMs) + 在途上传的预留分钟。少了后一项，闸门在整个
+  // 上传+转码窗口内对在途文件视而不见，串行连开也全放行（见 getInflightStorageMinutes）。
+  const usedHours =
+    (await getStorageHoursUsed(userId)) +
+    (await getInflightStorageMinutes(userId, sessionId)) / 60;
   const estMinutes = normalizeNonNegativeAmount(estimatedMinutes);
   const estHours = estMinutes / 60;
   const remainingMinutes = Math.max(0, Math.floor((limitHours - usedHours) * 60));
-  // 读时校验：当前真实占用 + 本次预估 <= 上限才放行。
+  // 读时校验：当前真实占用（含在途） + 本次预估 <= 上限才放行。
   const ok = usedHours + estHours <= limitHours;
   return { ok, remaining: remainingMinutes };
 }
@@ -837,6 +940,9 @@ export async function reserveStorageMinutes(
  * 结算一笔存储预留（契约6）。SUM(durationMs) 口径下，调用方把真实 durationMs 落到 session 本身
  * 即为结算——SUM 会自动反映真实占用。故此处为**有意的 no-op**（保留 API 以对齐契约6 签名、并给
  * 将来升级为持久预留列留接缝）。参数仅作审计语义，不落库。
+ *
+ * P5-12 后：在途占用改由 asyncReservedMinutes 承载，而 `durationMs<=0` 的过滤条件让「写入
+ * durationMs」这一步自动完成在途→已落库的交接（同一会话绝不会被两边同时计），仍无须在此落库。
  */
 export async function settleStorageMinutes(
   sessionId: string,

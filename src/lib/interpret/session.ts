@@ -3,9 +3,9 @@
 //
 // interpret 浏览器直连 Soniox，服务端只在 /start 与 /deduct 观测。旧实现若客户端不调 /deduct
 // （改装 / 掉线 / 故意）则整场免费、无兜底。这里在 /start 落一行 InterpretSession(settledAt=null)，
-// /deduct 成功扣费前**原子认领**它(设 settledAt)，cron 对超时仍未结算的按服务端墙钟(startedAt→now，
-// 封顶 MAX_INTERPRET_DURATION_MS)兜底扣费并结算。deduct 与 cron 经 settledAt 的条件认领互斥 →
-// 每场恰好扣一次：杜绝「不调 deduct 白嫖」与「deduct+cron 双扣」。
+// /deduct 成功扣费前**原子认领**它(设 settledAt)，cron 对超时仍未结算的按本场 grants 的 Soniox
+// 实测串流量(封顶 MAX_INTERPRET_DURATION_MS)兜底扣费并结算。deduct 与 cron 经 settledAt 的条件
+// 认领互斥 → 每场恰好扣一次：杜绝「不调 deduct 白嫖」与「deduct+cron 双扣」。
 
 import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
@@ -113,17 +113,19 @@ export async function ensureActiveInterpretSession(
 export async function settleInterpretSessionAsVoid(
   id: string,
   settledBy: string
-): Promise<void> {
+): Promise<boolean> {
   try {
-    await prisma.interpretSession.updateMany({
+    const settled = await prisma.interpretSession.updateMany({
       where: { id, settledAt: null },
       data: { settledAt: new Date(), settledBy, billedMinutes: 0 },
     });
+    return settled.count === 1;
   } catch (err) {
     sessionLogger.warn(
       { interpretSessionId: id, message: err instanceof Error ? err.message : String(err) },
       'failed to void empty interpret anchor after mint failure'
     );
+    return false;
   }
 }
 
@@ -203,8 +205,9 @@ export async function claimInterpretSessionForDeduct(
 }
 
 /**
- * cron 兜底：对超时仍未结算的同传会话，按服务端墙钟(startedAt→now，封顶 MAX_INTERPRET_DURATION_MS)
- * 扣费并结算。条件原子认领(WHERE settledAt=null)与 deduct 互斥 → 恰好扣一次。计费失败不回滚结算
+ * cron 兜底：对超时仍未结算的同传会话，按 grants 的 Soniox 实测串流量（封顶
+ * MAX_INTERPRET_DURATION_MS）扣费并结算；查无实测量的按 0 结算（P1-1，见函数体注释）。
+ * 条件原子认领(WHERE settledAt=null)与 deduct 互斥 → 恰好扣一次。计费失败不回滚结算
  * （已认领即视为已处理，留给对账兜底），避免反复重扫同一会话。
  */
 export async function reclaimStaleInterpretSessions(now: Date): Promise<number> {
@@ -218,20 +221,32 @@ export async function reclaimStaleInterpretSessions(now: Date): Promise<number> 
 
   let reclaimed = 0;
   for (const s of stale) {
-    // R1-L2：优先按 Soniox usage-logs 实测串流量计费（usage cron 已回填各 grant.actualMs，
-    // 7h 阈值远晚于回填窗口）——比「墙钟封 6h」精确得多：崩溃在第 3 分钟的诚实用户按 3 分钟扣，
-    // 改装客户端串满多少扣多少。无 grants/未回填（部署前旧数据、usage 拉取故障）退回墙钟封顶。
+    // R1-L2：按 Soniox usage-logs 实测串流量计费（usage cron 已回填各 grant.actualMs，
+    // 7h 阈值远晚于回填窗口）：崩溃在第 3 分钟的诚实用户按 3 分钟扣，改装客户端串满多少扣多少。
     const grantAgg = await prisma.sonioxStreamGrant.aggregate({
       where: { interpretSessionId: s.id, actualMs: { gt: 0 } },
       _sum: { actualMs: true },
     });
     const grantActualMs = grantAgg._sum.actualMs ?? 0;
-    const elapsedMs = Math.min(
-      grantActualMs > 0
-        ? grantActualMs
-        : Math.max(0, now.getTime() - s.startedAt.getTime()),
-      MAX_INTERPRET_DURATION_MS
-    );
+
+    // P1-1：查无实测量（该锚点根本没有 grant，或 grants 的 actualMs 全为空）→ **按 0 结算**，
+    // 绝不回落墙钟。INTERPRET_RECLAIM_STALE_MS(7h) > MAX_INTERPRET_DURATION_MS(6h)，墙钟口径恒被
+    // 夹到 6h → 每条被扫到的锚点都是 360 分钟；而 /start 在建流之前就落锚点、麦克风被拒或 Soniox
+    // 不可达时前端只置 error 不调 deduct —— 被扣满 6h 的是诚实用户不是攻击者。真实用量的唯一
+    // 可信来源是 grant 实测：没回填就交给 usage cron（孤儿 grant 按实测转实扣，迟到用量也会补扣），
+    // 这里不猜。
+    if (grantActualMs <= 0) {
+      if (await settleInterpretSessionAsVoid(s.id, 'cron_reclaim_void')) {
+        reclaimed += 1;
+        sessionLogger.warn(
+          { sessionId: s.id, userId: s.userId },
+          'voided stale interpret anchor with no measured stream usage (billed 0)'
+        );
+      }
+      continue;
+    }
+
+    const elapsedMs = Math.min(grantActualMs, MAX_INTERPRET_DURATION_MS);
     const billable = getBillableMinutes(elapsedMs);
 
     // 认领 + 结算 grants + 扣费 + 记台账**同事务**原子：任一步失败整体回滚 → 会话保持未结算

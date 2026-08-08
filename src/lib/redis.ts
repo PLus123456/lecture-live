@@ -21,11 +21,12 @@ export function getRedisClient(): Redis | null {
       lazyConnect: false,
       enableOfflineQueue: false,
       connectTimeout: 3000,
+      // 无上限重连。旧实现在 times > 3（累计约 1.2s）返回 null，ioredis 随即 close()/
+      // setStatus('end') 永久放弃；而实例缓存在 globalThis 从不重建 → 一次常规
+      // `docker restart redis` 就让该进程余生失去 Redis（token 吊销、限流全线降级到
+      // 进程内存）。指数退避封顶 30s：稳态每分钟最多 2 次重连尝试，代价可忽略。
       retryStrategy(times) {
-        if (times > 3) {
-          return null;
-        }
-        return Math.min(times * 200, 2000);
+        return Math.min(2 ** Math.min(times, 8) * 100, 30_000);
       },
     });
 

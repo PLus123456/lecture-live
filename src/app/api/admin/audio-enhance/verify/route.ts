@@ -44,6 +44,11 @@ export async function POST(req: Request) {
   if (!rawToken) {
     return NextResponse.json({ ok: false, error: 'worker token 未配置' }, { status: 400 });
   }
+
+  // 注：这里**刻意不做**「探测未保存地址必须显式给 token」的换靶闸（P2-2 已收窄为只保 SMTP）。
+  // 这是「填好地址先点一下测试连接」的常规动作，逼着重填 token 会把它变得很难用。
+  // 残余风险与收口方向见 admin/settings/route.ts 里的说明。
+
   for (const url of urls) {
     try {
       validateCloudreveBaseUrl(url);

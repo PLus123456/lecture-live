@@ -8,7 +8,10 @@
 import type { AudioSourceType } from '@/types/transcript';
 
 const DB_NAME = 'lecture-live-audio';
-const DB_VERSION = 2;
+// v3：删掉 v1 遗留的 `chunks` store。它存的是裸 Blob、没有 sessionId，
+// 兜底读取只能 getAll() 全取（C51/P6-8）——于是任意会话的 finalize 都会把这堆
+// 陈年音频当成自己的分片传上去，换账号后同样成立。见 getAudioChunkEntries 的注释。
+const DB_VERSION = 3;
 const SESSION_STORE = 'sessions';
 const CHUNK_STORE = 'session_chunks';
 const LEGACY_CHUNK_STORE = 'chunks';
@@ -79,6 +82,12 @@ function openDB(): Promise<IDBDatabase> {
           keyPath: ['sessionId', 'seq'],
         });
         chunkStore.createIndex('bySessionId', 'sessionId', { unique: false });
+      }
+
+      // C51/P6-8：legacy store 的记录无法归属到任何 sessionId，留着就只能被
+      // 无差别 getAll() 读走。v2 早已不再写它，直接删除是唯一能确定性堵住泄漏的做法。
+      if (db.objectStoreNames.contains(LEGACY_CHUNK_STORE)) {
+        db.deleteObjectStore(LEGACY_CHUNK_STORE);
       }
     };
 
@@ -153,31 +162,19 @@ export async function appendAudioChunk(
   });
 }
 
-async function getLegacyAudioChunks(): Promise<AudioChunkEntry[]> {
-  const db = await openDB();
-  if (!db.objectStoreNames.contains(LEGACY_CHUNK_STORE)) {
-    return [];
-  }
-
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(LEGACY_CHUNK_STORE, 'readonly');
-    const request = tx.objectStore(LEGACY_CHUNK_STORE).getAll();
-    request.onsuccess = () =>
-      resolve(
-        (request.result as Blob[]).map((blob, index) => ({
-          seq: index,
-          blob,
-        }))
-      );
-    request.onerror = () => reject(request.error);
-  });
-}
-
+/**
+ * 读取某个 session 的全部分片。
+ *
+ * C51/P6-8：这里曾有一条「本会话查不到就回落 legacy `chunks` store 的 getAll()」的兜底。
+ * legacy 记录是裸 Blob、不带 sessionId，于是任意会话（包括换账号后的新会话）在
+ * finalize 时都会把这堆陈年音频当成自己的分片上传（useSoniox 的 syncRemoteDraft）。
+ * legacy store 现在在 openDB 升级到 v3 时被删除，兜底一并去掉。
+ */
 export async function getAudioChunkEntries(
   sessionId: string
 ): Promise<AudioChunkEntry[]> {
   const db = await openDB();
-  const chunks = await new Promise<AudioChunkEntry[]>((resolve, reject) => {
+  return new Promise<AudioChunkEntry[]>((resolve, reject) => {
     if (!db.objectStoreNames.contains(CHUNK_STORE)) {
       resolve([]);
       return;
@@ -195,31 +192,11 @@ export async function getAudioChunkEntries(
     };
     request.onerror = () => reject(request.error);
   });
-
-  if (chunks.length > 0) {
-    return chunks;
-  }
-
-  return getLegacyAudioChunks();
 }
 
 export async function getAllAudioChunks(sessionId: string): Promise<Blob[]> {
   const entries = await getAudioChunkEntries(sessionId);
   return entries.map((entry) => entry.blob);
-}
-
-async function clearLegacyAudioChunks(): Promise<void> {
-  const db = await openDB();
-  if (!db.objectStoreNames.contains(LEGACY_CHUNK_STORE)) {
-    return;
-  }
-
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(LEGACY_CHUNK_STORE, 'readwrite');
-    tx.objectStore(LEGACY_CHUNK_STORE).clear();
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
 }
 
 export async function clearAudioChunks(sessionId: string): Promise<void> {
@@ -256,8 +233,53 @@ export async function clearAudioChunks(sessionId: string): Promise<void> {
     tx.onerror = () => reject(tx.error);
   });
 
-  await clearLegacyAudioChunks().catch(() => undefined);
   clearAudioArchiveSnapshot(sessionId);
+}
+
+/**
+ * 清空本机全部录音归档（所有 session）。登出时调用。
+ *
+ * C51/P6-8：登出只清了 store 与 localStorage，IndexedDB 里的音频原封不动地留给下一个
+ * 登录本机的账号。这里连 sessionStorage 里的归档快照一起扫掉。
+ * 尽力而为：indexedDB 不可用（SSR / 隐私模式）直接返回。
+ */
+export async function clearAllAudioArchives(): Promise<void> {
+  if (typeof indexedDB === 'undefined') {
+    return;
+  }
+
+  const db = await openDB();
+  await new Promise<void>((resolve, reject) => {
+    const storeNames = [SESSION_STORE, CHUNK_STORE].filter((storeName) =>
+      db.objectStoreNames.contains(storeName)
+    );
+    if (storeNames.length === 0) {
+      resolve();
+      return;
+    }
+    const tx = db.transaction(storeNames, 'readwrite');
+    for (const storeName of storeNames) {
+      tx.objectStore(storeName).clear();
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  try {
+    const stale: string[] = [];
+    for (let i = 0; i < sessionStorage.length; i += 1) {
+      const key = sessionStorage.key(i);
+      if (key && key.startsWith(ARCHIVE_SNAPSHOT_KEY_PREFIX)) {
+        stale.push(key);
+      }
+    }
+    for (const key of stale) {
+      sessionStorage.removeItem(key);
+    }
+    sessionStorage.removeItem(LEGACY_ARCHIVE_MIME_KEY);
+  } catch {
+    // Best effort only.
+  }
 }
 
 /**
@@ -290,9 +312,10 @@ export async function getMaxAudioChunkSeq(sessionId: string): Promise<number> {
 
 export async function hasAudioChunks(sessionId: string): Promise<boolean> {
   const db = await openDB();
-  const count = await new Promise<number>((resolve, reject) => {
+  // 同上：不再回落 legacy store —— 「别的会话有音频」不代表本会话有。
+  return new Promise<boolean>((resolve, reject) => {
     if (!db.objectStoreNames.contains(CHUNK_STORE)) {
-      resolve(0);
+      resolve(false);
       return;
     }
 
@@ -301,16 +324,9 @@ export async function hasAudioChunks(sessionId: string): Promise<boolean> {
       .objectStore(CHUNK_STORE)
       .index('bySessionId')
       .count(IDBKeyRange.only(sessionId));
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => resolve(request.result > 0);
     request.onerror = () => reject(request.error);
   });
-
-  if (count > 0) {
-    return true;
-  }
-
-  const legacyChunks = await getLegacyAudioChunks();
-  return legacyChunks.length > 0;
 }
 
 export async function getArchiveMimeType(

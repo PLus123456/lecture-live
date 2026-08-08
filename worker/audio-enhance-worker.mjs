@@ -798,9 +798,28 @@ async function handleRequest(req, res) {
 
 // ============================ 启动 ============================
 
+/**
+ * token 是否是发行的占位值。
+ *
+ * C39/P6-11：单元模板里的 `change-me-to-a-64-char-random-hex-string` 实测 40 字符，
+ * 稳稳通过 `length < 32` 这道门 —— 于是 install.sh 的 `change-me-*` 黑名单和这里的
+ * 长度门禁互相矛盾：手抄单元文件（不跑 install.sh）的机器会带着人尽皆知的 token 起服务。
+ * 两处口径必须一致。
+ */
+function isPlaceholderToken(token) {
+  return /^change[-_]me/i.test(token)
+}
+
 async function main() {
   if (!CONFIG.token || CONFIG.token.length < 32) {
     log('error', 'AUDIO_WORKER_TOKEN 未设置或长度不足 32 字符，拒绝启动')
+    process.exit(1)
+  }
+  if (isPlaceholderToken(CONFIG.token)) {
+    log(
+      'error',
+      'AUDIO_WORKER_TOKEN 仍是模板里的占位值，拒绝启动。请用 `openssl rand -hex 32` 生成后写入单元文件（或直接跑 worker/install.sh）'
+    )
     process.exit(1)
   }
   if (!(await hasFfmpeg())) {

@@ -6,7 +6,10 @@ import {
   resolveSessionAudioLocation,
   openLocalAudioRangeStream,
 } from '@/lib/sessionPersistence';
-import { CloudreveStorage } from '@/lib/storage/cloudreve';
+import {
+  CloudreveStorage,
+  CloudreveRangeNotSatisfiableError,
+} from '@/lib/storage/cloudreve';
 
 const PLAYBACK_STATUSES = new Set(['COMPLETED', 'ARCHIVED']);
 
@@ -18,24 +21,22 @@ export async function GET(
 ) {
   const { token: rawToken } = await params;
 
-  // 限流按分享 token 分桶（而非纯 IP）：音频走 HTTP Range、单个观众一次播放就会产生多次请求，
-  // 且同一 NAT 出口的多名观众共享一个公网 IP —— 原来的「10 次/10 分钟/IP」会误封第 11 名及以后的观众。
-  // 改为按 token 分桶并放宽额度：既容纳 Range 流式与 NAT 多观众，又把滥用限定在单个分享链接内
-  //（拿到 token 者本就有完整访问权，按 token 限流不额外放权）。
-  const rateLimited = await enforceRateLimit(req, {
-    scope: 'share:view:audio',
-    limit: 300,
-    windowMs: 10 * 60_000,
-    key: `share-audio:${rawToken.slice(0, 128)}`,
-  });
-  if (rateLimited) {
-    return rateLimited;
-  }
-
+  // P4-3：**先净化再限流**。sanitizeToken 剥掉 [A-Za-z0-9_-] 之外的一切字符，而查库用的是净化后
+  // 的串 —— 旧代码拿原始串做限流 key，于是 /ABC123、/A!B!C!1!2!3、/~ABC123 命中同一条 ShareLink
+  // 却各占一个桶，桶数无限，而这是本公开未认证端点的**唯一**限流（nginx 无 limit_req）。
   let token: string;
   try {
     token = sanitizeToken(rawToken);
   } catch {
+    // 净化失败（全是非法字符）此时还没过任何限流闸：按 IP 单独限一道，防止刷废串空转。
+    const junkLimited = await enforceRateLimit(req, {
+      scope: 'share:view:audio:invalid',
+      limit: 60,
+      windowMs: 10 * 60_000,
+    });
+    if (junkLimited) {
+      return junkLimited;
+    }
     return Response.json(
       { error: 'Invalid share token' },
       { status: 400, headers: secureHeaders() }
@@ -47,6 +48,20 @@ export async function GET(
       { error: 'Invalid share token' },
       { status: 400, headers: secureHeaders() }
     );
+  }
+
+  // 限流按分享 token 分桶（而非纯 IP）：音频走 HTTP Range、单个观众一次播放就会产生多次请求，
+  // 且同一 NAT 出口的多名观众共享一个公网 IP —— 原来的「10 次/10 分钟/IP」会误封第 11 名及以后的观众。
+  // 改为按 token 分桶并放宽额度：既容纳 Range 流式与 NAT 多观众，又把滥用限定在单个分享链接内
+  //（拿到 token 者本就有完整访问权，按 token 限流不额外放权）。
+  const rateLimited = await enforceRateLimit(req, {
+    scope: 'share:view:audio',
+    limit: 300,
+    windowMs: 10 * 60_000,
+    key: `share-audio:${token}`,
+  });
+  if (rateLimited) {
+    return rateLimited;
   }
 
   const link = await prisma.shareLink.findUnique({
@@ -123,7 +138,20 @@ export async function GET(
           headers,
         });
       } catch (error) {
-        // 流式失败（含 416 / 远程节点错误 / 配置缺失）：落到缓冲回退分支
+        // P4-3：Range 不可满足直接回 416。旧代码把 416 也当「流式失败」落进缓冲回退，
+        // 于是**整段录音进内存**之后才返回 416 —— 一条 `Range: bytes=99999999-` 就换一次整文件缓冲。
+        if (error instanceof CloudreveRangeNotSatisfiableError) {
+          return new Response(null, {
+            status: 416,
+            headers: {
+              ...(error.contentRange ? { 'Content-Range': error.contentRange } : {}),
+              'Accept-Ranges': 'bytes',
+              'X-Content-Type-Options': 'nosniff',
+              'Referrer-Policy': 'no-referrer',
+            },
+          });
+        }
+        // 流式失败（远程节点错误 / 配置缺失）：落到缓冲回退分支
         console.error('Share audio stream error, falling back to buffered load:', error);
       }
     }

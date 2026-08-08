@@ -16,6 +16,7 @@ import {
   uploadSonioxFile,
   createSonioxTranscription,
   deleteSonioxFile,
+  deleteSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
 import { settleFullReservation } from '@/lib/quota';
 
@@ -56,6 +57,8 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
 
   const tmpDir = path.join(TMP_ROOT, sessionId.replace(/[^a-zA-Z0-9_-]/g, ''));
   let uploadedFileId: string | null = null;
+  // P5-18：已创建但尚未写进 DB 的 transcription 也要在失败路径清掉（DB 里没有 ID，cron 回收扫不到）。
+  let createdTranscriptionId: string | null = null;
   let sonioxConfig: Awaited<ReturnType<typeof resolveAndPersistTaskRegion>> | null = null;
 
   try {
@@ -130,14 +133,20 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
       translation,
       clientReferenceId: `${sessionId}-full`,
     });
+    createdTranscriptionId = job.id;
 
-    // transcoding → transcribing（+ Soniox 引用）。抢不到（被取消）→ 清 Soniox 文件 + halt。
+    // transcoding → transcribing（+ Soniox 引用）。抢不到（被取消）→ 清 Soniox 资源 + halt。
     if (
       !(await setFullStatus(sessionId, 'transcribing', ['transcoding'], {
         fullSonioxFileId: sonioxFile.id,
         fullSonioxTranscriptionId: job.id,
       }))
     ) {
+      // P5-18：**transcription 也必须删**。CAS 抢不到时两个 Soniox ID 都没写进 DB，只删 file
+      // 会把已创建的 transcription 变成谁都查不到的孤儿（reclaim cron 只按 DB 里的 ID 回收），
+      // 永久占 Soniox 侧配额。先删 transcription 再删 file（transcription 引用 file，反序会留
+      // 更难回收的孤儿），与 asyncUploadProcessor 同一处的两删口径对齐。
+      await deleteSonioxTranscription(sonioxConfig, job.id).catch(() => undefined);
       await deleteSonioxFile(sonioxConfig, sonioxFile.id).catch(() => undefined);
       throw new PipelineHaltError();
     }
@@ -153,9 +162,17 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
       return;
     }
 
-    // 上传到 Soniox 后才失败：清掉刚上传的文件避免泄漏配额。
-    if (uploadedFileId && sonioxConfig) {
-      await deleteSonioxFile(sonioxConfig, uploadedFileId).catch(() => undefined);
+    // 上传到 Soniox 后才失败：清掉刚上传的资源避免泄漏配额。P5-18：transcription 与 file 都要删
+    // （先 transcription 后 file），二者的 ID 此时都还没写进 DB，不删就是 cron 也回收不到的孤儿。
+    if (sonioxConfig) {
+      if (createdTranscriptionId) {
+        await deleteSonioxTranscription(sonioxConfig, createdTranscriptionId).catch(
+          () => undefined
+        );
+      }
+      if (uploadedFileId) {
+        await deleteSonioxFile(sonioxConfig, uploadedFileId).catch(() => undefined);
+      }
     }
 
     const message = err instanceof Error ? err.message : 'Full transcribe failed';

@@ -7,42 +7,15 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { encrypt, decrypt } from '@/lib/crypto';
 import { invalidateSiteSettingsCache } from '@/lib/siteSettings';
 import { invalidateSonioxDbConfigCache } from '@/lib/soniox/env';
-import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
+// P6-4：校验实现搬到 @/lib/sonioxUrlValidation，与公开的 /api/setup 路径共用一份，
+// 免得同一防护再次只装在一条路径上。
+import {
+  validateSonioxRestUrl,
+  validateSonioxWsUrl,
+} from '@/lib/sonioxUrlValidation';
 
 const VALID_REGIONS = ['us', 'eu', 'jp'] as const;
 
-/**
- * 校验 Soniox REST 地址（https/http）：格式合法 + 私网过滤，防 SSRF。
- * 复用 Cloudreve 的 validateCloudreveBaseUrl（http/https + 私网黑名单）。
- * 通过则返回去掉尾部斜杠的原始地址；非法抛出 Error。
- */
-function validateSonioxRestUrl(value: string): string {
-  validateCloudreveBaseUrl(value);
-  // 保留管理员填写的原始地址（仅去掉尾部斜杠），不强制改写为 cloudreve 的规范化形式
-  return value.replace(/\/+$/, '');
-}
-
-/**
- * 校验 Soniox WebSocket 地址（wss/ws）：格式合法 + 私网过滤，防 SSRF。
- * validateCloudreveBaseUrl 仅接受 http/https，故先把 ws(s) 映射为 http(s) 复用其私网/格式校验，
- * 通过后仍返回管理员填写的原始 ws(s) 地址（仅去掉尾部斜杠）。
- */
-function validateSonioxWsUrl(value: string): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new Error('wsUrl must be a valid URL');
-  }
-  if (parsed.protocol !== 'wss:' && parsed.protocol !== 'ws:') {
-    throw new Error('wsUrl must use ws or wss');
-  }
-  // 映射到 http(s) 以复用 validateCloudreveBaseUrl 的私网/格式校验（host/userinfo/port 保持不变）
-  const httpEquivalent = new URL(value);
-  httpEquivalent.protocol = parsed.protocol === 'wss:' ? 'https:' : 'http:';
-  validateCloudreveBaseUrl(httpEquivalent.toString());
-  return value.replace(/\/+$/, '');
-}
 
 /**
  * GET /api/admin/soniox
@@ -151,11 +124,35 @@ export async function PUT(req: Request) {
       | { kind: 'delete'; key: string };
     const ops: Op[] = [];
 
+    // 已存值（密钥 + 两个自定义地址），供「改端点必须重填密钥」判定与下面的 configured 计算共用。
+    const apiKeyKeys = VALID_REGIONS.map((r) => `soniox_${r.toUpperCase()}_api_key`);
+    const existingRows = await prisma.siteSetting.findMany({
+      where: {
+        key: {
+          in: VALID_REGIONS.flatMap((r) => {
+            const u = r.toUpperCase();
+            return [
+              `soniox_${u}_api_key`,
+              `soniox_${u}_ws_url`,
+              `soniox_${u}_rest_url`,
+            ];
+          }),
+        },
+      },
+      select: { key: true, value: true },
+    });
+    const existingByKey = new Map(existingRows.map((row) => [row.key, row.value]));
+
     for (const [region, config] of Object.entries(regions)) {
       if (!VALID_REGIONS.includes(region as typeof VALID_REGIONS[number])) continue;
       if (!config) continue;
 
       const upper = region.toUpperCase();
+
+      // 注：这里**刻意不做**「改 wsUrl/restUrl 必须重填 apiKey」的换靶闸
+      //（P2-2 已收窄为只保 SMTP）。自建代理/中转地址会变，不该每次都逼着重填密钥。
+      // 下面的 validateSonioxWsUrl / validateSonioxRestUrl 仍在挡内网地址。
+      // 残余风险与收口方向见 admin/settings/route.ts 里的说明。
 
       // API Key：非空则加密写入，空字符串 = 删除
       if (config.apiKey !== undefined) {
@@ -208,12 +205,7 @@ export async function PUT(req: Request) {
     }
 
     // 计算提交后是否仍存在任何 API Key（含本次未触及的区域），据此定 soniox_configured。
-    const apiKeyKeys = VALID_REGIONS.map((r) => `soniox_${r.toUpperCase()}_api_key`);
-    const existingApiKeyRows = await prisma.siteSetting.findMany({
-      where: { key: { in: apiKeyKeys } },
-      select: { key: true },
-    });
-    const remainingKeys = new Set(existingApiKeyRows.map((row) => row.key));
+    const remainingKeys = new Set(apiKeyKeys.filter((key) => existingByKey.has(key)));
     for (const op of ops) {
       if (!apiKeyKeys.includes(op.key)) continue;
       if (op.kind === 'upsert') remainingKeys.add(op.key);

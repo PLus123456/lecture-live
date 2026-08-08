@@ -1,7 +1,6 @@
 import {
   EMPTY_STREAMING_PREVIEW_TRANSLATION,
   EMPTY_STREAMING_PREVIEW_TEXT,
-  combinePreviewText,
   hasPreviewContent,
 } from '@/lib/transcriptPreview';
 import type { RealtimeToken } from '@/types/soniox';
@@ -50,6 +49,20 @@ interface PendingTranslationToken {
   sourceLanguage: string | null;
 }
 
+/** 翻译 token 归属段落时允许的时间误差（realtime 与 async 两条路径共用） */
+export const TRANSLATION_MATCH_TOLERANCE_MS = 250;
+
+/** 时间点到 [startMs, endMs] 区间的距离；落在区间内为 0。 */
+export function distanceToRange(
+  timeMs: number,
+  startMs: number,
+  endMs: number
+): number {
+  if (timeMs < startMs) return startMs - timeMs;
+  if (timeMs > endMs) return timeMs - endMs;
+  return 0;
+}
+
 export class TokenProcessor {
   private sessions: SessionRecord[] = [];
   private currentSessionIndex = 0;
@@ -73,7 +86,6 @@ export class TokenProcessor {
   private segmentCounter = 0;
 
   private static SENTENCE_END_RE = /[.!?。！？；]\s*$/;
-  private static readonly TRANSLATION_MATCH_TOLERANCE_MS = 250;
   private static readonly MAX_RECENT_TRANSLATION_SEGMENTS = 64;
 
   private onSegmentFinalized?: (segment: TranscriptSegment) => void;
@@ -183,7 +195,8 @@ export class TokenProcessor {
   }
 
   onEndpoint() {
-    this.flushSegment();
+    // 话尾/收流边界：连同尚未定稿的尾巴一起结算，避免最后半句丢失（见 flushSegment）
+    this.flushSegment({ includeNonFinal: true });
     this.emitPreviewState();
   }
 
@@ -229,12 +242,6 @@ export class TokenProcessor {
           : null;
 
     return localTimeMs == null ? null : session.timeOffsetMs + localTimeMs;
-  }
-
-  private distanceToRange(timeMs: number, startMs: number, endMs: number): number {
-    if (timeMs < startMs) return startMs - timeMs;
-    if (timeMs > endMs) return timeMs - endMs;
-    return 0;
   }
 
   private getDominantLanguage(tokens = this.getCurrentSegmentTokens()) {
@@ -328,12 +335,15 @@ export class TokenProcessor {
     this.previewTranslationSourceLanguage = null;
   }
 
+  // C11：自动截断只看**终态**文本。若拿含非终态尾巴的预览文本判定，就会在尾巴
+  // 尚未定稿时切段，而 flush 只结算终态部分——切点落空（终态还很短）或切在句中。
+  // 判定与结算用同一份文本，二者才对得上。
   private shouldAutoSplit(): boolean {
     if (this.maxSegmentChars <= 0) {
       return false;
     }
 
-    const text = combinePreviewText(this.getCurrentPreview());
+    const text = this.segmentFinalTokens.map((token) => token.text).join('');
     return (
       text.length >= this.maxSegmentChars &&
       TokenProcessor.SENTENCE_END_RE.test(text)
@@ -368,7 +378,7 @@ export class TokenProcessor {
 
     for (let i = this.recentTranslationSegments.length - 1; i >= 0; i--) {
       const segment = this.recentTranslationSegments[i];
-      const distance = this.distanceToRange(
+      const distance = distanceToRange(
         globalTimeMs,
         segment.startMs,
         segment.endMs
@@ -382,7 +392,7 @@ export class TokenProcessor {
 
     if (
       bestMatch &&
-      bestDistance <= TokenProcessor.TRANSLATION_MATCH_TOLERANCE_MS
+      bestDistance <= TRANSLATION_MATCH_TOLERANCE_MS
     ) {
       return bestMatch;
     }
@@ -395,11 +405,11 @@ export class TokenProcessor {
     if (!currentRange) return false;
 
     return (
-      this.distanceToRange(
+      distanceToRange(
         globalTimeMs,
         currentRange.startMs,
         currentRange.endMs
-      ) <= TokenProcessor.TRANSLATION_MATCH_TOLERANCE_MS
+      ) <= TRANSLATION_MATCH_TOLERANCE_MS
     );
   }
 
@@ -622,10 +632,27 @@ export class TokenProcessor {
     this.pendingTranslationTokens = unresolved;
   }
 
-  private flushSegment() {
-    const segmentTokens = this.getCurrentSegmentTokens();
+  /**
+   * 结算当前段。
+   *
+   * C11：默认**只结算终态 token**，非终态尾巴留到它真正定稿后再进下一段。
+   * 旧实现把 final+nonFinal 一起成段并清空两个数组，而 Soniox 之后会把那批非终态
+   * token 原样重发、终态化后落进下一段 —— 同一句跨两段重复（下游 addFinalSegment
+   * 是盲 append，不会去重）。
+   *
+   * includeNonFinal=true 仅用于 onEndpoint 这种「话尾/收流」边界：此时 Soniox 已
+   * 定稿（尾巴通常为空），保留兜底是为了万一还有尾巴时不把用户最后半句丢掉。
+   */
+  private flushSegment(options: { includeNonFinal?: boolean } = {}) {
+    const includeNonFinal = options.includeNonFinal ?? false;
+    const segmentTokens = includeNonFinal
+      ? this.getCurrentSegmentTokens()
+      : [...this.segmentFinalTokens];
     if (segmentTokens.length === 0) {
-      this.clearCurrentPreviewTranslation();
+      // 只剩非终态尾巴时什么都没结算：预览译文仍属于当前段，不能清。
+      if (this.segmentNonFinalTokens.length === 0) {
+        this.clearCurrentPreviewTranslation();
+      }
       return;
     }
 
@@ -634,7 +661,9 @@ export class TokenProcessor {
     const text = rawText.trim();
     if (!text) {
       this.segmentFinalTokens = [];
-      this.segmentNonFinalTokens = [];
+      if (includeNonFinal) {
+        this.segmentNonFinalTokens = [];
+      }
       this.clearCurrentPreviewTranslation();
       return;
     }
@@ -715,7 +744,9 @@ export class TokenProcessor {
     }
 
     this.segmentFinalTokens = [];
-    this.segmentNonFinalTokens = [];
+    if (includeNonFinal) {
+      this.segmentNonFinalTokens = [];
+    }
     this.clearCurrentPreviewTranslation();
     this.flushPendingTranslationTokens();
   }

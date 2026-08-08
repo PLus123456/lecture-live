@@ -16,21 +16,30 @@ import type { RechargeSettings } from '@/lib/payment/settings';
  * 金额单位：支付宝以「元」为单位、两位小数；我们存储 amountCents（分）→ 除以 100。
  * 需你在支付宝开放平台配置应用私钥、上传应用公钥、下载支付宝公钥，并把回调地址设为 notify_url。
  */
+/** 支付宝境内收单固定人民币（通知里也不带币种字段）。 */
+const ALIPAY_CURRENCY = 'CNY';
+
 export class AlipayProvider implements PaymentProvider {
   readonly name = 'alipay' as const;
   private readonly appId: string;
+  private readonly sellerId: string;
   private readonly privateKeyPem: string;
   private readonly alipayPublicKeyPem: string;
   private readonly gateway: string;
 
   constructor(s: RechargeSettings) {
     this.appId = s.alipayAppId;
+    this.sellerId = (s.alipaySellerId || '').trim();
     this.privateKeyPem = wrapPem(s.alipayPrivateKey, 'PRIVATE KEY');
     this.alipayPublicKeyPem = wrapPem(s.alipayPublicKey, 'PUBLIC KEY');
     this.gateway = s.alipayGateway || 'https://openapi.alipay.com/gateway.do';
   }
 
   async createCharge(params: CreateChargeParams): Promise<CreateChargeResult> {
+    // 支付宝境内收单只做人民币；币种不符必须当场炸，绝不静默按 CNY 收（P3-15）。
+    if (params.currency !== ALIPAY_CURRENCY) {
+      throw new Error(`Alipay only settles ${ALIPAY_CURRENCY}, got ${params.currency}`);
+    }
     const bizContent = JSON.stringify({
       out_trade_no: params.outTradeNo,
       product_code: 'FAST_INSTANT_TRADE_PAY',
@@ -49,7 +58,8 @@ export class AlipayProvider implements PaymentProvider {
       return_url: appendQuery(params.returnUrl, 'recharge', 'success'),
       biz_content: bizContent,
     };
-    const signStr = buildSignString(common);
+    // 请求方向：sign_type **参与**签名（只有异步通知的 rsaCheckV1 才剔除它）。P3-1
+    const signStr = buildSignString(common, { forRequest: true });
     const sign = crypto
       .createSign('RSA-SHA256')
       .update(signStr, 'utf8')
@@ -69,14 +79,27 @@ export class AlipayProvider implements PaymentProvider {
 
     // 验签通过后仍须校验业务字段（支付宝集成规范要求，M2）：app_id 必须是本应用，否则拒绝——
     // 防止用「攻击者自己支付宝应用」生成的合法签名通知（同一平台密钥可验签）来给我方订单冒充到账。
-    // seller_id 若已配置则一并校验（当前未存商户 PID，暂略）。金额对账由上层据 amountCents 完成。
-    if (this.appId && params.app_id && params.app_id !== this.appId) return null;
+    // L17：缺 app_id 时**不能整条跳过**——那正好是冒充者最省事的构造（少填一个字段即免检）。
+    if (this.appId && params.app_id !== this.appId) return null;
+    // L17：seller_id（收款方商户 PID）已配置则必须匹配，同理不接受缺字段免检。
+    if (this.sellerId && params.seller_id !== this.sellerId) return null;
 
     const outTradeNo = params.out_trade_no || '';
     if (!outTradeNo) return null;
+
+    // P3-2：**退款类通知绝不能当到账**。部分退款的 trade_status 仍是 TRADE_SUCCESS，
+    // 只看状态会让「钱已退、权益照发」的通知认领 pending 单 = 凭空造钱。
+    // （全额退款走 TRADE_CLOSED，本就不在接受列表；TRADE_FINISHED 是「已收款且不可再退」，
+    //   删掉它反而会丢弃真实已付订单——两处都别改错。）
+    // 部分退款也一并标 reversal 走完整冻结：我们卖的是不可分割的权益（一期会员 / 一包分钟），
+    // 没有「退一半权益」的语义；宁可冻结 + 告警让人工补偿，也不留一笔权益悬在半退款状态。
+    const isRefund = Boolean(
+      params.refund_fee || params.gmt_refund || params.out_biz_no
+    );
     const paid =
-      params.trade_status === 'TRADE_SUCCESS' ||
-      params.trade_status === 'TRADE_FINISHED';
+      !isRefund &&
+      (params.trade_status === 'TRADE_SUCCESS' ||
+        params.trade_status === 'TRADE_FINISHED');
     // 支付宝金额以「元」计，两位小数 → 转分对账。
     const amountCents = params.total_amount
       ? Math.round(Number(params.total_amount) * 100)
@@ -84,7 +107,10 @@ export class AlipayProvider implements PaymentProvider {
     return {
       outTradeNo,
       paid,
+      ...(isRefund ? { reversal: true } : {}),
       amountCents: Number.isFinite(amountCents) ? amountCents : undefined,
+      // 支付宝境内收单恒为人民币，通知里不带币种字段。
+      currency: ALIPAY_CURRENCY,
       providerRef: params.trade_no,
       rawStatus: params.trade_status,
     };
@@ -101,10 +127,21 @@ function centsToYuan(cents: number): string {
   return (Math.max(0, Math.round(cents)) / 100).toFixed(2);
 }
 
-/** 构造待签名串：剔除 sign / sign_type / 空值，按 key 升序，`k=v` 用 & 连接（不 URL 编码）。导出供单测。 */
-export function buildSignString(params: Record<string, string>): string {
+/**
+ * 构造待签名串：剔除空值，按 key 升序，`k=v` 用 & 连接（不 URL 编码）。导出供单测。
+ *
+ * P3-1：**两个方向规则不同，不能共用一份剔除表**。
+ *  - 请求方向（createCharge）：只剔 `sign`，`sign_type` 参与签名。我们确实把 sign_type=RSA2
+ *    提交给了网关，签名串里却把它剔掉 → 网关必回 isv.invalid-signature，整条轨零成交。
+ *  - 通知方向（rsaCheckV1）：`sign` 与 `sign_type` 都剔除。
+ */
+export function buildSignString(
+  params: Record<string, string>,
+  opts?: { forRequest?: boolean }
+): string {
+  const dropped = opts?.forRequest ? ['sign'] : ['sign', 'sign_type'];
   return Object.keys(params)
-    .filter((k) => k !== 'sign' && k !== 'sign_type' && params[k] !== '' && params[k] != null)
+    .filter((k) => !dropped.includes(k) && params[k] !== '' && params[k] != null)
     .sort()
     .map((k) => `${k}=${params[k]}`)
     .join('&');

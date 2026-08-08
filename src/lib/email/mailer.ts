@@ -201,6 +201,10 @@ function isValidSmtpHost(host: string): boolean {
  * 让本站把自己的 SMTP 口令投递到对方指定的主机上（`transporter.verify()` 会照常
  * 跑 AUTH LOGIN）。GET 接口特意把密码脱敏成 ******** 防读取，这条路径不能反手把明文送出去。
  * 这里不区分恶意与手滑：管理员把 host 打错成抢注域名，后果完全一样。
+ *
+ * 注意这条只管**测试**路径。生产发信 sendMail() 读的是落库配置、不经过这里，所以同一条规则
+ * 还必须落在写入侧（admin/settings PUT，见 @/lib/credentialRetarget）—— 否则先 PUT 换靶
+ * 保口令、再让任意一封验证信/重置信把口令送出去，这里挡了也没用。
  */
 async function resolveConfigWithOverride(
   override?: Partial<EmailConfig>

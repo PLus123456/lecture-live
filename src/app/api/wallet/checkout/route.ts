@@ -5,13 +5,29 @@ import { getSiteSettings } from '@/lib/siteSettings';
 import { getRechargeSettings } from '@/lib/payment/settings';
 import { getPaymentProvider } from '@/lib/payment';
 import { isPaymentProviderName } from '@/lib/payment/types';
-import { createPaymentOrder, spendFromBalance, WalletError } from '@/lib/wallet';
+import {
+  createPaymentOrder,
+  spendFromBalance,
+  WalletError,
+  DEFAULT_ORDER_CURRENCY,
+} from '@/lib/wallet';
 import { enforceRateLimit } from '@/lib/rateLimit';
 
 interface CheckoutInput {
   tierId?: string;
   mode?: 'balance' | 'pay';
   provider?: string;
+}
+
+/**
+ * 结算币种（P3-15）：只认充值配置里的 ISO-4217 字段，绝不从展示用的 currencySymbol 反推——
+ * 管理员在符号框里填「元 / CNY / RMB」时 Stripe 会静默按美元收款（约 7.1× 超收）。
+ * 读法带兜底：配置项缺失时回落 CNY，而不是让整条下单轨崩掉。
+ */
+function resolveCurrency(settings: unknown): string {
+  const raw = (settings as { currency?: unknown } | null)?.currency;
+  const code = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
+  return /^[A-Z]{3}$/.test(code) ? code : DEFAULT_ORDER_CURRENCY;
 }
 
 // 发起充值/购买：mode='balance' 用余额买档位；mode='pay' 走支付渠道下单
@@ -50,6 +66,16 @@ export async function POST(req: Request) {
     if (tier.kind === 'topup') {
       return NextResponse.json({ error: '充值档位需通过支付渠道购买' }, { status: 400 });
     }
+    // L13：余额结算没有幂等键（支付轨靠 outTradeNo @unique 兜底，这条轨不建订单行）。攻击者
+    // 零收益（每次都真扣钱），但网络重发/双击会实打实扣两笔 —— 用「同用户同档位 10 秒 1 次」
+    // 的去抖把重复提交挡在事务之外。不是真幂等，是止损。
+    const duplicated = await enforceRateLimit(req, {
+      scope: 'wallet:checkout:balance',
+      limit: 1,
+      windowMs: 10_000,
+      key: `user:${payload.id}:tier:${tier.id}`,
+    });
+    if (duplicated) return duplicated;
     try {
       await spendFromBalance(payload.id, tier.id);
     } catch (err) {
@@ -77,12 +103,14 @@ export async function POST(req: Request) {
   const notifyUrl = `${base}/api/wallet/callback/${providerName}`;
   const returnUrl = `${base}/home`;
   const kind: 'topup' | 'purchase' = tier.kind === 'topup' ? 'topup' : 'purchase';
+  const currency = resolveCurrency(settings);
 
   const order = await createPaymentOrder({
     userId: payload.id,
     provider: providerName,
     kind,
     amountCents: tier.priceCents,
+    currency,
     tierId: kind === 'purchase' ? tier.id : undefined,
     creditCents: tier.kind === 'topup' ? tier.creditCents ?? tier.priceCents : undefined,
     returnUrl,
@@ -109,7 +137,18 @@ export async function POST(req: Request) {
       subject: tier.name,
       returnUrl,
       notifyUrl,
+      currency,
     });
+    // P3-14：网关侧流水号在这里就拿到了，从前直接丢掉 → Stripe 订单的 providerRef 恒 null，
+    // 对账时手里只有我方单号，网关后台那笔对不上。回调里再补是补不齐的（回调可能永远不来）。
+    if (charge.providerRef) {
+      await prisma.paymentOrder
+        .updateMany({
+          where: { id: order.id, status: 'pending' },
+          data: { providerRef: charge.providerRef },
+        })
+        .catch(() => {});
+    }
     return NextResponse.json({
       ok: true,
       mode: 'pay',
@@ -120,8 +159,11 @@ export async function POST(req: Request) {
     });
   } catch (err) {
     console.error('发起支付失败:', err);
+    // L16：裸 update 会把一笔**可能已在网关侧建单成功**的订单无条件打成终态 failed（歧义失败：
+    // 请求超时但网关其实收下了）。加 status:'pending' 谓词——晚到的回调若已把它认领成 paid，
+    // 这条就不再落地，钱不会因为一次超时而消失。
     await prisma.paymentOrder
-      .update({ where: { id: order.id }, data: { status: 'failed' } })
+      .updateMany({ where: { id: order.id, status: 'pending' }, data: { status: 'failed' } })
       .catch(() => {});
     return NextResponse.json({ error: '发起支付失败' }, { status: 502 });
   }

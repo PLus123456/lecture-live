@@ -19,9 +19,39 @@ vi.mock('@/lib/redis', () => ({
 }));
 
 import {
+  buildSessionsApiCacheKey,
   getOrSetApiCache,
   invalidateFoldersApiCache,
 } from '@/lib/apiResponseCache';
+
+// P4-4：缓存签名只纳入真正影响 SQL 的白名单参数。
+// 旧实现把整串查询参数塞进签名，而 GET /api/sessions 的 SQL 只看
+// unarchived/folderId/limit/cursor —— 任意垃圾参数都换一个新键、必然 miss、还各自驻留 30 秒，
+// 一条 400 字节的请求换来数百 KB 常驻内存（10³-10⁴ 倍放大），且 Redis 与限流/鉴权黑名单共用。
+describe('P4-4 会话列表缓存键基数', () => {
+  const key = (qs: string) =>
+    buildSessionsApiCacheKey('user-1', new URLSearchParams(qs));
+
+  it('垃圾参数不进签名（同一 SQL ⇒ 同一个键）', () => {
+    const base = key('');
+    expect(key('junk=1')).toBe(base);
+    expect(key('junk=2&other=x')).toBe(base);
+    expect(key('_=1699999999999')).toBe(base);
+  });
+
+  it('白名单参数照常参与签名（不同 SQL ⇒ 不同键）', () => {
+    const base = key('');
+    expect(key('unarchived=true')).not.toBe(base);
+    expect(key('folderId=f1')).not.toBe(key('folderId=f2'));
+    expect(key('limit=50')).not.toBe(key('limit=100'));
+    expect(key('cursor=a')).not.toBe(key('cursor=b'));
+  });
+
+  it('垃圾参数与白名单参数混合时，只按白名单部分分桶', () => {
+    expect(key('limit=50&junk=1')).toBe(key('limit=50'));
+    expect(key('junk=9&limit=50')).toBe(key('limit=50'));
+  });
+});
 
 describe('apiResponseCache', () => {
   beforeEach(() => {

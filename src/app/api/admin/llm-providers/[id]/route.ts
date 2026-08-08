@@ -66,6 +66,12 @@ export async function PATCH(
         );
       }
     }
+
+    // 注：这里**刻意不做**「改 apiBase 必须重填 apiKey」的换靶闸（P2-2 已收窄为只保 SMTP）。
+    // 多数厂商的 API Key 只在创建时显示一次，取不回来；为了改一个自建推理服务的地址就要求
+    // 重新签发 key，代价大于收益。残余风险与收口方向见 admin/settings/route.ts 里的说明。
+    // 上面的私网黑名单仍在（挡内网），但公网地址不拦。
+
     if (body.isAnthropic !== undefined) updateData.isAnthropic = body.isAnthropic;
     if (body.sortOrder !== undefined) updateData.sortOrder = body.sortOrder;
 

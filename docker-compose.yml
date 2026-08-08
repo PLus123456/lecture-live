@@ -52,7 +52,15 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: redis-server --requirepass ${REDIS_PASSWORD}
+    # P4-4：必须显式配 maxmemory + 逐出策略。裸 redis-server 是「无上限 + noeviction」：
+    # 这一个实例同时扛着 API 响应缓存、限流计数、鉴权黑名单，缓存把内存撑爆后写入直接报错，
+    # 限流与 token 吊销一起退化（限流回落进程内存 = 多实例下形同虚设）。
+    # allkeys-lru：所有键都可被逐出，且全部键都带 TTL（缓存 30s / 限流按窗口 / 黑名单按 token 寿命），
+    # 逐出的是最久未用的那批，压力下系统降级为「缓存未命中」而不是「写入失败」。
+    command: >-
+      redis-server --requirepass ${REDIS_PASSWORD}
+      --maxmemory ${REDIS_MAXMEMORY:-512mb}
+      --maxmemory-policy allkeys-lru
     volumes:
       - redisdata:/data
     networks:

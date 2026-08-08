@@ -17,6 +17,8 @@
  *       (b) finalize 守卫：WHERE asyncTranscribeStatus='finalizing' → 'completed'
  *           抢不到（收尾期间被 cancel）则不扣费、不跑 LLM，仅清 Soniox 资源。
  *     故对同一 session，扣费恰好执行一次（回收 vs 前端 poll 互斥，绝不双扣）。
+ *   - P5-7：(b) 与扣费/预留结算在**同一事务**里提交。计费失败即整体回滚、会话退回 transcribing
+ *     重试，绝不出现「终态已落但净扣 0 且无复扣路径」。
  */
 import type { Session } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
@@ -61,7 +63,11 @@ export type FinalizableSession = Pick<
 
 export type FinalizeAsyncResult =
   | {
-      /** 抢锁失败：另一条路径已在收尾（或状态已变），调用方应读最新状态返回。 */
+      /**
+       * 抢锁失败：另一条路径已在收尾（或状态已变），调用方应读最新状态返回。
+       * P5-7：「终态 CAS + 计费」事务整体失败（死锁/超时）已回退到 transcribing 时同样返回本值——
+       * 对调用方的处置完全一致（读最新状态、交下一轮 poll/cron 重收尾），故不新增 outcome 变体。
+       */
       outcome: 'claim_lost';
     }
   | {
@@ -84,8 +90,8 @@ export type FinalizeAsyncResult =
  * @param sonioxConfig     Soniox 运行配置（用于拉 transcript / 清资源）
  * @param options.allowClaimFrom  claim 允许的起始状态集合。前端 poll 传 ['transcribing']；
  *   回收路径也传 ['transcribing']（僵尸态里只有 transcribing 才可能持有已完成的 Soniox 转录）。
- * @param options.onCompleted  收尾成功后的副作用钩子（如失效 API 缓存）。在扣费/后台任务之前调用，
- *   与原 route 行为一致（route 里 invalidateSessionsApiCache 紧跟 finalize 守卫成功之后）。
+ * @param options.onCompleted  收尾成功后的副作用钩子（如失效 API 缓存）。P5-7 起在「终态 CAS +
+ *   扣费」的事务**提交之后**调用——事务可能整体回滚，提前失效缓存会对外暴露一个并不存在的终态。
  *
  * 注意：本函数**会抛出**拉 transcript / 落盘阶段的错误（含瞬时/永久之分由调用方判定），
  * 抛出前不改动 DB 状态——调用方需在 catch 里按 'finalizing' 守卫回退 transcribing 或标 failed。
@@ -131,23 +137,83 @@ export async function finalizeAsyncTranscription(
   };
   const persisted = await persistSessionTranscriptArtifacts(session, bundle);
 
+  // ── 终态 CAS + 计费：同一事务（P5-7）──
   // 完成写入必须带状态守卫（原 route U60 注释）：上面的 claim 把状态置 'finalizing'，但拉
   // transcript / 写盘期间用户仍可能取消（cancelAsyncUpload 的 setStatus 允许 finalizing→canceled）。
   // 条件 updateMany WHERE asyncTranscribeStatus='finalizing'：抢不到（已被取消）→ 不写库、不扣费。
-  const finalized = await prisma.session.updateMany({
-    where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
-    data: {
-      asyncTranscribeStatus: 'completed',
-      transcriptPath: persisted.transcript.path,
-      summaryPath: persisted.summary.path,
-      // P1-17：**不再**在 CAS 提交里清 Soniox 引用 —— 改到确认 DELETE 成功/404 之后才清（见文末）。
-      // 此前先清 ID 再 best-effort 删，删失败即永久失去重试依据、Soniox 侧文件/转录孤儿泄漏。
-      status: 'COMPLETED',
-      // B7：置扣费时刻，供对账按扣费周期归期（异步上传的权威扣费紧随其后）。
-      billedAt: new Date(),
-    },
-  });
-  if (finalized.count !== 1) {
+  //
+  // P5-7：**CAS 与计费必须同事务**。旧实现先单独提交终态（completed + billedAt），再另开事务扣费、
+  // 且异常只 log 吞掉 → 计费一失败就净扣 0；而两个调用点的 allowClaimFrom 都不含 'completed'，落终态
+  // 后再无任何复扣路径，维护循环 30 分钟后还会把残留预留一并释放。合并后任一步失败整体回滚：会话退回
+  // transcribing（见下方 catch），交下一轮 poll / cron 重收尾，幂等 claim 保证仍恰好扣一次。
+  //
+  // 锁序（P5-7 的现实失败原因是死锁而非 DB 宕机）：init 路由是 Session FOR UPDATE → User update；
+  // 旧的独立计费事务是 User update(deduct) → Session FOR UPDATE(settle)，同一 session 并发即成环。
+  // 合并后本事务的第一条语句就是按主键 X 锁本 Session 行的 CAS，之后才动 User → 与 init 同为
+  // Session→User，环被打断。
+  let canceledDuringFinalize = false;
+  try {
+    const { async_upload_billing_multiplier } = await getSiteSettings();
+    const billableMinutes = Math.ceil(
+      getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
+    );
+    canceledDuringFinalize = await prisma.$transaction(async (tx) => {
+      const finalized = await tx.session.updateMany({
+        where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
+        data: {
+          asyncTranscribeStatus: 'completed',
+          transcriptPath: persisted.transcript.path,
+          summaryPath: persisted.summary.path,
+          // P1-17：**不再**在 CAS 提交里清 Soniox 引用 —— 改到确认 DELETE 成功/404 之后才清（见文末）。
+          // 此前先清 ID 再 best-effort 删，删失败即永久失去重试依据、Soniox 侧文件/转录孤儿泄漏。
+          status: 'COMPLETED',
+          // B7：置扣费时刻，供对账按扣费周期归期（异步上传的权威扣费在同一事务里紧随其后）。
+          billedAt: new Date(),
+        },
+      });
+      if (finalized.count !== 1) {
+        // 守卫抢不到：不扣费、不结算预留，事务空提交，交下方 canceled 分支处理。
+        return true;
+      }
+
+      // 异步上传转录计费（批2 + B1）：claim + 此处 CAS 共同保证每个 session 仅有一个路径进到这里且
+      // 未被取消，故结算恰好执行一次（幂等无须额外锁）。按 ceil(分钟)×倍率 扣减，倍率默认 0.8、可在
+      // admin 设置；与对账侧口径一致。
+      //
+      // B1：把入口预留（session.asyncReservedMinutes，已计入 used）「转」为实扣——deduct 实际 +
+      // release 预留 + 清预留列。used 净变化 = 实扣，且不残留预留。
+      if (billableMinutes > 0) {
+        // P5-5：带 sessionId → 同事务写 Session.billedMinutes 台账，对账据此算 expected。
+        await deductTranscriptionMinutes(session.userId, billableMinutes, tx, {
+          sessionId: session.id,
+        });
+      }
+      // settleAsyncReservation 用 FOR UPDATE 读**当前**列并原子释放。deduct 内部 ensureQuotaWindow 若
+      // 刚触发月度重置会顺带清列 → 此时 settle 读到 0、不重复释放，杜绝跨周期把已被重置隐式清除的预留
+      // 再减一次（审查 R1）。并发多路径经 settle 也仅释放一次。
+      await settleAsyncReservation(session.id, tx);
+      return false;
+    });
+  } catch (billingErr) {
+    // P5-7：CAS+计费整体回滚（最现实的是死锁 / 事务超时）。此刻会话仍是 'finalizing'——退回
+    // transcribing，让下一次前端 poll（allowClaimFrom=['transcribing']）或 cron 回收重新收尾。
+    // 带 WHERE 守卫：若事务其实已提交、只是响应丢失，状态已是 completed → 0 行、绝不回退终态。
+    // 产物已落盘但未写库，重收尾会重新拉取/覆盖，幂等。
+    logger.error(
+      { err: billingErr, sessionId: session.id },
+      'async upload finalize+billing tx failed; rolled back to transcribing for retry'
+    );
+    await prisma.session
+      .updateMany({
+        where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
+        data: { asyncTranscribeStatus: 'transcribing' },
+      })
+      .catch(() => undefined);
+    // 与「对方已抢先」同一语义：调用方读最新状态返回，交由下一轮重试（绝不删 Soniox 资源）。
+    return { outcome: 'claim_lost' };
+  }
+
+  if (canceledDuringFinalize) {
     // 收尾守卫抢不到（finalizing 期间状态已变）。P1-19：**只有确认会话确实被取消（canceled）**才删
     // Soniox 资源——否则可能是并发 finalizer 的失败回退把状态改回 transcribing（转录仍需要），此时删
     // 外部资源会让后续 salvage getSoniox 404、会话永久卡死（回归红线）。非 canceled → 保留资源交对方/重试。
@@ -178,37 +244,10 @@ export async function finalizeAsyncTranscription(
     return { outcome: 'canceled_during_finalize' };
   }
 
-  // finalize 守卫成功之后立即执行的副作用（route：失效 sessions API 缓存）。
+  // 终态 + 计费已一并提交之后的副作用（route：失效 sessions API 缓存）。P5-7 之前它排在计费之前，
+  // 现在计费与终态同事务提交，缓存失效必须等提交成功——否则事务回滚后缓存却已按「已完成」失效。
   if (options.onCompleted) {
     await options.onCompleted(session);
-  }
-
-  // 异步上传转录计费（批2 + B1）：上方 claim + 此处 finalize 守卫共同保证每个 session 仅有一个
-  // 路径进到此分支且未被取消，故结算恰好执行一次（幂等无须额外锁）。按 ceil(分钟)×倍率 扣减，
-  // 倍率默认 0.8、可在 admin 设置；与对账侧口径一致。计费失败不影响转录完成，留给对账兜底。
-  //
-  // B1：把入口预留（session.asyncReservedMinutes，已计入 used）「转」为实扣——同一事务里
-  // deduct 实际 + release 预留 + 清预留列。used 净变化 = 实扣，且不残留预留。三步原子，避免
-  // finalize 与预留结算脱节；即便本事务整体失败，预留仍留在列上，由 cron 兜底释放。
-  try {
-    const { async_upload_billing_multiplier } = await getSiteSettings();
-    const billableMinutes = Math.ceil(
-      getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
-    );
-    await prisma.$transaction(async (tx) => {
-      if (billableMinutes > 0) {
-        await deductTranscriptionMinutes(session.userId, billableMinutes, tx);
-      }
-      // 把入口预留「转」为实扣：settleAsyncReservation 用 FOR UPDATE 读**当前**列并原子释放。
-      // deduct 内部 ensureQuotaWindow 若刚触发月度重置会顺带清列 → 此时 settle 读到 0、不重复释放，
-      // 杜绝跨周期把已被重置隐式清除的预留再减一次（审查 R1）。并发多路径经 settle 也仅释放一次。
-      await settleAsyncReservation(session.id, tx);
-    });
-  } catch (billingErr) {
-    logger.error(
-      { err: billingErr, sessionId: session.id },
-      'async upload billing settle failed (transcription already completed)'
-    );
   }
 
   // fire-and-forget：runBackgroundLLMTasks 自带 try/catch，不阻塞响应

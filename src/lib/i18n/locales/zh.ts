@@ -1038,7 +1038,7 @@ export default {
     siteUrl: '站点 URL',
     siteUrlDesc: '用于对外通信与接收回调的主站点地址（如支付、存储服务商），请填写可公开访问的 URL。',
     backupUrls: '备用 URL',
-    backupUrlsDesc: '额外允许访问的站点地址，来源不在此列表中的请求将被拦截，最多 10 个。',
+    backupUrlsDesc: '额外允许访问的站点地址，最多 10 个。仅作用于浏览器端：从列表外的地址打开页面时会显示提示页，不构成服务端访问控制（服务端不校验来源，直接请求 API 仍可通过）。请以反向代理 / 防火墙作为真正的域名限制手段。',
     addBackupUrl: '添加备用 URL',
     backupUrlLimitReached: '最多只能添加 10 个备用 URL',
     invalidBackupUrl: '存在格式不正确的备用 URL，请检查后重试',
@@ -1393,6 +1393,8 @@ export default {
     masterEnable: '启用充值系统',
     masterEnableDesc: '总开关。关闭后用户端不显示充值入口。',
     currencySymbol: '货币符号',
+    currencyCode: '结算币种',
+    currencyCodeDesc: '按 ISO-4217 码结算，展示符号随之确定。',
     sandbox: '沙箱（开发/测试）',
     sandboxDesc: '无真实网关的模拟渠道，可在本地跑通完整链路。生产环境请关闭。',
     alipay: '支付宝',
@@ -1403,6 +1405,8 @@ export default {
     alipayGateway: '网关地址',
     alipayPrivateKey: '应用私钥',
     alipayPublicKey: '支付宝公钥',
+    alipaySellerId: '商户 PID（seller_id）',
+    alipaySellerIdHint: '留空则不校验收款方；填写后回调里 seller_id 不匹配一律拒绝到账。',
     wechatMchId: '商户号 (mchid)',
     wechatSerialNo: '证书序列号',
     wechatApiV3Key: 'APIv3 密钥',
@@ -1445,6 +1449,7 @@ export default {
     adjustAmountYuan: '余额增减',
     adjustMinutes: '时长增减',
     applyAdjust: '确认调整',
+    confirmAdjust: '确认调整 {email} 的余额 {amount} 元、时长 {minutes} 分钟？该操作立即生效。',
     adjustDone: '已调整',
     txType_topup: '充值',
     txType_purchase_membership: '购买会员',
@@ -1593,6 +1598,10 @@ export default {
     overCharged: '多记',
     underCharged: '少记',
     total: '共 {n} 条记录',
+    inflightWarning:
+      '该用户当前有 {n} 分钟在途预留（异步上传 / 完整版补全转录 / 未结算的实时流）。在途预留在入口就已计入已用量，而对账只统计已完成的用量，因此这条负向差异很可能是假的——修复会把这部分预留从已用量里抹掉，等于白送额度。请等在途任务结束后重新对账再判断。',
+    inflightWarningAll:
+      '本次对账中有 {n} 条差异所属的用户仍有在途预留（异步上传 / 完整版补全转录 / 未结算的实时流）。在途预留已计入已用量但不计入对账口径，这些差异很可能是假的，修复会白送额度。请等在途任务结束后重新对账。',
   },
 
   // 任务队列

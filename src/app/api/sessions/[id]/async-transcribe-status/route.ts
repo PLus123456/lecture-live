@@ -230,6 +230,14 @@ function isTransientFinalizeError(err: unknown): boolean {
   const name = err instanceof Error ? err.name : '';
   if (name === 'TimeoutError' || name === 'AbortError') return true;
 
+  // P5-7：Prisma 的死锁(P2034)/事务超时(P2024)是**竞争**不是确定性错误 —— 重试即自愈。
+  // 漏掉它们会把一次并发撞车判成永久失败、把已经转好的会话标 failed（转录内容随之作废）。
+  const prismaCode =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as { code: unknown }).code)
+      : '';
+  if (prismaCode === 'P2034' || prismaCode === 'P2024') return true;
+
   const message = err instanceof Error ? err.message : String(err);
   // getSonioxTranscript 的 HTTP 错误：5xx / 429 可重试；4xx（除 429）视为永久
   const httpMatch = /Soniox get transcript failed: HTTP (\d{3})/.exec(message);

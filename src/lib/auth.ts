@@ -49,6 +49,10 @@ interface TokenBlacklistEntry {
 }
 
 const TOKEN_BLACKLIST_STORE_KEY = '__lectureLiveTokenBlacklistStore';
+// 内存黑名单现在是无条件双写的（见 revokeToken），故必须有上界，否则高频登出的站点
+// 会在进程里堆积最长 30 天的条目。超限时优先丢「最快过期」的那些——它们离自然失效最近，
+// 且 Redis 里仍有同一份记录。
+const TOKEN_BLACKLIST_MAX_ENTRIES = 20_000;
 
 type TokenBlacklistGlobal = typeof globalThis & {
   [TOKEN_BLACKLIST_STORE_KEY]?: Map<string, TokenBlacklistEntry>;
@@ -147,6 +151,16 @@ function pruneExpiredBlacklistedTokens(store: Map<string, TokenBlacklistEntry>) 
       store.delete(jti);
     }
   });
+
+  if (store.size <= TOKEN_BLACKLIST_MAX_ENTRIES) {
+    return;
+  }
+  const byExpiry = Array.from(store.entries()).sort(
+    (a, b) => a[1].expiresAt - b[1].expiresAt
+  );
+  for (let i = 0; i < byExpiry.length - TOKEN_BLACKLIST_MAX_ENTRIES; i += 1) {
+    store.delete(byExpiry[i][0]);
+  }
 }
 
 function getTokenExpiryDate(payload: AuthTokenPayload): Date {
@@ -178,17 +192,7 @@ function isValidTokenPayload(payload: unknown): payload is AuthTokenPayload {
   );
 }
 
-async function isTokenRevoked(jti: string): Promise<boolean> {
-  const redis = getRedisClient();
-  if (redis && redis.status === 'ready') {
-    try {
-      const exists = await redis.exists(`${TOKEN_BLACKLIST_PREFIX}${jti}`);
-      return exists === 1;
-    } catch {
-      // Fall back to in-memory blacklist when Redis is unavailable.
-    }
-  }
-
+function isTokenRevokedInMemory(jti: string): boolean {
   const store = getTokenBlacklistStore();
   pruneExpiredBlacklistedTokens(store);
   const entry = store.get(jti);
@@ -204,6 +208,27 @@ async function isTokenRevoked(jti: string): Promise<boolean> {
   return true;
 }
 
+async function isTokenRevoked(jti: string): Promise<boolean> {
+  // 两个存储都查，任一命中即视为已吊销。
+  // 旧实现在 redis.status === 'ready' 时直接早退，于是「Redis 断连期间写进内存表的吊销」
+  // 会在 Redis 恢复的那一刻集体失效（登出/踢人白做）。内存表命中优先，成本是一次 Map 查找。
+  if (isTokenRevokedInMemory(jti)) {
+    return true;
+  }
+
+  const redis = getRedisClient();
+  if (redis && redis.status === 'ready') {
+    try {
+      const exists = await redis.exists(`${TOKEN_BLACKLIST_PREFIX}${jti}`);
+      return exists === 1;
+    } catch {
+      // Redis 查询失败：内存表已经查过且未命中，按未吊销处理（与降级前口径一致）。
+    }
+  }
+
+  return false;
+}
+
 export async function revokeToken(
   payload: Pick<AuthTokenPayload, 'jti' | 'exp'>
 ): Promise<void> {
@@ -212,6 +237,12 @@ export async function revokeToken(
     1,
     Math.ceil((expiresAt - Date.now()) / 1000)
   );
+
+  // 写穿双写：内存表无条件写（Redis 恢复不再抹掉降级期的吊销），Redis ready 时再写一份
+  // 供跨进程（web / ws-server）共享。内存表先写，保证 Redis 抛错时吊销至少在本进程生效。
+  const store = getTokenBlacklistStore();
+  pruneExpiredBlacklistedTokens(store);
+  store.set(payload.jti, { expiresAt });
 
   const redis = getRedisClient();
   if (redis && redis.status === 'ready') {
@@ -222,15 +253,10 @@ export async function revokeToken(
         'EX',
         ttlSeconds
       );
-      return;
     } catch {
-      // Fall back to in-memory blacklist when Redis is unavailable.
+      // 内存表已写入，降级为进程本地吊销。
     }
   }
-
-  const store = getTokenBlacklistStore();
-  pruneExpiredBlacklistedTokens(store);
-  store.set(payload.jti, { expiresAt });
 }
 
 // --------------- Refresh idempotency (grace window) ---------------
@@ -449,6 +475,9 @@ export function signToken(
 ): string {
   const sessionStartedAt = options?.sessionStartedAt ?? Date.now();
   const days = options?.expiresInDays ?? DEFAULT_JWT_EXPIRY_DAYS;
+  // 用秒而不是 `${days}d`：钳到剩余绝对寿命后 days 可能是小数（见 getJwtExpiryConfig），
+  // 交给 ms 解析字符串小数没必要也不精确。整数天的老口径结果完全不变（7 → 604800）。
+  const expiresInSeconds = Math.max(1, Math.floor(days * 24 * 60 * 60));
   return jwt.sign(
     {
       id: payload.id,
@@ -459,20 +488,38 @@ export function signToken(
       jti: options?.jti ?? crypto.randomUUID(),
     },
     JWT_SECRET,
-    { expiresIn: `${days}d` }
+    { expiresIn: expiresInSeconds }
   );
 }
 
-/** 获取 JWT 过期天数和对应的 Cookie maxAge */
-export function getJwtExpiryConfig(jwtExpiryDays?: number) {
+/**
+ * 获取 JWT 过期天数和对应的 Cookie maxAge。
+ *
+ * 传 `sessionStartedAt`（刷新场景：会话起点保持不变）时，额外钳到「剩余绝对寿命」。
+ * 不钳的话，jwt_expiry=90 的站点在 day-10 自动刷新会发出 exp=day40 的 cookie，
+ * 而 verifyToken 在 sessionStartedAt+30d 处硬杀 → 「cookie 看着有效、用户中途被登出」。
+ */
+export function getJwtExpiryConfig(
+  jwtExpiryDays?: number,
+  options?: { sessionStartedAt?: number; now?: number }
+) {
   // 会话最长绝对存活 = ABSOLUTE_SESSION_LIFETIME_MS（30 天，verifyToken 硬性拦截）；
   // admin 把 jwt_expiry 配到更大（可达 365 天）只会让 JWT exp/cookie maxAge 与真实存活期不符、
   // 误导用户。这里把生效值钳到绝对上限，让 cookie/JWT 与实际登出时机一致。
-  const absoluteDays = ABSOLUTE_SESSION_LIFETIME_MS / (24 * 60 * 60 * 1000);
-  const days = Math.min(jwtExpiryDays ?? DEFAULT_JWT_EXPIRY_DAYS, absoluteDays);
+  const dayMs = 24 * 60 * 60 * 1000;
+  const absoluteDays = ABSOLUTE_SESSION_LIFETIME_MS / dayMs;
+  let days = Math.min(jwtExpiryDays ?? DEFAULT_JWT_EXPIRY_DAYS, absoluteDays);
+
+  const sessionStartedAt = options?.sessionStartedAt;
+  if (sessionStartedAt != null && Number.isFinite(sessionStartedAt)) {
+    const now = options?.now ?? Date.now();
+    const remainingMs = sessionStartedAt + ABSOLUTE_SESSION_LIFETIME_MS - now;
+    days = Math.min(days, Math.max(0, remainingMs) / dayMs);
+  }
+
   return {
     expiresInDays: days,
-    cookieMaxAge: days * 24 * 60 * 60,
+    cookieMaxAge: Math.max(0, Math.floor(days * 24 * 60 * 60)),
   };
 }
 

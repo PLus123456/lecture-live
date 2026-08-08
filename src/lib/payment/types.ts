@@ -27,6 +27,12 @@ export interface CreateChargeParams {
   returnUrl: string;
   /** 网关异步通知回调地址（服务端到服务端；验签为唯一信任源）。 */
   notifyUrl: string;
+  /**
+   * ISO-4217 币种码（大写，如 'CNY'），由 checkout 从充值配置读出后传入（P3-15）。
+   * 从前 Stripe 由「货币符号」猜币种、猜不出就 `return 'usd'`：管理员填「元」即静默按美元
+   * 收款、约 7.1× 超收。币种必须是显式配置项，绝不可从展示用符号反推。
+   */
+  currency: string;
 }
 
 /** 发起支付的结果：跳转 URL 或扫码内容，二选一（或都给）。 */
@@ -50,6 +56,21 @@ export interface CallbackResult {
    * PaymentOrder.amountCents 不一致则拒绝到账。渠道无法给出金额（如 sandbox）时留空 → 跳过对账。
    */
   amountCents?: number;
+  /**
+   * 网关回报的 ISO-4217 币种码（大写）。与 amountCents 成对使用：上层 creditPaidOrder 比
+   * (amount, currency) 二元组，只比金额挡不住跨币种套利（P3-15）。渠道给不出时留空 → 跳过。
+   */
+  currency?: string;
+  /**
+   * 退款 / 拒付 / 争议类通知（P3-16）。为 true 时回调路由走反向流程（冻结权益 + 告警），
+   * 绝不到账。与 paid 互斥：反向通知的 paid 恒为 false。
+   */
+  reversal?: boolean;
+  /**
+   * 验签通过但**无需到账也无需重试**的通知（如微信的非交易类事件，P6-13）。
+   * 回调路由据此回成功 ACK，避免网关按 15 次/24h 无限重推一条我们永远不会处理的通知。
+   */
+  acknowledged?: boolean;
   /** 网关侧订单号/流水号（审计）。 */
   providerRef?: string;
   /** 网关原始状态串（审计/排障）。 */

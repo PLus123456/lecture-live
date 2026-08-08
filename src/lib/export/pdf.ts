@@ -28,6 +28,19 @@ const SCALE = 2;
 /** 容器宽度（px），对应 A4 内容区域 */
 const CONTAINER_WIDTH_PX = Math.round(CONTENT_WIDTH_MM * 3.78); // ~643px
 
+/**
+ * L11：单张画布的安全高度上限（设备像素）。
+ *
+ * 浏览器对 canvas 有硬上限（Chrome 单边 65535 且总面积 ≤ 268M px；iOS Safari
+ * 总面积只有 ~16.7M px）。原实现把整篇文档一次性渲进一张画布：一小时讲座的转录
+ * 轻松几万像素高，超限时画布要么创建失败、要么被**静默截断** —— 用户拿到一份
+ * 后半篇凭空消失的 PDF，界面上没有任何提示。
+ *
+ * 取 8192：本容器约 1286 设备像素宽，面积 ~10.5M，iOS 也在安全区内。
+ * 文档超过一段时分多次 html2canvas 渲染（段边界对齐分页边界，任何一页都不跨段）。
+ */
+const MAX_CANVAS_DEVICE_PX = 8192;
+
 const CSS = `
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -326,52 +339,80 @@ export async function exportPdf(options: PdfExportOptions): Promise<Blob> {
     // 等待字体和图片加载
     await document.fonts.ready;
 
-    const canvas = await html2canvas(container, {
-      scale: SCALE,
-      useCORS: true,
-      backgroundColor: '#ffffff',
-      logging: false,
-      width: CONTAINER_WIDTH_PX,
-      windowWidth: CONTAINER_WIDTH_PX,
-    });
-
-    // 计算分页
     const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
     const pageContentHeight = A4_HEIGHT_MM - PAGE_MARGIN_MM * 2;
 
-    // canvas 像素到 mm 的转换
-    const pxPerMm = (canvas.width / SCALE) / CONTENT_WIDTH_MM;
-    const pageHeightPx = Math.floor(pageContentHeight * pxPerMm * SCALE);
-    const totalPages = Math.ceil(canvas.height / pageHeightPx);
+    // CSS 像素 ↔ mm。原来从 canvas.width 反推，但分段渲染要在渲染前就排好版，
+    // 这里直接用容器宽度（与 html2canvas 的 width 入参同一个值）。
+    const pxPerMm = CONTAINER_WIDTH_PX / CONTENT_WIDTH_MM;
+    const pageHeightCssPx = pageContentHeight * pxPerMm;
+    const pageHeightDevicePx = Math.floor(pageHeightCssPx * SCALE);
 
-    for (let page = 0; page < totalPages; page++) {
-      if (page > 0) pdf.addPage();
+    // 内容总高按容器实际布局高度算（不再依赖那张"可能已被截断"的画布高度）
+    const totalCssHeight = Math.max(container.scrollHeight, 1);
+    const totalPages = Math.max(1, Math.ceil(totalCssHeight / pageHeightCssPx));
 
-      // 切割当前页的 canvas 区域
-      const sliceY = page * pageHeightPx;
-      const sliceHeight = Math.min(pageHeightPx, canvas.height - sliceY);
+    // L11：每段渲染整数页，保证任何一页都不跨段（跨段就要拼两张画布）。
+    // 常见文档（≤4 页）依旧只渲一次，与原实现等价。
+    const pagesPerBand = Math.max(
+      1,
+      Math.floor(MAX_CANVAS_DEVICE_PX / Math.max(1, pageHeightDevicePx))
+    );
+    const bandCount = Math.ceil(totalPages / pagesPerBand);
 
-      const pageCanvas = document.createElement('canvas');
-      pageCanvas.width = canvas.width;
-      pageCanvas.height = sliceHeight;
-
-      const ctx = pageCanvas.getContext('2d')!;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
-      ctx.drawImage(
-        canvas,
-        0, sliceY, canvas.width, sliceHeight,
-        0, 0, canvas.width, sliceHeight,
+    for (let band = 0; band < bandCount; band++) {
+      const firstPage = band * pagesPerBand;
+      const endPage = Math.min(totalPages, firstPage + pagesPerBand);
+      const bandTopCssPx = firstPage * pageHeightCssPx;
+      const bandHeightCssPx = Math.min(
+        totalCssHeight - bandTopCssPx,
+        (endPage - firstPage) * pageHeightCssPx
       );
+      if (bandHeightCssPx <= 0) break;
 
-      const imgData = pageCanvas.toDataURL('image/jpeg', 0.92);
-      const imgHeightMm = (sliceHeight / SCALE) / pxPerMm;
+      // html2canvas 的 x/y 是「相对元素自身左上角的偏移」（内部 x = opts.x + element.left），
+      // 所以这里直接给段起点即可，不用管页面滚动位置。
+      const canvas = await html2canvas(container, {
+        scale: SCALE,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        logging: false,
+        width: CONTAINER_WIDTH_PX,
+        windowWidth: CONTAINER_WIDTH_PX,
+        y: bandTopCssPx,
+        height: bandHeightCssPx,
+      });
 
-      pdf.addImage(
-        imgData, 'JPEG',
-        PAGE_MARGIN_MM, PAGE_MARGIN_MM,
-        CONTENT_WIDTH_MM, imgHeightMm,
-      );
+      for (let page = firstPage; page < endPage; page++) {
+        // 切割当前页在本段画布内的区域
+        const sliceY = Math.round((page - firstPage) * pageHeightCssPx * SCALE);
+        const sliceHeight = Math.min(pageHeightDevicePx, canvas.height - sliceY);
+        if (sliceHeight <= 0) continue;
+
+        if (page > 0) pdf.addPage();
+
+        const pageCanvas = document.createElement('canvas');
+        pageCanvas.width = canvas.width;
+        pageCanvas.height = sliceHeight;
+
+        const ctx = pageCanvas.getContext('2d')!;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+        ctx.drawImage(
+          canvas,
+          0, sliceY, canvas.width, sliceHeight,
+          0, 0, canvas.width, sliceHeight,
+        );
+
+        const imgData = pageCanvas.toDataURL('image/jpeg', 0.92);
+        const imgHeightMm = (sliceHeight / SCALE) / pxPerMm;
+
+        pdf.addImage(
+          imgData, 'JPEG',
+          PAGE_MARGIN_MM, PAGE_MARGIN_MM,
+          CONTENT_WIDTH_MM, imgHeightMm,
+        );
+      }
     }
 
     return pdf.output('blob');

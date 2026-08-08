@@ -308,7 +308,10 @@ describe('POST temporary-key — 失败回滚', () => {
     expect(settleAnchorVoidMock).toHaveBeenCalledWith('is-new', 'mint_failed');
   });
 
-  it('Soniox 签发失败但锚点是复用的（created=false）→ 只回滚预扣，不动别人的锚点', async () => {
+  it('P1-1：锚点来自 /start（created=false）时 mint 失败**也**作废它', async () => {
+    // 旧行为带 `interpretAnchorCreated &&` 守卫，只作废 mint 自建的锚点 → Soniox 配错/不可达期间，
+    // 每个点了「开始」的诚实用户都留下一条悬挂锚点，7h 后被 cron 按墙钟扣满 6h（P1-1 最实的一支）。
+    ensureActiveInterpretMock.mockResolvedValueOnce({ id: 'is-start', created: false });
     fetchMock.mockResolvedValueOnce({
       ok: false,
       status: 502,
@@ -317,7 +320,24 @@ describe('POST temporary-key — 失败回滚', () => {
     const res = await POST(req({ kind: 'interpret' }));
     expect(res.status).toBe(502);
     expect(rollbackGrantMock).toHaveBeenCalledWith('grant-1');
-    expect(settleAnchorVoidMock).not.toHaveBeenCalled();
+    expect(settleAnchorVoidMock).toHaveBeenCalledWith('is-start', 'mint_failed');
+  });
+
+  it('P1-1：预扣阶段抛错（DB 故障）→ 复用锚点同样作废', async () => {
+    ensureActiveInterpretMock.mockResolvedValueOnce({ id: 'is-start', created: false });
+    createGrantMock.mockRejectedValueOnce(new Error('db down'));
+    const res = await POST(req({ kind: 'interpret' }));
+    expect(res.status).toBe(500);
+    expect(settleAnchorVoidMock).toHaveBeenCalledWith('is-start', 'mint_failed');
+  });
+
+  it('P1-1：fetch 抛异常（网络）→ 复用锚点同样作废', async () => {
+    ensureActiveInterpretMock.mockResolvedValueOnce({ id: 'is-start', created: false });
+    fetchMock.mockRejectedValueOnce(new Error('network down'));
+    const res = await POST(req({ kind: 'interpret' }));
+    expect(res.status).toBe(500);
+    expect(rollbackGrantMock).toHaveBeenCalledWith('grant-1');
+    expect(settleAnchorVoidMock).toHaveBeenCalledWith('is-start', 'mint_failed');
   });
 
   it('fetch 抛异常（网络）→ 500 + 回滚预扣', async () => {

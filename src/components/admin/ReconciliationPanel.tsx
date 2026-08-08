@@ -27,6 +27,12 @@ interface Mismatch {
   fixed: boolean;
   fixedAt: string | null;
   fixedBy: string | null;
+  /**
+   * P5-1(b)：该用户当前的在途预留分钟（异步上传 / 完整版补全 / 未结 grant）。
+   * 在途预留在入口就计进了 used，而对账只统计已完成用量 → 必然报出**假的负 drift**。
+   * >0 即表示这条差异很可能是假的，「修复」会把在途预留从 used 里抹掉（白送额度）。
+   */
+  inflightMinutes?: number;
 }
 
 interface Run {
@@ -218,6 +224,26 @@ export default function ReconciliationPanel() {
     }
   };
 
+  // P5-1(b)：确认框里也点名在途预留——一键「修复」会把在途预留从 used 里抹掉（白送额度），
+  // 而表格里的负 drift 恰恰被标成「多扣了用户」，最容易诱导管理员点下去。
+  const inflightCount =
+    selectedRun?.mismatches?.filter((m) => (m.inflightMinutes ?? 0) > 0 && !m.fixed).length ?? 0;
+  const pendingFixInflight =
+    pendingAction?.kind === 'fix'
+      ? (selectedRun?.mismatches?.find((m) => m.id === pendingAction.mismatchId)
+          ?.inflightMinutes ?? 0)
+      : 0;
+  const pendingFixInflightNote =
+    pendingFixInflight > 0
+      ? '\n\n' +
+        t('reconciliation.inflightWarning', { n: pendingFixInflight })
+      : '';
+  const pendingFixAllInflightNote =
+    inflightCount > 0
+      ? '\n\n' +
+        t('reconciliation.inflightWarningAll', { n: inflightCount })
+      : '';
+
   // 格式化时间
   const formatTime = (dateStr: string) => {
     const d = new Date(dateStr);
@@ -318,6 +344,16 @@ export default function ReconciliationPanel() {
           ))}
         </div>
 
+        {/* P5-1(b)：有在途预留的用户必被虚报负 drift，先在表格上方顶一条警示 */}
+        {inflightCount > 0 && (
+          <div className="flex items-start gap-2 mb-4 px-4 py-3 rounded-xl border border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-900/20">
+            <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-600 dark:text-amber-400" />
+            <p className="text-xs leading-relaxed text-amber-700 dark:text-amber-300">
+              {t('reconciliation.inflightWarningAll', { n: inflightCount })}
+            </p>
+          </div>
+        )}
+
         {/* 差异明细表 */}
         <div className="bg-white dark:bg-charcoal-800 rounded-xl border border-cream-200 dark:border-charcoal-700 overflow-x-auto">
           {/* 表头 */}
@@ -355,6 +391,18 @@ export default function ReconciliationPanel() {
                     <span className="text-xs ml-1 font-normal">
                       {m.driftMinutes > 0 ? t('reconciliation.underCharged') : t('reconciliation.overCharged')}
                     </span>
+                    {/* P5-1(b)：有在途预留 → 负 drift 极可能是假的，修复等于白送额度 */}
+                    {(m.inflightMinutes ?? 0) > 0 && (
+                      <span
+                        className="inline-flex items-center gap-0.5 ml-1 text-xs font-normal text-amber-600 dark:text-amber-400"
+                        title={t('reconciliation.inflightWarning', {
+                          n: m.inflightMinutes ?? 0,
+                        })}
+                      >
+                        <AlertTriangle className="w-3 h-3" />
+                        {m.inflightMinutes}
+                      </span>
+                    )}
                   </div>
                   <div>
                     {m.fixed ? (
@@ -530,9 +578,9 @@ export default function ReconciliationPanel() {
           pendingAction?.kind === 'trigger'
             ? t('reconciliation.triggerConfirm')
             : pendingAction?.kind === 'fix'
-              ? t('reconciliation.fixConfirm')
+              ? t('reconciliation.fixConfirm') + pendingFixInflightNote
               : pendingAction?.kind === 'fixAll'
-                ? t('reconciliation.fixAllConfirm')
+                ? t('reconciliation.fixAllConfirm') + pendingFixAllInflightNote
                 : undefined
         }
         confirmText={t('common.confirm')}

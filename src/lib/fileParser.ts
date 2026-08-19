@@ -131,22 +131,48 @@ export async function extractTextFromFile(file: File): Promise<string> {
   }
 }
 
+/**
+ * PPTX 单次提取的累计文本上限（字符）。唯一消费者 extract-keywords 拿到后就截到 400k，
+ * 这里的上限纯粹是资源闸：4M 字符 ≈ 8MB JS 字符串，正常演示文稿差着好几个数量级。
+ */
+export const MAX_PPTX_TEXT_CHARS = 4_000_000;
+
 async function extractPptxText(buffer: Buffer): Promise<string> {
+  // storage-parser#71：给整个 PPTX 提取套解析超时（此前只有 PDF 分支有）。正则改成线性之后
+  // 这条是兜底 —— 幻灯片之间有 await 让出点，超时能真正生效。
+  return withParseTimeout(extractPptxTextUnbounded(buffer), 'PPTX');
+}
+
+async function extractPptxTextUnbounded(buffer: Buffer): Promise<string> {
   // PPTX 是 ZIP 文件，解包后读取 ppt/slides/slide*.xml 中的文本。
   // loadZipGuarded 在解压前累加未压缩大小做防护（zip bomb）。
   const zip = await loadZipGuarded(buffer);
   const texts: string[] = [];
+  let totalChars = 0;
 
   for (const [name, entry] of Object.entries(zip.files)) {
     if (name.match(/ppt\/slides\/slide\d+\.xml$/)) {
       const xml = await entry.async('text');
-      // 提取 <a:t> 标签内文本
-      const pattern = /<a:t>(.*?)<\/a:t>/g;
+      // 提取 <a:t> 标签内文本。
+      //
+      // storage-parser#71：原来的 `(.*?)` 对**未闭合**的 <a:t> 呈二次复杂度 —— exec 对每个能
+      // 匹配 '<a:t>' 的起点都要向后扫描整个后缀去找 '</a:t>'，全部失败才返回 null，且 `.` 默认
+      // 不匹配换行，攻击者只要不放换行就能让每次扫描跑满整串。实测 '<a:t>' 重复填充：
+      // 100KB→480ms、200KB→1.9s、400KB→7.7s、800KB→31.6s（长度翻倍耗时翻四倍）。而
+      // loadZipGuarded 允许 200MiB 声明未压缩量、这种高度重复的内容压缩比极高，几百 KB 的上传
+      // 就能解出数十 MB 的 slide XML —— 一个请求把一个 CPU 核钉死数小时。
+      // 换成 `[^<]*`：字符类在遇到第一个 '<' 即停，跨所有起点的总扫描量退化为 O(L)（同一载荷
+      // 800KB 只要 0.6ms）。合法 OOXML 的文本内容里 '<' 必须转义成 '&lt;'，语义不变。
+      const pattern = /<a:t>([^<]*)<\/a:t>/g;
       let match: RegExpExecArray | null;
       do {
         match = pattern.exec(xml);
         if (match?.[1]) {
           texts.push(match[1]);
+          totalChars += match[1].length;
+          if (totalChars >= MAX_PPTX_TEXT_CHARS) {
+            return texts.join('\n').slice(0, MAX_PPTX_TEXT_CHARS);
+          }
         }
       } while (match);
     }

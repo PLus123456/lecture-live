@@ -120,19 +120,25 @@ export async function POST(
     // G2/G3：durationMs 派生自可被伪造的 transcript globalEndMs（resolveTranscriptDurationMs
     // 会 Math.max 进来），必须按角色上界 clamp 后再落库，否则 SUM(durationMs)/3600000 存储
     // 小时用量可被撑到 Int 上界。
-    let durationMs = clampSessionDurationMs(
-      await resolveExpectedRecordingDurationMs(session),
+    // P5-14：三个来源（session.durationMs / transcript / serverStartedAt）都建立在
+    // 「走过实时链路」的前提上。直传口可以往一个从没连过 WS 的会话灌音频，那时三者同时为 0，
+    // 这段录音对 storage_hours 的贡献恒为 0 —— 等于绕开存储小时额度。用 ffprobe 读真时长兜底。
+    //
+    // session-persist#151：兜底条件此前是「三源皆 0 才 probe」，于是只要**先**往库里塞一个极小
+    // 正值就能把整条 ffprobe 分支跳过 —— PATCH /api/sessions/[id] 允许会话所有者首次写入任意
+    // durationMs（1ms ≥ 当前 0、非终态，两道守卫都不拦），随后直传数小时的低码率录音：
+    // resolveExpectedRecordingDurationMs 返回 1，probe 不跑，1ms 落库。该录音对 storage_hours
+    // 几乎零贡献，且 /full-transcribe 的预留与实扣都按 ceil(getBillableMinutes(1)×倍率)=1 分钟
+    // 计价 —— 1 分钟额度换数小时 Soniox 转录。PATCH 侧已彻底不再接受客户端 durationMs，这里再
+    // 把口径从「为 0 才探测」改成「与探测值取最大值」：任何来源的低报都被真实音频长度顶上去。
+    const probedDurationMs = await probeAudioDurationMsFromBuffer(
+      buffer,
+      normalizedMimeType
+    );
+    const durationMs = clampSessionDurationMs(
+      Math.max(await resolveExpectedRecordingDurationMs(session), probedDurationMs),
       user.role
     );
-    if (durationMs <= 0) {
-      // P5-14：三个来源（session.durationMs / transcript / serverStartedAt）都建立在
-      // 「走过实时链路」的前提上。直传口可以往一个从没连过 WS 的会话灌音频，那时三者同时为 0，
-      // 这段录音对 storage_hours 的贡献恒为 0 —— 等于绕开存储小时额度。用 ffprobe 兜底读真时长。
-      durationMs = clampSessionDurationMs(
-        await probeAudioDurationMsFromBuffer(buffer, normalizedMimeType),
-        user.role
-      );
-    }
 
     const normalizedBuffer = await normalizeRecordedAudioDuration({
       buffer,

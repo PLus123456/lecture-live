@@ -113,6 +113,19 @@ const securityHeaders = [
     : []),
 ];
 
+/**
+ * pdfjs 的运行时资源清单（worker / CMap / 内置字体 / wasm 解码器 / 色彩配置）。
+ * 两份 pdfjs-dist 都要带：pdf-parse 内嵌一份，officeparser 依赖顶层一份，二者都走 legacy/build。
+ */
+const PDFJS_RUNTIME_ASSETS = [
+  'pdf-parse/node_modules/pdfjs-dist',
+  'pdfjs-dist',
+].flatMap((pkg) =>
+  ['legacy/build', 'cmaps', 'standard_fonts', 'wasm', 'iccs'].map(
+    (dir) => `./node_modules/${pkg}/${dir}/**`
+  )
+);
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'standalone',
@@ -133,7 +146,21 @@ const nextConfig = {
     ];
   },
   // Prevent server-side bundling of browser-only ML packages
-  serverExternalPackages: ['@huggingface/transformers', 'onnxruntime-web'],
+  // pdf-parse 内嵌 pdfjs-dist + @napi-rs/canvas（原生模块）：被 webpack 打进 server bundle
+  // 会在 import 时抛 "Object.defineProperty called on non-object"，必须交给 node 原生 require。
+  serverExternalPackages: ['@huggingface/transformers', 'onnxruntime-web', 'pdf-parse'],
+  // pdfjs 的 worker / CMap / 字体是运行时按路径加载的，nft 静态追踪不到，standalone 产物里会缺
+  // （install.sh 与 Dockerfile 都只拷 .next/standalone，缺了就在生产抛
+  // "Setting up fake worker failed: Cannot find module …/pdf.worker.mjs"）。
+  // 两份 pdfjs-dist 都要带：pdf-parse 内嵌一份，officeparser 依赖顶层一份，二者都走 legacy/build。
+  // cmaps 是中文 PDF 的预定义编码表，缺了 CJK 文本会解析成乱码。
+  // 路径写死到两份 pdfjs-dist（package-lock 锁定的安装结构）：前缀带 ** 的 glob 会让 nft
+  // 对每条路由整树遍历 node_modules，直接把 build 打成 V8 OOM。
+  outputFileTracingIncludes: {
+    '/api/translate/documents': PDFJS_RUNTIME_ASSETS,
+    '/api/chat-uploads': PDFJS_RUNTIME_ASSETS,
+    '/api/llm/extract-keywords': PDFJS_RUNTIME_ASSETS,
+  },
   webpack: (config, { dev, isServer }) => {
     config.resolve.alias = {
       ...config.resolve.alias,

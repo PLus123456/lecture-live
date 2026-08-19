@@ -61,6 +61,22 @@ export default function GlobalUploadDropzone() {
       return Array.from(types).some((t) => t === 'Files' || t === 'application/x-moz-file');
     };
 
+    /**
+     * 拖拽途中（dragenter/over）浏览器出于隐私只暴露 MIME、不给文件名和内容，
+     * 但这已足够判断"要不要亮上传转录的 overlay"。
+     *
+     * 不判断的话，在文档翻译页拖 PDF 会先闪一层"拖放上传转录"的全站 overlay
+     * ——文案对不上，而且松手后 drop 分支按非媒体静默忽略，等于白闪一次。
+     * type 为空 = 浏览器不认识该扩展名，保守放行（drop 时再由 ACCEPTED_MEDIA_RE 兜底提示）。
+     */
+    const mayContainMedia = (e: DragEvent) => {
+      const items = e.dataTransfer?.items;
+      if (!items || items.length === 0) return true;
+      return Array.from(items).some(
+        (item) => item.kind === 'file' && (!item.type || ACCEPTED_MEDIA_RE.test(item.type))
+      );
+    };
+
     const resetDragState = () => {
       dragCounterRef.current = 0;
       setDragActive(false);
@@ -68,7 +84,10 @@ export default function GlobalUploadDropzone() {
 
     const onDragEnter = (e: DragEvent) => {
       if (!isFileDrag(e)) return;
+      // preventDefault 与是否亮 overlay 解耦：非媒体拖拽也必须挡掉浏览器默认行为，
+      // 否则用户把 PDF 松手在页面空白处会被浏览器当成导航、直接跳出应用去打开这个文件。
       e.preventDefault();
+      if (!mayContainMedia(e)) return;
       dragCounterRef.current += 1;
       setDragActive(true);
     };

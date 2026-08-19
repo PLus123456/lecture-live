@@ -16,6 +16,7 @@ const {
   rollbackStagedArtifactMock,
   normalizeRecordedAudioDurationMock,
   resolveExpectedRecordingDurationMsMock,
+  probeAudioDurationMsFromBufferMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
@@ -30,6 +31,7 @@ const {
   rollbackStagedArtifactMock: vi.fn(),
   normalizeRecordedAudioDurationMock: vi.fn(),
   resolveExpectedRecordingDurationMsMock: vi.fn(),
+  probeAudioDurationMsFromBufferMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
@@ -50,6 +52,8 @@ vi.mock('@/lib/recordingDraftPersistence', () => ({
   sealRecordingDraft: sealRecordingDraftMock,
   unsealRecordingDraft: unsealRecordingDraftMock,
   deleteRecordingDraft: deleteRecordingDraftMock,
+  MAX_DRAFT_TOTAL_BYTES: 512 * 1024 * 1024,
+  RecordingDraftTooLargeError: class RecordingDraftTooLargeError extends Error {},
 }));
 vi.mock('@/lib/sessionPersistence', () => ({
   stageSessionAudioArtifact: stageSessionAudioArtifactMock,
@@ -57,7 +61,9 @@ vi.mock('@/lib/sessionPersistence', () => ({
   rollbackStagedArtifact: rollbackStagedArtifactMock,
 }));
 vi.mock('@/lib/audio/recordingDuration', () => ({
+  MAX_DURATION_FIX_BYTES: 128 * 1024 * 1024,
   normalizeRecordedAudioDuration: normalizeRecordedAudioDurationMock,
+  probeAudioDurationMsFromBuffer: probeAudioDurationMsFromBufferMock,
   resolveExpectedRecordingDurationMs: resolveExpectedRecordingDurationMsMock,
 }));
 vi.mock('@/lib/billing', () => ({
@@ -95,6 +101,7 @@ describe('audio/draft/finalize route (P0-5 / P1-7)', () => {
     rollbackStagedArtifactMock.mockReset().mockResolvedValue(undefined);
     normalizeRecordedAudioDurationMock.mockReset().mockImplementation(async ({ buffer }) => buffer);
     resolveExpectedRecordingDurationMsMock.mockReset().mockResolvedValue(120_000);
+    probeAudioDurationMsFromBufferMock.mockReset().mockResolvedValue(0);
     mergeRecordingDraftChunksMock.mockReset();
   });
 
@@ -169,5 +176,70 @@ describe('audio/draft/finalize route (P0-5 / P1-7)', () => {
     expect(rollbackStagedArtifactMock).toHaveBeenCalledTimes(1);
     expect(finalizeStagedArtifactPublishMock).not.toHaveBeenCalled();
     expect(deleteRecordingDraftMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * session-persist#143：草稿定稿对 CREATED 会话不做 ffprobe 兜底 → 落库 durationMs=0 的永久
+   * 录音，进而白嫖完整版转录。
+   *
+   * 攻击路径：建会话（CREATED）→ 灌满草稿分片（≤512MiB，chunks 路由对分片内容零校验）→ 把
+   * CREATED→RECORDING→FINALIZING 一气呵成（serverStartedAt 与 serverPausedAt 相隔毫秒，
+   * FINALIZING 会把 serverPausedAt 置为 now，于是 serverDuration 冻结在 ≈0）→ 定稿：
+   * resolveExpectedRecordingDurationMs 的三个来源同时为 0，durationMs 不写、recordingPath 照常
+   * 发布 → /full-transcribe 的 estimatedMinutes=0 跳过预留，fullTranscribeFinalize 的实扣也是
+   * ceil(getBillableMinutes(0)×倍率)=0 → 整段 Soniox 转录全程零扣费。
+   *
+   * 事后也没有任何兜底会补收：Soniox usage-logs 对账只覆盖 mint 过 grant 的直连串流
+   *（client_reference_id = 'rt|it:userId:grantId'），异步文件转录不在其中。
+   */
+  it('session-persist#143：三源时长皆为 0 → ffprobe 兜底，真实时长落库', async () => {
+    mergeRecordingDraftChunksMock.mockResolvedValue({
+      buffer: Buffer.from('a-very-long-recording'),
+      manifest: { mimeType: 'audio/webm', receivedSeqs: [0, 1, 2] },
+      hasGap: false,
+    });
+    // CREATED→RECORDING→FINALIZING 一气呵成：session.durationMs / transcript / serverStartedAt 皆 0
+    resolveExpectedRecordingDurationMsMock.mockResolvedValue(0);
+    probeAudioDurationMsFromBufferMock.mockResolvedValue(95 * 60_000);
+
+    const response = await POST(req(), { params });
+
+    expect(response.status).toBe(200);
+    expect(probeAudioDurationMsFromBufferMock).toHaveBeenCalledTimes(1);
+    expect(sessionUpdateManyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ durationMs: 95 * 60_000 }),
+      })
+    );
+  });
+
+  it('session-persist#143：探测不到时长（无 ffprobe/坏文件）→ 不写 durationMs，但录音照常发布', async () => {
+    mergeRecordingDraftChunksMock.mockResolvedValue({
+      buffer: Buffer.from('unreadable'),
+      manifest: { mimeType: 'audio/webm', receivedSeqs: [0] },
+      hasGap: false,
+    });
+    resolveExpectedRecordingDurationMsMock.mockResolvedValue(0);
+    probeAudioDurationMsFromBufferMock.mockResolvedValue(0);
+
+    const response = await POST(req(), { params });
+
+    expect(response.status).toBe(200);
+    // 探测失败一律返回 0、绝不抛 —— 保持既有语义（不写 0，交给 /full-transcribe 入口再探一次）。
+    expect(sessionUpdateManyMock.mock.calls[0][0].data).not.toHaveProperty('durationMs');
+    expect(finalizeStagedArtifactPublishMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('三源已有可信时长 → 不多跑一次 ffprobe（草稿最大 512MiB，探测要落临时文件）', async () => {
+    mergeRecordingDraftChunksMock.mockResolvedValue({
+      buffer: Buffer.from('complete'),
+      manifest: { mimeType: 'audio/webm', receivedSeqs: [0, 1, 2] },
+      hasGap: false,
+    });
+    resolveExpectedRecordingDurationMsMock.mockResolvedValue(120_000);
+
+    await POST(req(), { params });
+
+    expect(probeAudioDurationMsFromBufferMock).not.toHaveBeenCalled();
   });
 });

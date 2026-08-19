@@ -329,7 +329,10 @@ describe('session detail route', () => {
     expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
-  it('C2: 终态会话拒绝客户端 durationMs（防抹掉存储配额）', async () => {
+  // C2 的两道旧守卫（终态拒改 / 已有值不可下调）已被整体拒收取代：durationMs 是服务端
+  // 收尾路径的专属字段，PATCH 一律 400。下面三条覆盖旧守卫想堵的两种载荷 + session-persist#151
+  // 那条它们堵不住的（首次写入极小正值）。
+  it('C2: 终态会话的 durationMs:0（抹掉已消耗存储配额）→ 400', async () => {
     sessionFindUniqueMock.mockResolvedValue({
       id: 'session-1',
       userId: 'user-1',
@@ -348,14 +351,11 @@ describe('session detail route', () => {
       { params }
     );
 
-    expect(response.status).toBe(409);
-    await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
-      error: 'Cannot modify durationMs of a finalized session',
-    });
+    expect(response.status).toBe(400);
     expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
-  it('C2: 非终态会话拒绝把 durationMs 调低', async () => {
+  it('C2: 非终态会话把 durationMs 调低 → 400', async () => {
     sessionFindUniqueMock.mockResolvedValue({
       id: 'session-1',
       userId: 'user-1',
@@ -374,9 +374,36 @@ describe('session detail route', () => {
       { params }
     );
 
-    expect(response.status).toBe(409);
+    expect(response.status).toBe(400);
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+  });
+
+  it('session-persist#151: 新建会话首次写入极小正 durationMs → 400（旧的两道守卫都放行）', async () => {
+    // 旧守卫：非终态 ✅、1 ≥ 当前 0 ✅ —— 于是 1ms 落库，随后直传数小时录音时 /audio 的
+    // `durationMs <= 0` ffprobe 兜底条件永远为假，1ms 一路带到 /full-transcribe 的计价口径：
+    // ceil(getBillableMinutes(1) × 0.8) = 1 分钟额度换数小时 Soniox 转录。
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 'session-1',
+      userId: 'user-1',
+      title: 'Lecture',
+      status: 'CREATED',
+      serverStartedAt: null,
+      serverPausedAt: null,
+      durationMs: 0,
+    });
+
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { durationMs: 1 },
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(400);
     await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
-      error: 'durationMs cannot be lowered',
+      error:
+        'durationMs is server-managed and cannot be set via PATCH; it is written by the finalize/audio-save paths',
     });
     expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });

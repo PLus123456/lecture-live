@@ -79,7 +79,7 @@ async function loginThroughUi(page: Page) {
 interface FullMockOptions {
   /** GET /api/sessions/:id 的 recordingPath（null 用于测按钮门控） */
   recordingPath?: string | null;
-  /** 触发端点返回的 HTTP 码（默认 200；402 用于额度不足路径） */
+  /** 触发端点返回的 HTTP 码（默认 200；402 额度不足；409 时长不可判定/未收尾） */
   triggerStatus?: number;
   /** 每次 POST full-transcribe 回调（计数用） */
   onTrigger?: () => void;
@@ -182,6 +182,18 @@ function installFullTranscribeMocks(page: Page, opts: FullMockOptions = {}) {
           402
         );
       }
+      if (triggerStatus === 409) {
+        // session-persist#143：durationMs<=0 且 ffprobe 也探不出时长 → 服务端拒绝开跑
+        // （durationMs 是唯一计价依据，0 就等于整段免费且事后无人补收）。
+        return fulfillJson(
+          route,
+          {
+            error:
+              'Cannot determine the recording duration; full transcription is unavailable for this session',
+          },
+          409
+        );
+      }
       return fulfillJson(route, { status: 'pending', estimatedMinutes: 8 });
     }
     if (p === `/api/sessions/${SESSION_ID}/full-transcribe-status` && method === 'GET') {
@@ -272,6 +284,40 @@ test('额度不足(402)：确认后提示额度不足，不进入完整版切换
   // 402：不出现完整版切换（未进入 completed）
   await expect(page.getByTestId('view-full')).toHaveCount(0);
   // 仍停留在实时转录
+  await expect(page.getByText(LIVE_TEXT)).toBeVisible();
+});
+
+test('session-persist#143：时长不可判定(409) → 报错提示、关闭弹窗，不进入完整版流程', async ({
+  page,
+}) => {
+  // 服务端新增的入口守卫：durationMs<=0 的会话先探测真实录音时长再计价，探不到就 409。
+  // 这里验证前端把该拒绝当成可恢复错误处理 —— 出提示、收弹窗、不开轮询、留在实时转录。
+  let triggerCount = 0;
+  await installFullTranscribeMocks(page, {
+    triggerStatus: 409,
+    onTrigger: () => (triggerCount += 1),
+  });
+  await loginThroughUi(page);
+  await page.goto(`/session/${SESSION_ID}/playback`);
+
+  await expect(page.getByText(LIVE_TEXT)).toBeVisible({ timeout: 15_000 });
+  await page.getByTestId('full-transcribe-btn').click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await dialog.locator('button').last().click();
+
+  await expect.poll(() => triggerCount, { timeout: 10_000 }).toBe(1);
+
+  // 错误提示（e2e 跑在 en，断言中英双语以免 locale 漂移致假失败）
+  await expect(
+    page
+      .getByText(/Failed to start full transcription|启动完整版转录失败/)
+      .first()
+  ).toBeVisible({ timeout: 10_000 });
+
+  // 弹窗关闭、不进入完整版切换、仍停在实时转录
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByTestId('view-full')).toHaveCount(0);
   await expect(page.getByText(LIVE_TEXT)).toBeVisible();
 });
 

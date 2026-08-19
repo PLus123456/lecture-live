@@ -204,15 +204,33 @@ describe('POST /api/sessions/[id]/audio 存储会计 (P5-14)', () => {
     );
   });
 
-  it('已有可信时长 → 不多跑一次 ffprobe', async () => {
+  it('探测值低于服务端口径 → 取较大者（ffprobe 只做下限兜底，不下调）', async () => {
     resolveExpectedRecordingDurationMsMock.mockResolvedValue(60_000);
+    probeAudioDurationMsFromBufferMock.mockResolvedValue(45_000);
 
     await POST(makeReq(), { params });
 
-    expect(probeAudioDurationMsFromBufferMock).not.toHaveBeenCalled();
     expect(sessionUpdateManyMock).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ durationMs: 60_000 }),
+      })
+    );
+  });
+
+  it('session-persist#151：库里已有极小正值也跳不过 ffprobe —— 按真实音频时长落库', async () => {
+    // 攻击者先 PATCH {durationMs: 1}（旧代码允许首次写入任意极小正值，两道守卫都放行），
+    // resolveExpectedRecordingDurationMs 于是返回 1，旧的 `durationMs <= 0` 兜底条件永远为假：
+    // 数小时的低码率录音以 1ms 落库 → 对 storage_hours 几乎零贡献，且 /full-transcribe 只按
+    // 1 分钟计价。PATCH 侧已整体拒收 durationMs，这里是第二道：探测值与服务端口径取最大值。
+    resolveExpectedRecordingDurationMsMock.mockResolvedValue(1);
+    probeAudioDurationMsFromBufferMock.mockResolvedValue(3 * 60 * 60_000);
+
+    await POST(makeReq(), { params });
+
+    expect(probeAudioDurationMsFromBufferMock).toHaveBeenCalled();
+    expect(sessionUpdateManyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ durationMs: 3 * 60 * 60_000 }),
       })
     );
   });

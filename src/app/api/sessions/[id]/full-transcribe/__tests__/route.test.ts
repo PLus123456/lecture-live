@@ -16,6 +16,9 @@ const {
   releaseMock,
   getSiteSettingsMock,
   processFullMock,
+  sessionUpdateManyMock,
+  loadSessionAudioArtifactMock,
+  probeAudioDurationMsFromBufferMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
@@ -26,6 +29,9 @@ const {
   releaseMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
   processFullMock: vi.fn(),
+  sessionUpdateManyMock: vi.fn(),
+  loadSessionAudioArtifactMock: vi.fn(),
+  probeAudioDurationMsFromBufferMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
@@ -36,6 +42,7 @@ vi.mock('@/lib/requestLogger', () => ({
 // getBillableMinutes 用真实口径（ceil(ms/60000)）锁死预留分钟。
 vi.mock('@/lib/billing', () => ({
   getBillableMinutes: (ms: number) => Math.ceil(ms / 60_000),
+  clampSessionDurationMs: (ms: number) => ms,
 }));
 vi.mock('@/lib/quota', () => ({
   reserveTranscriptionMinutes: reserveMock,
@@ -45,9 +52,18 @@ vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: getSiteSettingsMock }));
 vi.mock('@/lib/audio/fullTranscribeProcessor', () => ({
   processFullTranscribe: processFullMock,
 }));
+vi.mock('@/lib/sessionPersistence', () => ({
+  loadSessionAudioArtifact: loadSessionAudioArtifactMock,
+}));
+vi.mock('@/lib/audio/recordingDuration', () => ({
+  probeAudioDurationMsFromBuffer: probeAudioDurationMsFromBufferMock,
+}));
 vi.mock('@/lib/prisma', () => ({
   prisma: {
-    session: { findUnique: sessionFindUniqueMock },
+    session: {
+      findUnique: sessionFindUniqueMock,
+      updateMany: sessionUpdateManyMock,
+    },
     // claim 走 FOR UPDATE 事务（$queryRaw 读状态+旧预留 → tx.session.update 置位+登记预留）。
     $transaction: (...a: unknown[]) => transactionMock(...a),
   },
@@ -93,6 +109,9 @@ describe('POST full-transcribe — R4 预留持有门禁', () => {
     transactionMock.mockReset();
     txQueryRawMock.mockReset();
     txSessionUpdateMock.mockReset();
+    sessionUpdateManyMock.mockReset().mockResolvedValue({ count: 1 });
+    loadSessionAudioArtifactMock.mockReset().mockResolvedValue(null);
+    probeAudioDurationMsFromBufferMock.mockReset().mockResolvedValue(0);
     reserveMock.mockReset();
     releaseMock.mockReset();
     getSiteSettingsMock.mockReset();
@@ -251,5 +270,54 @@ describe('POST full-transcribe — R4 预留持有门禁', () => {
     const res = await POST(makeReq(), { params });
     expect(res.status).toBe(403);
     expect(reserveMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * session-persist#143 的钱侧：durationMs 是本任务**唯一**的计价依据 —— 入口预留与
+   * fullTranscribeFinalize 的实扣都是 ceil(getBillableMinutes(session.durationMs) × 倍率)，
+   * 而 Soniox usage-logs 对账只覆盖 mint 过 grant 的直连串流，异步文件转录事后无人补收。
+   * 所以 durationMs=0 的会话必须先探出真实时长再计价，探不到就不许开跑。
+   */
+  it('session-persist#143：durationMs=0 → 先探测真实时长、落库、按探测值计价', async () => {
+    sessionFindUniqueMock.mockResolvedValueOnce(completedSession({ durationMs: 0 }));
+    loadSessionAudioArtifactMock.mockResolvedValueOnce({
+      data: Buffer.from('audio'),
+      contentType: 'audio/webm',
+    });
+    probeAudioDurationMsFromBufferMock.mockResolvedValueOnce(42 * 60_000);
+    reserveMock.mockResolvedValueOnce(true);
+    transactionMock.mockImplementationOnce(async (cb: (tx: unknown) => unknown) => cb(makeTx()));
+    txQueryRawMock.mockResolvedValueOnce([
+      { fullTranscribeStatus: null, fullReservedMinutes: 0 },
+    ]);
+
+    const res = await POST(makeReq(), { params });
+
+    expect(res.status).toBe(200);
+    // 修正值落库（条件更新：只覆盖仍 <=0 的行，绝不压掉并发写入的正数）
+    expect(sessionUpdateManyMock).toHaveBeenCalledWith({
+      where: { id: 's-1', durationMs: { lte: 0 } },
+      data: { durationMs: 42 * 60_000 },
+    });
+    // 计价按探测值：ceil(42 × 0.8) = 34，而不是旧代码的 0（= 整段免费）
+    expect(reserveMock).toHaveBeenCalledWith('user-1', 34);
+    await expect(res.json()).resolves.toMatchObject({ estimatedMinutes: 34 });
+  });
+
+  it('session-persist#143：durationMs=0 且探不到时长 → 409，不预留、不 claim、不开跑', async () => {
+    sessionFindUniqueMock.mockResolvedValueOnce(completedSession({ durationMs: 0 }));
+    loadSessionAudioArtifactMock.mockResolvedValueOnce({
+      data: Buffer.from('unreadable'),
+      contentType: 'audio/webm',
+    });
+    probeAudioDurationMsFromBufferMock.mockResolvedValueOnce(0);
+
+    const res = await POST(makeReq(), { params });
+
+    expect(res.status).toBe(409);
+    expect(reserveMock).not.toHaveBeenCalled();
+    expect(transactionMock).not.toHaveBeenCalled();
+    expect(processFullMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 });

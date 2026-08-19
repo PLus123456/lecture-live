@@ -4,13 +4,15 @@ import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { assertOwnership } from '@/lib/security';
 import { withRequestLogging } from '@/lib/requestLogger';
-import { getBillableMinutes } from '@/lib/billing';
+import { clampSessionDurationMs, getBillableMinutes } from '@/lib/billing';
 import {
   reserveTranscriptionMinutes,
   releaseTranscriptionMinutes,
 } from '@/lib/quota';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { processFullTranscribe } from '@/lib/audio/fullTranscribeProcessor';
+import { loadSessionAudioArtifact } from '@/lib/sessionPersistence';
+import { probeAudioDurationMsFromBuffer } from '@/lib/audio/recordingDuration';
 
 // 完整版补全转录触发：对已录制完成的会话，用其完整音频（含断网续采段）重跑一次 Soniox
 // 异步文件转录，产出独立并列的完整转录（不覆盖实时转录）。额外按异步倍率计费。
@@ -62,9 +64,39 @@ export const POST = withRequestLogging(
     // 无上限，并发/连发多个完整版补全可越过月度转录额度上限。现预留额记入 session.fullReservedMinutes
     //（同时已计入 transcriptionMinutesUsed），finalize 时把预留「转」为实扣，删会话 inline 释放、失败
     // 终态由 cron releaseOrphanFullReservations 兜底。多个在途补全各自持有预留、真正叠加占额，杜绝超额准入。
+    // session-persist#143：durationMs 是本任务**唯一**的计价依据 —— 入口预留与
+    // fullTranscribeFinalize 的实扣都是 ceil(getBillableMinutes(session.durationMs) × 倍率)，
+    // 而 Soniox 侧没有任何按实际音频回补的路径（usage-logs 对账只覆盖 mint 过 grant 的直连串流，
+    // 异步文件转录不在其中），所以 durationMs=0 就是整段免费、且事后无人补收。
+    // 草稿定稿路径此前缺 ffprobe 兜底、能把 0 落库（已在该路由补上），但**存量**会话仍可能带着
+    // 0 躺在库里。这里对 durationMs<=0 的会话先探测真实录音时长、落库、再计价：既补上计价依据，
+    // 又不至于把老录音永久挡在完整版转录之外。探不到（无录音/坏文件/没装 ffprobe）才拒绝。
+    let pricingDurationMs = session.durationMs ?? 0;
+    if (pricingDurationMs <= 0) {
+      const artifact = await loadSessionAudioArtifact(session).catch(() => null);
+      const probedMs = artifact
+        ? await probeAudioDurationMsFromBuffer(artifact.data, artifact.contentType)
+        : 0;
+      pricingDurationMs = clampSessionDurationMs(probedMs, user.role);
+      if (pricingDurationMs <= 0) {
+        return NextResponse.json(
+          {
+            error:
+              'Cannot determine the recording duration; full transcription is unavailable for this session',
+          },
+          { status: 409 }
+        );
+      }
+      // 条件更新：并发的另一次触发可能已经写过同一个修正值，谁先写谁算数，绝不覆盖正数。
+      await prisma.session.updateMany({
+        where: { id, durationMs: { lte: 0 } },
+        data: { durationMs: pricingDurationMs },
+      });
+    }
+
     const { async_upload_billing_multiplier } = await getSiteSettings();
     const estimatedMinutes = Math.ceil(
-      getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
+      getBillableMinutes(pricingDurationMs) * async_upload_billing_multiplier
     );
     const reserved =
       estimatedMinutes > 0

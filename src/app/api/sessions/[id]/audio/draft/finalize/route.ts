@@ -17,14 +17,12 @@ import {
   rollbackStagedArtifact,
 } from '@/lib/sessionPersistence';
 import {
+  MAX_DURATION_FIX_BYTES,
   normalizeRecordedAudioDuration,
+  probeAudioDurationMsFromBuffer,
   resolveExpectedRecordingDurationMs,
 } from '@/lib/audio/recordingDuration';
 import { clampSessionDurationMs } from '@/lib/billing';
-
-// P4-1：超过此体量就不再做 webm 时长修正（该函数是数份整份拷贝，峰值 ≈4× 合并结果）。
-// 128MiB 对应 128kbps 下约 2.3 小时录音，绝大多数会话都在阈值内、行为完全不变。
-const MAX_DURATION_FIX_BYTES = 128 * 1024 * 1024;
 
 export async function POST(
   req: Request,
@@ -96,10 +94,25 @@ export async function POST(
 
     // G2：按角色上界 clamp durationMs 后再落库（同 /audio 路由），防伪造 transcript
     // globalEndMs 撑高 SUM(durationMs) 存储小时用量。
-    const durationMs = clampSessionDurationMs(
+    let durationMs = clampSessionDurationMs(
       await resolveExpectedRecordingDurationMs(session),
       user.role
     );
+    if (durationMs <= 0) {
+      // session-persist#143：三个来源（session.durationMs / transcript / serverStartedAt）都建立在
+      // 「走过实时链路」的前提上。CREATED 会话可以先灌满草稿分片，再把 CREATED→RECORDING→FINALIZING
+      // 一气呵成（serverStartedAt 与 serverPausedAt 相隔毫秒 → serverDuration≈0），三源同时为 0：
+      // durationMs 不写、recordingPath 照常发布 → 该录音对 storage_hours 贡献恒为 0，随后
+      // /full-transcribe 按 durationMs=0 算 estimatedMinutes 跳过预留、finalize 实扣同样是 0，
+      // 得到完全免费的整段 Soniox 转录。直传口 /audio 早有 ffprobe 兜底（P5-14），这里补齐同款。
+      durationMs = clampSessionDurationMs(
+        await probeAudioDurationMsFromBuffer(
+          merged.buffer,
+          merged.manifest.mimeType
+        ),
+        user.role
+      );
+    }
     // P4-1：normalizeRecordedAudioDuration 会在合并结果之上再做 3-4 份整份拷贝（切段 → Blob →
     // arrayBuffer → concat），几百 MB 的录音就足以把 2GB 容器的主进程 OOM 掉。超过阈值时跳过
     // 时长修正：webm 时长头缺失只影响进度条/拖动的精度，浏览器照样能播；进程被打死则全站受害。

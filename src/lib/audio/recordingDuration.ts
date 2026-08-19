@@ -126,11 +126,44 @@ export async function probeAudioDurationMsFromBuffer(
 const WEBM_HEADER_BYTES = [0x1a, 0x45, 0xdf, 0xa3] as const;
 
 /**
+ * P4-1 / audio-recording#150：允许做 webm 时长修正的总字节上限。
+ *
+ * normalizeRecordedAudioDuration 会在输入之上再做 3-4 份整份拷贝（切段 → Blob →
+ * arrayBuffer → concat），几百 MB 的录音就足以把 2GB 容器的主进程 OOM 掉。此前这道闸
+ * 只长在草稿定稿路由里（局部常量），直传口 POST /audio 完全没有 —— 现在提到本模块，
+ * 由**所有**调用点共用同一个常量与同一条短路。
+ * 128MiB 对应 128kbps 下约 2.3 小时录音，绝大多数会话都在阈值内、行为完全不变。
+ */
+export const MAX_DURATION_FIX_BYTES = 128 * 1024 * 1024;
+
+/**
+ * audio-recording#150：单次输入允许识别出的 WebM 文档边界数上限。
+ *
+ * 真实的多段录音来自「暂停/断网重开 MediaRecorder」，一场课几十段已属极端；512 给足冗余。
+ * 超过即判定为伪造载荷（见下方 MIN_WEBM_SEGMENT_BYTES 的说明），放弃分段而不是硬着头皮切。
+ */
+const MAX_WEBM_DOCUMENT_SEGMENTS = 512;
+
+/**
+ * audio-recording#150：相邻两个文档边界之间的最小间隔。
+ *
+ * 攻击载荷是 8 字节的 `1A 45 DF A3 'webm'` 无限重复：每 8 字节命中一次魔数 + DocType 校验，
+ * 32MiB 输入即可切出约 4×10^6 段，随后逐段 new Blob + arrayBuffer + Buffer.from。实测
+ * 16MiB 载荷 → 2.1×10^6 段、16.5s、RSS 1.47GB（32MiB 线性外推约 2.9GB），单个请求即可把
+ * 常规容量的容器 OOM 掉。真实 webm 文档头后必然跟着 Segment/Tracks/Cluster，1KiB 是极宽松的下限。
+ */
+const MIN_WEBM_SEGMENT_BYTES = 1024;
+
+/**
  * 在 buffer 中搜索所有 WebM EBML 文档头的起始偏移。
  * 与 playback/page.tsx 中的 splitConcatenatedWebmBuffer 逻辑一致，
  * 额外做 DocType="webm" 校验以避免误匹配。
+ *
+ * audio-recording#150：两道硬闸 —— 相邻边界至少间隔 {@link MIN_WEBM_SEGMENT_BYTES}
+ * （密集伪造标记被折叠掉），边界总数超过 {@link MAX_WEBM_DOCUMENT_SEGMENTS} 时立刻放弃扫描并
+ * 返回 null（调用方据此原样返回 buffer，绝不进入切段循环）。
  */
-function findWebmDocumentOffsets(bytes: Uint8Array): number[] {
+function findWebmDocumentOffsets(bytes: Uint8Array): number[] | null {
   const offsets: number[] = [];
   for (let i = 0; i <= bytes.length - WEBM_HEADER_BYTES.length; i += 1) {
     if (
@@ -154,7 +187,15 @@ function findWebmDocumentOffsets(bytes: Uint8Array): number[] {
         }
       }
       if (hasDocType) {
+        const previous = offsets[offsets.length - 1];
+        // 距上一个已采纳边界不足最小段长 → 视为同一文档内的噪声/伪造标记，跳过。
+        if (previous !== undefined && i - previous < MIN_WEBM_SEGMENT_BYTES) {
+          continue;
+        }
         offsets.push(i);
+        if (offsets.length > MAX_WEBM_DOCUMENT_SEGMENTS) {
+          return null;
+        }
       }
     }
   }
@@ -171,8 +212,27 @@ export async function normalizeRecordedAudioDuration(options: {
     return options.buffer;
   }
 
+  // audio-recording#150：总字节闸。放在函数入口而不是各调用点，直传口与草稿定稿口共用。
+  // 超阈值直接放弃修正：webm 时长头缺失只影响进度条/拖动精度（浏览器照样能播），
+  // 进程被打死则全站受害。
+  if (options.buffer.length > MAX_DURATION_FIX_BYTES) {
+    console.warn(
+      `[recordingDuration] 输入 ${options.buffer.length} 字节超过 ${MAX_DURATION_FIX_BYTES}，跳过 webm 时长修正`
+    );
+    return options.buffer;
+  }
+
   const bytes = new Uint8Array(options.buffer);
   const offsets = findWebmDocumentOffsets(bytes);
+
+  // audio-recording#150：边界数超上限 —— 密集伪造的 EBML 标记（每 8 字节一个魔数即可让
+  // 32MiB 输入切出约 4×10^6 段）。原样返回，绝不进入「切段 + 逐段 fixWebmDuration」循环。
+  if (offsets === null) {
+    console.warn(
+      `[recordingDuration] webm 文档边界数超过 ${MAX_WEBM_DOCUMENT_SEGMENTS}，判定为异常载荷，跳过时长修正`
+    );
+    return options.buffer;
+  }
 
   // 单段 WebM（或找不到边界）：走原有逻辑
   if (offsets.length <= 1) {

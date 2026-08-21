@@ -10,6 +10,8 @@ import { fulfillJson, fulfillSse, installBrowserStubs, loginViaForm } from './he
  *  3) 上传 PDF → 报价确认弹窗 → 确认后调 /confirm。
  *  4) 组能力关闭（docEnabled=false）时文档 tab 显示不可用文案。
  *  5) 免计费账号（管理员）：价格提示全部换成「免费」，报价弹窗不谈钱、按钮不是「付费并翻译」。
+ *  6) 文档 tab 选模型：默认选中下发的 defaultModel → 换一个 → 上传时随 multipart 提交，
+ *     任务行回显模型名；两个 tab 的选择互不串（文本 tab 换模型不动文档 tab）。
  */
 
 const user: Record<string, unknown> = {
@@ -20,6 +22,7 @@ const user: Record<string, unknown> = {
 };
 
 let capturedTextBody: Record<string, unknown> | null = null;
+let capturedUploadModelId: string | null = null;
 let capturedConfirmId: string | null = null;
 let docEnabled = true;
 let billingExempt = false;
@@ -34,6 +37,7 @@ const quotedTask = {
   progress: 0,
   sourceLang: 'en',
   targetLang: 'zh',
+  modelId: null as string | null,
   estimatedCents: 120,
   chargedCents: 0,
   refunded: false,
@@ -46,6 +50,7 @@ const quotedTask = {
 
 test.beforeEach(async ({ page }) => {
   capturedTextBody = null;
+  capturedUploadModelId = null;
   capturedConfirmId = null;
   docEnabled = true;
   billingExempt = false;
@@ -72,6 +77,7 @@ test.beforeEach(async ({ page }) => {
       return fulfillJson(route, {
         models: [
           { id: 'm-trans', displayName: 'DeepSeek V3', modelId: 'deepseek-chat' },
+          { id: 'm-strong', displayName: 'Claude Opus', modelId: 'claude-opus' },
         ],
         defaultModel: 'm-trans',
         config: {
@@ -100,14 +106,26 @@ test.beforeEach(async ({ page }) => {
       return fulfillJson(route, { tasks });
     }
     if (p === '/api/translate/documents' && method === 'POST') {
+      // multipart 里挑出 modelId 字段（服务端就是这么收的）
+      const raw = request.postData() ?? '';
+      const matched = /name="modelId"\r?\n\r?\n([^\r\n]*)/.exec(raw);
+      capturedUploadModelId = matched ? matched[1] : null;
       // 服务端对免计费账号直接出 0 报价（见 /api/translate/documents 的 isBillingExempt 分支）
-      const quoted = billingExempt ? { ...quotedTask, estimatedCents: 0 } : quotedTask;
+      const quoted = {
+        ...quotedTask,
+        modelId: capturedUploadModelId,
+        ...(billingExempt ? { estimatedCents: 0 } : {}),
+      };
       tasks = [quoted, ...tasks];
       return fulfillJson(route, { task: quoted, walletBalanceCents: 10000 });
     }
     if (/^\/api\/translate\/documents\/[^/]+\/confirm$/.test(p) && method === 'POST') {
       capturedConfirmId = p.split('/')[4];
-      const started = { ...quotedTask, status: 'PENDING', chargedCents: 120 };
+      const started = {
+        ...(tasks.find((task) => task.id === p.split('/')[4]) ?? quotedTask),
+        status: 'PENDING',
+        chargedCents: 120,
+      };
       tasks = [started];
       return fulfillJson(route, { task: started, walletBalanceCents: 9880 });
     }
@@ -266,4 +284,58 @@ test('免计费账号（管理员）：价格提示换成免费，报价弹窗�
   await page.getByRole('button', { name: /Start translation|开始翻译/ }).click();
   await expect(page.getByText(/Queued|排队中/).first()).toBeVisible({ timeout: 15_000 });
   expect(capturedConfirmId).toBe('task-q1');
+});
+
+test('文档 tab：选模型 → 随上传提交 → 任务行回显模型名', async ({ page }) => {
+  await login(page);
+  await page.goto('/translate?tab=doc');
+  await expect(page.getByText(/Click or drop a PDF|点击或拖入 PDF/)).toBeVisible({
+    timeout: 15_000,
+  });
+
+  // 默认选中 /api/translate/models 下发的 defaultModel（组绑定 > 全局默认）
+  const modelSelect = page.getByLabel(/^(Model|模型)$/);
+  await expect(modelSelect).toHaveValue('m-trans');
+
+  await modelSelect.selectOption('m-strong');
+  await page.setInputFiles('input[type="file"]', {
+    name: 'paper.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4 fake'),
+  });
+
+  await expect(page.getByText(/Confirm translation|确认翻译/)).toBeVisible({ timeout: 15_000 });
+  // 选的模型进了 multipart（服务端据此定格 task.modelId）
+  expect(capturedUploadModelId).toBe('m-strong');
+
+  await page.getByRole('button', { name: /Pay & translate|付费并翻译/ }).click();
+  await expect(page.getByText(/Queued|排队中/).first()).toBeVisible({ timeout: 15_000 });
+  // 任务行回显这单实际用的模型（限定到任务行里找，否则先撞上下拉里的 <option>）
+  await expect(
+    page.getByRole('listitem').filter({ hasText: 'paper.pdf' })
+  ).toContainText('Claude Opus');
+});
+
+test('文本 tab 换模型不串到文档 tab（文档单独一份选择）', async ({ page }) => {
+  await login(page);
+  await page.goto('/translate');
+
+  const textModelSelect = page.getByLabel(/^(Model|模型)$/);
+  await expect(textModelSelect).toHaveValue('m-trans');
+  await textModelSelect.selectOption('m-strong');
+
+  await page.getByRole('button', { name: /^(Documents|文档)$/ }).click();
+  await expect(page.getByText(/Click or drop a PDF|点击或拖入 PDF/)).toBeVisible({
+    timeout: 15_000,
+  });
+  // 文档 tab 仍是默认模型
+  await expect(page.getByLabel(/^(Model|模型)$/)).toHaveValue('m-trans');
+
+  await page.setInputFiles('input[type="file"]', {
+    name: 'paper.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4 fake'),
+  });
+  await expect(page.getByText(/Confirm translation|确认翻译/)).toBeVisible({ timeout: 15_000 });
+  expect(capturedUploadModelId).toBe('m-trans');
 });

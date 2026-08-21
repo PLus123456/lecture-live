@@ -66,6 +66,7 @@ describe('toTaskView', () => {
       progress: 40,
       sourceLang: 'en',
       targetLang: 'zh',
+      modelId: 'model-trans',
       estimatedCents: 120,
       chargedCents: 120,
       refundedAt: new Date('2026-07-22T00:00:00Z'),
@@ -77,6 +78,8 @@ describe('toTaskView', () => {
     });
     expect(view.refunded).toBe(true);
     expect(view.hasMono).toBe(false);
+    // 模型快照出网（前端任务行回显「这单用的哪个模型」）
+    expect(view.modelId).toBe('model-trans');
     expect(view).not.toHaveProperty('proxyTokenHash');
     expect(view).not.toHaveProperty('workerId');
   });

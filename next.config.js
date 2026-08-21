@@ -124,6 +124,23 @@ const PDFJS_RUNTIME_ASSETS = [
   ['legacy/build', 'cmaps', 'standard_fonts', 'wasm', 'iccs'].map(
     (dir) => `./node_modules/${pkg}/${dir}/**`
   )
+).concat(
+  // pdfjs 在 Node 下靠 @napi-rs/canvas 补 DOMMatrix / ImageData / Path2D。这不是「渲染才用」的
+  // 可选件：pdf.mjs 顶层就有 `const SCALE_MATRIX = new DOMMatrix()`，补不上就在**模块求值阶段**
+  // 抛 ReferenceError；而路由里 `await import('pdf-parse')` 在 getInfo 的 try 之外，于是整条上传
+  // 变成不可读的 500（生产实测："Cannot load @napi-rs/canvas" → "Cannot polyfill DOMMatrix" →
+  // "ReferenceError: DOMMatrix is not defined"）。
+  // 追不到的原因与上面 worker/cmaps 同类：pdf.mjs 走 createRequire() 动态 require，且真正的二进制
+  // 在平台专属包里（canvas-linux-x64-gnu / canvas-darwin-arm64 …），nft 静态分析不稳。
+  // canvas-* 只用一层通配（不是前缀 **），命中的就是当前平台 npm 实际装下的那一个；
+  // 两处都写：pdf-parse 内嵌一份，officeparser 依赖的顶层 pdfjs-dist 一份（缺哪份就 glob 空匹配）。
+  [
+    'pdf-parse/node_modules/@napi-rs',
+    '@napi-rs',
+  ].flatMap((scope) => [
+    `./node_modules/${scope}/canvas/**`,
+    `./node_modules/${scope}/canvas-*/**`,
+  ])
 );
 
 /** @type {import('next').NextConfig} */

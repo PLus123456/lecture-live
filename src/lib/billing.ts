@@ -94,3 +94,17 @@ export function getQuotaCycleStartAt(quotaResetAt: Date | null): Date {
     )
   );
 }
+
+/**
+ * 管理员计费豁免：站内一切按量计费（钱包扣分 / 每日免费次数额度）对 ADMIN 一律不生效。
+ *
+ * 与既有口径一致：quota.ts 的配额哨兵（ADMIN 恒判有额度、扣减直接跳过）、
+ * userRoles.ts 的「ADMIN 视为无限」能力开关、wallet.ts 的「管理员无需购买会员」。
+ * 翻译模块此前漏了这一条，成了唯一会向管理员收费的功能。
+ *
+ * 调用约定：role 必须取自数据库。JWT 里的 role 在降级后最长可陈旧 7 天
+ * （改角色不 bump tokenVersion），拿它判豁免等于给刚被降级的账号继续免单。
+ */
+export function isBillingExempt(role: AppUserRole): boolean {
+  return role === 'ADMIN';
+}

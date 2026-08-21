@@ -9,6 +9,7 @@ import { resolveGroupBoundModel } from '@/lib/llm/summaryModel';
 import { getModelById } from '@/lib/llm/gateway';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { spendWalletCents, WalletError } from '@/lib/wallet';
+import { isBillingExempt } from '@/lib/billing';
 import {
   LLMValidationError,
   readOptionalIdentifier,
@@ -117,9 +118,14 @@ export async function POST(req: Request) {
       routing = (await resolveGroupBoundModel(groupModelId, 'TRANSLATION')).routing;
     }
 
-    // 计费：free=每日额度（请求时预消耗，彻底失败回滚）；per_char=钱包按千字符扣分
+    // 计费：free=每日额度（请求时预消耗，彻底失败回滚）；per_char=钱包按千字符扣分。
+    // ADMIN 两条线都豁免（role 取自 DB，见 isBillingExempt 的调用约定）：与配额哨兵同口径，
+    // 管理员既不扣钱包也不占每日免费次数。
     let chargedCents = 0;
-    if (settings.translation_text_billing_mode === 'per_char') {
+    const billingExempt = isBillingExempt(selection.user.role);
+    if (billingExempt) {
+      // 不计费：既不扣钱包也不消耗每日额度
+    } else if (settings.translation_text_billing_mode === 'per_char') {
       const cents =
         Math.ceil(text.length / 1000) *
         Math.max(0, settings.translation_text_price_cents_per_kchar);

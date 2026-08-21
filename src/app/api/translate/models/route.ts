@@ -12,6 +12,7 @@ import {
   resolveUserTranslationModelId,
 } from '@/lib/userRoles';
 import { getSiteSettings } from '@/lib/siteSettings';
+import { isBillingExempt } from '@/lib/billing';
 
 export interface TranslationModelOption {
   /** LlmModel DB id（请求时回传给 /api/translate/text 的 modelId） */
@@ -110,6 +111,8 @@ export async function GET(req: Request) {
       config: {
         textEnabled: settings.translation_text_enabled && featureFlags.allowTextTranslation,
         docEnabled: settings.translation_doc_enabled && featureFlags.allowDocTranslation,
+        // 管理员免单（服务端才是权威门禁，这个字段只用于把价格提示换成「免费」）
+        billingExempt: isBillingExempt(user.role),
         textBillingMode: settings.translation_text_billing_mode,
         textDailyFreeLimit: settings.translation_text_daily_free_limit,
         textPriceCentsPerKchar: settings.translation_text_price_cents_per_kchar,

@@ -43,6 +43,8 @@ interface TranslateModelOption {
 interface TranslateConfig {
   textEnabled: boolean;
   docEnabled: boolean;
+  /** 该账号免计费（当前=管理员）。服务端才是权威，这里只用于把价格提示换成「免费」 */
+  billingExempt?: boolean;
   textBillingMode: 'free' | 'per_char';
   textDailyFreeLimit: number;
   textPriceCentsPerKchar: number;
@@ -451,13 +453,15 @@ function TextTranslateTab({
       {/* 计费提示 */}
       {config && (
         <p className="text-[11px] text-charcoal-400">
-          {config.textBillingMode === 'per_char'
-            ? t('translate.perCharHint', {
-                price: yuan(config.textPriceCentsPerKchar),
-              })
-            : config.textDailyFreeLimit > 0
-              ? t('translate.freeDailyHint', { n: config.textDailyFreeLimit })
-              : t('translate.freeUnlimitedHint')}
+          {config.billingExempt
+            ? t('translate.exemptHint')
+            : config.textBillingMode === 'per_char'
+              ? t('translate.perCharHint', {
+                  price: yuan(config.textPriceCentsPerKchar),
+                })
+              : config.textDailyFreeLimit > 0
+                ? t('translate.freeDailyHint', { n: config.textDailyFreeLimit })
+                : t('translate.freeUnlimitedHint')}
         </p>
       )}
     </div>
@@ -637,11 +641,16 @@ function DocTranslateTab({ config }: { config: TranslateConfig | null }) {
         <LanguageSelect value={targetLang} onChange={setTargetLang} excludeCodes={[sourceLang]} className="w-44" />
         {config && (
           <span className="ml-auto text-[11px] text-charcoal-400">
-            {t('translate.docPricingHint', {
-              price: yuan(config.docPriceCentsPerPage),
-              pages: config.docMaxPages,
-              mb: config.docMaxMb,
-            })}
+            {config.billingExempt
+              ? t('translate.docPricingHintFree', {
+                  pages: config.docMaxPages,
+                  mb: config.docMaxMb,
+                })
+              : t('translate.docPricingHint', {
+                  price: yuan(config.docPriceCentsPerPage),
+                  pages: config.docMaxPages,
+                  mb: config.docMaxMb,
+                })}
           </span>
         )}
       </div>
@@ -715,15 +724,26 @@ function DocTranslateTab({ config }: { config: TranslateConfig | null }) {
         title={t('translate.quoteTitle')}
         message={
           quote
-            ? t('translate.quoteMessage', {
-                file: quote.task.fileName,
-                pages: quote.task.pageCount,
-                price: yuan(quote.task.estimatedCents),
-                balance: yuan(quote.balance),
-              })
+            ? config?.billingExempt
+              ? t('translate.quoteMessageFree', {
+                  file: quote.task.fileName,
+                  pages: quote.task.pageCount,
+                })
+              : t('translate.quoteMessage', {
+                  file: quote.task.fileName,
+                  pages: quote.task.pageCount,
+                  price: yuan(quote.task.estimatedCents),
+                  balance: yuan(quote.balance),
+                })
             : ''
         }
-        confirmText={confirming ? t('common.loading') : t('translate.confirmStart')}
+        confirmText={
+          confirming
+            ? t('common.loading')
+            : config?.billingExempt
+              ? t('translate.confirmStartFree')
+              : t('translate.confirmStart')
+        }
         loading={confirming}
         danger={false}
         onConfirm={handleConfirm}

@@ -1887,6 +1887,7 @@ export default {
     tabDoc: '文档',
     autoDetect: '检测语言',
     swap: '交换语言',
+    model: '模型',
     inputPlaceholder: '输入或粘贴要翻译的文本…',
     outputPlaceholder: '译文将显示在这里',
     translating: '翻译中…',

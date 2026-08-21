@@ -6,7 +6,7 @@ import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { LLMAccessError, resolveAuthorizedLlmSelection } from '@/lib/llm/access';
 import { resolveUserTranslationModelId } from '@/lib/userRoles';
 import { resolveGroupBoundModel } from '@/lib/llm/summaryModel';
-import { getModelById } from '@/lib/llm/gateway';
+import { isTranslationModelAllowed } from '@/lib/translate/modelAccess';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { spendWalletCents, WalletError } from '@/lib/wallet';
 import { isBillingExempt } from '@/lib/billing';
@@ -89,24 +89,12 @@ export async function POST(req: Request) {
       purpose: 'TRANSLATION',
     };
     if (requestedModelId) {
-      const cfg = await getModelById(requestedModelId).catch(() => null);
-      const purposeOk = cfg?.dbModelId === requestedModelId && cfg.purpose === 'TRANSLATION';
-      // allowedModels 门禁与 /api/llm/models 同口径：'*' 全允许；token 命中 DB id/底层 modelId/网关名
-      const allowedTokens = selection.user.allowedModels
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const accessOk =
-        purposeOk &&
-        cfg !== null &&
-        (selection.user.role === 'ADMIN' ||
-          selection.user.allowedModels === '*' ||
-          // L21：组绑定模型就是 /api/translate/models 下发的默认项，必须与那边同口径放行，
-          // 否则「按默认值提交」这条最常见路径恒 403。
-          requestedModelId === groupModelId ||
-          allowedTokens.some(
-            (tkn) => tkn === requestedModelId || tkn === cfg.model || tkn === cfg.name
-          ));
+      // 门禁口径见 isTranslationModelAllowed（与文档翻译共用；组绑定模型豁免 allowedModels）
+      const accessOk = await isTranslationModelAllowed(
+        selection.user,
+        requestedModelId,
+        groupModelId
+      );
       if (!accessOk) {
         return NextResponse.json(
           { error: '所选模型不可用或未授权' },

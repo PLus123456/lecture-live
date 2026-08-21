@@ -6,6 +6,7 @@ import { getSiteSettings } from '@/lib/siteSettings';
 import { resolveUserFeatureFlags, resolveUserTranslationModelId } from '@/lib/userRoles';
 import { isBillingExempt } from '@/lib/billing';
 import { getModelById } from '@/lib/llm/gateway';
+import { isTranslationModelAllowed } from '@/lib/translate/modelAccess';
 import { saveSourceFile, deleteTaskFiles } from '@/lib/translate/taskStorage';
 import {
   TASK_VIEW_SELECT,
@@ -37,7 +38,8 @@ export async function GET(req: Request) {
 
 /**
  * POST /api/translate/documents — 上传 PDF → 读页数报价 → 建 QUOTED 任务。
- * multipart/form-data：file（PDF）+ sourceLang + targetLang + glossary?（JSON 字符串）。
+ * multipart/form-data：file（PDF）+ sourceLang + targetLang + glossary?（JSON 字符串）
+ * + modelId?（LlmModel DB id，缺省=组绑定翻译模型 > 全局 TRANSLATION 默认）。
  * 报价 30 分钟内确认（/confirm 扣费入队），超时懒清理。
  */
 export async function POST(req: Request) {
@@ -63,7 +65,7 @@ export async function POST(req: Request) {
     // 且 role 在降级后最长陈旧 7 天（改角色不 bump tokenVersion）。
     const dbUser = await prisma.user.findUnique({
       where: { id: user.id },
-      select: { role: true, customGroupId: true },
+      select: { role: true, customGroupId: true, allowedModels: true },
     });
     if (!dbUser) {
       return NextResponse.json({ error: 'User not found' }, { status: 404 });
@@ -104,6 +106,34 @@ export async function POST(req: Request) {
       }
     }
 
+    // 模型：用户显式选择（须挂 TRANSLATION 用途 + allowedModels 门禁，组绑定模型豁免）>
+    // 组绑定 > 空（= 派发时按全局 TRANSLATION 默认解析）。选定值在建任务时定格进 task.modelId，
+    // 之后派发与 LLM 代理全程认这一个，中途 admin 换全局默认也不影响在途任务。
+    // 排在解析 PDF 之前：未授权的模型别白跑一趟 getInfo。
+    const rawModelId = form.get('modelId');
+    const requestedModelId =
+      typeof rawModelId === 'string' ? rawModelId.trim().slice(0, 128) : '';
+    // 组绑定必须拿 DB 行解析：verifyAuth 的载荷没有 customGroupId，传它会把自定义组绑的
+    // 翻译模型误判成底层系统角色绑的那个，且这个错快照会一路赢到派发与代理端。
+    const groupModelId = await resolveUserTranslationModelId(dbUser).catch(() => null);
+    let modelId: string | null = null;
+    if (requestedModelId) {
+      const accessOk = await isTranslationModelAllowed(
+        dbUser,
+        requestedModelId,
+        groupModelId
+      );
+      if (!accessOk) {
+        return NextResponse.json({ error: '所选模型不可用或未授权' }, { status: 403 });
+      }
+      modelId = requestedModelId;
+    } else if (groupModelId) {
+      const cfg = await getModelById(groupModelId).catch(() => null);
+      if (cfg?.dbModelId === groupModelId && cfg.purpose === 'TRANSLATION') {
+        modelId = groupModelId;
+      }
+    }
+
     const data = Buffer.from(await file.arrayBuffer());
     // 魔数校验：PDF 头 %PDF-（防伪装扩展名）
     if (!data.subarray(0, 5).toString('latin1').startsWith('%PDF-')) {
@@ -134,16 +164,6 @@ export async function POST(req: Request) {
 
     // 顺手清理本人超时未确认的旧报价
     await sweepExpiredQuotes(user.id).catch(() => undefined);
-
-    // 模型快照：任务创建时定格（组绑定失效则空=全局默认，代理端点兜底再解析）
-    let modelId: string | null = null;
-    const groupModelId = await resolveUserTranslationModelId(user).catch(() => null);
-    if (groupModelId) {
-      const cfg = await getModelById(groupModelId).catch(() => null);
-      if (cfg?.dbModelId === groupModelId && cfg.purpose === 'TRANSLATION') {
-        modelId = groupModelId;
-      }
-    }
 
     // ADMIN 免单：报价直接出 0（/confirm 与 /retry 侧还有一道同样的豁免，双保险）
     const estimatedCents = isBillingExempt(dbUser.role)

@@ -1907,6 +1907,7 @@ export default {
     tabDoc: 'Documents',
     autoDetect: 'Detect language',
     swap: 'Swap languages',
+    model: 'Model',
     inputPlaceholder: 'Type or paste text to translate…',
     outputPlaceholder: 'Translation appears here',
     translating: 'Translating…',

@@ -170,3 +170,85 @@ describe('POST /api/translate/text 计费顺序 (L21)', () => {
     );
   });
 });
+
+/**
+ * 管理员计费豁免：翻译是站内唯一会向 ADMIN 收费的功能（配额/会员两条线早就豁免了）。
+ * per_char 不扣钱包、free 不占每日免费次数，两条线都要按 DB 里的 role 判。
+ */
+describe('POST /api/translate/text 管理员豁免', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    verifyAuthMock.mockResolvedValue({ id: 'admin-1', role: 'ADMIN' });
+    enforceApiRateLimitMock.mockResolvedValue(null);
+    getSiteSettingsMock.mockResolvedValue({
+      translation_text_enabled: true,
+      translation_text_billing_mode: 'per_char',
+      translation_text_price_cents_per_kchar: 5,
+      translation_text_daily_free_limit: 10,
+    });
+    resolveAuthorizedLlmSelectionMock.mockResolvedValue({
+      user: { role: 'ADMIN', allowedModels: '*' },
+      featureFlags: { allowTextTranslation: true },
+    });
+    resolveUserTranslationModelIdMock.mockResolvedValue(null);
+    resolveGroupBoundModelMock.mockResolvedValue({
+      routing: { purpose: 'TRANSLATION' },
+      provider: null,
+    });
+    spendWalletCentsMock.mockResolvedValue({});
+    consumeDailyTextQuotaMock.mockResolvedValue({ allowed: true, limit: 10 });
+    releaseDailyTextQuotaMock.mockResolvedValue(undefined);
+    callLLMWithHistoryStreamMock.mockResolvedValue({ text: '译文' });
+  });
+
+  it('per_char 模式：管理员不扣钱包，done 事件 charged=0', async () => {
+    const res = await POST(makeReq({ text: 'hello', targetLang: 'zh' }));
+
+    expect(res.status).toBe(200);
+    expect(spendWalletCentsMock).not.toHaveBeenCalled();
+    expect(await res.text()).toContain('"charged":0');
+  });
+
+  it('free 模式：管理员不消耗每日免费次数', async () => {
+    getSiteSettingsMock.mockResolvedValue({
+      translation_text_enabled: true,
+      translation_text_billing_mode: 'free',
+      translation_text_price_cents_per_kchar: 0,
+      translation_text_daily_free_limit: 10,
+    });
+
+    const res = await POST(makeReq({ text: 'hello', targetLang: 'zh' }));
+
+    expect(res.status).toBe(200);
+    expect(consumeDailyTextQuotaMock).not.toHaveBeenCalled();
+  });
+
+  it('每日额度已耗尽也不拦管理员（额度对 ADMIN 根本不生效）', async () => {
+    getSiteSettingsMock.mockResolvedValue({
+      translation_text_enabled: true,
+      translation_text_billing_mode: 'free',
+      translation_text_price_cents_per_kchar: 0,
+      translation_text_daily_free_limit: 10,
+    });
+    consumeDailyTextQuotaMock.mockResolvedValue({ allowed: false, used: 10, limit: 10 });
+
+    const res = await POST(makeReq({ text: 'hello', targetLang: 'zh' }));
+
+    expect(res.status).toBe(200);
+  });
+
+  it('豁免只认 DB 里的 role：JWT 说 ADMIN 但库里已降级 → 照常扣费', async () => {
+    // 改角色不 bump tokenVersion，降级后旧 JWT 最长还能用 7 天
+    resolveAuthorizedLlmSelectionMock.mockResolvedValue({
+      user: { role: 'PRO', allowedModels: '*' },
+      featureFlags: { allowTextTranslation: true },
+    });
+
+    const res = await POST(makeReq({ text: 'hello', targetLang: 'zh' }));
+
+    expect(res.status).toBe(200);
+    expect(spendWalletCentsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ amountCents: 5, type: 'translation' })
+    );
+  });
+});

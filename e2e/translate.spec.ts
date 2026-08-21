@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, fulfillSse, installBrowserStubs } from './helpers';
+import { fulfillJson, fulfillSse, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 翻译页烟测 —— 全量 route mock、无真实 DB / worker。
@@ -9,9 +9,10 @@ import { fulfillJson, fulfillSse, installBrowserStubs } from './helpers';
  *  2) 文档 tab：任务列表渲染（完成任务显示下载/双语按钮；失败任务显示重试与退款标记）。
  *  3) 上传 PDF → 报价确认弹窗 → 确认后调 /confirm。
  *  4) 组能力关闭（docEnabled=false）时文档 tab 显示不可用文案。
+ *  5) 免计费账号（管理员）：价格提示全部换成「免费」，报价弹窗不谈钱、按钮不是「付费并翻译」。
  */
 
-const user = {
+const user: Record<string, unknown> = {
   id: 'user-1',
   email: 'stu@example.com',
   displayName: 'Student',
@@ -21,6 +22,7 @@ const user = {
 let capturedTextBody: Record<string, unknown> | null = null;
 let capturedConfirmId: string | null = null;
 let docEnabled = true;
+let billingExempt = false;
 let tasks: Array<Record<string, unknown>> = [];
 
 const quotedTask = {
@@ -46,6 +48,8 @@ test.beforeEach(async ({ page }) => {
   capturedTextBody = null;
   capturedConfirmId = null;
   docEnabled = true;
+  billingExempt = false;
+  user.role = 'FREE';
   tasks = [];
   await installBrowserStubs(page);
 
@@ -73,6 +77,7 @@ test.beforeEach(async ({ page }) => {
         config: {
           textEnabled: true,
           docEnabled,
+          billingExempt,
           textBillingMode: 'free',
           textDailyFreeLimit: 100,
           textPriceCentsPerKchar: 1,
@@ -95,8 +100,10 @@ test.beforeEach(async ({ page }) => {
       return fulfillJson(route, { tasks });
     }
     if (p === '/api/translate/documents' && method === 'POST') {
-      tasks = [quotedTask, ...tasks];
-      return fulfillJson(route, { task: quotedTask, walletBalanceCents: 10000 });
+      // 服务端对免计费账号直接出 0 报价（见 /api/translate/documents 的 isBillingExempt 分支）
+      const quoted = billingExempt ? { ...quotedTask, estimatedCents: 0 } : quotedTask;
+      tasks = [quoted, ...tasks];
+      return fulfillJson(route, { task: quoted, walletBalanceCents: 10000 });
     }
     if (/^\/api\/translate\/documents\/[^/]+\/confirm$/.test(p) && method === 'POST') {
       capturedConfirmId = p.split('/')[4];
@@ -130,11 +137,11 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function login(page: import('@playwright/test').Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('stu@example.com');
-  await page.locator('input[type="password"]').fill('whatever');
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  await loginViaForm(page, {
+    email: 'stu@example.com',
+    password: 'whatever',
+    prewarm: ['/translate'],
+  });
 }
 
 test('文本翻译：输入 → SSE 流式译文渲染 + 请求体带语言与模型', async ({ page }) => {
@@ -224,4 +231,39 @@ test('站点/组关闭文档翻译时显示不可用文案', async ({ page }) =>
   await expect(
     page.getByText(/Document translation is not available|当前账号不可使用文档翻译/)
   ).toBeVisible({ timeout: 15_000 });
+});
+
+test('免计费账号（管理员）：价格提示换成免费，报价弹窗不谈钱', async ({ page }) => {
+  billingExempt = true;
+  user.role = 'ADMIN';
+  await login(page);
+
+  // 文本 tab：只出免费提示，不出「每千字符 ¥x 扣费」
+  await page.goto('/translate');
+  await expect(
+    page.getByText(/Administrator account · translation is free|管理员账号 · 翻译不计费/)
+  ).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/per 1,000 characters|每千字符/)).toHaveCount(0);
+
+  // 文档 tab：单价提示换成免费，仍保留页数/体积上限
+  await page.goto('/translate?tab=doc');
+  await expect(
+    page.getByText(/Free for admins · up to 300 pages|管理员免费 · 上限 300 页/)
+  ).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/\/page ·|\/页 ·/)).toHaveCount(0);
+
+  // 报价弹窗：没有「费用/钱包余额」行，按钮不是「付费并翻译」
+  await page.setInputFiles('input[type="file"]', {
+    name: 'paper.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4 fake'),
+  });
+  await expect(page.getByText(/Confirm translation|确认翻译/)).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/Administrator account — no charge|管理员账号不计费/)).toBeVisible();
+  await expect(page.getByText(/wallet balance|钱包余额/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Pay & translate|付费并翻译/ })).toHaveCount(0);
+
+  await page.getByRole('button', { name: /Start translation|开始翻译/ }).click();
+  await expect(page.getByText(/Queued|排队中/).first()).toBeVisible({ timeout: 15_000 });
+  expect(capturedConfirmId).toBe('task-q1');
 });

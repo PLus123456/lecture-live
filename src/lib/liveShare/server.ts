@@ -1,11 +1,10 @@
 // src/lib/liveShare/server.ts
 // 服务端 socket.io 实时分享逻辑
 
-import fs from 'fs/promises';
-import path from 'path';
 import { Server as SocketIO, Socket } from 'socket.io';
 import { prisma } from '@/lib/prisma';
-import { assertWithinRoot, sanitizePath, sanitizeToken } from '@/lib/security';
+import { sanitizePath, sanitizeToken } from '@/lib/security';
+import { loadSessionTranscriptBundle } from '@/lib/sessionPersistence';
 import { logger, serializeError } from '@/lib/logger';
 import {
   EMPTY_STREAMING_PREVIEW_TEXT,
@@ -19,12 +18,16 @@ import {
   verifyAuthToken,
 } from '@/lib/auth';
 import { loadTranscriptDraft } from '@/lib/transcriptDraftPersistence';
+import {
+  MAX_PERSISTED_SNAPSHOT_BYTES,
+  readSnapshotChunkMeta,
+  trimSnapshotToByteBudget,
+} from './snapshotChunking';
 import type {
   StreamingPreviewText,
   StreamingPreviewTranslation,
 } from '@/types/transcript';
 
-const TRANSCRIPT_DIR = path.join(process.cwd(), 'data', 'transcripts');
 const liveShareLogger = logger.child({ component: 'live-share' });
 
 interface BroadcasterAuthPayload {
@@ -51,11 +54,30 @@ interface LiveSnapshot {
   sourceLang: string | null;
   targetLang: string | null;
   translationMode: string | null;
+  /**
+   * H1/L3：本快照不是完整历史 —— 主播端因传输体积上限丢掉了最早的一段 backlog，
+   * 或服务端从磁盘草稿恢复时按字节预算裁掉了最早的一段。随 initial_state 下发给
+   * 观众，让观众端能明确提示「历史不全」，而不是把残缺当完整。
+   */
+  truncated: boolean;
   updatedAt: number;
 }
 
 interface ViewerJoinPayload {
   shareToken?: string;
+}
+
+/**
+ * H1：分块 sync_snapshot 的暂存态，挂在**主播 socket** 的 socket.data 上。
+ * 挂在 socket 上而非模块级 Map，是因为它天然随 socket 生命周期回收：主播断连时
+ * 未完成的批次自动作废，不需要额外清扫（也就不会出现 U61 那种僵尸条目）。
+ * 只有集齐 expectedChunks 块才写进 snapshots —— 观众永远读不到半份快照。
+ */
+interface SnapshotStaging {
+  chunkId: string;
+  expectedChunks: number;
+  receivedChunks: number;
+  snapshot: LiveSnapshot;
 }
 
 const snapshots = new Map<string, LiveSnapshot>();
@@ -198,6 +220,42 @@ function sanitizeSnapshotTranslations(input: unknown): Record<string, string> {
   return out;
 }
 
+// L5：未鉴权的 join 会打一次匿名 prisma.shareLink.findUnique。全局令牌桶
+// （server/websocket.ts：20 msg/s）叠上每 IP 50 条连接，理论放大到 ~1000 q/s 的
+// 匿名 DB 查询。合法客户端每条连接只 join 一次（重连后再一次），因此这里再加一层
+// **每 socket** 的 join 预算即可把放大砍掉一个量级，且完全不触碰 SHARE-REVOKE-001
+// 的判定口径（不缓存查询结果 —— 缓存会让已撤销的 token 在 TTL 内继续 join 成功）。
+const JOIN_BUCKET_CAPACITY = 5;
+const JOIN_REFILL_PER_SEC = 1;
+
+interface JoinRateState {
+  tokens: number;
+  lastRefillMs: number;
+}
+
+function consumeJoinToken(socket: Socket): boolean {
+  const now = Date.now();
+  const state = (socket.data.joinRate as JoinRateState | undefined) ?? {
+    tokens: JOIN_BUCKET_CAPACITY,
+    lastRefillMs: now,
+  };
+  const elapsedMs = now - state.lastRefillMs;
+  if (elapsedMs > 0) {
+    state.tokens = Math.min(
+      JOIN_BUCKET_CAPACITY,
+      state.tokens + (elapsedMs / 1000) * JOIN_REFILL_PER_SEC
+    );
+    state.lastRefillMs = now;
+  }
+  socket.data.joinRate = state;
+
+  if (state.tokens < 1) {
+    return false;
+  }
+  state.tokens -= 1;
+  return true;
+}
+
 function getRoomId(sessionId: string) {
   return `live:${sessionId}`;
 }
@@ -226,65 +284,165 @@ function buildEmptySnapshot(): LiveSnapshot {
     sourceLang: null,
     targetLang: null,
     translationMode: null,
+    truncated: false,
     updatedAt: Date.now(),
   };
 }
 
-function readSessionTranscriptPath(sessionId: string) {
-  const safeSessionId = sanitizePath(sessionId);
-  const fullPath = path.join(TRANSCRIPT_DIR, `${safeSessionId}.json`);
-  assertWithinRoot(fullPath, TRANSCRIPT_DIR);
-  return fullPath;
+/**
+ * 读取**已收尾**会话的转录产物。以 DB 的 `Session.transcriptPath` 为准，不再按
+ * 约定拼 `data/transcripts/{id}.json`。
+ *
+ * 为什么必须改：产物落盘早已改成版本化文件名
+ * （`sessionPersistence.ts` 的 `buildVersionedArtifactFileName` → `{id}-{stamp}.json`），
+ * 先是 `api/sessions/[id]/transcript` 走了 staged 写入，随后 M5 把 finalize 主链路
+ * 也切了过去。约定式路径于是对**所有新收尾的会话必然 ENOENT**，然后静默掉进
+ * catch → 回退读草稿 → 而草稿在收尾时已被删 → 最终给观众推一份空快照。
+ * 整条链全被 catch 吞掉，无任何日志。
+ * 顺带解决另一个老问题：配了 Cloudreve 时产物根本不在本地，约定式路径只能碰运气；
+ * `loadSessionTranscriptBundle` 走 `readArtifactFromReference`，local / cloudreve 两种
+ * 存储都覆盖，并且在引用读不出来时仍会回退试一次 legacy 的 `{id}.json`（老会话不丢）。
+ */
+async function loadFinalizedTranscriptBundle(sessionId: string) {
+  let session: {
+    id: string;
+    userId: string;
+    recordingPath: string | null;
+    transcriptPath: string | null;
+    summaryPath: string | null;
+  } | null = null;
+
+  try {
+    session = await prisma.session.findUnique({
+      where: { id: sessionId },
+      select: {
+        id: true,
+        userId: true,
+        recordingPath: true,
+        transcriptPath: true,
+        summaryPath: true,
+      },
+    });
+  } catch (error) {
+    liveShareLogger.warn(
+      { sessionId, err: serializeError(error) },
+      'Failed to look up session transcript path for live snapshot'
+    );
+    return null;
+  }
+
+  if (!session) {
+    return null;
+  }
+
+  try {
+    const bundle = await loadSessionTranscriptBundle(session);
+    if (!bundle && session.transcriptPath) {
+      // 真异常：DB 登记了产物却读不出来（文件被删 / Cloudreve 不可达 / JSON 损坏）。
+      // 与「冷开分享本来就还没有产物」（transcriptPath 为空）区分开，别一起静默。
+      liveShareLogger.warn(
+        { sessionId, transcriptPath: session.transcriptPath },
+        'Session has a transcript artifact reference but it could not be loaded for the live snapshot'
+      );
+    }
+    return bundle;
+  } catch (error) {
+    liveShareLogger.warn(
+      { sessionId, transcriptPath: session.transcriptPath, err: serializeError(error) },
+      'Failed to load session transcript artifact for the live snapshot'
+    );
+    return null;
+  }
 }
 
+/**
+ * L3：从磁盘（收尾产物 / 转录草稿）恢复的快照此前**绕过全部 clamp** 直接进内存并
+ * 原样作为 initial_state 推给每个 join 的观众。草稿 PUT 侧既无限流也无 segment 体积
+ * 校验（transcriptDraftPersistence.ts 自认），异常巨大的草稿会让服务端常驻 MB 级
+ * 快照、每个观众 join 都拉一遍。这里补齐两道闸，与 sync_snapshot 入口同口径：
+ *   ① 条数/单条长度：复用 MAX_SNAPSHOT_* 与 sanitize*（U24 那套）；
+ *   ② 总字节：按 MAX_PERSISTED_SNAPSHOT_BYTES 保留最近的、裁掉最早的，并置
+ *      truncated 让观众端知道 backlog 不全。
+ */
 function buildSnapshotFrom(parsed: {
   segments?: unknown[];
   translations?: Record<string, string>;
   summaries?: unknown[];
   status?: string;
 }): LiveSnapshot {
+  const clamped = {
+    segments: clampArray(parsed.segments, MAX_SNAPSHOT_SEGMENTS).map(
+      sanitizeSegment
+    ),
+    summaryBlocks: clampArray(parsed.summaries, MAX_SNAPSHOT_SUMMARY_BLOCKS).map(
+      sanitizeSummaryBlock
+    ),
+    translations: sanitizeSnapshotTranslations(parsed.translations),
+  };
+
+  const trimmed = trimSnapshotToByteBudget(clamped, MAX_PERSISTED_SNAPSHOT_BYTES);
+  if (trimmed.truncated) {
+    liveShareLogger.warn(
+      {
+        droppedSegments: trimmed.droppedSegments,
+        droppedSummaryBlocks: trimmed.droppedSummaryBlocks,
+        budgetBytes: MAX_PERSISTED_SNAPSHOT_BYTES,
+      },
+      'Persisted live snapshot exceeded the outbound byte budget; trimmed to the most recent content'
+    );
+  }
+
   return {
-    segments: Array.isArray(parsed.segments) ? parsed.segments : [],
-    translations:
-      parsed.translations && typeof parsed.translations === 'object'
-        ? parsed.translations
-        : {},
-    summaryBlocks: Array.isArray(parsed.summaries) ? parsed.summaries : [],
+    segments: trimmed.segments,
+    translations: trimmed.translations,
+    summaryBlocks: trimmed.summaryBlocks,
     status: typeof parsed.status === 'string' ? parsed.status : null,
     previewText: EMPTY_STREAMING_PREVIEW_TEXT,
     previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
     sourceLang: null,
     targetLang: null,
     translationMode: null,
+    truncated: trimmed.truncated,
     updatedAt: Date.now(),
   };
 }
 
+/**
+ * 观众 join 时服务端内存无快照的回填链，三级：
+ *   ① 已收尾会话的转录产物（按 DB 的 transcriptPath，见 loadFinalizedTranscriptBundle）；
+ *   ② C16：直播进行中的转录草稿 —— 收尾产物只有**收尾之后**才有，冷开分享
+ *      （先录一段再点分享）时必然还不存在，只读 ① 就等于观众永远拿不到开分享前的内容；
+ *   ③ 空快照。
+ * 两级都要过 buildSnapshotFrom 的 clamp（L3），任何一级都不得绕开体积闸。
+ */
 async function loadPersistedSnapshot(sessionId: string): Promise<LiveSnapshot> {
-  try {
-    const fullPath = readSessionTranscriptPath(sessionId);
-    const raw = await fs.readFile(fullPath, 'utf-8');
-    return buildSnapshotFrom(
-      JSON.parse(raw) as Parameters<typeof buildSnapshotFrom>[0]
-    );
-  } catch {
-    // C16：data/transcripts/ 只有**收尾之后**才有文件；直播进行中转录稿在
-    // data/transcript-drafts/。冷开分享（先录一段再点分享）时前者必然不存在，
-    // 只读它就等于观众永远拿不到开分享前的内容。故回退读草稿。
-    try {
-      const draft = await loadTranscriptDraft({ id: sessionId, userId: '' });
-      if (draft) {
-        return buildSnapshotFrom({
-          segments: draft.segments,
-          translations: draft.translations,
-          summaries: draft.summaries,
-        });
-      }
-    } catch {
-      // 草稿不可读也不算错：继续回退到空快照
-    }
-    return buildEmptySnapshot();
+  const bundle = await loadFinalizedTranscriptBundle(sessionId);
+  if (bundle) {
+    return buildSnapshotFrom({
+      segments: bundle.segments,
+      translations: bundle.translations,
+      summaries: bundle.summaries,
+    });
   }
+
+  try {
+    const draft = await loadTranscriptDraft({ id: sessionId, userId: '' });
+    if (draft) {
+      return buildSnapshotFrom({
+        segments: draft.segments,
+        translations: draft.translations,
+        summaries: draft.summaries,
+      });
+    }
+  } catch (error) {
+    // 草稿不可读也不算错（直播尚未产生草稿是常态）：记一条 debug 后回退空快照
+    liveShareLogger.debug(
+      { sessionId, err: serializeError(error) },
+      'Live share transcript draft was unreadable; falling back to an empty snapshot'
+    );
+  }
+
+  return buildEmptySnapshot();
 }
 
 async function getSessionSnapshot(sessionId: string): Promise<LiveSnapshot> {
@@ -644,7 +802,15 @@ export async function revalidateAllLiveRooms(io: SocketIO): Promise<void> {
 }
 
 // sync_snapshot / broadcast 的处理体。抽成模块级函数，是为了让 C16 的监听器能在
-// 鉴权 await 之前同步注册（见 setupLiveShare 里的注释），逻辑本身与此前逐字一致。
+// 鉴权 await 之前同步注册（见 setupLiveShare 里的注释）。
+//
+// H1：现在的 sync_snapshot 是**分块协议**（线协议与打包见 snapshotChunking.ts）：
+//   - 无分块字段            → 旧式单块全量，行为与此前逐字一致（滚动发布/旧客户端）；
+//   - chunkIndex === 0      → 新一批的首块，落进 socket 上的暂存位；
+//   - 0 < chunkIndex        → 续块，按序追加进暂存快照；
+//   - 收满 chunkCount 块    → 原子提交进 snapshots（全量覆盖语义在这一刻才生效）。
+// 之所以要暂存而不是逐块直接覆盖/追加：sync_snapshot 是**全量覆盖**语义（U11），
+// 用半份内容覆盖会把服务端已累积的历史整个抹掉，正是 U11 注释警告过的事故形态。
 function handleSyncSnapshot(
   socket: Socket,
   emitError: (message: string) => void,
@@ -656,6 +822,68 @@ function handleSyncSnapshot(
   }
 
   const sessionId = socket.data.sessionId as string;
+  const chunkMeta = readSnapshotChunkMeta(payload);
+
+  if (chunkMeta.kind === 'invalid') {
+    // 带了分块字段却不合法：**只丢这一条**。两条理由：
+    // ① 绝不降级成「全量覆盖」——把续块当全量就是用残片抹掉历史（U11 的事故形态）；
+    // ② 也不清掉当前暂存——一条畸形消息不该把正在进行的合法批次一起毁掉。
+    liveShareLogger.warn(
+      { socketId: socket.id, sessionId },
+      'Dropped sync_snapshot with malformed chunk metadata'
+    );
+    return;
+  }
+
+  if (chunkMeta.kind === 'chunk' && chunkMeta.meta.chunkIndex > 0) {
+    const staging = socket.data.snapshotStaging as SnapshotStaging | undefined;
+
+    // 不属于当前批次（首块从未到达，或上一批被新批次顶掉后的迟到残块）：只丢这一条。
+    // 这里**不能**顺手清掉暂存——否则上一批的一条迟到续块就能把当前这一批毁掉，
+    // 结果是两批都提交不了、服务端快照停留在更早的旧态。
+    if (!staging || staging.chunkId !== chunkMeta.meta.chunkId) {
+      liveShareLogger.warn(
+        {
+          socketId: socket.id,
+          sessionId,
+          chunkIndex: chunkMeta.meta.chunkIndex,
+          chunkCount: chunkMeta.meta.chunkCount,
+        },
+        'Dropped live snapshot chunk that does not belong to the staged batch'
+      );
+      return;
+    }
+
+    // 同一批次内部乱序/块数对不上：socket.io 在同一条连接上保序，出现这种情况说明
+    // 发送方状态已经错乱，整批作废最安全（主播端每次 (重)连都会重发完整批次）。
+    if (
+      staging.expectedChunks !== chunkMeta.meta.chunkCount ||
+      staging.receivedChunks !== chunkMeta.meta.chunkIndex
+    ) {
+      socket.data.snapshotStaging = undefined;
+      liveShareLogger.warn(
+        {
+          socketId: socket.id,
+          sessionId,
+          chunkIndex: chunkMeta.meta.chunkIndex,
+          chunkCount: chunkMeta.meta.chunkCount,
+          receivedChunks: staging.receivedChunks,
+        },
+        'Dropped out-of-order live snapshot chunk and discarded the staged batch'
+      );
+      return;
+    }
+
+    mergeSnapshotChunk(staging.snapshot, payload);
+    staging.receivedChunks += 1;
+    if (staging.receivedChunks >= staging.expectedChunks) {
+      staging.snapshot.updatedAt = Date.now();
+      snapshots.set(sessionId, staging.snapshot);
+      socket.data.snapshotStaging = undefined;
+    }
+    return;
+  }
+
   const ext = payload as {
     previewText?: StreamingPreviewText | string;
     previewTranslation?: StreamingPreviewTranslation | string;
@@ -711,10 +939,60 @@ function handleSyncSnapshot(
     targetLang: typeof ext.targetLang === 'string' ? ext.targetLang : null,
     translationMode:
       typeof ext.translationMode === 'string' ? ext.translationMode : null,
+    truncated: (payload as { truncated?: unknown }).truncated === true,
     updatedAt: Date.now(),
   };
 
+  if (chunkMeta.kind === 'chunk' && chunkMeta.meta.chunkCount > 1) {
+    // 多块批次的首块：先暂存，集齐才提交（见函数头注释）。旧快照在这期间保持不变，
+    // 期间 join 的观众读到的是**上一份完整快照**（或磁盘草稿），不会是半份。
+    socket.data.snapshotStaging = {
+      chunkId: chunkMeta.meta.chunkId,
+      expectedChunks: chunkMeta.meta.chunkCount,
+      receivedChunks: 1,
+      snapshot: nextSnapshot,
+    } satisfies SnapshotStaging;
+    return;
+  }
+
+  socket.data.snapshotStaging = undefined;
   snapshots.set(sessionId, nextSnapshot);
+}
+
+/**
+ * H1：把一个续块并进暂存快照。刻意复用 mergeTranscriptSegment / mergeSummaryBlock
+ * 与译文条目上限 —— 它们已经带了 U24 的「增量路径不得绕过条数上限」守卫，也按 id
+ * 去重，所以重复块（极端时序下同一批次被重发）是幂等的。
+ * 续块只带三大集合；status / preview / 语言等头部字段只随首块来（见 I3）。
+ */
+function mergeSnapshotChunk(
+  snapshot: LiveSnapshot,
+  payload: Partial<LiveSnapshot>
+) {
+  if (Array.isArray(payload.segments)) {
+    for (const segment of payload.segments) {
+      mergeTranscriptSegment(snapshot, segment);
+    }
+  }
+  if (Array.isArray(payload.summaryBlocks)) {
+    for (const block of payload.summaryBlocks) {
+      mergeSummaryBlock(snapshot, block);
+    }
+  }
+
+  const translations = sanitizeSnapshotTranslations(payload.translations);
+  for (const [key, value] of Object.entries(translations)) {
+    const isNewKey = !Object.prototype.hasOwnProperty.call(
+      snapshot.translations,
+      key
+    );
+    if (
+      !isNewKey ||
+      Object.keys(snapshot.translations).length < MAX_SNAPSHOT_TRANSLATIONS
+    ) {
+      snapshot.translations[key] = value;
+    }
+  }
 }
 
 async function handleBroadcast(
@@ -844,6 +1122,16 @@ export function setupLiveShare(io: SocketIO): () => void {
     }
 
     socket.on('join', async ({ shareToken }: ViewerJoinPayload) => {
+      // L5：先过每 socket join 预算，再碰 DB —— 守卫必须在查询之前，否则等于没守。
+      if (!consumeJoinToken(socket)) {
+        liveShareLogger.warn(
+          { socketId: socket.id, clientIp: socket.data.clientIp },
+          'Throttled live share join flood'
+        );
+        emitError('Too many join attempts');
+        return;
+      }
+
       try {
         const safeToken = sanitizeToken(shareToken ?? '');
         const link = await resolveViewerLink(safeToken);

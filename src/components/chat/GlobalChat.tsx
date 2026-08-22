@@ -403,25 +403,33 @@ export default function GlobalChat({
 
   // Zustand chat store — 偏好/模型列表全局共享；运行时态按 conversationId 隔离
   // （模型/思考选择与模型列表拉取已抽到 ComposerModelControls，这里只读发送所需的值）
-  const {
-    selectedModel,
-    selectedThinkingPreference,
-    availableModels,
-    byConversation,
-    setActiveConversation,
-    setMessages,
-    addMessage,
-    updateMessage,
-    setLoading,
-    setTokenUsage,
-    resetConversation,
-    setContextFull,
-  } = useChatStore();
+  //
+  // L49：这里原本是无 selector 的 `useChatStore()`，等于订阅整个 store —— 任意一个对话的
+  // SSE 每来一个 delta（updateMessage 会重建 byConversation）就把所有使用方全量重渲染，
+  // 包括正在看别的对话的实例。改成逐字段 selector：actions 在 create() 里定义一次、引用恒定，
+  // 运行时切片只订阅**本对话**那一片，语义完全不变，只是不再为别人的 delta 重渲染。
+  const selectedModel = useChatStore((s) => s.selectedModel);
+  const selectedThinkingPreference = useChatStore(
+    (s) => s.selectedThinkingPreference
+  );
+  const availableModels = useChatStore((s) => s.availableModels);
+  const setActiveConversation = useChatStore((s) => s.setActiveConversation);
+  const setMessages = useChatStore((s) => s.setMessages);
+  const addMessage = useChatStore((s) => s.addMessage);
+  const updateMessage = useChatStore((s) => s.updateMessage);
+  const setLoading = useChatStore((s) => s.setLoading);
+  const setTokenUsage = useChatStore((s) => s.setTokenUsage);
+  const resetConversation = useChatStore((s) => s.resetConversation);
+  const setContextFull = useChatStore((s) => s.setContextFull);
 
   // 本对话的运行时切片 —— messages/archivedMessages/isLoading/contextFull/tokenUsage 全从这里取（不再读全局单例）
   // U19：此前漏读 archivedMessages，压缩过的对话里早期历史被永久隐藏、无展开入口。
+  // selector 返回的是 store 里已存在的对象引用（缺省时是模块级常量），引用稳定，
+  // 不会触发 zustand v5 的 "getSnapshot should be cached" 无限循环。
   const { messages, archivedMessages, isLoading, contextFull, tokenUsage } =
-    byConversation[conversationId] ?? EMPTY_CONVERSATION_RUNTIME;
+    useChatStore(
+      (s) => s.byConversation[conversationId] ?? EMPTY_CONVERSATION_RUNTIME
+    );
 
   /* ── 局部 UI state ── */
   const [input, setInput] = useState('');
@@ -477,6 +485,11 @@ export default function GlobalChat({
     resetConversation(conversationId);
     setActiveConversation(conversationId);
     setAttachments([]);
+    // M21：录音 pill 也必须一起清。组件按 conversationId 复用、不卸载，不清就会在新对话的
+    // recordings fetch 返回之前，把**上一个对话**的 pill 原样显示出来（还能点 X 去删——
+    // DELETE 打的却是新对话）。recordingsReady 一并复位，避免用旧对话的就绪态开放操作。
+    setRecordings([]);
+    setRecordingsReady(false);
     setEndedAt(null);
     // 切换对话时清掉上一对话残留的草稿 / 待发图片 / 图片错误，否则 A 的输入和图片会串到 B
     // 并在 B 里被发送出去。（下面 pending-first-message 流会在加载完成后再把首页暂存文本放回。）
@@ -871,6 +884,9 @@ export default function GlobalChat({
   const handleDetachRecording = useCallback(
     async (sessionId: string) => {
       if (!token) return;
+      // M21：记录发起删除时的活跃对话（与 removeAttachment 同一范式）。DELETE 返回时用户
+      // 可能已切走，迟到的失败回滚不能把旧对话的 pill 列表写进新对话视图。
+      const startConv = useChatStore.getState().activeConversationId;
       const prevList = recordings;
       // 乐观更新
       setRecordings((cur) => cur.filter((r) => r.sessionId !== sessionId));
@@ -888,12 +904,16 @@ export default function GlobalChat({
           }
         );
         if (!res.ok) {
-          setRecordings(prevList);
-          toast.error(t('common.operationFailed'));
+          if (useChatStore.getState().activeConversationId === startConv) {
+            setRecordings(prevList); // 回滚（仅当仍停留在同一对话）
+            toast.error(t('common.operationFailed'));
+          }
         }
       } catch {
-        setRecordings(prevList);
-        toast.error(t('common.networkError'));
+        if (useChatStore.getState().activeConversationId === startConv) {
+          setRecordings(prevList);
+          toast.error(t('common.networkError'));
+        }
       }
     },
     [conversationId, token, t, recordings]

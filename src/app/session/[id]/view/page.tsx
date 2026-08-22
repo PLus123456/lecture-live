@@ -19,6 +19,11 @@ import { useSummaryStore } from '@/stores/summaryStore';
 import { useSharedLinksStore } from '@/stores/sharedLinksStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import { useViewerSettingsStore } from '@/stores/viewerSettingsStore';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
 import { SettingsToggle, SettingsDrawer } from '@/components/viewer/ViewerSettingsPanel';
 import LiveShareBadge from '@/components/session/LiveShareBadge';
 import { ViewerTranscriptPanel } from './ViewerTranscriptPanel';
@@ -507,10 +512,24 @@ export default function ViewerPage() {
     clearTranscript();
     clearSummaries();
     clearTranslations();
+    const expected = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
+    let disposed = false;
+    const commitViewerUpdate = (update: () => void) =>
+      runAuthBoundaryCommit(expected, () => {
+        if (disposed || ownerSignal.aborted) return false;
+        update();
+        return true;
+      });
 
-    fetch(`/api/share/view/${encodeURIComponent(shareToken)}`)
-      .then((r) => r.json())
-      .then((data) => {
+    void (async () => {
+      try {
+        const response = await fetch(
+          `/api/share/view/${encodeURIComponent(shareToken)}`,
+          { signal: ownerSignal }
+        );
+        const data = await response.json();
+        const committed = await commitViewerUpdate(() => {
         if (data.error) {
           setError(data.error);
           setLoading(false);
@@ -550,52 +569,35 @@ export default function ViewerPage() {
         // 进行中的会话：连接 WebSocket 实时接收数据
         joinAsViewer(shareToken, {
           onInitialState: (snapshot) => {
-            // C6：每次 socket.io 自动重连都会重新 emit join → 服务端重发全量快照，
-            // 而 addFinalSegment/addBlock 按 id 追加不去重，盲目重填会让转录/摘要
-            // 成倍复制。重填前先清空三个 store，保证快照即为当前全量、无重复。
-            clearTranscript();
-            clearSummaries();
-            clearTranslations();
-            if (snapshot.segments) {
-              (snapshot.segments as TranscriptSegment[]).forEach(addFinalSegment);
-            }
-            if (snapshot.translations) {
-              Object.entries(snapshot.translations).forEach(([segmentId, translation]) => {
-                setTranslation(segmentId, translation);
-              });
-            }
-            if (snapshot.summaryBlocks) {
-              (snapshot.summaryBlocks as SummaryBlock[]).forEach(addBlock);
-            }
-            // 恢复当前预览文本
-            if (snapshot.previewText) {
-              updatePreview(snapshot.previewText);
-            }
-            if (snapshot.previewTranslation) {
-              updatePreviewTranslation(snapshot.previewTranslation);
-            }
-            setLoading(false);
+            void commitViewerUpdate(() => {
+              // C6：每次 socket.io 自动重连都会重新 emit join → 服务端重发全量快照，
+              // 而 addFinalSegment/addBlock 按 id 追加不去重，盲目重填会让转录/摘要
+              // 成倍复制。重填前先清空三个 store，保证快照即为当前全量、无重复。
+              clearTranscript();
+              clearSummaries();
+              clearTranslations();
+              if (snapshot.segments) {
+                (snapshot.segments as TranscriptSegment[]).forEach(addFinalSegment);
+              }
+              if (snapshot.translations) {
+                Object.entries(snapshot.translations).forEach(([segmentId, translation]) => {
+                  setTranslation(segmentId, translation);
+                });
+              }
+              if (snapshot.summaryBlocks) {
+                (snapshot.summaryBlocks as SummaryBlock[]).forEach(addBlock);
+              }
+              // 恢复当前预览文本
+              if (snapshot.previewText) updatePreview(snapshot.previewText);
+              if (snapshot.previewTranslation) {
+                updatePreviewTranslation(snapshot.previewTranslation);
+              }
+              setLoading(false);
+            });
           },
           onTranscriptDelta: (delta) => {
-            // 新段落到达时清空预览（该段落已从预览变为正式段落）
-            updatePreview({ finalText: '', nonFinalText: '' });
-            updatePreviewTranslation({
-              finalText: '',
-              nonFinalText: '',
-              state: 'idle',
-              sourceLanguage: null,
-            });
-            addFinalSegment(delta as TranscriptSegment);
-          },
-          onTranslationDelta: ({ segmentId, translation }) => {
-            setTranslation(segmentId, translation);
-          },
-          onSummaryUpdate: (block) => {
-            addBlock(block as SummaryBlock);
-          },
-          onStatusUpdate: ({ status: newStatus }) => {
-            if (newStatus === 'SHARE_OFFLINE' || newStatus === 'COMPLETED') {
-              // 录制结束：清空预览，切换到静态模式
+            void commitViewerUpdate(() => {
+              // 新段落到达时清空预览（该段落已从预览变为正式段落）
               updatePreview({ finalText: '', nonFinalText: '' });
               updatePreviewTranslation({
                 finalText: '',
@@ -603,32 +605,67 @@ export default function ViewerPage() {
                 state: 'idle',
                 sourceLanguage: null,
               });
-              setIsCompleted(true);
-              setSessionInfo((prev) => prev ? { ...prev, status: newStatus } : prev);
-            } else if (newStatus === 'SHARE_LIVE') {
-              // C3：主播瞬断（Wi-Fi 切换 / ping 超时）后重连成功，服务端广播 SHARE_LIVE。
-              // 观众自身 socket 通常并未断开、内存快照仍在，只是此前可能因误报的
-              // SHARE_OFFLINE 被单向锁成静态完成态——这里解锁回实时视图，后续增量继续渲染。
-              setIsCompleted(false);
-              setSessionInfo((prev) => prev ? { ...prev, status: 'LIVE' } : prev);
-            }
+              addFinalSegment(delta as TranscriptSegment);
+            });
+          },
+          onTranslationDelta: ({ segmentId, translation }) => {
+            void commitViewerUpdate(() => setTranslation(segmentId, translation));
+          },
+          onSummaryUpdate: (block) => {
+            void commitViewerUpdate(() => addBlock(block as SummaryBlock));
+          },
+          onStatusUpdate: ({ status: newStatus }) => {
+            void commitViewerUpdate(() => {
+              if (newStatus === 'SHARE_OFFLINE' || newStatus === 'COMPLETED') {
+                // 录制结束：清空预览，切换到静态模式
+                updatePreview({ finalText: '', nonFinalText: '' });
+                updatePreviewTranslation({
+                  finalText: '',
+                  nonFinalText: '',
+                  state: 'idle',
+                  sourceLanguage: null,
+                });
+                setIsCompleted(true);
+                setSessionInfo((prev) => prev ? { ...prev, status: newStatus } : prev);
+              } else if (newStatus === 'SHARE_LIVE') {
+                // C3：主播瞬断后重连成功，解除静态完成态。
+                setIsCompleted(false);
+                setSessionInfo((prev) => prev ? { ...prev, status: 'LIVE' } : prev);
+              }
+            });
           },
           onPreviewUpdate: ({ previewText, previewTranslation }) => {
-            updatePreview(previewText);
-            updatePreviewTranslation(previewTranslation);
+            void commitViewerUpdate(() => {
+              updatePreview(previewText);
+              updatePreviewTranslation(previewTranslation);
+            });
           },
           onError: (err) => {
-            setError(err.message);
-            setLoading(false);
+            void commitViewerUpdate(() => {
+              setError(err.message);
+              setLoading(false);
+            });
           },
         });
-      })
-      .catch(() => {
-        setError(t('viewer.loadSessionFailed'));
-        setLoading(false);
-      });
+        });
+        if (!committed.committed || !committed.value) return;
+      } catch (error) {
+        if (
+          disposed ||
+          ownerSignal.aborted ||
+          (error instanceof DOMException && error.name === 'AbortError')
+        ) {
+          return;
+        }
+        await commitViewerUpdate(() => {
+          setError(t('viewer.loadSessionFailed'));
+          setLoading(false);
+        });
+      }
+    })();
 
     return () => {
+      disposed = true;
       leaveAsViewer();
       clearTranscript();
       clearSummaries();

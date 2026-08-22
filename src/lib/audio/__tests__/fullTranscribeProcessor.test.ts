@@ -1,33 +1,32 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-/**
- * P5-18 回归：完整版补全转录在 CAS 抢不到时只删了 Soniox **file**，泄漏 transcription。
- *
- * 走到那一步时 fullSonioxFileId / fullSonioxTranscriptionId 都还没写进 DB（正是这条 CAS 要写的），
- * 所以漏掉的 transcription 是谁都查不到的孤儿：回收 cron 只按 DB 里的 ID 去删。对照
- * asyncUploadProcessor 的同一处（两个都删）。
- */
 const {
   sessionFindUniqueMock,
   sessionUpdateManyMock,
-  loadAudioMock,
+  mkdirMock,
+  rmMock,
+  validateContainerMock,
+  transcodeMock,
   probeDurationMock,
   uploadSonioxFileMock,
   createTranscriptionMock,
   deleteSonioxFileMock,
   deleteSonioxTranscriptionMock,
-  settleFullMock,
+  failAttemptMock,
   resolveRegionMock,
 } = vi.hoisted(() => ({
   sessionFindUniqueMock: vi.fn(),
   sessionUpdateManyMock: vi.fn(),
-  loadAudioMock: vi.fn(),
+  mkdirMock: vi.fn(),
+  rmMock: vi.fn(),
+  validateContainerMock: vi.fn(),
+  transcodeMock: vi.fn(),
   probeDurationMock: vi.fn(),
   uploadSonioxFileMock: vi.fn(),
   createTranscriptionMock: vi.fn(),
   deleteSonioxFileMock: vi.fn(),
   deleteSonioxTranscriptionMock: vi.fn(),
-  settleFullMock: vi.fn(),
+  failAttemptMock: vi.fn(),
   resolveRegionMock: vi.fn(),
 }));
 
@@ -40,19 +39,12 @@ vi.mock('@/lib/logger', () => ({
   logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 vi.mock('fs/promises', () => ({
-  default: {
-    mkdir: vi.fn(() => Promise.resolve(undefined)),
-    writeFile: vi.fn(() => Promise.resolve(undefined)),
-    rm: vi.fn(() => Promise.resolve(undefined)),
-  },
+  default: { mkdir: mkdirMock, rm: rmMock },
 }));
 vi.mock('@/lib/audio/ffmpegTranscode', () => ({
   probeDurationSec: probeDurationMock,
-  transcodeToMp3: vi.fn(() => Promise.resolve(undefined)),
-  validateMediaContainer: vi.fn(() => Promise.resolve(undefined)),
-}));
-vi.mock('@/lib/sessionPersistence', () => ({
-  loadSessionAudioArtifact: loadAudioMock,
+  transcodeToMp3: transcodeMock,
+  validateMediaContainer: validateContainerMock,
 }));
 vi.mock('@/lib/soniox/env', () => ({
   resolveAndPersistTaskRegion: resolveRegionMock,
@@ -63,11 +55,28 @@ vi.mock('@/lib/soniox/asyncFile', () => ({
   deleteSonioxFile: deleteSonioxFileMock,
   deleteSonioxTranscription: deleteSonioxTranscriptionMock,
 }));
-vi.mock('@/lib/quota', () => ({ settleFullReservation: settleFullMock }));
+vi.mock('@/lib/audio/fullTranscribeAdmission', () => ({
+  failFullTranscribeAttempt: failAttemptMock,
+}));
 
-import { processFullTranscribe } from '@/lib/audio/fullTranscribeProcessor';
+import {
+  processFullTranscribe,
+  type FullTranscribeProcessRequest,
+} from '@/lib/audio/fullTranscribeProcessor';
 
 const CONFIG = { region: 'eu', restBaseUrl: 'https://x', apiKey: 'k' };
+const request: FullTranscribeProcessRequest = {
+  sessionId: 's1',
+  claimId: 'claim-1',
+  input: {
+    inputPath: '/recordings/s1.webm',
+    workDir: '/tmp/full/s1--claim-1',
+    contentType: 'audio/webm',
+    sizeBytes: 4096,
+    source: 'local',
+  },
+  authoritativeDurationMs: 120_000,
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -77,59 +86,136 @@ beforeEach(() => {
     sourceLang: 'en',
     targetLang: 'zh',
     sonioxRegion: 'eu',
+    fullTranscribeClaimId: 'claim-1',
   });
-  loadAudioMock.mockResolvedValue({ data: Buffer.from('audio'), fileName: 'in.webm' });
+  sessionUpdateManyMock.mockResolvedValue({ count: 1 });
+  mkdirMock.mockResolvedValue(undefined);
+  rmMock.mockResolvedValue(undefined);
+  validateContainerMock.mockResolvedValue(undefined);
+  transcodeMock.mockResolvedValue({
+    outputPath: '/tmp/full/s1--claim-1/audio.mp3',
+    durationSec: 120,
+    outputSize: 1024,
+  });
   probeDurationMock.mockResolvedValue(120);
   resolveRegionMock.mockResolvedValue(CONFIG);
   uploadSonioxFileMock.mockResolvedValue({ id: 'file-1' });
   createTranscriptionMock.mockResolvedValue({ id: 'job-1' });
   deleteSonioxFileMock.mockResolvedValue(true);
   deleteSonioxTranscriptionMock.mockResolvedValue(true);
-  settleFullMock.mockResolvedValue(0);
-  sessionUpdateManyMock.mockResolvedValue({ count: 1 });
+  failAttemptMock.mockResolvedValue(true);
 });
 
-describe('processFullTranscribe Soniox 资源清理 (P5-18)', () => {
-  it('▶ 负向（核心）：transcribing CAS 抢不到 → transcription 与 file **都**要删，且先 transcription 后 file', async () => {
-    sessionUpdateManyMock
-      .mockResolvedValueOnce({ count: 1 }) // pending → transcoding
-      .mockResolvedValueOnce({ count: 0 }); // transcoding → transcribing 抢不到（被取消/重置）
+describe('processFullTranscribe — claimed path pipeline', () => {
+  it('uses the prepared path directly and binds every status CAS to claimId', async () => {
+    await expect(processFullTranscribe(request)).resolves.toBeUndefined();
 
-    await expect(processFullTranscribe('s1')).resolves.toBeUndefined();
-
-    // 旧实现只删 file，把已创建的 transcription 留成 DB 里没有 ID 的永久孤儿。
-    expect(deleteSonioxTranscriptionMock).toHaveBeenCalledWith(CONFIG, 'job-1');
-    expect(deleteSonioxFileMock).toHaveBeenCalledWith(CONFIG, 'file-1');
-    expect(
-      deleteSonioxTranscriptionMock.mock.invocationCallOrder[0]
-    ).toBeLessThan(deleteSonioxFileMock.mock.invocationCallOrder[0]);
-  });
-
-  it('▶ 负向：建完 transcription 后的非 halt 异常（CAS 抛错）同样两个都清', async () => {
-    sessionUpdateManyMock
-      .mockResolvedValueOnce({ count: 1 }) // pending → transcoding
-      .mockRejectedValueOnce(new Error('db down')) // transcribing CAS 抛错
-      .mockResolvedValue({ count: 1 }); // 标 failed
-
-    await expect(processFullTranscribe('s1')).resolves.toBeUndefined();
-
-    expect(deleteSonioxTranscriptionMock).toHaveBeenCalledWith(CONFIG, 'job-1');
-    expect(deleteSonioxFileMock).toHaveBeenCalledWith(CONFIG, 'file-1');
-    // 抢到 failed 终态 → 释放入口预留（R4 既有行为，不能被本次改动破坏）
-    expect(settleFullMock).toHaveBeenCalledWith('s1');
-  });
-
-  it('正常路径：CAS 抢到 → 不删任何 Soniox 资源（转录还要跑）', async () => {
-    await expect(processFullTranscribe('s1')).resolves.toBeUndefined();
-
-    expect(deleteSonioxTranscriptionMock).not.toHaveBeenCalled();
-    expect(deleteSonioxFileMock).not.toHaveBeenCalled();
-    // CAS 写入两个 Soniox 引用
-    const casCall = sessionUpdateManyMock.mock.calls[1][0];
-    expect(casCall.data).toMatchObject({
-      fullTranscribeStatus: 'transcribing',
-      fullSonioxFileId: 'file-1',
-      fullSonioxTranscriptionId: 'job-1',
+    expect(validateContainerMock).toHaveBeenCalledWith('/recordings/s1.webm');
+    expect(transcodeMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        inputPath: '/recordings/s1.webm',
+        outputPath: '/tmp/full/s1--claim-1/audio.mp3',
+        durationSec: 120,
+      })
+    );
+    expect(sessionUpdateManyMock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        where: expect.objectContaining({ fullTranscribeClaimId: 'claim-1' }),
+        data: expect.objectContaining({ fullTranscribeStatus: 'transcoding' }),
+      })
+    );
+    expect(sessionUpdateManyMock).toHaveBeenNthCalledWith(
+      4,
+      expect.objectContaining({
+        where: expect.objectContaining({ fullTranscribeClaimId: 'claim-1' }),
+        data: expect.objectContaining({
+          fullTranscribeStatus: 'transcribing',
+          fullSonioxFileId: 'file-1',
+          fullSonioxTranscriptionId: 'job-1',
+        }),
+      })
+    );
+    expect(rmMock).toHaveBeenCalledWith(request.input.workDir, {
+      recursive: true,
+      force: true,
     });
+  });
+
+  it('stale worker with an old claim performs no media or remote work and cleans only its dir', async () => {
+    sessionFindUniqueMock.mockResolvedValueOnce({
+      id: 's1',
+      fullTranscribeClaimId: 'newer-claim',
+    });
+
+    await expect(processFullTranscribe(request)).resolves.toBeUndefined();
+
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+    expect(validateContainerMock).not.toHaveBeenCalled();
+    expect(transcodeMock).not.toHaveBeenCalled();
+    expect(uploadSonioxFileMock).not.toHaveBeenCalled();
+    expect(rmMock).toHaveBeenCalledOnce();
+  });
+
+  it('transcribing CAS loss deletes both unpersisted Soniox resources in dependency order', async () => {
+    sessionUpdateManyMock
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+
+    await expect(processFullTranscribe(request)).resolves.toBeUndefined();
+
+    expect(deleteSonioxTranscriptionMock).toHaveBeenCalledWith(CONFIG, 'job-1');
+    expect(deleteSonioxFileMock).toHaveBeenCalledWith(CONFIG, 'file-1');
+    expect(deleteSonioxTranscriptionMock.mock.invocationCallOrder[0]).toBeLessThan(
+      deleteSonioxFileMock.mock.invocationCallOrder[0]
+    );
+    expect(failAttemptMock).not.toHaveBeenCalled();
+  });
+
+  it('lease loss after transcode stops before Soniox upload', async () => {
+    sessionUpdateManyMock
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+
+    await expect(processFullTranscribe(request)).resolves.toBeUndefined();
+
+    expect(transcodeMock).toHaveBeenCalledOnce();
+    expect(uploadSonioxFileMock).not.toHaveBeenCalled();
+    expect(createTranscriptionMock).not.toHaveBeenCalled();
+    expect(failAttemptMock).not.toHaveBeenCalled();
+    expect(rmMock).toHaveBeenCalledOnce();
+  });
+
+  it('processing failure marks only this claim failed, releases reservation and cleans temp', async () => {
+    transcodeMock.mockRejectedValueOnce(new Error('corrupt media'));
+    sessionUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    await expect(processFullTranscribe(request)).resolves.toBeUndefined();
+
+    expect(failAttemptMock).toHaveBeenCalledWith({
+      sessionId: 's1',
+      claimId: 'claim-1',
+      allowedStatuses: ['pending', 'transcoding'],
+      error: 'corrupt media',
+    });
+    expect(rmMock).toHaveBeenCalledOnce();
+  });
+
+  it('DB failure after Soniox task creation cleans transcription and file, then releases quota', async () => {
+    sessionUpdateManyMock
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 1 })
+      .mockRejectedValueOnce(new Error('db down'));
+
+    await expect(processFullTranscribe(request)).resolves.toBeUndefined();
+
+    expect(deleteSonioxTranscriptionMock).toHaveBeenCalledWith(CONFIG, 'job-1');
+    expect(deleteSonioxFileMock).toHaveBeenCalledWith(CONFIG, 'file-1');
+    expect(failAttemptMock).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 's1', claimId: 'claim-1' })
+    );
   });
 });

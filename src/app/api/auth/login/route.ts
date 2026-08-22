@@ -2,12 +2,17 @@ import { NextResponse } from 'next/server';
 import {
   CLIENT_SESSION_TOKEN,
   EMAIL_NOT_VERIFIED_ERROR,
+  getAuthTokenSessionBinding,
   getJwtExpiryConfig,
   login,
   setAuthCookie,
 } from '@/lib/auth';
+import {
+  enforcePublicAuthPrelude,
+  publicAuthAccountKey,
+  readPublicAuthJson,
+} from '@/lib/publicAuth';
 import { enforceRateLimit } from '@/lib/rateLimit';
-import { resolveRequestClientIp } from '@/lib/clientIp';
 import { logAction } from '@/lib/auditLog';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { normalizeEmail } from '@/lib/email/domains';
@@ -15,44 +20,31 @@ import { isEmailEnabled } from '@/lib/email';
 import { maybeNotifyNewDeviceLogin } from '@/lib/email/loginAlert';
 
 export async function POST(req: Request) {
-  let body: { email?: string; password?: string };
+  const prelude = await enforcePublicAuthPrelude(req, {
+    scope: 'login',
+    endpointIpLimit: 50,
+    endpointWindowMs: 60_000,
+  });
+  if (prelude.response) return prelude.response;
+
+  const parsed = await readPublicAuthJson<{ email?: string; password?: string }>(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   const siteSettings = await getSiteSettings().catch(() => null);
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json(
-      { error: 'Invalid request body' },
-      { status: 400 }
-    );
-  }
 
   // 按 email 维度限流，避免共享 IP 环境下误伤其他用户（针对单账号的暴破被节流）。
   const authLimit = siteSettings?.rate_limit_auth ?? 10;
   const emailKey = normalizeEmail(body.email ?? '').slice(0, 255);
-  const rateLimited = await enforceRateLimit(req, {
-    scope: 'auth:login',
-    limit: authLimit,
-    windowMs: 60_000,
-    ...(emailKey ? { key: `email:${emailKey}` } : {}),
-  });
+  const rateLimited = emailKey
+    ? await enforceRateLimit(req, {
+        scope: 'auth:login',
+        limit: authLimit,
+        windowMs: 60_000,
+        key: publicAuthAccountKey('email', emailKey),
+      })
+    : null;
   if (rateLimited) {
     return rateLimited;
-  }
-
-  // 安全：额外按真实来源 IP 限流，挡「横向密码喷洒」（一个弱口令遍历海量 email，
-  // 每个 email 各享独立 email 桶，单纯 email 限流挡不住）。仅当 IP 可确定时启用，
-  // trusted_proxy=false（'unknown'）则跳过以免退化成全局桶反被 DoS。
-  const clientIp = resolveRequestClientIp(req);
-  if (clientIp !== 'unknown') {
-    const ipLimited = await enforceRateLimit(req, {
-      scope: 'auth:login:ip',
-      limit: authLimit * 5,
-      windowMs: 60_000,
-      key: `ip:${clientIp}`,
-    });
-    if (ipLimited) {
-      return ipLimited;
-    }
   }
 
   try {
@@ -96,10 +88,12 @@ export async function POST(req: Request) {
         role: user.role,
       },
       token: CLIENT_SESSION_TOKEN,
+      sessionBinding: getAuthTokenSessionBinding(token),
     });
 
     // 设置 HttpOnly cookie（使用数据库配置的过期天数）
     setAuthCookie(response, token, { maxAge: jwtConfig.cookieMaxAge });
+    response.headers.set('Clear-Site-Data', '"cache"');
 
     return response;
   } catch (error) {

@@ -170,7 +170,19 @@ export async function resolveSessionTerms(options: {
       sessionKeywords,
       fileKeywords,
     });
-  } catch {
+  } catch (error) {
+    // AuthSessionMonitor uses AbortError to fence account-bound responses. A
+    // fallback is safe for an ordinary network failure, but swallowing this
+    // particular error would turn a rejected A request into successful A
+    // terms after B has already completed account cleanup.
+    if (
+      error &&
+      typeof error === 'object' &&
+      'name' in error &&
+      error.name === 'AbortError'
+    ) {
+      throw error;
+    }
     return mergeSessionTerms({ sessionKeywords, fileKeywords });
   }
 }

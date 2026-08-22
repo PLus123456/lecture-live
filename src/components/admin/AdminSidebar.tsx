@@ -9,6 +9,7 @@ import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useAdminTabs, useAdminTabState } from './adminTabs';
+import { toast } from '@/stores/toastStore';
 
 /**
  * 管理面板侧栏（桌面）—— 与 ChatSidebar 同一套 SlidingSidebar 滑动模式：
@@ -121,7 +122,14 @@ export default function AdminSidebar({ visible }: { visible: boolean }) {
               </button>
               <button
                 onClick={async () => {
-                  await logout();
+                  const result = await logout();
+                  if (!result.durableRevocation) {
+                    toast.error(
+                      t('auth.logoutIncomplete'),
+                      t('auth.logoutIncompleteDescription')
+                    );
+                    return;
+                  }
                   router.replace('/login');
                 }}
                 className="w-7 h-7 rounded-md flex items-center justify-center

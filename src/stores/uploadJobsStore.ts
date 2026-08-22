@@ -59,6 +59,7 @@ interface UploadJobsStore {
   ) => string;
   update: (id: string, patch: Partial<UploadJob>) => void;
   remove: (id: string) => void;
+  clearAll: () => void;
   get: (id: string) => UploadJob | undefined;
   list: () => UploadJob[];
 }
@@ -146,6 +147,8 @@ export const useUploadJobsStore = create<UploadJobsStore>()(
           return { jobs: next };
         }),
 
+      clearAll: () => set({ jobs: {} }),
+
       get: (id) => get().jobs[id],
       list: () => Object.values(get().jobs),
     }),
@@ -192,5 +195,13 @@ export const uploadJobs = {
     }
     cancelHandles.delete(id);
     useUploadJobsStore.getState().update(id, { status: 'canceled' });
+  },
+  /** 换号/登出：先中止本进程全部 pipeline/poll，再清空持久 job 元数据。 */
+  clearForAccountSwitch: () => {
+    for (const cancel of cancelHandles.values()) {
+      try { cancel(); } catch { /* ignore */ }
+    }
+    cancelHandles.clear();
+    useUploadJobsStore.getState().clearAll();
   },
 };

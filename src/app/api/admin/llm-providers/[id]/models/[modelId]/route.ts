@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 // 有效的 LLM 用途枚举值
 const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING', 'TRANSLATION'];
@@ -17,8 +17,8 @@ export async function PATCH(
     limit: 30,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -99,26 +99,54 @@ export async function PATCH(
     if (body.isDefault !== undefined) {
       updateData.isDefault = Boolean(body.isDefault);
     }
-    if (finalIsDefault) {
-      await prisma.llmModel.updateMany({
-        where: {
-          purpose: finalPurpose,
-          isDefault: true,
-          id: { not: modelId },
-        },
-        data: { isDefault: false },
+    const model = await prisma.$transaction(async (tx) => {
+      if (finalIsDefault) {
+        await tx.llmModel.updateMany({
+          where: {
+            purpose: finalPurpose,
+            isDefault: true,
+            id: { not: modelId },
+          },
+          data: { isDefault: false },
+        });
+      }
+      const updated = await tx.llmModel.update({
+        where: { id: modelId },
+        data: updateData,
       });
-    }
-
-    const model = await prisma.llmModel.update({
-      where: { id: modelId },
-      data: updateData,
-    });
-
-    // U67：模型级更新补审计
-    logAction(req, 'admin.llm.model.update', {
-      user: admin,
-      detail: `更新 LLM 模型: ${model.modelId} (${finalPurpose}${finalIsDefault ? ', 默认' : ''})`,
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-models.update',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'llm_model', id: modelId, providerId },
+          before: {
+            modelId: existing.modelId,
+            displayName: existing.displayName,
+            purpose: existing.purpose,
+            isDefault: existing.isDefault,
+            thinkingMode: existing.thinkingMode,
+            supportsImage: existing.supportsImage,
+            maxTokens: existing.maxTokens,
+            contextWindow: existing.contextWindow,
+          },
+          after: {
+            modelId: updated.modelId,
+            displayName: updated.displayName,
+            purpose: updated.purpose,
+            isDefault: updated.isDefault,
+            thinkingMode: updated.thinkingMode,
+            supportsImage: updated.supportsImage,
+            maxTokens: updated.maxTokens,
+            contextWindow: updated.contextWindow,
+          },
+          reason: 'admin_update',
+          outcome: 'SUCCESS',
+          metadata: { changedFields: Object.keys(updateData) },
+        },
+        tx
+      );
+      return updated;
     });
 
     return NextResponse.json({ model });
@@ -138,8 +166,8 @@ export async function DELETE(
     limit: 20,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -153,12 +181,26 @@ export async function DELETE(
       return NextResponse.json({ error: '模型不存在' }, { status: 404 });
     }
 
-    await prisma.llmModel.delete({ where: { id: modelId } });
-
-    // U67：模型级删除补审计（删默认模型会静默回落 sortOrder 模型，须留操作者痕迹）
-    logAction(req, 'admin.llm.model.delete', {
-      user: admin,
-      detail: `删除 LLM 模型: ${existing.modelId} (${existing.purpose}${existing.isDefault ? ', 默认' : ''})`,
+    await prisma.$transaction(async (tx) => {
+      await tx.llmModel.delete({ where: { id: modelId } });
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-models.delete',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'llm_model', id: modelId, providerId },
+          before: {
+            modelId: existing.modelId,
+            displayName: existing.displayName,
+            purpose: existing.purpose,
+            isDefault: existing.isDefault,
+          },
+          after: { deleted: true },
+          reason: 'admin_delete',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
     });
 
     return NextResponse.json({ message: '模型已删除' });

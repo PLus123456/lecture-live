@@ -4,7 +4,11 @@ import { prisma } from '@/lib/prisma';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { withRequestLogging } from '@/lib/requestLogger';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
-import { validatePersistedTranscriptBundle } from '@/lib/sessionApi';
+import {
+  admitSessionFinalizePayload,
+  readBoundedSessionJson,
+  SessionTranscriptPayloadError,
+} from '@/lib/sessionApi';
 import {
   finalizeSession,
   FinalizeSessionError,
@@ -23,45 +27,78 @@ export const POST = withRequestLogging(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    // 幂等短路：已 COMPLETED/ARCHIVED 的会话跳过按次限流，直接交给 finalizeSession 的
-    // alreadyCompleted 早退返回成功（其内部仍做归属校验）。避免 429 风暴冷却期内、合法的
-    // 收尾补发（前端 FINALIZING 轮询重试、多标签）被 10/分限流误伤而「收不了尾」。
+    // 幂等短路：已 COMPLETED/ARCHIVED 的会话先在下方做归属校验，然后
+    // 直接返回 alreadyCompleted，不解析必定不会被采纳的请求体。这既避免合法重试被
+    // 10/分限流误伤，也不会暴露一条无限制的大 JSON 解析通道。
     const preCheck = await prisma.session.findUnique({
       where: { id },
-      select: { status: true },
+      select: {
+        status: true,
+        userId: true,
+        recordingPath: true,
+        transcriptPath: true,
+        summaryPath: true,
+        durationMs: true,
+      },
     });
     const alreadyDone =
       preCheck?.status === 'COMPLETED' || preCheck?.status === 'ARCHIVED';
 
-    if (!alreadyDone) {
-      const rateLimited = await enforceRateLimit(req, {
-        scope: 'sessions:finalize',
-        limit: 10,
-        windowMs: 60_000,
-        key: `user:${user.id}`,
+    // Completed retries never adopt their body. Authorize and answer from the
+    // pre-check before parsing it, preserving cheap idempotence without giving
+    // completed/foreign IDs an unlimited 8 MiB JSON parsing lane.
+    if (alreadyDone && preCheck) {
+      if (preCheck.userId !== user.id) {
+        return NextResponse.json({ error: 'Access denied' }, { status: 403 });
+      }
+      const { searchParams } = new URL(req.url);
+      const source = searchParams.get('source') === 'unload' ? 'unload' : 'user';
+      logAction(req, 'session.finalize', {
+        user,
+        detail: `${id} (${source}, already completed)`,
       });
-      if (rateLimited) return rateLimited;
+      await invalidateSessionsApiCache(user.id);
+      return NextResponse.json({
+        success: true,
+        alreadyCompleted: true,
+        recordingPath: preCheck.recordingPath,
+        transcriptPath: preCheck.transcriptPath,
+        summaryPath: preCheck.summaryPath,
+        durationMs: preCheck.durationMs,
+      });
     }
+
+    const rateLimited = await enforceRateLimit(req, {
+      scope: 'sessions:finalize',
+      limit: 10,
+      windowMs: 60_000,
+      key: `user:${user.id}`,
+    });
+    if (rateLimited) return rateLimited;
 
     const { searchParams } = new URL(req.url);
     const finalizeSource =
       searchParams.get('source') === 'unload' ? 'unload' : 'user';
 
-    let clientBundle: ReturnType<typeof validatePersistedTranscriptBundle> = null;
+    let clientBundle: ReturnType<
+      typeof admitSessionFinalizePayload
+    >['clientBundle'] = null;
     let clientDurationMs: number | undefined;
     let clientTitle: string | undefined;
 
     try {
-      const body = await req.json();
-      clientBundle = validatePersistedTranscriptBundle(body);
-      if (typeof body.durationMs === 'number' && body.durationMs > 0) {
-        clientDurationMs = body.durationMs;
+      const body = await readBoundedSessionJson(req, { allowEmpty: true });
+      if (body) {
+        const admitted = admitSessionFinalizePayload(body);
+        clientBundle = admitted.clientBundle;
+        clientDurationMs = admitted.clientDurationMs;
+        clientTitle = admitted.clientTitle;
       }
-      if (typeof body.title === 'string' && body.title.trim()) {
-        clientTitle = body.title.trim().slice(0, 160);
+    } catch (error) {
+      if (error instanceof SessionTranscriptPayloadError) {
+        return NextResponse.json({ error: error.message }, { status: error.status });
       }
-    } catch {
-      // Empty body is allowed. Server-side draft data is the primary source of truth.
+      return NextResponse.json({ error: 'Invalid finalize payload' }, { status: 400 });
     }
 
     try {

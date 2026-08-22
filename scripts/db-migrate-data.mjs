@@ -19,6 +19,9 @@
 
 import { existsSync } from 'fs';
 import { PrismaClient } from '@prisma/client';
+import { ensureRechargeTierAdminConstraint } from './db-security-constraints.mjs';
+import { backfillPaymentFulfillmentState } from './payment-data-migrations.mjs';
+import { backfillTranscriptionChargeLedger } from './transcription-charge-ledger.mjs';
 
 // 独立运行时自动加载 env（与 prisma CLI 读取 .env 的行为一致）。
 // 若 DATABASE_URL 已由环境注入（Docker / systemd / --env-file），则不覆盖。
@@ -148,7 +151,19 @@ async function migrateConversationMessageSeq() {
 
 async function main() {
   console.log('[migrate-data] 开始数据感知迁移（db push 前置）...');
-  await migrateConversationMessageSeq();
+  const securityOnly = process.argv.includes('--security-only');
+  if (!securityOnly) await migrateConversationMessageSeq();
+  // SEC-023：Prisma schema/db push 无法声明 CHECK，故在既有库的前置阶段安装；
+  // 全新库此时还没有 RechargeTier，由 ensure-database 在 db push 后以 --security-only
+  // 再跑一次。本步骤先停用存量 active+ADMIN，再幂等安装数据库硬约束。
+  await ensureRechargeTierAdminConstraint(prisma);
+  // SEC-027/028：生产部署走 db push，不会执行 migrations/ 中的历史 fulfillment 回填。
+  // 此步骤前后各跑一次：旧结构在 pre-push 安全跳过，post-push（--security-only）立即补齐；
+  // 已升级数据库只会更新仍处于默认 pending 的历史终态，重复执行收敛为 0 行。
+  await backfillPaymentFulfillmentState(prisma);
+  // SEC-030：只有 db push 创建逐笔台账表后才能切换存量 counter；前置执行会安全跳过，
+  // post-push 以 SiteSetting 行锁 + 同事务 marker 幂等完成 opening-balance 回填。
+  await backfillTranscriptionChargeLedger(prisma);
   // 注：Conversation.userId 是可空列，db push 加列不会触发 reset，故由 db push 负责加列、
   //     由 scripts/backfill-conversation-user-id.mjs 负责（db push 之后）回填历史归属。
   console.log('[migrate-data] 全部完成');

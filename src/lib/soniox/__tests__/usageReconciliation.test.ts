@@ -285,7 +285,10 @@ describe('回填（usage-logs → grant.actualMs，CAS 恰好一次）', () => {
 
     // ceil(20017/60000)=1 分钟（封顶 maxSessionSeconds/60=15），补扣与台账同事务
     expect(transactionMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('u1', 1, TX);
+    expect(deductMock).toHaveBeenCalledWith('u1', 1, TX, {
+      source: 'soniox_late_usage',
+      referenceId: 'g1',
+    });
     expect(grantUpdateMock).toHaveBeenCalledWith({
       where: { id: 'g1' },
       data: { billedMinutes: 1, settledBy: 'usage_cron' },
@@ -364,7 +367,10 @@ describe('P1-2 迟到差额补扣（提前结算后继续串流的兜底）', ()
       where: { interpretSessionId: 'i1' },
       select: { actualMs: true, maxSessionSeconds: true, billedMinutes: true },
     });
-    expect(deductMock).toHaveBeenCalledWith('u1', 15, TX);
+    expect(deductMock).toHaveBeenCalledWith('u1', 15, TX, {
+      source: 'soniox_usage_topup',
+      referenceId: 'g1',
+    });
     // settledBy 保留 interpret_deduct（审计流水要看得出这场最初是谁结的）
     expect(grantUpdateMock).toHaveBeenCalledWith({
       where: { id: 'g1' },
@@ -388,7 +394,10 @@ describe('P1-2 迟到差额补扣（提前结算后继续串流的兜底）', ()
 
     await reconcileSonioxStreamUsage(NOW);
 
-    expect(deductMock).toHaveBeenCalledWith('u1', 15, TX);
+    expect(deductMock).toHaveBeenCalledWith('u1', 15, TX, {
+      source: 'soniox_usage_topup',
+      referenceId: 'g1',
+    });
   });
 
   it('interpret：deduct 已按整场足额扣过 → 差额 0，不补扣（诚实用户不被重复收）', async () => {
@@ -437,7 +446,10 @@ describe('P1-2 迟到差额补扣（提前结算后继续串流的兜底）', ()
 
     const stats = await reconcileSonioxStreamUsage(NOW);
 
-    expect(deductMock).toHaveBeenCalledWith('u1', 15, TX);
+    expect(deductMock).toHaveBeenCalledWith('u1', 15, TX, {
+      source: 'soniox_usage_topup',
+      referenceId: 'g1',
+    });
     expect(stats.lateCharged).toBe(1);
   });
 
@@ -594,7 +606,10 @@ describe('孤儿 grant 结算', () => {
     expect(transactionMock).toHaveBeenCalledTimes(1);
     expect(settleGrantsMock).toHaveBeenCalledWith({ grantId: 'g9' }, 'usage_cron', TX);
     // ceil(300000/60000)=5 分钟（封顶 15）
-    expect(deductMock).toHaveBeenCalledWith('u1', 5, TX);
+    expect(deductMock).toHaveBeenCalledWith('u1', 5, TX, {
+      source: 'soniox_orphan_usage',
+      referenceId: 'g9',
+    });
     expect(grantUpdateMock).toHaveBeenCalledWith({
       where: { id: 'g9' },
       data: { billedMinutes: 5 },

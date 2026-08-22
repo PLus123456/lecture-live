@@ -10,10 +10,11 @@ import {
   retryJob,
 } from '@/lib/jobQueue';
 import {
+  completeStagedArtifactPublishes,
   loadSessionAudioArtifact,
   stageArtifact,
-  finalizeStagedArtifactPublish,
   rollbackStagedArtifact,
+  settleStagedArtifactsInTransaction,
 } from '@/lib/sessionPersistence';
 import {
   getEnhanceFleetConfig,
@@ -29,6 +30,11 @@ import {
   type EnhanceJobStatus,
 } from '@/lib/audio/enhanceWorkerClient';
 import { logger, serializeError } from '@/lib/logger';
+import {
+  getStoredArtifactById,
+  STORED_ARTIFACT_STATE,
+  STORED_ARTIFACT_TYPE,
+} from '@/lib/storage/storedArtifactLedger';
 
 /**
  * 音频增强调度器（tick 对账制状态机）。
@@ -614,44 +620,97 @@ async function harvestJob(
   const staged = await stageArtifact(session, 'recordings', output.data, {
     mimeType: output.contentType || 'audio/mp4',
     previousReference: session.enhancedAudioPath,
+    artifactType: STORED_ARTIFACT_TYPE.ENHANCED_AUDIO,
   });
 
-  const updated = await prisma.session.updateMany({
-    where: { id: session.id },
-    data: {
-      enhancedAudioPath: staged.reference,
-      audioEnhanceStatus: 'completed',
-      audioEnhanceError: null,
-    },
+  const result = JSON.stringify({
+    enhancedAudioPath: staged.reference,
+    bytes: output.data.length,
+    durationMs: remote?.output?.durationMs ?? null,
+    denoiseEngine: remote?.output?.denoiseEngine ?? null,
+    normalized: remote?.output?.normalized ?? null,
   });
-  if (updated.count === 0) {
-    // 会话在下载期间被删：回滚刚写的对象，任务终态失败
-    await rollbackStagedArtifact(session, staged);
-    await failJob(jobId, session.id, new Error('会话已删除'), { retryable: false });
-    return;
-  }
-  await finalizeStagedArtifactPublish(session, staged).catch(() => undefined);
-
-  await prisma.jobQueue
-    .update({
-      where: { id: jobId },
-      data: {
-        status: JOB_STATUS.SUCCESS,
-        // P5-16：落终态即释放 activeKey，否则该会话永远入不了新队。
-        activeKey: null,
-        result: JSON.stringify({
+  let publications: Awaited<
+    ReturnType<typeof settleStagedArtifactsInTransaction>
+  > = [];
+  let committedAfterReadback = false;
+  try {
+    publications = await prisma.$transaction(async (tx) => {
+      const updated = await tx.session.updateMany({
+        where: { id: session.id, audioEnhanceStatus: 'processing' },
+        data: {
           enhancedAudioPath: staged.reference,
-          bytes: output.data.length,
-          durationMs: remote?.output?.durationMs ?? null,
-          denoiseEngine: remote?.output?.denoiseEngine ?? null,
-          normalized: remote?.output?.normalized ?? null,
-        }),
+          audioEnhanceStatus: 'completed',
+          audioEnhanceError: null,
+        },
+      });
+      if (updated.count !== 1) throw new Error('会话已删除或增强状态已变更');
+      const settled = await settleStagedArtifactsInTransaction(tx, [staged]);
+      const jobUpdated = await tx.jobQueue.updateMany({
+        where: { id: jobId, status: JOB_STATUS.PROCESSING },
+        data: {
+        status: JOB_STATUS.SUCCESS,
+        activeKey: null,
+          result,
         completedAt: new Date(),
-      },
-    })
-    .catch((err) =>
-      enhanceLogger.warn({ jobId, err: serializeError(err) }, '标记任务成功失败')
+        },
+      });
+      if (jobUpdated.count !== 1) throw new Error('增强任务状态已变更');
+      return settled;
+    });
+  } catch (publishError) {
+    try {
+      const [owner, artifact, job] = await Promise.all([
+        prisma.session.findUnique({
+          where: { id: session.id },
+          select: { enhancedAudioPath: true, audioEnhanceStatus: true },
+        }),
+        getStoredArtifactById(staged.storedArtifactId),
+        prisma.jobQueue.findUnique({
+          where: { id: jobId },
+          select: { status: true },
+        }),
+      ]);
+      if (
+        owner?.enhancedAudioPath === staged.reference &&
+        owner.audioEnhanceStatus === 'completed' &&
+        artifact?.state === STORED_ARTIFACT_STATE.ACTIVE &&
+        artifact.reference === staged.reference &&
+        job?.status === JOB_STATUS.SUCCESS
+      ) {
+        committedAfterReadback = true;
+      } else if (
+        owner?.enhancedAudioPath !== staged.reference &&
+        artifact?.state === STORED_ARTIFACT_STATE.RESERVED &&
+        job?.status !== JOB_STATUS.SUCCESS
+      ) {
+        await rollbackStagedArtifact(session, staged).catch(() => undefined);
+        throw publishError;
+      } else {
+        enhanceLogger.error(
+          { jobId, err: serializeError(publishError) },
+          '增强产物发布结果未知，保留 staged 对象供对账'
+        );
+        return;
+      }
+    } catch (readbackError) {
+      if (readbackError === publishError) throw readbackError;
+      enhanceLogger.error(
+        { jobId, err: serializeError(readbackError) },
+        '增强产物发布 readback 失败，保留 staged 对象'
+      );
+      return;
+    }
+  }
+  if (!committedAfterReadback) {
+    await completeStagedArtifactPublishes(session, publications).catch(
+      (cleanupError) =>
+        enhanceLogger.warn(
+          { jobId, err: serializeError(cleanupError) },
+          '增强产物已发布，但旧对象清理失败'
+        )
     );
+  }
   await deleteEnhanceJob(config, jobId).catch(() => undefined);
   enhanceLogger.info(
     { jobId, sessionId: session.id, bytes: output.data.length },

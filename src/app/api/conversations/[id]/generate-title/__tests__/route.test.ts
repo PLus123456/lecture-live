@@ -76,6 +76,7 @@ describe('POST /api/conversations/[id]/generate-title', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ title: 'React 性能优化' });
     expect(generateTitleMock).toHaveBeenCalledWith({
+      userId: 'u1',
       firstUserMessage: '怎么优化 React 性能？',
     });
     // U50：原子条件写入 —— where 带 title:null，仅当标题仍为空才落库。

@@ -4,12 +4,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Server as SocketIOServer } from 'socket.io';
 import { io as createClient, Socket } from 'socket.io-client';
 import { onceSocketEvent } from '../../../../tests/utils/socket';
+import {
+  makeSummaryBlock,
+  makeTranscriptSegment,
+} from './fixtures';
 
-const { shareLinkFindUniqueMock, shareLinkFindManyMock, verifyAuthTokenMock } =
+const {
+  shareLinkFindUniqueMock,
+  shareLinkFindManyMock,
+  verifyAuthTokenMock,
+  diagnoseEstablishedAuthFamilyTokenMock,
+} =
   vi.hoisted(() => ({
     shareLinkFindUniqueMock: vi.fn(),
     shareLinkFindManyMock: vi.fn(),
     verifyAuthTokenMock: vi.fn(),
+    diagnoseEstablishedAuthFamilyTokenMock: vi.fn(),
   }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -23,6 +33,7 @@ vi.mock('@/lib/prisma', () => ({
 
 vi.mock('@/lib/auth', () => ({
   CLIENT_SESSION_TOKEN: '__cookie_session__',
+  diagnoseEstablishedAuthFamilyToken: diagnoseEstablishedAuthFamilyTokenMock,
   extractTokenFromCookieHeader: vi.fn(() => null),
   verifyAuthToken: verifyAuthTokenMock,
 }));
@@ -45,6 +56,7 @@ vi.mock('@/lib/logger', () => {
 
 import {
   revalidateAllLiveRooms,
+  revalidateSessionBroadcasters,
   revalidateSessionViewers,
   setupLiveShare,
 } from '@/lib/liveShare/server';
@@ -57,7 +69,7 @@ describe('setupLiveShare', () => {
   const clients: Socket[] = [];
 
   beforeEach(async () => {
-    verifyAuthTokenMock.mockResolvedValue({
+    const authenticatedSession = {
       user: {
         id: 'user-1',
         email: 'alice@example.com',
@@ -68,6 +80,11 @@ describe('setupLiveShare', () => {
         tokenVersion: 1,
       },
       rawToken: 'server-jwt',
+    };
+    verifyAuthTokenMock.mockResolvedValue(authenticatedSession);
+    diagnoseEstablishedAuthFamilyTokenMock.mockResolvedValue({
+      status: 'valid',
+      session: authenticatedSession,
     });
 
     shareLinkFindUniqueMock.mockImplementation(
@@ -160,9 +177,14 @@ describe('setupLiveShare', () => {
     });
 
     broadcaster.emit('sync_snapshot', {
-      segments: [{ id: 'seg-1', text: 'Hello' }],
+      segments: [
+        {
+          ...makeTranscriptSegment(),
+          ignoredNestedField: { attacker: 'must not persist' },
+        },
+      ],
       translations: { 'seg-1': '你好' },
-      summaryBlocks: [{ id: 'sum-1', text: 'Summary' }],
+      summaryBlocks: [makeSummaryBlock()],
       status: 'RECORDING',
       previewText: { finalText: 'He', nonFinalText: 'l' },
       previewTranslation: {
@@ -183,7 +205,7 @@ describe('setupLiveShare', () => {
     const viewerInitialStatePromise = onceSocketEvent<{
       segments: Array<{ id: string; text: string }>;
       translations: Record<string, string>;
-      summaryBlocks: Array<{ id: string; text: string }>;
+      summaryBlocks: Array<{ id: string; summary: string }>;
       status: string | null;
       previewText: { finalText: string; nonFinalText: string };
       previewTranslation: {
@@ -200,10 +222,11 @@ describe('setupLiveShare', () => {
     viewer.emit('join', { shareToken: 'share-token' });
 
     await expect(viewerCountPromise).resolves.toEqual({ count: 1 });
-    await expect(viewerInitialStatePromise).resolves.toMatchObject({
+    const viewerInitialState = await viewerInitialStatePromise;
+    expect(viewerInitialState).toMatchObject({
       segments: [{ id: 'seg-1', text: 'Hello' }],
       translations: { 'seg-1': '你好' },
-      summaryBlocks: [{ id: 'sum-1', text: 'Summary' }],
+      summaryBlocks: [{ id: 'sum-1', summary: 'Summary' }],
       status: 'RECORDING',
       previewText: { finalText: 'He', nonFinalText: 'l' },
       previewTranslation: {
@@ -213,26 +236,40 @@ describe('setupLiveShare', () => {
         sourceLanguage: 'en',
       },
     });
+    expect(viewerInitialState.segments[0]).not.toHaveProperty(
+      'ignoredNestedField'
+    );
 
     const transcriptDeltaPromise = onceSocketEvent<{ id: string; text: string }>(
       viewer,
       'transcript_delta'
     );
+    const secondSegment = makeTranscriptSegment({
+      id: 'seg-2',
+      text: 'World',
+      globalStartMs: 1_000,
+      globalEndMs: 2_000,
+      startMs: 1_000,
+      endMs: 2_000,
+      timestamp: '00:00:01',
+    });
     broadcaster.emit('broadcast', {
       event: {
         type: 'transcript_delta',
-        payload: { id: 'seg-2', text: 'World' },
+        payload: { ...secondSegment, ignoredNestedField: { attacker: true } },
         timestamp: Date.now(),
       },
     });
 
-    await expect(transcriptDeltaPromise).resolves.toEqual({
+    const transcriptDelta = await transcriptDeltaPromise;
+    expect(transcriptDelta).toMatchObject({
       id: 'seg-2',
       text: 'World',
     });
+    expect(transcriptDelta).not.toHaveProperty('ignoredNestedField');
   });
 
-  it('sync_snapshot 过滤非字符串翻译并截断超长翻译', async () => {
+  it('sync_snapshot 对超长字段显式拒绝，且不写入部分快照', async () => {
     const broadcaster = createClient(baseUrl, {
       transports: ['websocket'],
       reconnection: false,
@@ -247,16 +284,20 @@ describe('setupLiveShare', () => {
     await onceSocketEvent(broadcaster, 'connect');
     await onceSocketEvent(broadcaster, 'initial_state');
 
-    const longTranslation = 'x'.repeat(10_050);
+    const errorPromise = onceSocketEvent<{ message: string; code: string }>(
+      broadcaster,
+      'share_error'
+    );
     broadcaster.emit('sync_snapshot', {
-      segments: [{ id: 'seg-1', text: 'Hello' }],
-      translations: {
-        'seg-1': longTranslation, // 超长 → 截断到 10000
-        'seg-2': 12345, // 非字符串 → 过滤
-        'seg-3': '正常翻译', // 合法 → 保留
-      },
+      segments: [makeTranscriptSegment({ text: 'x'.repeat(40_001) })],
+      translations: { 'seg-1': '正常翻译' },
       summaryBlocks: [],
       status: 'RECORDING',
+    });
+
+    await expect(errorPromise).resolves.toEqual({
+      message: 'Live share payload rejected',
+      code: 'INVALID_SNAPSHOT',
     });
 
     const viewer = createClient(baseUrl, {
@@ -267,17 +308,17 @@ describe('setupLiveShare', () => {
 
     await onceSocketEvent(viewer, 'connect');
     const viewerInitialStatePromise = onceSocketEvent<{
+      segments: unknown[];
       translations: Record<string, string>;
     }>(viewer, 'initial_state');
     viewer.emit('join', { shareToken: 'share-token' });
 
     const state = await viewerInitialStatePromise;
-    expect(state.translations['seg-1']?.length).toBe(10_000);
-    expect(state.translations['seg-2']).toBeUndefined();
-    expect(state.translations['seg-3']).toBe('正常翻译');
+    expect(state.segments).toEqual([]);
+    expect(state.translations).toEqual({});
   });
 
-  it('sync_snapshot 截断超长 segment.text 与 summary 各字符串字段', async () => {
+  it('broadcast 对超长 canonical 增量显式拒绝，旧快照保持不变', async () => {
     const broadcaster = createClient(baseUrl, {
       transports: ['websocket'],
       reconnection: false,
@@ -291,22 +332,6 @@ describe('setupLiveShare', () => {
 
     await onceSocketEvent(broadcaster, 'connect');
     await onceSocketEvent(broadcaster, 'initial_state');
-
-    const longText = 'a'.repeat(10_050);
-    broadcaster.emit('sync_snapshot', {
-      segments: [{ id: 'seg-1', text: longText, translatedText: longText }],
-      translations: {},
-      summaryBlocks: [
-        {
-          id: 'sum-1',
-          summary: longText,
-          keyPoints: [longText, 'short'],
-          definitions: { term: longText, ok: '短' },
-          suggestedQuestions: [longText],
-        },
-      ],
-      status: 'RECORDING',
-    });
 
     const viewer = createClient(baseUrl, {
       transports: ['websocket'],
@@ -315,88 +340,47 @@ describe('setupLiveShare', () => {
     clients.push(viewer);
 
     await onceSocketEvent(viewer, 'connect');
-    const viewerInitialStatePromise = onceSocketEvent<{
-      segments: Array<{ text: string; translatedText: string }>;
-      summaryBlocks: Array<{
-        summary: string;
-        keyPoints: string[];
-        definitions: Record<string, string>;
-        suggestedQuestions: string[];
-      }>;
-    }>(viewer, 'initial_state');
+    const viewerInitialStatePromise = onceSocketEvent<{ segments: unknown[] }>(
+      viewer,
+      'initial_state'
+    );
     viewer.emit('join', { shareToken: 'share-token' });
+    expect((await viewerInitialStatePromise).segments).toEqual([]);
 
-    const state = await viewerInitialStatePromise;
-    expect(state.segments[0].text.length).toBe(10_000);
-    expect(state.segments[0].translatedText.length).toBe(10_000);
-    expect(state.summaryBlocks[0].summary.length).toBe(10_000);
-    expect(state.summaryBlocks[0].keyPoints[0].length).toBe(10_000);
-    expect(state.summaryBlocks[0].keyPoints[1]).toBe('short');
-    expect(state.summaryBlocks[0].definitions.term.length).toBe(10_000);
-    expect(state.summaryBlocks[0].definitions.ok).toBe('短');
-    expect(state.summaryBlocks[0].suggestedQuestions[0].length).toBe(10_000);
-  });
-
-  it('broadcast 增量路径截断超长 segment.text 与 summary 字段', async () => {
-    const broadcaster = createClient(baseUrl, {
-      transports: ['websocket'],
-      reconnection: false,
-      auth: {
-        token: 'server-jwt',
-        sessionId: 'session-1',
-        shareToken: 'share-token',
-      },
-    });
-    clients.push(broadcaster);
-
-    await onceSocketEvent(broadcaster, 'connect');
-    await onceSocketEvent(broadcaster, 'initial_state');
-
-    const longText = 'b'.repeat(10_050);
+    const transcriptSpy = vi.fn();
+    viewer.on('transcript_delta', transcriptSpy);
+    const errorPromise = onceSocketEvent<{ message: string; code: string }>(
+      broadcaster,
+      'share_error'
+    );
     broadcaster.emit('broadcast', {
       event: {
         type: 'transcript_delta',
-        payload: { id: 'seg-1', text: longText },
-        timestamp: Date.now(),
-      },
-    });
-    broadcaster.emit('broadcast', {
-      event: {
-        type: 'summary_update',
-        payload: {
-          id: 'sum-1',
-          blockIndex: 0,
-          summary: longText,
-          keyPoints: [longText],
-          definitions: { term: longText },
-        },
+        payload: makeTranscriptSegment({ text: 'b'.repeat(40_001) }),
         timestamp: Date.now(),
       },
     });
 
-    // 新 viewer join 后会收到累积快照（含上述两条增量），断言其已被截断
-    const viewer = createClient(baseUrl, {
+    await expect(errorPromise).resolves.toEqual({
+      message: 'Live share payload rejected',
+      code: 'INVALID_EVENT',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(transcriptSpy).not.toHaveBeenCalled();
+
+    // 同一 socket 的重复 join 已是 no-op；用全新连接读取当前快照，确认拒绝是原子的。
+    const verifier = createClient(baseUrl, {
       transports: ['websocket'],
       reconnection: false,
     });
-    clients.push(viewer);
-
-    await onceSocketEvent(viewer, 'connect');
-    const viewerInitialStatePromise = onceSocketEvent<{
-      segments: Array<{ text: string }>;
-      summaryBlocks: Array<{
-        summary: string;
-        keyPoints: string[];
-        definitions: Record<string, string>;
-      }>;
-    }>(viewer, 'initial_state');
-    viewer.emit('join', { shareToken: 'share-token' });
-
-    const state = await viewerInitialStatePromise;
-    expect(state.segments[0].text.length).toBe(10_000);
-    expect(state.summaryBlocks[0].summary.length).toBe(10_000);
-    expect(state.summaryBlocks[0].keyPoints[0].length).toBe(10_000);
-    expect(state.summaryBlocks[0].definitions.term.length).toBe(10_000);
+    clients.push(verifier);
+    await onceSocketEvent(verifier, 'connect');
+    const verifierState = onceSocketEvent<{ segments: unknown[] }>(
+      verifier,
+      'initial_state'
+    );
+    verifier.emit('join', { shareToken: 'share-token' });
+    expect((await verifierState).segments).toEqual([]);
   });
 
   it('阻止 viewer 冒充 broadcaster 发布事件', async () => {
@@ -471,7 +455,7 @@ describe('setupLiveShare', () => {
     await onceSocketEvent(broadcaster, 'initial_state');
 
     broadcaster.emit('sync_snapshot', {
-      segments: [{ id: 'seg-1', text: 'Hello' }],
+      segments: [makeTranscriptSegment()],
       translations: {},
       summaryBlocks: [],
       status: 'RECORDING',
@@ -489,7 +473,7 @@ describe('setupLiveShare', () => {
       segments: Array<{ id: string; text: string }>;
     }>(settleViewer, 'initial_state');
     settleViewer.emit('join', { shareToken: 'share-token' });
-    expect((await settledStatePromise).segments).toEqual([
+    expect((await settledStatePromise).segments).toMatchObject([
       { id: 'seg-1', text: 'Hello' },
     ]);
 
@@ -513,7 +497,7 @@ describe('setupLiveShare', () => {
     viewer.emit('join', { shareToken: 'share-token' });
 
     const state = await initialStatePromise;
-    expect(state.segments).toEqual([{ id: 'seg-1', text: 'Hello' }]);
+    expect(state.segments).toMatchObject([{ id: 'seg-1', text: 'Hello' }]);
   });
 
   it('在无效分享 token 时返回 join 错误', async () => {
@@ -530,6 +514,514 @@ describe('setupLiveShare', () => {
     await expect(errorPromise).resolves.toEqual({
       message: 'Invalid or expired share link',
     });
+  });
+
+  it('SEC-003：同 socket 并发/规范化重复 join 只查一次 DB、发一次快照和人数', async () => {
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+
+    shareLinkFindUniqueMock.mockClear();
+    const initialStates: unknown[] = [];
+    const viewerCounts: Array<{ count: number }> = [];
+    viewer.on('initial_state', (state) => initialStates.push(state));
+    viewer.on('viewer_count', (count) => viewerCounts.push(count));
+
+    const firstState = onceSocketEvent(viewer, 'initial_state');
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      viewer.emit('join', { shareToken: 'share-token' });
+    }
+    await firstState;
+    viewer.emit('join', { shareToken: '  share-token  ' });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(shareLinkFindUniqueMock).toHaveBeenCalledTimes(1);
+    expect(initialStates).toHaveLength(1);
+    expect(viewerCounts).toEqual([{ count: 1 }]);
+    const roomSockets = await io.in('live:session-1').fetchSockets();
+    expect(roomSockets.filter((socket) => !socket.data.isHost)).toHaveLength(1);
+  });
+
+  it('SEC-003：随机 token 洪泛在第五次于 DB 前被专用成本桶拒绝', async () => {
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+
+    shareLinkFindUniqueMock.mockClear();
+    const errors: Array<{ message: string; code?: string }> = [];
+    const allErrors = new Promise<void>((resolve) => {
+      viewer.on('share_error', (error) => {
+        errors.push(error);
+        if (errors.length === 5) resolve();
+      });
+    });
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      viewer.emit('join', { shareToken: `random-${attempt}` });
+    }
+    await allErrors;
+
+    expect(shareLinkFindUniqueMock).toHaveBeenCalledTimes(4);
+    expect(errors.slice(0, 4)).toEqual(
+      Array.from({ length: 4 }, () => ({
+        message: 'Invalid or expired share link',
+      }))
+    );
+    expect(errors[4]).toEqual({
+      message: 'Too many live share join attempts',
+      code: 'JOIN_RATE_LIMITED',
+    });
+  });
+
+  it('SEC-003：跨房切换授权失败时仍留在原房，成功后才原子迁移', async () => {
+    shareLinkFindUniqueMock.mockImplementation(
+      async ({ where: { token } }: { where: { token: string } }) => {
+        const sessionId =
+          token === 'share-token'
+            ? 'session-1'
+            : token === 'second-token'
+              ? 'session-2'
+              : null;
+        if (!sessionId) return null;
+        return {
+          id: `link-${sessionId}`,
+          token,
+          sessionId,
+          createdBy: 'user-1',
+          isLive: true,
+          expiresAt: null,
+          session: {
+            id: sessionId,
+            userId: 'user-1',
+            status: 'RECORDING',
+          },
+        };
+      }
+    );
+
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+
+    let initialState = onceSocketEvent(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+    await initialState;
+
+    const failedSwitch = onceSocketEvent<{ message: string }>(
+      viewer,
+      'share_error'
+    );
+    viewer.emit('join', { shareToken: 'missing-token' });
+    await failedSwitch;
+    expect((await io.in('live:session-1').fetchSockets()).map((s) => s.id)).toContain(
+      viewer.id
+    );
+    expect((await io.in('live:session-2').fetchSockets()).map((s) => s.id)).not.toContain(
+      viewer.id
+    );
+
+    initialState = onceSocketEvent(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'second-token' });
+    await initialState;
+    expect((await io.in('live:session-1').fetchSockets()).map((s) => s.id)).not.toContain(
+      viewer.id
+    );
+    expect((await io.in('live:session-2').fetchSockets()).map((s) => s.id)).toContain(
+      viewer.id
+    );
+  });
+
+  it('SEC-022：敏感事件使用 established family 复核，routine refresh 后不误用 strict 握手校验', async () => {
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+    const initialState = onceSocketEvent(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+    await initialState;
+
+    // 模拟 routine refresh：旧 leaf 已不再能通过 strict current-leaf 校验，但其
+    // family 仍活跃，已建立连接必须改走 established-family 复核。
+    verifyAuthTokenMock.mockClear();
+    verifyAuthTokenMock.mockResolvedValue(null);
+    diagnoseEstablishedAuthFamilyTokenMock.mockClear();
+    shareLinkFindUniqueMock.mockClear();
+    const statusUpdate = onceSocketEvent<{ status: string }>(viewer, 'status_update');
+    broadcaster.emit('broadcast', {
+      event: {
+        type: 'status_update',
+        payload: { status: 'PAUSED' },
+        timestamp: Date.now(),
+      },
+    });
+
+    await expect(statusUpdate).resolves.toEqual({ status: 'PAUSED' });
+    expect(verifyAuthTokenMock).not.toHaveBeenCalled();
+    expect(diagnoseEstablishedAuthFamilyTokenMock).toHaveBeenCalledTimes(1);
+    expect(diagnoseEstablishedAuthFamilyTokenMock).toHaveBeenCalledWith(
+      'server-jwt'
+    );
+    expect(shareLinkFindUniqueMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('SEC-022：周期复核发现 family 撤销后主动断开主持人', async () => {
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    broadcaster.emit('sync_snapshot', {
+      segments: [makeTranscriptSegment({ text: 'old generation' })],
+      translations: {},
+      summaryBlocks: [],
+      status: 'RECORDING',
+    });
+    const settledViewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(settledViewer);
+    await onceSocketEvent(settledViewer, 'connect');
+    const settledState = onceSocketEvent<{ segments: Array<{ text: string }> }>(
+      settledViewer,
+      'initial_state'
+    );
+    settledViewer.emit('join', { shareToken: 'share-token' });
+    expect((await settledState).segments).toMatchObject([
+      { text: 'old generation' },
+    ]);
+
+    diagnoseEstablishedAuthFamilyTokenMock.mockResolvedValue({ status: 'revoked' });
+    const authError = onceSocketEvent<{ message: string; code: string }>(
+      broadcaster,
+      'share_error'
+    );
+    const disconnected = onceSocketEvent<string>(broadcaster, 'disconnect');
+    await expect(
+      revalidateSessionBroadcasters(io, 'session-1')
+    ).resolves.toBe(1);
+    await expect(authError).resolves.toEqual({
+      message: 'Broadcaster authorization revoked',
+      code: 'BROADCASTER_AUTH_REVOKED',
+    });
+    await expect(disconnected).resolves.toBe('io server disconnect');
+
+    // 安全撤权跳过 15 秒网络 grace，并轮换内存世代；同一公开链接后续 viewer
+    // 不能继续读到已撤主持人的旧内存快照。
+    const verifier = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(verifier);
+    await onceSocketEvent(verifier, 'connect');
+    const verifierState = onceSocketEvent<{ segments: unknown[] }>(
+      verifier,
+      'initial_state'
+    );
+    verifier.emit('join', { shareToken: 'share-token' });
+    expect((await verifierState).segments).toEqual([]);
+  });
+
+  it('SEC-022：分享链接换代后旧主持人下一事件失败关闭且不能广播', async () => {
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+    const initialState = onceSocketEvent(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+    await initialState;
+
+    shareLinkFindUniqueMock.mockResolvedValue(null);
+    const leakedStatus = vi.fn();
+    viewer.on('status_update', leakedStatus);
+    const authError = onceSocketEvent<{ code: string }>(
+      broadcaster,
+      'share_error'
+    );
+    const disconnected = onceSocketEvent<string>(broadcaster, 'disconnect');
+    broadcaster.emit('broadcast', {
+      event: {
+        type: 'status_update',
+        payload: { status: 'PAUSED' },
+        timestamp: Date.now(),
+      },
+    });
+
+    await expect(authError).resolves.toMatchObject({
+      code: 'BROADCASTER_AUTH_REVOKED',
+    });
+    await expect(disconnected).resolves.toBe('io server disconnect');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(leakedStatus).not.toHaveBeenCalledWith({ status: 'PAUSED' });
+  });
+
+  it('SEC-022：B 分享世代接管后隔离 A 快照，A 的迟到事件不污染 B 观众', async () => {
+    let oldLinkLive = true;
+    shareLinkFindUniqueMock.mockImplementation(
+      async ({ where: { token } }: { where: { token: string } }) => {
+        const isOld = token === 'share-token';
+        if ((!isOld && token !== 'share-token-b') || (isOld && !oldLinkLive)) {
+          return null;
+        }
+        return {
+          id: isOld ? 'link-a' : 'link-b',
+          token,
+          sessionId: 'session-1',
+          createdBy: 'user-1',
+          isLive: true,
+          expiresAt: null,
+          session: {
+            id: 'session-1',
+            userId: 'user-1',
+            status: 'RECORDING',
+          },
+        };
+      }
+    );
+
+    const broadcasterA = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      autoConnect: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcasterA);
+    const broadcasterAConnected = onceSocketEvent(broadcasterA, 'connect');
+    const broadcasterAInitialState = onceSocketEvent(
+      broadcasterA,
+      'initial_state'
+    );
+    broadcasterA.connect();
+    await broadcasterAConnected;
+    await broadcasterAInitialState;
+    broadcasterA.emit('sync_snapshot', {
+      segments: [makeTranscriptSegment({ id: 'seg-a', text: 'A history' })],
+      translations: {},
+      summaryBlocks: [],
+      status: 'RECORDING',
+    });
+
+    const viewerA = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewerA);
+    await onceSocketEvent(viewerA, 'connect');
+    const stateA = onceSocketEvent<{ segments: Array<{ id: string }> }>(
+      viewerA,
+      'initial_state'
+    );
+    viewerA.emit('join', { shareToken: 'share-token' });
+    expect((await stateA).segments).toMatchObject([{ id: 'seg-a' }]);
+
+    // A 被撤销而内部通知丢失；B viewer 先到，也必须以 link-b 激活新世代并拿到空态，
+    // 不能读到仍驻留内存的 A history。
+    oldLinkLive = false;
+    shareLinkFindManyMock.mockResolvedValue([{ token: 'share-token-b' }]);
+    const oldAuthError = onceSocketEvent<{ code: string }>(
+      broadcasterA,
+      'share_error'
+    );
+    const oldDisconnected = onceSocketEvent<string>(broadcasterA, 'disconnect');
+    const viewerB = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewerB);
+    await onceSocketEvent(viewerB, 'connect');
+    const stateB = onceSocketEvent<{ segments: unknown[] }>(viewerB, 'initial_state');
+    viewerB.emit('join', { shareToken: 'share-token-b' });
+    expect((await stateB).segments).toEqual([]);
+    await expect(oldAuthError).resolves.toMatchObject({
+      code: 'BROADCASTER_AUTH_REVOKED',
+    });
+    await expect(oldDisconnected).resolves.toBe('io server disconnect');
+
+    const bStatuses: string[] = [];
+    viewerB.on('status_update', ({ status }: { status: string }) => {
+      bStatuses.push(status);
+    });
+    // 已被主动断开的 A 即便客户端继续 emit，也到不了服务端，更不能污染 B 房间。
+    broadcasterA.emit('broadcast', {
+      event: {
+        type: 'status_update',
+        payload: { status: 'PAUSED' },
+        timestamp: Date.now(),
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(bStatuses).not.toContain('PAUSED');
+    expect(bStatuses).not.toContain('SHARE_OFFLINE');
+
+    const broadcasterB = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      autoConnect: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token-b',
+      },
+    });
+    clients.push(broadcasterB);
+    const broadcasterBConnected = onceSocketEvent(broadcasterB, 'connect');
+    const broadcasterBInitialState = onceSocketEvent(
+      broadcasterB,
+      'initial_state'
+    );
+    broadcasterB.connect();
+    await broadcasterBConnected;
+    await broadcasterBInitialState;
+
+    const segmentB = makeTranscriptSegment({ id: 'seg-b', text: 'B history' });
+    const bDelta = onceSocketEvent<{ id: string }>(viewerB, 'transcript_delta');
+    broadcasterB.emit('broadcast', {
+      event: {
+        type: 'transcript_delta',
+        payload: segmentB,
+        timestamp: Date.now(),
+      },
+    });
+    await expect(bDelta).resolves.toMatchObject({ id: 'seg-b' });
+
+    const verifierB = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(verifierB);
+    await onceSocketEvent(verifierB, 'connect');
+    const finalStateB = onceSocketEvent<{ segments: Array<{ id: string }> }>(
+      verifierB,
+      'initial_state'
+    );
+    verifierB.emit('join', { shareToken: 'share-token-b' });
+    expect((await finalStateB).segments.map((segment) => segment.id)).toEqual([
+      'seg-b',
+    ]);
+  });
+
+  it('SEC-022：原 leaf 自然过期断开后，可用新 current leaf 严格握手并恢复广播', async () => {
+    const oldBroadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'expired-leaf',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(oldBroadcaster);
+    await onceSocketEvent(oldBroadcaster, 'connect');
+    await onceSocketEvent(oldBroadcaster, 'initial_state');
+
+    diagnoseEstablishedAuthFamilyTokenMock.mockResolvedValue({
+      status: 'leaf_expired',
+    });
+    const leafExpiredError = onceSocketEvent<{ message: string; code: string }>(
+      oldBroadcaster,
+      'share_error'
+    );
+    const oldDisconnected = onceSocketEvent<string>(oldBroadcaster, 'disconnect');
+    await revalidateSessionBroadcasters(io, 'session-1');
+    await expect(leafExpiredError).resolves.toEqual({
+      message: 'Broadcaster authentication leaf expired',
+      code: 'BROADCASTER_AUTH_LEAF_EXPIRED',
+    });
+    await expect(oldDisconnected).resolves.toBe('io server disconnect');
+
+    const authenticatedSession = {
+      user: { id: 'user-1', email: 'alice@example.com', role: 'ADMIN' },
+      token: { jti: 'jti-new', tokenVersion: 1 },
+      rawToken: 'current-leaf',
+    };
+    verifyAuthTokenMock.mockClear();
+    verifyAuthTokenMock.mockResolvedValue(authenticatedSession);
+    diagnoseEstablishedAuthFamilyTokenMock.mockResolvedValue({
+      status: 'valid',
+      session: authenticatedSession,
+    });
+    const newBroadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'current-leaf',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(newBroadcaster);
+    await onceSocketEvent(newBroadcaster, 'connect');
+    await onceSocketEvent(newBroadcaster, 'initial_state');
+    expect(verifyAuthTokenMock).toHaveBeenCalledWith('current-leaf');
+
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+    const initialState = onceSocketEvent(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+    await initialState;
+    const resumed = onceSocketEvent<{ status: string }>(viewer, 'status_update');
+    newBroadcaster.emit('broadcast', {
+      event: {
+        type: 'status_update',
+        payload: { status: 'RECORDING' },
+        timestamp: Date.now(),
+      },
+    });
+    await expect(resumed).resolves.toEqual({ status: 'RECORDING' });
   });
 
   it('SHARE-REVOKE-001：复核驱逐持已撤销 token 的观众，保留合法观众与主播', async () => {
@@ -697,5 +1189,76 @@ describe('setupLiveShare', () => {
     await revalidateAllLiveRooms(io);
 
     await expect(disconnectPromise).resolves.toBe('io server disconnect');
+  });
+
+  it('SEC-022：通知丢失时周期扫描仍复核主持人，且观众 DB 失败不能跳过主持人撤权', async () => {
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    const viewer = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    clients.push(viewer);
+    await onceSocketEvent(viewer, 'connect');
+    const initialState = onceSocketEvent(viewer, 'initial_state');
+    viewer.emit('join', { shareToken: 'share-token' });
+    await initialState;
+
+    // 模拟内部撤权通知丢失；周期中观众查询又暂时失败，主持人复核仍必须独立执行。
+    shareLinkFindManyMock.mockRejectedValue(new Error('viewer DB unavailable'));
+    diagnoseEstablishedAuthFamilyTokenMock.mockResolvedValue({ status: 'revoked' });
+    const authError = onceSocketEvent<{ code: string }>(
+      broadcaster,
+      'share_error'
+    );
+    const disconnected = onceSocketEvent<string>(broadcaster, 'disconnect');
+
+    await revalidateAllLiveRooms(io);
+
+    await expect(authError).resolves.toMatchObject({
+      code: 'BROADCASTER_AUTH_REVOKED',
+    });
+    await expect(disconnected).resolves.toBe('io server disconnect');
+  });
+
+  it('SEC-022：session/link 删除且通知丢失时，周期分享世代复核仍主动断开', async () => {
+    const broadcaster = createClient(baseUrl, {
+      transports: ['websocket'],
+      reconnection: false,
+      auth: {
+        token: 'server-jwt',
+        sessionId: 'session-1',
+        shareToken: 'share-token',
+      },
+    });
+    clients.push(broadcaster);
+    await onceSocketEvent(broadcaster, 'connect');
+    await onceSocketEvent(broadcaster, 'initial_state');
+
+    // Prisma cascade 后 token 查询为 null；不依赖内部通知，60s 周期路径同样失败关闭。
+    shareLinkFindUniqueMock.mockResolvedValue(null);
+    const authError = onceSocketEvent<{ code: string }>(
+      broadcaster,
+      'share_error'
+    );
+    const disconnected = onceSocketEvent<string>(broadcaster, 'disconnect');
+
+    await revalidateAllLiveRooms(io);
+
+    await expect(authError).resolves.toMatchObject({
+      code: 'BROADCASTER_AUTH_REVOKED',
+    });
+    await expect(disconnected).resolves.toBe('io server disconnect');
   });
 });

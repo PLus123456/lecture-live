@@ -6,8 +6,17 @@ import { prisma } from '@/lib/prisma';
 import { resolveRoleQuotas, resolveRoleStorageBytesLimit } from '@/lib/userRoles';
 import { settlePoolOnLimitChange } from '@/lib/quota';
 import { logSystemEvent } from '@/lib/auditLog';
-import type { PaymentProviderName } from '@/lib/payment/types';
+import type { PaymentProviderMode, PaymentProviderName } from '@/lib/payment/types';
+import {
+  isPurchasableMembershipRole,
+  type PurchasableMembershipRole,
+} from '@/lib/payment/tierPolicy';
 import { sendSubscriptionSuccessEmail } from '@/lib/email';
+import {
+  allocateWalletSpend,
+  assertNoActivePaymentHold,
+  createWalletFundingLot,
+} from '@/lib/payment/fundingLedger';
 
 /** 面向用户的钱包业务错误（余额不足 / 档位无效等）。路由据 code 回 4xx。 */
 export class WalletError extends Error {
@@ -18,6 +27,7 @@ export class WalletError extends Error {
       | 'tier_unavailable'
       | 'user_not_found'
       | 'admin_no_membership'
+      | 'account_frozen'
       | 'bad_request' = 'bad_request'
   ) {
     super(message);
@@ -45,9 +55,7 @@ interface OrderMetadata {
   returnUrl?: string; // 支付完成后浏览器跳回
   subject?: string;
   grant?: GrantSnapshot; // purchase 订单：回调按此冻结快照发放
-  // purchase 订单的**发放闸**（L15）。PaymentOrder 无 granted 列（schema 冻结），故把标记落在
-  // metadata 里：tx2 内以「旧 metadataJson 原文」为 CAS 条件抢占它，抢到才发放。发放失败整段
-  // 回滚、标记一并撤销 → 网关重投时能再试一次（原先重投直接 return，用户付了钱永远拿不到权益）。
+  // 仅用于识别迁移前历史快照；新代码绝不再以 metadata CAS 作为发放真源。
   grantedAt?: string;
 }
 
@@ -66,6 +74,7 @@ function generateOutTradeNo(): string {
 }
 
 const ORDER_TTL_MS = 30 * 60_000; // 未支付订单 30 分钟过期
+const MAX_PROVIDER_CLOCK_SKEW_MS = 5 * 60_000;
 
 /** 归一化 ISO-4217 币种码（大写、去空白）；非法/空值回 ''，由调用方决定回落。 */
 function normalizeCurrency(v: string | null | undefined): string {
@@ -80,6 +89,20 @@ export const DEFAULT_ORDER_CURRENCY = 'CNY';
  * 伪造 —— 不能像 sandbox 那样「无金额就跳过对账」fail-open：那等于把 M1/M2 金额对账整条关掉。
  */
 const AMOUNT_REQUIRED_PROVIDERS: PaymentProviderName[] = ['alipay', 'wechat', 'stripe'];
+
+async function assertWalletAccountActive(
+  tx: Prisma.TransactionClient,
+  userId: string
+): Promise<void> {
+  try {
+    await assertNoActivePaymentHold(tx, userId);
+  } catch (err) {
+    if (err instanceof Error && err.message === 'payment_account_frozen') {
+      throw new WalletError('账户存在未处理的支付争议，请联系管理员', 'account_frozen');
+    }
+    throw err;
+  }
+}
 
 export interface WalletSummary {
   walletBalanceCents: number;
@@ -108,6 +131,8 @@ export async function getWalletSummary(userId: string): Promise<WalletSummary | 
 export async function createPaymentOrder(input: {
   userId: string;
   provider: PaymentProviderName;
+  providerMode?: PaymentProviderMode;
+  providerAccount?: string;
   kind: 'topup' | 'purchase';
   amountCents: number;
   /** ISO-4217 币种码；下单时冻结到订单行，回调按 (amount, currency) 二元组对账（P3-15）。 */
@@ -127,114 +152,126 @@ export async function createPaymentOrder(input: {
     // purchase 订单冻结发放快照（H1/H2）；topup 无需。
     grant: input.kind === 'purchase' ? input.grant : undefined,
   };
-  return prisma.paymentOrder.create({
-    data: {
-      userId: input.userId,
-      provider: input.provider,
-      kind: input.kind,
-      tierId: input.tierId ?? null,
-      outTradeNo: generateOutTradeNo(),
-      amountCents,
-      currency: normalizeCurrency(input.currency) || DEFAULT_ORDER_CURRENCY,
-      status: 'pending',
-      metadataJson: JSON.stringify(metadata),
-      expiresAt: new Date(Date.now() + ORDER_TTL_MS),
-    },
+  return prisma.$transaction(async (tx) => {
+    // Serialize checkout with chargeback/debt creation. Reversal takes
+    // PaymentOrder -> User -> hold; a brand-new order has no order row yet, so its first
+    // shared boundary is the User row. Whichever transaction gets this lock first defines the
+    // outcome: an already-frozen account cannot create another payable order, while an order
+    // durably created first remains auditable if a different payment is disputed immediately after.
+    const users = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT id FROM User WHERE id = ${input.userId} FOR UPDATE
+    `;
+    if (!users[0]) throw new WalletError('用户不存在', 'user_not_found');
+    await assertWalletAccountActive(tx, input.userId);
+    const order = await tx.paymentOrder.create({
+      data: {
+        userId: input.userId,
+        provider: input.provider,
+        kind: input.kind,
+        tierId: input.tierId ?? null,
+        outTradeNo: generateOutTradeNo(),
+        amountCents,
+        currency: normalizeCurrency(input.currency) || DEFAULT_ORDER_CURRENCY,
+        status: 'pending',
+        metadataJson: JSON.stringify(metadata),
+        // Provider event timestamps are second-granular. Floor the deadline to the same
+        // resolution so a payment at xx:00.900 cannot be reported as xx:00.000 and slip through
+        // an expiresAt of xx:00.800. This is intentionally conservative by <1 second.
+        expiresAt: new Date(
+          Math.floor((Date.now() + ORDER_TTL_MS) / 1000) * 1000
+        ),
+      },
+    });
+    // New columns are written through SQL so this patch remains compilable before the shared
+    // generated Prisma client is refreshed. Deployment's db push/migration installs them first.
+    await tx.$executeRaw`
+      UPDATE PaymentOrder
+      SET providerMode = ${input.providerMode ?? (input.provider === 'sandbox' ? 'sandbox' : 'unknown')},
+          providerAccount = ${(input.providerAccount || 'default').slice(0, 191)}
+      WHERE id = ${order.id}
+    `;
+    return order;
   });
 }
 
 export interface CreditResult {
   ok: boolean;
+  /** Durable terminal/review outcome that is safe to ACK even though no entitlement was granted. */
+  acknowledged?: boolean;
   alreadyProcessed: boolean;
   status?: string;
   returnUrl?: string;
 }
 
+interface CreditClaimOutcome {
+  order: LockedPaymentOrder | null;
+  meta: OrderMetadata;
+  claimedNow: boolean;
+  reject: RejectReason;
+  reviewStatus?: 'late_paid' | 'invalid_paid_at';
+}
+
+interface LockedPaymentOrder {
+  id: string;
+  userId: string;
+  provider: string;
+  kind: string;
+  tierId: string | null;
+  outTradeNo: string;
+  providerRef: string | null;
+  amountCents: number;
+  currency: string;
+  status: string;
+  paidAt: Date | string | null;
+  refundedAt: Date | string | null;
+  fulfillmentStatus: string;
+  reviewReason: string | null;
+  metadataJson: string | null;
+  createdAt: Date | string;
+  expiresAt: Date | string | null;
+}
+
 /** tx1 的拒绝原因（同时是审计事件名后缀）。null = 通过。 */
 type RejectReason =
   | 'refunded'
+  | 'provider_mismatch'
   | 'amount_mismatch'
   | 'amount_missing'
   | 'currency_mismatch'
+  | 'fulfillment_review'
   | null;
 
-/** 已发放的判据：这两类台账带 orderId，一笔购买订单至多各一条。 */
-const GRANT_TX_TYPES = ['purchase_membership', 'purchase_minutes'];
-
-/**
- * purchase 订单的发放段（tx2），至多执行一次：
- *  1) 台账查重——老订单（本次改动之前发放的）没有 grantedAt 标记，靠 orderId 上的出账台账兜底，
- *     否则重投会把它们再发一遍；
- *  2) 以「旧 metadataJson 原文」为条件 CAS 抢占 grantedAt 标记，count=0 = 并发重投已抢走 → 放弃；
- *  3) 发放。三步同事务：发放抛错则标记一并回滚，网关重投时能再试（L15）。
- * 发放失败**绝不**回滚 tx1 的到账（钱留在钱包），仅记事件供人工补发/退款。
- */
-async function settleGrantOnce(
-  order: {
-    id: string;
-    userId: string;
-    tierId: string | null;
-    outTradeNo: string;
-    metadataJson: string | null;
-  },
-  meta: OrderMetadata
-): Promise<boolean> {
-  if (meta.grantedAt) return true;
-  try {
-    await prisma.$transaction(async (tx) => {
-      const already = await tx.walletTransaction.findFirst({
-        where: { orderId: order.id, type: { in: GRANT_TX_TYPES } },
-        select: { id: true },
-      });
-      if (already) return;
-      const claim = await tx.paymentOrder.updateMany({
-        where: { id: order.id, metadataJson: order.metadataJson },
-        data: {
-          metadataJson: JSON.stringify({
-            ...meta,
-            grantedAt: new Date().toISOString(),
-          } satisfies OrderMetadata),
-        },
-      });
-      if (claim.count === 0) {
-        throw new WalletError('发放已被并发认领', 'bad_request');
-      }
-      const spec = meta.grant ?? (await resolveTierGrant(tx, order.tierId));
-      if (!spec) {
-        throw new WalletError('档位快照缺失且档位已不存在', 'tier_unavailable');
-      }
-      await applyGrantTx(tx, order.userId, spec, { orderId: order.id });
-    });
-    return true;
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : 'unknown';
-    console.error(`购买发放失败，已到账余额保留（outTradeNo=${order.outTradeNo}）:`, err);
-    logSystemEvent(
-      'recharge.grant.failed',
-      `outTradeNo=${order.outTradeNo} userId=${order.userId} reason=${reason}`
-    );
-    return false;
-  }
+async function lockPaymentOrderForUpdate(
+  tx: Prisma.TransactionClient,
+  outTradeNo: string
+): Promise<LockedPaymentOrder | null> {
+  const rows = await tx.$queryRaw<LockedPaymentOrder[]>`
+    SELECT id, userId, provider, kind, tierId, outTradeNo, providerRef,
+           amountCents, currency, status, paidAt, refundedAt, fulfillmentStatus, reviewReason,
+           metadataJson, createdAt, expiresAt
+    FROM PaymentOrder
+    WHERE outTradeNo = ${outTradeNo}
+    FOR UPDATE
+  `;
+  return rows[0] ?? null;
 }
 
 /**
- * 幂等到账。分两段事务，确保「钱已落袋」与「档位发放」解耦：
- *  - tx1：条件认领 PaymentOrder（pending→paid 原子 CAS），认领成功才 walletBalanceCents += creditCents
- *    并记 topup 台账。重复回调因 CAS count=0 无副作用（幂等）。
- *  - tx2（仅 purchase）：按订单**冻结的发放快照**等额出账 + 发放（不读 live 档位）。**发放失败绝不回滚
- *    tx1 的到账**——钱留在钱包余额（用户可改用余额购买），仅记 recharge.grant.failed 供人工处理，且回调
- *    仍据 tx1 成功回 ACK 让网关停止重试（H1）。快照冻结价与发放内容 → 无 credit/spend 价漂移（H2）。
+ * SEC-027: payment claim, wallet credit, purchase debit and entitlement grant are one transaction.
+ * Lock order is always PaymentOrder -> User. A refund takes the same locks in the same order, so
+ * it can never observe `paid` while the wallet/entitlement half is still uncommitted.
  */
 export async function creditPaidOrder(
   outTradeNo: string,
   providerRef?: string,
   expectedProvider?: PaymentProviderName,
   paidAmountCents?: number,
-  paidCurrency?: string
+  paidCurrency?: string,
+  paidOccurredAt?: Date
 ): Promise<CreditResult> {
-  // tx1：金额对账 → 认领 + 到账（钱先落袋，绝不因后续发放失败而回滚）。
-  const claimed = await prisma.$transaction(async (tx) => {
-    const order = await tx.paymentOrder.findUnique({ where: { outTradeNo } });
+  try {
+    const claimed = await prisma.$transaction(async (tx): Promise<CreditClaimOutcome> => {
+    const order = await lockPaymentOrderForUpdate(tx, outTradeNo);
     if (!order) {
       return {
         order: null as null,
@@ -249,6 +286,9 @@ export async function creditPaidOrder(
     // 不能把一笔已经退回去的钱重新发一遍权益。
     if (order.refundedAt) {
       return { order, meta, claimedNow: false, reject: 'refunded' as RejectReason };
+    }
+    if (expectedProvider && order.provider && order.provider !== expectedProvider) {
+      return { order, meta, claimedNow: false, reject: 'provider_mismatch' as RejectReason };
     }
 
     // 金额对账（M1/M2）：网关回报的实付金额须等于订单金额，否则拒绝到账（不认领，订单留 pending）。
@@ -278,34 +318,115 @@ export async function creditPaidOrder(
       return { order, meta, claimedNow: false, reject: 'currency_mismatch' as RejectReason };
     }
 
-    const claim = await tx.paymentOrder.updateMany({
-      // 绑定回调渠道到订单 provider（H3 纵深）：回调渠道须与下单渠道一致才认领，防止用某渠道
-      // （尤其无验签的 sandbox）替另一渠道的订单结算。正常回调渠道恒等于下单渠道，不影响业务。
-      where: {
-        outTradeNo,
-        status: 'pending',
-        ...(expectedProvider ? { provider: expectedProvider } : {}),
-      },
-      data: {
-        status: 'paid',
-        paidAt: new Date(),
-        ...(providerRef ? { providerRef } : {}),
-      },
-    });
-
-    if (claim.count === 0) {
-      // 未认领到：已被处理过（重复回调）或非 pending。幂等，不再到账。
+    if (order.status === 'paid' && order.fulfillmentStatus === 'fulfilled') {
       return { order, meta, claimedNow: false, reject: null as RejectReason };
     }
+    if (order.status === 'late_paid') {
+      return {
+        order,
+        meta,
+        claimedNow: false,
+        reject: null as RejectReason,
+        reviewStatus: 'late_paid',
+      };
+    }
+    if (
+      order.fulfillmentStatus === 'review' &&
+      order.reviewReason === 'payment_before_order'
+    ) {
+      return {
+        order,
+        meta,
+        claimedNow: false,
+        reject: null,
+        reviewStatus: 'invalid_paid_at',
+      };
+    }
+    const retryableUncommittedFailure =
+      order.fulfillmentStatus === 'review' &&
+      order.reviewReason === 'fulfillment_failed_uncommitted' &&
+      ['pending', 'expired', 'failed'].includes(order.status);
+    if (order.fulfillmentStatus === 'review' && !retryableUncommittedFailure) {
+      return { order, meta, claimedNow: false, reject: 'fulfillment_review' as RejectReason };
+    }
 
-    // 认领成功 → 进账
+    const paidAt =
+      paidOccurredAt instanceof Date && Number.isFinite(paidOccurredAt.getTime())
+        ? paidOccurredAt
+        : new Date();
+    const expiresAt = order.expiresAt ? new Date(order.expiresAt) : null;
+    const createdAt = new Date(order.createdAt);
+    if (
+      Number.isFinite(createdAt.getTime()) &&
+      paidAt.getTime() < createdAt.getTime() - MAX_PROVIDER_CLOCK_SKEW_MS
+    ) {
+      await tx.$executeRaw`
+        UPDATE PaymentOrder
+        SET paidAt = ${paidAt}, fulfillmentStatus = 'review',
+            reviewReason = 'payment_before_order',
+            fulfillmentError = 'provider payment timestamp predates order creation'
+        WHERE id = ${order.id} AND status NOT IN ('paid', 'refunded')
+      `;
+      return {
+        order: {
+          ...order,
+          paidAt,
+          fulfillmentStatus: 'review',
+          reviewReason: 'payment_before_order',
+        },
+        meta,
+        claimedNow: true,
+        reject: null,
+        reviewStatus: 'invalid_paid_at',
+      };
+    }
+    if (expiresAt && Number.isFinite(expiresAt.getTime()) && paidAt >= expiresAt) {
+      await tx.$executeRaw`
+        UPDATE PaymentOrder
+        SET status = 'late_paid', paidAt = ${paidAt},
+            providerRef = COALESCE(${providerRef ?? null}, providerRef),
+            fulfillmentStatus = 'review', reviewReason = 'payment_after_expiry',
+            fulfillmentError = 'provider-confirmed payment occurred after expiresAt'
+        WHERE id = ${order.id} AND status NOT IN ('paid', 'refunded')
+      `;
+      return {
+        order: { ...order, status: 'late_paid', fulfillmentStatus: 'review', paidAt },
+        meta,
+        claimedNow: true,
+        reject: null,
+        reviewStatus: 'late_paid',
+      };
+    }
+    // A delayed webhook may arrive after cron marked the order expired (or checkout timed out and
+    // marked it failed). A signed provider paidAt before expiresAt is authoritative and can resume.
+    if (!['pending', 'expired', 'failed'].includes(order.status)) {
+      return { order, meta, claimedNow: false, reject: null as RejectReason };
+    }
+    await tx.$executeRaw`
+      UPDATE PaymentOrder
+      SET status = 'paid', paidAt = ${paidAt},
+          providerRef = COALESCE(${providerRef ?? null}, providerRef),
+          fulfillmentStatus = 'processing', fulfillmentStartedAt = NOW(3),
+          fulfillmentError = NULL, reviewReason = NULL
+      WHERE id = ${order.id} AND status IN ('pending', 'expired', 'failed')
+    `;
+
+    // Explicit user lock closes both topup and purchase paths and fixes one global lock order.
+    const userLock = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT id FROM User WHERE id = ${order.userId} FOR UPDATE
+    `;
+    if (!userLock[0]) throw new WalletError('用户不存在', 'user_not_found');
+    await assertWalletAccountActive(tx, order.userId);
+
+    // Credit first, then (for direct purchase) spend the exact frozen price and grant in the same
+    // transaction. Any error rolls all of it back, including the paid/processing transition.
     const creditCents = Math.max(0, Math.round(meta.creditCents ?? order.amountCents));
     const credited = await tx.user.update({
       where: { id: order.userId },
       data: { walletBalanceCents: { increment: creditCents } },
       select: { walletBalanceCents: true },
     });
-    await tx.walletTransaction.create({
+    const topupTx = await tx.walletTransaction.create({
       data: {
         userId: order.userId,
         type: 'topup',
@@ -314,58 +435,121 @@ export async function creditPaidOrder(
         orderId: order.id,
       },
     });
+    const fundingLotId = await createWalletFundingLot(tx, {
+      userId: order.userId,
+      sourceOrderId: order.id,
+      sourceTransactionId: topupTx.id,
+      sourceKind: 'payment',
+      amountCents: creditCents,
+    });
+
+    if (order.kind === 'purchase') {
+      const spec = meta.grant ?? (await resolveTierGrant(tx, order.tierId));
+      if (!spec) {
+        throw new WalletError('档位快照缺失且档位已不存在', 'tier_unavailable');
+      }
+      await applyGrantTx(tx, order.userId, spec, {
+        orderId: order.id,
+        sourceFundingLotId: fundingLotId,
+      });
+    }
+
+    await tx.$executeRaw`
+      UPDATE PaymentOrder
+      SET fulfillmentStatus = 'fulfilled', fulfilledAt = NOW(3),
+          fulfillmentError = NULL, reviewReason = NULL
+      WHERE id = ${order.id} AND status = 'paid' AND fulfillmentStatus = 'processing'
+    `;
 
     return { order, meta, claimedNow: true, reject: null as RejectReason };
   });
 
-  const { order, meta } = claimed;
-  if (!order) {
-    return { ok: false, alreadyProcessed: false };
-  }
-  if (claimed.reject) {
-    // 对账不通过：拒绝到账，记录供排障（可能是攻击/网关不一致）。订单保持原状态。
-    logSystemEvent(
-      `recharge.callback.${claimed.reject}`,
-      `outTradeNo=${outTradeNo} expected=${order.amountCents}${
-        normalizeCurrency(order.currency) || DEFAULT_ORDER_CURRENCY
-      } paid=${paidAmountCents}${normalizeCurrency(paidCurrency)} provider=${expectedProvider ?? '-'}`
-    );
-    return {
-      ok: false,
-      alreadyProcessed: false,
-      status: order.status,
-      returnUrl: meta.returnUrl,
-    };
-  }
-  if (!claimed.claimedNow) {
-    // L15：重投的回调也要补做**未完成的发放**——原先这里直接 return，首投发放失败后用户
-    // 付了钱却永远拿不到权益，只剩一条 recharge.grant.failed 等人工。发放闸保证不会重复发。
-    if (order.status === 'paid' && order.kind === 'purchase' && !meta.grantedAt) {
-      const lateGranted = await settleGrantOnce(order, meta);
-      if (lateGranted) void notifyOrderCredited(order.id).catch(() => undefined);
+    const { order, meta } = claimed;
+    if (!order) {
+      return { ok: false, alreadyProcessed: false };
     }
-    return {
-      ok: order.status === 'paid',
-      alreadyProcessed: true,
-      status: order.status,
-      returnUrl: meta.returnUrl,
-    };
-  }
+    if (claimed.reviewStatus) {
+      const durableStatus =
+        claimed.reviewStatus === 'late_paid' ? 'late_paid' : 'review';
+      logSystemEvent(
+        `recharge.callback.${claimed.reviewStatus}`,
+        `outTradeNo=${outTradeNo} paidAt=${String(order.paidAt ?? paidOccurredAt ?? '')} expiresAt=${String(order.expiresAt ?? '')}`
+      );
+      return {
+        ok: false,
+        acknowledged: true,
+        alreadyProcessed: !claimed.claimedNow,
+        status: durableStatus,
+        returnUrl: meta.returnUrl,
+      };
+    }
+    if (claimed.reject) {
+      logSystemEvent(
+        `recharge.callback.${claimed.reject}`,
+        `outTradeNo=${outTradeNo} expected=${order.amountCents}${
+          normalizeCurrency(order.currency) || DEFAULT_ORDER_CURRENCY
+        } paid=${paidAmountCents}${normalizeCurrency(paidCurrency)} provider=${expectedProvider ?? '-'}`
+      );
+      return {
+        ok: false,
+        // A signed paid event delivered after an already-durable reversal is terminal and safe
+        // to ACK: refundedAt is the entitlement gate, so retries can never grant rights.
+        ...(claimed.reject === 'refunded' ? { acknowledged: true } : {}),
+        alreadyProcessed: false,
+        status: order.status,
+        returnUrl: meta.returnUrl,
+      };
+    }
+    if (!claimed.claimedNow) {
+      return {
+        ok: order.status === 'paid' && order.fulfillmentStatus === 'fulfilled',
+        alreadyProcessed: true,
+        status: order.status,
+        returnUrl: meta.returnUrl,
+      };
+    }
 
-  // tx2：purchase 订单按冻结快照发放（缺快照的旧订单回落读 live 档位）。发放失败不回滚到账。
-  const granted = order.kind === 'purchase' ? await settleGrantOnce(order, meta) : true;
-
-  // 订阅/充值成功通知邮件（fire-and-forget，受用户「订阅」偏好与站点营销总开关约束）。
-  //
-  // 发放失败时**绝不**发信：此时用户其实没拿到会员/时长，只是余额还在（待人工补发或退款）。
-  // 发一封「订阅成功」不但是假的，还会因为 roleExpiresAt 仍为空而渲染成「有效期至：永久有效」
-  // —— 把最糟的结果显示成最好的结果，用户既不会来报障，客服也无从发现。
-  // 充值订单（kind !== 'purchase'）没有发放环节，tx1 到账即成功，照常发。
-  if (granted) {
     void notifyOrderCredited(order.id).catch(() => undefined);
+    return { ok: true, alreadyProcessed: false, status: 'paid', returnUrl: meta.returnUrl };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'unknown';
+    logSystemEvent('recharge.fulfillment.failed', `outTradeNo=${outTradeNo} reason=${reason}`);
+    if (err instanceof WalletError) {
+      const changed = await prisma.$executeRaw`
+        UPDATE PaymentOrder
+        SET fulfillmentStatus = 'review',
+            reviewReason = 'fulfillment_failed_uncommitted',
+            fulfillmentError = ${reason.slice(0, 4096)}
+        WHERE outTradeNo = ${outTradeNo}
+          AND refundedAt IS NULL
+          AND status <> 'refunded'
+          AND fulfillmentStatus NOT IN ('fulfilled', 'reversed')
+      `;
+      if (Number(changed) === 0) {
+        const terminal = await prisma.$queryRaw<
+          Array<{ status: string; refundedAt: Date | string | null; fulfillmentStatus: string }>
+        >`
+          SELECT status, refundedAt, fulfillmentStatus
+          FROM PaymentOrder WHERE outTradeNo = ${outTradeNo} LIMIT 1
+        `;
+        if (
+          terminal[0] &&
+          (terminal[0].status === 'refunded' ||
+            terminal[0].refundedAt ||
+            terminal[0].fulfillmentStatus === 'reversed')
+        ) {
+          return {
+            ok: false,
+            acknowledged: true,
+            alreadyProcessed: true,
+            status: 'refunded',
+          };
+        }
+      }
+      return { ok: false, alreadyProcessed: false, status: 'review' };
+    }
+    throw err;
   }
-
-  return { ok: true, alreadyProcessed: false, status: 'paid', returnUrl: meta.returnUrl };
 }
 
 const yuan = (cents: number) => `¥${(Math.max(0, cents) / 100).toFixed(2)}`;
@@ -468,6 +652,12 @@ async function resolveTierGrant(
     // topup 档位不应走「购买发放」路径。
     throw new WalletError('该档位不可用余额购买', 'tier_unavailable');
   }
+  if (
+    tier.kind === 'membership' &&
+    !isPurchasableMembershipRole(tier.grantRole ?? 'PRO')
+  ) {
+    throw new WalletError('会员商品不能授予管理员角色', 'tier_unavailable');
+  }
   return {
     kind: tier.kind === 'membership' ? 'membership' : 'minutes',
     priceCents: tier.priceCents,
@@ -479,6 +669,36 @@ async function resolveTierGrant(
   };
 }
 
+async function recordPaymentEntitlement(
+  tx: Prisma.TransactionClient,
+  input: {
+    userId: string;
+    sourceOrderId?: string;
+    walletTransactionId: string | undefined;
+    kind: 'membership' | 'minutes';
+    grantRole?: UserRole | null;
+    totalUnits: number;
+    priceCents: number;
+  }
+): Promise<string> {
+  if (!input.walletTransactionId) {
+    throw new Error('wallet transaction id missing for entitlement ledger');
+  }
+  const entitlementId = crypto.randomUUID();
+  await tx.$executeRaw`
+    INSERT INTO PaymentEntitlement (
+      id, userId, sourceOrderId, walletTransactionId, kind, grantRole,
+      totalUnits, revokedUnits, priceCents, status, grantedAt, createdAt, updatedAt
+    ) VALUES (
+      ${entitlementId}, ${input.userId}, ${input.sourceOrderId ?? null},
+      ${input.walletTransactionId}, ${input.kind}, ${input.grantRole ?? null},
+      ${Math.max(0, Math.round(input.totalUnits))}, 0,
+      ${Math.max(0, Math.round(input.priceCents))}, 'active', NOW(3), NOW(3), NOW(3)
+    )
+  `;
+  return entitlementId;
+}
+
 /**
  * 事务内：按发放规格从余额扣款并发放（会员=改 role/到期；时间=加永久池）。
  * 规格可来自 live 档位（余额购买）或订单冻结快照（回调结算，H1/H2）。
@@ -487,7 +707,7 @@ async function applyGrantTx(
   tx: Prisma.TransactionClient,
   userId: string,
   spec: GrantSnapshot,
-  opts: { operatorId?: string; orderId?: string }
+  opts: { operatorId?: string; orderId?: string; sourceFundingLotId?: string }
 ): Promise<void> {
   const priceCents = Math.max(0, Math.round(spec.priceCents));
   // P3-7：0 元的会员/时长档 = 提款机。下面的扣款守卫是 `walletBalanceCents >= 0`，对 0 元恒真
@@ -495,6 +715,16 @@ async function applyGrantTx(
   // 冻结快照可能来自建管口收紧之前的 0 元档。
   if (priceCents <= 0) {
     throw new WalletError('档位价格无效（必须大于 0）', 'tier_unavailable');
+  }
+  // 最终发放闸：订单 metadata 是下单时冻结的历史快照，可能来自本修复之前的
+  // ADMIN 档位，不能只依赖当前档位或管理 API。必须在任何扣款、锁读、配额修改前拒绝。
+  let purchasableRole: PurchasableMembershipRole | null = null;
+  if (spec.kind === 'membership') {
+    const requestedRole = spec.grantRole ?? 'PRO';
+    if (!isPurchasableMembershipRole(requestedRole)) {
+      throw new WalletError('会员商品不能授予管理员角色', 'tier_unavailable');
+    }
+    purchasableRole = requestedRole;
   }
   // 锁读（P3-6）：会员发放对 roleExpiresAt / originalRole 是读-改-写，快照读在并发网关回调下
   // 必然 lost update —— 两笔各扣一次钱、到期只延一期，且台账看起来完全正常。FOR UPDATE 让第二笔
@@ -521,6 +751,7 @@ async function applyGrantTx(
     roleExpiresAt: row.roleExpiresAt ? new Date(row.roleExpiresAt) : null,
     transcriptionMinutesLimit: Number(row.transcriptionMinutesLimit),
   };
+  await assertWalletAccountActive(tx, userId);
   if (spec.kind === 'membership' && user.role === 'ADMIN') {
     throw new WalletError('管理员无需购买会员', 'admin_no_membership');
   }
@@ -541,7 +772,7 @@ async function applyGrantTx(
   const balanceAfter = after?.walletBalanceCents ?? user.walletBalanceCents - priceCents;
 
   if (spec.kind === 'membership') {
-    const grantRole: UserRole = spec.grantRole ?? 'PRO';
+    const grantRole: UserRole = purchasableRole ?? 'PRO';
     const days = Math.max(1, spec.durationDays ?? 30);
     const now = new Date();
     // 叠加续期：从「现有未过期到期日」或「现在」起算，取较晚者。
@@ -588,7 +819,7 @@ async function applyGrantTx(
         tokenVersion: { increment: 1 },
       },
     });
-    await tx.walletTransaction.create({
+    const purchaseTx = await tx.walletTransaction.create({
       data: {
         userId,
         type: 'purchase_membership',
@@ -600,13 +831,32 @@ async function applyGrantTx(
         note: `${spec.tierName}（${grantRole} ${days}天）`,
       },
     });
+    const entitlementId = await recordPaymentEntitlement(tx, {
+      userId,
+      sourceOrderId: opts.orderId,
+      walletTransactionId: purchaseTx.id,
+      kind: 'membership',
+      grantRole,
+      totalUnits: days,
+      priceCents,
+    });
+    await allocateWalletSpend(tx, {
+      userId,
+      spendTransactionId: purchaseTx.id,
+      amountCents: priceCents,
+      balanceAfterCents: balanceAfter,
+      targetKind: 'membership',
+      entitlementId,
+      totalUnits: days,
+      forcedFundingLotId: opts.sourceFundingLotId,
+    });
   } else {
     const minutes = Math.max(0, spec.grantMinutes ?? 0);
     await tx.user.update({
       where: { id: userId },
       data: { purchasedMinutesBalance: { increment: minutes } },
     });
-    await tx.walletTransaction.create({
+    const purchaseTx = await tx.walletTransaction.create({
       data: {
         userId,
         type: 'purchase_minutes',
@@ -619,6 +869,24 @@ async function applyGrantTx(
         note: `${spec.tierName}（+${minutes}分钟）`,
       },
     });
+    const entitlementId = await recordPaymentEntitlement(tx, {
+      userId,
+      sourceOrderId: opts.orderId,
+      walletTransactionId: purchaseTx.id,
+      kind: 'minutes',
+      totalUnits: minutes,
+      priceCents,
+    });
+    await allocateWalletSpend(tx, {
+      userId,
+      spendTransactionId: purchaseTx.id,
+      amountCents: priceCents,
+      balanceAfterCents: balanceAfter,
+      targetKind: 'minutes',
+      entitlementId,
+      totalUnits: minutes,
+      forcedFundingLotId: opts.sourceFundingLotId,
+    });
   }
 }
 
@@ -627,7 +895,7 @@ async function spendOnTierTx(
   tx: Prisma.TransactionClient,
   userId: string,
   tierId: string,
-  opts: { operatorId?: string; orderId?: string }
+  opts: { operatorId?: string; orderId?: string; sourceFundingLotId?: string }
 ): Promise<GrantSnapshot> {
   const spec = await resolveTierGrant(tx, tierId);
   if (!spec) throw new WalletError('档位不存在或已下架', 'tier_unavailable');
@@ -718,7 +986,7 @@ export async function adminAdjust(input: {
       `;
     }
 
-    await tx.walletTransaction.create({
+    const adminTx = await tx.walletTransaction.create({
       data: {
         userId: input.userId,
         type: 'admin_adjust',
@@ -729,6 +997,22 @@ export async function adminAdjust(input: {
         note: input.note ?? null,
       },
     });
+    if (effectiveAmountDelta > 0) {
+      await createWalletFundingLot(tx, {
+        userId: input.userId,
+        sourceTransactionId: adminTx.id,
+        sourceKind: 'admin',
+        amountCents: effectiveAmountDelta,
+      });
+    } else if (effectiveAmountDelta < 0) {
+      await allocateWalletSpend(tx, {
+        userId: input.userId,
+        spendTransactionId: adminTx.id,
+        amountCents: -effectiveAmountDelta,
+        balanceAfterCents: balanceAfter,
+        targetKind: 'admin',
+      });
+    }
     return { amountCentsDelta: effectiveAmountDelta, minutesDelta: effectiveMinutesDelta };
   });
 }
@@ -755,17 +1039,16 @@ export async function spendWalletCents(
     throw new WalletError('扣费金额非法', 'bad_request');
   }
   const run = async (db: Prisma.TransactionClient) => {
+    const locked = await db.$queryRaw<Array<{ id: string }>>`
+      SELECT id FROM User WHERE id = ${input.userId} FOR UPDATE
+    `;
+    if (!locked[0]) throw new WalletError('用户不存在', 'user_not_found');
+    await assertWalletAccountActive(db, input.userId);
     const spent = await db.user.updateMany({
       where: { id: input.userId, walletBalanceCents: { gte: amount } },
       data: { walletBalanceCents: { decrement: amount } },
     });
     if (spent.count === 0) {
-      // 区分「用户不存在」与「余额不足」，给路由清晰的 4xx 语义
-      const exists = await db.user.findUnique({
-        where: { id: input.userId },
-        select: { id: true },
-      });
-      if (!exists) throw new WalletError('用户不存在', 'user_not_found');
       throw new WalletError('钱包余额不足', 'insufficient_balance');
     }
     const after = await db.user.findUnique({
@@ -773,7 +1056,7 @@ export async function spendWalletCents(
       select: { walletBalanceCents: true },
     });
     const balanceAfterCents = after?.walletBalanceCents ?? 0;
-    await db.walletTransaction.create({
+    const spendTx = await db.walletTransaction.create({
       data: {
         userId: input.userId,
         type: input.type,
@@ -782,6 +1065,13 @@ export async function spendWalletCents(
         operatorId: input.operatorId ?? null,
         note: input.note ?? null,
       },
+    });
+    await allocateWalletSpend(db, {
+      userId: input.userId,
+      spendTransactionId: spendTx.id,
+      amountCents: amount,
+      balanceAfterCents,
+      targetKind: 'service',
     });
     return { balanceAfterCents };
   };
@@ -808,6 +1098,10 @@ export async function refundWalletCents(
     throw new WalletError('退款金额非法', 'bad_request');
   }
   const run = async (db: Prisma.TransactionClient) => {
+    const locked = await db.$queryRaw<Array<{ id: string }>>`
+      SELECT id FROM User WHERE id = ${input.userId} FOR UPDATE
+    `;
+    if (!locked[0]) throw new WalletError('用户不存在', 'user_not_found');
     const updated = await db.user
       .update({
         where: { id: input.userId },
@@ -816,7 +1110,7 @@ export async function refundWalletCents(
       })
       .catch(() => null);
     if (!updated) throw new WalletError('用户不存在', 'user_not_found');
-    await db.walletTransaction.create({
+    const refundTx = await db.walletTransaction.create({
       data: {
         userId: input.userId,
         type: input.type,
@@ -825,6 +1119,12 @@ export async function refundWalletCents(
         operatorId: input.operatorId ?? null,
         note: input.note ?? null,
       },
+    });
+    await createWalletFundingLot(db, {
+      userId: input.userId,
+      sourceTransactionId: refundTx.id,
+      sourceKind: 'service_refund',
+      amountCents: amount,
     });
     return { balanceAfterCents: updated.walletBalanceCents };
   };

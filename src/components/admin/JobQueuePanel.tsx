@@ -36,6 +36,9 @@ interface Job {
   createdAt: string;
   startedAt: string | null;
   completedAt: string | null;
+  resourceScope: string | null;
+  reservedUnits: string;
+  actualUnits: string | null;
 }
 
 interface Pagination {

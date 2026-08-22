@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import { LLM_PURPOSES, type LlmAdminPurpose } from '@/lib/llm/defaults';
 import {
   VALID_THINKING_MODES,
@@ -10,6 +9,7 @@ import {
   coerceTemperature,
 } from '@/lib/llm/routeParams';
 import { createRouteForRegistry, purposeMatchesKind } from '@/lib/llm/attachRoute';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 /**
  * POST /api/admin/llm-routes
@@ -23,8 +23,8 @@ export async function POST(req: Request) {
     limit: 30,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -95,18 +95,39 @@ export async function POST(req: Request) {
       );
     }
 
-    const route = await prisma.$transaction((tx) =>
-      createRouteForRegistry(tx, registry, purpose, {
+    const route = await prisma.$transaction(async (tx) => {
+      const created = await createRouteForRegistry(tx, registry, purpose, {
         thinkingMode,
         thinkingDepth,
         temperature,
         isDefault: Boolean(body.isDefault),
-      })
-    );
-
-    logAction(req, 'admin.llm.route.create', {
-      user: admin,
-      detail: `挂载模型到用途: ${registry.displayName} → ${purpose}`,
+      });
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-routes.create',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: {
+            type: 'llm_route',
+            id: created.id,
+            registryId,
+            providerId: registry.providerId,
+          },
+          after: {
+            purpose: created.purpose,
+            modelId: created.modelId,
+            displayName: created.displayName,
+            isDefault: created.isDefault,
+            thinkingMode: created.thinkingMode,
+            thinkingDepth: created.thinkingDepth,
+            temperature: created.temperature,
+          },
+          reason: 'admin_attach',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
+      return created;
     });
 
     return NextResponse.json({ route }, { status: 201 });

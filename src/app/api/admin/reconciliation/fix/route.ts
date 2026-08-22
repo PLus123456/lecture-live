@@ -1,8 +1,13 @@
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
-import { logAction } from '@/lib/auditLog';
 import { getQuotaCycleStartAt } from '@/lib/billing';
+import { getSiteSettings } from '@/lib/siteSettings';
+import { writeSecurityAudit } from '@/lib/securityAudit';
+import {
+  calculateTranscriptionUsageReconciliation,
+  type QuotaDbClient,
+} from '@/lib/quota';
 
 /**
  * P5-1(c)：修复的有效性下界 = max(配额周期起点, transcriptionUsageReconcileFrom)。
@@ -23,11 +28,88 @@ function fixLowerBound(user: {
     : cycleStart;
 }
 
-/** 修复被并发抢先/快照失效时抛出，用于回滚整个修复事务（Prisma 交互式事务遇异常整体回滚）。 */
-class FixConflictError extends Error {
-  constructor(public readonly reason: 'stale' | 'raced') {
-    super(reason);
-  }
+type LockedReconciliationUser = {
+  id: string;
+  email: string;
+  transcriptionMinutesUsed: number;
+  quotaResetAt: Date | null;
+  transcriptionUsageReconcileFrom: Date | null;
+};
+
+type RepairCandidate = {
+  id: string;
+  runId: string;
+  userId: string;
+};
+
+type RepairResult =
+  | { status: 'applied'; before: number; after: number }
+  | {
+      status:
+        | 'stale'
+        | 'raced'
+        | 'missing-user'
+        | 'expired-run'
+        | 'ambiguous-ledger';
+    };
+
+/**
+ * SEC-030: repair one mismatch against the fresh surviving ledger while the User row is locked.
+ * Reservation and settlement paths all update User in their transaction.  Therefore acquiring this
+ * lock before the non-locking ledger reads gives us a stable boundary without reversing their
+ * Session/Grant -> User lock order (and introducing a deadlock).
+ *
+ * TranscriptionCharge rows are independent of Session/User lifecycle, so both upward and downward
+ * repairs are safe once the current window contains only exact per-charge events. During the
+ * one-cycle legacy cutover, an ambiguous opening balance makes every automatic write fail closed.
+ */
+async function repairMismatchLocked(
+  tx: QuotaDbClient,
+  mismatch: RepairCandidate,
+  runCreatedAt: Date,
+  fixedBy: string,
+  asyncMultiplier: number
+): Promise<RepairResult> {
+  const locked = await tx.$queryRaw<LockedReconciliationUser[]>`
+    SELECT id, email, transcriptionMinutesUsed, quotaResetAt, transcriptionUsageReconcileFrom
+    FROM User
+    WHERE id = ${mismatch.userId}
+    FOR UPDATE
+  `;
+  const targetUser = locked[0];
+  if (!targetUser) return { status: 'missing-user' };
+  if (runCreatedAt < fixLowerBound(targetUser)) return { status: 'expired-run' };
+
+  const current = await calculateTranscriptionUsageReconciliation(
+    targetUser,
+    asyncMultiplier,
+    tx
+  );
+  if (current.driftMinutes === 0) return { status: 'stale' };
+  if (current.hasAmbiguousCharges) return { status: 'ambiguous-ledger' };
+
+  // Claim the mismatch in the same transaction.  If another repair won while we waited for the
+  // User lock, rolling the transaction back also rolls back the counter write below.
+  const marked = await tx.reconciliationMismatch.updateMany({
+    where: { id: mismatch.id, fixed: false },
+    data: { fixed: true, fixedAt: new Date(), fixedBy },
+  });
+  if (marked.count !== 1) return { status: 'raced' };
+
+  await tx.user.update({
+    where: { id: targetUser.id },
+    data: { transcriptionMinutesUsed: current.recordedMinutes },
+  });
+  await tx.reconciliationRun.update({
+    where: { id: mismatch.runId },
+    data: { fixedCount: { increment: 1 } },
+  });
+
+  return {
+    status: 'applied',
+    before: targetUser.transcriptionMinutesUsed,
+    after: current.recordedMinutes,
+  };
 }
 
 // 修复对账差异
@@ -64,77 +146,97 @@ export async function POST(req: Request) {
         return NextResponse.json({ message: '无需修复', fixedCount: 0 });
       }
 
-      // U45：recordedMinutes 是 run 创建时按当期快照的当期绝对用量。若 run 早于用户当前
-      // 配额周期起点（周期已滚动、计数器可能已月度重置），用旧快照覆写会造成用量倒灌/清零。
-      // 逐用户按其 quotaResetAt 判定：run 属于用户上一周期则跳过（不修）。
-      // P5-1(c)：下界还要取 transcriptionUsageReconcileFrom（见 fixLowerBound）。
-      const affectedUserIds = [...new Set(unfixed.map((m) => m.userId))];
-      const affectedUsers = await prisma.user.findMany({
-        where: { id: { in: affectedUserIds } },
-        select: {
-          id: true,
-          quotaResetAt: true,
-          transcriptionUsageReconcileFrom: true,
-        },
-      });
-      const lowerBoundByUser = new Map(
-        affectedUsers.map((u) => [u.id, fixLowerBound(u)])
-      );
-      const applicable = unfixed.filter((m) => {
-        const lowerBound = lowerBoundByUser.get(m.userId);
-        // 用户已不存在，或 run 早于其有效性下界 → 陈旧，跳过
-        return lowerBound !== undefined && run.createdAt >= lowerBound;
-      });
+      const { async_upload_billing_multiplier: asyncMultiplier } = await getSiteSettings();
 
-      if (applicable.length === 0) {
+      // Stable ordering avoids User-row lock inversion when two bulk repairs overlap.  Each entry is
+      // recomputed under its User lock; the historical run snapshot is only an authorization to
+      // repair, never the value written back.
+      const ordered = [...unfixed].sort(
+        (a, b) => a.userId.localeCompare(b.userId) || a.id.localeCompare(b.id)
+      );
+      const repaired: Array<{
+        mismatchId: string;
+        userId: string;
+        before: number;
+        after: number;
+      }> = [];
+      const skipped: string[] = [];
+      const ambiguous: string[] = [];
+      for (const mismatch of ordered) {
+        // SEC-030: one fresh transaction per user. Under MySQL REPEATABLE READ, the previous
+        // implementation's first user's non-locking read fixed one old snapshot for the entire
+        // batch. A later User FOR UPDATE was current-read, but Session/grant reads still came from
+        // that old snapshot and could resurrect a reservation already released before the lock.
+        // Here the User lock is the first statement of each short transaction; every consistent
+        // ledger read therefore starts after that lock boundary.
+        const result = await prisma.$transaction(async (tx) => {
+          const result = await repairMismatchLocked(
+            tx,
+            mismatch,
+            run.createdAt,
+            user.id,
+            asyncMultiplier
+          );
+          if (result.status === 'applied') {
+            // SEC-033: every independently committed mutation carries its own same-transaction
+            // outcome record. A later item/audit failure cannot leave this item unaudited.
+            await writeSecurityAudit(
+              req,
+              {
+                event: 'reconciliation.fix-all-item',
+                operator: { id: user.id, email: user.email, role: user.role },
+                target: {
+                  type: 'transcription_usage',
+                  id: mismatch.userId,
+                  ownerId: mismatch.userId,
+                },
+                before: { minutes: result.before },
+                after: { minutes: result.after },
+                reason: 'admin_reconciliation_bulk_fix',
+                outcome: 'SUCCESS',
+                metadata: { runId, mismatchId: mismatch.id },
+              },
+              tx
+            );
+          }
+          return result;
+        });
+        if (result.status === 'applied') {
+          repaired.push({
+            mismatchId: mismatch.id,
+            userId: mismatch.userId,
+            before: result.before,
+            after: result.after,
+          });
+        } else if (result.status === 'ambiguous-ledger') {
+          ambiguous.push(mismatch.id);
+        } else skipped.push(mismatch.id);
+      }
+
+      if (repaired.length === 0) {
+        if (ambiguous.length > 0) {
+          return NextResponse.json(
+            {
+              error:
+                '当前周期包含升级前无法精确分期的历史余额；已拒绝自动改写，请在下一配额周期重新对账',
+              code: 'AMBIGUOUS_LEGACY_LEDGER',
+              blockedCount: ambiguous.length,
+              skippedStale: skipped.length,
+            },
+            { status: 409 }
+          );
+        }
         return NextResponse.json(
-          { error: '该对账运行已跨越用户当前配额周期，快照用量已过期，不能修复' },
+          { error: '当前用量已变化或快照已过期，请重新运行对账' },
           { status: 409 }
         );
       }
 
-      // 在**一个**事务中批量修复（仅当期适用项）+ 标记 + 计数递增，保证一致。
-      // P5-1(a)：写回改「CAS + 增量」——WHERE transcriptionMinutesUsed = 快照 storedMinutes，
-      // data 用 increment: driftMinutes。绝对写（= recordedMinutes）会把 run 之后发生的所有真实
-      // 扣费一笔抹掉（陈旧快照覆盖）；CAS 让用量在 run 之后变动过的用户直接跳过、不误改。
-      const { appliedIds, staleIds } = await prisma.$transaction(async (tx) => {
-        const applied: string[] = [];
-        const stale: string[] = [];
-        for (const m of applicable) {
-          const cas = await tx.user.updateMany({
-            where: { id: m.userId, transcriptionMinutesUsed: m.storedMinutes },
-            data: { transcriptionMinutesUsed: { increment: m.driftMinutes } },
-          });
-          if (cas.count === 1) applied.push(m.id);
-          else stale.push(m.id);
-        }
-        if (applied.length > 0) {
-          // fixed:false 谓词：并发的另一次修复已标记过则不重复计数（fixedCount 不虚高）。
-          const marked = await tx.reconciliationMismatch.updateMany({
-            where: { id: { in: applied }, fixed: false },
-            data: { fixed: true, fixedAt: new Date(), fixedBy: user.id },
-          });
-          await tx.reconciliationRun.update({
-            where: { id: runId },
-            data: { fixedCount: { increment: marked.count } },
-          });
-        }
-        return { appliedIds: applied, staleIds: stale };
-      });
-
-      logAction(req, 'admin.reconciliation.fixAll', {
-        user,
-        detail: JSON.stringify({
-          runId,
-          fixedCount: appliedIds.length,
-          skippedStale: unfixed.length - applicable.length + staleIds.length,
-        }),
-      });
-
       return NextResponse.json({
         message: '批量修复完成',
-        fixedCount: appliedIds.length,
-        skippedStale: unfixed.length - applicable.length + staleIds.length,
+        fixedCount: repaired.length,
+        skippedStale: skipped.length,
+        skippedAmbiguous: ambiguous.length,
       });
     }
 
@@ -156,77 +258,61 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: '该差异已修复' }, { status: 400 });
     }
 
-    // U45：跨周期陈旧校验——recordedMinutes 是 run 创建时的当期绝对用量快照，若该 run
-    // 早于用户当前配额周期起点（周期已滚动/月度重置），覆写会造成用量倒灌或清零，拒绝修复。
-    const targetUser = await prisma.user.findUnique({
-      where: { id: mismatch.userId },
-      select: {
-        id: true,
-        quotaResetAt: true,
-        transcriptionUsageReconcileFrom: true,
-      },
+    const { async_upload_billing_multiplier: asyncMultiplier } = await getSiteSettings();
+    const repair = await prisma.$transaction(async (tx) => {
+      const result = await repairMismatchLocked(
+        tx,
+        mismatch,
+        mismatch.run.createdAt,
+        user.id,
+        asyncMultiplier
+      );
+      if (result.status === 'applied') {
+        await writeSecurityAudit(
+          req,
+          {
+            event: 'reconciliation.fix',
+            operator: { id: user.id, email: user.email, role: user.role },
+            target: {
+              type: 'transcription_usage',
+              id: mismatch.userId,
+              ownerId: mismatch.userId,
+            },
+            before: { minutes: result.before },
+            after: { minutes: result.after },
+            reason: 'admin_reconciliation_fix',
+            outcome: 'SUCCESS',
+            metadata: { mismatchId, runId: mismatch.runId },
+          },
+          tx
+        );
+      }
+      return result;
     });
-    if (!targetUser) {
+    if (repair.status === 'missing-user') {
       return NextResponse.json({ error: '目标用户不存在' }, { status: 404 });
     }
-    if (mismatch.run.createdAt < fixLowerBound(targetUser)) {
+    if (repair.status === 'ambiguous-ledger') {
       return NextResponse.json(
-        { error: '该对账运行已跨越用户当前配额周期，快照用量已过期，不能修复' },
+        {
+          error:
+            '当前周期包含升级前无法精确分期的历史余额；已拒绝自动改写，请在下一配额周期重新对账',
+          code: 'AMBIGUOUS_LEGACY_LEDGER',
+        },
         { status: 409 }
       );
     }
-
-    // P5-10：三步（改用量 / 标记已修 / 递增计数）此前是三次独立提交——任一步失败都留下
-    // 「钱改了但没标记」或「标记了但计数没动」的半截状态，重试还会再改一次用量。包进一个事务。
-    // P5-1(a)：写回同样改 CAS + increment driftMinutes（见批量分支注释）。
-    try {
-      await prisma.$transaction(async (tx) => {
-        // 先抢标记（fixed:false 谓词）：并发的第二个请求在此拿到 count=0 → 抛错整体回滚，
-        // 不会出现「两个请求各改一次用量、fixedCount 加两次」。
-        const marked = await tx.reconciliationMismatch.updateMany({
-          where: { id: mismatchId, fixed: false },
-          data: { fixed: true, fixedAt: new Date(), fixedBy: user.id },
-        });
-        if (marked.count !== 1) throw new FixConflictError('raced');
-
-        const cas = await tx.user.updateMany({
-          where: {
-            id: mismatch.userId,
-            transcriptionMinutesUsed: mismatch.storedMinutes,
-          },
-          data: { transcriptionMinutesUsed: { increment: mismatch.driftMinutes } },
-        });
-        if (cas.count !== 1) throw new FixConflictError('stale');
-
-        await tx.reconciliationRun.update({
-          where: { id: mismatch.runId },
-          data: { fixedCount: { increment: 1 } },
-        });
-      });
-    } catch (txErr) {
-      if (txErr instanceof FixConflictError) {
-        return NextResponse.json(
-          {
-            error:
-              txErr.reason === 'raced'
-                ? '该差异已被其他管理员修复'
-                : '该用户用量在本次对账之后已变化，快照已过期；请重新运行对账后再修复',
-          },
-          { status: 409 }
-        );
-      }
-      throw txErr;
+    if (repair.status !== 'applied') {
+      return NextResponse.json(
+        {
+          error:
+            repair.status === 'raced'
+              ? '该差异已被其他管理员修复'
+              : '当前用量已变化或快照已过期；请重新运行对账后再修复',
+        },
+        { status: 409 }
+      );
     }
-
-    logAction(req, 'admin.reconciliation.fix', {
-      user,
-      detail: JSON.stringify({
-        mismatchId,
-        userId: mismatch.userId,
-        from: mismatch.storedMinutes,
-        to: mismatch.recordedMinutes,
-      }),
-    });
 
     return NextResponse.json({ message: '修复成功' });
   } catch (err) {

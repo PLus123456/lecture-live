@@ -1,18 +1,28 @@
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import {
   validateChatFileCleanupParams,
   performChatFileCleanup,
 } from '@/lib/chatFileCleanup';
+import { JOB_STATUS, JOB_TYPE, trackJob } from '@/lib/jobQueue';
+import {
+  getSecurityAuditRequestId,
+  writeSecurityAudit,
+} from '@/lib/securityAudit';
 
-/**
- * POST /api/admin/chat-files/cleanup —— 批量清理（JSON body 形式）。
- *
- * 与 DELETE /api/admin/chat-files?... 等价；DELETE 形式是为了与
- * CleanupModalShell 现有的 "DELETE + querystring" 模板对齐；POST + body 是
- * 给 curl / 后台脚本用的更可读的入口。两者共用 `performCleanup`。
- */
+function operatorFromAdmin(admin: {
+  id: string;
+  email?: string | null;
+  role?: string | null;
+}) {
+  return {
+    id: admin.id,
+    email: admin.email ?? null,
+    role: admin.role ?? null,
+  };
+}
+
+/** POST /api/admin/chat-files/cleanup — JSON-body form of the durable cleanup. */
 export async function POST(req: Request) {
   const { user: admin, response } = await requireAdminAccess(req, {
     scope: 'admin:chat-files:cleanup',
@@ -20,6 +30,7 @@ export async function POST(req: Request) {
     windowMs: 60_000,
   });
   if (response) return response;
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
 
   let body: unknown;
   try {
@@ -29,7 +40,6 @@ export async function POST(req: Request) {
   }
 
   const raw = (body ?? {}) as Record<string, unknown>;
-
   const validation = validateChatFileCleanupParams({
     olderThanDays: Number(raw.olderThanDays),
     sizeBytesGT:
@@ -43,28 +53,141 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: validation.error }, { status: 400 });
   }
 
-  try {
-    const result = await performChatFileCleanup({
-      olderThanDays: validation.olderThanDays,
-      sizeBytesGT: validation.sizeBytesGT,
-      userId: validation.userId,
-      kinds: validation.kinds,
-      conversationId: validation.conversationId,
-    });
+  const requestId = getSecurityAuditRequestId(req);
+  const filters = {
+    olderThanDays: validation.olderThanDays,
+    sizeBytesGT: validation.sizeBytesGT,
+    userId: validation.userId ?? null,
+    kinds: validation.kinds,
+    conversationId: validation.conversationId ?? null,
+  };
 
-    logAction(req, 'admin.chat_files.cleanup', {
-      user: admin,
-      detail: JSON.stringify({
-        olderThanDays: validation.olderThanDays,
-        sizeBytesGT: validation.sizeBytesGT,
-        userId: validation.userId,
-        kinds: validation.kinds,
-        conversationId: validation.conversationId,
-        deletedCount: result.deleted,
-        releasedBytes: result.releasedBytes,
-        truncated: result.truncated,
-      }),
-    });
+  try {
+    const result = await trackJob(
+      {
+        type: JOB_TYPE.CHAT_FILES_CLEANUP,
+        userId: admin.id,
+        triggeredBy: `admin:${admin.id}`,
+        params: { operation: 'admin_chat_files_cleanup', filters, requestId },
+        resultSummary: (value) => ({
+          deleted: value.deleted,
+          releasedBytes: value.releasedBytes,
+          truncated: value.truncated,
+          physicalDeleteComplete: value.physicalDeleteComplete,
+          pendingArtifactCount: value.pendingArtifactCount,
+        }),
+        errorSummary: () => 'ChatFileCleanupError',
+        terminalMutation: async (tx, terminal) => {
+          if (terminal.status === JOB_STATUS.SUCCESS) {
+            const completed = terminal.result;
+            await writeSecurityAudit(
+              req,
+              {
+                event: 'chat_files.cleanup',
+                operator: operatorFromAdmin(admin),
+                target: { type: 'chat_attachment_collection' },
+                before: { filters },
+                after: {
+                  deletedCount: completed.deleted,
+                  releasedBytes: completed.releasedBytes,
+                  truncated: completed.truncated,
+                  pendingArtifactCount: completed.pendingArtifactCount,
+                },
+                reason: 'admin_cleanup',
+                outcome: 'SUCCESS',
+                requestId,
+              },
+              tx
+            );
+            return;
+          }
+          await writeSecurityAudit(
+            req,
+            {
+              event: 'chat_files.cleanup',
+              operator: operatorFromAdmin(admin),
+              target: { type: 'chat_attachment_collection' },
+              before: { filters },
+              after: { completed: false },
+              reason: 'admin_cleanup',
+              outcome: 'PARTIAL',
+              metadata: {
+                errorClass:
+                  terminal.error instanceof Error
+                    ? terminal.error.name
+                    : 'UnknownError',
+              },
+              requestId,
+            },
+            tx
+          );
+        },
+      },
+      async () => {
+        try {
+          const cleanupResult = await performChatFileCleanup(
+            {
+              olderThanDays: validation.olderThanDays,
+              sizeBytesGT: validation.sizeBytesGT,
+              userId: validation.userId,
+              kinds: validation.kinds,
+              conversationId: validation.conversationId,
+            },
+            {
+              onDatabaseMutation: async (tx, summary) => {
+                await writeSecurityAudit(
+                  req,
+                  {
+                    event: 'chat_files.cleanup_database',
+                    operator: operatorFromAdmin(admin),
+                    target: { type: 'chat_attachment_collection' },
+                    before: { filters, candidateCount: summary.candidateCount },
+                    after: {
+                      deletedCount: summary.deleted,
+                      releasedBytes: summary.releasedBytes,
+                      queuedArtifactCount: summary.queuedArtifactCount,
+                    },
+                    reason: 'admin_cleanup',
+                    outcome: 'SUCCESS',
+                    requestId,
+                  },
+                  tx
+                );
+              },
+              onArtifactReleaseMutation: async (tx, summary) => {
+                await writeSecurityAudit(
+                  req,
+                  {
+                    event: 'chat_files.cleanup_artifacts',
+                    operator: operatorFromAdmin(admin),
+                    target: { type: 'stored_artifact_collection' },
+                    before: { artifactCount: summary.artifactCount },
+                    after: {
+                      releasedArtifactCount: summary.releasedArtifactCount,
+                      releasedBytes: summary.releasedBytes,
+                    },
+                    reason: 'admin_cleanup_remote_delete_confirmed',
+                    outcome:
+                      summary.releasedArtifactCount === summary.artifactCount
+                        ? 'SUCCESS'
+                        : 'PARTIAL',
+                    requestId,
+                  },
+                  tx
+                );
+              },
+            }
+          );
+          if (!cleanupResult.physicalDeleteComplete) {
+            throw new Error('chat file physical cleanup incomplete');
+          }
+          return cleanupResult;
+        } catch {
+          // Persist only a bounded safe class in JobQueue.error.
+          throw new Error('chat file cleanup operation failed');
+        }
+      }
+    );
 
     return NextResponse.json({
       success: true,

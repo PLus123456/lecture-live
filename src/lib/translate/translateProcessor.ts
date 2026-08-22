@@ -1,6 +1,7 @@
 import 'server-only';
 
 import crypto from 'node:crypto';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { JOB_TYPE, JOB_STATUS, createJob, retryJob } from '@/lib/jobQueue';
 import { getSiteSettings } from '@/lib/siteSettings';
@@ -24,7 +25,7 @@ import {
 import {
   readSourceFile,
   saveOutputFile,
-  deleteTaskFiles,
+  deleteOutputGeneration,
 } from '@/lib/translate/taskStorage';
 import { logger, serializeError } from '@/lib/logger';
 
@@ -32,8 +33,9 @@ import { logger, serializeError } from '@/lib/logger';
  * 文档翻译调度器（tick 对账制状态机，与 enhanceProcessor 同构）。
  *
  * 真源分工：JobQueue(type=doc_translate) 是**调度**真源（claim/attempt/退避），
- * TranslationTask 是**业务**真源（用户可见状态/进度/产物/计费）。worker 侧 jobId
- * 直接用 JobQueue 行 id，天然幂等：中断后下一轮 tick 查 worker 实际状态续接。
+ * TranslationTask 是**业务**真源（用户可见状态/进度/产物/计费）。worker 侧 id
+ * 由 JobQueue id + proxyGeneration 派生；同一调度行自动重试也不会让旧代远端副作用
+ * 命中新代任务，中断后下一轮 tick 仍可按同一派生 id 找回。
  *
  * 状态流转（JobQueue.status / TranslationTask.status）：
  *   SUBMITTED / PENDING     → 已确认扣费待派发（含自动重试回炉）
@@ -53,6 +55,12 @@ const MAX_WORKER_RUNTIME_MS = 180 * 60_000;
 const RETRY_BACKOFF_MS = [5 * 60_000, 20 * 60_000, 45 * 60_000];
 const DEFAULT_MAX_ATTEMPTS = 3;
 /**
+ * claim 到 worker start 之间要读取源文件并最多上传 10 分钟。其他进程的
+ * reconcile 在这个窗口内不得把“PROCESSING 但尚未写 workerId”误判为孤儿。
+ * 真崩溃最迟 12 分钟回炉；所有旧 dispatch 还受 proxyGeneration CAS 二次保护。
+ */
+const DISPATCH_START_GRACE_MS = 12 * 60_000;
+/**
  * L23：孤儿任务（PENDING 但没有调度行）的补入队宽限期。
  * 正常路径里「扣费事务提交 → enqueueDocTranslate 写回 jobQueueId」只隔几十毫秒，
  * 取 2 分钟足以避开正常窗口，又不至于让真正的孤儿等太久。
@@ -64,6 +72,11 @@ interface TranslateJobParams {
   taskId?: string;
   /** 任务绑定的 worker 行 id（多台时由派发选定；后续对账/收割/清理都走它） */
   workerId?: string;
+  /** 每次 SUBMITTED→PROCESSING 换新，同一 JobQueue id 回炉也不复用。 */
+  proxyGeneration?: string;
+  /** worker 侧 generation-scoped id；可由 job id + proxyGeneration 确定性重建。 */
+  remoteJobId?: string;
+  dispatchState?: 'claiming' | 'started';
   nextRetryAt?: string;
   progress?: { stage: string | null; percent: number; at: string };
   [key: string]: unknown;
@@ -79,10 +92,30 @@ function parseJobParams(raw: string | null): TranslateJobParams {
   }
 }
 
-async function writeJobParams(jobId: string, params: TranslateJobParams): Promise<void> {
-  await prisma.jobQueue
-    .update({ where: { id: jobId }, data: { params: JSON.stringify(params) } })
-    .catch(() => undefined);
+/**
+ * worker 协议只接受 1..64 位 `[A-Za-z0-9_-]`。固定 64 位 hex 同时隐藏内部
+ * JobQueue id，并确保同一 DB 行的不同调度代绝不复用远端副作用命名空间。
+ */
+export function translationRemoteJobId(
+  jobQueueId: string,
+  proxyGeneration: string
+): string {
+  return crypto
+    .createHash('sha256')
+    .update('translation-worker-generation-v1\0')
+    .update(jobQueueId)
+    .update('\0')
+    .update(proxyGeneration)
+    .digest('hex');
+}
+
+function remoteJobIdFor(
+  jobQueueId: string,
+  proxyGeneration: string | null | undefined
+): string {
+  return proxyGeneration
+    ? translationRemoteJobId(jobQueueId, proxyGeneration)
+    : jobQueueId;
 }
 
 // ─── 入队（由确认扣费路由调用） ───
@@ -92,10 +125,11 @@ async function writeJobParams(jobId: string, params: TranslateJobParams): Promis
  * 返回 jobId；创建失败返回 null（调用方回滚扣费）。
  */
 export async function enqueueDocTranslate(taskId: string, userId: string): Promise<string | null> {
+  let createdJobId: string | null = null;
   try {
     const task = await prisma.translationTask.findUnique({
       where: { id: taskId },
-      select: { jobQueueId: true },
+      select: { jobQueueId: true, updatedAt: true },
     });
     if (task?.jobQueueId) {
       const existing = await prisma.jobQueue.findUnique({
@@ -118,11 +152,17 @@ export async function enqueueDocTranslate(taskId: string, userId: string): Promi
       maxAttempts: DEFAULT_MAX_ATTEMPTS,
     });
     if (!jobId) return null;
+    createdJobId = jobId;
     // L23：绑定失败（任务被并发取消/删除、或状态已不是 PENDING）时必须把刚建的调度行
     // 就地终态化。原来用的是会抛的 prisma.update：抛出后外层 catch 只 return null，
     // 那行永远留在 SUBMITTED 里，每轮 tick 都被捞进 take(totalSlots)、白占一个全局派发槽。
     const bound = await prisma.translationTask.updateMany({
-      where: { id: taskId, status: 'PENDING' },
+      where: {
+        id: taskId,
+        status: 'PENDING',
+        jobQueueId: null,
+        updatedAt: task?.updatedAt,
+      },
       data: { jobQueueId: jobId },
     });
     if (bound.count === 0) {
@@ -136,10 +176,56 @@ export async function enqueueDocTranslate(taskId: string, userId: string): Promi
           },
         })
         .catch(() => undefined);
+      const winner = await prisma.translationTask.findUnique({
+        where: { id: taskId },
+        select: { status: true, jobQueueId: true },
+      });
+      if (
+        winner?.jobQueueId &&
+        (winner.status === 'PENDING' || winner.status === 'TRANSLATING')
+      ) {
+        return winner.jobQueueId;
+      }
       return null;
     }
     return jobId;
   } catch (error) {
+    // bind update 的提交响应可能丢失；先从业务真源读回，已绑定有效行就复用，
+    // 不能让上层把正在派发的任务误标失败并退款。
+    try {
+      const current = await prisma.translationTask.findUnique({
+        where: { id: taskId },
+        select: { status: true, jobQueueId: true },
+      });
+      if (
+        current?.jobQueueId &&
+        (current.status === 'PENDING' || current.status === 'TRANSLATING')
+      ) {
+        const currentJob = await prisma.jobQueue.findUnique({
+          where: { id: current.jobQueueId },
+          select: { status: true },
+        });
+        if (
+          currentJob &&
+          currentJob.status !== JOB_STATUS.SUCCESS &&
+          currentJob.status !== JOB_STATUS.FAILED
+        ) {
+          return current.jobQueueId;
+        }
+      }
+      if (createdJobId) {
+        await prisma.jobQueue.updateMany({
+          where: { id: createdJobId, status: JOB_STATUS.SUBMITTED },
+          data: {
+            status: JOB_STATUS.FAILED,
+            error: '入队绑定失败',
+            completedAt: new Date(),
+          },
+        });
+      }
+    } catch {
+      // readback 也失败时提交状态未知，保留行等待后续 tick 对账，不能猜测退款。
+    }
     translateLogger.warn({ taskId, err: serializeError(error) }, '翻译任务入队失败');
     return null;
   }
@@ -252,14 +338,58 @@ async function executeTick(): Promise<void> {
   });
   const healthCache = new Map<string, { ok: boolean; load: number }>();
   for (const job of submitted) {
-    const claimed = await claimJob(job.id);
-    if (!claimed) continue;
-    await dispatchJob(job, fleet, busyByWorkerId, healthCache).catch(async (error) => {
+    let proxyGeneration: string | null = null;
+    try {
+      proxyGeneration = await claimJob(job);
+    } catch (error) {
+      // 一条被并发取消/换绑的 poisoned SUBMITTED 行不能中止整个 tick，
+      // 否则后续所有合法任务都会长期饿死。
+      translateLogger.warn(
+        { jobId: job.id, err: serializeError(error) },
+        '翻译任务 claim 失败，跳过该行继续派发'
+      );
+      const taskId = parseJobParams(job.params).taskId;
+      if (taskId) {
+        try {
+          const current = await prisma.translationTask.findUnique({
+            where: { id: taskId },
+            select: { status: true, jobQueueId: true },
+          });
+          if (
+            !current ||
+            current.jobQueueId !== job.id ||
+            current.status === 'CANCELED' ||
+            current.status === 'COMPLETED' ||
+            current.status === 'FAILED'
+          ) {
+            await prisma.jobQueue.updateMany({
+              where: { id: job.id, status: JOB_STATUS.SUBMITTED },
+              data: {
+                status: JOB_STATUS.FAILED,
+                error: '调度行未绑定当前任务',
+                completedAt: new Date(),
+              },
+            });
+          }
+        } catch {
+          // DB 状态也不可确认时保留 SUBMITTED，下轮重试，不能误杀可能有效的行。
+        }
+      }
+      continue;
+    }
+    if (!proxyGeneration) continue;
+    await dispatchJob(
+      job,
+      proxyGeneration,
+      fleet,
+      busyByWorkerId,
+      healthCache
+    ).catch(async (error) => {
       translateLogger.warn(
         { jobId: job.id, err: serializeError(error) },
         '文档翻译任务派发异常'
       );
-      await failJob(job.id, error, { retryable: true });
+      await failJob(job.id, error, { retryable: true }, proxyGeneration);
     });
   }
 }
@@ -316,11 +446,11 @@ function workerById(
 /** 无绑定时逐台查找该任务落在哪台上（找回场景） */
 async function findJobOnFleet(
   fleet: TranslateFleetConfig,
-  jobId: string
+  remoteJobId: string
 ): Promise<{ worker: TranslateWorkerConfig; remote: TranslateJobStatus } | null> {
   for (const worker of fleet.workers) {
     try {
-      const remote = await getTranslateJob(worker, jobId);
+      const remote = await getTranslateJob(worker, remoteJobId);
       return { worker, remote };
     } catch {
       continue;
@@ -329,13 +459,164 @@ async function findJobOnFleet(
   return null;
 }
 
-/** 条件抢占：SUBMITTED → PROCESSING（跨进程唯一赢家） */
-async function claimJob(jobId: string): Promise<boolean> {
-  const result = await prisma.jobQueue.updateMany({
-    where: { id: jobId, status: JOB_STATUS.SUBMITTED },
-    data: { status: JOB_STATUS.PROCESSING, startedAt: new Date() },
+/**
+ * 条件抢占：SUBMITTED → PROCESSING（跨进程唯一赢家）。旧 worker token
+ * 的吊销必须与调度行重新变为 PROCESSING 同事务；否则两步之间的
+ * 窗口会让上一代凭据再次通过 proxy post-claim 调度检查。
+ */
+async function claimJob(job: JobRow): Promise<string | null> {
+  const taskId = parseJobParams(job.params).taskId;
+  if (!taskId) return null;
+  const proxyGeneration = crypto.randomBytes(32).toString('hex');
+  const params: TranslateJobParams = {
+    ...parseJobParams(job.params),
+    workerId: undefined,
+    proxyGeneration,
+    remoteJobId: translationRemoteJobId(job.id, proxyGeneration),
+    dispatchState: 'claiming',
+  };
+  return prisma.$transaction(async (tx) => {
+    const claimed = await tx.jobQueue.updateMany({
+      where: { id: job.id, status: JOB_STATUS.SUBMITTED },
+      data: {
+        status: JOB_STATUS.PROCESSING,
+        startedAt: new Date(),
+        params: JSON.stringify(params),
+      },
+    });
+    if (claimed.count !== 1) return null;
+    const revoked = await tx.translationTask.updateMany({
+      where: {
+        id: taskId,
+        jobQueueId: job.id,
+        proxyGeneration: null,
+        status: { in: ['PENDING', 'TRANSLATING'] },
+      },
+      data: { proxyTokenHash: null, proxyGeneration, workerId: null },
+    });
+    if (revoked.count !== 1) {
+      throw new Error('翻译任务代次已变更，拒绝重新调度');
+    }
+    return proxyGeneration;
   });
-  return result.count === 1;
+}
+
+function generationMarker(proxyGeneration: string): string {
+  return `\"proxyGeneration\":\"${proxyGeneration}\"`;
+}
+
+/**
+ * 只能把调用方所持的 dispatch 代次回炉。JobQueue 状态转换和任务
+ * token/代次撤销同事务：新 claim 必须等这个行锁提交后才能写新代次，
+ * 因此旧进程不会清掉新 worker 的凭据。
+ */
+async function requeueClaimedJob(
+  taskId: string,
+  jobId: string,
+  proxyGeneration: string
+): Promise<boolean> {
+  return prisma.$transaction(async (tx) => {
+    const requeued = await tx.jobQueue.updateMany({
+      where: {
+        id: jobId,
+        status: JOB_STATUS.PROCESSING,
+        params: { contains: generationMarker(proxyGeneration) },
+      },
+      data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
+    });
+    if (requeued.count !== 1) return false;
+    const revoked = await tx.translationTask.updateMany({
+      where: { id: taskId, jobQueueId: jobId, proxyGeneration },
+      data: {
+        proxyTokenHash: null,
+        proxyGeneration: null,
+        workerId: null,
+      },
+    });
+    if (revoked.count !== 1) {
+      throw new Error('翻译任务代次已变更，拒绝回炉');
+    }
+    return true;
+  });
+}
+
+/** migration 期无 generation 的 PROCESSING 行也必须用完整 params 快照 CAS。 */
+async function requeueLegacyJob(taskId: string, job: JobRow): Promise<boolean> {
+  return prisma.$transaction(async (tx) => {
+    const requeued = await tx.jobQueue.updateMany({
+      where: {
+        id: job.id,
+        status: JOB_STATUS.PROCESSING,
+        params: job.params,
+      },
+      data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
+    });
+    if (requeued.count !== 1) return false;
+    const revoked = await tx.translationTask.updateMany({
+      where: {
+        id: taskId,
+        jobQueueId: job.id,
+        proxyGeneration: null,
+        status: { in: ['PENDING', 'TRANSLATING'] },
+      },
+      data: { proxyTokenHash: null, workerId: null },
+    });
+    if (revoked.count !== 1) {
+      throw new Error('翻译任务 legacy 代次已变更，拒绝回炉');
+    }
+    return true;
+  });
+}
+
+async function writeJobParamsForGeneration(
+  jobId: string,
+  proxyGeneration: string,
+  params: TranslateJobParams
+): Promise<void> {
+  const updated = await prisma.jobQueue.updateMany({
+    where: {
+      id: jobId,
+      status: JOB_STATUS.PROCESSING,
+      params: { contains: generationMarker(proxyGeneration) },
+    },
+    data: { params: JSON.stringify(params) },
+  });
+  if (updated.count !== 1) {
+    throw new Error('翻译调度代次已变更');
+  }
+}
+
+async function writeLegacyProgress(
+  job: JobRow,
+  params: TranslateJobParams,
+  taskId: string,
+  percent: number
+): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    const updated = await tx.jobQueue.updateMany({
+      where: {
+        id: job.id,
+        status: JOB_STATUS.PROCESSING,
+        params: job.params,
+      },
+      data: { params: JSON.stringify(params) },
+    });
+    if (updated.count !== 1) {
+      throw new Error('翻译调度 legacy 快照已变更');
+    }
+    const taskUpdated = await tx.translationTask.updateMany({
+      where: {
+        id: taskId,
+        jobQueueId: job.id,
+        proxyGeneration: null,
+        status: 'TRANSLATING',
+      },
+      data: { progress: percent },
+    });
+    if (taskUpdated.count !== 1) {
+      throw new Error('翻译任务 legacy 快照已变更');
+    }
+  });
 }
 
 // ─── 派发 ───
@@ -357,6 +638,10 @@ async function loadTask(taskId: string | undefined) {
       refundedAt: true,
       pageCount: true,
       modelId: true,
+      proxyGeneration: true,
+      workerId: true,
+      monoPath: true,
+      dualPath: true,
       // L24：代次令牌 —— 清盘/退款前必须确认任务仍绑在当前这一代调度行上
       jobQueueId: true,
       user: { select: { role: true, customGroupId: true } },
@@ -384,36 +669,96 @@ function parseGlossary(raw: string | null): { src: string; dst: string }[] | nul
   }
 }
 
-/** 生成任务级 LLM 代理凭据：明文只下发给 worker，库里只存 sha256（同 EmailToken 惯例） */
-async function issueProxyToken(taskId: string): Promise<string> {
+/**
+ * 签发凭据与当前调度代次/TRANSLATING 状态做一次 CAS。这必须先于
+ * worker start，否则远端刚启动就回调代理时会看到 PENDING 而收到401。
+ */
+async function issueProxyToken(
+  taskId: string,
+  jobId: string,
+  workerId: string,
+  proxyGeneration: string
+): Promise<{ raw: string; hash: string }> {
   const raw = crypto.randomBytes(32).toString('hex');
   const hash = crypto.createHash('sha256').update(raw).digest('hex');
-  await prisma.translationTask.update({
-    where: { id: taskId },
-    data: { proxyTokenHash: hash },
+  await prisma.$transaction(async (tx) => {
+    // 写入同一 JobQueue 行取 X lock，并同时校验它仍是调用方的
+    // PROCESSING 代次。回炉事务要么先清代次，要么等这里提交后再清 token。
+    const guarded = await tx.jobQueue.updateMany({
+      where: {
+        id: jobId,
+        status: JOB_STATUS.PROCESSING,
+        params: { contains: generationMarker(proxyGeneration) },
+      },
+      data: { startedAt: new Date() },
+    });
+    if (guarded.count !== 1) {
+      throw new Error('翻译调度代次已变更，拒绝签发代理凭据');
+    }
+    const issued = await tx.translationTask.updateMany({
+      where: {
+        id: taskId,
+        jobQueueId: jobId,
+        proxyGeneration,
+        status: { in: ['PENDING', 'TRANSLATING'] },
+      },
+      data: {
+        proxyTokenHash: hash,
+        status: 'TRANSLATING',
+        workerId,
+        errorMessage: null,
+      },
+    });
+    if (issued.count !== 1) {
+      throw new Error('翻译任务代次已变更，拒绝签发代理凭据');
+    }
   });
-  return raw;
+  return { raw, hash };
 }
 
 async function dispatchJob(
   job: JobRow,
+  proxyGeneration: string,
   fleet: TranslateFleetConfig,
   busyByWorkerId: Map<string, number>,
   healthCache: Map<string, { ok: boolean; load: number }>
 ): Promise<void> {
   const jobId = job.id;
-  const params = parseJobParams(job.params);
+  const remoteJobId = translationRemoteJobId(jobId, proxyGeneration);
+  const params: TranslateJobParams = {
+    ...parseJobParams(job.params),
+    proxyGeneration,
+    remoteJobId,
+    dispatchState: 'claiming',
+    workerId: undefined,
+  };
   const task = await loadTask(params.taskId);
   if (!task) {
-    await failJob(jobId, new Error('翻译任务已删除'), { retryable: false });
+    await failJob(
+      jobId,
+      new Error('翻译任务已删除'),
+      { retryable: false },
+      proxyGeneration
+    );
     return;
   }
-  if (task.status === 'CANCELED' || task.status === 'COMPLETED') {
-    // 用户已取消 / 任务已由别的路径完成：清 worker 痕迹，调度行终态
+  if (
+    task.jobQueueId !== jobId ||
+    task.proxyGeneration !== proxyGeneration ||
+    task.status === 'CANCELED' ||
+    task.status === 'COMPLETED'
+  ) {
+    // claim 后的业务真源必须仍精确绑定本 generation；否则 provider 前失败关闭。
     const bound = workerById(fleet, params.workerId);
-    if (bound) await deleteTranslateJob(bound, jobId).catch(() => undefined);
+    if (bound) {
+      await deleteTranslateJob(bound, remoteJobId).catch(() => undefined);
+    }
     await prisma.jobQueue.updateMany({
-      where: { id: jobId, status: JOB_STATUS.PROCESSING },
+      where: {
+        id: jobId,
+        status: JOB_STATUS.PROCESSING,
+        params: { contains: generationMarker(proxyGeneration) },
+      },
       data: {
         status: task.status === 'COMPLETED' ? JOB_STATUS.SUCCESS : JOB_STATUS.FAILED,
         error: task.status === 'CANCELED' ? '用户已取消' : null,
@@ -428,26 +773,37 @@ async function dispatchJob(
   let located: { worker: TranslateWorkerConfig; remote: TranslateJobStatus } | null = null;
   if (bound) {
     try {
-      located = { worker: bound, remote: await getTranslateJob(bound, jobId) };
+      located = {
+        worker: bound,
+        remote: await getTranslateJob(bound, remoteJobId),
+      };
     } catch (error) {
       if (!(error instanceof TranslateWorkerError) || error.status !== 404) {
         throw error; // 绑定台网络异常：保持 PROCESSING 下轮重试
       }
     }
   } else {
-    located = await findJobOnFleet(fleet, jobId);
+    located = await findJobOnFleet(fleet, remoteJobId);
   }
 
   if (located) {
     if (located.worker.id !== params.workerId) {
-      await writeJobParams(jobId, { ...params, workerId: located.worker.id });
+      await writeJobParamsForGeneration(jobId, proxyGeneration, {
+        ...params,
+        workerId: located.worker.id,
+      });
     }
     if (located.remote.status === 'succeeded') {
-      await harvestJob(jobId, task, located.worker);
+      await harvestJob(jobId, task, located.worker, proxyGeneration);
       return;
     }
     if (located.remote.status === 'queued' || located.remote.status === 'running') {
-      await markTaskTranslating(task.id, located.worker.id);
+      await markTaskTranslating(
+        task.id,
+        located.worker.id,
+        jobId,
+        proxyGeneration
+      );
       return;
     }
     // created / failed：留在这台重推
@@ -456,16 +812,18 @@ async function dispatchJob(
   const target = located?.worker ?? (await pickWorker(fleet, busyByWorkerId, healthCache));
   if (!target) {
     // 全部不可达/占满：让位回 SUBMITTED，不消耗 attempt
-    await prisma.jobQueue.updateMany({
-      where: { id: jobId, status: JOB_STATUS.PROCESSING },
-      data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
-    });
+    await requeueClaimedJob(task.id, jobId, proxyGeneration);
     return;
   }
 
   const source = await readSourceFile(task.id);
   if (!source) {
-    await failJob(jobId, new Error('源文件读取失败'), { retryable: false });
+    await failJob(
+      jobId,
+      new Error('源文件读取失败'),
+      { retryable: false },
+      proxyGeneration
+    );
     return;
   }
 
@@ -476,23 +834,68 @@ async function dispatchJob(
   // 换模型不再复用旧译文）；② 解析出具体路由行且任务尚无快照时定格回 task.modelId，
   // 让代理端点全程恒定同一模型（中途 admin 换全局默认不影响在途任务）。
   const boundId =
-    task.modelId || (await resolveUserTranslationModelId(task.user).catch(() => null));
-  const resolved = await resolveGroupBoundModel(boundId, 'TRANSLATION').catch(() => null);
+    task.modelId || (await resolveUserTranslationModelId(task.user));
+  const resolved = await resolveGroupBoundModel(boundId, 'TRANSLATION');
   const resolvedDbId =
     resolved?.provider?.dbModelId && resolved.provider.purpose === 'TRANSLATION'
       ? resolved.provider.dbModelId
       : null;
-  if (resolvedDbId && !task.modelId) {
-    await prisma.translationTask
-      .updateMany({ where: { id: task.id }, data: { modelId: resolvedDbId } })
-      .catch(() => undefined);
+  if (!resolvedDbId) {
+    throw new Error('无法持久化翻译模型快照，拒绝启动 worker');
+  }
+  if (task.modelId && task.modelId !== resolvedDbId) {
+    throw new Error('翻译模型快照解析不一致，拒绝启动 worker');
+  }
+  if (!task.modelId) {
+    let snapshotCount = 0;
+    let snapshotError: unknown;
+    try {
+      const snapshotted = await prisma.translationTask.updateMany({
+        where: {
+          id: task.id,
+          jobQueueId: jobId,
+          proxyGeneration,
+          status: { in: ['PENDING', 'TRANSLATING'] },
+          modelId: null,
+        },
+        data: { modelId: resolvedDbId },
+      });
+      snapshotCount = snapshotted.count;
+    } catch (error) {
+      snapshotError = error;
+    }
+    if (snapshotCount !== 1) {
+      const current = await prisma.translationTask.findUnique({
+        where: { id: task.id },
+        select: {
+          jobQueueId: true,
+          proxyGeneration: true,
+          status: true,
+          modelId: true,
+        },
+      });
+      if (
+        current?.jobQueueId !== jobId ||
+        current.proxyGeneration !== proxyGeneration ||
+        (current.status !== 'PENDING' && current.status !== 'TRANSLATING') ||
+        current.modelId !== resolvedDbId
+      ) {
+        throw snapshotError ?? new Error('翻译模型快照写入未生效');
+      }
+    }
   }
   const modelLabel = buildWorkerModelLabel(resolved?.provider ?? null);
 
+  let issuedProxy: { raw: string; hash: string } | null = null;
   try {
-    await uploadTranslateInput(target, jobId, source);
-    const proxyToken = await issueProxyToken(task.id);
-    await startTranslateJob(target, jobId, {
+    await uploadTranslateInput(target, remoteJobId, source);
+    issuedProxy = await issueProxyToken(
+      task.id,
+      jobId,
+      target.id,
+      proxyGeneration
+    );
+    await startTranslateJob(target, remoteJobId, {
       langIn: task.sourceLang,
       langOut: task.targetLang,
       qps: target.qps,
@@ -500,18 +903,15 @@ async function dispatchJob(
       glossary: parseGlossary(task.glossaryJson),
       llm: {
         baseUrl: `${appUrl}/api/translate/llm-proxy/v1`,
-        apiKey: proxyToken,
+        apiKey: issuedProxy.raw,
         model: modelLabel,
       },
     });
   } catch (error) {
     if (error instanceof TranslateWorkerError && error.status === 429) {
       // 这台队列满：清绑定让位，下轮重选别台，不消耗 attempt
-      await writeJobParams(jobId, { ...params, workerId: undefined });
-      await prisma.jobQueue.updateMany({
-        where: { id: jobId, status: JOB_STATUS.PROCESSING },
-        data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
-      });
+      await deleteTranslateJob(target, remoteJobId).catch(() => undefined);
+      await requeueClaimedJob(task.id, jobId, proxyGeneration);
       return;
     }
     if (
@@ -521,26 +921,90 @@ async function dispatchJob(
       error.status !== 408
     ) {
       // 确定性 4xx（413 超限/401 token 错/400 参数错）：立即终态失败并退款
-      await failJob(jobId, error, { retryable: false });
+      await deleteTranslateJob(target, remoteJobId).catch(() => undefined);
+      await failJob(jobId, error, { retryable: false }, proxyGeneration);
       return;
     }
+    if (issuedProxy) {
+      // start 请求已携带本代 token 发出，网络/5xx 无法证明远端未接受。
+      // 保持本代 PROCESSING+token，下一 tick 查 worker 真实状态；若实际 404
+      // 再原子回炉。此处若直接 fail/retry，已运行的远端只持旧 token，会连续 401。
+      try {
+        await writeJobParamsForGeneration(jobId, proxyGeneration, {
+          ...params,
+          workerId: target.id,
+          dispatchState: 'started',
+        });
+      } catch (writeError) {
+        // token/workerId 已先在 TranslationTask 事务化落库。这里若是 DB 响应丢失
+        // 或旧代 CAS 失败，都不能再进入外层 failJob 吊销可能正在使用的 token；
+        // 下一 tick 会用 task.workerId 找回远端，或由新代 CAS 自然隔离旧 dispatch。
+        translateLogger.warn(
+          {
+            jobId,
+            taskId: task.id,
+            worker: target.name,
+            err: serializeError(writeError),
+          },
+          '记录不确定 worker start 绑定失败，保留本代凭据等待对账'
+        );
+      }
+      translateLogger.warn(
+        { jobId, taskId: task.id, worker: target.name, err: serializeError(error) },
+        'worker start 结果不确定，保留本代凭据等待对账'
+      );
+      return;
+    }
+    // token 尚未签发，远端不可能进行付费回调；若 upload 响应丢失只会留下
+    // created 壳，尽力按本 generation id 清理后再让外层走可重试失败。
+    await deleteTranslateJob(target, remoteJobId).catch(() => undefined);
     throw error; // 5xx/网络错：外层按可重试失败处理
   }
 
-  await writeJobParams(jobId, { ...params, workerId: target.id });
+  try {
+    await writeJobParamsForGeneration(jobId, proxyGeneration, {
+      ...params,
+      workerId: target.id,
+      dispatchState: 'started',
+    });
+  } catch (writeError) {
+    // start 已成功返回后仍必须按“远端已运行”处理；params 辅助写失败不能
+    // 反向终结 JobQueue/吊销 token。task.workerId 是下一 tick 的 durable fallback。
+    translateLogger.warn(
+      {
+        jobId,
+        taskId: task.id,
+        worker: target.name,
+        err: serializeError(writeError),
+      },
+      '记录 worker start 绑定失败，保留本代凭据等待对账'
+    );
+  }
   busyByWorkerId.set(target.id, (busyByWorkerId.get(target.id) ?? 0) + 1);
-  await markTaskTranslating(task.id, target.id);
   translateLogger.info(
     { jobId, taskId: task.id, worker: target.name },
     '文档翻译任务已派发给 worker'
   );
 }
 
-async function markTaskTranslating(taskId: string, workerId: string): Promise<void> {
-  await prisma.translationTask.updateMany({
-    where: { id: taskId, status: { in: ['PENDING', 'TRANSLATING'] } },
+async function markTaskTranslating(
+  taskId: string,
+  workerId: string,
+  jobId: string,
+  proxyGeneration: string
+): Promise<void> {
+  const marked = await prisma.translationTask.updateMany({
+    where: {
+      id: taskId,
+      jobQueueId: jobId,
+      proxyGeneration,
+      status: { in: ['PENDING', 'TRANSLATING'] },
+    },
     data: { status: 'TRANSLATING', workerId, errorMessage: null },
   });
+  if (marked.count !== 1) {
+    throw new Error('翻译任务代次已变更');
+  }
 }
 
 // ─── 对账 ───
@@ -559,47 +1023,126 @@ async function reconcileProcessingJob(
 ): Promise<void> {
   const params = parseJobParams(job.params);
   const task = await loadTask(params.taskId);
-  if (!task || task.status === 'CANCELED') {
-    const bound = workerById(fleet, params.workerId);
-    if (bound) await deleteTranslateJob(bound, job.id).catch(() => undefined);
-    // L24：deleteTaskFiles 是对整个任务目录的 `rm -rf`（含源文件）。用户「取消 → 重试」
-    // 之后源文件必须留着给新一代用，而上一代的对账可能才刚跑到这里读到 CANCELED 快照。
-    // 只有任务仍绑在本代调度行上时才允许清盘。
-    if (task && task.jobQueueId === job.id) {
-      await deleteTaskFiles(task.id).catch(() => undefined);
+  const paramsGeneration = params.proxyGeneration ?? null;
+  if (task?.status === 'COMPLETED' && task.jobQueueId === job.id) {
+    // Task CAS 已发布、JobQueue SUCCESS 尚未提交的正常间隙。第三个 tick 不能
+    // 因 task 已清 proxyGeneration 而把同一行标 FAILED；完整 params 快照 CAS
+    // 又确保旧 generation 快照无法收敛当前新代。
+    const converged = await prisma.jobQueue.updateMany({
+      where: {
+        id: job.id,
+        status: JOB_STATUS.PROCESSING,
+        params: job.params,
+      },
+      data: {
+        status: JOB_STATUS.SUCCESS,
+        result: JSON.stringify({
+          monoPath: task.monoPath,
+          dualPath: task.dualPath,
+          reconciledAfterPublish: true,
+        }),
+        completedAt: new Date(),
+      },
+    });
+    if (converged.count === 1) {
+      const bound = workerById(fleet, params.workerId);
+      if (bound) {
+        await deleteTranslateJob(
+          bound,
+          remoteJobIdFor(job.id, paramsGeneration)
+        ).catch(() => undefined);
+      }
+    }
+    return;
+  }
+  const ownsTaskGeneration =
+    task?.jobQueueId === job.id &&
+    (paramsGeneration
+      ? task.proxyGeneration === paramsGeneration
+      : task.proxyGeneration === null);
+  if (!task || task.status === 'CANCELED' || !ownsTaskGeneration) {
+    // 旧 legacy 行在用户 retry 换绑后，绝不能借用新任务的 generation/worker。
+    // CANCELED 的 source 也必须保留：产品允许取消后重试，物理删除路由才清目录。
+    const staleGeneration = params.proxyGeneration ?? null;
+    const bound = workerById(
+      fleet,
+      params.workerId ??
+        (ownsTaskGeneration && paramsGeneration
+          ? task?.workerId ?? undefined
+          : undefined)
+    );
+    if (bound) {
+      await deleteTranslateJob(
+        bound,
+        remoteJobIdFor(job.id, staleGeneration)
+      ).catch(() => undefined);
     }
     await prisma.jobQueue.updateMany({
-      where: { id: job.id, status: JOB_STATUS.PROCESSING },
+      where: {
+        id: job.id,
+        status: JOB_STATUS.PROCESSING,
+        // 精确快照 CAS 也保护无 generation 的迁移期 legacy 行，防迟到对账
+        // 把同一 JobQueue 行的新 claim 终结。
+        params: job.params,
+      },
       data: {
         status: JOB_STATUS.FAILED,
-        error: task ? '用户已取消' : '翻译任务已删除',
+        error: !task
+          ? '翻译任务已删除'
+          : task.status === 'CANCELED'
+            ? '用户已取消'
+            : '翻译任务已换代',
         completedAt: new Date(),
       },
     });
     return;
   }
 
-  const bound = workerById(fleet, params.workerId);
+  // 远端 identity 只能来自当前 JobQueue params 快照；绝不能从 task fallback，
+  // 因为自动 retry 会复用同一 JobQueue id，而 task 已可能属于新 generation。
+  const proxyGeneration = paramsGeneration;
+  const remoteJobId = remoteJobIdFor(job.id, proxyGeneration);
+  const paramsBound = workerById(fleet, params.workerId);
+  if (!paramsBound) {
+    if (
+      proxyGeneration &&
+      job.startedAt &&
+      Date.now() - job.startedAt.getTime() < DISPATCH_START_GRACE_MS
+    ) {
+      // 另一进程可能正在最长 10 分钟的上传/start 窗口。issueProxyToken
+      // 会先把 workerId 写进 task，但 start 尚未发出时远端仍会返回404；这里必须
+      // 先等 grace，不能因 task.workerId fallback 提前回炉并吊销刚签发的 token。
+      return;
+    }
+  }
+  // start 后 params 辅助写若响应丢失，task.workerId 是 durable fallback；grace
+  // 结束后先按它查询远端，再决定是否回炉。
+  const bound =
+    paramsBound ??
+    (proxyGeneration
+      ? workerById(fleet, task.workerId ?? undefined)
+      : null);
   if (!bound) {
     // PROCESSING 却无有效绑定（那台被删/禁用）：回炉重派（dispatch 会逐台找回）
-    await prisma.jobQueue.updateMany({
-      where: { id: job.id, status: JOB_STATUS.PROCESSING },
-      data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
-    });
+    if (proxyGeneration) {
+      await requeueClaimedJob(task.id, job.id, proxyGeneration);
+    } else {
+      await requeueLegacyJob(task.id, job);
+    }
     return;
   }
 
   let remote: TranslateJobStatus;
   try {
-    remote = await getTranslateJob(bound, job.id);
+    remote = await getTranslateJob(bound, remoteJobId);
   } catch (error) {
     if (error instanceof TranslateWorkerError && error.status === 404) {
       // worker 重启弄丢任务：清绑定回炉重推（jobId 不变，幂等）
-      await writeJobParams(job.id, { ...params, workerId: undefined });
-      await prisma.jobQueue.updateMany({
-        where: { id: job.id, status: JOB_STATUS.PROCESSING },
-        data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
-      });
+      if (proxyGeneration) {
+        await requeueClaimedJob(task.id, job.id, proxyGeneration);
+      } else {
+        await requeueLegacyJob(task.id, job);
+      }
       translateLogger.info(
         { jobId: job.id, taskId: task.id, worker: bound.name },
         'worker 侧任务丢失，回炉重派'
@@ -611,13 +1154,29 @@ async function reconcileProcessingJob(
 
   switch (remote.status) {
     case 'succeeded':
-      await harvestJob(job.id, task, bound);
+      await harvestJob(
+        job.id,
+        task,
+        bound,
+        proxyGeneration ?? undefined,
+        job.params
+      );
       return;
     case 'failed':
-      await deleteTranslateJob(bound, job.id).catch(() => undefined);
+      await deleteTranslateJob(bound, remoteJobId).catch(() => undefined);
       await failJob(job.id, new Error(remote.error || 'worker 翻译失败'), {
         retryable: true,
-      });
+      }, proxyGeneration ?? undefined, proxyGeneration ? undefined : job.params);
+      return;
+    case 'created':
+      // upload 已完成但 start 尚未可靠发生时只存在未运行壳。精确删除本代
+      // remote id 并回炉，不能把 created 当 running 挂到总超时。
+      await deleteTranslateJob(bound, remoteJobId).catch(() => undefined);
+      if (proxyGeneration) {
+        await requeueClaimedJob(task.id, job.id, proxyGeneration);
+      } else {
+        await requeueLegacyJob(task.id, job);
+      }
       return;
     default: {
       // queued/running：进度回写 task 行（用户轮询直接读 task；变化才写）
@@ -625,21 +1184,41 @@ async function reconcileProcessingJob(
         ? Math.max(0, Math.min(99, Math.round(remote.progress)))
         : 0;
       if (params.progress?.percent !== percent || params.progress?.stage !== (remote.stage ?? null)) {
-        await writeJobParams(job.id, {
+        const nextParams = {
           ...params,
           progress: { stage: remote.stage ?? null, percent, at: new Date().toISOString() },
-        });
-        await prisma.translationTask
-          .updateMany({
-            where: { id: task.id, status: 'TRANSLATING' },
-            data: { progress: percent },
-          })
-          .catch(() => undefined);
+        };
+        if (proxyGeneration) {
+          await writeJobParamsForGeneration(
+            job.id,
+            proxyGeneration,
+            nextParams
+          );
+          await prisma.translationTask
+            .updateMany({
+              where: {
+                id: task.id,
+                jobQueueId: job.id,
+                proxyGeneration,
+                status: 'TRANSLATING',
+              },
+              data: { progress: percent },
+            })
+            .catch(() => undefined);
+        } else {
+          await writeLegacyProgress(job, nextParams, task.id, percent);
+        }
       }
       const startedAt = job.startedAt?.getTime() ?? Date.now();
       if (Date.now() - startedAt > MAX_WORKER_RUNTIME_MS) {
-        await deleteTranslateJob(bound, job.id).catch(() => undefined);
-        await failJob(job.id, new Error('worker 翻译超时'), { retryable: true });
+        await deleteTranslateJob(bound, remoteJobId).catch(() => undefined);
+        await failJob(
+          job.id,
+          new Error('worker 翻译超时'),
+          { retryable: true },
+          proxyGeneration ?? undefined,
+          proxyGeneration ? undefined : job.params
+        );
       }
     }
   }
@@ -650,51 +1229,200 @@ async function reconcileProcessingJob(
 async function harvestJob(
   jobId: string,
   task: TaskRow,
-  worker: TranslateWorkerConfig
+  worker: TranslateWorkerConfig,
+  proxyGeneration?: string,
+  expectedLegacyParams?: string | null
 ): Promise<void> {
+  const remoteJobId = remoteJobIdFor(jobId, proxyGeneration);
   // mono 必得；dual 允许缺（worker 侧按参数可能只产单语）
-  const mono = await downloadTranslateOutput(worker, jobId, 'mono');
+  const mono = await downloadTranslateOutput(worker, remoteJobId, 'mono');
   let dual: { data: Buffer } | null = null;
   try {
-    dual = await downloadTranslateOutput(worker, jobId, 'dual');
+    dual = await downloadTranslateOutput(worker, remoteJobId, 'dual');
   } catch (error) {
     if (!(error instanceof TranslateWorkerError) || error.status !== 404) {
       throw error;
     }
   }
 
-  const monoPath = await saveOutputFile(task.id, 'mono', mono.data);
-  const dualPath = dual ? await saveOutputFile(task.id, 'dual', dual.data) : null;
+  // 每次 harvest 都写唯一 attempt 目录。同 generation 的两个 tick 也不会互相
+  // rename/删除；CAS winner 发布自己的精确引用，loser 只能清自己的 attempt。
+  const storageGeneration = proxyGeneration ?? jobId;
+  const storageAttempt = crypto
+    .createHash('sha256')
+    .update('translation-output-attempt-v1\0')
+    .update(storageGeneration)
+    .update('\0')
+    .update(crypto.randomBytes(32))
+    .digest('hex');
+  let monoPath: string;
+  let dualPath: string | null;
+  try {
+    monoPath = await saveOutputFile(
+      task.id,
+      'mono',
+      mono.data,
+      storageAttempt
+    );
+    dualPath = dual
+      ? await saveOutputFile(
+          task.id,
+          'dual',
+          dual.data,
+          storageAttempt
+        )
+      : null;
+  } catch (error) {
+    await deleteOutputGeneration(task.id, storageAttempt).catch(
+      () => undefined
+    );
+    throw error;
+  }
 
-  const updated = await prisma.translationTask.updateMany({
-    where: { id: task.id, status: { in: ['PENDING', 'TRANSLATING'] } },
-    data: {
-      status: 'COMPLETED',
-      progress: 100,
-      monoPath,
-      dualPath,
-      errorMessage: null,
-      completedAt: new Date(),
-      proxyTokenHash: null, // 任务终态即吊销代理凭据
-    },
-  });
-  if (updated.count === 0) {
-    // 任务在下载期间被取消/删除：清落盘产物，调度行终态
-    // L24：同上，只清本代的盘（用户可能已经 retry，新一代还要用源文件）
-    if (task.jobQueueId === jobId) {
-      await deleteTaskFiles(task.id).catch(() => undefined);
+  let publishCount = 0;
+  let publishError: unknown;
+  try {
+    const taskPublish: Prisma.TranslationTaskUpdateManyArgs = {
+      where: {
+        id: task.id,
+        jobQueueId: jobId,
+        ...(proxyGeneration
+          ? { proxyGeneration }
+          : { proxyGeneration: null }),
+        status: { in: ['PENDING', 'TRANSLATING'] },
+      },
+      data: {
+        status: 'COMPLETED',
+        progress: 100,
+        monoPath,
+        dualPath,
+        errorMessage: null,
+        completedAt: new Date(),
+        proxyTokenHash: null, // 任务终态即吊销代理凭据
+        proxyGeneration: null,
+      },
+    };
+    const updated = proxyGeneration
+      ? await prisma.translationTask.updateMany(taskPublish)
+      : await prisma.$transaction(async (tx) => {
+          if (expectedLegacyParams === undefined) {
+            throw new Error('legacy harvest 缺少 JobQueue params 快照');
+          }
+          // 先锁住并验证 legacy 调度真源。requeue-first 时这里 count=0；
+          // publish-first 时 requeue 随后会因 Task 已终态而整笔回滚。
+          const owned = await tx.jobQueue.updateMany({
+            where: {
+              id: jobId,
+              status: JOB_STATUS.PROCESSING,
+              params: expectedLegacyParams,
+            },
+            data: { params: expectedLegacyParams },
+          });
+          if (owned.count !== 1) return { count: 0 };
+          return tx.translationTask.updateMany(taskPublish);
+        });
+    publishCount = updated.count;
+  } catch (error) {
+    publishError = error;
+  }
+
+  if (publishCount !== 1) {
+    let publishedByThisGeneration = false;
+    let sameGenerationStillActive = false;
+    let completedBySameJobGeneration = false;
+    try {
+      const current = await prisma.translationTask.findUnique({
+        where: { id: task.id },
+        select: {
+          status: true,
+          jobQueueId: true,
+          proxyGeneration: true,
+          monoPath: true,
+          dualPath: true,
+        },
+      });
+      const currentJob = await prisma.jobQueue.findUnique({
+        where: { id: jobId },
+        select: { status: true, params: true },
+      });
+      publishedByThisGeneration =
+        current?.status === 'COMPLETED' &&
+        current.jobQueueId === jobId &&
+        current.monoPath === monoPath &&
+        current.dualPath === dualPath;
+      sameGenerationStillActive =
+        current?.jobQueueId === jobId &&
+        (current.status === 'PENDING' || current.status === 'TRANSLATING') &&
+        (proxyGeneration
+          ? current.proxyGeneration === proxyGeneration
+          : current.proxyGeneration === null);
+      const jobStillRepresentsCaller = proxyGeneration
+        ? currentJob?.params?.includes(generationMarker(proxyGeneration)) ===
+          true
+        : currentJob?.params === expectedLegacyParams;
+      completedBySameJobGeneration =
+        current?.status === 'COMPLETED' &&
+        current.jobQueueId === jobId &&
+        typeof current.monoPath === 'string' &&
+        jobStillRepresentsCaller &&
+        (currentJob?.status === JOB_STATUS.PROCESSING ||
+          currentJob?.status === JOB_STATUS.SUCCESS);
+      if (completedBySameJobGeneration && current) {
+        // 另一个同代 harvest 已赢得 Task CAS。使用 winner 的引用收敛同一
+        // JobQueue，当前 loser 只清自己的唯一 attempt，绝不能把队列改 FAILED。
+        await deleteOutputGeneration(task.id, storageAttempt).catch(
+          () => undefined
+        );
+        monoPath = current.monoPath as string;
+        dualPath = current.dualPath;
+      }
+    } catch (readbackError) {
+      // DB 提交结果未知时不能删除 staged generation：它可能正是 task 已发布路径。
+      throw publishError ?? readbackError;
     }
+    if (publishedByThisGeneration) {
+      // update 已提交但响应丢失；继续收敛 JobQueue，保留已发布文件。
+      publishCount = 1;
+    } else if (completedBySameJobGeneration) {
+      publishCount = 1;
+    } else if (sameGenerationStillActive) {
+      // readback 已确认发布未提交，故只清本次 attempt；若 readback 本身失败，
+      // 上面的 catch 会保留它，避免误删已提交但响应丢失的产物。
+      await deleteOutputGeneration(task.id, storageAttempt).catch(
+        () => undefined
+      );
+      throw publishError ?? new Error('翻译产物发布未完成');
+    }
+  }
+
+  if (publishCount !== 1) {
+    await deleteOutputGeneration(task.id, storageAttempt).catch(
+      () => undefined
+    );
+    // 任务在下载期间被取消/删除/换代：只终结调用方 generation 的调度行。
     await prisma.jobQueue.updateMany({
-      where: { id: jobId, status: JOB_STATUS.PROCESSING },
+      where: {
+        id: jobId,
+        status: JOB_STATUS.PROCESSING,
+        ...(proxyGeneration
+          ? { params: { contains: generationMarker(proxyGeneration) } }
+          : { params: expectedLegacyParams }),
+      },
       data: { status: JOB_STATUS.FAILED, error: '任务已取消', completedAt: new Date() },
     });
-    await deleteTranslateJob(worker, jobId).catch(() => undefined);
+    await deleteTranslateJob(worker, remoteJobId).catch(() => undefined);
     return;
   }
 
   await prisma.jobQueue
-    .update({
-      where: { id: jobId },
+    .updateMany({
+      where: {
+        id: jobId,
+        status: JOB_STATUS.PROCESSING,
+        ...(proxyGeneration
+          ? { params: { contains: generationMarker(proxyGeneration) } }
+          : { params: expectedLegacyParams }),
+      },
       data: {
         status: JOB_STATUS.SUCCESS,
         result: JSON.stringify({
@@ -709,7 +1437,7 @@ async function harvestJob(
     .catch((err) =>
       translateLogger.warn({ jobId, err: serializeError(err) }, '标记任务成功失败')
     );
-  await deleteTranslateJob(worker, jobId).catch(() => undefined);
+  await deleteTranslateJob(worker, remoteJobId).catch(() => undefined);
   notifyTaskFinished(task.id, 'completed');
   translateLogger.info(
     { jobId, taskId: task.id, monoBytes: mono.data.length },
@@ -720,7 +1448,9 @@ async function harvestJob(
 async function failJob(
   jobId: string,
   error: unknown,
-  options: { retryable: boolean }
+  options: { retryable: boolean },
+  expectedGeneration?: string,
+  expectedLegacyParams?: string | null
 ): Promise<void> {
   const message = error instanceof Error ? error.message : String(error ?? 'Unknown error');
   const job = await prisma.jobQueue.findUnique({ where: { id: jobId } });
@@ -735,9 +1465,22 @@ async function failJob(
     delete params.nextRetryAt;
   }
 
-  await prisma.jobQueue
-    .update({
-      where: { id: jobId },
+  const failed = await prisma.jobQueue
+    .updateMany({
+      where: {
+        id: jobId,
+        ...(expectedGeneration
+          ? {
+              status: JOB_STATUS.PROCESSING,
+              params: { contains: generationMarker(expectedGeneration) },
+            }
+          : expectedLegacyParams !== undefined
+            ? {
+                status: JOB_STATUS.PROCESSING,
+                params: expectedLegacyParams,
+              }
+            : {}),
+      },
       data: {
         status: JOB_STATUS.FAILED,
         error: message.slice(0, 1000),
@@ -745,9 +1488,14 @@ async function failJob(
         completedAt: new Date(),
       },
     })
-    .catch((err) =>
-      translateLogger.warn({ jobId, err: serializeError(err) }, '标记任务失败失败')
-    );
+    .catch((err) => {
+      translateLogger.warn(
+        { jobId, err: serializeError(err) },
+        '标记任务失败失败'
+      );
+      return { count: 0 };
+    });
+  if (failed.count !== 1) return;
 
   const taskId = params.taskId;
   if (taskId) {
@@ -761,8 +1509,21 @@ async function failJob(
       // 等待自动重试期间对用户仍显示「翻译中」，不闪失败
       await prisma.translationTask
         .updateMany({
-          where: { id: taskId, jobQueueId: jobId, status: 'TRANSLATING' },
-          data: { errorMessage: null },
+          where: {
+            id: taskId,
+            jobQueueId: jobId,
+            ...(expectedGeneration
+              ? { proxyGeneration: expectedGeneration }
+              : expectedLegacyParams !== undefined
+                ? { proxyGeneration: null }
+                : {}),
+            status: { in: ['PENDING', 'TRANSLATING'] },
+          },
+          data: {
+            errorMessage: null,
+            proxyTokenHash: null,
+            proxyGeneration: null,
+          },
         })
         .catch(() => undefined);
     } else {
@@ -771,12 +1532,18 @@ async function failJob(
           where: {
             id: taskId,
             jobQueueId: jobId,
+            ...(expectedGeneration
+              ? { proxyGeneration: expectedGeneration }
+              : expectedLegacyParams !== undefined
+                ? { proxyGeneration: null }
+                : {}),
             status: { in: ['PENDING', 'TRANSLATING'] },
           },
           data: {
             status: 'FAILED',
             errorMessage: message.slice(0, 500),
             proxyTokenHash: null,
+            proxyGeneration: null,
           },
         })
         .catch(() => ({ count: 0 }));
@@ -801,31 +1568,58 @@ async function failJob(
  * 这笔钱永久消失（补偿写 refundedAt=null 本身也可能挂）。refundWalletCents 本就收
  * 可选 tx 参数，包进来后失败即整体回滚，refundedAt 自动还原，不需要任何补偿写。
  *
- * L24：可选的 expectJobQueueId 代次守卫 —— 只有当任务仍绑在发起方那一代调度行上时才退，
- * 防止上一代的迟到失败退掉用户重试后新扣的那笔钱。
+ * L24：可选代次守卫。调度器可按 jobQueueId 守卫；HTTP 路由必须传完整终态快照
+ *（status/jobQueueId/proxyGeneration/chargedCents），防止迟到请求退掉重试后新扣的费用。
  */
 export async function refundTaskCharge(
   taskId: string,
   note: string,
-  expectJobQueueId?: string
-): Promise<void> {
+  expectation?:
+    | string
+    | {
+        status: 'FAILED' | 'CANCELED';
+        jobQueueId: string | null;
+        proxyGeneration: string | null;
+        chargedCents: number;
+        updatedAt: Date;
+      }
+): Promise<{ claimed: boolean; updatedAt?: Date }> {
   try {
-    await prisma.$transaction(async (tx) => {
+    return await prisma.$transaction(async (tx) => {
+      const refundAt = new Date(
+        expectation && typeof expectation !== 'string'
+          ? Math.max(Date.now(), expectation.updatedAt.getTime() + 1)
+          : Date.now()
+      );
       const claimed = await tx.translationTask.updateMany({
         where: {
           id: taskId,
           refundedAt: null,
-          chargedCents: { gt: 0 },
-          ...(expectJobQueueId ? { jobQueueId: expectJobQueueId } : {}),
+          chargedCents:
+            expectation && typeof expectation !== 'string'
+              ? { equals: expectation.chargedCents, gt: 0 }
+              : { gt: 0 },
+          ...(typeof expectation === 'string'
+            ? { jobQueueId: expectation }
+            : expectation
+              ? {
+                  status: expectation.status,
+                  jobQueueId: expectation.jobQueueId,
+                  proxyGeneration: expectation.proxyGeneration,
+                  updatedAt: expectation.updatedAt,
+                }
+              : {}),
         },
-        data: { refundedAt: new Date() },
+        data: { refundedAt: refundAt, updatedAt: refundAt },
       });
-      if (claimed.count === 0) return;
+      if (claimed.count === 0) return { claimed: false };
       const task = await tx.translationTask.findUnique({
         where: { id: taskId },
         select: { userId: true, chargedCents: true },
       });
-      if (!task) return;
+      if (!task) {
+        throw new Error('Translation refund target disappeared');
+      }
       await refundWalletCents(
         {
           userId: task.userId,
@@ -835,6 +1629,7 @@ export async function refundTaskCharge(
         },
         tx
       );
+      return { claimed: true, updatedAt: refundAt };
     });
   } catch (error) {
     // 事务已整体回滚（refundedAt 自动还原），兜底路径下轮重试
@@ -842,6 +1637,7 @@ export async function refundTaskCharge(
       { taskId, err: serializeError(error) },
       '翻译退款入账失败（事务已回滚，等待重试）'
     );
+    return { claimed: false };
   }
 }
 

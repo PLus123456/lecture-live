@@ -3,6 +3,8 @@ import { writeFile, mkdir, unlink } from 'fs/promises';
 import path from 'path';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { sanitizeSvgContent } from '@/lib/svgSanitizer';
+import { JOB_STATUS, JOB_TYPE, trackJob } from '@/lib/jobQueue';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 // 所有允许的图标扩展名（用于重传换格式时清理旧扩展名的残留文件）
 const ALL_ICON_EXTENSIONS = ['.png', '.jpg', '.svg', '.ico', '.webp', '.gif'];
@@ -58,14 +60,12 @@ function matchesImageSignature(buffer: Buffer, mimeType: string): boolean {
 
 // 上传图标文件
 export async function POST(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user, response } = await requireAdminAccess(req, {
     scope: 'admin:upload-icon',
     limit: 20,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
-  }
+  if (response || !user) return response!;
 
   // Content-Length 预检：读 body 前先按声明长度挡掉明显超限的请求，避免把超大 body
   // 整个缓冲进内存才发现超限（OOM 面）。multipart 有额外开销，给 1MB 余量避免误杀；
@@ -122,11 +122,7 @@ export async function POST(req: Request) {
     const ext = getExtension(normalizedMimeType);
     const fileName = `${ICON_TYPES[type]}${ext}`;
 
-    // 确保目标目录存在
     const iconsDir = path.join(process.cwd(), 'data', 'icons');
-    await mkdir(iconsDir, { recursive: true });
-
-    // 将文件写入磁盘
     const rawBuffer = Buffer.from(await file.arrayBuffer());
     const buffer =
       normalizedMimeType === 'image/svg+xml'
@@ -142,27 +138,68 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
-    // G7：写入前清理同一图标前缀但扩展名不同的旧文件，否则重传换格式（如 PNG→SVG）后
-    // 旧 logo.png 不再被任何设置引用，却永久残留在 data/icons/（全站无 cron/unlink 兜底）。
     const prefix = ICON_TYPES[type];
-    await Promise.all(
-      ALL_ICON_EXTENSIONS.filter((otherExt) => otherExt !== ext).map((otherExt) =>
-        unlink(path.join(iconsDir, `${prefix}${otherExt}`)).catch(() => undefined)
-      )
+    const result = await trackJob(
+      {
+        type: JOB_TYPE.ADMIN_MUTATION,
+        userId: user.id,
+        triggeredBy: `admin:${user.id}`,
+        params: {
+          operation: 'upload_icon',
+          iconType: type,
+          mimeType: normalizedMimeType,
+          bytes: file.size,
+        },
+        resultSummary: (value) => value,
+        terminalMutation: async (tx, terminal) => {
+          await writeSecurityAudit(
+            req,
+            {
+              event: 'icon.upload',
+              operator: user,
+              target: { type: 'site_icon', id: type },
+              before: null,
+              after:
+                terminal.status === JOB_STATUS.SUCCESS
+                  ? {
+                      fileName: terminal.result.fileName,
+                      mimeType: terminal.result.type,
+                      bytes: terminal.result.size,
+                    }
+                  : null,
+              reason: 'admin-site-icon-upload',
+              outcome:
+                terminal.status === JOB_STATUS.SUCCESS ? 'SUCCESS' : 'FAILED',
+              metadata: { journaled: true },
+            },
+            tx
+          );
+        },
+      },
+      async () => {
+        // JobQueue PROCESSING 已先持久化；其后才开始目录/文件系统副作用。
+        await mkdir(iconsDir, { recursive: true });
+
+        // G7：写入前清理同一图标前缀但扩展名不同的旧文件，否则重传换格式（如 PNG→SVG）后
+        // 旧 logo.png 不再被任何设置引用，却永久残留在 data/icons/（全站无 cron/unlink 兜底）。
+        await Promise.all(
+          ALL_ICON_EXTENSIONS.filter((otherExt) => otherExt !== ext).map((otherExt) =>
+            unlink(path.join(iconsDir, `${prefix}${otherExt}`)).catch(() => undefined)
+          )
+        );
+
+        const filePath = path.join(iconsDir, fileName);
+        await writeFile(filePath, buffer);
+        return {
+          path: `/api/assets/icons/${fileName}`,
+          fileName,
+          size: file.size,
+          type: normalizedMimeType,
+        };
+      }
     );
 
-    const filePath = path.join(iconsDir, fileName);
-    await writeFile(filePath, buffer);
-
-    // 返回相对路径（前端可通过此路径访问）
-    const relativePath = `/api/assets/icons/${fileName}`;
-
-    return NextResponse.json({
-      path: relativePath,
-      fileName,
-      size: file.size,
-      type: normalizedMimeType,
-    });
+    return NextResponse.json(result);
   } catch (err) {
     console.error('上传图标失败:', err);
     return NextResponse.json({ error: '上传失败' }, { status: 500 });

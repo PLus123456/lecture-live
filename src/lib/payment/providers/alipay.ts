@@ -21,6 +21,8 @@ const ALIPAY_CURRENCY = 'CNY';
 
 export class AlipayProvider implements PaymentProvider {
   readonly name = 'alipay' as const;
+  readonly mode: 'live' | 'test';
+  readonly account: string;
   private readonly appId: string;
   private readonly sellerId: string;
   private readonly privateKeyPem: string;
@@ -29,10 +31,12 @@ export class AlipayProvider implements PaymentProvider {
 
   constructor(s: RechargeSettings) {
     this.appId = s.alipayAppId;
+    this.account = this.appId.trim() || 'default';
     this.sellerId = (s.alipaySellerId || '').trim();
     this.privateKeyPem = wrapPem(s.alipayPrivateKey, 'PRIVATE KEY');
     this.alipayPublicKeyPem = wrapPem(s.alipayPublicKey, 'PUBLIC KEY');
     this.gateway = s.alipayGateway || 'https://openapi.alipay.com/gateway.do';
+    this.mode = /alipaydev|sandbox/i.test(this.gateway) ? 'test' : 'live';
   }
 
   async createCharge(params: CreateChargeParams): Promise<CreateChargeResult> {
@@ -108,11 +112,22 @@ export class AlipayProvider implements PaymentProvider {
       outTradeNo,
       paid,
       ...(isRefund ? { reversal: true } : {}),
+      ...(!isRefund && params.trade_status === 'WAIT_BUYER_PAY'
+        ? { acknowledged: true }
+        : {}),
       amountCents: Number.isFinite(amountCents) ? amountCents : undefined,
       // 支付宝境内收单恒为人民币，通知里不带币种字段。
       currency: ALIPAY_CURRENCY,
       providerRef: params.trade_no,
       rawStatus: params.trade_status,
+      eventId: params.notify_id,
+      eventType: isRefund ? 'trade.refund' : params.trade_status,
+      providerMode: this.mode,
+      providerAccount: this.account,
+      occurredAt: parseAlipayDate(params.gmt_payment || params.notify_time),
+      objectRefs: params.trade_no
+        ? [{ objectType: 'transaction', objectId: params.trade_no }]
+        : undefined,
     };
   }
 
@@ -120,6 +135,24 @@ export class AlipayProvider implements PaymentProvider {
     // 支付宝要求异步通知处理成功后回纯文本 "success"，否则会重试。
     return { body: ok ? 'success' : 'fail', contentType: 'text/plain', status: 200 };
   }
+}
+
+/** Alipay timestamps are documented in UTC+8 and omit an offset. */
+function parseAlipayDate(value: string | undefined): Date | undefined {
+  if (!value) return undefined;
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+  if (!match) return undefined;
+  const [, year, month, day, hour, minute, second] = match;
+  const millis = Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour) - 8,
+    Number(minute),
+    Number(second)
+  );
+  const parsed = new Date(millis);
+  return Number.isFinite(parsed.getTime()) ? parsed : undefined;
 }
 
 /** 分 → 元（两位小数字符串）。 */

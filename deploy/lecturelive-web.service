@@ -1,7 +1,10 @@
 [Unit]
 Description=LectureLive Next.js Web Server
-After=network.target mysql.service redis.service
+After=network.target mysql.service redis.service lecturelive-ws.service
 Wants=mysql.service redis.service
+# Web 与 WebSocket 必须作为一个故障域启动/停止。这样直接 systemctl start 任一 unit
+# 也会拉起另一项；任一项退出或启动闸失败时，另一项随即被停掉。
+BindsTo=lecturelive-ws.service
 
 [Service]
 Type=simple
@@ -15,9 +18,17 @@ WorkingDirectory=/opt/lecturelive
 Environment=HOSTNAME=127.0.0.1
 Environment=PORT=3000
 # 使用 node --env-file 加载 .env（正确处理引号），不用 EnvironmentFile
+# 每次启动都重新验证持久化的生产支付配置；不能只依赖安装/升级时的一次检查，
+# 否则运维之后直接 systemctl restart 会绕过 SEC-024 的 fail-closed 边界。
+ExecStartPre=/usr/bin/grep -Fxq health-ready-v1 /opt/lecturelive/.runtime-security-version
+ExecStartPre=/usr/bin/node --env-file=/opt/lecturelive/.env /opt/lecturelive/scripts/check-production-payment-config.mjs
 ExecStart=/usr/bin/node --env-file=/opt/lecturelive/.env server.js
-Restart=always
-RestartSec=5
+# 等 Web 真正可连接并完成受保护的深度检查。旧备份没有 readiness 路由，且在上面的
+# runtime marker 处就会被拒绝，不能在回滚/直接 systemctl start 时短暂重新上线匿名深探测。
+ExecStartPost=/usr/bin/node --env-file=/opt/lecturelive/.env /opt/lecturelive/scripts/check-readiness.mjs --wait
+# 不在 unit 内自动重试启动安全闸。否则 marker/payment/readiness 的确定性失败会被
+# Restart=always 放大成无限重启；恢复配置后由运维显式重新启动两项服务。
+Restart=no
 KillSignal=SIGTERM
 TimeoutStopSec=45
 StandardOutput=journal

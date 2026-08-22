@@ -1,5 +1,11 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import {
+  createHash,
+  createHmac,
+  randomUUID,
+  timingSafeEqual,
+} from 'crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { JWT_SECRET } from '@/lib/serverSecrets';
@@ -13,20 +19,22 @@ import { getNextQuotaResetAt } from '@/lib/billing';
 // 直接引 tokens 而非 @/lib/email 桶文件：桶会拉进 mailer/模板（含 nodemailer），
 // 而 auth 是几乎所有路由的公共依赖，没必要为一句 updateMany 背上整个发信栈。
 import { invalidateUserEmailTokens } from '@/lib/email/tokens';
+import {
+  AUTH_SESSION_BINDING_HEADER,
+  CLIENT_SESSION_TOKEN,
+} from '@/lib/authProtocol';
+export {
+  AUTH_SESSION_BINDING_HEADER,
+  CLIENT_SESSION_TOKEN,
+} from '@/lib/authProtocol';
 
 const DEFAULT_JWT_EXPIRY_DAYS = 7;
 const COOKIE_NAME = 'lecture-live-token';
 const ABSOLUTE_SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const AUTH_SESSION_REVOCATION_CAPABILITY_VERSION = 'v1';
+const AUTH_SESSION_REVOCATION_PURPOSE = 'auth-family-revoke';
+const AUTH_SESSION_REVOCATION_MAX_LENGTH = 2_048;
 const TOKEN_BLACKLIST_PREFIX = 'auth:blacklist:';
-// 刷新幂等宽限窗：旧 jti 被 rotate 后，把「旧 jti → 刚 rotate 出的新原始 token」
-// 短暂记一份。并发第二个 Tab（丢包、或还没收到新 cookie）带着刚 rotate 的旧 jti 再来刷新时，
-// 返回同一个新 token 而非 401——两个 Tab 收敛到同一个 cookie。
-// 宽限窗一过记录即失效，旧 jti 仍在黑名单里（TTL=剩余寿命），重放保护完全不变。
-// 返回前对新 token 走一次完整 verifyAuthToken（签名/绝对上限/黑名单/tokenVersion/status），
-// 故改密/封禁/版本递增的即时吊销一律不受宽限影响。
-const TOKEN_REFRESH_GRACE_PREFIX = 'auth:refresh-grace:';
-const TOKEN_REFRESH_GRACE_TTL_MS = 30 * 1000;
-export const CLIENT_SESSION_TOKEN = '__cookie_session__';
 const DUMMY_PASSWORD_HASH =
   '$2a$12$l8o61N0Huak0dRlwugeWR.BFVvNTyaqygzfgFHhPLBBEPtvQY9z..';
 
@@ -58,17 +66,6 @@ type TokenBlacklistGlobal = typeof globalThis & {
   [TOKEN_BLACKLIST_STORE_KEY]?: Map<string, TokenBlacklistEntry>;
 };
 
-interface RefreshGraceEntry {
-  token: string;
-  expiresAt: number;
-}
-
-const TOKEN_REFRESH_GRACE_STORE_KEY = '__lectureLiveTokenRefreshGraceStore';
-
-type TokenRefreshGraceGlobal = typeof globalThis & {
-  [TOKEN_REFRESH_GRACE_STORE_KEY]?: Map<string, RefreshGraceEntry>;
-};
-
 export interface UserPayload {
   id: string;
   email: string;
@@ -79,6 +76,9 @@ export interface AuthTokenPayload extends jwt.JwtPayload, UserPayload {
   tokenVersion: number;
   sessionStartedAt: number;
   jti: string;
+  /** 新令牌必有；升级前签发的 legacy cookie 两项都不存在。 */
+  familyId?: string;
+  generation?: number;
 }
 
 export interface AuthSession {
@@ -90,6 +90,17 @@ export interface AuthSession {
 type TokenUserPayload = UserPayload & {
   tokenVersion: number;
 };
+
+class AuthVerificationInfrastructureError extends Error {
+  constructor() {
+    super('Auth verification persistence unavailable');
+    this.name = 'AuthVerificationInfrastructureError';
+  }
+}
+
+export type RotateAuthTokenResult =
+  | { status: 'rotated'; token: string }
+  | { status: 'reused' };
 
 // --------------- Password validation ---------------
 
@@ -170,6 +181,25 @@ function getTokenExpiryDate(payload: AuthTokenPayload): Date {
   return new Date(Date.now() + DEFAULT_JWT_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
 }
 
+function hashTokenJti(jti: string): string {
+  return createHash('sha256').update(jti, 'utf8').digest('hex');
+}
+
+function getFamilyExpiryDate(sessionStartedAt: number): Date {
+  return new Date(sessionStartedAt + ABSOLUTE_SESSION_LIFETIME_MS);
+}
+
+function hasTokenFamily(
+  payload: AuthTokenPayload
+): payload is AuthTokenPayload & { familyId: string; generation: number } {
+  return (
+    typeof payload.familyId === 'string' &&
+    payload.familyId.length > 0 &&
+    Number.isInteger(payload.generation) &&
+    (payload.generation as number) >= 0
+  );
+}
+
 function isValidRole(role: unknown): role is UserPayload['role'] {
   return role === 'ADMIN' || role === 'PRO' || role === 'FREE';
 }
@@ -180,6 +210,8 @@ function isValidTokenPayload(payload: unknown): payload is AuthTokenPayload {
   }
 
   const candidate = payload as Partial<AuthTokenPayload>;
+  const hasFamilyId = candidate.familyId !== undefined;
+  const hasGeneration = candidate.generation !== undefined;
   return (
     typeof candidate.id === 'string' &&
     typeof candidate.email === 'string' &&
@@ -188,8 +220,170 @@ function isValidTokenPayload(payload: unknown): payload is AuthTokenPayload {
     typeof candidate.sessionStartedAt === 'number' &&
     Number.isFinite(candidate.sessionStartedAt) &&
     typeof candidate.jti === 'string' &&
-    candidate.jti.length > 0
+    candidate.jti.length > 0 &&
+    hasFamilyId === hasGeneration &&
+    (!hasFamilyId ||
+      (typeof candidate.familyId === 'string' &&
+        candidate.familyId.length > 0 &&
+        Number.isInteger(candidate.generation) &&
+        (candidate.generation as number) >= 0))
   );
+}
+
+interface AuthSessionRevocationCapabilityPayload {
+  purpose: typeof AUTH_SESSION_REVOCATION_PURPOSE;
+  familyId: string;
+  userId: string;
+  absoluteExpiresAt: number;
+}
+
+export type RevokeAuthSessionByBindingResult =
+  | {
+      status: 'revoked' | 'already_invalid';
+      familyId: string;
+      userId: string;
+    }
+  | { status: 'invalid' };
+
+function getAuthSessionRevocationSigningInput(payloadSegment: string): string {
+  return `${AUTH_SESSION_REVOCATION_CAPABILITY_VERSION}.${payloadSegment}`;
+}
+
+function decodeCanonicalBase64Url(
+  value: string,
+  maxDecodedBytes: number
+): Buffer | null {
+  if (!value || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  try {
+    const decoded = Buffer.from(value, 'base64url');
+    if (
+      decoded.length === 0 ||
+      decoded.length > maxDecodedBytes ||
+      decoded.toString('base64url') !== value
+    ) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function parseAuthSessionRevocationCapability(
+  binding: string
+): AuthSessionRevocationCapabilityPayload | null {
+  if (
+    typeof binding !== 'string' ||
+    binding.length === 0 ||
+    binding.length > AUTH_SESSION_REVOCATION_MAX_LENGTH
+  ) {
+    return null;
+  }
+
+  const parts = binding.split('.');
+  if (
+    parts.length !== 3 ||
+    parts[0] !== AUTH_SESSION_REVOCATION_CAPABILITY_VERSION
+  ) {
+    return null;
+  }
+  const payloadBytes = decodeCanonicalBase64Url(parts[1], 1_024);
+  const suppliedMac = decodeCanonicalBase64Url(parts[2], 32);
+  if (!payloadBytes || !suppliedMac || suppliedMac.length !== 32) return null;
+
+  const expectedMac = createHmac('sha256', JWT_SECRET)
+    .update(getAuthSessionRevocationSigningInput(parts[1]), 'utf8')
+    .digest();
+  if (!timingSafeEqual(suppliedMac, expectedMac)) return null;
+
+  try {
+    const candidate = JSON.parse(payloadBytes.toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      return null;
+    }
+    const keys = Object.keys(candidate).sort();
+    if (
+      keys.length !== 4 ||
+      keys[0] !== 'absoluteExpiresAt' ||
+      keys[1] !== 'familyId' ||
+      keys[2] !== 'purpose' ||
+      keys[3] !== 'userId' ||
+      candidate.purpose !== AUTH_SESSION_REVOCATION_PURPOSE ||
+      typeof candidate.familyId !== 'string' ||
+      candidate.familyId.length === 0 ||
+      candidate.familyId.length > 512 ||
+      typeof candidate.userId !== 'string' ||
+      candidate.userId.length === 0 ||
+      candidate.userId.length > 512 ||
+      !Number.isSafeInteger(candidate.absoluteExpiresAt) ||
+      (candidate.absoluteExpiresAt as number) <= 0 ||
+      (candidate.absoluteExpiresAt as number) > 8_640_000_000_000_000
+    ) {
+      return null;
+    }
+    return candidate as unknown as AuthSessionRevocationCapabilityPayload;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 浏览器可见、只能撤销指定 token family 的能力。载荷固定绑定 family/user/绝对过期时刻/
+ * purpose，HMAC 使用 JWT_SECRET 域隔离签名；它不含 JWT、jti 或其他可用于数据授权的秘密。
+ */
+export function getAuthSessionBinding(
+  payload: AuthTokenPayload
+): string | null {
+  if (
+    !hasTokenFamily(payload) ||
+    payload.familyId.length > 512 ||
+    payload.id.length === 0 ||
+    payload.id.length > 512
+  ) {
+    return null;
+  }
+  const absoluteExpiresAt = getFamilyExpiryDate(
+    payload.sessionStartedAt
+  ).getTime();
+  if (!Number.isSafeInteger(absoluteExpiresAt)) return null;
+
+  const capability: AuthSessionRevocationCapabilityPayload = {
+    purpose: AUTH_SESSION_REVOCATION_PURPOSE,
+    familyId: payload.familyId,
+    userId: payload.id,
+    absoluteExpiresAt,
+  };
+  const payloadSegment = Buffer.from(
+    JSON.stringify(capability),
+    'utf8'
+  ).toString('base64url');
+  const signature = createHmac('sha256', JWT_SECRET)
+    .update(getAuthSessionRevocationSigningInput(payloadSegment), 'utf8')
+    .digest('base64url');
+  return `${AUTH_SESSION_REVOCATION_CAPABILITY_VERSION}.${payloadSegment}.${signature}`;
+}
+
+/**
+ * 从签名 JWT 派生 revoke-only session capability；不查询 DB，也不接受伪造 JWT。
+ *
+ * 这里有意忽略 leaf 的自然过期：旧 leaf 在 family 绝对寿命内仍应生成同一 capability，
+ * 供 refresh 竞态后的持久撤销重试。
+ * 返回值绝不能作为数据授权或 family 存活证明。
+ */
+export function getAuthTokenSessionBinding(token: string): string | null {
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: ['HS256'],
+      ignoreExpiration: true,
+    }) as AuthTokenPayload;
+    if (!isValidTokenPayload(decoded)) return null;
+    return getAuthSessionBinding(decoded);
+  } catch {
+    return null;
+  }
 }
 
 function isTokenRevokedInMemory(jti: string): boolean {
@@ -229,17 +423,109 @@ async function isTokenRevoked(jti: string): Promise<boolean> {
   return false;
 }
 
+type PersistentFamilyRevocationStatus =
+  | 'revoked'
+  | 'already_invalid'
+  | 'mismatch';
+
+/**
+ * DB 是 family 撤销的权威真源。updateMany 的 count=0 也可能只是并发请求已经先撤销；
+ * 因此必须复查，而不是把安全的幂等重试误报成基础设施故障。
+ */
+async function persistentlyRevokeAuthTokenFamily(input: {
+  familyId: string;
+  userId: string;
+  reason: string;
+  expectedAbsoluteExpiresAt?: number;
+}): Promise<PersistentFamilyRevocationStatus> {
+  const now = new Date();
+  if (
+    input.expectedAbsoluteExpiresAt !== undefined &&
+    input.expectedAbsoluteExpiresAt <= now.getTime()
+  ) {
+    return 'already_invalid';
+  }
+  const revoked = await prisma.authTokenFamily.updateMany({
+    where: {
+      id: input.familyId,
+      userId: input.userId,
+      revokedAt: null,
+      expiresAt:
+        input.expectedAbsoluteExpiresAt === undefined
+          ? { gt: now }
+          : {
+              equals: new Date(input.expectedAbsoluteExpiresAt),
+              gt: now,
+            },
+    },
+    data: {
+      revokedAt: now,
+      revokedReason: input.reason.slice(0, 64),
+    },
+  });
+  if (revoked.count === 1) return 'revoked';
+  if (revoked.count !== 0) {
+    throw new Error('Unexpected auth token family revocation result');
+  }
+
+  // 并发赢家、自然过期、用户删除级联/维护清理都已不可能继续授权，视为幂等成功。
+  // 活跃且完全匹配的行仍在却 update=0 则不可证明已撤销，必须失败关闭。
+  const family = await prisma.authTokenFamily.findUnique({
+    where: { id: input.familyId },
+    select: {
+      userId: true,
+      expiresAt: true,
+      revokedAt: true,
+    },
+  });
+  if (!family) return 'already_invalid';
+  if (
+    family.userId !== input.userId ||
+    (input.expectedAbsoluteExpiresAt !== undefined &&
+      family.expiresAt.getTime() !== input.expectedAbsoluteExpiresAt)
+  ) {
+    return 'mismatch';
+  }
+  if (family.revokedAt !== null || family.expiresAt.getTime() <= Date.now()) {
+    return 'already_invalid';
+  }
+  throw new Error('Auth token family could not be persistently revoked');
+}
+
 export async function revokeToken(
-  payload: Pick<AuthTokenPayload, 'jti' | 'exp'>
+  payload: Pick<
+    AuthTokenPayload,
+    'id' | 'jti' | 'exp' | 'sessionStartedAt' | 'familyId' | 'generation'
+  >,
+  options?: { reason?: string }
 ): Promise<void> {
+  const reason = (options?.reason ?? 'logout').slice(0, 64);
+
+  // DB 是撤销真源：先持久化，失败就向上传播。这样 web / 独立 WS 进程即便 Redis
+  // 故障、重启或被淘汰，也不会把已经 logout 的单设备 family 重新放行。
+  if (
+    typeof payload.familyId !== 'string' ||
+    payload.familyId.length === 0 ||
+    !Number.isInteger(payload.generation)
+  ) {
+    throw new Error('Legacy auth tokens require reauthentication');
+  }
+  const persistentStatus = await persistentlyRevokeAuthTokenFamily({
+    familyId: payload.familyId,
+    userId: payload.id,
+    reason,
+  });
+  if (persistentStatus === 'mismatch') {
+    throw new Error('Auth token family could not be persistently revoked');
+  }
+
   const expiresAt = getTokenExpiryDate(payload as AuthTokenPayload).getTime();
   const ttlSeconds = Math.max(
     1,
     Math.ceil((expiresAt - Date.now()) / 1000)
   );
 
-  // 写穿双写：内存表无条件写（Redis 恢复不再抹掉降级期的吊销），Redis ready 时再写一份
-  // 供跨进程（web / ws-server）共享。内存表先写，保证 Redis 抛错时吊销至少在本进程生效。
+  // 内存/Redis 只是拒绝路径的快速辅助索引，不再承担安全真源职责。
   const store = getTokenBlacklistStore();
   pruneExpiredBlacklistedTokens(store);
   store.set(payload.jti, { expiresAt });
@@ -259,85 +545,66 @@ export async function revokeToken(
   }
 }
 
-// --------------- Refresh idempotency (grace window) ---------------
-
-function getRefreshGraceStore(): Map<string, RefreshGraceEntry> {
-  const globalState = globalThis as TokenRefreshGraceGlobal;
-  if (!globalState[TOKEN_REFRESH_GRACE_STORE_KEY]) {
-    globalState[TOKEN_REFRESH_GRACE_STORE_KEY] = new Map<string, RefreshGraceEntry>();
-  }
-  return globalState[TOKEN_REFRESH_GRACE_STORE_KEY] as Map<string, RefreshGraceEntry>;
-}
-
-function pruneExpiredGraceEntries(store: Map<string, RefreshGraceEntry>) {
-  const now = Date.now();
-  store.forEach((entry, jti) => {
-    if (entry.expiresAt <= now) {
-      store.delete(jti);
-    }
-  });
-}
-
 /**
- * 记录一次刷新 rotation：旧 jti → 刚 rotate 出的新原始 token，短 TTL（默认 30s）。
- * 仅用于让并发/丢包的第二个 Tab 幂等拿到同一个新 token；不影响任何吊销逻辑。
- * Redis 优先，不可用时回落进程内存（与黑名单同构）。
+ * 验证 revoke-only binding 后，仅撤销其中被 HMAC 绑定的 family。无论当前浏览器 Cookie
+ * 属于谁，都不会把它当成撤销目标；DB 读写失败会抛出，调用方必须返回非 2xx。
  */
-export async function recordRefreshGrace(
-  oldJti: string,
-  newToken: string
-): Promise<void> {
-  const ttlSeconds = Math.ceil(TOKEN_REFRESH_GRACE_TTL_MS / 1000);
+export async function revokeAuthSessionByBinding(
+  binding: string,
+  options?: { reason?: string }
+): Promise<RevokeAuthSessionByBindingResult> {
+  const capability = parseAuthSessionRevocationCapability(binding);
+  if (!capability) return { status: 'invalid' };
 
-  const redis = getRedisClient();
-  if (redis && redis.status === 'ready') {
-    try {
-      await redis.set(
-        `${TOKEN_REFRESH_GRACE_PREFIX}${oldJti}`,
-        newToken,
-        'EX',
-        ttlSeconds
-      );
-      return;
-    } catch {
-      // Fall back to in-memory grace store when Redis is unavailable.
-    }
-  }
-
-  const store = getRefreshGraceStore();
-  pruneExpiredGraceEntries(store);
-  store.set(oldJti, {
-    token: newToken,
-    expiresAt: Date.now() + TOKEN_REFRESH_GRACE_TTL_MS,
+  // 先权威确认 capability 绑定的 user/绝对寿命。这个读取只决定“能否撤销”，不返回或
+  // 授权任何用户数据；查询失败直接向上传播。并发请求随后仍由 update+复查闭合竞态。
+  const family = await prisma.authTokenFamily.findUnique({
+    where: { id: capability.familyId },
+    select: {
+      userId: true,
+      expiresAt: true,
+      revokedAt: true,
+    },
   });
-}
-
-/**
- * 查一个（已被 rotate 的）旧 jti 是否有仍在宽限窗内的新 token。
- * 命中返回该新原始 token（调用方仍需对它走完整 verifyAuthToken 再放行）；
- * 未命中/已过期返回 null。
- */
-export async function lookupRefreshGrace(oldJti: string): Promise<string | null> {
-  const redis = getRedisClient();
-  if (redis && redis.status === 'ready') {
-    try {
-      return await redis.get(`${TOKEN_REFRESH_GRACE_PREFIX}${oldJti}`);
-    } catch {
-      // Fall back to in-memory grace store when Redis is unavailable.
-    }
+  if (!family) {
+    return {
+      status: 'already_invalid',
+      familyId: capability.familyId,
+      userId: capability.userId,
+    };
+  }
+  if (
+    family.userId !== capability.userId ||
+    family.expiresAt.getTime() !== capability.absoluteExpiresAt
+  ) {
+    return { status: 'invalid' };
+  }
+  if (family.revokedAt !== null || family.expiresAt.getTime() <= Date.now()) {
+    return {
+      status: 'already_invalid',
+      familyId: capability.familyId,
+      userId: capability.userId,
+    };
   }
 
-  const store = getRefreshGraceStore();
-  pruneExpiredGraceEntries(store);
-  const entry = store.get(oldJti);
-  if (!entry) {
-    return null;
+  // capability 到期后绝不再执行写操作。理论上它与 family.expiresAt 精确相等，因此上面
+  // 已覆盖正常过期；这里保留显式闸门，防止时钟跨界或未来 schema 变化误把过期能力用于撤销。
+  if (capability.absoluteExpiresAt <= Date.now()) {
+    return { status: 'invalid' };
   }
-  if (entry.expiresAt <= Date.now()) {
-    store.delete(oldJti);
-    return null;
-  }
-  return entry.token;
+
+  const status = await persistentlyRevokeAuthTokenFamily({
+    familyId: capability.familyId,
+    userId: capability.userId,
+    expectedAbsoluteExpiresAt: capability.absoluteExpiresAt,
+    reason: options?.reason ?? 'logout',
+  });
+  if (status === 'mismatch') return { status: 'invalid' };
+  return {
+    status,
+    familyId: capability.familyId,
+    userId: capability.userId,
+  };
 }
 
 export function extractTokenFromCookieHeader(
@@ -367,9 +634,19 @@ export function extractToken(req: Request): string | null {
   return extractTokenFromCookieHeader(req.headers.get('Cookie'));
 }
 
-async function verifyToken(token: string): Promise<AuthSession | null> {
+async function verifyToken(
+  token: string,
+  options?: {
+    allowConsumedLeaf?: boolean;
+    ignoreLeafExpiration?: boolean;
+    throwOnInfrastructureError?: boolean;
+  }
+): Promise<AuthSession | null> {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as AuthTokenPayload;
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: ['HS256'],
+      ignoreExpiration: options?.ignoreLeafExpiration === true,
+    }) as AuthTokenPayload;
     if (!isValidTokenPayload(decoded)) {
       return null;
     }
@@ -378,20 +655,47 @@ async function verifyToken(token: string): Promise<AuthSession | null> {
       return null;
     }
 
+    // 安全 cutover：部署前的 legacy JWT 没有 familyId，其历史撤销只可能存在于
+    // Redis/单进程内存。Redis miss、故障或淘汰后无法证明它未被撤销，因此一律要求
+    // 重新登录。不能把“查不到 legacy 撤销记录”解释为仍然有效。
+    if (!hasTokenFamily(decoded)) {
+      return null;
+    }
+
     if (await isTokenRevoked(decoded.jti)) {
       return null;
     }
 
-    const user = await prisma.user.findUnique({
-      where: { id: decoded.id },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        tokenVersion: true,
-        status: true,
-      },
-    });
+    const jtiHash = hashTokenJti(decoded.jti);
+    let user;
+    let family;
+    try {
+      [user, family] = await Promise.all([
+        prisma.user.findUnique({
+          where: { id: decoded.id },
+          select: {
+            id: true,
+            email: true,
+            role: true,
+            tokenVersion: true,
+            status: true,
+          },
+        }),
+        prisma.authTokenFamily.findUnique({
+          where: { id: decoded.familyId },
+          select: {
+            id: true,
+            userId: true,
+            currentJtiHash: true,
+            generation: true,
+            expiresAt: true,
+            revokedAt: true,
+          },
+        }),
+      ]);
+    } catch {
+      throw new AuthVerificationInfrastructureError();
+    }
 
     if (!user || user.tokenVersion !== decoded.tokenVersion) {
       return null;
@@ -399,6 +703,24 @@ async function verifyToken(token: string): Promise<AuthSession | null> {
 
     // 被禁用用户（status !== 1）的旧 token 立即失效——一处生效全域。
     if (user.status !== 1) {
+      return null;
+    }
+
+    // 新 token 的 DB family 是权威状态。缺行、跨用户、过期或 revoked 一律拒绝；
+    // DB 查询本身抛错也会由外层 catch 失败关闭，Redis 不再能让它恢复有效。
+    if (
+      !family ||
+      family.userId !== decoded.id ||
+      family.revokedAt !== null ||
+      family.expiresAt.getTime() <= Date.now()
+    ) {
+      return null;
+    }
+    if (
+      !options?.allowConsumedLeaf &&
+      (family.generation !== decoded.generation ||
+        family.currentJtiHash !== jtiHash)
+    ) {
       return null;
     }
 
@@ -411,16 +733,20 @@ async function verifyToken(token: string): Promise<AuthSession | null> {
       token: decoded,
       rawToken: token,
     };
-  } catch {
+  } catch (error) {
+    if (
+      options?.throwOnInfrastructureError &&
+      error instanceof AuthVerificationInfrastructureError
+    ) {
+      throw error;
+    }
     return null;
   }
 }
 
 /**
- * 只校验签名、载荷结构与绝对上限，返回 jti——不查黑名单、不查 DB。
- * 用于刷新幂等：当 verifyAuthSession 因「旧 jti 已入黑名单」而拒绝时，
- * 仍需拿到这个（真实签发过的）jti 去查宽限记录。伪造/过期/篡改 token 一律返回 null，
- * 故不会放宽任何伪造保护——攻击者没有签名密钥就构造不出匹配的 jti。
+ * 只校验签名、载荷结构与绝对上限并返回 jti，不参与授权、不查 DB。
+ * 主要供测试/诊断；伪造、过期或篡改 token 一律返回 null。
  */
 export function peekTokenJti(token: string): string | null {
   try {
@@ -464,6 +790,154 @@ export async function verifyAuthToken(token: string): Promise<AuthSession | null
   return verifyToken(token);
 }
 
+/**
+ * 仅供“握手时已经用 verifyAuthToken 严格认证成功”的既有长连接复核身份。
+ * routine refresh 后旧 leaf 不再是 current，但同一未撤销、未过期 family 内的既有连接
+ * 仍可继续工作；登出、重放撤族、账号版本/状态变化或 DB 故障仍然失败关闭。
+ *
+ * 禁止用于 HTTP 授权或新的 WebSocket 握手；这些入口必须继续使用 verifyAuthToken。
+ */
+export async function verifyEstablishedAuthFamilyToken(
+  token: string
+): Promise<AuthSession | null> {
+  if (!token || isClientSessionToken(token)) {
+    return null;
+  }
+
+  return verifyToken(token, { allowConsumedLeaf: true });
+}
+
+export type EstablishedAuthFamilyDiagnosis =
+  | { status: 'valid'; session: AuthSession }
+  | { status: 'leaf_expired' }
+  | { status: 'revoked' };
+
+/**
+ * 仅供已严格握手成功的既有长连接决定“自然 leaf exp 后是否值得做一次 strict 新握手”。
+ * leaf_expired 只忽略 raw JWT 的 exp；签名、payload、绝对寿命、黑名单、用户版本/状态及
+ * 持久 family 的 user/revokedAt/expiresAt 仍完整验证。legacy、DB 故障和任何其他失败均
+ * 归为 revoked。返回 leaf_expired 不携带 session，绝不能据此继续授权或完成新握手。
+ */
+export async function diagnoseEstablishedAuthFamilyToken(
+  token: string
+): Promise<EstablishedAuthFamilyDiagnosis> {
+  if (!token || isClientSessionToken(token)) return { status: 'revoked' };
+
+  const valid = await verifyToken(token, { allowConsumedLeaf: true });
+  if (valid) return { status: 'valid', session: valid };
+
+  const expiredOnly = await verifyToken(token, {
+    allowConsumedLeaf: true,
+    ignoreLeafExpiration: true,
+  });
+  if (
+    expiredOnly &&
+    typeof expiredOnly.token.exp === 'number' &&
+    Number.isFinite(expiredOnly.token.exp) &&
+    expiredOnly.token.exp * 1000 <= Date.now()
+  ) {
+    return { status: 'leaf_expired' };
+  }
+  return { status: 'revoked' };
+}
+
+/**
+ * refresh 专用：身份、账号状态与 family 存活性仍全部验证，但允许已消费叶子走到 CAS，
+ * 由 rotateAuthToken 原子判定并执行 reuse → revoke family。不要用于普通 API 授权。
+ */
+export async function verifyRefreshAuthToken(
+  token: string
+): Promise<AuthSession | null> {
+  if (!token || isClientSessionToken(token)) {
+    return null;
+  }
+  return verifyToken(token, {
+    allowConsumedLeaf: true,
+    throwOnInfrastructureError: true,
+  });
+}
+
+/**
+ * logout 专用：允许同一仍存活 family 的已消费 leaf 撤销整族。
+ *
+ * 这封住“攻击者先用被盗 g0 赢得 refresh CAS→g1，受害者随后拿 g0 logout”竞态；
+ * 签名、leaf exp、绝对寿命、用户版本/状态、family 归属/过期/撤销和 DB fail-closed
+ * 仍与严格认证一致。不要用于普通 HTTP 授权。
+ */
+export async function verifyLogoutAuthToken(
+  token: string
+): Promise<AuthSession | null> {
+  if (!token || isClientSessionToken(token)) {
+    return null;
+  }
+  return verifyToken(token, {
+    allowConsumedLeaf: true,
+    throwOnInfrastructureError: true,
+  });
+}
+
+export type LogoutAuthTokenResolution =
+  | { status: 'active'; session: AuthSession }
+  | { status: 'already_invalid'; session: AuthSession }
+  | { status: 'invalid' };
+
+/**
+ * logout/retry 专用解析：只要签名 family 凭据与持久 family 归属一致，就允许任意旧 leaf
+ * 撤整族；若 DB 已确认该 family revoked/过期/已清理，则返回幂等成功依据。
+ *
+ * 这里不用于任何数据授权。DB 查询失败会抛出而不是把“不可判定”伪装成已登出。
+ */
+export async function resolveLogoutAuthToken(
+  token: string
+): Promise<LogoutAuthTokenResolution> {
+  if (!token || isClientSessionToken(token)) return { status: 'invalid' };
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: ['HS256'],
+      ignoreExpiration: true,
+    }) as AuthTokenPayload;
+    if (!isValidTokenPayload(decoded) || !hasTokenFamily(decoded)) {
+      return { status: 'invalid' };
+    }
+
+    let family;
+    try {
+      family = await prisma.authTokenFamily.findUnique({
+        where: { id: decoded.familyId },
+        select: {
+          id: true,
+          userId: true,
+          expiresAt: true,
+          revokedAt: true,
+        },
+      });
+    } catch {
+      throw new AuthVerificationInfrastructureError();
+    }
+
+    const session: AuthSession = {
+      user: { id: decoded.id, email: decoded.email, role: decoded.role },
+      token: decoded,
+      rawToken: token,
+    };
+    // 行已被安全维护任务清理，或已明确 revoked/绝对过期：任何 successor 都不可能再授权，
+    // 可对“DB 已成功撤销但 200 丢包”的重试给出幂等 2xx。
+    if (!family) return { status: 'already_invalid', session };
+    if (family.userId !== decoded.id) return { status: 'invalid' };
+    if (
+      family.revokedAt !== null ||
+      family.expiresAt.getTime() <= Date.now() ||
+      decoded.sessionStartedAt + ABSOLUTE_SESSION_LIFETIME_MS <= Date.now()
+    ) {
+      return { status: 'already_invalid', session };
+    }
+    return { status: 'active', session };
+  } catch (error) {
+    if (error instanceof AuthVerificationInfrastructureError) throw error;
+    return { status: 'invalid' };
+  }
+}
+
 /** Sign a new JWT for the given user payload */
 export function signToken(
   payload: TokenUserPayload,
@@ -471,6 +945,8 @@ export function signToken(
     sessionStartedAt?: number;
     jti?: string;
     expiresInDays?: number;
+    familyId?: string;
+    generation?: number;
   }
 ): string {
   const sessionStartedAt = options?.sessionStartedAt ?? Date.now();
@@ -478,6 +954,13 @@ export function signToken(
   // 用秒而不是 `${days}d`：钳到剩余绝对寿命后 days 可能是小数（见 getJwtExpiryConfig），
   // 交给 ms 解析字符串小数没必要也不精确。整数天的老口径结果完全不变（7 → 604800）。
   const expiresInSeconds = Math.max(1, Math.floor(days * 24 * 60 * 60));
+  const familyClaims =
+    options?.familyId !== undefined && options?.generation !== undefined
+      ? {
+          familyId: options.familyId,
+          generation: options.generation,
+        }
+      : {};
   return jwt.sign(
     {
       id: payload.id,
@@ -485,11 +968,102 @@ export function signToken(
       role: payload.role,
       tokenVersion: payload.tokenVersion,
       sessionStartedAt,
-      jti: options?.jti ?? crypto.randomUUID(),
+      jti: options?.jti ?? randomUUID(),
+      ...familyClaims,
     },
     JWT_SECRET,
     { expiresIn: expiresInSeconds }
   );
+}
+
+/** 创建一次独立登录 / 设备 family，并签出 generation=0 的首个叶子。 */
+export async function issueAuthToken(
+  payload: TokenUserPayload,
+  options?: {
+    sessionStartedAt?: number;
+    expiresInDays?: number;
+  }
+): Promise<string> {
+  const sessionStartedAt = options?.sessionStartedAt ?? Date.now();
+  const familyId = randomUUID();
+  const jti = randomUUID();
+  const token = signToken(payload, {
+    sessionStartedAt,
+    expiresInDays: options?.expiresInDays,
+    familyId,
+    generation: 0,
+    jti,
+  });
+
+  await prisma.authTokenFamily.create({
+    data: {
+      id: familyId,
+      userId: payload.id,
+      currentJtiHash: hashTokenJti(jti),
+      generation: 0,
+      sessionStartedAt: new Date(sessionStartedAt),
+      expiresAt: getFamilyExpiryDate(sessionStartedAt),
+    },
+  });
+
+  return token;
+}
+
+/**
+ * 原子消费一个 family refresh 叶子。成功只更新 current leaf；CAS loser 表示同一旧凭据
+ * 被重用，立即持久撤销整族。legacy leaf 不迁移、直接要求重新登录；DB 错误失败关闭。
+ */
+export async function rotateAuthToken(
+  current: AuthTokenPayload,
+  user: TokenUserPayload,
+  options?: { expiresInDays?: number }
+): Promise<RotateAuthTokenResult> {
+  const nextJti = randomUUID();
+  const nextJtiHash = hashTokenJti(nextJti);
+
+  if (!hasTokenFamily(current)) {
+    // 安全 cutover 不迁移 legacy leaf；所有无 family JWT 必须重新登录。
+    return { status: 'reused' };
+  }
+
+  const nextGeneration = current.generation + 1;
+  const nextToken = signToken(user, {
+    sessionStartedAt: current.sessionStartedAt,
+    expiresInDays: options?.expiresInDays,
+    familyId: current.familyId,
+    generation: nextGeneration,
+    jti: nextJti,
+  });
+  const rotated = await prisma.authTokenFamily.updateMany({
+    where: {
+      id: current.familyId,
+      userId: current.id,
+      currentJtiHash: hashTokenJti(current.jti),
+      generation: current.generation,
+      revokedAt: null,
+      expiresAt: { gt: new Date() },
+    },
+    data: {
+      currentJtiHash: nextJtiHash,
+      generation: { increment: 1 },
+    },
+  });
+  if (rotated.count === 1) {
+    return { status: 'rotated', token: nextToken };
+  }
+
+  await prisma.authTokenFamily.updateMany({
+    where: {
+      id: current.familyId,
+      userId: current.id,
+      revokedAt: null,
+    },
+    data: {
+      revokedAt: new Date(),
+      revokedReason: 'refresh_reuse',
+    },
+  });
+  return { status: 'reused' };
 }
 
 /**
@@ -540,6 +1114,12 @@ export function setAuthCookie(
     path: '/',                          // 全站可用
     maxAge,
   });
+  // Set-Cookie 在 body 解析前已生效。把同一个非授权 family binding 放进稳定响应头，
+  // 客户端即使遇到截断 JSON 也能在全局 cookie lock 内撤销刚写入但未 commit 的 family。
+  const sessionBinding = getAuthTokenSessionBinding(token);
+  if (sessionBinding) {
+    response.headers.set(AUTH_SESSION_BINDING_HEADER, sessionBinding);
+  }
   return response;
 }
 
@@ -602,12 +1182,15 @@ export async function registerWithOptions(
       storageBytesLimit,
     },
   });
-  const token = signToken({
-    id: user.id,
-    email: user.email,
-    role: user.role,
-    tokenVersion: user.tokenVersion,
-  }, { expiresInDays: options?.jwtExpiryDays });
+  const token = await issueAuthToken(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      tokenVersion: user.tokenVersion,
+    },
+    { expiresInDays: options?.jwtExpiryDays }
+  );
   return { user, token };
 }
 
@@ -674,11 +1257,14 @@ export async function login(
   if (options?.requireEmailVerified && user.emailVerifiedAt == null) {
     throw new Error(EMAIL_NOT_VERIFIED_ERROR);
   }
-  const token = signToken({
-    id: user.id,
-    email: user.email,
-    role: user.role,
-    tokenVersion: user.tokenVersion,
-  }, { expiresInDays: options?.jwtExpiryDays });
+  const token = await issueAuthToken(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      tokenVersion: user.tokenVersion,
+    },
+    { expiresInDays: options?.jwtExpiryDays }
+  );
   return { user, token };
 }

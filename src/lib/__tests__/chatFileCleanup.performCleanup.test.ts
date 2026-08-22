@@ -6,6 +6,10 @@ const chatAttachmentDeleteManyMock = vi.fn();
 const queryRawMock = vi.fn();
 const executeRawUnsafeMock = vi.fn();
 const transactionMock = vi.fn();
+const findBillableStoredArtifactsByOwnersMock = vi.fn();
+const deleteCloudreveAttachmentFilesMock = vi.fn();
+const releaseStoredArtifactInTransactionMock = vi.fn();
+const markStoredArtifactsDeletePendingInTransactionMock = vi.fn();
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
@@ -21,7 +25,17 @@ vi.mock('@/lib/adminCleanup', () => ({
 }));
 
 vi.mock('@/lib/storage/cloudreveFileDelete', () => ({
-  deleteCloudreveAttachmentFiles: vi.fn().mockResolvedValue(undefined),
+  deleteCloudreveAttachmentFiles: (...args: unknown[]) =>
+    deleteCloudreveAttachmentFilesMock(...args),
+}));
+
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  findBillableStoredArtifactsByOwners:
+    (...args: unknown[]) => findBillableStoredArtifactsByOwnersMock(...args),
+  markStoredArtifactsDeletePendingInTransaction: (...args: unknown[]) =>
+    markStoredArtifactsDeletePendingInTransactionMock(...args),
+  releaseStoredArtifactInTransaction: (...args: unknown[]) =>
+    releaseStoredArtifactInTransactionMock(...args),
 }));
 
 import { performChatFileCleanup } from '@/lib/chatFileCleanup';
@@ -44,11 +58,19 @@ describe('performChatFileCleanup — 释放口径按事务内 FOR UPDATE 实际�
     queryRawMock.mockReset();
     executeRawUnsafeMock.mockReset();
     transactionMock.mockReset();
+    findBillableStoredArtifactsByOwnersMock.mockReset();
+    deleteCloudreveAttachmentFilesMock.mockReset();
+    releaseStoredArtifactInTransactionMock.mockReset();
+    markStoredArtifactsDeletePendingInTransactionMock.mockReset();
+    findBillableStoredArtifactsByOwnersMock.mockResolvedValue([]);
+    deleteCloudreveAttachmentFilesMock.mockResolvedValue(true);
+    releaseStoredArtifactInTransactionMock.mockResolvedValue(true);
     transactionMock.mockImplementation(
       async (cb: (tx: unknown) => Promise<unknown>) => cb(makeTx())
     );
     chatAttachmentDeleteManyMock.mockResolvedValue({ count: 0 });
     executeRawUnsafeMock.mockResolvedValue(undefined);
+    markStoredArtifactsDeletePendingInTransactionMock.mockResolvedValue([]);
   });
 
   it('无并发：锁定重读=快照 → 释放并删除全部行', async () => {
@@ -69,7 +91,13 @@ describe('performChatFileCleanup — 释放口径按事务内 FOR UPDATE 实际�
       kinds: [],
     });
 
-    expect(res).toEqual({ deleted: 3, releasedBytes: 180, truncated: false });
+    expect(res).toEqual({
+      deleted: 3,
+      releasedBytes: 180,
+      truncated: false,
+      physicalDeleteComplete: true,
+      pendingArtifactCount: 0,
+    });
     // 每用户各释放一次：A=150, B=30（releaseUserStorageBytesRaw 调 $executeRawUnsafe(sql, value, userId)）
     expect(executeRawUnsafeMock).toHaveBeenCalledTimes(2);
     const calls = executeRawUnsafeMock.mock.calls.map((c) => [c[1], c[2]]);
@@ -99,7 +127,13 @@ describe('performChatFileCleanup — 释放口径按事务内 FOR UPDATE 实际�
     });
 
     // r1 的 100 字节不再由本处释放 → 只退 80、删 2（此前按快照会多退 r1 的 100）
-    expect(res).toEqual({ deleted: 2, releasedBytes: 80, truncated: false });
+    expect(res).toEqual({
+      deleted: 2,
+      releasedBytes: 80,
+      truncated: false,
+      physicalDeleteComplete: true,
+      pendingArtifactCount: 0,
+    });
     const calls = executeRawUnsafeMock.mock.calls.map((c) => [c[1], c[2]]);
     expect(calls).toContainEqual(['50', 'A']); // A 只退 r2 的 50，而非快照的 150
     expect(calls).toContainEqual(['30', 'B']);
@@ -121,7 +155,13 @@ describe('performChatFileCleanup — 释放口径按事务内 FOR UPDATE 实际�
       kinds: [],
     });
 
-    expect(res).toEqual({ deleted: 0, releasedBytes: 0, truncated: false });
+    expect(res).toEqual({
+      deleted: 0,
+      releasedBytes: 0,
+      truncated: false,
+      physicalDeleteComplete: true,
+      pendingArtifactCount: 0,
+    });
     expect(executeRawUnsafeMock).not.toHaveBeenCalled();
     expect(chatAttachmentDeleteManyMock).not.toHaveBeenCalled();
   });
@@ -133,7 +173,179 @@ describe('performChatFileCleanup — 释放口径按事务内 FOR UPDATE 实际�
       sizeBytesGT: 0,
       kinds: [],
     });
-    expect(res).toEqual({ deleted: 0, releasedBytes: 0, truncated: false });
+    expect(res).toEqual({
+      deleted: 0,
+      releasedBytes: 0,
+      truncated: false,
+      physicalDeleteComplete: true,
+      pendingArtifactCount: 0,
+    });
     expect(transactionMock).not.toHaveBeenCalled();
+  });
+
+  it('legacy 物理删除失败时保留 owner 行与配额，供后续安全重试', async () => {
+    chatAttachmentFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'r1',
+        userId: 'A',
+        bytes: BigInt(100),
+        cloudrevePath: '/private/object?token=never-persist',
+        extractedTextPath: null,
+      },
+    ]);
+    deleteCloudreveAttachmentFilesMock.mockResolvedValueOnce(false);
+
+    const res = await performChatFileCleanup({
+      olderThanDays: 30,
+      sizeBytesGT: 0,
+      kinds: [],
+    });
+
+    expect(res).toEqual({
+      deleted: 0,
+      releasedBytes: 0,
+      truncated: false,
+      physicalDeleteComplete: false,
+      pendingArtifactCount: 0,
+    });
+    expect(queryRawMock).not.toHaveBeenCalled();
+    expect(executeRawUnsafeMock).not.toHaveBeenCalled();
+    expect(chatAttachmentDeleteManyMock).not.toHaveBeenCalled();
+  });
+
+  it('ledger 物理删除失败时 owner 行已转 durable pending，但不释放配额', async () => {
+    chatAttachmentFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'r1',
+        userId: 'A',
+        bytes: BigInt(100),
+        cloudrevePath: 'ledger/path',
+        extractedTextPath: null,
+      },
+    ]);
+    const artifact = {
+      id: 'artifact-1',
+      ownerId: 'r1',
+      chargedBytes: BigInt(100),
+    };
+    findBillableStoredArtifactsByOwnersMock.mockResolvedValueOnce([artifact]);
+    queryRawMock.mockResolvedValueOnce([
+      { id: 'r1', userId: 'A', bytes: BigInt(100) },
+    ]);
+    markStoredArtifactsDeletePendingInTransactionMock.mockResolvedValueOnce([
+      artifact,
+    ]);
+    deleteCloudreveAttachmentFilesMock.mockResolvedValueOnce(false);
+
+    const res = await performChatFileCleanup({
+      olderThanDays: 30,
+      sizeBytesGT: 0,
+      kinds: [],
+    });
+
+    expect(res).toEqual({
+      deleted: 1,
+      releasedBytes: 0,
+      truncated: false,
+      physicalDeleteComplete: false,
+      pendingArtifactCount: 1,
+    });
+    expect(markStoredArtifactsDeletePendingInTransactionMock).toHaveBeenCalled();
+    expect(chatAttachmentDeleteManyMock).toHaveBeenCalled();
+    expect(executeRawUnsafeMock).not.toHaveBeenCalled();
+    expect(releaseStoredArtifactInTransactionMock).not.toHaveBeenCalled();
+  });
+
+  it('ledger 配额释放与成功审计 callback 使用同一个事务', async () => {
+    chatAttachmentFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'r1',
+        userId: 'A',
+        bytes: BigInt(100),
+        cloudrevePath: 'ledger/path',
+        extractedTextPath: null,
+      },
+    ]);
+    const artifact = {
+      id: 'artifact-1',
+      ownerId: 'r1',
+      chargedBytes: BigInt(100),
+    };
+    findBillableStoredArtifactsByOwnersMock.mockResolvedValueOnce([artifact]);
+    queryRawMock.mockResolvedValueOnce([
+      { id: 'r1', userId: 'A', bytes: BigInt(100) },
+    ]);
+    markStoredArtifactsDeletePendingInTransactionMock.mockResolvedValueOnce([
+      artifact,
+    ]);
+    const releaseAuditMock = vi.fn().mockResolvedValue(undefined);
+
+    const res = await performChatFileCleanup(
+      { olderThanDays: 30, sizeBytesGT: 0, kinds: [] },
+      { onArtifactReleaseMutation: releaseAuditMock }
+    );
+
+    expect(res).toEqual({
+      deleted: 1,
+      releasedBytes: 100,
+      truncated: false,
+      physicalDeleteComplete: true,
+      pendingArtifactCount: 0,
+    });
+    const releaseTx = releaseStoredArtifactInTransactionMock.mock.calls[0]?.[0];
+    expect(releaseAuditMock).toHaveBeenCalledWith(releaseTx, {
+      artifactCount: 1,
+      releasedArtifactCount: 1,
+      releasedBytes: 100,
+    });
+  });
+
+  it('delete/quota 成功审计失败时事务回滚，不会留下无审计 mutation', async () => {
+    const durable = { rowPresent: true, storageBytesUsed: 100 };
+    chatAttachmentFindManyMock.mockResolvedValueOnce([
+      {
+        id: 'r1',
+        userId: 'A',
+        bytes: BigInt(100),
+        cloudrevePath: 'legacy/path',
+        extractedTextPath: null,
+      },
+    ]);
+    queryRawMock.mockImplementation(async () =>
+      durable.rowPresent
+        ? [{ id: 'r1', userId: 'A', bytes: BigInt(100) }]
+        : []
+    );
+    executeRawUnsafeMock.mockImplementation(async () => {
+      durable.storageBytesUsed = 0;
+    });
+    chatAttachmentDeleteManyMock.mockImplementation(async () => {
+      durable.rowPresent = false;
+      return { count: 1 };
+    });
+    transactionMock.mockImplementation(
+      async (cb: (tx: unknown) => Promise<unknown>) => {
+        const snapshot = { ...durable };
+        try {
+          return await cb(makeTx());
+        } catch (error) {
+          Object.assign(durable, snapshot);
+          throw error;
+        }
+      }
+    );
+
+    await expect(
+      performChatFileCleanup(
+        { olderThanDays: 30, sizeBytesGT: 0, kinds: [] },
+        {
+          onDatabaseMutation: async () => {
+            throw new Error('audit unavailable');
+          },
+        }
+      )
+    ).rejects.toThrow('audit unavailable');
+
+    expect(durable).toEqual({ rowPresent: true, storageBytesUsed: 100 });
   });
 });

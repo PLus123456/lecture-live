@@ -3,6 +3,13 @@
 // 上层 checkout / callback 路由与钱包结算（wallet.ts）不感知具体渠道差异。
 
 export type PaymentProviderName = 'alipay' | 'wechat' | 'stripe' | 'sandbox';
+export type PaymentProviderMode = 'live' | 'test' | 'sandbox' | 'unknown';
+
+/** A typed gateway object reference used for durable event-to-order correlation. */
+export interface PaymentObjectRef {
+  objectType: string;
+  objectId: string;
+}
 
 export const PAYMENT_PROVIDER_NAMES: PaymentProviderName[] = [
   'alipay',
@@ -43,6 +50,8 @@ export interface CreateChargeResult {
   qrCode?: string;
   /** 网关侧订单号/流水号（审计，可空）。 */
   providerRef?: string;
+  /** 订单创建时已知的 typed gateway objects（Stripe 初始通常只有 Checkout Session）。 */
+  objectRefs?: PaymentObjectRef[];
 }
 
 /** 解析并验签网关异步通知后的归一化结果。 */
@@ -66,6 +75,16 @@ export interface CallbackResult {
    * 绝不到账。与 paid 互斥：反向通知的 paid 恒为 false。
    */
   reversal?: boolean;
+  /** 网关回报的退款/争议金额；Stripe 退款为累计 amount_refunded。 */
+  reversalAmountCents?: number;
+  /** true 才证明整单反向；false 表示部分退款，必须进入人工复核，绝不能全量撤权。 */
+  fullReversal?: boolean;
+  /**
+   * Stripe refund/dispute lifecycle state. `pending` freezes value without guessing a final
+   * clawback, `withdrawn` is a succeeded refund/lost dispute, and `reinstated` is a terminal
+   * failed/canceled refund or won dispute that may release only the matching pending hold.
+   */
+  reversalState?: 'pending' | 'withdrawn' | 'reinstated';
   /**
    * 验签通过但**无需到账也无需重试**的通知（如微信的非交易类事件，P6-13）。
    * 回调路由据此回成功 ACK，避免网关按 15 次/24h 无限重推一条我们永远不会处理的通知。
@@ -75,6 +94,18 @@ export interface CallbackResult {
   providerRef?: string;
   /** 网关原始状态串（审计/排障）。 */
   rawStatus?: string;
+  /** 网关稳定事件 ID；缺失渠道由上层对验签原文做 SHA-256 生成，不保存原文。 */
+  eventId?: string;
+  /** 事件种类（如 checkout.session.completed / REFUND.SUCCESS）。 */
+  eventType?: string;
+  /** live/test/sandbox 隔离维度；对象映射与 inbox 唯一键必须包含。 */
+  providerMode?: PaymentProviderMode;
+  /** 商户/Connect 账户隔离维度（appId/mchId/acct_*）；绝不放密钥。 */
+  providerAccount?: string;
+  /** 网关签名事件中的业务发生时间；支付过期状态机使用它，而非回调到达时间。 */
+  occurredAt?: Date;
+  /** 本事件携带的 Checkout Session / PaymentIntent / Charge / Dispute 等引用。 */
+  objectRefs?: PaymentObjectRef[];
 }
 
 /** 回调应答（不同网关要求不同的 ACK 响应体）。 */
@@ -86,6 +117,9 @@ export interface CallbackAck {
 
 export interface PaymentProvider {
   readonly name: PaymentProviderName;
+  /** 创建订单时可确定的网关命名空间。 */
+  readonly mode?: PaymentProviderMode;
+  readonly account?: string;
   /** 发起一笔支付。凭据缺失/配置非法应抛错（checkout 路由捕获并回 4xx/5xx）。 */
   createCharge(params: CreateChargeParams): Promise<CreateChargeResult>;
   /**

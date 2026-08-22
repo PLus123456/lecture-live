@@ -11,6 +11,7 @@ const {
   transactionMock,
   invalidateSiteSettingsCacheMock,
   invalidateSonioxDbConfigCacheMock,
+  writeSecurityAuditMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   siteSettingUpsertMock: vi.fn(),
@@ -20,6 +21,7 @@ const {
   transactionMock: vi.fn(),
   invalidateSiteSettingsCacheMock: vi.fn(),
   invalidateSonioxDbConfigCacheMock: vi.fn(),
+  writeSecurityAuditMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({
@@ -53,6 +55,10 @@ vi.mock('@/lib/soniox/env', () => ({
   invalidateSonioxDbConfigCache: invalidateSonioxDbConfigCacheMock,
 }));
 
+vi.mock('@/lib/securityAudit', () => ({
+  writeSecurityAudit: writeSecurityAuditMock,
+}));
+
 import { PUT } from '@/app/api/admin/soniox/route';
 
 function makeRequest(body: unknown): Request {
@@ -75,6 +81,7 @@ describe('PUT /api/admin/soniox', () => {
     transactionMock.mockReset();
     invalidateSiteSettingsCacheMock.mockReset();
     invalidateSonioxDbConfigCacheMock.mockReset();
+    writeSecurityAuditMock.mockReset().mockResolvedValue({});
 
     requireAdminAccessMock.mockResolvedValue({
       user: { id: 'admin-1', role: 'ADMIN' },
@@ -84,7 +91,16 @@ describe('PUT /api/admin/soniox', () => {
     siteSettingDeleteManyMock.mockResolvedValue({ count: 0 });
     siteSettingFindFirstMock.mockResolvedValue(null);
     siteSettingFindManyMock.mockResolvedValue([]);
-    transactionMock.mockResolvedValue([]);
+    transactionMock.mockImplementation(async (callback) =>
+      callback({
+        siteSetting: {
+          upsert: siteSettingUpsertMock,
+          deleteMany: siteSettingDeleteManyMock,
+          findMany: siteSettingFindManyMock,
+        },
+        auditLog: { create: vi.fn() },
+      })
+    );
     delete process.env.CLOUDREVE_ALLOW_PRIVATE_HOST;
   });
 
@@ -215,5 +231,46 @@ describe('PUT /api/admin/soniox', () => {
       );
       expect(res.status).toBe(200);
     });
+  });
+
+  it('配置写入与 SUCCESS 审计在同一事务，且审计不含密钥或端点', async () => {
+    const res = await PUT(
+      makeRequest({
+        regions: {
+          us: {
+            apiKey: 'soniox-secret',
+            restUrl: 'https://api.soniox.example/v1?credential=hidden',
+          },
+        },
+      })
+    );
+
+    expect(res.status).toBe(200);
+    expect(transactionMock).toHaveBeenCalledTimes(1);
+    expect(writeSecurityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'soniox.update',
+        outcome: 'SUCCESS',
+        after: expect.objectContaining({ endpointChanged: true }),
+      }),
+      expect.objectContaining({ siteSetting: expect.any(Object) })
+    );
+    const auditEvent = writeSecurityAuditMock.mock.calls[0][1];
+    expect(JSON.stringify(auditEvent)).not.toContain('soniox-secret');
+    expect(JSON.stringify(auditEvent)).not.toContain('api.soniox.example');
+    expect(JSON.stringify(auditEvent)).not.toContain('hidden');
+  });
+
+  it('审计写失败会回滚配置事务并返回 500', async () => {
+    writeSecurityAuditMock.mockRejectedValueOnce(new Error('audit unavailable'));
+
+    const res = await PUT(
+      makeRequest({ regions: { us: { restUrl: 'https://api.soniox.example' } } })
+    );
+
+    expect(res.status).toBe(500);
+    expect(invalidateSiteSettingsCacheMock).not.toHaveBeenCalled();
+    expect(invalidateSonioxDbConfigCacheMock).not.toHaveBeenCalled();
   });
 });

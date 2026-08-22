@@ -1,6 +1,7 @@
 // 模型库「验证」：对登记的模型发一次最小请求，确认网关地址/密钥/模型标识可用。
 // 只做连通性验证，不评估输出质量；结果写回 LlmRegistryModel.status。
 import { decrypt } from '@/lib/crypto';
+import { fetchLlmOutbound } from '@/lib/llm/outboundPolicy';
 
 const VERIFY_TIMEOUT_MS = 20_000;
 
@@ -88,7 +89,7 @@ export async function verifyRegistryModel(
   }
 
   try {
-    const res = await fetch(url, {
+    const res = await fetchLlmOutbound(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),

@@ -31,10 +31,12 @@
     "db:studio": "node scripts/run-prisma.mjs studio",
     "db:backfill-conversation-user-id": "node scripts/backfill-conversation-user-id.mjs",
     "db:backfill-email-verified-at": "node scripts/backfill-email-verified-at.mjs",
+    "db:backfill-stored-artifacts": "node scripts/backfill-stored-artifacts.mjs",
     "billing:reset-quotas": "ts-node scripts/reset-monthly-quotas.ts",
     "billing:reconcile": "ts-node scripts/reconcile-transcription-usage.ts",
     "billing:maintenance": "ts-node scripts/billing-maintenance.ts",
     "security:reencrypt-llm-keys": "node scripts/reencrypt-llm-provider-keys.mjs",
+    "payment:reconcile-stripe-history": "node scripts/reconcile-stripe-history.mjs",
     "postinstall": "node scripts/patch-next-minify.mjs && node scripts/run-prisma.mjs generate"
   },
   "dependencies": {
@@ -64,6 +66,7 @@
     "react-markdown": "^10.1.0",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
+    "undici": "^7.28.0",
     "zustand": "^5.0.3"
   },
   "devDependencies": {

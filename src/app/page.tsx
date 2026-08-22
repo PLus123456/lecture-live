@@ -35,9 +35,8 @@ export async function generateMetadata(): Promise<Metadata> {
 }
 
 /**
- * 检查初始设置是否完成。
- * 如果 setup_complete 标记不存在，但核心配置（admin）已就绪，
- * 自动标记为完成（兼容已有部署）。
+ * 只读取初始设置完成标记。该标记只能由已认证 ADMIN 明确提交 setup step=complete；
+ * 首页是匿名可达的，绝不能仅因管理员已经存在就替用户写入并提前封闭后续配置向导。
  */
 async function isSetupComplete(): Promise<boolean> {
   // E2E 种子：e2e harness 的 DATABASE_URL 指向不可达端口（全靠 page.route 拦
@@ -48,19 +47,7 @@ async function isSetupComplete(): Promise<boolean> {
     const setting = await prisma.siteSetting.findUnique({
       where: { key: 'setup_complete' },
     });
-    if (setting?.value === 'true') return true;
-
-    const adminCount = await prisma.user.count({ where: { role: 'ADMIN' } });
-    if (adminCount > 0) {
-      await prisma.siteSetting.upsert({
-        where: { key: 'setup_complete' },
-        update: { value: 'true' },
-        create: { key: 'setup_complete', value: 'true' },
-      });
-      return true;
-    }
-
-    return false;
+    return setting?.value === 'true';
   } catch {
     // 数据库不可用时跳过检查，让用户进入 setup
     return false;

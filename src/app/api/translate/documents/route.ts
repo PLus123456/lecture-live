@@ -1,10 +1,15 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
+import { isPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
 import { prisma } from '@/lib/prisma';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { resolveUserFeatureFlags, resolveUserTranslationModelId } from '@/lib/userRoles';
 import { getModelById } from '@/lib/llm/gateway';
+import {
+  DocumentParserError,
+  inspectPdfDocument,
+} from '@/lib/documentParserProcess';
 import { saveSourceFile, deleteTaskFiles } from '@/lib/translate/taskStorage';
 import {
   TASK_VIEW_SELECT,
@@ -43,6 +48,12 @@ export async function POST(req: Request) {
   const user = await verifyAuth(req);
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  if (!(await isPaymentBenefitAvailable(user.id))) {
+    return NextResponse.json(
+      { error: '账户存在未处理的支付争议', code: 'payment_account_frozen' },
+      { status: 403 }
+    );
   }
   const rateLimited = await enforceApiRateLimit(req, {
     scope: 'translate:doc-upload',
@@ -101,15 +112,34 @@ export async function POST(req: Request) {
 
     // 读页数（getInfo 只读元数据，不抽全文）
     let pageCount = 0;
-    const { PDFParse } = await import('pdf-parse');
-    const parser = new PDFParse({ data });
     try {
-      const info = await parser.getInfo();
-      pageCount = info.total;
-    } catch {
+      const info = await inspectPdfDocument(data, { signal: req.signal });
+      pageCount = info.pages;
+    } catch (error) {
+      if (error instanceof DocumentParserError) {
+        if (error.code === 'cancelled') {
+          return NextResponse.json({ error: 'Request cancelled' }, { status: 499 });
+        }
+        if (error.code === 'input_limit' || error.code === 'archive_limit') {
+          return NextResponse.json(
+            { error: 'PDF 过大或过于复杂', code: 'document_too_complex' },
+            { status: 413 }
+          );
+        }
+        if (error.code === 'timeout') {
+          return NextResponse.json(
+            { error: 'PDF 解析超时', code: 'document_parse_timeout' },
+            { status: 422 }
+          );
+        }
+        if (error.code === 'busy' || error.code === 'worker_failed') {
+          return NextResponse.json(
+            { error: 'PDF 解析服务暂不可用', code: 'parser_unavailable' },
+            { status: 503, headers: { 'Retry-After': '5' } }
+          );
+        }
+      }
       return NextResponse.json({ error: 'PDF 解析失败（可能已加密或损坏）' }, { status: 400 });
-    } finally {
-      await parser.destroy();
     }
     if (!Number.isFinite(pageCount) || pageCount <= 0) {
       return NextResponse.json({ error: 'PDF 页数读取失败' }, { status: 400 });

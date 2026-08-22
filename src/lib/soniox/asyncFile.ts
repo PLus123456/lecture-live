@@ -18,6 +18,10 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { logger } from '@/lib/logger';
 import type { SonioxRuntimeConfig } from './env';
+import {
+  BoundedBodyError,
+  readJsonBodyBounded,
+} from '@/lib/boundedBody';
 
 export const SONIOX_ASYNC_MODEL = 'stt-async-v4';
 
@@ -25,6 +29,13 @@ export const SONIOX_ASYNC_MODEL = 'stt-async-v4';
 // 上传可能是数百 MB 的转码音频，给足 10 分钟；其余控制类请求 30 秒。
 const SONIOX_UPLOAD_TIMEOUT_MS = 10 * 60_000;
 const SONIOX_API_TIMEOUT_MS = 30_000;
+/** Provider transcript ingress limits, enforced before JSON.parse/conversion. */
+export const SONIOX_TRANSCRIPT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+export const SONIOX_TRANSCRIPT_MAX_TOKENS = 500_000;
+const SONIOX_TRANSCRIPT_MAX_TOKEN_TEXT_BYTES = 64 * 1024;
+const SONIOX_TRANSCRIPT_MAX_TOTAL_TOKEN_TEXT_BYTES = 16 * 1024 * 1024;
+const SONIOX_TRANSCRIPT_MAX_METADATA_BYTES = 256;
+const SONIOX_TRANSCRIPT_MAX_TIMELINE_MS = 24 * 60 * 60 * 1000;
 
 export interface SonioxFileUploadResponse {
   id: string;
@@ -88,6 +99,160 @@ export interface SonioxTranscriptResponse {
   id: string;
   text: string;
   tokens: SonioxAsyncToken[];
+}
+
+export class SonioxTranscriptPayloadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SonioxTranscriptPayloadError';
+  }
+}
+
+const SONIOX_TRANSCRIPT_KEYS = new Set(['id', 'text', 'tokens']);
+const SONIOX_TOKEN_KEYS = new Set([
+  'text',
+  'start_ms',
+  'end_ms',
+  'confidence',
+  'speaker',
+  'language',
+  'is_audio_event',
+  'translation_status',
+]);
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function requireBoundedString(
+  value: unknown,
+  label: string,
+  maxBytes: number
+): string {
+  if (typeof value !== 'string') {
+    throw new SonioxTranscriptPayloadError(`${label} must be a string`);
+  }
+  if (Buffer.byteLength(value, 'utf8') > maxBytes) {
+    throw new SonioxTranscriptPayloadError(`${label} exceeds its byte limit`);
+  }
+  return value;
+}
+
+function requireTimelineNumber(value: unknown, label: string): number {
+  if (
+    typeof value !== 'number' ||
+    !Number.isFinite(value) ||
+    value < 0 ||
+    value > SONIOX_TRANSCRIPT_MAX_TIMELINE_MS
+  ) {
+    throw new SonioxTranscriptPayloadError(`${label} is invalid`);
+  }
+  return value;
+}
+
+/** Canonicalize an untrusted provider response without copying unknown nesting. */
+export function admitSonioxTranscriptResponse(
+  value: unknown
+): SonioxTranscriptResponse {
+  if (!isPlainRecord(value)) {
+    throw new SonioxTranscriptPayloadError('Soniox transcript must be an object');
+  }
+  for (const key in value) {
+    if (Object.hasOwn(value, key) && !SONIOX_TRANSCRIPT_KEYS.has(key)) {
+      throw new SonioxTranscriptPayloadError(`Soniox transcript.${key} is not allowed`);
+    }
+  }
+  if (!Array.isArray(value.tokens)) {
+    throw new SonioxTranscriptPayloadError('Soniox transcript.tokens must be an array');
+  }
+  if (value.tokens.length > SONIOX_TRANSCRIPT_MAX_TOKENS) {
+    throw new SonioxTranscriptPayloadError('Soniox transcript has too many tokens');
+  }
+
+  let totalTokenTextBytes = 0;
+  const tokens: SonioxAsyncToken[] = [];
+  for (let index = 0; index < value.tokens.length; index += 1) {
+    const raw = value.tokens[index];
+    const label = `Soniox transcript.tokens[${index}]`;
+    if (!isPlainRecord(raw)) {
+      throw new SonioxTranscriptPayloadError(`${label} must be an object`);
+    }
+    for (const key in raw) {
+      if (Object.hasOwn(raw, key) && !SONIOX_TOKEN_KEYS.has(key)) {
+        throw new SonioxTranscriptPayloadError(`${label}.${key} is not allowed`);
+      }
+    }
+    const text = requireBoundedString(
+      raw.text,
+      `${label}.text`,
+      SONIOX_TRANSCRIPT_MAX_TOKEN_TEXT_BYTES
+    );
+    totalTokenTextBytes += Buffer.byteLength(text, 'utf8');
+    if (totalTokenTextBytes > SONIOX_TRANSCRIPT_MAX_TOTAL_TOKEN_TEXT_BYTES) {
+      throw new SonioxTranscriptPayloadError(
+        'Soniox transcript token text exceeds its total byte limit'
+      );
+    }
+    const startMs = requireTimelineNumber(raw.start_ms, `${label}.start_ms`);
+    const endMs = requireTimelineNumber(raw.end_ms, `${label}.end_ms`);
+    if (endMs < startMs) {
+      throw new SonioxTranscriptPayloadError(`${label} has a reversed time range`);
+    }
+    if (
+      typeof raw.confidence !== 'number' ||
+      !Number.isFinite(raw.confidence) ||
+      raw.confidence < 0 ||
+      raw.confidence > 1
+    ) {
+      throw new SonioxTranscriptPayloadError(`${label}.confidence is invalid`);
+    }
+    const token: SonioxAsyncToken = {
+      text,
+      start_ms: startMs,
+      end_ms: endMs,
+      confidence: raw.confidence,
+    };
+    for (const key of ['speaker', 'language'] as const) {
+      if (raw[key] !== undefined && raw[key] !== null) {
+        token[key] = requireBoundedString(
+          raw[key],
+          `${label}.${key}`,
+          SONIOX_TRANSCRIPT_MAX_METADATA_BYTES
+        );
+      }
+    }
+    if (raw.is_audio_event !== undefined && raw.is_audio_event !== null) {
+      if (typeof raw.is_audio_event !== 'boolean') {
+        throw new SonioxTranscriptPayloadError(`${label}.is_audio_event is invalid`);
+      }
+      token.is_audio_event = raw.is_audio_event;
+    }
+    if (raw.translation_status !== undefined && raw.translation_status !== null) {
+      if (raw.translation_status !== 'translation') {
+        throw new SonioxTranscriptPayloadError(
+          `${label}.translation_status is invalid`
+        );
+      }
+      token.translation_status = raw.translation_status;
+    }
+    tokens.push(token);
+  }
+
+  return {
+    id: requireBoundedString(
+      value.id,
+      'Soniox transcript.id',
+      SONIOX_TRANSCRIPT_MAX_METADATA_BYTES
+    ),
+    text: requireBoundedString(
+      value.text,
+      'Soniox transcript.text',
+      SONIOX_TRANSCRIPT_MAX_TOTAL_TOKEN_TEXT_BYTES
+    ),
+    tokens,
+  };
 }
 
 function authHeader(config: SonioxRuntimeConfig): Record<string, string> {
@@ -283,7 +448,23 @@ export async function getSonioxTranscript(
     throw new Error(`Soniox get transcript failed: HTTP ${res.status}`);
   }
 
-  const response = (await res.json()) as SonioxTranscriptResponse;
+  let untrusted: unknown;
+  try {
+    untrusted = await readJsonBodyBounded(
+      res,
+      SONIOX_TRANSCRIPT_MAX_RESPONSE_BYTES
+    );
+  } catch (error) {
+    if (error instanceof BoundedBodyError) {
+      throw new SonioxTranscriptPayloadError(
+        error.code === 'too_large'
+          ? 'Soniox transcript response is too large'
+          : 'Soniox transcript response is invalid'
+      );
+    }
+    throw error;
+  }
+  const response = admitSonioxTranscriptResponse(untrusted);
 
   // 诊断日志：确认 Soniox 是否返回了 speaker / translation token（用于排查"上传录音
   // 无说话人分段/无翻译"类问题）。单次遍历统计，避免在大 transcript 上多次扫描。

@@ -10,7 +10,14 @@ import {
 import { useInterpret, type InterpretLine } from '@/hooks/useInterpret';
 import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+  isAuthBoundaryCurrent,
+  isPersistedAuthBoundaryCurrent,
+  useAuthStore,
+} from '@/stores/authStore';
+import { ACCOUNT_BOUNDARY_CLEAR_EVENT } from '@/lib/clientAccountCleanup';
 import type {
   StreamingPreviewText,
   StreamingPreviewTranslation,
@@ -176,6 +183,38 @@ export default function InterpretPage() {
   const [selectedMic, setSelectedMic] = useState('');
   const [micTesting, setMicTesting] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
+  const micTestGenerationRef = useRef(0);
+  const micTestResourcesRef = useRef<{
+    stream: MediaStream;
+    context: AudioContext;
+    interval: ReturnType<typeof setInterval>;
+    timeout: ReturnType<typeof setTimeout>;
+  } | null>(null);
+
+  const cancelMicTest = useCallback((updateState: boolean) => {
+    micTestGenerationRef.current += 1;
+    const resources = micTestResourcesRef.current;
+    micTestResourcesRef.current = null;
+    if (resources) {
+      clearInterval(resources.interval);
+      clearTimeout(resources.timeout);
+      resources.stream.getTracks().forEach((track) => track.stop());
+      void resources.context.close().catch(() => undefined);
+    }
+    if (updateState) {
+      setMicTesting(false);
+      setMicLevel(0);
+    }
+  }, []);
+
+  useEffect(() => {
+    const cancelForBoundary = () => cancelMicTest(true);
+    window.addEventListener(ACCOUNT_BOUNDARY_CLEAR_EVENT, cancelForBoundary);
+    return () => {
+      window.removeEventListener(ACCOUNT_BOUNDARY_CLEAR_EVENT, cancelForBoundary);
+      cancelMicTest(false);
+    };
+  }, [cancelMicTest]);
 
   useEffect(() => {
     navigator.mediaDevices?.enumerateDevices().then((devices) => {
@@ -223,11 +262,24 @@ export default function InterpretPage() {
   /** 测试麦克风 — 录 3 秒后自动停止 */
   const testMic = useCallback(async () => {
     if (micTesting) return;
+    const generation = micTestGenerationRef.current + 1;
+    micTestGenerationRef.current = generation;
+    const expected = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
+    const ownerIsCurrent = () =>
+      micTestGenerationRef.current === generation &&
+      !ownerSignal.aborted &&
+      isAuthBoundaryCurrent(expected) &&
+      isPersistedAuthBoundaryCurrent(expected);
     setMicTesting(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: selectedMic ? { deviceId: selectedMic } : true,
       });
+      if (!ownerIsCurrent()) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       const ctx = new AudioContext();
       const source = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
@@ -236,22 +288,30 @@ export default function InterpretPage() {
       const data = new Uint8Array(analyser.frequencyBinCount);
 
       const interval = setInterval(() => {
+        if (!ownerIsCurrent()) {
+          cancelMicTest(true);
+          return;
+        }
         analyser.getByteFrequencyData(data);
         const avg = data.reduce((a, b) => a + b, 0) / data.length;
         setMicLevel(avg / 255);
       }, 50);
 
-      setTimeout(() => {
-        clearInterval(interval);
-        stream.getTracks().forEach((track) => track.stop());
-        void ctx.close();
-        setMicTesting(false);
-        setMicLevel(0);
+      const timeout = setTimeout(() => {
+        if (micTestGenerationRef.current === generation) {
+          cancelMicTest(true);
+        }
       }, 3000);
+      micTestResourcesRef.current = {
+        stream,
+        context: ctx,
+        interval,
+        timeout,
+      };
     } catch {
-      setMicTesting(false);
+      if (ownerIsCurrent()) setMicTesting(false);
     }
-  }, [micTesting, selectedMic]);
+  }, [cancelMicTest, micTesting, selectedMic]);
 
   // 录制中离开页面时提示数据丢失
   useEffect(() => {

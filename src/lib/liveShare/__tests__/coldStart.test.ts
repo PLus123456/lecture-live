@@ -13,10 +13,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Server as SocketIOServer } from 'socket.io';
 import { io as createClient, Socket } from 'socket.io-client';
 import { onceSocketEvent } from '../../../../tests/utils/socket';
+import {
+  makeSummaryBlock,
+  makeTranscriptSegment,
+} from './fixtures';
 
-const { shareLinkFindUniqueMock, verifyAuthTokenMock } = vi.hoisted(() => ({
+const {
+  shareLinkFindUniqueMock,
+  verifyAuthTokenMock,
+  diagnoseEstablishedAuthFamilyTokenMock,
+} = vi.hoisted(() => ({
   shareLinkFindUniqueMock: vi.fn(),
   verifyAuthTokenMock: vi.fn(),
+  diagnoseEstablishedAuthFamilyTokenMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -30,6 +39,7 @@ vi.mock('@/lib/prisma', () => ({
 
 vi.mock('@/lib/auth', () => ({
   CLIENT_SESSION_TOKEN: '__cookie_session__',
+  diagnoseEstablishedAuthFamilyToken: diagnoseEstablishedAuthFamilyTokenMock,
   extractTokenFromCookieHeader: vi.fn(() => null),
   verifyAuthToken: verifyAuthTokenMock,
 }));
@@ -70,6 +80,10 @@ describe('直播冷开分享的历史回填（C16/U11）', () => {
 
   beforeEach(async () => {
     verifyAuthTokenMock.mockResolvedValue(AUTH_SESSION);
+    diagnoseEstablishedAuthFamilyTokenMock.mockResolvedValue({
+      status: 'valid',
+      session: AUTH_SESSION,
+    });
     shareLinkFindUniqueMock.mockImplementation(
       async ({ where: { token } }: { where: { token: string } }) => {
         const link = LINKS[token];
@@ -121,25 +135,25 @@ describe('直播冷开分享的历史回填（C16/U11）', () => {
     return (broadcaster as unknown as { socket: Socket }).socket;
   }
 
-  /** 反复 join 直到服务端快照就位（跨 socket 到达顺序不确定，join 每次都回 initial_state） */
+  /** 每次用新 socket join，模拟真实重连；同一 socket 的重复 join 按 SEC-003 必须 no-op。 */
   async function joinUntil<T extends { segments: unknown[] }>(
     shareToken: string,
     predicate: (state: T) => boolean
   ): Promise<T> {
-    const viewer = createClient(baseUrl, {
-      transports: ['websocket'],
-      reconnection: false,
-    });
-    clients.push(viewer);
-    await onceSocketEvent(viewer, 'connect');
-
     let state = { segments: [] } as unknown as T;
-    for (let attempt = 0; attempt < 40; attempt++) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const viewer = createClient(baseUrl, {
+        transports: ['websocket'],
+        reconnection: false,
+      });
+      clients.push(viewer);
+      await onceSocketEvent(viewer, 'connect');
       const statePromise = onceSocketEvent<T>(viewer, 'initial_state');
       viewer.emit('join', { shareToken });
       state = await statePromise;
       if (predicate(state)) break;
-      await new Promise((r) => setTimeout(r, 25));
+      viewer.disconnect();
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     return state;
   }
@@ -165,7 +179,12 @@ describe('直播冷开分享的历史回填（C16/U11）', () => {
     // 连上之前就 emit：socket.io-client 会缓冲，并在 connect 完成的同刻立即发出，
     // 于是这一帧必然落在服务端 authenticateBroadcaster 的 await 窗口内。
     broadcaster.emit('sync_snapshot', {
-      segments: [{ id: 'seg-cold', text: '开分享之前录的内容' }],
+      segments: [
+        makeTranscriptSegment({
+          id: 'seg-cold',
+          text: '开分享之前录的内容',
+        }),
+      ],
       translations: { 'seg-cold': 'recorded before sharing' },
       summaryBlocks: [],
       status: 'RECORDING',
@@ -179,7 +198,7 @@ describe('直播冷开分享的历史回填（C16/U11）', () => {
       translations: Record<string, string>;
     }>('share-token', (s) => s.segments.length > 0);
 
-    expect(state.segments).toEqual([
+    expect(state.segments).toMatchObject([
       { id: 'seg-cold', text: '开分享之前录的内容' },
     ]);
     expect(state.translations).toEqual({
@@ -198,9 +217,16 @@ describe('直播冷开分享的历史回填（C16/U11）', () => {
     await fs.writeFile(
       path.join(draftDir, 'transcript.json'),
       JSON.stringify({
-        segments: [{ id: 'seg-draft', text: '草稿里的历史' }],
+        segments: [
+          makeTranscriptSegment({ id: 'seg-draft', text: '草稿里的历史' }),
+        ],
         translations: { 'seg-draft': 'from draft' },
-        summaries: [{ id: 'sum-draft', blockIndex: 0, summary: 'draft summary' }],
+        summaries: [
+          makeSummaryBlock({
+            id: 'sum-draft',
+            summary: 'draft summary',
+          }),
+        ],
         clientTs: Date.now(),
       }),
       'utf-8'
@@ -213,9 +239,11 @@ describe('直播冷开分享的历史回填（C16/U11）', () => {
         summaryBlocks: Array<{ id: string }>;
       }>('draft-token', (s) => s.segments.length > 0);
 
-      expect(state.segments).toEqual([{ id: 'seg-draft', text: '草稿里的历史' }]);
+      expect(state.segments).toMatchObject([
+        { id: 'seg-draft', text: '草稿里的历史' },
+      ]);
       expect(state.translations).toEqual({ 'seg-draft': 'from draft' });
-      expect(state.summaryBlocks).toEqual([
+      expect(state.summaryBlocks).toMatchObject([
         { id: 'sum-draft', blockIndex: 0, summary: 'draft summary' },
       ]);
     } finally {
@@ -235,7 +263,7 @@ describe('直播冷开分享的历史回填（C16/U11）', () => {
     await onceSocketEvent(raw, 'connect');
 
     broadcaster.syncSnapshot({
-      segments: [{ id: 'seg-1', text: 'Hello' }],
+      segments: [makeTranscriptSegment()],
       translations: { 'seg-1': '你好' },
       summaryBlocks: [],
       status: 'RECORDING',
@@ -246,16 +274,22 @@ describe('直播冷开分享的历史回填（C16/U11）', () => {
         state: 'idle',
         sourceLanguage: null,
       },
-    } as unknown as Parameters<LiveBroadcaster['syncSnapshot']>[0]);
+    });
 
     // 开分享后新产生的内容只走增量
-    broadcaster.broadcastTranscriptDelta({ id: 'seg-2', text: 'World' } as never);
+    broadcaster.broadcastTranscriptDelta(
+      makeTranscriptSegment({
+        id: 'seg-2',
+        text: 'World',
+        globalStartMs: 1_000,
+        globalEndMs: 2_000,
+        startMs: 1_000,
+        endMs: 2_000,
+        timestamp: '00:00:01',
+      })
+    );
     broadcaster.broadcastTranslationDelta('seg-2', '世界');
-    broadcaster.broadcastSummaryUpdate({
-      id: 'sum-1',
-      blockIndex: 0,
-      summary: 'Summary',
-    } as never);
+    broadcaster.broadcastSummaryUpdate(makeSummaryBlock());
 
     // 先确认服务端已吃到 seg-2（避免与下面的断连竞争）
     await joinUntil<{ segments: Array<{ id: string }> }>(

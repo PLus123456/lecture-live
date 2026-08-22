@@ -45,6 +45,7 @@ interface RateLimitBucket {
 }
 
 const MEMORY_STORE_KEY = '__lectureLiveRateLimitStore';
+const MEMORY_BUCKET_LIMIT = 5000;
 
 type MemoryGlobal = typeof globalThis & {
   [MEMORY_STORE_KEY]?: Map<string, RateLimitBucket>;
@@ -70,13 +71,26 @@ function memoryEnforce(bucketKey: string, options: RateLimitOptions): NextRespon
   const store = getMemoryStore();
   const now = Date.now();
 
-  if (store.size > 5000) {
+  if (store.size >= MEMORY_BUCKET_LIMIT) {
     pruneExpiredBuckets(store, now);
   }
 
   const existing = store.get(bucketKey);
 
   if (!existing || existing.resetAt <= now) {
+    // Redis 故障时不能让攻击者用高基数 key 无界扩张进程 Map，也不能淘汰仍有效的
+    // 安全桶来绕过计数。容量耗尽后只拒绝新桶；已有桶继续按原窗口计数。
+    if (!existing && store.size >= MEMORY_BUCKET_LIMIT) {
+      return NextResponse.json(
+        { error: 'Too many requests' },
+        {
+          status: 429,
+          headers: {
+            'Retry-After': String(Math.max(1, Math.ceil(options.windowMs / 1000))),
+          },
+        }
+      );
+    }
     store.set(bucketKey, { count: 1, resetAt: now + options.windowMs });
     return null;
   }

@@ -52,6 +52,8 @@ type SonioxCallbacks = {
 };
 const capturedCallbacks: SonioxCallbacks[] = [];
 let hangNextStart = false;
+let hangNextSenderStream = false;
+let pendingSenderResolvers: Array<() => void> = [];
 
 const startSonioxRecordingMock = vi.fn(
   async (_config: unknown, _token: string, callbacks: SonioxCallbacks) => {
@@ -90,6 +92,11 @@ vi.mock('@/lib/audio/recordingArchiveManager', () => ({
     setCaptureEndedHandler() {}
     async ensureArchive() {}
     async getSenderStream() {
+      if (hangNextSenderStream) {
+        await new Promise<void>((resolve) => {
+          pendingSenderResolvers.push(resolve);
+        });
+      }
       return {} as MediaStream;
     }
     async resume() {}
@@ -137,6 +144,13 @@ function resetStores() {
     currentSessionIndex: 0,
     activeSessionId: null,
     currentPreviewText: { finalText: '', nonFinalText: '' },
+    connectionMeta: {
+      region: null,
+      wsUrl: null,
+      latencyMs: null,
+      connectedAt: null,
+      transcriptionLatencyMs: null,
+    },
   } as never);
 }
 
@@ -144,7 +158,9 @@ beforeEach(() => {
   capturedCallbacks.length = 0;
   recordingHandles.length = 0;
   pendingResolvers = [];
+  pendingSenderResolvers = [];
   hangNextStart = false;
+  hangNextSenderStream = false;
   startSonioxRecordingMock.mockClear();
   resetStores();
 });
@@ -209,6 +225,77 @@ describe('useSoniox P0-2 晚到 start 对齐 pause', () => {
     // 修复后：句柄被 pause()。
     const handle = recordingHandles[recordingHandles.length - 1];
     expect(handle.pause).toHaveBeenCalled();
+  });
+});
+
+describe('useSoniox account boundary cancellation', () => {
+  it('account clear invalidates a delayed start and the old hook cannot adopt the next boundary', async () => {
+    hangNextStart = true;
+    const { result } = renderHook(() =>
+      useSoniox('sess-account-a', { idleTimeoutMs: 999_999_999 })
+    );
+
+    let startPromise!: Promise<void>;
+    await act(async () => {
+      startPromise = result.current.start();
+      await vi.waitFor(() => {
+        if (pendingResolvers.length === 0) throw new Error('not yet at soniox');
+      });
+    });
+
+    act(() => {
+      window.dispatchEvent(
+        new Event('lecture-live:account-boundary-clear')
+      );
+    });
+
+    await act(async () => {
+      pendingResolvers.forEach((resolve) => resolve(undefined));
+      await startPromise;
+    });
+
+    expect(recordingHandles).toHaveLength(1);
+    expect(recordingHandles[0].stop).toHaveBeenCalledTimes(1);
+
+    const callsAfterBoundary = startSonioxRecordingMock.mock.calls.length;
+    await act(async () => {
+      await result.current.start();
+    });
+    expect(startSonioxRecordingMock).toHaveBeenCalledTimes(callsAfterBoundary);
+  });
+
+  it('does not mint a temporary key after the boundary changes while sender media is pending', async () => {
+    hangNextSenderStream = true;
+    const { result } = renderHook(() =>
+      useSoniox('sess-account-before-key', { idleTimeoutMs: 999_999_999 })
+    );
+
+    let startPromise!: Promise<void>;
+    await act(async () => {
+      startPromise = result.current.start();
+      await vi.waitFor(() => {
+        if (pendingSenderResolvers.length === 0) {
+          throw new Error('not yet waiting for sender stream');
+        }
+      });
+    });
+
+    act(() => {
+      window.dispatchEvent(
+        new Event('lecture-live:account-boundary-clear')
+      );
+    });
+
+    await act(async () => {
+      pendingSenderResolvers.forEach((resolve) => resolve());
+      await startPromise;
+    });
+
+    expect(startSonioxRecordingMock).not.toHaveBeenCalled();
+    expect(useTranscriptStore.getState().connectionMeta).toMatchObject({
+      region: null,
+      wsUrl: null,
+    });
   });
 });
 

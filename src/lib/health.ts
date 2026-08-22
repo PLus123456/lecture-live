@@ -7,9 +7,15 @@ import { prisma } from '@/lib/prisma';
 import { getRedisClient } from '@/lib/redis';
 import { getSiteSettings } from '@/lib/siteSettings';
 
-// /api/health 未授权可读，对外只回固定文案，避免泄露内网主机名/端口/连接串。
-// 原始错误仅进服务端日志，供运维排障。
+// 深度报告只由带内部 bearer 的 /api/health/ready 返回；即便如此仍只回固定文案，
+// 避免监控输出或代理日志泄露内网主机名/端口/连接串。原始错误仅进服务端日志。
 const DEPENDENCY_DOWN_DETAIL = 'unavailable';
+
+// A timeout only stops the readiness request from waiting; Prisma and some Redis
+// clients cannot cancel an already-issued command. Keep one underlying probe per
+// dependency until it really settles so a black-holed backend cannot accumulate
+// another live query every time the short readiness cache expires.
+const probeFlights = new Map<string, Promise<DependencyHealth>>();
 
 export type DependencyHealthStatus = 'up' | 'down' | 'disabled';
 export type AppHealthStatus = 'ok' | 'degraded' | 'down';
@@ -33,6 +39,40 @@ export interface HealthReport {
 
 function durationMsFrom(startedAt: number) {
   return Date.now() - startedAt;
+}
+
+async function withProbeDeadline(
+  name: string,
+  createProbe: () => Promise<DependencyHealth>,
+  timeoutMs: number
+): Promise<DependencyHealth> {
+  let probe = probeFlights.get(name);
+  if (!probe) {
+    const started = createProbe();
+    probe = started.finally(() => {
+      if (probeFlights.get(name) === probe) {
+        probeFlights.delete(name);
+      }
+    });
+    probeFlights.set(name, probe);
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<DependencyHealth>((resolve) => {
+    timer = setTimeout(() => {
+      logger.error({ probe: name, timeoutMs }, 'Health check probe timed out');
+      resolve({
+        status: 'down',
+        latencyMs: timeoutMs,
+        detail: DEPENDENCY_DOWN_DETAIL,
+      });
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([probe, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function checkDatabase(): Promise<DependencyHealth> {
@@ -71,7 +111,7 @@ async function checkRedis(): Promise<DependencyHealth> {
     return {
       status: pong === 'PONG' ? 'up' : 'down',
       latencyMs: durationMsFrom(startedAt),
-      ...(pong === 'PONG' ? {} : { detail: `Unexpected ping response: ${pong}` }),
+      ...(pong === 'PONG' ? {} : { detail: DEPENDENCY_DOWN_DETAIL }),
     };
   } catch (error) {
     logger.error({ err: serializeError(error) }, 'Health check: redis down');
@@ -144,7 +184,7 @@ async function checkCloudreve(): Promise<DependencyHealth> {
 /**
  * L7：WS 进程存活探针。
  *
- * 单容器部署里 docker-entrypoint.sh 同时拉起 Next 与 WS，但 /api/health 只体检
+ * 单容器部署里 docker-entrypoint.sh 同时拉起 Next 与 WS；深度 readiness 会体检
  * DB/Redis/Cloudreve —— WS 崩掉后 Next 照常 200，Docker healthcheck 恒绿、永不重启，
  * 实时转录与直播分享整条链路静默失效。这里补一个到 WS 端口的 TCP 探针。
  *
@@ -216,14 +256,14 @@ async function checkWebsocket(): Promise<DependencyHealth> {
 
 export async function getHealthReport(): Promise<HealthReport> {
   const [database, redis, cloudreve, websocket] = await Promise.all([
-    checkDatabase(),
-    checkRedis(),
-    checkCloudreve(),
-    checkWebsocket(),
+    withProbeDeadline('database', checkDatabase, 2_000),
+    withProbeDeadline('redis', checkRedis, 2_000),
+    withProbeDeadline('cloudreve', checkCloudreve, 3_500),
+    withProbeDeadline('websocket', checkWebsocket, 2_500),
   ]);
 
   // WS 挂了默认只算 degraded（分体部署时不该因 WS 抖动把 Web 摘出负载均衡）；
-  // 单容器镜像里 Dockerfile 显式置 HEALTH_WS_REQUIRED=1，让它升级成 down → /api/health
+  // 单容器镜像里 Dockerfile 显式置 HEALTH_WS_REQUIRED=1，让它升级成 down → /api/health/ready
   // 回 503 → HEALTHCHECK 转红 → 重启策略把整容器拉起来（WS 与 Web 同生共死）。
   const websocketRequired = process.env.HEALTH_WS_REQUIRED === '1';
 

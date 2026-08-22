@@ -23,7 +23,7 @@ const ROOT = process.cwd();
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const nextConfig = require_(path.join(ROOT, 'next.config.js')) as any;
 
-/** 解析 PDF 的三条服务端入口：documents=pdf-parse，chat-uploads/extract-keywords=fileExtractor/fileParser */
+/** 三条服务端入口都经 documentParserProcess 派发到独立进程。 */
 const PDF_ROUTES = [
   '/api/translate/documents',
   '/api/chat-uploads',
@@ -33,6 +33,9 @@ const PDF_ROUTES = [
 describe('PDF 解析的打包契约', () => {
   it('pdf-parse 必须是服务端外部包（否则 webpack 打包后 import 即崩）', () => {
     expect(nextConfig.serverExternalPackages).toContain('pdf-parse');
+    for (const dependency of ['jszip', 'mammoth', 'exceljs', 'officeparser']) {
+      expect(nextConfig.serverExternalPackages).toContain(dependency);
+    }
   });
 
   it('每条解析 PDF 的路由都声明了 pdfjs 运行时资源', () => {
@@ -49,6 +52,39 @@ describe('PDF 解析的打包契约', () => {
       .map((glob) => glob.replace(/\/\*\*$/, '').replace(/^\.\//, ''))
       .filter((dir) => !fs.existsSync(path.join(ROOT, dir)));
     expect(missing).toEqual([]);
+  });
+
+  it('三条路由均携带独立解析进程的运行脚本', () => {
+    const expected = [
+      './scripts/document-parser-worker.mjs',
+      './scripts/document-parser-network-deny.cjs',
+      './scripts/document-archive-preflight.mjs',
+    ];
+    for (const route of PDF_ROUTES) {
+      expect(nextConfig.outputFileTracingIncludes[route]).toEqual(
+        expect.arrayContaining(expected)
+      );
+    }
+
+    const translateRoute = fs.readFileSync(
+      path.join(ROOT, 'src/app/api/translate/documents/route.ts'),
+      'utf8'
+    );
+    expect(translateRoute).toContain('inspectPdfDocument(data');
+    expect(translateRoute).not.toContain("import('pdf-parse')");
+  });
+
+  it('native install and upgrade copy every parser runtime script', () => {
+    for (const deployScript of ['deploy/install.sh', 'deploy/upgrade.sh']) {
+      const source = fs.readFileSync(path.join(ROOT, deployScript), 'utf8');
+      for (const file of [
+        'document-parser-worker.mjs',
+        'document-parser-network-deny.cjs',
+        'document-archive-preflight.mjs',
+      ]) {
+        expect(source).toContain(`$SRC_DIR/scripts/${file}`);
+      }
+    }
   });
 
   it('两份 pdfjs-dist 的 worker 文件都存在（pdf-parse 内嵌 + officeparser 顶层）', () => {

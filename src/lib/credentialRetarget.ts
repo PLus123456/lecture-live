@@ -6,11 +6,9 @@
 // 服务端把解密后的真实凭据主动投递到新地址 —— SMTP 的 AUTH LOGIN、worker / LLM 的
 // Authorization: Bearer 都是一次握手就送出去。这条反向通道绕的正是脱敏，从 GET 侧堵不住。
 //
-// ⚠️ 适用范围：**当前只有 SMTP 一处在用**（admin/settings 的 smtp_host/port/user → smtp_password）。
-// Cloudreve / 音频增强 worker / 翻译 worker / LLM apiBase / Soniox 都已刻意放开：那些是自建服务，
-// 机器 IP 一变就得改地址，却要求重填一把可能根本取不回来的密钥（LLM 厂商的 key 多数只在创建时
-// 显示一次），代价大于收益。这是个明确的范围决定，各路由的测试都把它固化住了。
-// 想再加行之前先读 admin/settings/route.ts 里 retargetGuards 上方那段说明（含残余风险与收口方向）。
+// 适用范围：SMTP 和 LLM provider 的写入边界使用本规则。其他自建 worker/存储
+// 端点是否强制重绑凭据，必须在各自路由上按威胁模型明确决定；不得把本 helper
+// 不在某路由使用解读为“旧凭据可以安全发往新主机”。
 //
 // 保留 SMTP 的理由：邮件服务商地址几乎不变（改它基本只有换靶一种解释），而 SMTP 口令常常就是
 // 邮箱账号本身的密码、在别处复用，外带出去破坏面最大；且管理员一定知道这个口令，重填成本≈0。
@@ -19,13 +17,34 @@
 export const SECRET_MASK = '********';
 
 /**
- * 端点比较的归一：trim + 去尾斜杠。
+ * 端点比较的归一：trim + 去 URL pathname 尾斜杠。
  * 落库时本来就按去尾斜杠存（parseWorkerUrls / validateSonioxRestUrl / worker baseUrl），
  * 这里对齐口径，避免管理员原样回填 `https://x/` 被误判成「改靶」而白挨一个 400。
  */
-function normalizeEndpoint(value: unknown): string {
+export function normalizeCredentialEndpoint(value: unknown): string {
   if (value === undefined || value === null) return '';
-  return String(value).trim().replace(/\/+$/, '');
+  const trimmed = String(value).trim();
+
+  // 不能对整个 URL 做 `/\\/+$/`：斜杠可以属于 query 值，例如
+  // `?tenant=a///`。把它们抹掉会把真实不同的落库/请求目标判成相同，
+  // 从而绕过“换靶必须重填密钥”。对 HTTP(S) 只归一 pathname，完整保留
+  // search/hash；非 URL 端点（SMTP host、端口等）继续沿用原有行为。
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      const pathname = parsed.pathname.replace(/\/+$/, '');
+      const auth = parsed.username
+        ? `${parsed.username}${parsed.password ? `:${parsed.password}` : ''}@`
+        : '';
+      // 显式按 URL 分量重建，不能再对 serialized URL 做尾斜杠替换；
+      // 否则 search/hash 最后一个 `/` 仍会被误删。
+      return `${parsed.protocol}//${auth}${parsed.host}${pathname}${parsed.search}${parsed.hash}`;
+    }
+  } catch {
+    // 非 URL 分量由下方的通用归一处理。
+  }
+
+  return trimmed.replace(/\/+$/, '');
 }
 
 /** 本次请求是否**真的**给出了新凭据。非字符串 / 空串 / 纯空白 / 脱敏占位 都算「没给」。 */
@@ -45,7 +64,8 @@ export interface EndpointChange {
 export function isEndpointRetargeted(changes: EndpointChange[]): boolean {
   return changes.some(
     ({ current, next }) =>
-      next !== undefined && normalizeEndpoint(current) !== normalizeEndpoint(next)
+      next !== undefined &&
+      normalizeCredentialEndpoint(current) !== normalizeCredentialEndpoint(next)
   );
 }
 
@@ -73,8 +93,10 @@ export function findUnsavedEndpoints(
   requested: readonly string[],
   saved: readonly string[]
 ): string[] {
-  const allowed = new Set(saved.map(normalizeEndpoint));
-  return requested.filter((url) => !allowed.has(normalizeEndpoint(url)));
+  const allowed = new Set(saved.map(normalizeCredentialEndpoint));
+  return requested.filter(
+    (url) => !allowed.has(normalizeCredentialEndpoint(url))
+  );
 }
 
 /** 统一错误文案（面向管理员，说清为什么必须重填）。 */

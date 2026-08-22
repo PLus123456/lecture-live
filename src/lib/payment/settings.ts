@@ -4,6 +4,10 @@ import { prisma } from '@/lib/prisma';
 import { encrypt, decrypt } from '@/lib/crypto';
 import { SETTING_SECRET_MASK } from '@/lib/siteSettings';
 import type { PaymentProviderName } from '@/lib/payment/types';
+import {
+  getStripeKeyMode,
+  isStripeKeyAllowedForEnvironment,
+} from '@/lib/payment/stripeMode';
 
 /**
  * 充值系统配置（货币 + 各支付渠道开关与凭据）。存于 SiteSetting 的 `recharge_*` 键。
@@ -163,6 +167,7 @@ export async function updateRechargeSettings(
   patch: Partial<RechargeSettings>
 ): Promise<void> {
   assertStripeKeyModeConsistency(patch);
+  await assertStripeProductionConfiguration(patch);
 
   // 先整份校验、再统一落库：校验一旦中途抛错就写了一半，配置会停在自相矛盾的中间态。
   const pending: Array<{ key: string; value: string }> = [];
@@ -205,23 +210,20 @@ export async function updateRechargeSettings(
  * 是一次正常保存动作，落成 live 密钥 + test webhook 的分裂态：真实支付永远验签失败（用户
  * 付钱不到账），而测试卡产生的事件反倒是唯一验得过的。掩码字段无法判定模式 → 跳过不误伤。
  */
-function assertStripeKeyModeConsistency(patch: Partial<RechargeSettings>): void {
-  const supplied = (v: string | undefined): string | null =>
-    v === undefined || v === SETTING_SECRET_MASK || v === '' ? null : v;
+function suppliedStripeSecret(v: string | undefined): string | null {
+  return v === undefined || v === SETTING_SECRET_MASK || v === '' ? null : v;
+}
 
-  const secret = supplied(patch.stripeSecretKey);
+function assertStripeKeyModeConsistency(patch: Partial<RechargeSettings>): void {
+  const secret = suppliedStripeSecret(patch.stripeSecretKey);
   if (!secret) return; // 没在改密钥（掩码回存）→ 与本次保存无关
 
-  const secretMode = secret.startsWith('sk_live_')
-    ? 'live'
-    : secret.startsWith('sk_test_')
-      ? 'test'
-      : null;
+  const secretMode = getStripeKeyMode(secret);
   if (!secretMode) return; // 非标准前缀（自建代理等）→ 无从判定，不阻拦
 
   // 换密钥就必须同时给出配套的 webhook 签名密钥：whsec_ 本身不带 test/live 段，
   // 无法事后校验一致性，只能靠「同一次保存一起换」把分裂态挡在门外。
-  const hook = supplied(patch.stripeWebhookSecret);
+  const hook = suppliedStripeSecret(patch.stripeWebhookSecret);
   if (!hook) {
     throw new RechargeSettingsError(
       '更换 Stripe 密钥时必须同时填写对应模式的 Webhook 签名密钥（否则会落成 live 密钥 + test 验签的分裂态）'
@@ -236,6 +238,33 @@ function assertStripeKeyModeConsistency(patch: Partial<RechargeSettings>): void 
     throw new RechargeSettingsError(
       'Stripe 密钥与 Webhook 签名密钥的模式不一致（test / live 必须同侧）'
     );
+  }
+}
+
+/**
+ * SEC-024 保存侧门禁：生产环境不得新存 test/未知 key；启用 Stripe 且密钥仍是掩码时，
+ * 在本次请求内读取现有值核验。读取发生在显式保存调用中，不在模块加载或 build 阶段连接数据库。
+ */
+async function assertStripeProductionConfiguration(
+  patch: Partial<RechargeSettings>
+): Promise<void> {
+  if (process.env.NODE_ENV !== 'production') return;
+
+  const suppliedKey = suppliedStripeSecret(patch.stripeSecretKey);
+  if (suppliedKey) {
+    if (getStripeKeyMode(suppliedKey) !== 'live') {
+      throw new RechargeSettingsError('生产环境的 Stripe 密钥必须是 live 模式');
+    }
+    return;
+  }
+
+  if (patch.stripeEnabled === undefined || !strictBool('stripeEnabled', patch.stripeEnabled)) {
+    return;
+  }
+
+  const current = await getRechargeSettings();
+  if (getStripeKeyMode(current.stripeSecretKey) !== 'live') {
+    throw new RechargeSettingsError('生产环境启用 Stripe 前必须配置 live 模式密钥');
   }
 }
 
@@ -270,7 +299,12 @@ export function hasChannelCredentials(
       );
     case 'stripe':
       // stripeWebhookSecret 缺失 → verifyCallback 直接 return null。
-      return Boolean(s.stripeSecretKey && s.stripeWebhookSecret);
+      // SEC-024：生产环境必须是明确的 live key；test/未知 key 一律视为渠道未就绪。
+      return Boolean(
+        s.stripeSecretKey &&
+          s.stripeWebhookSecret &&
+          isStripeKeyAllowedForEnvironment(s.stripeSecretKey)
+      );
     case 'sandbox':
       return true; // 沙箱无凭据（可用性由 NODE_ENV + 开关决定）
     default:
@@ -298,6 +332,9 @@ export function toPublicRechargeConfig(s: RechargeSettings): {
     currencySymbol: s.currencySymbol || DEFAULT_CURRENCY,
     currency: s.currency || DEFAULT_CURRENCY_CODE,
     providers,
-    stripePublishableKey: s.stripePublishableKey,
+    // 公钥不是秘密，但生产配置处于 test/未知模式时也不应向客户端宣告可用 Stripe 配置。
+    stripePublishableKey: isStripeKeyAllowedForEnvironment(s.stripeSecretKey)
+      ? s.stripePublishableKey
+      : '',
   };
 }

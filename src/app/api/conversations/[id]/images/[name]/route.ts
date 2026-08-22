@@ -41,7 +41,9 @@ export async function GET(
   return new Response(new Uint8Array(image.data), {
     headers: {
       'Content-Type': image.contentType,
-      'Cache-Control': 'private, max-age=31536000, immutable',
+      // URL 不含主体/version，浏览器若长期缓存会在换号后绕过新的 ownership check。
+      'Cache-Control': 'private, no-store, no-cache, must-revalidate',
+      Vary: 'Cookie, Authorization',
     },
   });
 }

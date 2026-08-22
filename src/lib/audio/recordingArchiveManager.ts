@@ -21,6 +21,10 @@ import {
   mapStartError,
   pickRecorderOptions,
 } from './audioCapture';
+import {
+  registerActiveRecordingArchive,
+  unregisterActiveRecordingArchive,
+} from './recordingArchiveRegistry';
 
 interface EnsureArchiveOptions {
   sourceType: AudioSourceType;
@@ -34,10 +38,19 @@ interface EnsureArchiveOptions {
   initialSeq?: number;
 }
 
+interface RecordingArchiveManagerOptions {
+  /** Auth/session boundary that owned the async recording start. */
+  ownerSignal?: AbortSignal;
+}
+
 // P1-6 契约5：归档分片时长 250ms→3000ms。归档 recorder 与实时 Soniox 流互不相干，加大
 // 分片粒度不影响实时转录延迟；4h 录音由 ~57.6 万片降到 4800 片，远低于服务端 5 万分片上限，
 // 也大幅缓解每片一次目录扫描/上传带来的 O(n²) 与限流压力（审计 P1-6）。
 const ARCHIVE_TIMESLICE_MS = 3000;
+// A non-conforming/backgrounded MediaRecorder may never dispatch `stop`. The
+// account boundary is already synchronously invalidated, so a bounded wait is
+// sufficient: late events are ignored and the source tracks are stopped now.
+const ACCOUNT_BOUNDARY_STOP_TIMEOUT_MS = 1500;
 type ChunkStoredHandler = (
   payload: { seq: number; blob: Blob; mimeType: string }
 ) => Promise<boolean | void> | boolean | void;
@@ -51,7 +64,7 @@ export class RecordingArchiveManager {
   private nextSeq = 0;
   private mimeType = 'audio/webm';
   private startedAt = Date.now();
-  private readonly pendingWrites = new Set<Promise<void>>();
+  private readonly pendingWrites = new Set<Promise<unknown>>();
   private onChunkStored: ChunkStoredHandler | null = null;
   // 硬件掉线（麦克风拔出 / 系统共享停止，track 触发 'ended'）回调。上层据此把 UI 从
   // recording 切走，而不是继续显示在录直到 WS/idle 超时（P1-10）。
@@ -65,11 +78,63 @@ export class RecordingArchiveManager {
   // 串行化闸：ensureArchive/switchInput/stop 全部经此排队，杜绝并发 replaceCapture/stop
   // 交叉执行导致的孤儿 recorder / 竞态（P0-1）。private replaceCapture 不入队（避免自锁）。
   private opChain: Promise<void> = Promise.resolve();
+  // 主体边界一旦失效，本 manager 永久不得再写 IDB/sessionStorage。与
+  // captureGeneration 分开：后者只管硬件采集，本代际覆盖所有持久化回调。
+  private persistenceGeneration = 0;
+  private accountBoundaryInvalidated = false;
+  private boundaryTeardownPromise: Promise<void> | null = null;
+  private readonly ownerSignal: AbortSignal | null;
+  private readonly ownerAbortHandler: () => void;
 
-  constructor(sessionId: string) {
+  constructor(
+    sessionId: string,
+    options: RecordingArchiveManagerOptions = {}
+  ) {
     this.sessionId = sessionId;
     this.sourceType = 'mic';
     this.deviceId = null;
+    this.ownerSignal = options.ownerSignal ?? null;
+    this.ownerAbortHandler = () => {
+      void this.teardownForAccountBoundary();
+    };
+
+    registerActiveRecordingArchive(this);
+    if (this.ownerSignal?.aborted) {
+      this.invalidateForAccountBoundary();
+      void this.teardownForAccountBoundary();
+    } else {
+      this.ownerSignal?.addEventListener('abort', this.ownerAbortHandler, {
+        once: true,
+      });
+    }
+  }
+
+  private isPersistenceCurrent(generation = this.persistenceGeneration): boolean {
+    return (
+      !this.accountBoundaryInvalidated &&
+      !this.ownerSignal?.aborted &&
+      generation === this.persistenceGeneration
+    );
+  }
+
+  private assertAccountBoundaryCurrent(): void {
+    if (!this.isPersistenceCurrent()) {
+      throw new DOMException('Recording account boundary changed', 'AbortError');
+    }
+  }
+
+  private markActive(): void {
+    this.assertAccountBoundaryCurrent();
+    registerActiveRecordingArchive(this);
+  }
+
+  private trackPendingWrite<T>(write: Promise<T>): Promise<T> {
+    this.pendingWrites.add(write);
+    void write.then(
+      () => this.pendingWrites.delete(write),
+      () => this.pendingWrites.delete(write)
+    );
+    return write;
   }
 
   /**
@@ -85,13 +150,79 @@ export class RecordingArchiveManager {
     return run;
   }
 
+  /** Synchronous half of account teardown: every old callback loses write authority. */
+  invalidateForAccountBoundary(): void {
+    if (this.accountBoundaryInvalidated) {
+      return;
+    }
+    this.accountBoundaryInvalidated = true;
+    this.persistenceGeneration += 1;
+    this.captureGeneration += 1;
+    this.onChunkStored = null;
+    this.onCaptureEnded = null;
+  }
+
+  /**
+   * Account cleanup must not use normal stop(): normal stop intentionally writes
+   * finalizing/stopped metadata. This path invalidates first, then waits only for
+   * hardware shutdown and writes that were already in flight.
+   */
+  teardownForAccountBoundary(): Promise<void> {
+    this.invalidateForAccountBoundary();
+    if (this.boundaryTeardownPromise) {
+      return this.boundaryTeardownPromise;
+    }
+
+    this.boundaryTeardownPromise = (async () => {
+      const recorder = this.archiveRecorder;
+      this.archiveRecorder = null;
+
+      if (recorder && recorder.state !== 'inactive') {
+        const stopPromise = new Promise<void>((resolve) => {
+          recorder.addEventListener('stop', () => resolve(), { once: true });
+        });
+        try {
+          recorder.requestData();
+        } catch {
+          // Best effort. Invalidation already prevents the final callback writing.
+        }
+        try {
+          recorder.stop();
+          this.stopSourceStream();
+          let timeout: ReturnType<typeof setTimeout> | null = null;
+          await Promise.race([
+            stopPromise,
+            new Promise<void>((resolve) => {
+              timeout = setTimeout(resolve, ACCOUNT_BOUNDARY_STOP_TIMEOUT_MS);
+            }),
+          ]);
+          if (timeout) {
+            clearTimeout(timeout);
+          }
+        } catch {
+          // A recorder that already failed cannot regain persistence authority.
+        }
+      }
+
+      this.stopSourceStream();
+      await this.flushPendingWrites();
+    })().finally(() => {
+      this.ownerSignal?.removeEventListener('abort', this.ownerAbortHandler);
+      unregisterActiveRecordingArchive(this);
+    });
+
+    return this.boundaryTeardownPromise;
+  }
+
   async ensureArchive(options: EnsureArchiveOptions): Promise<void> {
+    this.markActive();
     return this.enqueue(() => this.ensureArchiveInternal(options));
   }
 
   private async ensureArchiveInternal(
     options: EnsureArchiveOptions
   ): Promise<void> {
+    this.assertAccountBoundaryCurrent();
     const previousSourceType = this.sourceType;
     const previousDeviceId = this.deviceId;
 
@@ -108,17 +239,20 @@ export class RecordingArchiveManager {
       // 全新采集：清除历史暂停意图，避免复用同一 manager 时残留 paused 抑制新录音。
       this.desiredCaptureState = 'recording';
       await clearAudioChunks(this.sessionId);
+      this.assertAccountBoundaryCurrent();
       // 冷启动即便清空本地 IDB，也要从服务端 nextSeq 起步：换设备/清缓存后服务端草稿仍在，
       // 从 0 起会覆盖服务端 seq 0（P0-4 critical）。全新会话 negotiatedSeq=0，从 0 开始。
       this.nextSeq = negotiatedSeq;
       this.startedAt = options.startedAt ?? Date.now();
     } else {
       const session = await getAudioSession(this.sessionId);
+      this.assertAccountBoundaryCurrent();
       const snapshot = getAudioArchiveSnapshot(this.sessionId);
       // 从 IDB 中查询实际存在的最大 chunk seq，避免因 chunkCount 元数据
       // 落后（浏览器被强制关闭时最后几次写入可能未提交）而导致新 chunk
       // 覆盖旧 chunk。同时并入服务端协商 nextSeq，取三者较大值防跨设备撞号。
       const maxSeqInDb = await getMaxAudioChunkSeq(this.sessionId);
+      this.assertAccountBoundaryCurrent();
       const metadataCount = Math.max(
         session?.chunkCount ?? 0,
         snapshot?.chunkCount ?? 0
@@ -147,6 +281,7 @@ export class RecordingArchiveManager {
   }
 
   async getSenderStream(): Promise<MediaStream> {
+    this.assertAccountBoundaryCurrent();
     if (!this.sourceStream) {
       throw new Error('Archive source stream is not available');
     }
@@ -157,6 +292,9 @@ export class RecordingArchiveManager {
   }
 
   async pause(): Promise<void> {
+    if (!this.isPersistenceCurrent()) {
+      return;
+    }
     // 同步记录暂停意图（即使当前 recorder 不在 recording 态，如正在切麦），供后续
     // replaceCapture 的新 recorder 继承（P1-1）。
     this.desiredCaptureState = 'paused';
@@ -167,6 +305,9 @@ export class RecordingArchiveManager {
   }
 
   async resume(): Promise<void> {
+    if (!this.isPersistenceCurrent()) {
+      return;
+    }
     this.desiredCaptureState = 'recording';
     if (this.archiveRecorder?.state === 'paused') {
       this.archiveRecorder.resume();
@@ -175,6 +316,9 @@ export class RecordingArchiveManager {
   }
 
   checkpoint() {
+    if (!this.isPersistenceCurrent()) {
+      return;
+    }
     if (!this.archiveRecorder || this.archiveRecorder.state === 'inactive') {
       return;
     }
@@ -187,6 +331,9 @@ export class RecordingArchiveManager {
   }
 
   flushForPageUnload() {
+    if (!this.isPersistenceCurrent()) {
+      return;
+    }
     if (!this.archiveRecorder || this.archiveRecorder.state === 'inactive') {
       return;
     }
@@ -205,7 +352,9 @@ export class RecordingArchiveManager {
     deviceId?: string | null;
     preAcquiredStream?: MediaStream | null;
   }): Promise<void> {
+    this.markActive();
     return this.enqueue(async () => {
+      this.assertAccountBoundaryCurrent();
       this.sourceType = options.sourceType;
       this.deviceId = options.deviceId ?? null;
       await this.replaceCapture(options.preAcquiredStream ?? null);
@@ -230,10 +379,16 @@ export class RecordingArchiveManager {
   }
 
   setCaptureEndedHandler(handler: (() => void) | null) {
+    if (!this.isPersistenceCurrent()) {
+      return;
+    }
     this.onCaptureEnded = handler;
   }
 
   async hasRecoverableAudio(): Promise<boolean> {
+    if (!this.isPersistenceCurrent()) {
+      return false;
+    }
     if (this.nextSeq > 0) {
       return true;
     }
@@ -241,6 +396,9 @@ export class RecordingArchiveManager {
   }
 
   setChunkStoredHandler(handler: ChunkStoredHandler | null) {
+    if (!this.isPersistenceCurrent()) {
+      return;
+    }
     this.onChunkStored = handler;
   }
 
@@ -250,17 +408,31 @@ export class RecordingArchiveManager {
    * 收尾合并出旧音频、新音频被丢）。仅前进不后退，保证 seq 单调。审计 high。
    */
   ensureSeqAbove(minSeq: number): void {
+    if (!this.isPersistenceCurrent()) {
+      return;
+    }
     if (Number.isFinite(minSeq) && minSeq > this.nextSeq) {
       this.nextSeq = minSeq;
     }
   }
 
   async stop(): Promise<void> {
+    if (!this.isPersistenceCurrent()) {
+      return this.teardownForAccountBoundary();
+    }
+    this.markActive();
     // 同步递增采集代际：即使 stop 排在某个在途 ensureArchive/switchInput 之后才真正执行，
     // 该在途操作的 replaceCapture 在 await 授权返回后会看到代际已变，立即停掉刚拿到的
     // track 并放弃发布——这是「stop 后授权返回复活孤儿录音」的根治点（P0-1）。
     this.captureGeneration += 1;
-    return this.enqueue(() => this.stopInternal());
+    return this.enqueue(async () => {
+      await this.stopInternal();
+      // Browser ordering guarantees final dataavailable before stop, but seal
+      // this generation as defence in depth against a delayed/non-conforming
+      // callback after the manager has left the active registry.
+      this.persistenceGeneration += 1;
+      unregisterActiveRecordingArchive(this);
+    });
   }
 
   private async stopInternal(): Promise<void> {
@@ -317,7 +489,9 @@ export class RecordingArchiveManager {
   private async replaceCapture(
     preAcquiredStream: MediaStream | null
   ): Promise<void> {
+    this.assertAccountBoundaryCurrent();
     await this.stopRecorderOnly();
+    this.assertAccountBoundaryCurrent();
     this.stopSourceStream();
 
     // 记录进入 acquire 前的代际；授权期间若发生 stop()（代际 +1），返回后立即作废（P0-1）。
@@ -330,7 +504,10 @@ export class RecordingArchiveManager {
           ? await acquireSystemAudioStream()
           : await acquireMicrophoneStream(this.deviceId);
 
-      if (generation !== this.captureGeneration) {
+      if (
+        generation !== this.captureGeneration ||
+        !this.isPersistenceCurrent()
+      ) {
         // acquire 期间已 stop：绝不发布 sourceStream、绝不启动 recorder，直接停掉孤儿轨。
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -345,6 +522,7 @@ export class RecordingArchiveManager {
   }
 
   private async startRecorder(): Promise<void> {
+    this.assertAccountBoundaryCurrent();
     if (!this.sourceStream) {
       throw new Error('Audio source stream is not available');
     }
@@ -371,18 +549,29 @@ export class RecordingArchiveManager {
 
     const recorderOptions = pickRecorderOptions();
     const recorder = new MediaRecorder(this.sourceStream, recorderOptions);
+    const recorderPersistenceGeneration = this.persistenceGeneration;
     this.mimeType = recorder.mimeType || recorderOptions.mimeType || 'audio/webm';
     recorder.addEventListener('dataavailable', (event: BlobEvent) => {
-      if (event.data.size === 0) {
+      if (
+        event.data.size === 0 ||
+        !this.isPersistenceCurrent(recorderPersistenceGeneration)
+      ) {
         return;
       }
 
       const seq = this.nextSeq;
       this.nextSeq += 1;
       const archiveStatus = recorder.state === 'paused' ? 'paused' : 'recording';
-      this.syncArchiveSnapshot(archiveStatus);
+      this.syncArchiveSnapshot(
+        archiveStatus,
+        recorderPersistenceGeneration
+      );
 
-      const persistChunk = appendAudioChunk(this.sessionId, seq, event.data)
+      // Register the IDB transaction before invoking the upload callback. A
+      // synchronous auth abort from that callback must see and await this write.
+      const persistChunk = this.trackPendingWrite(
+        appendAudioChunk(this.sessionId, seq, event.data)
+      )
         .then(() => true)
         .catch(() => false);
       const notifyChunk = this.onChunkStored
@@ -399,6 +588,9 @@ export class RecordingArchiveManager {
 
       const write = Promise.all([persistChunk, notifyChunk])
         .then(async ([didPersist, didNotify]) => {
+          if (!this.isPersistenceCurrent(recorderPersistenceGeneration)) {
+            return;
+          }
           if (!didPersist && !didNotify) {
             // 本地 IndexedDB 写入与服务端上传双双失败：该分片既没落本地也没传服务端，
             // nextSeq 已递增 → 归档将出现无法恢复的 seq 空洞。不再静默吞（旧行为直接 return），
@@ -409,14 +601,17 @@ export class RecordingArchiveManager {
             );
             return;
           }
-          await this.ensureSessionRecord(archiveStatus);
+          await this.ensureSessionRecord(
+            archiveStatus,
+            recorderPersistenceGeneration
+          );
         })
         .catch(() => undefined)
         .finally(() => {
           this.pendingWrites.delete(write);
         });
 
-      this.pendingWrites.add(write);
+      this.trackPendingWrite(write);
     });
 
     recorder.start(ARCHIVE_TIMESLICE_MS);
@@ -477,7 +672,13 @@ export class RecordingArchiveManager {
     await Promise.allSettled(Array.from(this.pendingWrites));
   }
 
-  private syncArchiveSnapshot(status: AudioArchiveStatus) {
+  private syncArchiveSnapshot(
+    status: AudioArchiveStatus,
+    generation = this.persistenceGeneration
+  ) {
+    if (!this.isPersistenceCurrent(generation)) {
+      return;
+    }
     persistAudioArchiveSnapshot({
       sessionId: this.sessionId,
       sourceType: this.sourceType,
@@ -490,9 +691,28 @@ export class RecordingArchiveManager {
     });
   }
 
-  private async ensureSessionRecord(status: 'recording' | 'paused' | 'finalizing' | 'stopped') {
-    this.syncArchiveSnapshot(status);
+  private ensureSessionRecord(
+    status: 'recording' | 'paused' | 'finalizing' | 'stopped',
+    generation = this.persistenceGeneration
+  ): Promise<void> {
+    if (!this.isPersistenceCurrent(generation)) {
+      return Promise.resolve();
+    }
+
+    return this.trackPendingWrite(
+      this.ensureSessionRecordInternal(status, generation)
+    );
+  }
+
+  private async ensureSessionRecordInternal(
+    status: 'recording' | 'paused' | 'finalizing' | 'stopped',
+    generation: number
+  ): Promise<void> {
+    this.syncArchiveSnapshot(status, generation);
     const current = await getAudioSession(this.sessionId);
+    if (!this.isPersistenceCurrent(generation)) {
+      return;
+    }
     const nextRecord = {
       sessionId: this.sessionId,
       sourceType: this.sourceType,
@@ -505,6 +725,9 @@ export class RecordingArchiveManager {
     } as const;
 
     if (current) {
+      if (!this.isPersistenceCurrent(generation)) {
+        return;
+      }
       await patchAudioSession(this.sessionId, {
         sourceType: nextRecord.sourceType,
         deviceId: nextRecord.deviceId,
@@ -517,6 +740,9 @@ export class RecordingArchiveManager {
       return;
     }
 
+    if (!this.isPersistenceCurrent(generation)) {
+      return;
+    }
     await upsertAudioSession(nextRecord);
   }
 }

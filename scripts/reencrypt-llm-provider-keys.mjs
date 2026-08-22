@@ -1,6 +1,8 @@
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from 'crypto';
 import { PrismaClient } from '@prisma/client';
 import nextEnv from '@next/env';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const { loadEnvConfig } = nextEnv;
 loadEnvConfig(process.cwd());
@@ -124,8 +126,8 @@ function encryptCurrent(plaintext) {
   return `${CURRENT_PREFIX}${iv.toString('hex')}:${tag}:${encrypted}`;
 }
 
-async function main() {
-  const providers = await prisma.llmProvider.findMany({
+export async function reencryptProviderKeys(client = prisma, logger = console) {
+  const providers = await client.llmProvider.findMany({
     select: {
       id: true,
       name: true,
@@ -135,6 +137,7 @@ async function main() {
   });
 
   let updatedCount = 0;
+  let skippedConcurrentCount = 0;
 
   for (const provider of providers) {
     const { plaintext, needsUpdate } = inspectStoredValue(provider.apiKey);
@@ -142,23 +145,42 @@ async function main() {
       continue;
     }
 
-    await prisma.llmProvider.update({
-      where: { id: provider.id },
+    // SEC-034：端点 PATCH 可能在本脚本读取后已经换了新 key。
+    // 只在 ciphertext 仍与读取快照一致时重加密，避免迟到写把旧 key
+    // 覆盖回新端点。这个 CAS 也保护同时轮换的另一个脚本实例。
+    const result = await client.llmProvider.updateMany({
+      where: { id: provider.id, apiKey: provider.apiKey },
       data: { apiKey: encryptCurrent(plaintext) },
     });
 
-    updatedCount += 1;
-    console.log(`Re-encrypted API key for provider: ${provider.name}`);
+    if (result.count === 1) {
+      updatedCount += 1;
+      logger.log(`Re-encrypted API key for provider: ${provider.name}`);
+    } else {
+      skippedConcurrentCount += 1;
+      logger.warn(
+        `Skipped provider changed concurrently (no key overwritten): ${provider.name}`
+      );
+    }
   }
 
-  console.log(`Finished. Updated ${updatedCount} provider(s).`);
+  logger.log(
+    `Finished. Updated ${updatedCount} provider(s); skipped ${skippedConcurrentCount} concurrent change(s).`
+  );
+  return { updatedCount, skippedConcurrentCount };
 }
 
-main()
-  .catch((error) => {
-    console.error('Failed to re-encrypt provider API keys:', error);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+const invokedAsMain = Boolean(
+  process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url
+);
+
+if (invokedAsMain) {
+  reencryptProviderKeys()
+    .catch((error) => {
+      console.error('Failed to re-encrypt provider API keys:', error);
+      process.exitCode = 1;
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}

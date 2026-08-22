@@ -7,15 +7,15 @@ import {
   loadTranscriptDraft,
   loadTranscriptDraftManifest,
   persistTranscriptDraft,
-  type TranscriptDraftPayload,
 } from '@/lib/transcriptDraftPersistence';
 import { isRecordingDraftSealed } from '@/lib/recordingDraftPersistence';
 import { enforceRateLimit } from '@/lib/rateLimit';
-
-// P4-5：草稿载荷字节上限。旧代码只有元素**个数**上限（MAX_SEGMENTS 等），对单个 segment 的
-// 体积零校验 —— 10000 个巨型 segment 完全合法，落盘还 pretty-print 撑得更大。
-// 8MiB 对「10000 段 + 翻译」的真实草稿有数倍余量。
-const MAX_DRAFT_BODY_BYTES = 8 * 1024 * 1024;
+import { StoredArtifactQuotaExceededError } from '@/lib/storage/storedArtifactLedger';
+import {
+  admitTranscriptDraftPayload,
+  readBoundedSessionJson,
+  SessionTranscriptPayloadError,
+} from '@/lib/sessionApi';
 
 // P4-5：PUT 限流。客户端每数秒冲刷一次快照，120 次/分钟远高于正常节奏（含 unload keepalive 冲刷）。
 const DRAFT_PUT_RATE_LIMIT_PER_MIN = 120;
@@ -85,53 +85,8 @@ export async function PUT(
   }
 
   try {
-    // P4-5：先按字节量闸，再 JSON.parse —— 数量闸挡不住「10000 个巨型 segment」，
-    // 而 parse 本身也是同步 CPU，先量后解能一起挡住。
-    const raw = await req.text();
-    if (raw.length > MAX_DRAFT_BODY_BYTES) {
-      return NextResponse.json(
-        {
-          error: `Draft payload too large (max ${MAX_DRAFT_BODY_BYTES} bytes)`,
-          maxBytes: MAX_DRAFT_BODY_BYTES,
-        },
-        { status: 413 }
-      );
-    }
-    const body = JSON.parse(raw);
-
-    const segments = Array.isArray(body.segments) ? body.segments : [];
-    const summaries = Array.isArray(body.summaries) ? body.summaries : [];
-    const translations =
-      body.translations && typeof body.translations === 'object' && !Array.isArray(body.translations)
-        ? body.translations
-        : {};
-
-    // 安全：限制数组/对象大小，防止深度嵌套或巨型载荷
-    const MAX_SEGMENTS = 10000;
-    const MAX_SUMMARIES = 500;
-    const MAX_TRANSLATIONS = 10000;
-    if (segments.length > MAX_SEGMENTS) {
-      return NextResponse.json({ error: `segments 数量不能超过 ${MAX_SEGMENTS}` }, { status: 400 });
-    }
-    if (summaries.length > MAX_SUMMARIES) {
-      return NextResponse.json({ error: `summaries 数量不能超过 ${MAX_SUMMARIES}` }, { status: 400 });
-    }
-    if (Object.keys(translations).length > MAX_TRANSLATIONS) {
-      return NextResponse.json({ error: `translations 数量不能超过 ${MAX_TRANSLATIONS}` }, { status: 400 });
-    }
-
-    const payload: TranscriptDraftPayload = {
-      segments,
-      summaries,
-      translations,
-      clientTs: typeof body.clientTs === 'number' ? body.clientTs : Date.now(),
-      recordingStartTime: typeof body.recordingStartTime === 'number' ? body.recordingStartTime : undefined,
-      pausedAt: typeof body.pausedAt === 'number' ? body.pausedAt : undefined,
-      totalPausedMs: typeof body.totalPausedMs === 'number' ? body.totalPausedMs : undefined,
-      totalDurationMs: typeof body.totalDurationMs === 'number' ? body.totalDurationMs : undefined,
-      summaryRunningContext: typeof body.summaryRunningContext === 'string' ? body.summaryRunningContext : undefined,
-      currentSessionIndex: typeof body.currentSessionIndex === 'number' ? body.currentSessionIndex : undefined,
-    };
+    const body = await readBoundedSessionJson(req);
+    const payload = admitTranscriptDraftPayload(body);
 
     const manifest = await persistTranscriptDraft(result.session, payload);
     return NextResponse.json({
@@ -140,6 +95,18 @@ export async function PUT(
       updatedAt: manifest.updatedAt,
     });
   } catch (error) {
+    if (error instanceof SessionTranscriptPayloadError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
+    if (error instanceof StoredArtifactQuotaExceededError) {
+      return NextResponse.json(
+        {
+          error: 'Storage quota exceeded; transcript draft was not saved',
+          quota: 'storage_bytes',
+        },
+        { status: 402 }
+      );
+    }
     console.error('保存转录稿草稿失败:', error);
     return NextResponse.json(
       { error: 'Failed to save transcript draft' },

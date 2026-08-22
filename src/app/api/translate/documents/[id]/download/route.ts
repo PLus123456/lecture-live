@@ -55,7 +55,13 @@ export async function GET(
     if (variantRaw === 'dual' && !task.dualPath) {
       return NextResponse.json({ error: '双语产物不存在' }, { status: 404 });
     }
-    data = await readOutputFile(id, variantRaw as 'mono' | 'dual');
+    const reference =
+      variantRaw === 'mono' ? task.monoPath : task.dualPath;
+    data = await readOutputFile(
+      id,
+      variantRaw as 'mono' | 'dual',
+      reference
+    );
     suffix = variantRaw === 'mono' ? `.${task.targetLang}` : `.${task.targetLang}.dual`;
   }
   if (!data) {

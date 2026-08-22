@@ -26,6 +26,13 @@ const {
 
 vi.mock('@/lib/adminApi', () => ({ requireAdminAccess: requireAdminAccessMock }));
 vi.mock('@/lib/auditLog', () => ({ logAction: vi.fn() }));
+vi.mock('@/lib/securityAudit', () => ({
+  getSecurityAuditRequestId: vi.fn(() => 'audit-request-id'),
+  writeSecurityAudit: vi.fn().mockResolvedValue({
+    requestId: 'audit-request-id',
+    action: 'admin.security.users.test',
+  }),
+}));
 vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: getSiteSettingsMock }));
 vi.mock('@/lib/auth', () => ({ validatePassword: vi.fn().mockReturnValue(null) }));
 vi.mock('bcryptjs', () => ({ default: { hash: async () => 'hashed' } }));
@@ -90,7 +97,7 @@ describe('admin 用户接口 — 邮箱验证状态（#17）', () => {
     userUpdateMock.mockResolvedValue({ ...EXISTING });
     transactionMock.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) =>
       fn({
-        user: { update: userUpdateMock },
+        user: { create: userCreateMock, update: userUpdateMock },
         emailToken: { updateMany: emailTokenUpdateManyMock },
       })
     );

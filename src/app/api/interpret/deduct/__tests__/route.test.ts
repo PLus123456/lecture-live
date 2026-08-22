@@ -105,7 +105,10 @@ describe('POST interpret/deduct — R1-L2 grants 结算挂钩', () => {
       'interpret_deduct',
       expect.anything()
     );
-    expect(deductMock).toHaveBeenCalledWith('user-1', 10, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('user-1', 10, expect.anything(), {
+      source: 'interpret_deduct',
+      referenceId: 'is-1',
+    });
   });
 
   it('claimed 但 billable=0（空场）→ 仍结算 grants 释放预扣，跳过扣费', async () => {
@@ -133,7 +136,10 @@ describe('POST interpret/deduct — R1-L2 grants 结算挂钩', () => {
     const res = await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
     expect(res.status).toBe(200);
     expect(settleGrantsMock).not.toHaveBeenCalled();
-    expect(deductMock).toHaveBeenCalledWith('user-1', 10, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('user-1', 10, expect.anything(), {
+      source: 'interpret_deduct',
+      referenceId: 'a1',
+    });
   });
 });
 
@@ -161,7 +167,10 @@ describe('POST interpret/deduct — P3-8 降级路径（无 anchorId 盲认领�
     const res = await POST(req({ durationMs: 1 }));
 
     expect(res.status).toBe(200);
-    expect(deductMock).toHaveBeenCalledWith('user-1', 42, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('user-1', 42, expect.anything(), {
+      source: 'interpret_deduct',
+      referenceId: 'is-1',
+    });
     expect(recordUsageMock).toHaveBeenCalledWith(
       'user-1',
       42,
@@ -185,7 +194,10 @@ describe('POST interpret/deduct — P3-8 降级路径（无 anchorId 盲认领�
 
     await POST(req({ durationMs: 30 * 60_000 }));
 
-    expect(deductMock).toHaveBeenCalledWith('user-1', 30, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('user-1', 30, expect.anything(), {
+      source: 'interpret_deduct',
+      referenceId: 'is-1',
+    });
   });
 
   it('无 anchorId + 实测量超 6h 上限 → 仍封顶（防 Soniox 侧异常大值）', async () => {
@@ -198,7 +210,10 @@ describe('POST interpret/deduct — P3-8 降级路径（无 anchorId 盲认领�
 
     await POST(req({ durationMs: 1 }));
 
-    expect(deductMock).toHaveBeenCalledWith('user-1', 360, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('user-1', 360, expect.anything(), {
+      source: 'interpret_deduct',
+      referenceId: 'is-1',
+    });
   });
 
   it('带 anchorId（正常路径）：实测量不参与，仍按锚点口径扣（不改变诚实用户体验）', async () => {
@@ -210,7 +225,10 @@ describe('POST interpret/deduct — P3-8 降级路径（无 anchorId 盲认领�
 
     await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
 
-    expect(deductMock).toHaveBeenCalledWith('user-1', 10, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('user-1', 10, expect.anything(), {
+      source: 'interpret_deduct',
+      referenceId: 'is-1',
+    });
   });
 });
 

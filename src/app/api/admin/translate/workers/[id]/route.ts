@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import { encrypt } from '@/lib/crypto';
 import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 export const runtime = 'nodejs';
 
@@ -11,6 +11,39 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+function auditWorker(row: {
+  id: string;
+  name: string;
+  baseUrl: string;
+  token: string;
+  enabled: boolean;
+  concurrency: number;
+  weight: number;
+  qps: number;
+  status: string;
+  sortOrder: number;
+}) {
+  let endpointOrigin: string | null = null;
+  try {
+    endpointOrigin = new URL(row.baseUrl).origin;
+  } catch {
+    // 不把脏 endpoint 原文写进审计。
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    endpointOrigin,
+    endpointValid: endpointOrigin !== null,
+    hasToken: Boolean(row.token),
+    enabled: row.enabled,
+    concurrency: row.concurrency,
+    weight: row.weight,
+    qps: row.qps,
+    status: row.status,
+    sortOrder: row.sortOrder,
+  };
 }
 
 /** PATCH /api/admin/translate/workers/[id] — 更新单台设置（token 空串=保持原值） */
@@ -23,7 +56,9 @@ export async function PATCH(
     limit: 60,
     windowMs: 10 * 60_000,
   });
-  if (response) return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
+  }
 
   try {
     const { id } = await params;
@@ -71,10 +106,23 @@ export async function PATCH(
     if (Object.keys(data).length === 0) {
       return NextResponse.json({ error: '没有可更新的字段' }, { status: 400 });
     }
-    const row = await prisma.translationWorker.update({ where: { id }, data });
-    logAction(req, 'admin.translate.worker.update', {
-      user: admin,
-      detail: `更新翻译 worker: ${row.name}`,
+    const row = await prisma.$transaction(async (tx) => {
+      const updated = await tx.translationWorker.update({ where: { id }, data });
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'translate-workers.update',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'translation_worker', id },
+          before: auditWorker(existing),
+          after: auditWorker(updated),
+          reason: 'admin_update',
+          outcome: 'SUCCESS',
+          metadata: { changedFields: Object.keys(data).filter((key) => key !== 'token'), tokenChanged: data.token !== undefined },
+        },
+        tx
+      );
+      return updated;
     });
     return NextResponse.json({
       worker: {
@@ -108,17 +156,31 @@ export async function DELETE(
     limit: 30,
     windowMs: 10 * 60_000,
   });
-  if (response) return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
+  }
 
   try {
     const { id } = await params;
-    const row = await prisma.translationWorker.delete({ where: { id } }).catch(() => null);
-    if (!row) {
+    const existing = await prisma.translationWorker.findUnique({ where: { id } });
+    if (!existing) {
       return NextResponse.json({ error: 'worker 不存在' }, { status: 404 });
     }
-    logAction(req, 'admin.translate.worker.delete', {
-      user: admin,
-      detail: `删除翻译 worker: ${row.name} (${row.baseUrl})`,
+    await prisma.$transaction(async (tx) => {
+      await tx.translationWorker.delete({ where: { id } });
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'translate-workers.delete',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'translation_worker', id },
+          before: auditWorker(existing),
+          after: { deleted: true },
+          reason: 'admin_delete',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
     });
     return NextResponse.json({ ok: true });
   } catch (err) {

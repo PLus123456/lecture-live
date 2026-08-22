@@ -7,10 +7,20 @@ services:
       - "127.0.0.1:3001:3001"     # WebSocket server for live share
     env_file: .env.local
     environment:
+      # 容器内部必须监听所有接口，宿主暴露面仍由上面的 127.0.0.1 端口绑定收口。
+      # Docker 会自动注入容器 ID 形式的 HOSTNAME，不能让 Next.js 误绑定该名字。
+      HOSTNAME: "0.0.0.0"
+      WS_HOST: "0.0.0.0"
       DATABASE_URL: mysql://lecturelive:${DB_PASSWORD_ENCODED}@db:3306/lecturelive
       # 用 URL 编码后的口令拼 URL（口令含 '/'、'@'、':' 等时裸拼会让 ioredis 的 url 解析报错）；
       # redis 服务自身的 --requirepass / healthcheck 仍用未编码的 REDIS_PASSWORD。
       REDIS_URL: redis://:${REDIS_PASSWORD_ENCODED}@redis:6379
+      # 标准部署由宿主本机 nginx 反代到 loopback 发布端口，固定一跳；额外 CDN/LB
+      # 必须在宿主 .env 显式覆盖 hop 与 CIDR，非法多跳配置会让 WS 启动失败。
+      TRUSTED_PROXY_HOPS: "${TRUSTED_PROXY_HOPS:-1}"
+      # Docker NAT 下宿主 nginx 在容器内通常表现为 bridge gateway (172.16/12)。端口只
+      # 发布到宿主 loopback；若你的 Docker 地址池不同，请显式改成实际 gateway CIDR。
+      TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-127.0.0.1/32,::1/128,172.16.0.0/12}"
     # 录音/转录/摘要/报告/聊天图片/图标/异步分片等都写入 /app/data（未配 Cloudreve 时仅存本地）；
     # 不挂卷则容器重建即丢失全部用户数据、DB 中 local: 引用全部悬空。
     volumes:
@@ -23,7 +33,7 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health >/dev/null || exit 1"]
+      test: ["CMD", "node", "scripts/check-readiness.mjs"]
       interval: 30s
       timeout: 5s
       retries: 5

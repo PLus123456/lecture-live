@@ -9,10 +9,14 @@ import SiteLogo from '@/components/SiteLogo';
 import { useI18n } from '@/lib/i18n';
 import DOMPurify from 'dompurify';
 import ThemeSwitcher from '@/components/ThemeSwitcher';
+import {
+  PENDING_AUTH_REVOCATION_KEY,
+  getPendingAuthRevocation,
+} from '@/lib/clientAuthCookieMutation';
 
 export default function LoginPage() {
   const router = useRouter();
-  const { loginUser } = useAuth();
+  const { loginUser, logout, hasPendingLogout } = useAuth();
   const { t } = useI18n();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -27,6 +31,8 @@ export default function LoginPage() {
   const [needsVerification, setNeedsVerification] = useState(false);
   const [resendMsg, setResendMsg] = useState('');
   const [resending, setResending] = useState(false);
+  const [pendingLogout, setPendingLogout] = useState(hasPendingLogout);
+  const [retryingLogout, setRetryingLogout] = useState(false);
 
   useEffect(() => {
     const loadSiteConfig = async () => {
@@ -57,8 +63,34 @@ export default function LoginPage() {
     void loadSiteConfig();
   }, []);
 
+  useEffect(() => {
+    const syncPendingLogout = (event: StorageEvent) => {
+      if (event.key === PENDING_AUTH_REVOCATION_KEY) {
+        setPendingLogout(Boolean(event.newValue));
+      }
+    };
+    window.addEventListener('storage', syncPendingLogout);
+    return () => window.removeEventListener('storage', syncPendingLogout);
+  }, []);
+
+  const handleRetryLogout = async () => {
+    setRetryingLogout(true);
+    const result = await logout();
+    setPendingLogout(result.pendingRevocation);
+    if (!result.durableRevocation) {
+      setError(t('auth.logoutIncompleteDescription'));
+    } else {
+      setError('');
+    }
+    setRetryingLogout(false);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (pendingLogout) {
+      setError(t('auth.logoutIncompleteDescription'));
+      return;
+    }
     setError('');
     setNeedsVerification(false);
     setResendMsg('');
@@ -67,6 +99,7 @@ export default function LoginPage() {
       await loginUser(email, password);
       router.push('/home');
     } catch (err) {
+      setPendingLogout(getPendingAuthRevocation() !== null);
       const e2 = err as Error & { needsVerification?: boolean };
       if (e2?.needsVerification) {
         setNeedsVerification(true);
@@ -132,6 +165,22 @@ export default function LoginPage() {
               {error}
             </div>
           )}
+          {pendingLogout && (
+            <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+              <div>{t('auth.logoutIncompleteDescription')}</div>
+              <button
+                type="button"
+                onClick={handleRetryLogout}
+                disabled={retryingLogout}
+                className="font-medium text-rust-600 hover:underline disabled:opacity-50"
+              >
+                {retryingLogout && (
+                  <Loader2 className="mr-1 inline h-3 w-3 animate-spin" />
+                )}
+                {t('common.retry')}
+              </button>
+            </div>
+          )}
           {needsVerification && (
             <div className="px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-700 space-y-2">
               <div>{t('auth.verifyEmailPrompt')}</div>
@@ -157,6 +206,7 @@ export default function LoginPage() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               required
+              disabled={pendingLogout}
               className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm
                          focus:outline-none focus:ring-2 focus:ring-rust-400 focus:border-transparent"
             />
@@ -171,6 +221,7 @@ export default function LoginPage() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
+              disabled={pendingLogout}
               className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm
                          focus:outline-none focus:ring-2 focus:ring-rust-400 focus:border-transparent"
             />
@@ -183,7 +234,7 @@ export default function LoginPage() {
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || pendingLogout}
             className="w-full py-2.5 bg-rust-500 text-white rounded-lg text-sm font-medium
                        hover:bg-rust-600 disabled:opacity-50 transition-all duration-200
                        flex items-center justify-center gap-2 btn-bounce"

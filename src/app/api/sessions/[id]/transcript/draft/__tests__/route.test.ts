@@ -33,11 +33,26 @@ vi.mock('@/lib/rateLimit', () => ({ enforceRateLimit: enforceRateLimitMock }));
 import { PUT } from '@/app/api/sessions/[id]/transcript/draft/route';
 
 const params = Promise.resolve({ id: 'session-1' });
+const validSegment = (overrides: Record<string, unknown> = {}) => ({
+  id: 'segment-1',
+  sessionIndex: 0,
+  speaker: 'Speaker 1',
+  language: 'en',
+  text: 'late',
+  globalStartMs: 0,
+  globalEndMs: 1_000,
+  startMs: 0,
+  endMs: 1_000,
+  isFinal: true,
+  confidence: 1,
+  timestamp: '00:00:00',
+  ...overrides,
+});
 const putReq = () =>
   new Request('http://localhost:3000/api/sessions/session-1/transcript/draft', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ segments: [{ text: 'late' }], summaries: [], translations: {} }),
+    body: JSON.stringify({ segments: [validSegment()], summaries: [], translations: {} }),
   });
 
 describe('transcript/draft PUT sealed 栅栏 (P1-7)', () => {
@@ -127,5 +142,23 @@ describe('transcript/draft PUT 体积闸与限流 (P4-5)', () => {
       expect.anything(),
       expect.objectContaining({ key: 'user:user-1:session:session-1' })
     );
+  });
+
+  it('段内夹带未知深层对象返回 400，且不落盘', async () => {
+    const response = await PUT(
+      new Request('http://localhost:3000/api/sessions/session-1/transcript/draft', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          segments: [validSegment({ attacker: { nested: { payload: 'x' } } })],
+          summaries: [],
+          translations: {},
+        }),
+      }),
+      { params }
+    );
+
+    expect(response.status).toBe(400);
+    expect(persistTranscriptDraftMock).not.toHaveBeenCalled();
   });
 });

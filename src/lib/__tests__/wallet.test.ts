@@ -92,12 +92,19 @@ vi.mock('@/lib/email', () => ({
   sendSubscriptionSuccessEmail: sendSubscriptionSuccessEmailMock,
 }));
 
-import { creditPaidOrder, spendFromBalance, adminAdjust, WalletError } from '@/lib/wallet';
+import {
+  creditPaidOrder,
+  createPaymentOrder,
+  spendFromBalance,
+  adminAdjust,
+  WalletError,
+} from '@/lib/wallet';
 
 beforeEach(() => {
   resetTransactionImpl(); // 防止「提交失败」替身泄漏到其它用例
   paymentOrderUpdateManyMock.mockReset();
   paymentOrderFindUniqueMock.mockReset();
+  paymentOrderCreateMock.mockReset();
   userUpdateMock.mockReset();
   userUpdateManyMock.mockReset();
   userFindUniqueMock.mockReset();
@@ -105,6 +112,8 @@ beforeEach(() => {
   walletTxFindFirstMock.mockReset();
   rechargeTierFindUniqueMock.mockReset();
   executeRawMock.mockReset();
+  // Funding ledger 里的条件 UPDATE 以 affected rows=1 作为并发安全闸；默认模拟成功。
+  executeRawMock.mockResolvedValue(1);
   queryRawMock.mockReset();
   settlePoolOnLimitChangeMock.mockReset();
   settlePoolOnLimitChangeMock.mockResolvedValue(undefined);
@@ -113,16 +122,69 @@ beforeEach(() => {
   userUpdateMock.mockResolvedValue({ walletBalanceCents: 0 });
   // 条件扣款守卫默认扣款成功（余额充足）；余额不足的用例各自覆盖为 { count: 0 }。
   userUpdateManyMock.mockResolvedValue({ count: 1 });
-  walletTxCreateMock.mockResolvedValue({});
+  walletTxCreateMock.mockResolvedValue({ id: 'wallet-tx-1' });
   // 发放闸（L15）：默认「本单还没发过」+「抢占标记成功」。
   walletTxFindFirstMock.mockResolvedValue(null);
   paymentOrderUpdateManyMock.mockResolvedValue({ count: 1 });
   // applyGrantTx / adminAdjust 改用 `SELECT … FOR UPDATE` 锁读用户行（P3-6）。替身把它接到
   // userFindUniqueMock，既有用例照旧用 userFindUniqueMock 配置「用户当前状态」即可；
   // 需要断言锁读本身（或给出 transcriptionMinutesLimit）的用例自行覆盖 queryRawMock。
-  queryRawMock.mockImplementation(async () => {
+  queryRawMock.mockImplementation(async (strings: TemplateStringsArray) => {
+    const sql = String(strings);
+    if (/FROM PaymentOrder/i.test(sql)) {
+      const row = await paymentOrderFindUniqueMock();
+      return row ? [{ fulfillmentStatus: 'pending', refundedAt: null, currency: 'CNY', ...row }] : [];
+    }
+    // 默认账户没有支付争议冻结；不能把该查询转给 userFindUniqueMock，否则会把用户 fixture
+    // 当成 hold，既误报 account_frozen，也会提前消费后续用户状态。
+    if (/FROM PaymentAccountHold/i.test(sql)) return [];
+    // 默认没有已追踪资金批次，消费路径会显式创建 legacy_unattributed lot；同样不可误消费
+    // userFindUniqueMock。具体资金来源归属由 funding ledger 专项测试覆盖。
+    if (/FROM WalletFundingLot/i.test(sql)) return [];
+    if (/SELECT id FROM User/i.test(sql)) return [{ id: 'u1' }];
     const row = await userFindUniqueMock();
     return row ? [row] : [];
+  });
+});
+
+describe('createPaymentOrder：拒付冻结与建单并发闸', () => {
+  it('▶ 先锁 User 再查 active hold；已冻结用户不会落 pending 订单', async () => {
+    queryRawMock
+      .mockResolvedValueOnce([{ id: 'u1' }])
+      .mockResolvedValueOnce([{ id: 'hold-1' }]);
+
+    await expect(
+      createPaymentOrder({
+        userId: 'u1',
+        provider: 'stripe',
+        kind: 'topup',
+        amountCents: 1000,
+      })
+    ).rejects.toMatchObject({ code: 'account_frozen' });
+
+    expect(paymentOrderCreateMock).not.toHaveBeenCalled();
+    const sql = queryRawMock.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(sql).toMatch(/FROM User[\s\S]*FOR UPDATE[\s\S]*FROM PaymentAccountHold/i);
+  });
+
+  it('▶ SEC-029 到期点向下对齐网关秒级时间戳，关闭亚秒迟付窗口', async () => {
+    const now = new Date('2026-08-20T10:00:00.987Z').getTime();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+    paymentOrderCreateMock.mockResolvedValueOnce({ id: 'o1' });
+    try {
+      await createPaymentOrder({
+        userId: 'u1',
+        provider: 'stripe',
+        kind: 'topup',
+        amountCents: 1000,
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    const expiresAt = paymentOrderCreateMock.mock.calls[0][0].data.expiresAt as Date;
+    expect(expiresAt.toISOString()).toBe('2026-08-20T10:30:00.000Z');
+    expect(expiresAt.getMilliseconds()).toBe(0);
   });
 });
 
@@ -135,7 +197,7 @@ describe('creditPaidOrder：幂等到账', () => {
       kind: 'topup',
       tierId: null,
       amountCents: 1000,
-      status: 'paid',
+      status: 'pending',
       metadataJson: JSON.stringify({ creditCents: 1200, returnUrl: '/x' }), // 充1000送200
     });
     userUpdateMock.mockResolvedValueOnce({ walletBalanceCents: 1200 });
@@ -161,6 +223,7 @@ describe('creditPaidOrder：幂等到账', () => {
       kind: 'topup',
       amountCents: 1000,
       status: 'paid',
+      fulfillmentStatus: 'fulfilled',
       metadataJson: JSON.stringify({ creditCents: 1000 }),
     });
 
@@ -215,7 +278,7 @@ describe('creditPaidOrder：幂等到账', () => {
     );
   });
 
-  it('▶ H3 渠道绑定：认领 CAS 带 provider 过滤（防跨渠道/沙箱替真单结算）', async () => {
+  it('▶ H3 渠道绑定：锁定订单后仍严格比对 provider（防跨渠道/沙箱替真单结算）', async () => {
     paymentOrderUpdateManyMock.mockResolvedValueOnce({ count: 1 });
     paymentOrderFindUniqueMock.mockResolvedValueOnce({
       id: 'o-prov',
@@ -223,21 +286,17 @@ describe('creditPaidOrder：幂等到账', () => {
       kind: 'topup',
       tierId: null,
       amountCents: 1000,
-      status: 'paid',
+      status: 'pending',
+      provider: 'stripe',
       metadataJson: JSON.stringify({ creditCents: 1000 }),
     });
     userUpdateMock.mockResolvedValueOnce({ walletBalanceCents: 1000 });
 
     // 必须带实付金额：真实网关的通知一定有金额字段，缺了会被 L20 挡下（见下方专项用例）。
-    await creditPaidOrder('LLPROV', 'ref', 'stripe', 1000);
-    expect(paymentOrderUpdateManyMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          outTradeNo: 'LLPROV',
-          status: 'pending',
-          provider: 'stripe',
-        }),
-      })
+    const result = await creditPaidOrder('LLPROV', 'ref', 'stripe', 1000);
+    expect(result.ok).toBe(true);
+    expect(queryRawMock.mock.calls.map((call) => String(call[0])).join('\n')).toMatch(
+      /FROM PaymentOrder[\s\S]*FOR UPDATE/i
     );
   });
 
@@ -249,7 +308,7 @@ describe('creditPaidOrder：幂等到账', () => {
       kind: 'purchase',
       tierId: 't-min',
       amountCents: 5000,
-      status: 'paid',
+      status: 'pending',
       metadataJson: JSON.stringify({ creditCents: 5000 }),
     });
     rechargeTierFindUniqueMock.mockResolvedValueOnce({
@@ -287,7 +346,7 @@ describe('creditPaidOrder：幂等到账', () => {
       kind: 'purchase',
       tierId: 't-min',
       amountCents: 5000,
-      status: 'paid',
+      status: 'pending',
       metadataJson: JSON.stringify({
         creditCents: 5000,
         grant: {
@@ -324,7 +383,7 @@ describe('creditPaidOrder：幂等到账', () => {
     );
   });
 
-  it('▶ H1 发放失败不回滚已到账余额（钱留钱包，回调仍成功，不再无限重试）', async () => {
+  it('▶ SEC-027 发放失败回滚整笔 fulfillment 并进入 review，不成功 ACK', async () => {
     paymentOrderUpdateManyMock.mockResolvedValueOnce({ count: 1 });
     paymentOrderFindUniqueMock.mockResolvedValueOnce({
       id: 'o-fail',
@@ -332,7 +391,7 @@ describe('creditPaidOrder：幂等到账', () => {
       kind: 'purchase',
       tierId: 't-min',
       amountCents: 5000,
-      status: 'paid',
+      status: 'pending',
       metadataJson: JSON.stringify({
         creditCents: 5000,
         grant: {
@@ -351,12 +410,154 @@ describe('creditPaidOrder：幂等到账', () => {
 
     const res = await creditPaidOrder('LLFAIL');
 
-    // 回调据 tx1 到账成功照常返回 ok（网关停止重试）。
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe('review');
     expect(res.alreadyProcessed).toBe(false);
-    const types = walletTxCreateMock.mock.calls.map((c) => c[0].data.type);
-    expect(types).toContain('topup'); // 钱已入账、保留
-    expect(types).not.toContain('purchase_minutes'); // 发放失败，无出账台账
+    expect(
+      executeRawMock.mock.calls.some((call) =>
+        String(call[0]).includes("reviewReason = 'fulfillment_failed_uncommitted'")
+      )
+    ).toBe(true);
+    expect(sendSubscriptionSuccessEmailMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ refund 在回滚与 catch 之间赢锁时，review CAS 不覆盖 reversed 终态', async () => {
+    paymentOrderFindUniqueMock
+      .mockResolvedValueOnce({
+        id: 'o-race',
+        userId: 'u1',
+        kind: 'purchase',
+        tierId: 't-min',
+        amountCents: 5000,
+        status: 'pending',
+        metadataJson: JSON.stringify({
+          creditCents: 5000,
+          grant: {
+            kind: 'minutes',
+            priceCents: 5000,
+            tierId: 't-min',
+            tierName: 'X',
+            grantMinutes: 600,
+          },
+        }),
+      })
+      .mockResolvedValueOnce({
+        id: 'o-race',
+        status: 'refunded',
+        refundedAt: new Date('2026-08-20T10:00:00.000Z'),
+        fulfillmentStatus: 'reversed',
+      });
+    userUpdateMock.mockResolvedValueOnce({ walletBalanceCents: 5000 });
+    userFindUniqueMock.mockResolvedValueOnce(null);
+    executeRawMock.mockImplementation(async (strings: TemplateStringsArray) =>
+      String(strings).includes("reviewReason = 'fulfillment_failed_uncommitted'") ? 0 : 1
+    );
+
+    await expect(creditPaidOrder('LLRACE')).resolves.toMatchObject({
+      ok: false,
+      acknowledged: true,
+      alreadyProcessed: true,
+      status: 'refunded',
+    });
+    const catchSql = executeRawMock.mock.calls.find((call) =>
+      String(call[0]).includes("reviewReason = 'fulfillment_failed_uncommitted'")
+    );
+    expect(String(catchSql?.[0])).toMatch(
+      /refundedAt IS NULL[\s\S]*status <> 'refunded'[\s\S]*fulfillmentStatus NOT IN \('fulfilled', 'reversed'\)/
+    );
+  });
+
+  it('▶ active hold 解除后，fulfillment_failed_uncommitted 的 paid 重投可重新结算', async () => {
+    paymentOrderFindUniqueMock.mockResolvedValueOnce({
+      id: 'o-retry-hold',
+      userId: 'u1',
+      provider: 'stripe',
+      kind: 'topup',
+      tierId: null,
+      amountCents: 1000,
+      currency: 'CNY',
+      status: 'pending',
+      fulfillmentStatus: 'review',
+      reviewReason: 'fulfillment_failed_uncommitted',
+      refundedAt: null,
+      createdAt: new Date('2026-08-20T09:00:00.000Z'),
+      expiresAt: new Date('2026-08-20T11:00:00.000Z'),
+      metadataJson: JSON.stringify({ creditCents: 1000 }),
+    });
+    userUpdateMock.mockResolvedValueOnce({ walletBalanceCents: 1000 });
+
+    await expect(
+      creditPaidOrder(
+        'LLRETRYHOLD',
+        'pi_retry',
+        'stripe',
+        1000,
+        'CNY',
+        new Date('2026-08-20T10:00:00.000Z')
+      )
+    ).resolves.toMatchObject({ ok: true, alreadyProcessed: false, status: 'paid' });
+    expect(
+      executeRawMock.mock.calls.some(
+        (call) =>
+          String(call[0]).includes("fulfillmentStatus = 'processing'") &&
+          String(call[0]).includes('reviewReason = NULL')
+      )
+    ).toBe(true);
+  });
+
+  it('▶ 档位修复后，未提交 marker 的 paid 重投重新读取 live tier 并完成发放', async () => {
+    paymentOrderFindUniqueMock.mockResolvedValueOnce({
+      id: 'o-retry-tier',
+      userId: 'u1',
+      provider: 'stripe',
+      kind: 'purchase',
+      tierId: 'tier-repaired',
+      amountCents: 5000,
+      currency: 'CNY',
+      status: 'pending',
+      fulfillmentStatus: 'review',
+      reviewReason: 'fulfillment_failed_uncommitted',
+      refundedAt: null,
+      createdAt: new Date('2026-08-20T09:00:00.000Z'),
+      expiresAt: new Date('2026-08-20T11:00:00.000Z'),
+      metadataJson: JSON.stringify({ creditCents: 5000 }),
+    });
+    rechargeTierFindUniqueMock.mockResolvedValueOnce({
+      id: 'tier-repaired',
+      kind: 'minutes',
+      name: '修复后的分钟包',
+      priceCents: 5000,
+      grantMinutes: 600,
+      active: true,
+    });
+    userUpdateMock.mockResolvedValueOnce({ walletBalanceCents: 5000 });
+    userFindUniqueMock
+      .mockResolvedValueOnce({
+        walletBalanceCents: 5000,
+        purchasedMinutesBalance: 0,
+        role: 'FREE',
+        originalRole: null,
+        roleExpiresAt: null,
+        transcriptionMinutesLimit: 60,
+      })
+      .mockResolvedValueOnce({ walletBalanceCents: 0 });
+
+    await expect(
+      creditPaidOrder(
+        'LLRETRYTIER',
+        'pi_retry_tier',
+        'stripe',
+        5000,
+        'CNY',
+        new Date('2026-08-20T10:00:00.000Z')
+      )
+    ).resolves.toMatchObject({ ok: true, status: 'paid' });
+    expect(rechargeTierFindUniqueMock).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'tier-repaired' } })
+    );
+    expect(userUpdateMock).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { purchasedMinutesBalance: { increment: 600 } } })
+    );
   });
 });
 
@@ -499,6 +700,26 @@ describe('spendFromBalance：余额购买', () => {
     await expect(spendFromBalance('admin', 't-pro')).rejects.toMatchObject({
       code: 'admin_no_membership',
     });
+  });
+
+  it('▶ SEC-023 历史 ADMIN 商品 → 扣款和锁读前拒绝', async () => {
+    rechargeTierFindUniqueMock.mockResolvedValueOnce({
+      id: 't-admin',
+      kind: 'membership',
+      name: '历史管理员商品',
+      priceCents: 3000,
+      grantRole: 'ADMIN',
+      durationDays: 30,
+      active: true,
+    });
+
+    await expect(spendFromBalance('u1', 't-admin')).rejects.toMatchObject({
+      code: 'tier_unavailable',
+    });
+    expect(queryRawMock).not.toHaveBeenCalled();
+    expect(userUpdateManyMock).not.toHaveBeenCalled();
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(walletTxCreateMock).not.toHaveBeenCalled();
   });
 
   // #16：余额购买此前完全不发确认信 —— 钱扣了、角色变了、tokenVersion++ 还把人踢下线，
@@ -789,6 +1010,41 @@ describe('applyGrantTx：发放段防线', () => {
     expect(userUpdateMock).not.toHaveBeenCalled();
     expect(walletTxCreateMock).not.toHaveBeenCalled();
   });
+
+  it('▶ SEC-023 冻结快照 grantRole=ADMIN → 整笔进入 review、不扣款、不提权', async () => {
+    paymentOrderUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    paymentOrderFindUniqueMock.mockResolvedValueOnce({
+      id: 'o-admin-snapshot',
+      userId: 'u1',
+      kind: 'purchase',
+      tierId: 't-admin',
+      outTradeNo: 'LLADMIN',
+      amountCents: 3000,
+      status: 'pending',
+      metadataJson: JSON.stringify({
+        creditCents: 3000,
+        grant: {
+          kind: 'membership',
+          priceCents: 3000,
+          tierId: 't-admin',
+          tierName: '历史管理员商品',
+          grantRole: 'ADMIN',
+          durationDays: 30,
+        },
+      }),
+    });
+    userUpdateMock.mockResolvedValueOnce({ walletBalanceCents: 3000 });
+
+    const res = await creditPaidOrder('LLADMIN');
+
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe('review');
+    expect(userUpdateManyMock).not.toHaveBeenCalled();
+    expect(
+      userUpdateMock.mock.calls.some((call) => call[0]?.data?.role === 'ADMIN')
+    ).toBe(false);
+    expect(sendSubscriptionSuccessEmailMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('creditPaidOrder：对账拒绝与补发', () => {
@@ -801,6 +1057,7 @@ describe('creditPaidOrder：对账拒绝与补发', () => {
     amountCents: 5000,
     currency: 'CNY',
     status: 'paid',
+    fulfillmentStatus: 'fulfilled',
     refundedAt: null,
     metadataJson: JSON.stringify({
       creditCents: 5000,
@@ -880,56 +1137,168 @@ describe('creditPaidOrder：对账拒绝与补发', () => {
 
     const res = await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY');
 
-    expect(res.ok).toBe(false);
+    expect(res).toMatchObject({ ok: false, acknowledged: true, status: 'pending' });
     expect(paymentOrderUpdateManyMock).not.toHaveBeenCalled();
     expect(userUpdateMock).not.toHaveBeenCalled();
   });
 
-  // L15：首投发放失败后，钱已到账、权益没发。重投时旧实现直接 return（"已处理"），
-  // 于是永远补不上 —— 用户付了钱只剩一条 recharge.grant.failed 等人工。
-  it('▶ L15 重投的回调补发未完成的发放', async () => {
-    // 认领 CAS 打不中（已 paid），但该单尚无发放标记。
-    paymentOrderUpdateManyMock.mockResolvedValueOnce({ count: 0 });
-    paymentOrderFindUniqueMock.mockResolvedValue(purchaseOrder());
-    queryRawMock.mockResolvedValueOnce([
-      {
-        walletBalanceCents: 5000,
-        role: 'FREE',
-        originalRole: null,
-        roleExpiresAt: null,
-        transcriptionMinutesLimit: 600,
-      },
-    ]);
-    userFindUniqueMock.mockResolvedValueOnce({ walletBalanceCents: 0 });
-
-    const res = await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY');
-
-    expect(res.alreadyProcessed).toBe(true);
-    // 关键：真的补发了（加了 600 分钟池 + 出账台账）。
-    expect(userUpdateMock).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { purchasedMinutesBalance: { increment: 600 } } })
+  it('▶ SEC-029 signed paidAt 晚于 expiresAt → late_paid+review，不发任何权益', async () => {
+    const expiresAt = new Date('2026-08-20T10:00:00.000Z');
+    const paidAt = new Date('2026-08-20T10:00:01.000Z');
+    paymentOrderFindUniqueMock.mockResolvedValueOnce(
+      purchaseOrder({
+        status: 'expired',
+        fulfillmentStatus: 'pending',
+        kind: 'topup',
+        tierId: null,
+        expiresAt,
+      })
     );
-    expect(walletTxCreateMock.mock.calls.map((c) => c[0].data.type)).toContain(
-      'purchase_minutes'
+
+    const res = await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY', paidAt);
+
+    expect(res).toMatchObject({
+      ok: false,
+      acknowledged: true,
+      alreadyProcessed: false,
+      status: 'late_paid',
+    });
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(walletTxCreateMock).not.toHaveBeenCalled();
+    expect(executeRawMock.mock.calls.map((c) => String(c[0])).join('\n')).toContain(
+      "status = 'late_paid'"
     );
   });
 
-  // ⚠️ 下面两条都必须把用户行喂足（余额够、锁读拿得到）——否则「没重复发放」会退化成
-  // 「applyGrantTx 因为查不到用户而抛错」，删掉防线也照样绿，就是一条假测试。
-  const fundUser = () => {
-    queryRawMock.mockResolvedValueOnce([
-      {
-        walletBalanceCents: 5000,
-        role: 'FREE',
-        originalRole: null,
-        roleExpiresAt: null,
-        transcriptionMinutesLimit: 600,
-      },
-    ]);
-    userFindUniqueMock.mockResolvedValueOnce({ walletBalanceCents: 0 });
-  };
+  it('▶ SEC-029 signed paidAt 恰等于 expiresAt → 与 sweep 的 <= 边界一致，进入 review', async () => {
+    const expiresAt = new Date('2026-08-20T10:00:00.000Z');
+    paymentOrderFindUniqueMock.mockResolvedValueOnce(
+      purchaseOrder({
+        status: 'expired',
+        fulfillmentStatus: 'pending',
+        kind: 'topup',
+        tierId: null,
+        expiresAt,
+      })
+    );
 
-  it('▶ L15 已发放过的订单重投 → 绝不重复发放（metadata 标记）', async () => {
+    const res = await creditPaidOrder(
+      'LLX',
+      'ref',
+      'stripe',
+      5000,
+      'CNY',
+      expiresAt
+    );
+
+    expect(res).toMatchObject({ ok: false, acknowledged: true, status: 'late_paid' });
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(walletTxCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ SEC-029 signed paidAt 早于订单创建超过时钟偏差 → durable review', async () => {
+    const createdAt = new Date('2026-08-20T10:00:00.000Z');
+    const paidAt = new Date('2026-08-20T09:54:59.000Z');
+    paymentOrderFindUniqueMock.mockResolvedValueOnce(
+      purchaseOrder({
+        status: 'pending',
+        fulfillmentStatus: 'pending',
+        kind: 'topup',
+        tierId: null,
+        createdAt,
+        expiresAt: new Date('2026-08-20T10:30:00.000Z'),
+      })
+    );
+
+    const res = await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY', paidAt);
+
+    expect(res).toMatchObject({
+      ok: false,
+      acknowledged: true,
+      alreadyProcessed: false,
+      status: 'review',
+    });
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(walletTxCreateMock).not.toHaveBeenCalled();
+    expect(
+      executeRawMock.mock.calls.some((call) =>
+        String(call[0]).includes("reviewReason = 'payment_before_order'")
+      )
+    ).toBe(true);
+  });
+
+  it('▶ SEC-029 payment_before_order review 重投幂等 ACK，不再碰余额', async () => {
+    paymentOrderFindUniqueMock.mockResolvedValueOnce(
+      purchaseOrder({
+        status: 'pending',
+        fulfillmentStatus: 'review',
+        reviewReason: 'payment_before_order',
+        kind: 'topup',
+        tierId: null,
+      })
+    );
+
+    const res = await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY');
+
+    expect(res).toMatchObject({
+      ok: false,
+      acknowledged: true,
+      alreadyProcessed: true,
+      status: 'review',
+    });
+    expect(userUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ SEC-029 回调虽晚到，但 signed paidAt 在 expiresAt 前 → 可从 expired 安全完成', async () => {
+    const paidAt = new Date('2026-08-20T09:59:59.000Z');
+    paymentOrderFindUniqueMock.mockResolvedValueOnce(
+      purchaseOrder({
+        status: 'expired',
+        fulfillmentStatus: 'pending',
+        kind: 'topup',
+        tierId: null,
+        expiresAt: new Date('2026-08-20T10:00:00.000Z'),
+      })
+    );
+    userUpdateMock.mockResolvedValueOnce({ walletBalanceCents: 5000 });
+
+    const res = await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY', paidAt);
+
+    expect(res.ok).toBe(true);
+    expect(userUpdateMock).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { walletBalanceCents: { increment: 5000 } } })
+    );
+  });
+
+  it('▶ SEC-029 late_paid 重投只返回 durable review，不二次触碰余额', async () => {
+    paymentOrderFindUniqueMock.mockResolvedValueOnce(
+      purchaseOrder({
+        status: 'late_paid',
+        fulfillmentStatus: 'review',
+        kind: 'topup',
+        tierId: null,
+      })
+    );
+
+    const res = await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY');
+
+    expect(res).toMatchObject({ ok: false, acknowledged: true, alreadyProcessed: true });
+    expect(userUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ SEC-027 历史 paid+review 单重投不再靠 metadata 猜测补发', async () => {
+    paymentOrderFindUniqueMock.mockResolvedValue(
+      purchaseOrder({ fulfillmentStatus: 'review' })
+    );
+
+    const res = await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY');
+
+    expect(res.ok).toBe(false);
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(walletTxCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ SEC-027 fulfilled 订单重投 → metadata 内容无论如何都不重复发放', async () => {
     paymentOrderUpdateManyMock.mockResolvedValueOnce({ count: 0 });
     paymentOrderFindUniqueMock.mockResolvedValue(
       purchaseOrder({
@@ -946,25 +1315,21 @@ describe('creditPaidOrder：对账拒绝与补发', () => {
         }),
       })
     );
-    fundUser();
-
     await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY');
 
     expect(userUpdateMock).not.toHaveBeenCalled();
     expect(walletTxCreateMock).not.toHaveBeenCalled();
   });
 
-  // 上线前发放的老订单没有 metadata 标记，只能靠 orderId 上的出账台账兜底，否则重投会重发一遍。
-  it('▶ L15 无标记但台账已有出账（老订单）→ 不重复发放', async () => {
+  it('▶ SEC-027 fulfilled 状态本身即幂等锚点，不再查台账猜测', async () => {
     paymentOrderUpdateManyMock.mockResolvedValueOnce({ count: 0 });
     paymentOrderFindUniqueMock.mockResolvedValue(purchaseOrder());
     walletTxFindFirstMock.mockResolvedValueOnce({ id: 'tx-old' });
-    fundUser();
-
     await creditPaidOrder('LLX', 'ref', 'stripe', 5000, 'CNY');
 
     expect(userUpdateMock).not.toHaveBeenCalled();
     expect(walletTxCreateMock).not.toHaveBeenCalled();
+    expect(walletTxFindFirstMock).not.toHaveBeenCalled();
   });
 
   // P3-13：creditCents 被误配成 0 时（`Number(null)===0` 的老 bug 造出来的档位），
@@ -978,7 +1343,7 @@ describe('creditPaidOrder：对账拒绝与补发', () => {
       outTradeNo: 'LLZERO',
       amountCents: 10000,
       currency: 'CNY',
-      status: 'paid',
+      status: 'pending',
       refundedAt: null,
       metadataJson: JSON.stringify({ creditCents: 0 }),
     };
@@ -1122,7 +1487,7 @@ describe('creditPaidOrder：订阅成功通知邮件', () => {
       kind: 'purchase',
       tierId: 't-gone',
       amountCents: 3900,
-      status: 'paid',
+      status: 'pending',
       metadataJson: JSON.stringify({ creditCents: 3900 }), // 无 grant 快照
     };
     paymentOrderUpdateManyMock.mockResolvedValueOnce({ count: 1 });
@@ -1140,8 +1505,9 @@ describe('creditPaidOrder：订阅成功通知邮件', () => {
     const res = await creditPaidOrder('LLGRANTFAIL');
     await flush();
 
-    // 钱已到账（不回滚），但发放没成功
-    expect(res.ok).toBe(true);
+    // SEC-027：到账与发放同事务；发放失败即 review，绝不确认一笔半完成订单。
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe('review');
     expect(sendSubscriptionSuccessEmailMock).not.toHaveBeenCalled();
   });
 
@@ -1155,7 +1521,7 @@ describe('creditPaidOrder：订阅成功通知邮件', () => {
         kind: 'purchase',
         tierId: 't-pro',
         amountCents: 3900,
-        status: 'paid',
+        status: 'pending',
         metadataJson: JSON.stringify({
           creditCents: 3900,
           grant: {
@@ -1204,7 +1570,7 @@ describe('creditPaidOrder：订阅成功通知邮件', () => {
         kind: 'purchase',
         tierId: 't-pro',
         amountCents: 3900,
-        status: 'paid',
+        status: 'pending',
         metadataJson: JSON.stringify({
           creditCents: 3900,
           grant: {
@@ -1249,7 +1615,7 @@ describe('creditPaidOrder：订阅成功通知邮件', () => {
         kind: 'topup',
         tierId: null,
         amountCents: 10000,
-        status: 'paid',
+        status: 'pending',
         metadataJson: JSON.stringify({ creditCents: 12000 }),
       })
       .mockResolvedValueOnce({

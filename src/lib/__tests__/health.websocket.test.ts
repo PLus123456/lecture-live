@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * L7：单容器部署里 WS 进程崩掉后 /api/health 仍恒绿 → healthcheck 不转红 → 永不重启。
+ * L7：单容器部署里 WS 进程崩掉后 readiness 必须转红，供容器健康检查摘除。
  * 这里锁定 health 报告新增的 websocket 探针，以及 HEALTH_WS_REQUIRED 下的 down 升级。
  */
 vi.mock('server-only', () => ({}));
@@ -94,7 +94,7 @@ describe('getHealthReport — websocket 探针 (L7)', () => {
     expect(JSON.stringify(report)).not.toContain('ECONNREFUSED');
   });
 
-  it('单容器镜像（HEALTH_WS_REQUIRED=1）下 WS 挂掉 → 整体 down（→ /api/health 503）', async () => {
+  it('单容器镜像（HEALTH_WS_REQUIRED=1）下 WS 挂掉 → 整体 down（→ readiness 503）', async () => {
     process.env.HEALTH_WS_REQUIRED = '1';
     netConnectMock.mockImplementation(() => fakeSocket('error'));
     const report = await getHealthReport();

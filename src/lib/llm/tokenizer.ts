@@ -17,6 +17,25 @@ import { encode } from 'gpt-tokenizer';
 // encode 一次、chunkText 再对每个句子各 encode 一次）。
 // 200K 字符 ≈ 17ms，超过这个量级的文本对任何上下文预算都已经是「远超上限」，精确值毫无意义。
 const EXACT_ENCODE_MAX_CHARS = 200_000;
+const TRUNCATE_COARSE_CHARS_PER_TOKEN = 8;
+
+function truncateCoarseMaxChars(maxTokens: number): number {
+  return Math.max(
+    EXACT_ENCODE_MAX_CHARS,
+    maxTokens * TRUNCATE_COARSE_CHARS_PER_TOKEN
+  );
+}
+
+/**
+ * truncateToTokensFromEnd 可能返回的 UTF-8 字节数确定上界，供付费调用预预算使用。
+ * JS length 按 UTF-16 code unit；单个 code unit 经 TextEncoder 最多占 3 字节，
+ * 这里按 4 预留，兼顾实现/编码器差异并保持安全方向。
+ */
+export function truncateToTokensFromEndUtf8ByteUpperBound(
+  maxTokens: number
+): number {
+  return truncateCoarseMaxChars(maxTokens) * 4;
+}
 
 // CJK（含中日韩统一表意文字、假名、谚文）判定：cl100k 是 UTF-8 字节级 BPE，一个汉字通常
 // 编成 1-2 个 token，而英文约 4 字符/token。两类字符必须分开算，否则中文会被严重低估。
@@ -69,7 +88,7 @@ export function truncateToTokensFromEnd(text: string, maxTokens: number): string
   // P4-2：先按「最坏 8 字符/token」粗切尾部，把 encode 的工作量钉死在 maxTokens 量级，
   // 而不是随输入长度线性增长（几十 MB 的输入会同步 encode 数秒）。粗切只多留不少留，
   // 下面的精确按比例回切照常生效。
-  const coarseMaxChars = Math.max(EXACT_ENCODE_MAX_CHARS, maxTokens * 8);
+  const coarseMaxChars = truncateCoarseMaxChars(maxTokens);
   const source =
     text.length > coarseMaxChars ? text.slice(text.length - coarseMaxChars) : text;
   const tokens = encode(source);

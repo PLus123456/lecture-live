@@ -1,39 +1,62 @@
 import { NextResponse } from 'next/server';
 import {
+  AUTH_SESSION_BINDING_HEADER,
   CLIENT_SESSION_TOKEN,
-  extractToken,
+  clearAuthCookie,
+  extractTokenFromCookieHeader,
+  getAuthTokenSessionBinding,
   getJwtExpiryConfig,
-  lookupRefreshGrace,
-  peekTokenJti,
-  recordRefreshGrace,
-  revokeToken,
+  rotateAuthToken,
   setAuthCookie,
-  signToken,
-  verifyAuthSession,
-  verifyAuthToken,
+  verifyRefreshAuthToken,
 } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { getSiteSettings } from '@/lib/siteSettings';
+import { guardAuthMutationRequest } from '@/lib/publicAuth';
 
 /**
- * GET /api/auth/refresh
+ * POST /api/auth/refresh
  * 从 HttpOnly cookie 中读取 JWT，验证后返回用户信息并续签 cookie。
  * 用于页面加载时自动恢复会话，无需重新登录。
  *
- * 幂等刷新（v3-R7）：单个 cookie 的并发刷新（多 Tab）或丢包时，第一个请求会 rotate
- * 出新 token 并把旧 jti 立即入黑名单。第二个请求带着「刚被 rotate 的旧 jti」到来时，
- * verifyAuthSession 会因黑名单命中而返回 null——此时不再直接 401，而是查一个短 TTL
- * 宽限记录，把同一个新 token 再发一次，让两个 Tab 收敛到同一个 cookie。宽限窗一过、
- * 或旧 jti 无宽限记录，则照常 401。宽限只在极短窗口内让「刚 rotate 的旧 jti」换回其
- * 对应的新 token，且返回前对新 token 走完整 verifyAuthToken，故重放/即时吊销保护不变。
+ * 每个登录/设备有独立 AuthTokenFamily。数据库 CAS 保证当前叶子只能消费一次；CAS loser
+ * 是旧 refresh 凭据重用，持久撤销该 family。数据库只存 jti SHA-256，不缓存/返回后继 JWT。
  */
-export async function GET(req: Request) {
-  const session = await verifyAuthSession(req);
-
+export async function POST(req: Request) {
+  const requestGuard = guardAuthMutationRequest(req);
+  if (requestGuard) return requestGuard;
+  const expectedBinding = req.headers.get(AUTH_SESSION_BINDING_HEADER);
+  // Authenticate the browser mutation before emitting *any* cookie-changing
+  // response. A cross-site form POST carries no custom header, but the browser
+  // would still apply a target-origin Max-Age=0 response and allow logout CSRF.
+  if (!expectedBinding) {
+    return buildRefreshError('Session binding required', 428);
+  }
+  const rawToken = extractTokenFromCookieHeader(req.headers.get('Cookie'));
+  if (!rawToken) {
+    return buildRefreshError('Unauthorized', 401);
+  }
+  const cookieBinding = getAuthTokenSessionBinding(rawToken);
+  // refresh 会消费一次性 leaf，不能允许 SameSite=Lax 顶层跨站 GET/表单请求触发。
+  // 自定义 family binding 既触发 CORS preflight，又把迟到请求绑定到其发起会话。
+  if (!cookieBinding) {
+    return buildRefreshError('Unauthorized', 401, { clearCookie: true });
+  }
+  if (expectedBinding !== cookieBinding) {
+    return buildRefreshError('Session changed', 409);
+  }
+  let session;
+  try {
+    session = await verifyRefreshAuthToken(rawToken);
+  } catch (error) {
+    console.error('Refresh token verification persistence unavailable:', error);
+    // 与坏 token 的 401 区分：DB 暂时不可判定时失败关闭但保留 cookie，用户恢复后仍能
+    // 重试或持久撤族，不能把唯一凭据删掉而让攻击者保存的副本日后复活。
+    return buildRefreshError('Session verification unavailable', 503);
+  }
   if (!session) {
-    // 会话校验失败：可能是并发/丢包下「刚被 rotate 的旧 jti」——尝试幂等宽限。
-    return handleRefreshGrace(req);
+    return buildRefreshError('Unauthorized', 401, { clearCookie: true });
   }
 
   const rateLimited = await enforceRateLimit(req, {
@@ -55,11 +78,18 @@ export async function GET(req: Request) {
       displayName: true,
       role: true,
       tokenVersion: true,
+      status: true,
     },
   });
 
   if (!user) {
-    return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    return buildRefreshError('Unauthorized', 401, { clearCookie: true });
+  }
+  if (
+    user.status !== 1 ||
+    user.tokenVersion !== session.token.tokenVersion
+  ) {
+    return buildRefreshError('Unauthorized', 401, { clearCookie: true });
   }
 
   // 签发新 token（滑动过期 + 绝对过期：保留初始会话起点）。
@@ -68,85 +98,51 @@ export async function GET(req: Request) {
   const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry, {
     sessionStartedAt: session.token.sessionStartedAt,
   });
-  const newToken = signToken(user, {
-    sessionStartedAt: session.token.sessionStartedAt,
-    expiresInDays: jwtConfig.expiresInDays,
-  });
-  // 先记宽限（旧 jti → 新 token），再吊销旧 jti：这样并发的第二个请求即使在吊销后到达，
-  // 也能凭旧 jti 换回同一个新 token。宽限 TTL 极短，过后旧 jti 仍留在黑名单里彻底失效。
-  await recordRefreshGrace(session.token.jti, newToken);
-  await revokeToken(session.token);
+  let rotation;
+  try {
+    rotation = await rotateAuthToken(session.token, user, {
+      expiresInDays: jwtConfig.expiresInDays,
+    });
+  } catch (error) {
+    console.error('Refresh token family rotation failed:', error);
+    // DB 无法完成 CAS 时绝不签出一个无权威状态的 token；保留旧 cookie 供故障恢复后重试。
+    return buildRefreshError('Session refresh unavailable', 503);
+  }
+  if (rotation.status === 'reused') {
+    return buildRefreshError('Unauthorized', 401, { clearCookie: true });
+  }
 
-  const response = buildRefreshResponse(user, newToken, jwtConfig.cookieMaxAge);
+  const response = buildRefreshResponse(
+    user,
+    rotation.token,
+    jwtConfig.cookieMaxAge
+  );
   return response;
 }
 
-/**
- * 旧 jti 已被 rotate（黑名单命中）时的幂等回退。
- * 仅当：token 签名/结构/绝对上限合法（peekTokenJti 通过，杜绝伪造）、且该 jti 有仍在
- * 宽限窗内的新 token、且该新 token 本身仍能通过完整 verifyAuthToken（签名/绝对上限/黑名单/
- * tokenVersion/status）时，才把新 token 再发一次。任何一步不满足 → 401。
- */
-async function handleRefreshGrace(req: Request): Promise<NextResponse> {
-  const rawToken = extractToken(req);
-  if (!rawToken) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+/** 跨站顶层导航只能发 GET；明确拒绝且绝不轮换/清 cookie。 */
+export async function GET() {
+  const response = NextResponse.json(
+    { error: 'Method not allowed' },
+    { status: 405 }
+  );
+  response.headers.set('Allow', 'POST');
+  response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  return response;
+}
+
+function buildRefreshError(
+  message: string,
+  status: number,
+  options?: { clearCookie?: boolean }
+): NextResponse {
+  const response = NextResponse.json({ error: message }, { status });
+  if (options?.clearCookie) {
+    clearAuthCookie(response);
+    response.headers.set('Clear-Site-Data', '"cache"');
   }
-
-  const jti = peekTokenJti(rawToken);
-  if (!jti) {
-    // 伪造/过期/篡改 token，或非本系统签发——直接拒绝。
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
-  const graceToken = await lookupRefreshGrace(jti);
-  if (!graceToken) {
-    // 无宽限记录（宽限窗已过，或该 jti 从未被本流程 rotate）——旧 jti 照常彻底失效。
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
-  // 关键：对宽限 token 走完整校验。若两次刷新之间发生改密/封禁/tokenVersion 递增，
-  // 该新 token 会在这里被拒（tokenVersion 不符或 status !== 1 或已被吊销），即时吊销不被绕过。
-  const graceSession = await verifyAuthToken(graceToken);
-  if (!graceSession) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
-  const rateLimited = await enforceRateLimit(req, {
-    scope: 'auth:refresh',
-    limit: 60,
-    windowMs: 60_000,
-    key: `user:${graceSession.user.id}`,
-  });
-  if (rateLimited) {
-    return rateLimited;
-  }
-
-  const user = await prisma.user.findUnique({
-    where: { id: graceSession.user.id },
-    select: {
-      id: true,
-      email: true,
-      displayName: true,
-      role: true,
-      tokenVersion: true,
-    },
-  });
-
-  if (!user) {
-    return NextResponse.json({ error: 'User not found' }, { status: 404 });
-  }
-
-  const siteSettings = await getSiteSettings().catch(() => null);
-  // 宽限路径同样按该会话的起点钳 cookieMaxAge：graceToken 的 exp 由首个请求签出（已钳），
-  // 这里若发一个更长的 maxAge，cookie 会比 token 活得久，回到「看着有效实则登出」。
-  const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry, {
-    sessionStartedAt: graceSession.token.sessionStartedAt,
-  });
-
-  // 幂等：不再 rotate，也不吊销——把已 rotate 出的同一个新 token 原样再发，
-  // 让并发/丢包的 Tab 收敛到与首个请求相同的 cookie（全局仍只有一个有效 token）。
-  return buildRefreshResponse(user, graceToken, jwtConfig.cookieMaxAge);
+  response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  return response;
 }
 
 function buildRefreshResponse(
@@ -162,6 +158,7 @@ function buildRefreshResponse(
       role: user.role,
     },
     token: CLIENT_SESSION_TOKEN,
+    sessionBinding: getAuthTokenSessionBinding(token),
   });
 
   // 续签 cookie
@@ -169,6 +166,7 @@ function buildRefreshResponse(
 
   // 防止浏览器缓存会话恢复响应
   response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  response.headers.set('Clear-Site-Data', '"cache"');
 
   return response;
 }

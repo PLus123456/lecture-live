@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import type { LlmPurpose } from '@/types/llm';
 import { verifyAuth } from '@/lib/auth';
+import { isPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
 import { callLLM } from '@/lib/llm/gateway';
 import { buildIncrementalSummaryPrompt } from '@/lib/llm/prompts';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
@@ -25,6 +26,12 @@ export async function POST(req: Request) {
   const user = await verifyAuth(req);
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  if (!(await isPaymentBenefitAvailable(user.id))) {
+    return NextResponse.json(
+      { error: 'Payment account frozen', code: 'payment_account_frozen' },
+      { status: 403 }
+    );
   }
 
   // 已认证用户按 userId 限流，使用管理员配置的 rate_limit_api

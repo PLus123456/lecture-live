@@ -12,12 +12,20 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
-import { releaseStorageBytes } from '@/lib/quota';
 import {
   loadCloudreveContext,
   deleteCloudreveFile,
 } from '@/lib/storage/cloudreveFileDelete';
 import { logger, serializeError } from '@/lib/logger';
+import {
+  STORED_ARTIFACT_TYPE,
+  areStoredArtifactDeleteIntentsDurable,
+  assertStoredArtifactBackfillComplete,
+  assertStoredArtifactReferencesCovered,
+  findBillableStoredArtifactsByOwner,
+  markStoredArtifactsDeletePendingInTransaction,
+  releaseStoredArtifact,
+} from '@/lib/storage/storedArtifactLedger';
 
 const routeLogger = logger.child({ component: 'chat-uploads-delete' });
 
@@ -64,37 +72,116 @@ export async function DELETE(
     );
   }
 
-  // 物理文件 best-effort 删除（失败不阻塞 DB 清理）
-  const cloudreveCtx = await loadCloudreveContext();
-  if (cloudreveCtx) {
-    await deleteCloudreveFile(attachment.cloudrevePath, cloudreveCtx);
-    if (attachment.extractedTextPath) {
-      await deleteCloudreveFile(attachment.extractedTextPath, cloudreveCtx);
-    }
-  }
-
-  // DB 删除 + 配额释放（按附件 owner 释放，admin 跨用户删也要还给原用户）
+  let ledgerRows: Awaited<
+    ReturnType<typeof findBillableStoredArtifactsByOwner>
+  >;
   try {
-    await prisma.chatAttachment.delete({ where: { id } });
+    await assertStoredArtifactBackfillComplete();
+    ledgerRows = await findBillableStoredArtifactsByOwner(
+      'chat_attachment',
+      attachment.id
+    );
+    assertStoredArtifactReferencesCovered(ledgerRows, [
+      attachment.cloudrevePath,
+      attachment.extractedTextPath,
+    ]);
   } catch (err) {
     routeLogger.error(
       { id, err: serializeError(err) },
-      'chat-uploads-delete: DB delete failed'
+      'chat attachment inventory is incomplete; delete refused'
     );
-    return NextResponse.json({ error: 'Delete failed' }, { status: 500 });
+    return NextResponse.json(
+      { error: 'Attachment storage inventory is not ready' },
+      { status: 503, headers: { 'Retry-After': '30' } }
+    );
   }
 
+  // 先在同一 DB 事务中删 owner 并把 ledger 变成持久 DELETE_PENDING。
+  // 物理删除放在提交后：崩溃只会留下可重试的 ownerless 对象，
+  // 绝不会把仍可见的附件先删成断链。
   try {
-    await releaseStorageBytes(attachment.userId, Number(attachment.bytes));
+    await prisma.$transaction(async (tx) => {
+      await markStoredArtifactsDeletePendingInTransaction(
+        tx,
+        ledgerRows.map((row) => row.id)
+      );
+      await tx.chatAttachment.delete({ where: { id } });
+      if (ledgerRows.length === 0) {
+        await tx.$executeRaw`
+          UPDATE User
+          SET storageBytesUsed = GREATEST(0, storageBytesUsed - ${attachment.bytes})
+          WHERE id = ${attachment.userId}
+        `;
+      }
+    });
   } catch (err) {
-    routeLogger.warn(
-      {
-        userId: attachment.userId,
-        bytes: attachment.bytes.toString(),
-        err: serializeError(err),
-      },
-      'chat-uploads-delete: releaseStorageBytes failed; admin reconcile 会兜底'
+    try {
+      const owner = await prisma.chatAttachment.findUnique({
+        where: { id },
+        select: { id: true },
+      });
+      if (owner) {
+        routeLogger.error(
+          { id, err: serializeError(err) },
+          'chat-uploads-delete: DB delete failed'
+        );
+        return NextResponse.json({ error: 'Delete failed' }, { status: 500 });
+      }
+      const deleteIntentDurable = await areStoredArtifactDeleteIntentsDurable(
+        ledgerRows.map((row) => row.id)
+      );
+      if (!deleteIntentDurable) {
+        routeLogger.error(
+          { id },
+          'chat attachment owner detached without a provable ledger delete intent'
+        );
+        return NextResponse.json(
+          { error: 'Delete status is being reconciled' },
+          { status: 503, headers: { 'Retry-After': '30' } }
+        );
+      }
+      routeLogger.warn(
+        { id },
+        'chat attachment delete returned failure but owner+ledger readback confirmed commit'
+      );
+    } catch (readbackError) {
+      routeLogger.error(
+        { id, err: serializeError(readbackError) },
+        'chat attachment delete outcome unknown; physical files preserved'
+      );
+      return NextResponse.json(
+        { error: 'Delete status is being reconciled' },
+        { status: 503, headers: { 'Retry-After': '30' } }
+      );
+    }
+  }
+
+  const cloudreveCtx = await loadCloudreveContext();
+  let rawDeleted = false;
+  let extractedDeleted = attachment.extractedTextPath === null;
+  if (cloudreveCtx) {
+    rawDeleted = await deleteCloudreveFile(
+      attachment.cloudrevePath,
+      cloudreveCtx
     );
+    if (attachment.extractedTextPath) {
+      extractedDeleted = await deleteCloudreveFile(
+        attachment.extractedTextPath,
+        cloudreveCtx
+      );
+    }
+  }
+
+  if (ledgerRows.length > 0) {
+    for (const artifact of ledgerRows) {
+      const deleted =
+        artifact.artifactType === STORED_ARTIFACT_TYPE.CHAT_EXTRACTED
+          ? extractedDeleted
+          : rawDeleted;
+      if (deleted) {
+        await releaseStoredArtifact(artifact.id).catch(() => undefined);
+      }
+    }
   }
 
   return NextResponse.json({ ok: true });

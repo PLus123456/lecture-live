@@ -8,6 +8,8 @@ const callEmbeddingMock = vi.fn<(texts: string[]) => Promise<number[][]>>();
 
 vi.mock('@/lib/llm/gateway', () => ({
   callEmbedding: (texts: string[]) => callEmbeddingMock(texts),
+  EMBEDDING_MAX_INPUTS: 512,
+  EmbeddingAdmissionError: class EmbeddingAdmissionError extends Error {},
 }));
 
 // estimateTokens 用真实实现走得通，但为了让 chunk 切分边界稳定且可预测，
@@ -21,9 +23,31 @@ vi.mock('@/lib/llm/tokenizer', () => ({
 import {
   invalidateRagCache,
   invalidateRagCacheForRecordings,
-  makeRagRetrieverForRecordings,
-  retrieveTranscriptByEmbedding,
+  computeTranscriptContentSignature,
+  makeRagRetrieverForRecordings as makeRagRetrieverForRecordingsRaw,
+  retrieveTranscriptByEmbedding as retrieveTranscriptByEmbeddingRaw,
 } from '@/lib/llm/embedding/transcriptRag';
+
+const TEST_USER_ID = 'user-rag-test';
+const makeRagRetrieverForRecordings = (
+  recordingIds: ReadonlyArray<string>,
+  loadTranscript: (
+    recordingId: string
+  ) => Promise<ReadonlyArray<TranscriptSegment>>,
+  contentSignature?: string | number
+) =>
+  makeRagRetrieverForRecordingsRaw(
+    recordingIds,
+    TEST_USER_ID,
+    loadTranscript,
+    contentSignature
+  );
+const retrieveTranscriptByEmbedding = (
+  args: Omit<
+    Parameters<typeof retrieveTranscriptByEmbeddingRaw>[0],
+    'userId'
+  >
+) => retrieveTranscriptByEmbeddingRaw({ ...args, userId: TEST_USER_ID });
 
 /**
  * 给每段 transcript 派发一个独特的、可预测的"向量"：
@@ -62,6 +86,7 @@ beforeEach(() => {
   invalidateRagCache('rec-b');
   invalidateRagCache('rec-c');
   invalidateRagCache('rec-dim');
+  invalidateRagCache('rec-limit');
   invalidateRagCacheForRecordings(['rec-a', 'rec-b']);
   invalidateRagCacheForRecordings(['rec-b', 'rec-a']);
   invalidateRagCacheForRecordings(['rec-a']);
@@ -321,6 +346,81 @@ describe('retrieveTranscriptByEmbedding 单录音内容签名（段数守恒也�
       maxTokens: 1000,
     });
     expect(callEmbeddingMock.mock.calls.length).toBe(callsAfterFirst + 1);
+  });
+
+  it('段数与字符长度都不变的纠正也会失效旧向量', async () => {
+    await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-a',
+      query: 'alpha',
+      transcript: makeSegments(['alpha one']),
+      maxTokens: 1000,
+    });
+    const callsBeforeCorrection = callEmbeddingMock.mock.calls.length;
+
+    const output = await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-a',
+      query: 'beta',
+      // 两个文本都是 9 个 UTF-16 code units。
+      transcript: makeSegments(['betaX one']),
+      maxTokens: 1000,
+    });
+
+    const correctionCalls = callEmbeddingMock.mock.calls.slice(
+      callsBeforeCorrection
+    );
+    expect(
+      correctionCalls.some((args) => args[0].includes('betaX one'))
+    ).toBe(true);
+    expect(output).toContain('betaX one');
+  });
+});
+
+describe('RAG aggregate embedding admission', () => {
+  const chunkySegments = (count: number): TranscriptSegment[] =>
+    Array.from({ length: count }, (_, i) => ({
+      text: `alpha-${i} ${'x'.repeat(180)}`,
+      startMs: i * 1000,
+    }));
+
+  it('单录音超过512 chunks 在任何 embedding 调用前拒绝', async () => {
+    await expect(
+      retrieveTranscriptByEmbedding({
+        sessionId: 'rec-limit',
+        query: 'alpha',
+        transcript: chunkySegments(513),
+        maxTokens: 1000,
+      })
+    ).rejects.toThrow('Embedding chunk count exceeded');
+    expect(callEmbeddingMock).not.toHaveBeenCalled();
+  });
+
+  it('多录音共享512 chunk 总额，不是每录音各512', async () => {
+    const retrieve = makeRagRetrieverForRecordings(
+      ['rec-a', 'rec-b'],
+      async () => chunkySegments(300),
+      'oversized-combined'
+    );
+
+    expect(await retrieve('alpha', [], 1000)).toBe('');
+    expect(callEmbeddingMock).not.toHaveBeenCalled();
+  });
+
+  it('强内容签名区分等长改写与录音边界', () => {
+    const first = computeTranscriptContentSignature([
+      { recordingId: 'a', segments: makeSegments(['alpha one']) },
+      { recordingId: 'b', segments: makeSegments(['beta two']) },
+    ]);
+    const equalLengthRewrite = computeTranscriptContentSignature([
+      { recordingId: 'a', segments: makeSegments(['gamma one']) },
+      { recordingId: 'b', segments: makeSegments(['beta two']) },
+    ]);
+    const movedBoundary = computeTranscriptContentSignature([
+      { recordingId: 'a', segments: makeSegments(['alpha one', 'beta two']) },
+      { recordingId: 'b', segments: [] },
+    ]);
+
+    expect(first).not.toBe(equalLengthRewrite);
+    expect(first).not.toBe(movedBoundary);
   });
 });
 

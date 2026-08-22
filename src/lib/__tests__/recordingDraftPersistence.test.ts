@@ -4,6 +4,141 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const ledgerHarness = vi.hoisted(() => {
+  class PublishConflictError extends Error {}
+  class OutcomeUnknownError extends Error {}
+  type ArtifactRow = Record<string, unknown> & {
+    id: string;
+    logicalKey: string;
+    state: string;
+    identityKey: string | null;
+    ownerType: string;
+    ownerId: string;
+    chargedBytes: bigint;
+  };
+  const rows = new Map<string, ArtifactRow>();
+  const active = new Map<string, ArtifactRow>();
+  let sequence = 0;
+  return {
+    rows,
+    active,
+    reset() {
+      rows.clear();
+      active.clear();
+      sequence = 0;
+    },
+    nextId() {
+      sequence += 1;
+      return `artifact-${sequence}`;
+    },
+    PublishConflictError,
+    OutcomeUnknownError,
+  };
+});
+
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_STATE: {
+    RESERVED: 'RESERVED',
+    ACTIVE: 'ACTIVE',
+    DELETE_PENDING: 'DELETE_PENDING',
+  },
+  STORED_ARTIFACT_TYPE: { RECORDING_DRAFT: 'recording_draft' },
+  StoredArtifactPublishConflictError: ledgerHarness.PublishConflictError,
+  StoredArtifactPublishOutcomeUnknownError: ledgerHarness.OutcomeUnknownError,
+  buildStoredArtifactLogicalKey: vi.fn(
+    (ownerType: string, ownerId: string, artifactType: string) =>
+      `${ownerType}:${ownerId}:${artifactType}`
+  ),
+  reserveStoredArtifact: vi.fn(async (input: Record<string, unknown> & {
+    logicalKey: string;
+    expectedBytes: number;
+    ownerType: string;
+    ownerId: string;
+  }) => {
+    const id = ledgerHarness.nextId();
+    const previous = ledgerHarness.active.get(input.logicalKey) ?? null;
+    const row = {
+      ...input,
+      id,
+      state: 'RESERVED',
+      storage: 'pending',
+      reference: null,
+      bytes: BigInt(input.expectedBytes),
+      chargedBytes: BigInt(input.expectedBytes),
+      identityKey: null,
+      replacesArtifactId: previous?.id ?? null,
+      reservationKey: `reservation-${id}`,
+    };
+    ledgerHarness.rows.set(id, row);
+    return row;
+  }),
+  recordReservedStoredArtifactLocation: vi.fn(
+    async (id: string, publication: Record<string, unknown>) => {
+      Object.assign(ledgerHarness.rows.get(id)!, publication);
+    }
+  ),
+  settleStoredArtifact: vi.fn(
+    async (id: string, publication: Record<string, unknown>) => {
+      const row = ledgerHarness.rows.get(id)!;
+      const previous = ledgerHarness.active.get(row.logicalKey) ?? null;
+      if (
+        Object.hasOwn(publication, 'expectedPreviousArtifactId') &&
+        (previous?.id ?? null) !== publication.expectedPreviousArtifactId
+      ) {
+        throw new ledgerHarness.PublishConflictError();
+      }
+      if (previous) {
+        previous.state = 'ORPHANED';
+        previous.identityKey = null;
+      }
+      Object.assign(row, publication, {
+        state: 'ACTIVE',
+        identityKey: row.logicalKey,
+      });
+      ledgerHarness.active.set(row.logicalKey, row);
+      return { artifact: row, previous };
+    }
+  ),
+  getActiveStoredArtifactByLogicalKey: vi.fn(
+    async (logicalKey: string) => ledgerHarness.active.get(logicalKey) ?? null
+  ),
+  getStoredArtifactById: vi.fn(
+    async (id: string) => ledgerHarness.rows.get(id) ?? null
+  ),
+  rollbackStoredArtifact: vi.fn(async (id: string) => {
+    const row = ledgerHarness.rows.get(id);
+    if (row) {
+      row.state = 'DELETED';
+      row.chargedBytes = BigInt(0);
+    }
+    return true;
+  }),
+  releaseStoredArtifact: vi.fn(async (id: string) => {
+    const row = ledgerHarness.rows.get(id);
+    if (row) {
+      row.state = 'DELETED';
+      row.chargedBytes = BigInt(0);
+    }
+    return true;
+  }),
+  findBillableStoredArtifactsByOwner: vi.fn(
+    async (ownerType: string, ownerId: string) =>
+      Array.from(ledgerHarness.rows.values()).filter(
+        (row) =>
+          row.ownerType === ownerType &&
+          row.ownerId === ownerId &&
+          row.chargedBytes > BigInt(0)
+      )
+  ),
+  markStoredArtifactsDeletePending: vi.fn(async (ids: string[]) => {
+    for (const id of ids) {
+      const row = ledgerHarness.rows.get(id);
+      if (row) row.state = 'DELETE_PENDING';
+    }
+    return ids.map((id) => ledgerHarness.rows.get(id)).filter(Boolean);
+  }),
+}));
+
 // 每个测试前重新解析模块，并将 cwd 指向独立的临时目录，
 // 确保 DRAFTS_ROOT (process.cwd()/data/recording-drafts) 互不干扰。
 async function loadModule(cwd: string) {
@@ -16,6 +151,7 @@ describe('recordingDraftPersistence', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
+    ledgerHarness.reset();
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'recording-draft-test-'));
   });
 
@@ -483,7 +619,11 @@ describe('recordingDraftPersistence', () => {
 
     // 把 stale 会话的 manifest 与目录时间都推到 72 小时前。
     const staleDir = path.join(tmpDir, 'data', 'recording-drafts', 'stale-sess');
-    const staleManifest = path.join(staleDir, 'manifest.json');
+    const staleManifestName = (await fs.readdir(staleDir)).find(
+      (name) => name.startsWith('manifest-') && name.endsWith('.json')
+    );
+    expect(staleManifestName).toBeDefined();
+    const staleManifest = path.join(staleDir, staleManifestName!);
     const old = Date.now() - 72 * 60 * 60_000;
     const parsed = JSON.parse(await fs.readFile(staleManifest, 'utf-8'));
     await fs.writeFile(

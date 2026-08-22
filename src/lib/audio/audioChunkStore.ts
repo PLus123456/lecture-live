@@ -241,9 +241,25 @@ export async function clearAudioChunks(sessionId: string): Promise<void> {
  *
  * C51/P6-8：登出只清了 store 与 localStorage，IndexedDB 里的音频原封不动地留给下一个
  * 登录本机的账号。这里连 sessionStorage 里的归档快照一起扫掉。
- * 尽力而为：indexedDB 不可用（SSR / 隐私模式）直接返回。
+ * 尽力而为：indexedDB 不可用（SSR / 隐私模式）时仍会先清 sessionStorage 快照。
  */
 export async function clearAllAudioArchives(): Promise<void> {
+  try {
+    const stale: string[] = [];
+    for (let i = 0; i < sessionStorage.length; i += 1) {
+      const key = sessionStorage.key(i);
+      if (key && key.startsWith(ARCHIVE_SNAPSHOT_KEY_PREFIX)) {
+        stale.push(key);
+      }
+    }
+    for (const key of stale) {
+      sessionStorage.removeItem(key);
+    }
+    sessionStorage.removeItem(LEGACY_ARCHIVE_MIME_KEY);
+  } catch {
+    // Best effort only.
+  }
+
   if (typeof indexedDB === 'undefined') {
     return;
   }
@@ -264,22 +280,6 @@ export async function clearAllAudioArchives(): Promise<void> {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
-
-  try {
-    const stale: string[] = [];
-    for (let i = 0; i < sessionStorage.length; i += 1) {
-      const key = sessionStorage.key(i);
-      if (key && key.startsWith(ARCHIVE_SNAPSHOT_KEY_PREFIX)) {
-        stale.push(key);
-      }
-    }
-    for (const key of stale) {
-      sessionStorage.removeItem(key);
-    }
-    sessionStorage.removeItem(LEGACY_ARCHIVE_MIME_KEY);
-  } catch {
-    // Best effort only.
-  }
 }
 
 /**

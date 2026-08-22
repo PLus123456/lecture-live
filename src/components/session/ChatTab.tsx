@@ -633,7 +633,7 @@ export default function ChatTab({
     compressActive,
     addMessage,
   } = useChat(sessionId);
-  const { extractFromText, addManualKeyword } = useKeywords();
+  const { extractFromText, addManualKeywords } = useKeywords();
   const { t } = useI18n();
 
   // U55：当前活跃对话是否已关闭（endedAt 非空）。已关闭对话服务端会 409 拒绝发送，
@@ -824,10 +824,14 @@ export default function ChatTab({
         steps[1].status = 'active';
         setKeywordSteps([...steps]);
 
+        let acceptedKeywords: string[] = [];
         try {
-          manualKeywords.forEach(addManualKeyword);
+          acceptedKeywords = addManualKeywords(manualKeywords);
+          if (acceptedKeywords.length === 0) {
+            throw new Error('关键词未添加：已达安全列表上限或输入超限');
+          }
           if (onInjectKeywords) {
-            await onInjectKeywords(manualKeywords);
+            await onInjectKeywords(acceptedKeywords);
           }
           steps[1].status = 'done';
           setKeywordSteps([...steps]);
@@ -848,8 +852,8 @@ export default function ChatTab({
         addMessage({
           id: crypto.randomUUID(),
           role: 'assistant',
-          content: `已将 ${manualKeywords.length} 个关键词添加到 ASR 上下文: ${manualKeywords.join(', ')}`,
-          thinking: `解析输入: "${manualKeywordInput}"\n识别到 ${manualKeywords.length} 个关键词: [${manualKeywords.join(', ')}]\n已添加到关键词库并注入 ASR 引擎`,
+          content: `已将 ${acceptedKeywords.length} 个关键词添加到 ASR 上下文: ${acceptedKeywords.join(', ')}`,
+          thinking: `解析输入: "${manualKeywordInput}"\n识别到 ${manualKeywords.length} 个关键词，安全准入 ${acceptedKeywords.length} 个: [${acceptedKeywords.join(', ')}]\n已添加到关键词库并注入 ASR 引擎`,
           timestamp: Date.now(),
         });
         setKeywordSteps(null);

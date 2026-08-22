@@ -1,76 +1,110 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-/**
- * R4：完整版补全转录触发端点的「预留持有」门禁。
- * 覆盖：额度足够→预留持有 + claim 登记 fullReservedMinutes（成功不释放）；额度不足→402 不 claim；
- * 已在跑（快路径 / claim 事务权威）→释放本次预留；re-trigger 顶替→锁内释放旧预留；notfound→释放+404。
- */
-
 const {
   verifyAuthMock,
   sessionFindUniqueMock,
-  transactionMock,
-  txQueryRawMock,
-  txSessionUpdateMock,
-  reserveMock,
-  releaseMock,
+  claimMock,
+  registerMock,
+  failClaimMock,
+  prepareInputMock,
+  cleanupMock,
+  measureDurationMock,
   getSiteSettingsMock,
   processFullMock,
-  sessionUpdateManyMock,
-  loadSessionAudioArtifactMock,
-  probeAudioDurationMsFromBufferMock,
+  rateLimitMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
-  transactionMock: vi.fn(),
-  txQueryRawMock: vi.fn(),
-  txSessionUpdateMock: vi.fn(),
-  reserveMock: vi.fn(),
-  releaseMock: vi.fn(),
+  claimMock: vi.fn(),
+  registerMock: vi.fn(),
+  failClaimMock: vi.fn(),
+  prepareInputMock: vi.fn(),
+  cleanupMock: vi.fn(),
+  measureDurationMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
   processFullMock: vi.fn(),
-  sessionUpdateManyMock: vi.fn(),
-  loadSessionAudioArtifactMock: vi.fn(),
-  probeAudioDurationMsFromBufferMock: vi.fn(),
+  rateLimitMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
-// withRequestLogging 直通：POST = 原始 handler，方便直接调用。
 vi.mock('@/lib/requestLogger', () => ({
   withRequestLogging: (_name: string, handler: unknown) => handler,
 }));
-// getBillableMinutes 用真实口径（ceil(ms/60000)）锁死预留分钟。
+vi.mock('@/lib/rateLimit', () => ({ enforceRateLimit: rateLimitMock }));
+vi.mock('@/lib/prisma', () => ({
+  prisma: { session: { findUnique: sessionFindUniqueMock } },
+}));
+vi.mock('@/lib/logger', () => ({
+  logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
 vi.mock('@/lib/billing', () => ({
   getBillableMinutes: (ms: number) => Math.ceil(ms / 60_000),
-  clampSessionDurationMs: (ms: number) => ms,
-}));
-vi.mock('@/lib/quota', () => ({
-  reserveTranscriptionMinutes: reserveMock,
-  releaseTranscriptionMinutes: releaseMock,
+  getMaxSessionDurationMs: (role: string) =>
+    role === 'ADMIN' ? null : role === 'PRO' ? 4 * 60 * 60_000 : 2 * 60 * 60_000,
 }));
 vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: getSiteSettingsMock }));
 vi.mock('@/lib/audio/fullTranscribeProcessor', () => ({
   processFullTranscribe: processFullMock,
 }));
-vi.mock('@/lib/sessionPersistence', () => ({
-  loadSessionAudioArtifact: loadSessionAudioArtifactMock,
+vi.mock('@/lib/audio/fullTranscribeAdmission', () => ({
+  FULL_TRANSCRIBE_ACTIVE_STATES: [
+    'pending',
+    'transcoding',
+    'transcribing',
+    'finalizing',
+  ],
+  claimFullTranscribeTask: claimMock,
+  registerFullTranscribeReservation: registerMock,
+  failFullTranscribeClaim: failClaimMock,
 }));
-vi.mock('@/lib/audio/recordingDuration', () => ({
-  probeAudioDurationMsFromBuffer: probeAudioDurationMsFromBufferMock,
-}));
-vi.mock('@/lib/prisma', () => ({
-  prisma: {
-    session: {
-      findUnique: sessionFindUniqueMock,
-      updateMany: sessionUpdateManyMock,
-    },
-    // claim 走 FOR UPDATE 事务（$queryRaw 读状态+旧预留 → tx.session.update 置位+登记预留）。
-    $transaction: (...a: unknown[]) => transactionMock(...a),
-  },
-}));
-// @/lib/security 用真实实现（assertOwnership 只比对 userId，不带副作用）。
+vi.mock('@/lib/audio/fullTranscribeInput', () => {
+  class FullTranscribeInputTooLargeError extends Error {
+    constructor(readonly maxBytes: number) {
+      super('too large');
+      this.name = 'FullTranscribeInputTooLargeError';
+    }
+  }
+  class FullTranscribeInputUnavailableError extends Error {
+    constructor(message = 'unavailable') {
+      super(message);
+      this.name = 'FullTranscribeInputUnavailableError';
+    }
+  }
+  return {
+    FullTranscribeInputTooLargeError,
+    FullTranscribeInputUnavailableError,
+    prepareFullTranscribeInput: prepareInputMock,
+    cleanupFullTranscribeWorkDir: cleanupMock,
+  };
+});
+vi.mock('@/lib/audio/recordingDuration', () => {
+  class RecordingDurationMeasurementError extends Error {
+    constructor(message = 'measurement failed') {
+      super(message);
+      this.name = 'RecordingDurationMeasurementError';
+    }
+  }
+  return {
+    RecordingDurationMeasurementError,
+    RECORDING_DURATION_LIMIT_GRACE_MS: 60_000,
+    measureAuthoritativeRecordingDurationMs: measureDurationMock,
+  };
+});
 
 import { POST } from '@/app/api/sessions/[id]/full-transcribe/route';
+import {
+  FullTranscribeInputTooLargeError,
+} from '@/lib/audio/fullTranscribeInput';
+import { RecordingDurationMeasurementError } from '@/lib/audio/recordingDuration';
+
+const params = Promise.resolve({ id: 's-1' });
+const input = {
+  inputPath: '/safe/recording.webm',
+  workDir: '/safe/work/s-1--claim-1',
+  contentType: 'audio/webm',
+  sizeBytes: 1024,
+  source: 'local' as const,
+};
 
 function makeReq(): Request {
   return new Request('http://localhost/api/sessions/s-1/full-transcribe', {
@@ -78,246 +112,233 @@ function makeReq(): Request {
   });
 }
 
-/** $transaction 回调注入的 tx：$queryRaw 返回锁行快照(状态+旧预留)，session.update 置位。 */
-function makeTx() {
-  return {
-    $queryRaw: (...a: unknown[]) => txQueryRawMock(...a),
-    session: { update: (...a: unknown[]) => txSessionUpdateMock(...a) },
-  };
-}
-
-const params = Promise.resolve({ id: 's-1' });
-
-// 一场 10min（durationMs=600000 → billable=10）；倍率 0.8 → est = ceil(10×0.8)=8
 function completedSession(over: Record<string, unknown> = {}) {
   return {
     id: 's-1',
     userId: 'user-1',
     status: 'COMPLETED',
-    recordingPath: '/user-1/recordings/s-1.webm',
+    recordingPath: 'local:recording.webm',
     durationMs: 600_000,
     fullTranscribeStatus: null,
-    fullReservedMinutes: 0,
     ...over,
   };
 }
 
-describe('POST full-transcribe — R4 预留持有门禁', () => {
-  beforeEach(() => {
-    verifyAuthMock.mockReset();
-    sessionFindUniqueMock.mockReset();
-    transactionMock.mockReset();
-    txQueryRawMock.mockReset();
-    txSessionUpdateMock.mockReset();
-    sessionUpdateManyMock.mockReset().mockResolvedValue({ count: 1 });
-    loadSessionAudioArtifactMock.mockReset().mockResolvedValue(null);
-    probeAudioDurationMsFromBufferMock.mockReset().mockResolvedValue(0);
-    reserveMock.mockReset();
-    releaseMock.mockReset();
-    getSiteSettingsMock.mockReset();
-    processFullMock.mockReset();
+function claimed() {
+  return {
+    outcome: 'claimed' as const,
+    claimId: 'claim-1',
+    startedAt: new Date('2026-08-20T00:00:00Z'),
+    session: {
+      id: 's-1',
+      userId: 'user-1',
+      recordingPath: 'local:recording.webm',
+    },
+  };
+}
 
+describe('POST full-transcribe — claim-before-read and measured billing', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
     verifyAuthMock.mockResolvedValue({ id: 'user-1', role: 'FREE' });
     sessionFindUniqueMock.mockResolvedValue(completedSession());
+    claimMock.mockResolvedValue(claimed());
+    prepareInputMock.mockResolvedValue(input);
+    measureDurationMock.mockResolvedValue(42 * 60_000);
     getSiteSettingsMock.mockResolvedValue({ async_upload_billing_multiplier: 0.8 });
-    reserveMock.mockResolvedValue(true);
-    releaseMock.mockResolvedValue(undefined);
+    registerMock.mockResolvedValue({ outcome: 'reserved' });
+    failClaimMock.mockResolvedValue(true);
+    cleanupMock.mockResolvedValue(undefined);
     processFullMock.mockResolvedValue(undefined);
-    // 默认 claim 事务：执行回调并注入 tx；$queryRaw 默认返回可 claim 的空态、无旧预留。
-    transactionMock.mockImplementation(
-      async (cb: (tx: unknown) => Promise<unknown>) => cb(makeTx())
+    rateLimitMock.mockResolvedValue(null);
+  });
+
+  it('claims/admit resources before path resolution, measurement, reservation and processing', async () => {
+    const response = await POST(makeReq(), { params });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      status: 'pending',
+      estimatedMinutes: 34,
+    });
+    expect(claimMock).toHaveBeenCalledWith('s-1', 'user-1');
+    expect(prepareInputMock).toHaveBeenCalledWith(claimed().session, 'claim-1');
+    expect(measureDurationMock).toHaveBeenCalledWith(input.inputPath, {
+      tempRoot: input.workDir,
+    });
+    expect(registerMock).toHaveBeenCalledWith({
+      sessionId: 's-1',
+      userId: 'user-1',
+      claimId: 'claim-1',
+      durationMs: 42 * 60_000,
+      estimatedMinutes: 34,
+    });
+    expect(processFullMock).toHaveBeenCalledWith({
+      sessionId: 's-1',
+      claimId: 'claim-1',
+      input,
+      authoritativeDurationMs: 42 * 60_000,
+    });
+
+    expect(claimMock.mock.invocationCallOrder[0]).toBeLessThan(
+      prepareInputMock.mock.invocationCallOrder[0]
     );
-    txQueryRawMock.mockResolvedValue([
-      { fullTranscribeStatus: null, fullReservedMinutes: 0 },
+    expect(prepareInputMock.mock.invocationCallOrder[0]).toBeLessThan(
+      measureDurationMock.mock.invocationCallOrder[0]
+    );
+    expect(measureDurationMock.mock.invocationCallOrder[0]).toBeLessThan(
+      registerMock.mock.invocationCallOrder[0]
+    );
+    expect(registerMock.mock.invocationCallOrder[0]).toBeLessThan(
+      processFullMock.mock.invocationCallOrder[0]
+    );
+  });
+
+  it('does not trust a tiny positive stored duration', async () => {
+    sessionFindUniqueMock.mockResolvedValueOnce(completedSession({ durationMs: 1 }));
+    measureDurationMock.mockResolvedValueOnce(10 * 60_000);
+
+    const response = await POST(makeReq(), { params });
+
+    expect(response.status).toBe(200);
+    expect(measureDurationMock).toHaveBeenCalledOnce();
+    expect(registerMock).toHaveBeenCalledWith(
+      expect.objectContaining({ durationMs: 10 * 60_000, estimatedMinutes: 8 })
+    );
+  });
+
+  it('two concurrent same-session triggers let only the claim winner touch audio', async () => {
+    claimMock
+      .mockResolvedValueOnce(claimed())
+      .mockResolvedValueOnce({ outcome: 'already_running', status: 'pending' });
+
+    const [winner, loser] = await Promise.all([
+      POST(makeReq(), { params }),
+      POST(makeReq(), { params }),
     ]);
-    txSessionUpdateMock.mockResolvedValue(undefined);
+
+    expect(winner.status).toBe(200);
+    expect(loser.status).toBe(200);
+    await expect(loser.json()).resolves.toMatchObject({ alreadyRunning: true });
+    expect(claimMock).toHaveBeenCalledTimes(2);
+    expect(prepareInputMock).toHaveBeenCalledTimes(1);
+    expect(measureDurationMock).toHaveBeenCalledTimes(1);
+    expect(processFullMock).toHaveBeenCalledTimes(1);
   });
 
-  it('额度足够 → 预留持有(成功不释放) + claim 登记 fullReservedMinutes=est(8)', async () => {
-    const res = await POST(makeReq(), { params });
-
-    expect(res.status).toBe(200);
-    const json = (await res.json()) as { status: string; estimatedMinutes: number };
-    expect(json.status).toBe('pending');
-    expect(json.estimatedMinutes).toBe(8);
-
-    // 预留一次 8 分钟；成功路径不释放（持有到 finalize/删除/回收）；无旧预留 → 不 release。
-    expect(reserveMock).toHaveBeenCalledWith('user-1', 8);
-    expect(releaseMock).not.toHaveBeenCalled();
-    // claim 事务把本次预留额写入 fullReservedMinutes + 置 pending。
-    expect(txSessionUpdateMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: 's-1' },
-        data: expect.objectContaining({
-          fullTranscribeStatus: 'pending',
-          fullReservedMinutes: 8,
-        }),
-      })
-    );
-    // fire-and-forget 后台处理已触发。
-    expect(processFullMock).toHaveBeenCalledWith('s-1');
-  });
-
-  it('额度不足：reserve→false → 402，不进 claim 事务、不释放、不触发后台', async () => {
-    reserveMock.mockResolvedValueOnce(false);
-
-    const res = await POST(makeReq(), { params });
-
-    expect(res.status).toBe(402);
-    expect(transactionMock).not.toHaveBeenCalled();
-    expect(releaseMock).not.toHaveBeenCalled();
-    expect(processFullMock).not.toHaveBeenCalled();
-  });
-
-  it('快路径 already_running（findUnique 读到活动态）→ 200，根本不预留', async () => {
+  it('fast-path active status performs no claim or file work', async () => {
     sessionFindUniqueMock.mockResolvedValueOnce(
       completedSession({ fullTranscribeStatus: 'transcribing' })
     );
 
-    const res = await POST(makeReq(), { params });
+    const response = await POST(makeReq(), { params });
 
-    expect(res.status).toBe(200);
-    const json = (await res.json()) as { alreadyRunning: boolean };
-    expect(json.alreadyRunning).toBe(true);
-    // 未预留、未进 claim 事务。
-    expect(reserveMock).not.toHaveBeenCalled();
-    expect(transactionMock).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(claimMock).not.toHaveBeenCalled();
+    expect(prepareInputMock).not.toHaveBeenCalled();
   });
 
-  it('权威 already_running（claim 事务锁内读到活动态，并发触发抢先）→ 释放本次预留(8) + 200', async () => {
-    // 快路径 snapshot 为 null（放行），但锁内读到并发已置 pending。
-    sessionFindUniqueMock
-      .mockResolvedValueOnce(completedSession())
-      .mockResolvedValueOnce({ fullTranscribeStatus: 'pending' }); // latest 查询
-    txQueryRawMock.mockResolvedValueOnce([
-      { fullTranscribeStatus: 'pending', fullReservedMinutes: 0 },
-    ]);
+  it('rate-limits repeated expensive triggers before session lookup or claim', async () => {
+    rateLimitMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: 'Too many requests' }), { status: 429 })
+    );
 
-    const res = await POST(makeReq(), { params });
+    const response = await POST(makeReq(), { params });
 
-    expect(res.status).toBe(200);
-    const json = (await res.json()) as { alreadyRunning: boolean };
-    expect(json.alreadyRunning).toBe(true);
-    // 预留已发生 → 撤销本次预留 8；绝不写 fullReservedMinutes、不触发后台。
-    expect(reserveMock).toHaveBeenCalledWith('user-1', 8);
-    expect(releaseMock).toHaveBeenCalledWith('user-1', 8);
-    expect(txSessionUpdateMock).not.toHaveBeenCalled();
+    expect(response.status).toBe(429);
+    expect(sessionFindUniqueMock).not.toHaveBeenCalled();
+    expect(claimMock).not.toHaveBeenCalled();
+    expect(prepareInputMock).not.toHaveBeenCalled();
+  });
+
+  it('user/global admission rejection happens before file work', async () => {
+    claimMock.mockResolvedValueOnce({ outcome: 'user_busy' });
+    const userBusy = await POST(makeReq(), { params });
+    expect(userBusy.status).toBe(429);
+    expect(userBusy.headers.get('retry-after')).toBe('30');
+
+    claimMock.mockResolvedValueOnce({ outcome: 'global_busy' });
+    const globalBusy = await POST(makeReq(), { params });
+    expect(globalBusy.status).toBe(503);
+    expect(prepareInputMock).not.toHaveBeenCalled();
+  });
+
+  it('quota rejection fails inside reservation transaction and removes temp input', async () => {
+    registerMock.mockResolvedValueOnce({ outcome: 'insufficient_quota' });
+
+    const response = await POST(makeReq(), { params });
+
+    expect(response.status).toBe(402);
+    expect(cleanupMock).toHaveBeenCalledWith('s-1', 'claim-1');
     expect(processFullMock).not.toHaveBeenCalled();
   });
 
-  it('re-trigger 顶替：claim 事务锁内读到旧预留(5) → 同一事务释放它，净预留=本次(8)', async () => {
-    // 快路径 snapshot：failed 态（放行），锁内读到残留旧预留 5。
-    sessionFindUniqueMock.mockResolvedValueOnce(
-      completedSession({ fullTranscribeStatus: 'failed', fullReservedMinutes: 5 })
+  it('measurement failure marks only this claim failed and cleans temp', async () => {
+    measureDurationMock.mockRejectedValueOnce(
+      new RecordingDurationMeasurementError('decode failed')
     );
-    txQueryRawMock.mockResolvedValueOnce([
-      { fullTranscribeStatus: 'failed', fullReservedMinutes: 5 },
-    ]);
 
-    const res = await POST(makeReq(), { params });
+    const response = await POST(makeReq(), { params });
 
-    expect(res.status).toBe(200);
-    // 本次 reserve 8；在 claim 事务内释放旧预留 5（第三参为事务 tx）。
-    expect(reserveMock).toHaveBeenCalledWith('user-1', 8);
-    expect(releaseMock).toHaveBeenCalledWith('user-1', 5, expect.anything());
-    // 新预留登记为 8（顶替旧值）。
-    expect(txSessionUpdateMock).toHaveBeenCalledWith(
+    expect(response.status).toBe(409);
+    expect(failClaimMock).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 's-1', claimId: 'claim-1' })
+    );
+    expect(cleanupMock).toHaveBeenCalledWith('s-1', 'claim-1');
+    expect(registerMock).not.toHaveBeenCalled();
+    expect(processFullMock).not.toHaveBeenCalled();
+  });
+
+  it('actual streamed bytes over the cap return 413 and release the claim', async () => {
+    prepareInputMock.mockRejectedValueOnce(new FullTranscribeInputTooLargeError(1024));
+
+    const response = await POST(makeReq(), { params });
+
+    expect(response.status).toBe(413);
+    expect(failClaimMock).toHaveBeenCalledWith(
+      expect.objectContaining({ claimId: 'claim-1', error: 'Recording is too large for full transcription' })
+    );
+    expect(measureDurationMock).not.toHaveBeenCalled();
+  });
+
+  it('does not clamp an over-role recording into a cheaper billable duration', async () => {
+    measureDurationMock.mockResolvedValueOnce(2 * 60 * 60_000 + 60_001);
+
+    const response = await POST(makeReq(), { params });
+
+    expect(response.status).toBe(409);
+    expect(registerMock).not.toHaveBeenCalled();
+    expect(failClaimMock).toHaveBeenCalledWith(
+      expect.objectContaining({ durationMs: 2 * 60 * 60_000 + 60_001 })
+    );
+  });
+
+  it('keeps the publish-path one-minute codec tail grace but bills the real duration', async () => {
+    measureDurationMock.mockResolvedValueOnce(2 * 60 * 60_000 + 30_000);
+
+    const response = await POST(makeReq(), { params });
+
+    expect(response.status).toBe(200);
+    expect(registerMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ fullReservedMinutes: 8 }),
+        durationMs: 2 * 60 * 60_000 + 30_000,
+        estimatedMinutes: 97,
       })
     );
   });
 
-  it('claim 事务锁内行不存在（并发删除）→ 释放本次预留(8) + 404', async () => {
-    txQueryRawMock.mockResolvedValueOnce([]);
-
-    const res = await POST(makeReq(), { params });
-
-    expect(res.status).toBe(404);
-    expect(releaseMock).toHaveBeenCalledWith('user-1', 8);
-    expect(processFullMock).not.toHaveBeenCalled();
-  });
-
-  it('会话未收尾（status=RECORDING）→ 409，不预留', async () => {
-    sessionFindUniqueMock.mockResolvedValueOnce(
-      completedSession({ status: 'RECORDING' })
-    );
-    const res = await POST(makeReq(), { params });
-    expect(res.status).toBe(409);
-    expect(reserveMock).not.toHaveBeenCalled();
-  });
-
-  it('无录音（recordingPath 空）→ 409，不预留', async () => {
-    sessionFindUniqueMock.mockResolvedValueOnce(
-      completedSession({ recordingPath: null })
-    );
-    const res = await POST(makeReq(), { params });
-    expect(res.status).toBe(409);
-    expect(reserveMock).not.toHaveBeenCalled();
-  });
-
-  it('未授权 → 401，不触碰配额', async () => {
+  it('preserves auth, ownership and finalized-session gates before claim', async () => {
     verifyAuthMock.mockResolvedValueOnce(null);
-    const res = await POST(makeReq(), { params });
-    expect(res.status).toBe(401);
-    expect(reserveMock).not.toHaveBeenCalled();
-  });
+    expect((await POST(makeReq(), { params })).status).toBe(401);
 
-  it('非本人 session → 403，不预留', async () => {
     sessionFindUniqueMock.mockResolvedValueOnce(
       completedSession({ userId: 'someone-else' })
     );
-    const res = await POST(makeReq(), { params });
-    expect(res.status).toBe(403);
-    expect(reserveMock).not.toHaveBeenCalled();
-  });
+    expect((await POST(makeReq(), { params })).status).toBe(403);
 
-  /**
-   * session-persist#143 的钱侧：durationMs 是本任务**唯一**的计价依据 —— 入口预留与
-   * fullTranscribeFinalize 的实扣都是 ceil(getBillableMinutes(session.durationMs) × 倍率)，
-   * 而 Soniox usage-logs 对账只覆盖 mint 过 grant 的直连串流，异步文件转录事后无人补收。
-   * 所以 durationMs=0 的会话必须先探出真实时长再计价，探不到就不许开跑。
-   */
-  it('session-persist#143：durationMs=0 → 先探测真实时长、落库、按探测值计价', async () => {
-    sessionFindUniqueMock.mockResolvedValueOnce(completedSession({ durationMs: 0 }));
-    loadSessionAudioArtifactMock.mockResolvedValueOnce({
-      data: Buffer.from('audio'),
-      contentType: 'audio/webm',
-    });
-    probeAudioDurationMsFromBufferMock.mockResolvedValueOnce(42 * 60_000);
-    reserveMock.mockResolvedValueOnce(true);
-    transactionMock.mockImplementationOnce(async (cb: (tx: unknown) => unknown) => cb(makeTx()));
-    txQueryRawMock.mockResolvedValueOnce([
-      { fullTranscribeStatus: null, fullReservedMinutes: 0 },
-    ]);
+    sessionFindUniqueMock.mockResolvedValueOnce(completedSession({ status: 'RECORDING' }));
+    expect((await POST(makeReq(), { params })).status).toBe(409);
 
-    const res = await POST(makeReq(), { params });
-
-    expect(res.status).toBe(200);
-    // 修正值落库（条件更新：只覆盖仍 <=0 的行，绝不压掉并发写入的正数）
-    expect(sessionUpdateManyMock).toHaveBeenCalledWith({
-      where: { id: 's-1', durationMs: { lte: 0 } },
-      data: { durationMs: 42 * 60_000 },
-    });
-    // 计价按探测值：ceil(42 × 0.8) = 34，而不是旧代码的 0（= 整段免费）
-    expect(reserveMock).toHaveBeenCalledWith('user-1', 34);
-    await expect(res.json()).resolves.toMatchObject({ estimatedMinutes: 34 });
-  });
-
-  it('session-persist#143：durationMs=0 且探不到时长 → 409，不预留、不 claim、不开跑', async () => {
-    sessionFindUniqueMock.mockResolvedValueOnce(completedSession({ durationMs: 0 }));
-    loadSessionAudioArtifactMock.mockResolvedValueOnce({
-      data: Buffer.from('unreadable'),
-      contentType: 'audio/webm',
-    });
-    probeAudioDurationMsFromBufferMock.mockResolvedValueOnce(0);
-
-    const res = await POST(makeReq(), { params });
-
-    expect(res.status).toBe(409);
-    expect(reserveMock).not.toHaveBeenCalled();
-    expect(transactionMock).not.toHaveBeenCalled();
-    expect(processFullMock).not.toHaveBeenCalled();
-    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+    expect(claimMock).not.toHaveBeenCalled();
   });
 });

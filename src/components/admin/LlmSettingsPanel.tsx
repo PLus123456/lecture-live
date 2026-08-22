@@ -30,6 +30,7 @@ import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
 import ModalPortal from '@/components/ModalPortal';
 import ConfirmDialog from '@/components/ConfirmDialog';
+import { normalizeCredentialEndpoint } from '@/lib/credentialRetarget';
 
 /* ────────────────────────── 类型 ────────────────────────── */
 
@@ -88,6 +89,7 @@ interface Gateway {
   isAnthropic: boolean;
   hasApiKey: boolean;
   maskedApiKey: string;
+  endpointRedacted: boolean;
   registryModels: RegistryModel[];
   routes: RouteRow[];
 }
@@ -240,6 +242,7 @@ export default function LlmSettingsPanel() {
             isAnthropic: Boolean(p.isAnthropic),
             hasApiKey: Boolean(p.hasApiKey),
             maskedApiKey: (p.maskedApiKey ?? '') as string,
+            endpointRedacted: Boolean(p.endpointRedacted),
             registryModels: ((p.registryModels ?? []) as RegistryModel[]).map(
               (m) => ({ ...m, routes: m.routes ?? [] })
             ),
@@ -1475,7 +1478,7 @@ function SpecCell({
 
 /* ────────────────────────── 弹窗：网关 ────────────────────────── */
 
-function GatewayModal({
+export function GatewayModal({
   gateway,
   onClose,
   onSaved,
@@ -1489,15 +1492,37 @@ function GatewayModal({
   const [name, setName] = useState(gateway?.name ?? '');
   const [apiBase, setApiBase] = useState(gateway?.apiBase ?? '');
   const [apiKey, setApiKey] = useState('');
+  const [currentPassword, setCurrentPassword] = useState('');
   const [isAnthropic, setIsAnthropic] = useState(gateway?.isAnthropic ?? false);
   const [saving, setSaving] = useState(false);
 
   const inputCls =
     'w-full px-3 py-2 text-sm border border-cream-200 dark:border-charcoal-600 rounded-lg bg-white dark:bg-charcoal-700 text-charcoal-800 dark:text-cream-100 focus:outline-none focus:ring-2 focus:ring-rust-200 focus:border-rust-300';
 
+  const retargeted =
+    !isNew &&
+    (gateway!.endpointRedacted ||
+      normalizeCredentialEndpoint(apiBase) !==
+        normalizeCredentialEndpoint(gateway!.apiBase) ||
+      isAnthropic !== gateway!.isAnthropic);
+  const requiresCurrentPassword = isNew || retargeted;
+
   const submit = async () => {
-    if (!name.trim() || !apiBase.trim() || (isNew && !apiKey.trim())) {
+    if (
+      !name.trim() ||
+      !apiBase.trim() ||
+      (isNew && !apiKey.trim()) ||
+      (retargeted && gateway?.hasApiKey && !apiKey.trim())
+    ) {
+      if (retargeted && gateway?.hasApiKey && !apiKey.trim()) {
+        toast.error(t('adminSettings.llmApiKeyRequiredOnEndpointChange'));
+        return;
+      }
       toast.error(t('adminSettings.llmGatewayMissingFields'));
+      return;
+    }
+    if (requiresCurrentPassword && !currentPassword) {
+      toast.error(t('adminSettings.llmCurrentPasswordRequired'));
       return;
     }
     setSaving(true);
@@ -1513,6 +1538,7 @@ function GatewayModal({
           apiBase: apiBase.trim(),
           isAnthropic,
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+          ...(requiresCurrentPassword ? { currentPassword } : {}),
         }),
       });
       if (res.ok) {
@@ -1527,6 +1553,7 @@ function GatewayModal({
     } catch {
       toast.error(t('common.saveFailed'), t('common.networkError'));
     } finally {
+      setCurrentPassword('');
       setSaving(false);
     }
   };
@@ -1588,7 +1615,30 @@ function GatewayModal({
                 placeholder={isNew ? 'sk-...' : '••••••••'}
                 className={inputCls}
               />
+              {!isNew && gateway?.hasApiKey && (
+                <p className="mt-1 text-[11px] text-charcoal-400 dark:text-charcoal-500">
+                  {t('adminSettings.llmApiKeyRetargetHint')}
+                </p>
+              )}
             </div>
+            {requiresCurrentPassword && (
+              <div>
+                <label className="text-xs text-charcoal-500 dark:text-charcoal-300 mb-1 block">
+                  {t('auth.currentPassword')}
+                </label>
+                <input
+                  type="password"
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  autoComplete="current-password"
+                  placeholder={t('settings.currentPasswordPlaceholder')}
+                  className={inputCls}
+                />
+                <p className="mt-1 text-[11px] text-charcoal-400 dark:text-charcoal-500">
+                  {t('adminSettings.llmCurrentPasswordHint')}
+                </p>
+              </div>
+            )}
             <label className="flex items-center gap-2 text-sm text-charcoal-600 dark:text-cream-200 cursor-pointer">
               <input
                 type="checkbox"

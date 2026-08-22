@@ -21,7 +21,10 @@ import {
   countTitleWords,
   type TitleGenerationResult,
 } from './security';
-import { estimateTokens } from './tokenizer';
+import {
+  estimateTokens,
+  truncateToTokensFromEndUtf8ByteUpperBound,
+} from './tokenizer';
 import { chunkText } from './chunking';
 import { logger, serializeError } from '@/lib/logger';
 
@@ -35,6 +38,20 @@ const MAP_REDUCE_CONCURRENCY = 3;
  * 配置里读出 contextWindow 传进来。
  */
 const DEFAULT_CONTEXT_WINDOW = 16384;
+
+/**
+ * 单份报告允许的最坏供应商工作量。合法的数小时课程通常远低于 128 次调用；
+ * 该硬顶主要阻断超大持久化 transcript 被放大成默认 500 次 map 调用。
+ */
+export const REPORT_MAX_PROVIDER_CALLS = 128;
+export const REPORT_MAX_RESERVED_TOKENS = 2_500_000;
+const PROMPT_PROTOCOL_TOKEN_OVERHEAD = 64;
+
+function positiveIntegerOrDefault(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) && (value ?? 0) > 0
+    ? Math.floor(value as number)
+    : fallback;
+}
 
 /**
  * 计算 final summary 阶段的"transcript 输入预算"。
@@ -65,6 +82,170 @@ function formatReportDuration(hours: number, mins: number, language: string): st
 
 /** 最短有效转录文本长度（字符数）— 过短的直接跳过 */
 const MIN_TRANSCRIPT_LENGTH = 50;
+
+export interface SessionReportWorkPlan {
+  providerCalls: number;
+  reservedTokens: number;
+  chunkCount: number;
+  usesMapReduce: boolean;
+}
+
+export class SessionReportBudgetExceededError extends Error {
+  constructor(readonly plan: SessionReportWorkPlan) {
+    super(
+      `report generation exceeds budget (${plan.providerCalls} calls, ${plan.reservedTokens} reserved tokens)`
+    );
+    this.name = 'SessionReportBudgetExceededError';
+  }
+}
+
+export interface PlanReportWorkOptions {
+  transcript: string;
+  sessionTitle: string;
+  courseName: string;
+  durationMs: number;
+  date: string;
+  summaryBlocks: SummaryBlock[];
+  language: string;
+  contextWindow?: number;
+  /** 实际 gateway 请求会使用的 max_tokens；每次调用都按该最坏输出量预留。 */
+  maxOutputTokens?: number;
+}
+
+function buildSummaryContext(summaryBlocks: SummaryBlock[]): string {
+  return summaryBlocks
+    .map((block) => {
+      const parts = [block.summary];
+      if (block.keyPoints.length > 0) {
+        parts.push('Key points: ' + block.keyPoints.join('; '));
+      }
+      return parts.join(' | ');
+    })
+    .join('\n')
+    .slice(0, LLM_LIMITS.reportSummaryContext);
+}
+
+/**
+ * 用 UTF-8 字节数作为输入 token 的保守上界。主流 BPE 的单个 token 至少消费一个字节；
+ * 再加固定协议开销，避免只按字符/某一家 tokenizer 低估供应商实际计费。
+ */
+function promptTokenUpperBound(system: string, user: string): number {
+  return (
+    new TextEncoder().encode(system).byteLength +
+    new TextEncoder().encode(user).byteLength +
+    PROMPT_PROTOCOL_TOKEN_OVERHEAD
+  );
+}
+
+/**
+ * 在首个供应商调用前计算整次 significance + map/reduce 的最坏工作量。
+ * 这是纯函数；调用方必须先 assertSessionReportWorkWithinBudget，再取得跨实例单飞 claim。
+ */
+export function planSessionReportWork(
+  options: PlanReportWorkOptions
+): SessionReportWorkPlan {
+  const contextWindow = positiveIntegerOrDefault(
+    options.contextWindow,
+    DEFAULT_CONTEXT_WINDOW
+  );
+  const maxOutputTokens = positiveIntegerOrDefault(options.maxOutputTokens, 4096);
+
+  if (options.transcript.trim().length < MIN_TRANSCRIPT_LENGTH) {
+    return {
+      providerCalls: 0,
+      reservedTokens: 0,
+      chunkCount: 0,
+      usesMapReduce: false,
+    };
+  }
+
+  const significancePrompt = buildSignificanceEvaluationPrompt(
+    options.transcript,
+    options.durationMs,
+    options.language
+  );
+  let providerCalls = 1;
+  let reservedTokens =
+    promptTokenUpperBound(significancePrompt.system, significancePrompt.user) +
+    maxOutputTokens;
+
+  const inputBudget = computeTranscriptInputBudget(contextWindow);
+  const transcriptTokens = estimateTokens(options.transcript);
+  const summaryContext = buildSummaryContext(options.summaryBlocks);
+  let chunkCount = 0;
+  let usesMapReduce = false;
+
+  if (transcriptTokens > inputBudget) {
+    usesMapReduce = true;
+    const chunks = chunkText(options.transcript, { chunkTargetTokens: 800 });
+    chunkCount = chunks.length;
+    providerCalls += chunks.length;
+    for (const chunk of chunks) {
+      const prompt = buildChunkSummaryPrompt(
+        chunk.text,
+        chunk.index,
+        chunks.length,
+        options.language
+      );
+      reservedTokens +=
+        promptTokenUpperBound(prompt.system, prompt.user) + maxOutputTokens;
+    }
+
+    // map 输出最终会在 reportManager 中由 truncateToTokensFromEnd 截到 inputBudget。
+    // 按该函数的确定 UTF-8 字节上界全额预留，再叠加不含 transcript 的固定 prompt。
+    const finalPrompt = buildSessionReportPrompt(
+      '',
+      options.sessionTitle,
+      options.courseName,
+      options.durationMs,
+      options.date,
+      summaryContext,
+      options.language
+    );
+    reservedTokens +=
+      promptTokenUpperBound(finalPrompt.system, finalPrompt.user) +
+      truncateToTokensFromEndUtf8ByteUpperBound(inputBudget) +
+      maxOutputTokens;
+    providerCalls += 1;
+  } else {
+    const finalPrompt = buildSessionReportPrompt(
+      options.transcript,
+      options.sessionTitle,
+      options.courseName,
+      options.durationMs,
+      options.date,
+      summaryContext,
+      options.language
+    );
+    reservedTokens +=
+      promptTokenUpperBound(finalPrompt.system, finalPrompt.user) + maxOutputTokens;
+    providerCalls += 1;
+  }
+
+  return {
+    providerCalls,
+    reservedTokens,
+    chunkCount,
+    usesMapReduce,
+  };
+}
+
+export function assertSessionReportWorkWithinBudget(
+  plan: SessionReportWorkPlan
+): void {
+  if (
+    !Number.isSafeInteger(plan.providerCalls) ||
+    plan.providerCalls < 0 ||
+    !Number.isSafeInteger(plan.reservedTokens) ||
+    plan.reservedTokens < 0 ||
+    !Number.isSafeInteger(plan.chunkCount) ||
+    plan.chunkCount < 0 ||
+    plan.providerCalls > REPORT_MAX_PROVIDER_CALLS ||
+    plan.reservedTokens > REPORT_MAX_RESERVED_TOKENS
+  ) {
+    throw new SessionReportBudgetExceededError(plan);
+  }
+}
 
 interface GenerateReportOptions {
   sessionId: string;
@@ -102,8 +283,12 @@ export async function generateSessionReport(
     summaryBlocks,
     language,
     callLLM,
-    contextWindow = DEFAULT_CONTEXT_WINDOW,
+    contextWindow: rawContextWindow,
   } = options;
+  const contextWindow = positiveIntegerOrDefault(
+    rawContextWindow,
+    DEFAULT_CONTEXT_WINDOW
+  );
 
   // 快速检查：转录文本过短直接跳过
   if (transcript.trim().length < MIN_TRANSCRIPT_LENGTH) {
@@ -135,16 +320,7 @@ export async function generateSessionReport(
   }
 
   // 步骤 2: 生成结构化报告
-  const summaryContext = summaryBlocks
-    .map((block) => {
-      const parts = [block.summary];
-      if (block.keyPoints.length > 0) {
-        parts.push('Key points: ' + block.keyPoints.join('; '));
-      }
-      return parts.join(' | ');
-    })
-    .join('\n')
-    .slice(0, LLM_LIMITS.reportSummaryContext);
+  const summaryContext = buildSummaryContext(summaryBlocks);
 
   const report = await generateReport(
     transcript,

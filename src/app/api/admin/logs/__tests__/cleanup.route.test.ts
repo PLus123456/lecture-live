@@ -5,12 +5,18 @@ const {
   requireAdminAccessMock,
   auditLogDeleteManyMock,
   auditLogCountMock,
+  auditLogFindManyMock,
+  transactionMock,
   logActionMock,
+  writeSecurityAuditMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   auditLogDeleteManyMock: vi.fn(),
   auditLogCountMock: vi.fn(),
+  auditLogFindManyMock: vi.fn(),
+  transactionMock: vi.fn(),
   logActionMock: vi.fn(),
+  writeSecurityAuditMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({
@@ -21,13 +27,18 @@ vi.mock('@/lib/auditLog', () => ({
   logAction: logActionMock,
 }));
 
+vi.mock('@/lib/securityAudit', () => ({
+  writeSecurityAudit: writeSecurityAuditMock,
+}));
+
 vi.mock('@/lib/prisma', () => ({
   prisma: {
     auditLog: {
       deleteMany: auditLogDeleteManyMock,
       count: auditLogCountMock,
-      findMany: vi.fn(),
+      findMany: auditLogFindManyMock,
     },
+    $transaction: transactionMock,
   },
 }));
 
@@ -44,8 +55,18 @@ beforeEach(() => {
   requireAdminAccessMock.mockReset();
   auditLogDeleteManyMock.mockReset();
   auditLogCountMock.mockReset();
+  auditLogFindManyMock.mockReset();
+  transactionMock.mockReset();
   logActionMock.mockReset();
+  writeSecurityAuditMock.mockReset();
   requireAdminAccessMock.mockResolvedValue({ user: adminUser, response: null });
+  writeSecurityAuditMock.mockResolvedValue({
+    requestId: 'request-1',
+    action: 'admin.security.audit_logs.cleanup',
+  });
+  transactionMock.mockImplementation(async (callback) =>
+    callback({ auditLog: { deleteMany: auditLogDeleteManyMock } })
+  );
 });
 
 function deleteReq(params: Record<string, string | string[]>): Request {
@@ -132,6 +153,30 @@ describe('DELETE /api/admin/logs', () => {
       'admin.auditlog.cleanup',
       expect.objectContaining({ user: adminUser })
     );
+    expect(writeSecurityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'audit_logs.cleanup',
+        outcome: 'SUCCESS',
+      }),
+      expect.objectContaining({ auditLog: expect.any(Object) })
+    );
+  });
+
+  it('安全审计写入失败时返回 503，且不记录删除成功', async () => {
+    auditLogDeleteManyMock.mockResolvedValue({ count: 5 });
+    writeSecurityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+
+    const res = await DELETE(
+      deleteReq({ actionCategories: 'system', olderThanDays: '180' })
+    );
+
+    expect(res.status).toBe(503);
+    expect(transactionMock).toHaveBeenCalledTimes(1);
+    expect(logActionMock).not.toHaveBeenCalled();
+    await expect(readJson<{ error: string }>(res)).resolves.toEqual({
+      error: '安全审计服务不可用',
+    });
   });
 
   it('非管理员 — deleteMany 不被调用', async () => {
@@ -159,6 +204,28 @@ describe('GET /api/admin/logs?cleanup_preview=1', () => {
     expect(res.status).toBe(200);
     await expect(readJson<{ count: number }>(res)).resolves.toEqual({ count: 50 });
     expect(auditLogDeleteManyMock).not.toHaveBeenCalled();
+    expect(writeSecurityAuditMock).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        event: 'audit_logs.cleanup_preview',
+        after: { eligibleCount: 50 },
+      })
+    );
+  });
+
+  it('审计失败时不返回清理预览数据', async () => {
+    auditLogCountMock.mockResolvedValue(50);
+    writeSecurityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+
+    const req = new Request(
+      'http://localhost:3000/api/admin/logs?cleanup_preview=1&actionCategories=session&olderThanDays=60'
+    );
+    const res = await GET(req);
+
+    expect(res.status).toBe(503);
+    await expect(readJson<Record<string, unknown>>(res)).resolves.toEqual({
+      error: '安全审计服务不可用',
+    });
   });
 
   it('preview 也拒绝危险类别', async () => {
@@ -168,5 +235,44 @@ describe('GET /api/admin/logs?cleanup_preview=1', () => {
     const res = await GET(req);
     expect(res.status).toBe(400);
     expect(auditLogCountMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/admin/logs', () => {
+  it('返回敏感日志前等待安全审计成功', async () => {
+    auditLogFindManyMock.mockResolvedValue([
+      { id: 'log-1', detail: 'sensitive evidence' },
+    ]);
+    auditLogCountMock.mockResolvedValue(1);
+
+    const req = new Request('http://localhost:3000/api/admin/logs?page=1');
+    const res = await GET(req);
+
+    expect(res.status).toBe(200);
+    expect(writeSecurityAuditMock).toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({
+        event: 'audit_logs.read',
+        outcome: 'SUCCESS',
+        after: expect.objectContaining({ resultCount: 1, total: 1 }),
+      })
+    );
+  });
+
+  it('安全审计失败时不泄露日志内容', async () => {
+    auditLogFindManyMock.mockResolvedValue([
+      { id: 'log-1', detail: 'sensitive evidence' },
+    ]);
+    auditLogCountMock.mockResolvedValue(1);
+    writeSecurityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+
+    const res = await GET(
+      new Request('http://localhost:3000/api/admin/logs?page=1')
+    );
+    const body = await readJson<Record<string, unknown>>(res);
+
+    expect(res.status).toBe(503);
+    expect(body).toEqual({ error: '安全审计服务不可用' });
+    expect(JSON.stringify(body)).not.toContain('sensitive evidence');
   });
 });

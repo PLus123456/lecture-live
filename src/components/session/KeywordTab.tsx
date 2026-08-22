@@ -21,7 +21,7 @@ export default function KeywordTab({
   const {
     keywords,
     isExtracting,
-    addManualKeyword,
+    addManualKeywords,
     getActiveKeywords,
     removeKeyword,
     toggleKeyword,
@@ -57,7 +57,7 @@ export default function KeywordTab({
       .split(',')
       .map((w) => w.trim())
       .filter(Boolean);
-    words.forEach(addManualKeyword);
+    addManualKeywords(words);
     setManualInput('');
   };
 

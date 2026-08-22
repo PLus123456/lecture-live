@@ -2,6 +2,7 @@ import 'server-only';
 
 import { callLLM } from '@/lib/llm/gateway';
 import { logger, serializeError } from '@/lib/logger';
+import { assertPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
 
 const titleLogger = logger.child({ component: 'conversation-title' });
 
@@ -32,9 +33,11 @@ export function sanitizeTitle(raw: string): string | null {
  * 基于首条用户消息（可附首条助手回复）。失败返回 null（调用方保持 title=null，可重试）。
  */
 export async function generateConversationTitle(input: {
+  userId?: string;
   firstUserMessage: string;
   firstAssistantMessage?: string | null;
 }): Promise<string | null> {
+  if (input.userId) await assertPaymentBenefitAvailable(input.userId);
   const userMsg = stripImageMarkdown(input.firstUserMessage).slice(0, 500);
   if (!userMsg) return null;
 

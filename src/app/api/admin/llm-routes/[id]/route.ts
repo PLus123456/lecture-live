@@ -1,12 +1,12 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import {
   VALID_THINKING_MODES,
   VALID_DEPTHS,
   coerceTemperature,
 } from '@/lib/llm/routeParams';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 /**
  * PATCH /api/admin/llm-routes/[id]
@@ -22,8 +22,8 @@ export async function PATCH(
     limit: 60,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -85,12 +85,45 @@ export async function PATCH(
           data: { isDefault: false },
         });
       }
-      return tx.llmModel.update({ where: { id }, data });
-    });
-
-    logAction(req, 'admin.llm.route.update', {
-      user: admin,
-      detail: `更新用途路由: ${existing.displayName} @ ${existing.purpose}`,
+      const updated = await tx.llmModel.update({ where: { id }, data });
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-routes.update',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: {
+            type: 'llm_route',
+            id,
+            registryId: existing.registryId,
+            providerId: existing.providerId,
+          },
+          before: {
+            purpose: existing.purpose,
+            modelId: existing.modelId,
+            displayName: existing.displayName,
+            isDefault: existing.isDefault,
+            thinkingMode: existing.thinkingMode,
+            thinkingDepth: existing.thinkingDepth,
+            temperature: existing.temperature,
+            sortOrder: existing.sortOrder,
+          },
+          after: {
+            purpose: updated.purpose,
+            modelId: updated.modelId,
+            displayName: updated.displayName,
+            isDefault: updated.isDefault,
+            thinkingMode: updated.thinkingMode,
+            thinkingDepth: updated.thinkingDepth,
+            temperature: updated.temperature,
+            sortOrder: updated.sortOrder,
+          },
+          reason: 'admin_update',
+          outcome: 'SUCCESS',
+          metadata: { changedFields: Object.keys(data) },
+        },
+        tx
+      );
+      return updated;
     });
 
     return NextResponse.json({ route });
@@ -114,8 +147,8 @@ export async function DELETE(
     limit: 30,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -125,11 +158,31 @@ export async function DELETE(
       return NextResponse.json({ error: '路由不存在' }, { status: 404 });
     }
 
-    await prisma.llmModel.delete({ where: { id } });
-
-    logAction(req, 'admin.llm.route.delete', {
-      user: admin,
-      detail: `摘除用途路由: ${existing.displayName} @ ${existing.purpose}`,
+    await prisma.$transaction(async (tx) => {
+      await tx.llmModel.delete({ where: { id } });
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-routes.delete',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: {
+            type: 'llm_route',
+            id,
+            registryId: existing.registryId,
+            providerId: existing.providerId,
+          },
+          before: {
+            purpose: existing.purpose,
+            modelId: existing.modelId,
+            displayName: existing.displayName,
+            isDefault: existing.isDefault,
+          },
+          after: { deleted: true },
+          reason: 'admin_detach',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
     });
 
     return NextResponse.json({ message: '已摘除' });

@@ -20,9 +20,14 @@ const {
   loadSessionTranscriptBundleMock,
   deleteSessionArtifactsMock,
   deleteRecordingDraftMock,
-  deleteConversationsCascadeMock,
+  deleteTranscriptDraftMock,
+  prepareConversationsCascadeMock,
+  deletePreparedConversationsInTransactionMock,
+  completePreparedConversationCascadeMock,
   cancelAsyncUploadMock,
   resolveMaxConcurrentMock,
+  findBillableStoredArtifactsByOwnerMock,
+  markStoredArtifactsDeletePendingInTransactionMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
@@ -42,9 +47,14 @@ const {
   loadSessionTranscriptBundleMock: vi.fn(),
   deleteSessionArtifactsMock: vi.fn(),
   deleteRecordingDraftMock: vi.fn(),
-  deleteConversationsCascadeMock: vi.fn(),
+  deleteTranscriptDraftMock: vi.fn(),
+  prepareConversationsCascadeMock: vi.fn(),
+  deletePreparedConversationsInTransactionMock: vi.fn(),
+  completePreparedConversationCascadeMock: vi.fn(),
   cancelAsyncUploadMock: vi.fn(),
   resolveMaxConcurrentMock: vi.fn(),
+  findBillableStoredArtifactsByOwnerMock: vi.fn(),
+  markStoredArtifactsDeletePendingInTransactionMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({
@@ -91,9 +101,21 @@ vi.mock('@/lib/sessionPersistence', () => ({
 vi.mock('@/lib/recordingDraftPersistence', () => ({
   deleteRecordingDraft: deleteRecordingDraftMock,
 }));
+vi.mock('@/lib/transcriptDraftPersistence', () => ({
+  deleteTranscriptDraft: deleteTranscriptDraftMock,
+}));
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  findBillableStoredArtifactsByOwner: findBillableStoredArtifactsByOwnerMock,
+  markStoredArtifactsDeletePendingInTransaction:
+    markStoredArtifactsDeletePendingInTransactionMock,
+}));
 
 vi.mock('@/lib/conversationCascade', () => ({
-  deleteConversationsCascade: deleteConversationsCascadeMock,
+  prepareConversationsCascade: prepareConversationsCascadeMock,
+  deletePreparedConversationsInTransaction:
+    deletePreparedConversationsInTransactionMock,
+  completePreparedConversationCascade:
+    completePreparedConversationCascadeMock,
 }));
 
 vi.mock('@/lib/audio/asyncUploadProcessor', () => ({
@@ -149,14 +171,38 @@ describe('session detail route', () => {
     conversationFindManyMock.mockReset().mockResolvedValue([]);
     deleteSessionArtifactsMock.mockReset().mockResolvedValue(undefined);
     deleteRecordingDraftMock.mockReset().mockResolvedValue(undefined);
-    deleteConversationsCascadeMock.mockReset().mockResolvedValue(0);
+    deleteTranscriptDraftMock.mockReset().mockResolvedValue(undefined);
+    prepareConversationsCascadeMock.mockReset().mockImplementation(async (ids) => ({
+      ids,
+      attachments: [],
+      ledgerRows: [],
+    }));
+    deletePreparedConversationsInTransactionMock
+      .mockReset()
+      .mockResolvedValue(0);
+    completePreparedConversationCascadeMock
+      .mockReset()
+      .mockResolvedValue(true);
     cancelAsyncUploadMock.mockReset().mockResolvedValue(undefined);
+    findBillableStoredArtifactsByOwnerMock.mockReset().mockResolvedValue([]);
+    markStoredArtifactsDeletePendingInTransactionMock
+      .mockReset()
+      .mockResolvedValue([]);
     // $transaction 有两种调用形态：DELETE 传操作数组；PATCH 的并发闸传回调（注入 tx）。
     transactionMock.mockImplementation(async (arg: unknown) =>
       typeof arg === 'function'
         ? (arg as (tx: unknown) => Promise<unknown>)({
             $queryRaw: (...a: unknown[]) => txQueryRawMock(...a),
-            session: { updateMany: (...a: unknown[]) => txSessionUpdateManyMock(...a) },
+            session: {
+              updateMany: (...a: unknown[]) => txSessionUpdateManyMock(...a),
+              delete: (...a: unknown[]) => sessionDeleteMock(...a),
+            },
+            folderSession: {
+              deleteMany: (...a: unknown[]) => folderSessionDeleteManyMock(...a),
+            },
+            shareLink: {
+              deleteMany: (...a: unknown[]) => shareLinkDeleteManyMock(...a),
+            },
           })
         : Promise.all(arg as unknown[])
     );
@@ -527,9 +573,10 @@ describe('session detail route', () => {
     // U4：删行前 best-effort 物理清理产物 + 录音草稿目录
     expect(deleteSessionArtifactsMock).toHaveBeenCalledTimes(1);
     expect(deleteRecordingDraftMock).toHaveBeenCalledTimes(1);
+    expect(deleteTranscriptDraftMock).toHaveBeenCalledTimes(1);
   });
 
-  it('删除进行中的异步上传 session 时先取消（清本地盘 + Soniox 文件）', async () => {
+  it('删除进行中的异步上传 session 时提交 owner 删除后再取消外部任务', async () => {
     const liveSession = {
       id: 'session-1',
       userId: 'user-1',
@@ -550,10 +597,13 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(200);
-    // 取消必须在删行前发生，且拿到的是同一个 session（cancelAsyncUpload 需要 sonioxFileId）
+    // 先提交 owner/ledger 脱钩，之后再取消外部任务；避免数据库失败时先删物理资源。
     expect(cancelAsyncUploadMock).toHaveBeenCalledTimes(1);
     expect(cancelAsyncUploadMock).toHaveBeenCalledWith(liveSession);
     expect(sessionDeleteMock).toHaveBeenCalledWith({ where: { id: 'session-1' } });
+    expect(sessionDeleteMock.mock.invocationCallOrder[0]).toBeLessThan(
+      cancelAsyncUploadMock.mock.invocationCallOrder[0]
+    );
   });
 
   it.each([['completed'], ['failed'], ['canceled'], [null]])(
@@ -614,7 +664,7 @@ describe('session detail route', () => {
     expect(sessionDeleteMock).not.toHaveBeenCalled();
   });
 
-  it('U8: 删除会话时 legacy 对话经 deleteConversationsCascade 删干净（含 Cloudreve 物理文件 + 释放字节）', async () => {
+  it('U8: legacy 对话与 session 在同一事务脱钩，提交后才清物理文件', async () => {
     conversationFindManyMock.mockResolvedValue([{ id: 'conv-1' }, { id: 'conv-2' }]);
 
     const response = await DELETE(
@@ -629,10 +679,39 @@ describe('session detail route', () => {
       where: { sessionId: 'session-1' },
       select: { id: true },
     });
-    expect(deleteConversationsCascadeMock).toHaveBeenCalledWith(['conv-1', 'conv-2']);
+    expect(prepareConversationsCascadeMock).toHaveBeenCalledWith([
+      'conv-1',
+      'conv-2',
+    ]);
+    expect(deletePreparedConversationsInTransactionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ ids: ['conv-1', 'conv-2'] })
+    );
+    expect(completePreparedConversationCascadeMock).toHaveBeenCalledWith(
+      expect.objectContaining({ ids: ['conv-1', 'conv-2'] })
+    );
   });
 
-  it('U8: 无 legacy 对话时不调 deleteConversationsCascade', async () => {
+  it('session/legacy owner 事务失败时不触发任何提交后物理清理', async () => {
+    conversationFindManyMock.mockResolvedValue([{ id: 'conv-1' }]);
+    transactionMock.mockRejectedValueOnce(new Error('transaction failed'));
+
+    await expect(
+      DELETE(
+        createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+          method: 'DELETE',
+        }),
+        { params }
+      )
+    ).rejects.toThrow('transaction failed');
+
+    expect(completePreparedConversationCascadeMock).not.toHaveBeenCalled();
+    expect(deleteSessionArtifactsMock).not.toHaveBeenCalled();
+    expect(deleteRecordingDraftMock).not.toHaveBeenCalled();
+    expect(deleteTranscriptDraftMock).not.toHaveBeenCalled();
+  });
+
+  it('U8: 无 legacy 对话时准备空计划，不触碰任何物理引用', async () => {
     conversationFindManyMock.mockResolvedValue([]);
 
     const response = await DELETE(
@@ -643,6 +722,9 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(deleteConversationsCascadeMock).not.toHaveBeenCalled();
+    expect(prepareConversationsCascadeMock).toHaveBeenCalledWith([]);
+    expect(completePreparedConversationCascadeMock).toHaveBeenCalledWith(
+      expect.objectContaining({ ids: [] })
+    );
   });
 });

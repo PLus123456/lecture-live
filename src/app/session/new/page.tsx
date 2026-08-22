@@ -7,6 +7,12 @@ import UserSettingsModal from '@/components/UserSettingsModal';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useMicrophoneMonitor } from '@/hooks/useMicrophoneMonitor';
 import { useAuth } from '@/hooks/useAuth';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+  isPersistedAuthBoundaryCurrent,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
 import { useI18n } from '@/lib/i18n';
 import { resolveSessionTerms } from '@/lib/keywords/sessionTerms';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -15,6 +21,7 @@ import {
   toSessionAudioSource,
 } from '@/types/transcript';
 import LanguageSelect from '@/components/LanguageSelect';
+import SessionAuthRecovery from '@/components/session/SessionAuthRecovery';
 import {
   Mic,
   Monitor,
@@ -36,10 +43,8 @@ interface FolderItem {
 export default function NewSessionPage() {
   const router = useRouter();
   const isMobile = useIsMobile();
-  const { user, token, restoreSession } = useAuth();
+  const { user, token, sessionChecked, restoreSession } = useAuth();
   const { t } = useI18n();
-  const restoreAttempted = useRef(false);
-  const restoreInFlight = useRef(false);
   const sidebarCollapsed = useSettingsStore((s) => s.sidebarCollapsed);
   const audioSource = useSettingsStore((s) => s.audioSource);
   const preferredMicDeviceId = useSettingsStore((s) => s.preferredMicDeviceId);
@@ -92,26 +97,11 @@ export default function NewSessionPage() {
     permissionState,
     requestAccess: requestMicrophoneAccess,
   } = useMicrophoneMonitor({
-    enabled: audioSource === 'mic',
+    // Authentication recovery can remain on this page while the service is
+    // unavailable. Never start/retain microphone capture behind that fallback.
+    enabled: audioSource === 'mic' && Boolean(user && token),
     preferredDeviceId: preferredMicDeviceId,
   });
-
-  /* ---- Auth restore ---- */
-  useEffect(() => {
-    if (user && token) return;
-    // restoreSession 正在进行中：StrictMode 双调用或快速重渲染时，不能误跳 /login
-    if (restoreInFlight.current) return;
-    if (!restoreAttempted.current) {
-      restoreAttempted.current = true;
-      restoreInFlight.current = true;
-      restoreSession().then((ok) => {
-        restoreInFlight.current = false;
-        if (!ok) router.replace('/login');
-      });
-      return;
-    }
-    if (!user || !token) router.replace('/login');
-  }, [user, token, router, restoreSession]);
 
   /* ---- Fetch folders ---- */
   const fetchFolders = useCallback(() => {
@@ -135,8 +125,9 @@ export default function NewSessionPage() {
 
   /* ---- System audio cleanup ---- */
   useEffect(() => {
-    if (audioSource !== 'system') {
-      // 切走系统音频：递增代际，作废任何在途 getDisplayMedia，避免晚到的流被发布（P1-9）。
+    if (audioSource !== 'system' || !user || !token) {
+      // 切走系统音频或进入认证恢复屏：递增代际，作废任何在途
+      // getDisplayMedia，避免登出/401 后屏幕音频仍在采集或被晚到请求发布（P1-9）。
       systemAudioRequestGenRef.current += 1;
       if (systemStreamRef.current) {
         systemStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -145,7 +136,7 @@ export default function NewSessionPage() {
         setSystemAudioError(null);
       }
     }
-  }, [audioSource]);
+  }, [audioSource, token, user]);
 
   useEffect(() => {
     if (isMobile && audioSource === 'system') {
@@ -260,6 +251,8 @@ export default function NewSessionPage() {
   const handleStart = useCallback(async () => {
     if (isStarting) return;
     if (!token) { router.push('/login'); return; }
+    const expected = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
     setIsStarting(true);
     setErrorMsg(null);
     try {
@@ -288,24 +281,49 @@ export default function NewSessionPage() {
         return;
       }
       const session = await res.json();
+      if (!session || typeof session.id !== 'string' || !session.id) {
+        throw new Error('Invalid session response');
+      }
       const sessionTerms = await resolveSessionTerms({
         token,
         folderId: folderId || null,
         sessionKeywords: terms,
       });
-      setPendingSessionTerms(session.id, sessionTerms);
-      if (audioSource === 'mic') {
-        const fb = preferredMicDeviceId || activeDeviceId || availableMics[0]?.deviceId || null;
-        if (fb) setPreferredMicDeviceId(fb);
-      }
-      if (audioSource === 'system' && systemStreamRef.current) {
-        setPendingSystemStream(systemStreamRef.current);
+      const committed = await runAuthBoundaryCommit(expected, () => {
+        if (ownerSignal.aborted) return false;
+        setPendingSessionTerms(session.id, sessionTerms);
+        if (audioSource === 'mic') {
+          const fb = preferredMicDeviceId || activeDeviceId || availableMics[0]?.deviceId || null;
+          if (fb) setPreferredMicDeviceId(fb);
+        }
+        if (audioSource === 'system' && systemStreamRef.current) {
+          setPendingSystemStream(systemStreamRef.current);
+          systemStreamRef.current = null;
+        }
+        setIsStarting(false);
+        setPendingAutoStart(true);
+        router.push(`/session/${session.id}`);
+        return true;
+      });
+      if (!committed.committed || !committed.value) {
+        systemStreamRef.current?.getTracks().forEach((track) => track.stop());
         systemStreamRef.current = null;
+        setIsStarting(false);
       }
-      setIsStarting(false);
-      setPendingAutoStart(true);
-      router.push(`/session/${session.id}`);
-    } catch {
+    } catch (error) {
+      if (
+        ownerSignal.aborted ||
+        !isPersistedAuthBoundaryCurrent(expected) ||
+        (error &&
+          typeof error === 'object' &&
+          'name' in error &&
+          error.name === 'AbortError')
+      ) {
+        systemStreamRef.current?.getTracks().forEach((track) => track.stop());
+        systemStreamRef.current = null;
+        setIsStarting(false);
+        return;
+      }
       setErrorMsg(t('session.newSession.networkError'));
       setIsStarting(false);
     }
@@ -320,9 +338,11 @@ export default function NewSessionPage() {
   /* ---- Loading guard ---- */
   if (!user || !token) {
     return (
-      <div className="min-h-[100dvh] flex items-center justify-center bg-cream-50">
-        <div className="text-charcoal-400 text-sm">{t('playback.redirectingToLogin')}</div>
-      </div>
+      <SessionAuthRecovery
+        sessionChecked={sessionChecked}
+        restoreSession={restoreSession}
+        pendingMessage={t('playback.redirectingToLogin')}
+      />
     );
   }
 

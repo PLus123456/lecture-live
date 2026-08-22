@@ -11,6 +11,19 @@ import type { RechargeSettings } from '@/lib/payment/settings';
 const WECHAT_API_BASE = 'https://api.mch.weixin.qq.com';
 /** 微信境内收单固定人民币。 */
 const WECHAT_CURRENCY = 'CNY';
+const WECHAT_HARMLESS_EVENT_TYPES = new Set([
+  'MCHTRANSFER.SUCCESS',
+  'MCHTRANSFER.FAIL',
+]);
+const WECHAT_HARMLESS_TRANSACTION_STATES = new Set([
+  'CLOSED',
+  'REVOKED',
+  'PAYERROR',
+]);
+const WECHAT_HARMLESS_REFUND_EVENTS = new Set([
+  'REFUND.CLOSED',
+  'REFUND.ABNORMAL',
+]);
 
 /**
  * 微信支付渠道（Native 扫码，API v3）。
@@ -24,6 +37,8 @@ const WECHAT_CURRENCY = 'CNY';
  */
 export class WechatProvider implements PaymentProvider {
   readonly name = 'wechat' as const;
+  readonly mode = 'live' as const;
+  readonly account: string;
   private readonly appId: string;
   private readonly mchId: string;
   private readonly apiV3Key: string;
@@ -34,6 +49,7 @@ export class WechatProvider implements PaymentProvider {
   constructor(s: RechargeSettings) {
     this.appId = s.wechatAppId;
     this.mchId = s.wechatMchId;
+    this.account = this.mchId.trim() || 'default';
     this.apiV3Key = s.wechatApiV3Key;
     this.serialNo = s.wechatSerialNo;
     this.privateKeyPem = s.wechatPrivateKey.trim();
@@ -101,7 +117,12 @@ export class WechatProvider implements PaymentProvider {
       return null;
     }
 
-    let notify: { resource?: WechatResource; event_type?: string };
+    let notify: {
+      id?: string;
+      create_time?: string;
+      resource?: WechatResource;
+      event_type?: string;
+    };
     try {
       notify = JSON.parse(rawBody);
     } catch {
@@ -114,7 +135,19 @@ export class WechatProvider implements PaymentProvider {
     const eventType = notify.event_type ?? '';
     const isRefundEvent = eventType.startsWith('REFUND.');
     if (eventType && !eventType.startsWith('TRANSACTION.') && !isRefundEvent) {
-      return { outTradeNo: '', paid: false, acknowledged: true, rawStatus: eventType };
+      return {
+        outTradeNo: '',
+        paid: false,
+        ...(WECHAT_HARMLESS_EVENT_TYPES.has(eventType)
+          ? { acknowledged: true }
+          : {}),
+        rawStatus: eventType,
+        eventId: notify.id,
+        eventType,
+        providerMode: this.mode,
+        providerAccount: this.account,
+        occurredAt: parseWechatDate(notify.create_time),
+      };
     }
 
     // 3) 解密 resource（AES-256-GCM，APIv3 密钥）。
@@ -129,6 +162,7 @@ export class WechatProvider implements PaymentProvider {
       refund_status?: string;
       transaction_id?: string;
       refund_id?: string;
+      success_time?: string;
       amount?: { total?: number; payer_total?: number; currency?: string };
     };
     try {
@@ -151,20 +185,50 @@ export class WechatProvider implements PaymentProvider {
       return {
         outTradeNo,
         paid: false,
-        ...(refunded ? { reversal: true } : { acknowledged: true }),
+        ...(refunded
+          ? { reversal: true }
+          : WECHAT_HARMLESS_REFUND_EVENTS.has(eventType)
+            ? { acknowledged: true }
+            : {}),
         currency,
         providerRef: payload.refund_id ?? payload.transaction_id,
         rawStatus: eventType || payload.refund_status,
+        eventId: notify.id,
+        eventType: eventType || 'REFUND',
+        providerMode: this.mode,
+        providerAccount: this.account,
+        occurredAt: parseWechatDate(payload.success_time || notify.create_time),
+        objectRefs: [
+          ...(payload.refund_id
+            ? [{ objectType: 'refund', objectId: payload.refund_id }]
+            : []),
+          ...(payload.transaction_id
+            ? [{ objectType: 'transaction', objectId: payload.transaction_id }]
+            : []),
+        ],
       };
     }
 
+    const paid = payload.trade_state === 'SUCCESS';
     return {
       outTradeNo,
-      paid: payload.trade_state === 'SUCCESS',
+      paid,
+      ...(!paid && payload.trade_state &&
+      WECHAT_HARMLESS_TRANSACTION_STATES.has(payload.trade_state)
+        ? { acknowledged: true }
+        : {}),
       amountCents,
       currency,
       providerRef: payload.transaction_id,
       rawStatus: payload.trade_state,
+      eventId: notify.id,
+      eventType: eventType || 'TRANSACTION',
+      providerMode: this.mode,
+      providerAccount: this.account,
+      occurredAt: parseWechatDate(payload.success_time || notify.create_time),
+      objectRefs: payload.transaction_id
+        ? [{ objectType: 'transaction', objectId: payload.transaction_id }]
+        : undefined,
     };
   }
 
@@ -190,6 +254,12 @@ export class WechatProvider implements PaymentProvider {
       `signature="${signature}"`
     );
   }
+}
+
+function parseWechatDate(value: string | undefined): Date | undefined {
+  if (!value) return undefined;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed : undefined;
 }
 
 interface WechatResource {

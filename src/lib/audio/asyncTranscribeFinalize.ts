@@ -33,7 +33,13 @@ import {
   convertAsyncTokensToSegments,
   extractTranslationsByTokens,
 } from '@/lib/soniox/asyncTranscriptConverter';
-import { persistSessionTranscriptArtifacts } from '@/lib/sessionPersistence';
+import {
+  stageSessionTranscriptArtifacts,
+  settleStagedArtifactsInTransaction,
+  completeStagedArtifactPublishes,
+  readbackStagedArtifactPublication,
+  rollbackStagedArtifact,
+} from '@/lib/sessionPersistence';
 import { runBackgroundLLMTasks } from '@/lib/sessionFinalization';
 import {
   deductTranscriptionMinutes,
@@ -135,7 +141,7 @@ export async function finalizeAsyncTranscription(
     summaries: [],
     translations,
   };
-  const persisted = await persistSessionTranscriptArtifacts(session, bundle);
+  const staged = await stageSessionTranscriptArtifacts(session, bundle);
 
   // ── 终态 CAS + 计费：同一事务（P5-7）──
   // 完成写入必须带状态守卫（原 route U60 注释）：上面的 claim 把状态置 'finalizing'，但拉
@@ -152,18 +158,21 @@ export async function finalizeAsyncTranscription(
   // 合并后本事务的第一条语句就是按主键 X 锁本 Session 行的 CAS，之后才动 User → 与 init 同为
   // Session→User，环被打断。
   let canceledDuringFinalize = false;
+  let stagedPublications: Awaited<
+    ReturnType<typeof settleStagedArtifactsInTransaction>
+  > = [];
   try {
     const { async_upload_billing_multiplier } = await getSiteSettings();
     const billableMinutes = Math.ceil(
       getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
     );
-    canceledDuringFinalize = await prisma.$transaction(async (tx) => {
+    const commit = await prisma.$transaction(async (tx) => {
       const finalized = await tx.session.updateMany({
         where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
         data: {
           asyncTranscribeStatus: 'completed',
-          transcriptPath: persisted.transcript.path,
-          summaryPath: persisted.summary.path,
+          transcriptPath: staged.transcript.reference,
+          summaryPath: staged.summary.reference,
           // P1-17：**不再**在 CAS 提交里清 Soniox 引用 —— 改到确认 DELETE 成功/404 之后才清（见文末）。
           // 此前先清 ID 再 best-effort 删，删失败即永久失去重试依据、Soniox 侧文件/转录孤儿泄漏。
           status: 'COMPLETED',
@@ -173,7 +182,7 @@ export async function finalizeAsyncTranscription(
       });
       if (finalized.count !== 1) {
         // 守卫抢不到：不扣费、不结算预留，事务空提交，交下方 canceled 分支处理。
-        return true;
+        return { canceled: true as const, stagedPublications: [] };
       }
 
       // 异步上传转录计费（批2 + B1）：claim + 此处 CAS 共同保证每个 session 仅有一个路径进到这里且
@@ -186,14 +195,22 @@ export async function finalizeAsyncTranscription(
         // P5-5：带 sessionId → 同事务写 Session.billedMinutes 台账，对账据此算 expected。
         await deductTranscriptionMinutes(session.userId, billableMinutes, tx, {
           sessionId: session.id,
+          source: 'async_upload_finalize',
+          referenceId: session.id,
         });
       }
       // settleAsyncReservation 用 FOR UPDATE 读**当前**列并原子释放。deduct 内部 ensureQuotaWindow 若
       // 刚触发月度重置会顺带清列 → 此时 settle 读到 0、不重复释放，杜绝跨周期把已被重置隐式清除的预留
       // 再减一次（审查 R1）。并发多路径经 settle 也仅释放一次。
       await settleAsyncReservation(session.id, tx);
-      return false;
+      const publications = await settleStagedArtifactsInTransaction(tx, [
+        staged.transcript,
+        staged.summary,
+      ]);
+      return { canceled: false as const, stagedPublications: publications };
     });
+    canceledDuringFinalize = commit.canceled;
+    stagedPublications = commit.stagedPublications;
   } catch (billingErr) {
     // P5-7：CAS+计费整体回滚（最现实的是死锁 / 事务超时）。此刻会话仍是 'finalizing'——退回
     // transcribing，让下一次前端 poll（allowClaimFrom=['transcribing']）或 cron 回收重新收尾。
@@ -203,17 +220,63 @@ export async function finalizeAsyncTranscription(
       { err: billingErr, sessionId: session.id },
       'async upload finalize+billing tx failed; rolled back to transcribing for retry'
     );
-    await prisma.session
-      .updateMany({
-        where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
-        data: { asyncTranscribeStatus: 'transcribing' },
-      })
-      .catch(() => undefined);
-    // 与「对方已抢先」同一语义：调用方读最新状态返回，交由下一轮重试（绝不删 Soniox 资源）。
-    return { outcome: 'claim_lost' };
+    try {
+      const owner = await prisma.session.findUnique({
+        where: { id: session.id },
+        select: {
+          asyncTranscribeStatus: true,
+          transcriptPath: true,
+          summaryPath: true,
+        },
+      });
+      const readback = await readbackStagedArtifactPublication(
+        [staged.transcript, staged.summary],
+        [owner?.transcriptPath, owner?.summaryPath]
+      );
+      if (
+        owner?.asyncTranscribeStatus === 'completed' &&
+        readback.outcome === 'committed'
+      ) {
+        // COMMIT succeeded and only its ACK was lost. Continue the normal
+        // post-commit cleanup path; rolling back here would delete live data.
+        stagedPublications = readback.publications;
+      } else if (readback.outcome === 'not_committed') {
+        await prisma.session
+          .updateMany({
+            where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
+            data: { asyncTranscribeStatus: 'transcribing' },
+          })
+          .catch(() => undefined);
+        await Promise.all([
+          rollbackStagedArtifact(session, staged.transcript).catch(
+            () => undefined
+          ),
+          rollbackStagedArtifact(session, staged.summary).catch(
+            () => undefined
+          ),
+        ]);
+        return { outcome: 'claim_lost' };
+      } else {
+        logger.error(
+          { sessionId: session.id },
+          'async finalize publication outcome unknown; preserving staged artifacts'
+        );
+        return { outcome: 'claim_lost' };
+      }
+    } catch (readbackError) {
+      logger.error(
+        { err: readbackError, sessionId: session.id },
+        'async finalize publication readback failed; preserving staged artifacts'
+      );
+      return { outcome: 'claim_lost' };
+    }
   }
 
   if (canceledDuringFinalize) {
+    await Promise.all([
+      rollbackStagedArtifact(session, staged.transcript).catch(() => undefined),
+      rollbackStagedArtifact(session, staged.summary).catch(() => undefined),
+    ]);
     // 收尾守卫抢不到（finalizing 期间状态已变）。P1-19：**只有确认会话确实被取消（canceled）**才删
     // Soniox 资源——否则可能是并发 finalizer 的失败回退把状态改回 transcribing（转录仍需要），此时删
     // 外部资源会让后续 salvage getSoniox 404、会话永久卡死（回归红线）。非 canceled → 保留资源交对方/重试。
@@ -243,6 +306,13 @@ export async function finalizeAsyncTranscription(
     }
     return { outcome: 'canceled_during_finalize' };
   }
+
+  const [transcriptResult, summaryResult] =
+    await completeStagedArtifactPublishes(session, stagedPublications);
+  if (!transcriptResult || !summaryResult) {
+    throw new Error('async transcript artifact publication was incomplete');
+  }
+  const persisted = { transcript: transcriptResult, summary: summaryResult };
 
   // 终态 + 计费已一并提交之后的副作用（route：失效 sessions API 缓存）。P5-7 之前它排在计费之前，
   // 现在计费与终态同事务提交，缓存失效必须等提交成功——否则事务回滚后缓存却已按「已完成」失效。

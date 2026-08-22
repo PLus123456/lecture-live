@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import { coerceRegistryKind } from '@/lib/llm/registry';
 import { LLM_PURPOSES, type LlmAdminPurpose } from '@/lib/llm/defaults';
 import { createRouteForRegistry, purposeMatchesKind } from '@/lib/llm/attachRoute';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 /**
  * POST /api/admin/llm-providers/[id]/registry
@@ -21,8 +21,8 @@ export async function POST(
     limit: 30,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -105,7 +105,7 @@ export async function POST(
     });
 
     // 登记 + 挂载放同一事务：任一用途挂载失败则整体回滚，不留「半挂载」状态
-    const registryId = await prisma.$transaction(async (tx) => {
+    const registry = await prisma.$transaction(async (tx) => {
       const created = await tx.llmRegistryModel.create({
         data: {
           providerId,
@@ -122,19 +122,34 @@ export async function POST(
       for (const purpose of purposes) {
         await createRouteForRegistry(tx, created, purpose);
       }
-      return created.id;
-    });
-
-    const registry = await prisma.llmRegistryModel.findUnique({
-      where: { id: registryId },
-      include: { routes: { select: { id: true, purpose: true, isDefault: true } } },
-    });
-
-    logAction(req, 'admin.llm.registry.create', {
-      user: admin,
-      detail: `登记模型: ${displayName} (${modelId}) @ ${provider.name}${
-        purposes.length > 0 ? ` → 挂载 ${purposes.join('/')}` : ''
-      }`,
+      const full = await tx.llmRegistryModel.findUnique({
+        where: { id: created.id },
+        include: {
+          routes: { select: { id: true, purpose: true, isDefault: true } },
+        },
+      });
+      if (!full) throw new Error('创建后的模型库条目不存在');
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-registry.create',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'llm_registry_model', id: full.id, providerId },
+          after: {
+            modelId: full.modelId,
+            displayName: full.displayName,
+            kind: full.kind,
+            supportsImage: full.supportsImage,
+            maxTokens: full.maxTokens,
+            contextWindow: full.contextWindow,
+            routePurposes: full.routes.map((route) => route.purpose),
+          },
+          reason: 'admin_create',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
+      return full;
     });
 
     return NextResponse.json({ registryModel: registry }, { status: 201 });

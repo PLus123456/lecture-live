@@ -3,7 +3,8 @@ import { createReadStream } from 'fs';
 import { Readable } from 'stream';
 import path from 'path';
 import crypto from 'crypto';
-import type { Session } from '@prisma/client';
+import type { Prisma, Session } from '@prisma/client';
+import { prisma } from '@/lib/prisma';
 import {
   CloudreveStorage,
   type SessionArtifactCategory,
@@ -14,6 +15,26 @@ import {
   type CloudreveDeleteContext,
 } from '@/lib/storage/cloudreveFileDelete';
 import { logger, serializeError } from '@/lib/logger';
+import {
+  STORED_ARTIFACT_STATE,
+  STORED_ARTIFACT_TYPE,
+  type StoredArtifactType,
+  findBillableStoredArtifactsByOwner,
+  getStoredArtifactById,
+  markStoredArtifactOrphan,
+  recordReservedStoredArtifactLocation,
+  releaseStoredArtifact,
+  reserveStoredArtifact,
+  rollbackStoredArtifact,
+  settleStoredArtifactInTransaction,
+  settleStoredArtifact,
+  type SettledStoredArtifact,
+  type StoredArtifactRow,
+} from '@/lib/storage/storedArtifactLedger';
+import {
+  admitPersistedTranscriptBundle,
+  SESSION_TRANSCRIPT_LIMITS,
+} from '@/lib/sessionApi';
 
 const DATA_ROOT = path.join(process.cwd(), 'data');
 const LOCAL_DIRS: Record<SessionArtifactCategory, string> = {
@@ -208,8 +229,17 @@ function parseLocalReference(
 export async function readArtifactFromReference(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
   category: SessionArtifactCategory,
-  reference: string | null | undefined
+  reference: string | null | undefined,
+  options?: { maxBytes?: number }
 ): Promise<Buffer | null> {
+  const maxBytes = options?.maxBytes;
+  if (
+    maxBytes !== undefined &&
+    (!Number.isSafeInteger(maxBytes) || maxBytes < 0)
+  ) {
+    throw new RangeError('maxBytes must be a non-negative safe integer');
+  }
+
   let cloudreve: CloudreveStorage | null | undefined;
   const defaultCandidates =
     category === 'recordings'
@@ -234,10 +264,23 @@ export async function readArtifactFromReference(
       if (!localPath) {
         continue;
       }
-      if (await fileExists(localPath)) {
+      if (!(await fileExists(localPath))) {
+        continue;
+      }
+
+      if (maxBytes === undefined) {
         return fs.readFile(localPath);
       }
-      continue;
+
+      try {
+        const stat = await fs.stat(localPath);
+        if (!stat.isFile() || stat.size > maxBytes) {
+          return null;
+        }
+        return await readLocalFileBounded(localPath, maxBytes);
+      } catch {
+        continue;
+      }
     }
 
     if (candidate.startsWith('/')) {
@@ -250,6 +293,12 @@ export async function readArtifactFromReference(
       }
 
       try {
+        if (maxBytes !== undefined) {
+          const response = await cloudreve.openDownloadStream(candidate, {
+            expectedUserId: session.userId,
+          });
+          return await readResponseBodyBounded(response, maxBytes);
+        }
         return await cloudreve.downloadByRemotePath(candidate, session.userId);
       } catch {
         continue;
@@ -258,6 +307,97 @@ export async function readArtifactFromReference(
   }
 
   return null;
+}
+
+async function readLocalFileBounded(
+  filePath: string,
+  maxBytes: number
+): Promise<Buffer | null> {
+  const handle = await fs.open(filePath, 'r');
+  const chunks: Buffer[] = [];
+  const scratch = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1));
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const remaining = maxBytes + 1 - totalBytes;
+      if (remaining <= 0) {
+        return null;
+      }
+      const { bytesRead } = await handle.read(
+        scratch,
+        0,
+        Math.min(scratch.byteLength, remaining),
+        null
+      );
+      if (bytesRead === 0) {
+        return Buffer.concat(chunks, totalBytes);
+      }
+      totalBytes += bytesRead;
+      if (totalBytes > maxBytes) {
+        return null;
+      }
+      chunks.push(Buffer.from(scratch.subarray(0, bytesRead)));
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readResponseBodyBounded(
+  response: Response,
+  maxBytes: number
+): Promise<Buffer | null> {
+  const contentLength = response.headers.get('content-length');
+  if (contentLength && /^\d+$/.test(contentLength)) {
+    const declaredBytes = Number(contentLength);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes > maxBytes) {
+      await response.body?.cancel().catch(() => undefined);
+      return null;
+    }
+  }
+
+  if (!response.body) {
+    return Buffer.alloc(0);
+  }
+
+  const reader = response.body.getReader();
+  let output = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes));
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        return output.subarray(0, totalBytes);
+      }
+      if (!value || value.byteLength === 0) {
+        continue;
+      }
+      if (value.byteLength > maxBytes - totalBytes) {
+        await reader.cancel().catch(() => undefined);
+        return null;
+      }
+
+      const requiredBytes = totalBytes + value.byteLength;
+      if (requiredBytes > output.byteLength) {
+        let nextCapacity = Math.max(1, output.byteLength);
+        while (nextCapacity < requiredBytes) {
+          nextCapacity = Math.min(maxBytes, nextCapacity * 2);
+        }
+        const grown = Buffer.allocUnsafe(nextCapacity);
+        output.copy(grown, 0, 0, totalBytes);
+        output = grown;
+      }
+      Buffer.from(value.buffer, value.byteOffset, value.byteLength).copy(
+        output,
+        totalBytes
+      );
+      totalBytes = requiredBytes;
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function artifactFileName(
@@ -297,6 +437,41 @@ async function inferLocalRecordingMimeType(sessionId: string): Promise<string> {
 
 const persistenceLogger = logger.child({ component: 'session-persistence' });
 
+const CATEGORY_ARTIFACT_TYPE: Record<
+  SessionArtifactCategory,
+  StoredArtifactType
+> = {
+  recordings: STORED_ARTIFACT_TYPE.RECORDING,
+  transcripts: STORED_ARTIFACT_TYPE.TRANSCRIPT,
+  summaries: STORED_ARTIFACT_TYPE.SUMMARY,
+  reports: STORED_ARTIFACT_TYPE.REPORT,
+  'full-transcripts': STORED_ARTIFACT_TYPE.FULL_TRANSCRIPT,
+};
+
+function categoryForArtifactType(
+  artifactType: string
+): SessionArtifactCategory | null {
+  switch (artifactType) {
+    case STORED_ARTIFACT_TYPE.RECORDING:
+    case STORED_ARTIFACT_TYPE.ENHANCED_AUDIO:
+      return 'recordings';
+    case STORED_ARTIFACT_TYPE.TRANSCRIPT:
+      return 'transcripts';
+    case STORED_ARTIFACT_TYPE.SUMMARY:
+      return 'summaries';
+    case STORED_ARTIFACT_TYPE.REPORT:
+      return 'reports';
+    case STORED_ARTIFACT_TYPE.FULL_TRANSCRIPT:
+      return 'full-transcripts';
+    default:
+      return null;
+  }
+}
+
+function artifactDataBytes(data: Buffer | string): number {
+  return Buffer.isBuffer(data) ? data.byteLength : Buffer.byteLength(data, 'utf8');
+}
+
 /**
  * best-effort 物理删除一条 artifact 引用（本地文件或 Cloudreve 远程文件）。
  * reference 形如 `local:{category}/{fileName}`（本地）或 `/{userId}/{category}/{fileName}`
@@ -307,65 +482,130 @@ async function deleteArtifactByReference(
   category: SessionArtifactCategory,
   reference: string | null | undefined,
   cloudreveCtx?: CloudreveDeleteContext | null
-): Promise<void> {
+): Promise<boolean> {
   if (!reference) {
-    return;
+    return true;
   }
 
   if (reference.startsWith('local:')) {
     const localPath = parseLocalReference(category, reference, session.id);
     if (localPath) {
-      await fs.rm(localPath, { force: true }).catch((err) => {
+      try {
+        await fs.rm(localPath, { force: true });
+        return true;
+      } catch (err) {
         persistenceLogger.warn(
           { localPath, err: serializeError(err) },
           '删除本地 artifact 失败；残留由清理工具兜底'
         );
-      });
+        return false;
+      }
     }
-    return;
+    return false;
   }
 
   if (reference.startsWith('/')) {
     const ctx =
       cloudreveCtx === undefined ? await loadCloudreveContext() : cloudreveCtx;
     if (!ctx) {
-      return;
+      return false;
     }
-    await deleteCloudreveFile(reference, ctx);
+    return deleteCloudreveFile(reference, ctx);
   }
+  return false;
 }
 
 export async function persistArtifact(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
   category: SessionArtifactCategory,
   data: Buffer | string,
-  options?: { mimeType?: string | null; previousReference?: string | null }
+  options?: {
+    mimeType?: string | null;
+    previousReference?: string | null;
+    artifactType?: StoredArtifactType;
+    reservationKey?: string;
+  }
 ): Promise<PersistedArtifactResult> {
   const fileName = artifactFileName(category, session.id, options);
-
-  await ensureLocalDir(category);
-  await fs.writeFile(buildLocalArtifactPath(category, fileName), data);
-
+  const bytes = artifactDataBytes(data);
+  const artifactType = options?.artifactType ?? CATEGORY_ARTIFACT_TYPE[category];
+  const reservation = await reserveStoredArtifact({
+    userId: session.userId,
+    ownerType: 'session',
+    ownerId: session.id,
+    sessionId: session.id,
+    artifactType,
+    expectedBytes: bytes,
+    reservationKey: options?.reservationKey,
+  });
+  const localPath = buildLocalArtifactPath(category, fileName);
   const localReference = buildLocalArtifactReference(category, fileName);
-  const storage = await getCloudreveStorageIfConfigured();
-  const result: PersistedArtifactResult = storage
-    ? {
-        path: await storage.upload(session.userId, category, fileName, data),
-        storage: 'cloudreve',
+  let result: PersistedArtifactResult | null = null;
+  try {
+    await ensureLocalDir(category);
+    await fs.writeFile(localPath, data);
+
+    const storage = await getCloudreveStorageIfConfigured();
+    if (storage) {
+      const remotePath = await storage.upload(session.userId, category, fileName, data);
+      // 先记录已创建的远端对象，再清掉本地 staging。即使本地 rm 异常，catch 也能
+      // 精确删除远端对象并只在物理删除成功后释放 reservation，避免未记账孤儿。
+      result = { path: remotePath, storage: 'cloudreve' };
+      // Cloudreve 发布成功后本地文件只是 staging 副本，立即删除；
+      // 否则同一逻辑 artifact 有两份物理占用却只有一行账本。
+      await fs.rm(localPath, { force: true });
+    } else {
+      result = { path: localReference, storage: 'local' };
+    }
+
+    const settled = await settleStoredArtifact(reservation.id, {
+      actualBytes: bytes,
+      storage: result.storage,
+      reference: result.path,
+    });
+
+    const previousReference =
+      settled.previous?.reference ?? options?.previousReference ?? null;
+    if (
+      previousReference &&
+      previousReference !== result.path &&
+      previousReference !== localReference
+    ) {
+      const deleted = await deleteArtifactByReference(
+        session,
+        category,
+        previousReference
+      );
+      if (deleted && settled.previous) {
+        await releaseStoredArtifact(settled.previous.id, 'REPLACED');
       }
-    : { path: localReference, storage: 'local' };
-
-  // G5/G6：换容器格式重传/草稿定稿会写入不同后缀的新文件；若旧 recordingPath 指向的
-  // 物理文件与新文件不同（本地路径或 Cloudreve 远程路径不一致），best-effort 删旧物理文件，
-  // 避免本地盘 + Cloudreve 永久孤儿。remotePath/localReference 均可稳定比较。
-  const previous = options?.previousReference;
-  if (previous && previous !== result.path && previous !== localReference) {
-    // 同时清掉与新引用不同的旧本地文件（Cloudreve 上传后本地也保留了一份新文件，
-    // 旧本地文件仍需单独删）。
-    await deleteArtifactByReference(session, category, previous);
+    } else if (settled.previous) {
+      // 固定 key 被原子覆盖，旧物理对象已不再单独存在。
+      await releaseStoredArtifact(settled.previous.id, 'REPLACED');
+    }
+    return result;
+  } catch (error) {
+    let deleted = true;
+    if (result) {
+      deleted = await deleteArtifactByReference(
+        session,
+        category,
+        result.path
+      ).catch(() => false);
+    } else {
+      try {
+        await fs.rm(localPath, { force: true });
+      } catch {
+        deleted = false;
+      }
+    }
+    if (deleted) {
+      await rollbackStoredArtifact(reservation.id).catch(() => undefined);
+    } else {
+      await markStoredArtifactOrphan(reservation.id).catch(() => undefined);
+    }
+    throw error;
   }
-
-  return result;
 }
 
 export async function persistSessionAudioArtifact(
@@ -396,6 +636,73 @@ export interface StagedArtifact {
   localReference: string;
   storage: 'local' | 'cloudreve';
   previousReference?: string | null;
+  storedArtifactId: string;
+  expectedPreviousArtifactId: string | null;
+  actualBytes: number;
+  artifactType: StoredArtifactType;
+}
+
+export interface SettledStagedArtifactPublish {
+  staged: StagedArtifact;
+  settled: SettledStoredArtifact;
+}
+
+export type StagedArtifactPublicationReadback =
+  | {
+      outcome: 'committed';
+      publications: SettledStagedArtifactPublish[];
+    }
+  | { outcome: 'not_committed'; publications: [] }
+  | { outcome: 'unknown'; publications: [] };
+
+/**
+ * Classify a transaction error without destroying a generation whose COMMIT
+ * may have succeeded but whose acknowledgement was lost. Callers must pass the
+ * owner columns read after the error in the same order as `stagedArtifacts`.
+ */
+export async function readbackStagedArtifactPublication(
+  stagedArtifacts: ReadonlyArray<StagedArtifact>,
+  ownerReferences: ReadonlyArray<string | null | undefined>
+): Promise<StagedArtifactPublicationReadback> {
+  if (stagedArtifacts.length !== ownerReferences.length) {
+    return { outcome: 'unknown', publications: [] };
+  }
+  const artifacts = await Promise.all(
+    stagedArtifacts.map((staged) =>
+      getStoredArtifactById(staged.storedArtifactId)
+    )
+  );
+  const committed = stagedArtifacts.every((staged, index) => {
+    const artifact = artifacts[index];
+    return (
+      ownerReferences[index] === staged.reference &&
+      artifact?.state === STORED_ARTIFACT_STATE.ACTIVE &&
+      artifact.reference === staged.reference &&
+      artifact.storage === staged.storage &&
+      artifact.bytes === BigInt(staged.actualBytes)
+    );
+  });
+  if (committed) {
+    return {
+      outcome: 'committed',
+      publications: stagedArtifacts.map((staged, index) => ({
+        staged,
+        settled: { artifact: artifacts[index]!, previous: null },
+      })),
+    };
+  }
+
+  const definitelyNotCommitted = stagedArtifacts.every((staged, index) => {
+    const artifact = artifacts[index];
+    return (
+      ownerReferences[index] !== staged.reference &&
+      artifact?.state === STORED_ARTIFACT_STATE.RESERVED &&
+      artifact.reference === staged.reference
+    );
+  });
+  return definitelyNotCommitted
+    ? { outcome: 'not_committed', publications: [] }
+    : { outcome: 'unknown', publications: [] };
 }
 
 function buildVersionedArtifactFileName(
@@ -417,31 +724,81 @@ export async function stageArtifact(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
   category: SessionArtifactCategory,
   data: Buffer | string,
-  options?: { mimeType?: string | null; previousReference?: string | null }
+  options?: {
+    mimeType?: string | null;
+    previousReference?: string | null;
+    artifactType?: StoredArtifactType;
+    reservationKey?: string;
+  }
 ): Promise<StagedArtifact> {
   const fileName = buildVersionedArtifactFileName(category, session.id, options);
-  await ensureLocalDir(category);
-  await fs.writeFile(buildLocalArtifactPath(category, fileName), data);
-
+  const bytes = artifactDataBytes(data);
+  const artifactType = options?.artifactType ?? CATEGORY_ARTIFACT_TYPE[category];
+  const reservation = await reserveStoredArtifact({
+    userId: session.userId,
+    ownerType: 'session',
+    ownerId: session.id,
+    sessionId: session.id,
+    artifactType,
+    expectedBytes: bytes,
+    reservationKey: options?.reservationKey,
+  });
+  const localPath = buildLocalArtifactPath(category, fileName);
   const localReference = buildLocalArtifactReference(category, fileName);
-  const storage = await getCloudreveStorageIfConfigured();
-  if (storage) {
-    const remotePath = await storage.upload(session.userId, category, fileName, data);
+  let physicalReference: string | null = null;
+  let physicalStorage: 'local' | 'cloudreve' = 'local';
+  try {
+    await ensureLocalDir(category);
+    physicalReference = localReference;
+    await recordReservedStoredArtifactLocation(reservation.id, {
+      actualBytes: bytes,
+      storage: 'local',
+      reference: localReference,
+    });
+    await fs.writeFile(localPath, data);
+
+    const storage = await getCloudreveStorageIfConfigured();
+    if (storage) {
+      const remotePath = await storage.upload(session.userId, category, fileName, data);
+      physicalReference = remotePath;
+      physicalStorage = 'cloudreve';
+      await recordReservedStoredArtifactLocation(reservation.id, {
+        actualBytes: bytes,
+        storage: physicalStorage,
+        reference: physicalReference,
+      });
+      await fs.rm(localPath, { force: true });
+    }
     return {
       category,
-      reference: remotePath,
+      reference: physicalReference,
       localReference,
-      storage: 'cloudreve',
+      storage: physicalStorage,
       previousReference: options?.previousReference ?? null,
+      storedArtifactId: reservation.id,
+      expectedPreviousArtifactId: reservation.replacesArtifactId,
+      actualBytes: bytes,
+      artifactType,
     };
+  } catch (error) {
+    let deleted = true;
+    if (physicalReference) {
+      deleted = await deleteArtifactByReference(
+        session,
+        category,
+        physicalReference
+      ).catch(() => false);
+    }
+    if (physicalReference !== localReference) {
+      await fs.rm(localPath, { force: true }).catch(() => undefined);
+    }
+    if (deleted) {
+      await rollbackStoredArtifact(reservation.id).catch(() => undefined);
+    } else {
+      await markStoredArtifactOrphan(reservation.id).catch(() => undefined);
+    }
+    throw error;
   }
-  return {
-    category,
-    reference: localReference,
-    localReference,
-    storage: 'local',
-    previousReference: options?.previousReference ?? null,
-  };
 }
 
 export async function stageSessionAudioArtifact(
@@ -455,20 +812,84 @@ export async function stageSessionAudioArtifact(
   });
 }
 
-/** P0-6：CAS 成功后发布 —— best-effort 删旧 previousReference，返回最终 PersistedArtifactResult。 */
+/**
+ * Settle staged rows inside the caller's owner-row transaction. Owner paths and
+ * ledger identity therefore commit together; physical replacement cleanup is
+ * deliberately deferred until after commit.
+ */
+export async function settleStagedArtifactsInTransaction(
+  tx: Prisma.TransactionClient,
+  stagedArtifacts: ReadonlyArray<StagedArtifact>
+): Promise<SettledStagedArtifactPublish[]> {
+  const publications: SettledStagedArtifactPublish[] = [];
+  for (const staged of stagedArtifacts) {
+    const settled = await settleStoredArtifactInTransaction(
+      tx,
+      staged.storedArtifactId,
+      {
+        actualBytes: staged.actualBytes,
+        storage: staged.storage,
+        reference: staged.reference,
+        expectedPreviousArtifactId: staged.expectedPreviousArtifactId,
+      }
+    );
+    publications.push({ staged, settled });
+  }
+  return publications;
+}
+
+/** Best-effort post-commit cleanup; failed deletes remain charged ORPHANED. */
+export async function completeStagedArtifactPublishes(
+  session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
+  publications: ReadonlyArray<SettledStagedArtifactPublish>
+): Promise<PersistedArtifactResult[]> {
+  const results: PersistedArtifactResult[] = [];
+  for (const { staged, settled } of publications) {
+    const previous = settled.previous?.reference ?? staged.previousReference;
+    if (
+      previous &&
+      previous !== staged.reference &&
+      previous !== staged.localReference
+    ) {
+      const deleted = await deleteArtifactByReference(
+        session,
+        staged.category,
+        previous
+      );
+      if (deleted && settled.previous) {
+        await releaseStoredArtifact(settled.previous.id, 'REPLACED').catch(
+          () => undefined
+        );
+      }
+    } else if (settled.previous) {
+      await releaseStoredArtifact(settled.previous.id, 'REPLACED').catch(
+        () => undefined
+      );
+    }
+    results.push({ path: staged.reference, storage: staged.storage });
+  }
+  return results;
+}
+
+/** Atomically publish one or more staged artifacts, then clean replaced objects. */
+export async function finalizeStagedArtifactPublishes(
+  session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
+  stagedArtifacts: ReadonlyArray<StagedArtifact>
+): Promise<PersistedArtifactResult[]> {
+  const publications = await prisma.$transaction((tx) =>
+    settleStagedArtifactsInTransaction(tx, stagedArtifacts)
+  );
+  return completeStagedArtifactPublishes(session, publications);
+}
+
+/** Compatibility wrapper for callers that publish one staged object. */
 export async function finalizeStagedArtifactPublish(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
   staged: StagedArtifact
 ): Promise<PersistedArtifactResult> {
-  const previous = staged.previousReference;
-  if (
-    previous &&
-    previous !== staged.reference &&
-    previous !== staged.localReference
-  ) {
-    await deleteArtifactByReference(session, staged.category, previous);
-  }
-  return { path: staged.reference, storage: staged.storage };
+  const [result] = await finalizeStagedArtifactPublishes(session, [staged]);
+  if (!result) throw new Error('staged artifact publication returned no result');
+  return result;
 }
 
 /** P0-6：CAS 失败回滚 —— 删掉刚写的版本化对象（本地 + 可能的 Cloudreve），绝不动旧 artifact。 */
@@ -476,16 +897,25 @@ export async function rollbackStagedArtifact(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
   staged: StagedArtifact
 ): Promise<void> {
+  let deleted = true;
   if (staged.storage === 'cloudreve' && staged.reference !== staged.localReference) {
-    await deleteArtifactByReference(session, staged.category, staged.reference).catch(
-      () => undefined
-    );
+    deleted = await deleteArtifactByReference(
+      session,
+      staged.category,
+      staged.reference
+    ).catch(() => false);
   }
-  await deleteArtifactByReference(
+  const localDeleted = await deleteArtifactByReference(
     session,
     staged.category,
     staged.localReference
-  ).catch(() => undefined);
+  ).catch(() => false);
+  deleted = deleted && localDeleted;
+  if (deleted) {
+    await rollbackStoredArtifact(staged.storedArtifactId);
+  } else {
+    await markStoredArtifactOrphan(staged.storedArtifactId);
+  }
 }
 
 /**
@@ -494,7 +924,8 @@ export async function rollbackStagedArtifact(
  * 单次加载 Cloudreve 上下文复用。任何失败仅 warn，绝不阻塞 DB 删除。
  */
 export async function deleteSessionArtifacts(
-  session: SessionArtifactsSource
+  session: SessionArtifactsSource,
+  prefetchedLedgerRows?: ReadonlyArray<StoredArtifactRow>
 ): Promise<void> {
   const ctx = await loadCloudreveContext();
   const targets: Array<[SessionArtifactCategory, string | null | undefined]> = [
@@ -508,8 +939,32 @@ export async function deleteSessionArtifacts(
     // 与其它产物一并清理，删会话不留孤儿。fullTranscriptPath 为空则被 deleteArtifactByReference 跳过。
     ['full-transcripts', session.fullTranscriptPath],
   ];
+  const deletedByReference = new Map<string, boolean>();
   for (const [category, reference] of targets) {
-    await deleteArtifactByReference(session, category, reference, ctx);
+    const deleted = await deleteArtifactByReference(session, category, reference, ctx);
+    if (reference) deletedByReference.set(reference, deleted);
+  }
+
+  // 账本还可能含有替换失败留下的 ORPHANED 版本，它们不再出现在
+  // Session path 列中，但删会话时同样必须清理并释放。
+  const ledgerRows =
+    prefetchedLedgerRows ??
+    (await findBillableStoredArtifactsByOwner('session', session.id));
+  for (const row of ledgerRows) {
+    if (!row.reference) {
+      continue;
+    }
+    let deleted = deletedByReference.get(row.reference);
+    if (deleted === undefined) {
+      const category = categoryForArtifactType(row.artifactType);
+      deleted = category
+        ? await deleteArtifactByReference(session, category, row.reference, ctx)
+        : false;
+      deletedByReference.set(row.reference, deleted);
+    }
+    if (deleted) {
+      await releaseStoredArtifact(row.id).catch(() => undefined);
+    }
   }
 }
 
@@ -520,15 +975,27 @@ export async function persistSessionTranscriptArtifacts(
   transcript: PersistedArtifactResult;
   summary: PersistedArtifactResult;
 }> {
-  const transcriptJson = JSON.stringify(bundle, null, 2);
-  const summaryJson = JSON.stringify(bundle.summaries, null, 2);
-
-  const [transcript, summary] = await Promise.all([
-    persistArtifact(session, 'transcripts', transcriptJson),
-    persistArtifact(session, 'summaries', summaryJson),
-  ]);
-
-  return { transcript, summary };
+  // Shared last-mile boundary: async Soniox finalize and any future internal
+  // caller must obey the same persisted object-graph/byte limits as HTTP.
+  const staged = await stageSessionTranscriptArtifacts(session, bundle);
+  try {
+    const [transcript, summary] = await finalizeStagedArtifactPublishes(session, [
+      staged.transcript,
+      staged.summary,
+    ]);
+    if (!transcript || !summary) {
+      throw new Error('transcript artifact publication was incomplete');
+    }
+    return { transcript, summary };
+  } catch (error) {
+    // Atomic settle either publishes both or leaves both RESERVED. Remove both
+    // staged objects on failure so a quota error can never leak the first half.
+    await Promise.all([
+      rollbackStagedArtifact(session, staged.transcript).catch(() => undefined),
+      rollbackStagedArtifact(session, staged.summary).catch(() => undefined),
+    ]);
+    throw error;
+  }
 }
 
 /**
@@ -540,15 +1007,20 @@ export async function stageSessionTranscriptArtifacts(
   session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
   bundle: PersistedTranscriptBundle
 ): Promise<{ transcript: StagedArtifact; summary: StagedArtifact }> {
-  const transcriptJson = JSON.stringify(bundle, null, 2);
-  const summaryJson = JSON.stringify(bundle.summaries, null, 2);
+  const admitted = admitPersistedTranscriptBundle(bundle);
+  const transcriptJson = JSON.stringify(admitted, null, 2);
+  const summaryJson = JSON.stringify(admitted.summaries, null, 2);
 
-  const [transcript, summary] = await Promise.all([
-    stageArtifact(session, 'transcripts', transcriptJson),
-    stageArtifact(session, 'summaries', summaryJson),
-  ]);
-
-  return { transcript, summary };
+  const transcript = await stageArtifact(session, 'transcripts', transcriptJson);
+  try {
+    const summary = await stageArtifact(session, 'summaries', summaryJson);
+    return { transcript, summary };
+  } catch (error) {
+    // The first physical object/reservation must not survive failure to reserve
+    // or write the second half of the pair.
+    await rollbackStagedArtifact(session, transcript).catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function loadSessionTranscriptBundle(
@@ -557,10 +1029,17 @@ export async function loadSessionTranscriptBundle(
   const transcriptBuffer = await readArtifactFromReference(
     session,
     'transcripts',
-    session.transcriptPath
+    session.transcriptPath,
+    { maxBytes: SESSION_TRANSCRIPT_LIMITS.maxPersistedJsonBytes }
   );
 
   if (!transcriptBuffer) {
+    return null;
+  }
+  if (
+    transcriptBuffer.byteLength >
+    SESSION_TRANSCRIPT_LIMITS.maxPersistedJsonBytes
+  ) {
     return null;
   }
 
@@ -570,17 +1049,23 @@ export async function loadSessionTranscriptBundle(
   }
 
   const record = parsed as Partial<PersistedTranscriptBundle>;
-  const fallbackSummaries = await loadSessionSummaryData(session);
-
-  return {
+  const fallbackSummaries = Array.isArray(record.summaries)
+    ? null
+    : await loadSessionSummaryData(session);
+  const candidate = {
     segments: Array.isArray(record.segments) ? record.segments : [],
     summaries: Array.isArray(record.summaries)
       ? record.summaries
       : fallbackSummaries ?? [],
     translations: isPlainObject(record.translations)
-      ? sanitizeStringRecord(record.translations)
+      ? record.translations
       : {},
   };
+  try {
+    return admitPersistedTranscriptBundle(candidate);
+  } catch {
+    return null;
+  }
 }
 
 export async function loadSessionSummaryData(
@@ -589,10 +1074,16 @@ export async function loadSessionSummaryData(
   const summaryBuffer = await readArtifactFromReference(
     session,
     'summaries',
-    session.summaryPath
+    session.summaryPath,
+    { maxBytes: SESSION_TRANSCRIPT_LIMITS.maxPersistedJsonBytes }
   );
 
   if (!summaryBuffer) {
+    return null;
+  }
+  if (
+    summaryBuffer.byteLength > SESSION_TRANSCRIPT_LIMITS.maxPersistedJsonBytes
+  ) {
     return null;
   }
 
@@ -732,15 +1223,6 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function sanitizeStringRecord(
-  value: Record<string, unknown>
-): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(([, entry]) => typeof entry === 'string')
-      .map(([key, entry]) => [key, entry as string])
-  );
-}
 
 /** 保存会话报告 */
 export async function persistSessionReport(

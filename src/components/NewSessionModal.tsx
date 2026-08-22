@@ -4,6 +4,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useMicrophoneMonitor } from '@/hooks/useMicrophoneMonitor';
 import { useAuth } from '@/hooks/useAuth';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+  isPersistedAuthBoundaryCurrent,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
 import { resolveSessionTerms } from '@/lib/keywords/sessionTerms';
 import { useI18n } from '@/lib/i18n';
 import { useSettingsStore } from '@/stores/settingsStore';
@@ -231,6 +237,8 @@ export default function NewSessionModal({ onClose, defaultFolderId }: NewSession
   const handleStart = useCallback(async () => {
     if (isStarting) return;
     if (!token) { router.push('/login'); return; }
+    const expected = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
     setIsStarting(true);
     setErrorMsg(null);
     try {
@@ -261,25 +269,51 @@ export default function NewSessionModal({ onClose, defaultFolderId }: NewSession
         return;
       }
       const session = await res.json();
+      if (!session || typeof session.id !== 'string' || !session.id) {
+        throw new Error('Invalid session response');
+      }
       const sessionTerms = await resolveSessionTerms({
         token,
         folderId: folderId || null,
         sessionKeywords: terms,
       });
-      setPendingSessionTerms(session.id, sessionTerms);
-      if (audioSource === 'mic') {
-        const fb = preferredMicDeviceId || activeDeviceId || availableMics[0]?.deviceId || null;
-        if (fb) setPreferredMicDeviceId(fb);
+      const committed = await runAuthBoundaryCommit(expected, () => {
+        if (ownerSignal.aborted) return false;
+        setPendingSessionTerms(session.id, sessionTerms);
+        if (audioSource === 'mic') {
+          const fb = preferredMicDeviceId || activeDeviceId || availableMics[0]?.deviceId || null;
+          if (fb) setPreferredMicDeviceId(fb);
+        }
+        // Hand off system audio only in the same atomic owner commit. A stale
+        // closure must neither publish nor detach its media capability.
+        if (audioSource === 'system' && systemStreamRef.current) {
+          setPendingSystemStream(systemStreamRef.current);
+          systemStreamRef.current = null; // prevent cleanup on valid unmount
+        }
+        setIsStarting(false);
+        setPendingAutoStart(true);
+        router.push(`/session/${session.id}`);
+        return true;
+      });
+      if (!committed.committed || !committed.value) {
+        systemStreamRef.current?.getTracks().forEach((track) => track.stop());
+        systemStreamRef.current = null;
+        setIsStarting(false);
       }
-      // Hand off system audio stream to session page so it doesn't need re-auth
-      if (audioSource === 'system' && systemStreamRef.current) {
-        setPendingSystemStream(systemStreamRef.current);
-        systemStreamRef.current = null; // prevent cleanup on unmount
+    } catch (error) {
+      if (
+        ownerSignal.aborted ||
+        !isPersistedAuthBoundaryCurrent(expected) ||
+        (error &&
+          typeof error === 'object' &&
+          'name' in error &&
+          error.name === 'AbortError')
+      ) {
+        systemStreamRef.current?.getTracks().forEach((track) => track.stop());
+        systemStreamRef.current = null;
+        setIsStarting(false);
+        return;
       }
-      setIsStarting(false);
-      setPendingAutoStart(true);
-      router.push(`/session/${session.id}`);
-    } catch {
       setErrorMsg(t('session.newSession.networkError'));
       setIsStarting(false);
     }

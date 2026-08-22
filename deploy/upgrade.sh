@@ -9,6 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC_DIR="$(dirname "$SCRIPT_DIR")"
 APP_DIR="/opt/lecturelive"
+MAINTENANCE_DIR="/opt/lecturelive-maintenance"
 WS_DIR="/opt/lecturelive/ws-server"
 APP_USER="lecturelive"
 BACKUP_DIR="/opt/lecturelive/backups"
@@ -37,6 +38,42 @@ fi
 
 cd "$SRC_DIR"
 
+# 进入升级流程后第一时间收紧/补齐生产环境；不要等 npm ci 完成后才修复旧 0644 文件。
+[[ -f "$APP_DIR/.env" ]] || error "缺少生产环境配置: $APP_DIR/.env"
+bash "$SCRIPT_DIR/ensure-security-env.sh" "$APP_DIR/.env"
+
+# 从这一刻起升级中的任何失败都必须保持旧服务隔离。尤其是生产 Stripe 预检发现
+# 历史 test key 时，不能退出升级却让仍在运行的旧版本继续接受测试付款。
+info "停止服务并进入安全升级窗口..."
+systemctl stop lecturelive-web 2>/dev/null || true
+systemctl stop lecturelive-ws 2>/dev/null || true
+if systemctl is-active --quiet lecturelive-web || systemctl is-active --quiet lecturelive-ws; then
+    error "无法确认旧服务已停止；为避免继续处理不安全的支付配置，升级已中止"
+fi
+
+# 先于 npm、数据库迁移和编译安装不可回退的启动安全闸。这样从旧版本升级时，即使
+# 后续因历史 Stripe test key 失败，再执行旧产物回滚也只能经过新 preflight，不能把
+# 无闸门的旧 systemd unit 重新启动。
+info "安装 fail-closed 生产启动闸..."
+install -d -o "$APP_USER" -g "$APP_USER" -m 0755 "$APP_DIR/scripts"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SRC_DIR/scripts/check-production-payment-config.mjs" "$APP_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SRC_DIR/scripts/payment-production-preflight-core.mjs" "$APP_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SRC_DIR/scripts/stripe-history-reconciliation-core.mjs" "$APP_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0755 \
+    "$SRC_DIR/scripts/reconcile-stripe-history.mjs" "$APP_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SRC_DIR/scripts/stripe-key-mode.mjs" "$APP_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SRC_DIR/scripts/check-readiness.mjs" "$APP_DIR/scripts/"
+install -m 0644 "$SCRIPT_DIR/lecturelive-web.service" /etc/systemd/system/
+install -m 0644 "$SCRIPT_DIR/lecturelive-ws.service" /etc/systemd/system/
+systemctl daemon-reload
+install -m 0755 "$SCRIPT_DIR/payment-reconciliation-maintenance.sh" \
+    /usr/local/bin/lecturelive-payment-maintenance
+
 echo "========================================"
 echo "  LectureLive 升级 — $TIMESTAMP"
 echo "========================================"
@@ -64,6 +101,39 @@ if ! command -v ffmpeg &>/dev/null; then
 fi
 npm ci
 
+# Build the new security boundary before the DB preflight. If the one-time history gate stops
+# this upgrade, operators must review through this staged build, never the old live server.
+node --env-file="$APP_DIR/.env" scripts/run-prisma.mjs generate
+npm run build
+[[ -d "$SRC_DIR/.next/standalone" ]] || error "编译失败，未生成 standalone 产物"
+npm run build:ws
+[[ -f "$SRC_DIR/dist/websocket.js" ]] || error "WebSocket 编译失败"
+rm -rf "$MAINTENANCE_DIR"
+install -d -o "$APP_USER" -g "$APP_USER" -m 0755 "$MAINTENANCE_DIR"
+cp -a "$SRC_DIR/.next/standalone/." "$MAINTENANCE_DIR/"
+install -d -o "$APP_USER" -g "$APP_USER" -m 0755 "$MAINTENANCE_DIR/scripts"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SRC_DIR/scripts/check-production-payment-config.mjs" "$MAINTENANCE_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SRC_DIR/scripts/payment-production-preflight-core.mjs" "$MAINTENANCE_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SRC_DIR/scripts/stripe-history-reconciliation-core.mjs" "$MAINTENANCE_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0755 \
+    "$SRC_DIR/scripts/reconcile-stripe-history.mjs" "$MAINTENANCE_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SRC_DIR/scripts/stripe-key-mode.mjs" "$MAINTENANCE_DIR/scripts/"
+install -o "$APP_USER" -g "$APP_USER" -m 0644 \
+    "$SCRIPT_DIR/payment-maintenance-runtime-version" \
+    "$MAINTENANCE_DIR/.payment-maintenance-runtime-version"
+chown -R "$APP_USER:$APP_USER" "$MAINTENANCE_DIR"
+
+# Resolve the reconciliation CLI from the same standalone runtime that will host the restricted
+# maintenance API. This check must precede ensure-database's production history gate.
+if ! runuser -u "$APP_USER" -- /usr/bin/node \
+    "$MAINTENANCE_DIR/scripts/reconcile-stripe-history.mjs" --help >/dev/null; then
+    error "支付对账维护运行时无法解析依赖，已停止升级"
+fi
+
 # ── 3. Prisma 迁移 ──
 # 走统一编排器（scripts/ensure-database.mjs）：数据感知迁移 → db push → 历史归属回填。
 # 关键：裸调 `prisma db push` 对「有数据的表加必填自增列」等变更会要求 reset 整库（数据全失）；
@@ -73,28 +143,16 @@ info "同步数据库结构（数据感知迁移 → db push → 历史归属回
 # 真实生产配置在 $APP_DIR/.env（与 systemd ExecStart 一致，能正确处理引号）。
 # 用 node --env-file 载入它，让 prisma generate（经 run-prisma 包装器）与 ensure-database.mjs
 # 都拿得到 DATABASE_URL —— 否则 generate 会在缺连接串时静默 exit 0、ensure-database 静默跳过，schema 漂移。
-if [[ -f "$APP_DIR/.env" ]]; then
-    node --env-file="$APP_DIR/.env" scripts/run-prisma.mjs generate
-    node --env-file="$APP_DIR/.env" scripts/ensure-database.mjs
-else
-    node scripts/run-prisma.mjs generate
-    node scripts/ensure-database.mjs
-fi
+# Client/build already completed above so the staged maintenance API is available on failure.
+node --env-file="$APP_DIR/.env" scripts/ensure-database.mjs --require-database
 
 # ── 4. 编译 Next.js ──
-info "编译 Next.js..."
-npm run build
-[[ -d "$SRC_DIR/.next/standalone" ]] || error "编译失败，未生成 standalone 产物"
+info "校验预先编译的 Next.js 维护/正式产物..."
+[[ -d "$SRC_DIR/.next/standalone" ]] || error "编译产物不存在"
 
 # ── 5. 编译 WebSocket 服务器 ──
-info "编译 WebSocket 服务器..."
-npm run build:ws
-[[ -f "$SRC_DIR/dist/websocket.js" ]] || error "WebSocket 编译失败"
-
-# ── 6. 停止服务 ──
-info "停止服务..."
-systemctl stop lecturelive-web 2>/dev/null || true
-systemctl stop lecturelive-ws 2>/dev/null || true
+info "校验预先编译的 WebSocket 服务器..."
+[[ -f "$SRC_DIR/dist/websocket.js" ]] || error "WebSocket 编译产物不存在"
 
 # ── 7. 部署 Next.js standalone ──
 info "部署 Next.js 产物..."
@@ -106,6 +164,17 @@ find "$APP_DIR" -mindepth 1 -maxdepth 1 \
     -exec rm -rf {} +
 
 cp -a "$SRC_DIR/.next/standalone/." "$APP_DIR/"
+mkdir -p "$APP_DIR/scripts"
+install -m 0644 "$SRC_DIR/scripts/check-production-payment-config.mjs" "$APP_DIR/scripts/"
+install -m 0644 "$SRC_DIR/scripts/payment-production-preflight-core.mjs" "$APP_DIR/scripts/"
+install -m 0644 "$SRC_DIR/scripts/stripe-history-reconciliation-core.mjs" "$APP_DIR/scripts/"
+install -m 0755 "$SRC_DIR/scripts/reconcile-stripe-history.mjs" "$APP_DIR/scripts/"
+install -m 0644 "$SRC_DIR/scripts/stripe-key-mode.mjs" "$APP_DIR/scripts/"
+install -m 0644 "$SRC_DIR/scripts/check-readiness.mjs" "$APP_DIR/scripts/"
+install -m 0644 "$SRC_DIR/scripts/document-parser-worker.mjs" "$APP_DIR/scripts/"
+install -m 0644 "$SRC_DIR/scripts/document-parser-network-deny.cjs" "$APP_DIR/scripts/"
+install -m 0644 "$SRC_DIR/scripts/document-archive-preflight.mjs" "$APP_DIR/scripts/"
+install -m 0644 "$SCRIPT_DIR/runtime-security-version" "$APP_DIR/.runtime-security-version"
 mkdir -p "$APP_DIR/.next/static"
 cp -a "$SRC_DIR/.next/static/." "$APP_DIR/.next/static/"
 # Next standalone 运行时需要可写的 .next/cache，编译产物不含，须显式创建
@@ -131,6 +200,7 @@ ln -sfn "$APP_DIR/.env" "$WS_DIR/.env"
 
 # ── 9. 修复权限 ──
 chown -R $APP_USER:$APP_USER "$APP_DIR"
+chown -R $APP_USER:$APP_USER "$MAINTENANCE_DIR"
 chmod 600 "$APP_DIR/.env"
 
 # ── 10. 更新 systemd 并启动 ──
@@ -138,7 +208,16 @@ info "启动服务..."
 cp "$SCRIPT_DIR/lecturelive-web.service" /etc/systemd/system/
 cp "$SCRIPT_DIR/lecturelive-ws.service" /etc/systemd/system/
 systemctl daemon-reload
-systemctl start lecturelive-web lecturelive-ws
+install -m 0755 "$SCRIPT_DIR/payment-reconciliation-maintenance.sh" \
+    /usr/local/bin/lecturelive-payment-maintenance
+if ! systemctl start lecturelive-web lecturelive-ws; then
+    systemctl stop lecturelive-web 2>/dev/null || true
+    systemctl stop lecturelive-ws 2>/dev/null || true
+    if systemctl is-active --quiet lecturelive-web || systemctl is-active --quiet lecturelive-ws; then
+        error "服务启动失败，且无法确认失败实例已停止"
+    fi
+    error "服务启动失败，所有实例已保持停止"
+fi
 
 # ── 11. 健康检查 ──
 info "等待服务启动..."
@@ -149,7 +228,13 @@ WS_OK=false
 HEALTH_OK=false
 systemctl is-active --quiet lecturelive-web && WEB_OK=true
 systemctl is-active --quiet lecturelive-ws && WS_OK=true
-curl -fsS http://127.0.0.1:3000/api/health >/dev/null 2>&1 && HEALTH_OK=true
+runuser -u "$APP_USER" -- /usr/bin/node --env-file="$APP_DIR/.env" \
+    "$APP_DIR/scripts/check-readiness.mjs" --wait >/dev/null 2>&1 && HEALTH_OK=true
+# readiness 期间任一 unit 都可能退出；成功判定前重新读取两项状态，不能复用探测前快照。
+WEB_OK=false
+WS_OK=false
+systemctl is-active --quiet lecturelive-web && WEB_OK=true
+systemctl is-active --quiet lecturelive-ws && WS_OK=true
 
 echo ""
 if $WEB_OK && $WS_OK && $HEALTH_OK; then
@@ -158,11 +243,15 @@ if $WEB_OK && $WS_OK && $HEALTH_OK; then
     echo "  WebSocket: $(systemctl is-active lecturelive-ws)"
     echo "  Health:    ok"
 else
-    warn "服务状态异常，请检查日志:"
+    warn "服务未通过完整启动检查，正在隔离失败实例:"
     $WEB_OK || echo "  ✗ lecturelive-web: journalctl -u lecturelive-web -n 30 --no-pager"
     $WS_OK  || echo "  ✗ lecturelive-ws:  journalctl -u lecturelive-ws -n 30 --no-pager"
-    $HEALTH_OK || echo "  ✗ healthcheck:    curl -fsS http://127.0.0.1:3000/api/health"
-    echo ""
-    warn "如需回滚: sudo bash deploy/rollback.sh"
+    $HEALTH_OK || echo "  ✗ readiness: node --env-file=$APP_DIR/.env $APP_DIR/scripts/check-readiness.mjs"
+    systemctl stop lecturelive-web 2>/dev/null || true
+    systemctl stop lecturelive-ws 2>/dev/null || true
+    if systemctl is-active --quiet lecturelive-web || systemctl is-active --quiet lecturelive-ws; then
+        error "启动检查失败，且无法确认服务已停止；请立即检查 systemd 状态"
+    fi
+    error "升级失败：服务已保持停止；修复配置或回滚到带 health-ready-v1 标记的安全版本"
 fi
 echo ""

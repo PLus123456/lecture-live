@@ -35,6 +35,9 @@ const {
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
+vi.mock('@/lib/payment/entitlementAdmission', () => ({
+  isPaymentBenefitAvailable: vi.fn().mockResolvedValue(true),
+}));
 vi.mock('@/lib/rateLimit', () => ({ enforceApiRateLimit: enforceApiRateLimitMock }));
 vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: getSiteSettingsMock }));
 vi.mock('@/lib/llm/access', () => ({

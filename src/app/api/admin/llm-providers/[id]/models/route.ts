@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 // 有效的 LLM 用途枚举值
 const VALID_PURPOSES = ['CHAT', 'REALTIME_SUMMARY', 'FINAL_SUMMARY', 'KEYWORD_EXTRACTION', 'EMBEDDING', 'TRANSLATION'];
@@ -17,8 +17,8 @@ export async function POST(
     limit: 30,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -84,41 +84,58 @@ export async function POST(
       );
     }
 
-    // 如果设置为默认模型，先取消同用途下其他默认模型
     const effectivePurpose = purpose || 'CHAT';
-    if (isDefault) {
-      await prisma.llmModel.updateMany({
-        where: { purpose: effectivePurpose, isDefault: true },
-        data: { isDefault: false },
-      });
-    }
 
     // supportsThinkingDepth 由 mode === 'DEPTH' 派生（一致性保护）
     const effectiveThinkingMode = thinkingMode ?? 'NONE';
     const effectiveSupportsDepth = effectiveThinkingMode === 'DEPTH';
 
-    const model = await prisma.llmModel.create({
-      data: {
-        providerId,
-        modelId,
-        displayName,
-        thinkingDepth: thinkingDepth ?? 'medium',
-        thinkingMode: effectiveThinkingMode,
-        supportsThinkingDepth: effectiveSupportsDepth,
-        supportsImage: Boolean(supportsImage),
-        maxTokens: effectiveMaxTokens,
-        contextWindow: effectiveContextWindow,
-        temperature: temperature ?? 0.3,
-        purpose: effectivePurpose,
-        isDefault: isDefault ?? false,
-        sortOrder: sortOrder ?? 0,
-      },
-    });
-
-    // U67：模型级变更补审计（与 provider 级端点对齐），否则删/改默认模型无操作者留痕。
-    logAction(req, 'admin.llm.model.create', {
-      user: admin,
-      detail: `新增 LLM 模型: ${modelId} (${effectivePurpose}${isDefault ? ', 默认' : ''})`,
+    const model = await prisma.$transaction(async (tx) => {
+      if (isDefault) {
+        await tx.llmModel.updateMany({
+          where: { purpose: effectivePurpose, isDefault: true },
+          data: { isDefault: false },
+        });
+      }
+      const created = await tx.llmModel.create({
+        data: {
+          providerId,
+          modelId,
+          displayName,
+          thinkingDepth: thinkingDepth ?? 'medium',
+          thinkingMode: effectiveThinkingMode,
+          supportsThinkingDepth: effectiveSupportsDepth,
+          supportsImage: Boolean(supportsImage),
+          maxTokens: effectiveMaxTokens,
+          contextWindow: effectiveContextWindow,
+          temperature: temperature ?? 0.3,
+          purpose: effectivePurpose,
+          isDefault: isDefault ?? false,
+          sortOrder: sortOrder ?? 0,
+        },
+      });
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-models.create',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'llm_model', id: created.id, providerId },
+          after: {
+            modelId: created.modelId,
+            displayName: created.displayName,
+            purpose: created.purpose,
+            isDefault: created.isDefault,
+            thinkingMode: created.thinkingMode,
+            supportsImage: created.supportsImage,
+            maxTokens: created.maxTokens,
+            contextWindow: created.contextWindow,
+          },
+          reason: 'admin_create',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
+      return created;
     });
 
     return NextResponse.json({ model }, { status: 201 });

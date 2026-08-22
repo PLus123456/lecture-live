@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/hooks/useAuth';
 import { isAuthHydrated, useAuthStore } from '@/stores/authStore';
+import { useI18n } from '@/lib/i18n';
 
 /**
  * 订阅 Zustand persist 水合状态，避免水合期间闪烁 loading。
@@ -25,37 +26,105 @@ function useHydrated() {
 
 export default function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
-  const { user, token, sessionChecked, restoreSession } = useAuth();
+  const {
+    user,
+    token,
+    sessionChecked,
+    restoreSession,
+    logout,
+    hasPendingLogout,
+  } = useAuth();
+  const { t } = useI18n();
   const restoreAttempted = useRef(false);
+  const [restoreUnavailable, setRestoreUnavailable] = useState(false);
+  const [retryGeneration, setRetryGeneration] = useState(0);
   const hydrated = useHydrated();
 
   useEffect(() => {
     // 水合未完成，等待 localStorage 数据加载
     if (!hydrated) return;
 
+    // 上一次服务端持久撤销未确认时，必须先保留当前 cookie 供精确重试；不能 refresh
+    // 或登录覆盖它，否则被盗副本对应的 family 将失去本机撤销凭据。
+    if (hasPendingLogout) {
+      setRestoreUnavailable(true);
+      return;
+    }
+
     // store 里已经有 user/token（来自 localStorage 水合），无需恢复
     if (user && token) return;
+
+    // 显式 logout/401 cleanup 已把 sessionChecked 置 true：这是已确认的匿名边界，绝不能
+    // 因本组件本次挂载尚未 restore 而立刻拿残留 cookie 并发 refresh、把用户重新写回来。
+    if (sessionChecked) {
+      router.replace('/login');
+      return;
+    }
 
     // 尝试从 HttpOnly cookie 恢复会话
     if (!restoreAttempted.current) {
       restoreAttempted.current = true;
-      restoreSession().then((restored) => {
-        if (!restored) {
+      restoreSession().then((result) => {
+        if (result === 'invalid') {
           router.replace('/login');
+        } else if (result === 'unavailable') {
+          setRestoreUnavailable(true);
         }
       });
       return;
     }
 
-    // 已经尝试过恢复但失败了
-    if (sessionChecked && (!user || !token)) {
-      router.replace('/login');
-    }
-  }, [hydrated, user, token, sessionChecked, restoreSession, router]);
+  }, [
+    hydrated,
+    user,
+    token,
+    sessionChecked,
+    hasPendingLogout,
+    restoreSession,
+    router,
+    retryGeneration,
+  ]);
 
   // 水合完成且 localStorage 有缓存 → 直接渲染，不阻塞
-  if (hydrated && user && token) {
+  if (hydrated && user && token && !hasPendingLogout) {
     return <>{children}</>;
+  }
+
+  if (restoreUnavailable) {
+    return (
+      <div className="min-h-[100dvh] bg-cream-50 flex items-center justify-center px-6">
+        <div className="max-w-md rounded-2xl border border-amber-200 bg-white p-6 text-center shadow-sm">
+          <p className="font-semibold text-charcoal-800">
+            {hasPendingLogout
+              ? t('auth.logoutIncomplete')
+              : t('auth.sessionServiceUnavailable')}
+          </p>
+          <p className="mt-2 text-sm text-charcoal-500">
+            {hasPendingLogout
+              ? t('auth.logoutIncompleteDescription')
+              : t('auth.sessionServiceUnavailableDescription')}
+          </p>
+          <button
+            type="button"
+            className="mt-4 rounded-xl bg-rust-500 px-4 py-2 text-sm font-semibold text-white"
+            onClick={async () => {
+              if (hasPendingLogout) {
+                const result = await logout();
+                if (result.durableRevocation) {
+                  router.replace('/login');
+                }
+                return;
+              }
+              restoreAttempted.current = false;
+              setRestoreUnavailable(false);
+              setRetryGeneration((value) => value + 1);
+            }}
+          >
+            {t('common.retry')}
+          </button>
+        </div>
+      </div>
+    );
   }
 
   // 水合中 或 正在从 cookie 恢复 → 显示骨架屏

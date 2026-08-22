@@ -38,6 +38,33 @@ function buf(value: unknown): Buffer {
   return Buffer.from(typeof value === 'string' ? value : JSON.stringify(value));
 }
 
+function segment(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 's0',
+    sessionIndex: 0,
+    speaker: 'Speaker 1',
+    language: 'en',
+    text: 'hi',
+    globalStartMs: 0,
+    globalEndMs: 1000,
+    startMs: 0,
+    endMs: 1000,
+    isFinal: true,
+    confidence: 0.9,
+    timestamp: '00:00',
+    ...overrides,
+  };
+}
+
+function transcriptBundle(overrides: Record<string, unknown> = {}) {
+  return {
+    segments: [segment()],
+    summaries: [],
+    translations: { s0: '你好' },
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
@@ -45,24 +72,21 @@ beforeEach(() => {
 describe('loadFullTranscript', () => {
   it('正常读取：返回归一后的 segments/summaries/translations', async () => {
     readArtifactMock.mockResolvedValue(
-      buf({
-        segments: [{ id: 's0', text: 'hi' }],
-        summaries: [{ summary: 'x' }],
-        translations: { s0: '你好' },
-      })
+      buf(transcriptBundle())
     );
 
     const bundle = await loadFullTranscript(session as never);
     expect(bundle).not.toBeNull();
     expect(bundle!.segments).toHaveLength(1);
-    expect(bundle!.summaries).toHaveLength(1);
+    expect(bundle!.summaries).toHaveLength(0);
     expect(bundle!.translations).toEqual({ s0: '你好' });
 
     // 阶段C：读取经 readArtifactFromReference（'full-transcripts' + fullTranscriptPath 引用）
     expect(readArtifactMock).toHaveBeenCalledWith(
       session,
       'full-transcripts',
-      session.fullTranscriptPath
+      session.fullTranscriptPath,
+      { maxBytes: 8 * 1024 * 1024 }
     );
   });
 
@@ -81,21 +105,18 @@ describe('loadFullTranscript', () => {
     expect(await loadFullTranscript(session as never)).toBeNull();
   });
 
-  it('防御性归一：非数组 segments → []，非字符串译文被过滤', async () => {
+  it('防御性验证：非数组 segments 或非字符串译文使整个产物失败关闭', async () => {
     readArtifactMock.mockResolvedValue(
       buf({
         segments: 'oops',
         translations: { good: 'ok', bad: 123, nested: { x: 1 } },
       })
     );
-    const bundle = await loadFullTranscript(session as never);
-    expect(bundle!.segments).toEqual([]);
-    expect(bundle!.summaries).toEqual([]);
-    expect(bundle!.translations).toEqual({ good: 'ok' });
+    await expect(loadFullTranscript(session as never)).resolves.toBeNull();
   });
 
   it('无 fullTranscriptPath：以 null 引用委托 readArtifactFromReference 回退候选', async () => {
-    readArtifactMock.mockResolvedValue(buf({ segments: [{ id: 's0' }] }));
+    readArtifactMock.mockResolvedValue(buf(transcriptBundle()));
     const bundle = await loadFullTranscript({
       id: 'sess-x',
       userId: 'user-1',
@@ -106,7 +127,8 @@ describe('loadFullTranscript', () => {
     expect(readArtifactMock).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'sess-x' }),
       'full-transcripts',
-      null
+      null,
+      { maxBytes: 8 * 1024 * 1024 }
     );
   });
 });

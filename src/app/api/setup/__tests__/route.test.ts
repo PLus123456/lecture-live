@@ -8,7 +8,7 @@ import { Prisma } from '@prisma/client';
  * + 10 次/10 分钟限流，而完整接管只需要 3-4 个请求：建隐藏管理员 / 把 LLM 端点指向
  * 攻击者 / 把 Soniox 端点指向攻击者 / 抢先置位 setup_complete 把实例锁死。
  *
- * 这里 validateCloudreveBaseUrl 保持真实，验证的是真正的私网黑名单。
+ * 这里 LLM exact-origin policy 保持真实，验证 setup 不会成为 allowlist 旁路。
  */
 
 const {
@@ -19,9 +19,13 @@ const {
   siteSettingUpsertMock,
   siteSettingCreateMock,
   llmProviderCreateMock,
+  llmProviderCountMock,
   transactionMock,
   enforceRateLimitMock,
   verifyAuthMock,
+  dnsLookupMock,
+  llmReauthMock,
+  llmSecurityAuditMock,
   prismaMock,
 } = vi.hoisted(() => {
   const mocks = {
@@ -36,6 +40,9 @@ const {
     transactionMock: vi.fn(),
     enforceRateLimitMock: vi.fn(),
     verifyAuthMock: vi.fn(),
+    dnsLookupMock: vi.fn(),
+    llmReauthMock: vi.fn(),
+    llmSecurityAuditMock: vi.fn(),
   };
   return {
     ...mocks,
@@ -62,6 +69,14 @@ const {
   };
 });
 
+vi.mock('node:dns/promises', () => ({ lookup: dnsLookupMock }));
+vi.mock('@/lib/llm/adminReauth', () => ({
+  requireLlmAdminCurrentPassword: llmReauthMock,
+}));
+vi.mock('@/lib/llm/securityAudit', () => ({
+  writeLlmSecurityAudit: llmSecurityAuditMock,
+}));
+
 vi.mock('@/lib/prisma', () => ({ prisma: prismaMock }));
 
 vi.mock('@/lib/rateLimit', () => ({ enforceRateLimit: enforceRateLimitMock }));
@@ -74,13 +89,14 @@ vi.mock('@/lib/soniox/env', () => ({ invalidateSonioxDbConfigCache: vi.fn() }));
 
 vi.mock('@/lib/auth', () => ({
   verifyAuth: verifyAuthMock,
-  signToken: () => 'signed-token',
+  getAuthTokenSessionBinding: () => 'binding-setup',
+  issueAuthToken: async () => 'signed-token',
   setAuthCookie: (response: unknown) => response,
   CLIENT_SESSION_TOKEN: '__cookie_session__',
   validatePassword: () => null,
 }));
 
-import { POST } from '@/app/api/setup/route';
+import { GET, POST } from '@/app/api/setup/route';
 
 function makeRequest(body: unknown, headers: Record<string, string> = {}): Request {
   return new Request('http://localhost/api/setup', {
@@ -90,11 +106,17 @@ function makeRequest(body: unknown, headers: Record<string, string> = {}): Reque
   });
 }
 
+const BOOTSTRAP_TOKEN = 'test-bootstrap-token-32-bytes-minimum-value';
 const ORIGINAL_BOOTSTRAP_TOKEN = process.env.SETUP_BOOTSTRAP_TOKEN;
+const ORIGINAL_LLM_ALLOWED_ORIGINS = process.env.LLM_PROVIDER_ALLOWED_ORIGINS;
 
 beforeEach(() => {
   vi.clearAllMocks();
-  delete process.env.SETUP_BOOTSTRAP_TOKEN;
+  process.env.SETUP_BOOTSTRAP_TOKEN = BOOTSTRAP_TOKEN;
+  process.env.LLM_PROVIDER_ALLOWED_ORIGINS = 'https://api.openai.com';
+  dnsLookupMock.mockResolvedValue([{ address: '93.184.216.34', family: 4 }]);
+  llmReauthMock.mockResolvedValue({ ok: true });
+  llmSecurityAuditMock.mockResolvedValue(undefined);
   enforceRateLimitMock.mockResolvedValue(null);
   // setup_complete 未置位
   siteSettingFindUniqueMock.mockResolvedValue(null);
@@ -120,17 +142,51 @@ beforeEach(() => {
 afterEach(() => {
   if (ORIGINAL_BOOTSTRAP_TOKEN === undefined) delete process.env.SETUP_BOOTSTRAP_TOKEN;
   else process.env.SETUP_BOOTSTRAP_TOKEN = ORIGINAL_BOOTSTRAP_TOKEN;
+  if (ORIGINAL_LLM_ALLOWED_ORIGINS === undefined) {
+    delete process.env.LLM_PROVIDER_ALLOWED_ORIGINS;
+  } else {
+    process.env.LLM_PROVIDER_ALLOWED_ORIGINS = ORIGINAL_LLM_ALLOWED_ORIGINS;
+  }
 });
 
 describe('POST /api/setup —— 未认证引导窗口 (C02 / P6-4)', () => {
-  it('全新库（零管理员）仍可匿名走 step=admin —— 真正的首次部署窗口不被堵死', async () => {
+  it('跨源 text/plain bootstrap 请求在任何 DB/认领前拒绝且不写 cookie', async () => {
     const res = await POST(
-      makeRequest({
-        step: 'admin',
-        email: 'admin@example.com',
-        password: 'Abcd1234',
-        displayName: 'Admin',
+      new Request('https://app.example/api/setup', {
+        method: 'POST',
+        headers: {
+          Origin: 'https://evil.example',
+          'Sec-Fetch-Site': 'same-site',
+          'Content-Type': 'text/plain',
+          'x-setup-token': BOOTSTRAP_TOKEN,
+        },
+        body: JSON.stringify({
+          step: 'admin',
+          email: 'attacker@example.com',
+          password: 'Abcd1234',
+          displayName: 'Attacker',
+        }),
       })
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.headers.get('set-cookie')).toBeNull();
+    expect(res.headers.get('clear-site-data')).toBeNull();
+    expect(enforceRateLimitMock).not.toHaveBeenCalled();
+    expect(userCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('全新库（零管理员）只有正确 bootstrap token 才可走 step=admin', async () => {
+    const res = await POST(
+      makeRequest(
+        {
+          step: 'admin',
+          email: 'admin@example.com',
+          password: 'Abcd1234',
+          displayName: 'Admin',
+        },
+        { 'x-setup-token': BOOTSTRAP_TOKEN }
+      )
     );
     expect(res.status).toBe(200);
     expect(userCreateMock).toHaveBeenCalledTimes(1);
@@ -183,9 +239,7 @@ describe('POST /api/setup —— 未认证引导窗口 (C02 / P6-4)', () => {
     expect(res.status).toBe(403);
   });
 
-  it('配了 SETUP_BOOTSTRAP_TOKEN 时：不带/带错密钥一律 401，哪怕库是全新的', async () => {
-    process.env.SETUP_BOOTSTRAP_TOKEN = 'super-secret-bootstrap-token';
-
+  it('不带/带错密钥一律 401，哪怕库是全新的', async () => {
     const missing = await POST(
       makeRequest({
         step: 'admin',
@@ -199,29 +253,45 @@ describe('POST /api/setup —— 未认证引导窗口 (C02 / P6-4)', () => {
     const wrong = await POST(
       makeRequest(
         { step: 'admin', email: 'a@b.c', password: 'Abcd1234', displayName: 'A' },
-        { 'x-setup-token': 'super-secret-bootstrap-tokeN' }
+        { 'x-setup-token': `${BOOTSTRAP_TOKEN}x` }
       )
     );
     expect(wrong.status).toBe(401);
     expect(userCreateMock).not.toHaveBeenCalled();
   });
 
-  it('配了 SETUP_BOOTSTRAP_TOKEN 且密钥正确时放行', async () => {
-    process.env.SETUP_BOOTSTRAP_TOKEN = 'super-secret-bootstrap-token';
+  it('缺少或弱 SETUP_BOOTSTRAP_TOKEN 时 fail-closed（503）', async () => {
+    delete process.env.SETUP_BOOTSTRAP_TOKEN;
+    const missing = await POST(
+      makeRequest(
+        { step: 'admin', email: 'a@b.c', password: 'Abcd1234', displayName: 'A' },
+        { 'x-setup-token': BOOTSTRAP_TOKEN }
+      )
+    );
+    expect(missing.status).toBe(503);
 
+    process.env.SETUP_BOOTSTRAP_TOKEN = 'too-short';
+    const weak = await POST(
+      makeRequest(
+        { step: 'admin', email: 'a@b.c', password: 'Abcd1234', displayName: 'A' },
+        { 'x-setup-token': 'too-short' }
+      )
+    );
+    expect(weak.status).toBe(503);
+    expect(userCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('SETUP_BOOTSTRAP_TOKEN 正确时放行首管认领', async () => {
     const res = await POST(
       makeRequest(
         { step: 'admin', email: 'a@b.c', password: 'Abcd1234', displayName: 'A' },
-        { 'x-setup-token': 'super-secret-bootstrap-token' }
+        { 'x-setup-token': BOOTSTRAP_TOKEN }
       )
     );
     expect(res.status).toBe(200);
   });
 
-  it('配了 SETUP_BOOTSTRAP_TOKEN 也不锁死管理员：已登录 ADMIN 无需带密钥', async () => {
-    // 两条通行证是「或」的关系——否则运维一配密钥，浏览器里的向导（不会带这个 header）
-    // 就整条走不通了。
-    process.env.SETUP_BOOTSTRAP_TOKEN = 'super-secret-bootstrap-token';
+  it('首管存在后，已登录 ADMIN 无需带 bootstrap token', async () => {
     userCountMock.mockResolvedValue(1);
     verifyAuthMock.mockResolvedValue({
       id: 'admin-1',
@@ -232,17 +302,74 @@ describe('POST /api/setup —— 未认证引导窗口 (C02 / P6-4)', () => {
     const res = await POST(makeRequest({ step: 'complete' }));
     expect(res.status).toBe(200);
   });
+
+  it('首管存在后 bootstrap token 永久失效，不能替代 ADMIN 会话', async () => {
+    userCountMock.mockResolvedValue(1);
+    verifyAuthMock.mockResolvedValue(null);
+
+    const res = await POST(
+      makeRequest(
+        {
+          step: 'llm',
+          providers: [
+            { name: 'evil', apiKey: 'k', apiBase: 'https://attacker.example.com' },
+          ],
+        },
+        { 'x-setup-token': BOOTSTRAP_TOKEN }
+      )
+    );
+
+    expect(res.status).toBe(403);
+    expect(llmProviderCreateMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['database', 'llm', 'soniox', 'complete'])(
+    'bootstrap token 不能执行非 admin 步骤: %s',
+    async (step) => {
+      const res = await POST(
+        makeRequest({ step }, { 'x-setup-token': BOOTSTRAP_TOKEN })
+      );
+
+      expect(res.status).toBe(403);
+      expect(llmProviderCreateMock).not.toHaveBeenCalled();
+      expect(siteSettingUpsertMock).not.toHaveBeenCalled();
+    }
+  );
+});
+
+describe('GET /api/setup —— 只读状态', () => {
+  it('即使 admin/LLM/Soniox 都就绪也不隐式写 setup_complete', async () => {
+    userCountMock.mockResolvedValue(1);
+    llmProviderCountMock.mockResolvedValue(1);
+    siteSettingFindUniqueMock.mockImplementation(
+      async ({ where }: { where: { key: string } }) =>
+        where.key === 'soniox_configured' ? { value: 'true' } : null
+    );
+
+    const response = await GET(new Request('http://localhost/api/setup'));
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      setupComplete: false,
+      steps: { admin: true, llm: true, soniox: true },
+    });
+    expect(siteSettingUpsertMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST /api/setup step=admin —— 首个管理员的并发抢占 (C02 / P6-4)', () => {
   it('创建走事务，并先对 setup_admin_claimed 做唯一键 CAS 抢占', async () => {
     await POST(
-      makeRequest({
-        step: 'admin',
-        email: 'admin@example.com',
-        password: 'Abcd1234',
-        displayName: 'Admin',
-      })
+      makeRequest(
+        {
+          step: 'admin',
+          email: 'admin@example.com',
+          password: 'Abcd1234',
+          displayName: 'Admin',
+        },
+        { 'x-setup-token': BOOTSTRAP_TOKEN }
+      )
     );
 
     expect(transactionMock).toHaveBeenCalledTimes(1);
@@ -261,12 +388,15 @@ describe('POST /api/setup step=admin —— 首个管理员的并发抢占 (C02 
     );
 
     const res = await POST(
-      makeRequest({
-        step: 'admin',
-        email: 'admin@example.com',
-        password: 'Abcd1234',
-        displayName: 'Admin',
-      })
+      makeRequest(
+        {
+          step: 'admin',
+          email: 'admin@example.com',
+          password: 'Abcd1234',
+          displayName: 'Admin',
+        },
+        { 'x-setup-token': BOOTSTRAP_TOKEN }
+      )
     );
 
     expect(res.status).toBe(409);
@@ -277,12 +407,15 @@ describe('POST /api/setup step=admin —— 首个管理员的并发抢占 (C02 
     userFindFirstMock.mockResolvedValue({ id: 'existing-admin' });
 
     const res = await POST(
-      makeRequest({
-        step: 'admin',
-        email: 'admin@example.com',
-        password: 'Abcd1234',
-        displayName: 'Admin',
-      })
+      makeRequest(
+        {
+          step: 'admin',
+          email: 'admin@example.com',
+          password: 'Abcd1234',
+          displayName: 'Admin',
+        },
+        { 'x-setup-token': BOOTSTRAP_TOKEN }
+      )
     );
 
     expect(res.status).toBe(409);
@@ -290,14 +423,24 @@ describe('POST /api/setup step=admin —— 首个管理员的并发抢占 (C02 
   });
 });
 
-describe('POST /api/setup —— 出站地址校验 (C02 / P6-4)', () => {
+describe('POST /api/setup —— LLM exact-origin policy (SEC-034)', () => {
+  beforeEach(() => {
+    userCountMock.mockResolvedValue(1);
+    verifyAuthMock.mockResolvedValue({
+      id: 'admin-1',
+      email: 'a@b.c',
+      role: 'ADMIN',
+    });
+  });
+
   it.each([
     'http://127.0.0.1:11434',
     'http://localhost:8080/v1',
     'http://169.254.169.254/latest/meta-data',
     'http://[::1]:3000',
     'not-a-url',
-  ])('step=llm 拒绝内网/非法 apiBase: %s', async (apiBase) => {
+    'https://attacker.example/v1',
+  ])('step=llm 拒绝非 allowlist/非法 apiBase: %s', async (apiBase) => {
     const res = await POST(
       makeRequest({
         step: 'llm',
@@ -307,6 +450,8 @@ describe('POST /api/setup —— 出站地址校验 (C02 / P6-4)', () => {
 
     expect(res.status).toBe(400);
     expect(llmProviderCreateMock).not.toHaveBeenCalled();
+    expect(llmReauthMock).not.toHaveBeenCalled();
+    expect(llmSecurityAuditMock).toHaveBeenCalledTimes(1);
   });
 
   it('step=llm 接受正常的公网 apiBase', async () => {
@@ -316,6 +461,7 @@ describe('POST /api/setup —— 出站地址校验 (C02 / P6-4)', () => {
         providers: [
           { name: 'openai', apiKey: 'k', apiBase: 'https://api.openai.com/v1' },
         ],
+        currentPassword: 'admin-password',
       })
     );
 
@@ -324,6 +470,164 @@ describe('POST /api/setup —— 出站地址校验 (C02 / P6-4)', () => {
     expect(llmProviderCreateMock.mock.calls[0][0].data.apiBase).toBe(
       'https://api.openai.com/v1'
     );
+    expect(llmReauthMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      'admin-1',
+      'admin-password'
+    );
+  });
+
+  it('被盗 ADMIN 会话缺少 currentPassword 时不能通过 setup 创建 provider', async () => {
+    llmReauthMock.mockResolvedValue({
+      ok: false,
+      reason: 'missing_or_invalid',
+      response: Response.json(
+        { code: 'RECENT_AUTH_REQUIRED' },
+        { status: 403 }
+      ),
+    });
+
+    const res = await POST(
+      makeRequest({
+        step: 'llm',
+        providers: [
+          { name: 'openai', apiKey: 'k', apiBase: 'https://api.openai.com/v1' },
+        ],
+      })
+    );
+
+    expect(res.status).toBe(403);
+    expect(llmProviderCreateMock).not.toHaveBeenCalled();
+    expect(llmSecurityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      'llm-provider.create-rejected',
+      expect.objectContaining({
+        detail: expect.objectContaining({
+          reason: 'setup_reauth_missing_or_invalid',
+          setup: true,
+        }),
+      })
+    );
+  });
+
+  it('整批先验证：后一个 origin 被拒时前一个也不得落库', async () => {
+    const res = await POST(
+      makeRequest({
+        step: 'llm',
+        currentPassword: 'admin-password',
+        providers: [
+          { name: 'openai', apiKey: 'k1', apiBase: 'https://api.openai.com/v1' },
+          { name: 'evil', apiKey: 'k2', apiBase: 'https://attacker.example/v1' },
+        ],
+      })
+    );
+
+    expect(res.status).toBe(400);
+    expect(llmProviderCreateMock).not.toHaveBeenCalled();
+    expect(llmReauthMock).not.toHaveBeenCalled();
+  });
+
+  it('整批数据库写原子化：后一个 provider 写失败时前一个也不提交', async () => {
+    const committed: Array<{ id: string; name: string }> = [];
+    transactionMock.mockImplementationOnce(
+      async (callback: (tx: typeof prismaMock) => Promise<unknown>) => {
+        const staged: Array<{ id: string; name: string }> = [];
+        let createCount = 0;
+        const txCreate = vi.fn(async ({ data }: { data: { name: string } }) => {
+          createCount += 1;
+          if (createCount === 2) throw new Error('second provider insert failed');
+          const provider = { id: `tx-p${createCount}`, name: data.name };
+          staged.push(provider);
+          return provider;
+        });
+        try {
+          const result = await callback({
+            ...prismaMock,
+            llmProvider: { ...prismaMock.llmProvider, create: txCreate },
+          });
+          committed.push(...staged);
+          return result;
+        } catch (error) {
+          // Mirrors Prisma transaction rollback: staged writes are discarded.
+          throw error;
+        }
+      }
+    );
+
+    const res = await POST(
+      makeRequest({
+        step: 'llm',
+        currentPassword: 'admin-password',
+        providers: [
+          { name: 'first', apiKey: 'k1', apiBase: 'https://api.openai.com/v1' },
+          { name: 'second', apiKey: 'k2', apiBase: 'https://api.openai.com/v2' },
+        ],
+      })
+    );
+
+    expect(res.status).toBe(500);
+    expect(committed).toEqual([]);
+    expect(llmProviderCreateMock).not.toHaveBeenCalled();
+    expect(transactionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('query secret 拒绝审计不含参数名或参数值', async () => {
+    const res = await POST(
+      makeRequest({
+        step: 'llm',
+        currentPassword: 'admin-password',
+        providers: [
+          {
+            name: 'openai',
+            apiKey: 'k',
+            apiBase: 'https://api.openai.com/v1?api_key=TOPSECRET',
+          },
+        ],
+      })
+    );
+
+    expect(res.status).toBe(400);
+    const audit = JSON.stringify(llmSecurityAuditMock.mock.calls[0]);
+    expect(audit).not.toContain('api_key');
+    expect(audit).not.toContain('TOPSECRET');
+    expect(llmProviderCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('allowlist 拒绝审计写失败时返回 500 且关闭失败', async () => {
+    llmSecurityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+    const res = await POST(
+      makeRequest({
+        step: 'llm',
+        currentPassword: 'admin-password',
+        providers: [
+          { name: 'evil', apiKey: 'k', apiBase: 'https://attacker.example/v1' },
+        ],
+      })
+    );
+
+    expect(res.status).toBe(500);
+    expect(llmProviderCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('reauth 拒绝审计写失败时同样不创建 provider', async () => {
+    llmReauthMock.mockResolvedValue({
+      ok: false,
+      reason: 'missing_or_invalid',
+      response: Response.json({ code: 'RECENT_AUTH_REQUIRED' }, { status: 403 }),
+    });
+    llmSecurityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+
+    const res = await POST(
+      makeRequest({
+        step: 'llm',
+        providers: [
+          { name: 'openai', apiKey: 'k', apiBase: 'https://api.openai.com/v1' },
+        ],
+      })
+    );
+
+    expect(res.status).toBe(500);
+    expect(llmProviderCreateMock).not.toHaveBeenCalled();
   });
 
   it('step=soniox 拒绝内网 wsUrl，且一个字段都不落库', async () => {
@@ -375,12 +679,14 @@ describe('POST /api/setup —— 出站地址校验 (C02 / P6-4)', () => {
 });
 
 describe('POST /api/setup step=complete —— 前置条件 (C02 / P6-4)', () => {
-  it('零管理员时拒绝置位 setup_complete（否则实例被匿名锁死，只能连库恢复）', async () => {
+  it('零管理员时即使 token 正确也拒绝置位 setup_complete', async () => {
     userCountMock.mockResolvedValue(0);
 
-    const res = await POST(makeRequest({ step: 'complete' }));
+    const res = await POST(
+      makeRequest({ step: 'complete' }, { 'x-setup-token': BOOTSTRAP_TOKEN })
+    );
 
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
     expect(siteSettingUpsertMock).not.toHaveBeenCalled();
   });
 });

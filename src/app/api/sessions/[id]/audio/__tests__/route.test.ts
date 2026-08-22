@@ -16,11 +16,12 @@ const {
   checkQuotaMock,
   reserveStorageBytesMock,
   releaseStorageBytesMock,
-  resolveExpectedRecordingDurationMsMock,
-  probeAudioDurationMsFromBufferMock,
+  measureAuthoritativeRecordingDurationMsFromBufferMock,
   normalizeRecordedAudioDurationMock,
   stageSessionAudioArtifactMock,
+  settleStagedArtifactsInTransactionMock,
   finalizeStagedArtifactPublishMock,
+  readbackStagedArtifactPublicationMock,
   rollbackStagedArtifactMock,
   resolveSessionAudioLocationMock,
 } = vi.hoisted(() => ({
@@ -31,11 +32,12 @@ const {
   checkQuotaMock: vi.fn(),
   reserveStorageBytesMock: vi.fn(),
   releaseStorageBytesMock: vi.fn(),
-  resolveExpectedRecordingDurationMsMock: vi.fn(),
-  probeAudioDurationMsFromBufferMock: vi.fn(),
+  measureAuthoritativeRecordingDurationMsFromBufferMock: vi.fn(),
   normalizeRecordedAudioDurationMock: vi.fn(),
   stageSessionAudioArtifactMock: vi.fn(),
+  settleStagedArtifactsInTransactionMock: vi.fn(),
   finalizeStagedArtifactPublishMock: vi.fn(),
+  readbackStagedArtifactPublicationMock: vi.fn(),
   rollbackStagedArtifactMock: vi.fn(),
   resolveSessionAudioLocationMock: vi.fn(),
 }));
@@ -45,6 +47,9 @@ vi.mock('@/lib/rateLimit', () => ({ enforceRateLimit: enforceRateLimitMock }));
 vi.mock('@/lib/prisma', () => ({
   prisma: {
     session: { findUnique: sessionFindUniqueMock, updateMany: sessionUpdateManyMock },
+    $transaction: vi.fn(async (callback) =>
+      callback({ session: { updateMany: sessionUpdateManyMock } })
+    ),
   },
 }));
 vi.mock('@/lib/apiResponseCache', () => ({
@@ -66,7 +71,9 @@ vi.mock('@/lib/recordingDraftPersistence', () => ({
 }));
 vi.mock('@/lib/sessionPersistence', () => ({
   stageSessionAudioArtifact: stageSessionAudioArtifactMock,
-  finalizeStagedArtifactPublish: finalizeStagedArtifactPublishMock,
+  settleStagedArtifactsInTransaction: settleStagedArtifactsInTransactionMock,
+  completeStagedArtifactPublishes: finalizeStagedArtifactPublishMock,
+  readbackStagedArtifactPublication: readbackStagedArtifactPublicationMock,
   rollbackStagedArtifact: rollbackStagedArtifactMock,
   loadSessionAudioArtifact: vi.fn(),
   resolveSessionAudioLocation: resolveSessionAudioLocationMock,
@@ -75,19 +82,26 @@ vi.mock('@/lib/sessionPersistence', () => ({
 vi.mock('@/lib/storage/cloudreve', () => ({ CloudreveStorage: { create: vi.fn() } }));
 vi.mock('@/lib/audio/recordingDuration', () => ({
   normalizeRecordedAudioDuration: normalizeRecordedAudioDurationMock,
-  probeAudioDurationMsFromBuffer: probeAudioDurationMsFromBufferMock,
-  resolveExpectedRecordingDurationMs: resolveExpectedRecordingDurationMsMock,
+  measureAuthoritativeRecordingDurationMsFromBuffer:
+    measureAuthoritativeRecordingDurationMsFromBufferMock,
+  RECORDING_DURATION_LIMIT_GRACE_MS: 60_000,
+  RecordingDurationMeasurementError: class RecordingDurationMeasurementError extends Error {},
 }));
 vi.mock('@/lib/billing', () => ({
-  clampSessionDurationMs: (ms: number) => ms,
+  getMaxSessionDurationMs: () => 4 * 60 * 60_000,
 }));
 vi.mock('@/lib/quota', () => ({
   checkQuota: checkQuotaMock,
   reserveStorageBytes: reserveStorageBytesMock,
   releaseStorageBytes: releaseStorageBytesMock,
 }));
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  StoredArtifactQuotaExceededError: class StoredArtifactQuotaExceededError extends Error {},
+}));
 
 import { POST } from '@/app/api/sessions/[id]/audio/route';
+import { RecordingDurationMeasurementError } from '@/lib/audio/recordingDuration';
+import { StoredArtifactQuotaExceededError } from '@/lib/storage/storedArtifactLedger';
 
 const AUDIO_BYTES = 1024;
 
@@ -121,8 +135,7 @@ describe('POST /api/sessions/[id]/audio 存储会计 (P5-14)', () => {
     checkQuotaMock.mockResolvedValue(true);
     reserveStorageBytesMock.mockResolvedValue(true);
     releaseStorageBytesMock.mockResolvedValue(null);
-    resolveExpectedRecordingDurationMsMock.mockResolvedValue(0);
-    probeAudioDurationMsFromBufferMock.mockResolvedValue(0);
+    measureAuthoritativeRecordingDurationMsFromBufferMock.mockResolvedValue(120_000);
     normalizeRecordedAudioDurationMock.mockImplementation(
       async (o: { buffer: Buffer }) => o.buffer
     );
@@ -131,40 +144,49 @@ describe('POST /api/sessions/[id]/audio 存储会计 (P5-14)', () => {
       reference: 'local:recordings/s1.webm',
       previousReference: null,
     });
-    finalizeStagedArtifactPublishMock.mockResolvedValue({
-      path: 'local:recordings/s1.webm',
-      storage: 'local',
+    settleStagedArtifactsInTransactionMock.mockResolvedValue([
+      { staged: {}, settled: {} },
+    ]);
+    finalizeStagedArtifactPublishMock.mockResolvedValue([
+      { path: 'local:recordings/s1.webm', storage: 'local' },
+    ]);
+    readbackStagedArtifactPublicationMock.mockResolvedValue({
+      outcome: 'not_committed',
+      publications: [],
     });
   });
 
-  it('首次上传 → 按字节数预留 storage_bytes', async () => {
+  it('首次上传 → stage 统一账本在物理写入前预留字节', async () => {
     const res = await POST(makeReq(), { params });
     expect(res.status).toBe(200);
-    expect(reserveStorageBytesMock).toHaveBeenCalledWith('u1', AUDIO_BYTES);
+    expect(stageSessionAudioArtifactMock).toHaveBeenCalledTimes(1);
+    expect(reserveStorageBytesMock).not.toHaveBeenCalled();
   });
 
-  it('字节配额不足 → 402，且绝不落盘/落库', async () => {
-    reserveStorageBytesMock.mockResolvedValue(false);
+  it('统一账本预留报配额不足 → 402，且绝不落库', async () => {
+    stageSessionAudioArtifactMock.mockRejectedValue(
+      new StoredArtifactQuotaExceededError()
+    );
 
     const res = await POST(makeReq(), { params });
 
     expect(res.status).toBe(402);
     expect((await res.json()).quota).toBe('storage_bytes');
-    expect(stageSessionAudioArtifactMock).not.toHaveBeenCalled();
+    expect(stageSessionAudioArtifactMock).toHaveBeenCalledTimes(1);
     expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 
-  it('终态会话 CAS 失败 → 回滚 staged 对象并退还刚预留的字节', async () => {
+  it('终态会话 CAS 失败 → rollback staged 对象原子释放账本预留', async () => {
     sessionUpdateManyMock.mockResolvedValue({ count: 0 });
 
     const res = await POST(makeReq(), { params });
 
     expect(res.status).toBe(409);
     expect(rollbackStagedArtifactMock).toHaveBeenCalled();
-    expect(releaseStorageBytesMock).toHaveBeenCalledWith('u1', AUDIO_BYTES);
+    expect(releaseStorageBytesMock).not.toHaveBeenCalled();
   });
 
-  it('覆盖本地旧录音 → 只预留净增量', async () => {
+  it('覆盖旧录音 → 新对象按完整临时占用预留，不用不安全净增量', async () => {
     resolveSessionAudioLocationMock.mockResolvedValue({
       kind: 'local',
       filePath: '/tmp/x',
@@ -174,10 +196,11 @@ describe('POST /api/sessions/[id]/audio 存储会计 (P5-14)', () => {
 
     await POST(makeReq(), { params });
 
-    expect(reserveStorageBytesMock).toHaveBeenCalledWith('u1', AUDIO_BYTES - 400);
+    expect(stageSessionAudioArtifactMock).toHaveBeenCalledTimes(1);
+    expect(reserveStorageBytesMock).not.toHaveBeenCalled();
   });
 
-  it('覆盖后变小 → 把腾出的字节还回去', async () => {
+  it('覆盖后变小 → 由 publish 删除旧物理对象后释放旧账本行', async () => {
     resolveSessionAudioLocationMock.mockResolvedValue({
       kind: 'local',
       filePath: '/tmp/x',
@@ -188,15 +211,16 @@ describe('POST /api/sessions/[id]/audio 存储会计 (P5-14)', () => {
     await POST(makeReq(), { params });
 
     expect(reserveStorageBytesMock).not.toHaveBeenCalled();
-    expect(releaseStorageBytesMock).toHaveBeenCalledWith('u1', 500);
+    expect(releaseStorageBytesMock).not.toHaveBeenCalled();
+    expect(finalizeStagedArtifactPublishMock).toHaveBeenCalledTimes(1);
   });
 
-  it('三个时长来源全为 0（从没连过 WS 的会话直传）→ ffprobe 兜底，durationMs 真实落库', async () => {
-    probeAudioDurationMsFromBufferMock.mockResolvedValue(125_000);
+  it('媒体实测时长是唯一发布口径，durationMs 真实落库', async () => {
+    measureAuthoritativeRecordingDurationMsFromBufferMock.mockResolvedValue(125_000);
 
     await POST(makeReq(), { params });
 
-    expect(probeAudioDurationMsFromBufferMock).toHaveBeenCalled();
+    expect(measureAuthoritativeRecordingDurationMsFromBufferMock).toHaveBeenCalled();
     expect(sessionUpdateManyMock).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ durationMs: 125_000 }),
@@ -204,34 +228,86 @@ describe('POST /api/sessions/[id]/audio 存储会计 (P5-14)', () => {
     );
   });
 
-  it('探测值低于服务端口径 → 取较大者（ffprobe 只做下限兜底，不下调）', async () => {
-    resolveExpectedRecordingDurationMsMock.mockResolvedValue(60_000);
-    probeAudioDurationMsFromBufferMock.mockResolvedValue(45_000);
+  it('库中已有时长也不能覆盖媒体实测结果', async () => {
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 's1',
+      userId: 'u1',
+      status: 'RECORDING',
+      durationMs: 60_000,
+      recordingPath: null,
+    });
+    measureAuthoritativeRecordingDurationMsFromBufferMock.mockResolvedValue(45_000);
 
     await POST(makeReq(), { params });
 
     expect(sessionUpdateManyMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ durationMs: 60_000 }),
+        data: expect.objectContaining({ durationMs: 45_000 }),
       })
     );
   });
 
-  it('session-persist#151：库里已有极小正值也跳不过 ffprobe —— 按真实音频时长落库', async () => {
-    // 攻击者先 PATCH {durationMs: 1}（旧代码允许首次写入任意极小正值，两道守卫都放行），
-    // resolveExpectedRecordingDurationMs 于是返回 1，旧的 `durationMs <= 0` 兜底条件永远为假：
-    // 数小时的低码率录音以 1ms 落库 → 对 storage_hours 几乎零贡献，且 /full-transcribe 只按
-    // 1 分钟计价。PATCH 侧已整体拒收 durationMs，这里是第二道：探测值与服务端口径取最大值。
-    resolveExpectedRecordingDurationMsMock.mockResolvedValue(1);
-    probeAudioDurationMsFromBufferMock.mockResolvedValue(3 * 60 * 60_000);
+  it('SEC-018：库里已有极小正值也必须测量媒体时长', async () => {
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 's1',
+      userId: 'u1',
+      status: 'RECORDING',
+      durationMs: 1,
+      recordingPath: null,
+    });
+    measureAuthoritativeRecordingDurationMsFromBufferMock.mockResolvedValue(
+      3 * 60 * 60_000
+    );
 
     await POST(makeReq(), { params });
 
-    expect(probeAudioDurationMsFromBufferMock).toHaveBeenCalled();
+    expect(measureAuthoritativeRecordingDurationMsFromBufferMock).toHaveBeenCalledTimes(1);
     expect(sessionUpdateManyMock).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ durationMs: 3 * 60 * 60_000 }),
       })
     );
+  });
+
+  it('SEC-018：权威测量失败 → 422，绝不 stage 或发布录音', async () => {
+    measureAuthoritativeRecordingDurationMsFromBufferMock.mockRejectedValue(
+      new RecordingDurationMeasurementError()
+    );
+
+    const res = await POST(makeReq(), { params });
+
+    expect(res.status).toBe(422);
+    expect(stageSessionAudioArtifactMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+    expect(finalizeStagedArtifactPublishMock).not.toHaveBeenCalled();
+  });
+
+  it('自动停止/codec 尾帧的一分钟余量仍按真实时长发布', async () => {
+    measureAuthoritativeRecordingDurationMsFromBufferMock.mockResolvedValue(
+      4 * 60 * 60_000 + 30_000
+    );
+
+    const res = await POST(makeReq(), { params });
+
+    expect(res.status).toBe(200);
+    expect(sessionUpdateManyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          durationMs: 4 * 60 * 60_000 + 30_000,
+        }),
+      })
+    );
+  });
+
+  it('超出角色上限及收尾余量 → 422 且不发布', async () => {
+    measureAuthoritativeRecordingDurationMsFromBufferMock.mockResolvedValue(
+      4 * 60 * 60_000 + 60_001
+    );
+
+    const res = await POST(makeReq(), { params });
+
+    expect(res.status).toBe(422);
+    expect(stageSessionAudioArtifactMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });
 });

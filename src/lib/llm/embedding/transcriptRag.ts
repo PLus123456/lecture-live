@@ -1,6 +1,12 @@
 import 'server-only';
 
-import { callEmbedding } from '@/lib/llm/gateway';
+import crypto from 'node:crypto';
+
+import {
+  callEmbedding,
+  EMBEDDING_MAX_INPUTS,
+  EmbeddingAdmissionError,
+} from '@/lib/llm/gateway';
 import { estimateTokens } from '@/lib/llm/tokenizer';
 import type { TranscriptSegment } from '@/lib/llm/chatContextBuilder';
 import { logger, serializeError } from '@/lib/logger';
@@ -13,6 +19,9 @@ const CHUNK_TARGET_TOKENS = 150;
 const CHUNK_MAX_TOKENS = 250;
 /** Session 级 cache 上限（最近使用的 N 个 session） */
 const MAX_CACHED_SESSIONS = 10;
+/** 向量按每个 JS number 16 bytes 保守估算，再计入文本/数组开销。 */
+const MAX_RAG_CACHE_BYTES = 32 * 1024 * 1024;
+const MAX_RAG_CACHE_ENTRY_BYTES = 16 * 1024 * 1024;
 
 interface SegmentChunk {
   text: string;
@@ -27,16 +36,10 @@ interface RagState {
   /** transcript 总 segment 数（变化时增量补 embed） */
   lastSegmentCount: number;
   /**
-   * 单录音模式：transcript 全文字符总长。段数守恒但文本被改写（如某段被重转写/纠正
-   * 而段数不变）时 segment count 判据感知不到，这里补一个内容长度判据兜底 ——
-   * 长度变即重切重 embed。undefined = 旧 entry 升级前留下（视为需重建）。
+   * 强内容签名。单录音由本模块按 id/startMs/text 计算；多录音由已经
+   * 加载转录的调用方传入。保留 number 只为兼容旧调用者。
    */
-  lastContentLength?: number;
-  /**
-   * 多录音模式：调用方传入的内容签名（各录音 segment 总数之和）。变化即说明某录音
-   * 增长/变动 → 触发增量重建。undefined = 调用方未提供（旧行为：集合不变即整体命中）。
-   */
-  contentSignature?: number;
+  contentSignature?: string | number;
   chunks: SegmentChunk[];
   vectors: number[][];
   lastUsedAt: number;
@@ -51,17 +54,70 @@ interface RagState {
  */
 const sessionCache = new Map<string, RagState>();
 
-function evictLRU() {
-  if (sessionCache.size <= MAX_CACHED_SESSIONS) return;
-  let oldestKey: string | null = null;
-  let oldestTime = Infinity;
-  for (const [key, state] of sessionCache.entries()) {
-    if (state.lastUsedAt < oldestTime) {
-      oldestTime = state.lastUsedAt;
-      oldestKey = key;
+function estimateRagStateBytes(state: RagState): number {
+  let bytes = 256;
+  for (const chunk of state.chunks) {
+    // UTF-16 字符最多 4 UTF-8 bytes；再加 chunk/数组元数据保守开销。
+    bytes += chunk.text.length * 4 + 160;
+  }
+  for (const vector of state.vectors) {
+    bytes += vector.length * 16 + 64;
+  }
+  return bytes;
+}
+
+function evictLRU(): void {
+  let cachedBytes = 0;
+  for (const state of sessionCache.values()) {
+    cachedBytes += estimateRagStateBytes(state);
+  }
+  while (
+    sessionCache.size > MAX_CACHED_SESSIONS ||
+    cachedBytes > MAX_RAG_CACHE_BYTES
+  ) {
+    let oldestKey: string | null = null;
+    let oldestTime = Infinity;
+    for (const [key, state] of sessionCache.entries()) {
+      if (state.lastUsedAt < oldestTime) {
+        oldestTime = state.lastUsedAt;
+        oldestKey = key;
+      }
+    }
+    if (!oldestKey) return;
+    const oldest = sessionCache.get(oldestKey);
+    if (oldest) cachedBytes -= estimateRagStateBytes(oldest);
+    sessionCache.delete(oldestKey);
+  }
+}
+
+function cacheRagState(key: string, state: RagState): void {
+  if (estimateRagStateBytes(state) > MAX_RAG_CACHE_ENTRY_BYTES) {
+    sessionCache.delete(key);
+    return;
+  }
+  sessionCache.set(key, state);
+  evictLRU();
+}
+
+export function computeTranscriptContentSignature(
+  groups: ReadonlyArray<{
+    recordingId: string;
+    segments: ReadonlyArray<TranscriptSegment>;
+  }>
+): string {
+  const hash = crypto.createHash('sha256').update('transcript-content-v1\0');
+  const addText = (value: string) => {
+    hash.update(String(value.length)).update(':').update(value).update(';');
+  };
+  for (const group of groups) {
+    addText(group.recordingId);
+    hash.update(String(group.segments.length)).update(';');
+    for (const segment of group.segments) {
+      hash.update(String(segment.startMs)).update(';');
+      addText(segment.text);
     }
   }
-  if (oldestKey) sessionCache.delete(oldestKey);
+  return hash.digest('hex');
 }
 
 /**
@@ -104,9 +160,13 @@ function splitOversizedSegmentText(text: string, tokens: number): string[] {
  * 每个 chunk 自然记录 startMs/endMs，方便上层加时间标签。
  */
 function chunkSegments(
-  segments: ReadonlyArray<TranscriptSegment>
+  segments: ReadonlyArray<TranscriptSegment>,
+  maxChunks = EMBEDDING_MAX_INPUTS
 ): SegmentChunk[] {
   if (segments.length === 0) return [];
+  if (maxChunks <= 0) {
+    throw new EmbeddingAdmissionError('Embedding chunk count exceeded');
+  }
 
   const chunks: SegmentChunk[] = [];
   let bufferText = '';
@@ -116,6 +176,9 @@ function chunkSegments(
 
   const flush = () => {
     if (!bufferText) return;
+    if (chunks.length >= maxChunks) {
+      throw new EmbeddingAdmissionError('Embedding chunk count exceeded');
+    }
     chunks.push({
       text: bufferText.trim(),
       startMs: bufferStart,
@@ -137,6 +200,9 @@ function chunkSegments(
       for (const piece of splitOversizedSegmentText(seg.text, segTokens)) {
         const text = piece.trim();
         if (!text) continue;
+        if (chunks.length >= maxChunks) {
+          throw new EmbeddingAdmissionError('Embedding chunk count exceeded');
+        }
         chunks.push({
           text,
           // 段内没有更细的时间信息，各片共用该段起点。
@@ -230,25 +296,26 @@ function formatTimeLabel(ms: number): string {
  */
 export async function retrieveTranscriptByEmbedding(args: {
   sessionId: string;
+  userId: string;
   query: string;
   transcript: ReadonlyArray<TranscriptSegment>;
   maxTokens: number;
 }): Promise<string> {
-  const { sessionId, query, transcript, maxTokens } = args;
+  const { sessionId, userId, query, transcript, maxTokens } = args;
   if (transcript.length === 0 || !query.trim()) return '';
 
   let state = sessionCache.get(sessionId);
 
-  // 内容签名：transcript 全文字符总长。配合 segment 数共同判新鲜度 —— segment 数守恒
-  // 但某段被重转写/纠正（文本变、段数不变）时仅靠 segment count 会漏判命中陈旧向量。
-  const contentLength = transcript.reduce((acc, seg) => acc + seg.text.length, 0);
+  const contentSignature = computeTranscriptContentSignature([
+    { recordingId: sessionId, segments: transcript },
+  ]);
 
-  // 增量补块：segment 数或全文长度任一变化时重切（简化处理 —— 实测重切成本远低于 embed）。
-  // 旧 entry（升级前无 lastContentLength）一律视为需重建，重建后即带上该字段。
+  // 增量补块：segment 数或强内容签名任一变化时重切。只比长度会
+  // 漏掉等长纠正，从而长期返回陈旧向量。
   const needsRebuild =
     !state ||
     state.lastSegmentCount !== transcript.length ||
-    state.lastContentLength !== contentLength;
+    state.contentSignature !== contentSignature;
 
   if (needsRebuild) {
     const newChunks = chunkSegments(transcript);
@@ -273,7 +340,10 @@ export async function retrieveTranscriptByEmbedding(args: {
 
     if (missingIndices.length > 0) {
       const missingTexts = missingIndices.map((i) => newChunks[i].text);
-      const newVectors = await callEmbedding(missingTexts);
+      const newVectors = await callEmbedding(missingTexts, {
+        userId,
+        sessionId,
+      });
       missingIndices.forEach((idx, i) => {
         existingVectors[idx] = newVectors[i];
       });
@@ -281,13 +351,12 @@ export async function retrieveTranscriptByEmbedding(args: {
 
     state = {
       lastSegmentCount: transcript.length,
-      lastContentLength: contentLength,
+      contentSignature,
       chunks: newChunks,
       vectors: existingVectors,
       lastUsedAt: Date.now(),
     };
-    sessionCache.set(sessionId, state);
-    evictLRU();
+    cacheRagState(sessionId, state);
 
     ragLogger.debug(
       {
@@ -305,7 +374,7 @@ export async function retrieveTranscriptByEmbedding(args: {
   let ragState = state!;
 
   // Query embedding
-  const [queryVec] = await callEmbedding([query]);
+  const [queryVec] = await callEmbedding([query], { userId, sessionId });
 
   // 检测 query vec 与缓存 chunk vec 的维度是否一致：
   // 不一致通常是 admin 切换了不同维度的 embedding 模型（如 1536 → 1024），
@@ -327,15 +396,18 @@ export async function retrieveTranscriptByEmbedding(args: {
       'Embedding 维度不一致（可能切换了 embedding 模型），自动清空 cache 并重新 embed'
     );
     sessionCache.delete(sessionId);
-    const freshVectors = await callEmbedding(ragState.chunks.map((c) => c.text));
+    const freshVectors = await callEmbedding(
+      ragState.chunks.map((c) => c.text),
+      { userId, sessionId }
+    );
     ragState = {
       lastSegmentCount: transcript.length,
-      lastContentLength: contentLength,
+      contentSignature,
       chunks: ragState.chunks,
       vectors: freshVectors,
       lastUsedAt: Date.now(),
     };
-    sessionCache.set(sessionId, ragState);
+    cacheRagState(sessionId, ragState);
   }
 
   // Cosine 排序
@@ -431,7 +503,7 @@ export function invalidateRagCacheForRecordings(
  * 把 retrieveTranscriptByEmbedding 包成 chatContextBuilder.ts 期望的 ragRetrieve 签名。
  * 失败时返回空串，让 chatContextBuilder 退化到截尾 transcript。
  */
-export function makeRagRetrieverForSession(sessionId: string) {
+export function makeRagRetrieverForSession(sessionId: string, userId: string) {
   return async (
     query: string,
     transcript: ReadonlyArray<TranscriptSegment>,
@@ -440,6 +512,7 @@ export function makeRagRetrieverForSession(sessionId: string) {
     try {
       return await retrieveTranscriptByEmbedding({
         sessionId,
+        userId,
         query,
         transcript,
         maxTokens,
@@ -469,22 +542,23 @@ export function makeRagRetrieverForSession(sessionId: string) {
  * 缓存：
  *  - key = `multi:${sortedRecordingIds.join('|')}`，与单录音 `sessionCache` 共用同一个
  *    Map，但 multi 前缀绝不会与单录音 sessionId 冲突；
- *  - 命中时按 `contentSignature`（调用方传入的各录音 segment 总数）判断是否增量重建：
+ *  - 命中时按 `contentSignature`（调用方传入的强内容签名）判断是否增量重建：
  *    签名变 → 重载 + 重切 + 只补 embed 新增/变动 chunk（复用未变 chunk 旧向量）；
  *    签名未变（或未传） → 复用 vectors，不重载（loadTranscript 不被调用）；
  *  - 任一录音消失/重置时由 `invalidateRagCache(recordingId)` 清掉。
  *
- * @param contentSignature 可选内容签名（典型传各录音 segment 数之和）。用于感知"挂载的
- *   录音增长"——不传则退化为旧行为（recordingIds 集合不变即整体命中旧快照）。
+ * @param contentSignature 可选强内容签名。用于感知挂载录音的等长改写；
+ *   不传则退化为旧行为（recordingIds 集合不变即整体命中旧快照）。
  *
  * 失败语义与单录音 retriever 一致：embed 抛错 → 返回 ''，让 chatContextBuilder 退化。
  */
 export function makeRagRetrieverForRecordings(
   recordingIds: ReadonlyArray<string>,
+  userId: string,
   loadTranscript: (
     recordingId: string
   ) => Promise<ReadonlyArray<TranscriptSegment>>,
-  contentSignature?: number
+  contentSignature?: string | number
 ): (
   query: string,
   _transcript: ReadonlyArray<TranscriptSegment>,
@@ -515,7 +589,10 @@ export function makeRagRetrieverForRecordings(
           // prefix 写进 chunk text 是为了让 embedding 向量本身带来源信号，
           // 同时上层渲染时可直接 split 出 recordingId
           const prefixTokens = estimateTokens(prefix);
-          for (const chunk of chunkSegments(transcripts[i])) {
+          for (const chunk of chunkSegments(
+            transcripts[i],
+            EMBEDDING_MAX_INPUTS - allChunks.length
+          )) {
             allChunks.push({
               text: `${prefix}${chunk.text}`,
               startMs: chunk.startMs,
@@ -547,7 +624,8 @@ export function makeRagRetrieverForRecordings(
           .filter((i) => i >= 0);
         if (missingIndices.length > 0) {
           const newVectors = await callEmbedding(
-            missingIndices.map((i) => allChunks[i].text)
+            missingIndices.map((i) => allChunks[i].text),
+            { userId, sessionId: sortedIds[0] }
           );
           missingIndices.forEach((idx, i) => {
             vectors[idx] = newVectors[i];
@@ -563,8 +641,7 @@ export function makeRagRetrieverForRecordings(
           vectors,
           lastUsedAt: Date.now(),
         };
-        sessionCache.set(cacheKey, state);
-        evictLRU();
+        cacheRagState(cacheKey, state);
 
         ragLogger.debug(
           {
@@ -584,7 +661,10 @@ export function makeRagRetrieverForRecordings(
       if (!state) return '';
       if (state.chunks.length === 0) return '';
 
-      const [queryVec] = await callEmbedding([query]);
+      const [queryVec] = await callEmbedding([query], {
+        userId,
+        sessionId: sortedIds[0],
+      });
 
       // 维度不一致兜底：admin 切换了 embedding 模型时 cache 里仍是旧维度
       // vectors（增量重建后可能新旧混合维度），需要整批重 embed。对整个数组做统一
@@ -604,7 +684,10 @@ export function makeRagRetrieverForRecordings(
           'Embedding 维度不一致（可能切换了 embedding 模型），自动清空 multi-cache 并重新 embed'
         );
         sessionCache.delete(cacheKey);
-        const freshVectors = await callEmbedding(state.chunks.map((c) => c.text));
+        const freshVectors = await callEmbedding(
+          state.chunks.map((c) => c.text),
+          { userId, sessionId: sortedIds[0] }
+        );
         state = {
           contentSignature: state.contentSignature,
           lastSegmentCount: state.chunks.length,
@@ -612,7 +695,7 @@ export function makeRagRetrieverForRecordings(
           vectors: freshVectors,
           lastUsedAt: Date.now(),
         };
-        sessionCache.set(cacheKey, state);
+        cacheRagState(cacheKey, state);
       }
 
       return formatTopKByScore(state.chunks, state.vectors, queryVec, maxTokens);

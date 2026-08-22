@@ -1,9 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { readdirMock, rmMock, findManyMock } = vi.hoisted(() => ({
+const {
+  readdirMock,
+  rmMock,
+  findManyMock,
+  findBillableStoredArtifactsByConversationsMock,
+  findBillableStoredArtifactsByOwnerMock,
+  releaseStoredArtifactMock,
+} = vi.hoisted(() => ({
   readdirMock: vi.fn(),
   rmMock: vi.fn(),
   findManyMock: vi.fn(),
+  findBillableStoredArtifactsByConversationsMock: vi.fn(),
+  findBillableStoredArtifactsByOwnerMock: vi.fn(),
+  releaseStoredArtifactMock: vi.fn(),
 }));
 
 vi.mock('fs/promises', () => ({
@@ -21,6 +31,18 @@ vi.mock('@/lib/llm/chatImageStorage', () => ({
 vi.mock('@/lib/storage/cloudreveFileDelete', () => ({
   loadCloudreveContext: vi.fn(),
   deleteCloudreveFile: vi.fn(),
+}));
+
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_TYPE: {
+    CHAT_EXTRACTED: 'chat_extracted',
+    INLINE_IMAGE: 'inline_image',
+  },
+  findBillableStoredArtifactsByConversations:
+    findBillableStoredArtifactsByConversationsMock,
+  findBillableStoredArtifactsByOwner: findBillableStoredArtifactsByOwnerMock,
+  markStoredArtifactOrphan: vi.fn(),
+  releaseStoredArtifact: releaseStoredArtifactMock,
 }));
 
 vi.mock('@/lib/logger', () => {
@@ -44,6 +66,9 @@ describe('cleanupOrphanChatImageDirs', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     rmMock.mockResolvedValue(undefined);
+    findBillableStoredArtifactsByConversationsMock.mockResolvedValue([]);
+    findBillableStoredArtifactsByOwnerMock.mockResolvedValue([]);
+    releaseStoredArtifactMock.mockResolvedValue(true);
   });
 
   it('根目录不存在 → 返回 0，不查 DB', async () => {

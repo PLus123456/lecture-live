@@ -124,6 +124,30 @@ export async function middleware(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid path' }, { status: 400 });
   }
 
+  // A historical Stripe reconciliation may need the authenticated ADMIN review API while the
+  // normal production gate remains pending. In this explicit maintenance mode, deny every user,
+  // wallet, callback, setup, share, translation and health mutation at the earliest common edge.
+  // Stripe callbacks receive 503 and retry later; no paid entitlement can be consumed or granted.
+  if (
+    process.env.PAYMENT_RECONCILIATION_MAINTENANCE === '1' &&
+    request.nextUrl.pathname.startsWith('/api/')
+  ) {
+    const pathname = request.nextUrl.pathname;
+    const allowed =
+      pathname === '/api/auth/login' ||
+      pathname === '/api/auth/logout' ||
+      pathname === '/api/auth/refresh' ||
+      pathname === '/api/admin/recharge/reviews';
+    if (!allowed) {
+      return applySecurityHeaders(
+        NextResponse.json(
+          { error: 'payment reconciliation maintenance' },
+          { status: 503 }
+        )
+      );
+    }
+  }
+
   // 2. API 路由鉴权（/api/* 除了 /api/auth/*, /api/share/view/*, /api/setup* 等公开端点）
   //    充值支付回调 /api/wallet/callback/* 与沙箱确认页 /api/wallet/sandbox/* 也放行：
   //    网关异步通知/浏览器跳转不带用户 JWT，鉴权由各 provider 的验签（verifyCallback）承担。

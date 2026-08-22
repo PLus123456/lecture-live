@@ -3,8 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // 封禁/会员相关回归测试：被禁用用户（status !== 1）既不能凭旧 token 通过 verifyToken，
 // 也不能用正确密码重新登录拿新 token。需在导入 @/lib/auth 前 mock prisma / redis。
 
-const { userFindUniqueMock, getRedisClientMock } = vi.hoisted(() => ({
+const { userFindUniqueMock, familyFindUniqueMock, familyCreateMock, getRedisClientMock } = vi.hoisted(() => ({
   userFindUniqueMock: vi.fn(),
+  familyFindUniqueMock: vi.fn(),
+  familyCreateMock: vi.fn(),
   getRedisClientMock: vi.fn(),
 }));
 
@@ -12,6 +14,10 @@ vi.mock('@/lib/prisma', () => ({
   prisma: {
     user: {
       findUnique: userFindUniqueMock,
+    },
+    authTokenFamily: {
+      findUnique: familyFindUniqueMock,
+      create: familyCreateMock,
     },
   },
 }));
@@ -21,14 +27,22 @@ vi.mock('@/lib/redis', () => ({
 }));
 
 import bcrypt from 'bcryptjs';
-import { login, signToken, verifyAuthToken } from '@/lib/auth';
+import { issueAuthToken, login, verifyAuthToken } from '@/lib/auth';
 
 const PASSWORD = 'Abcd1234';
+let familyRow: Record<string, unknown> | null = null;
 
 describe('被禁用用户封禁', () => {
   beforeEach(() => {
+    vi.clearAllMocks();
+    familyRow = null;
     // 无 Redis（走内存黑名单分支）
     getRedisClientMock.mockReturnValue(null);
+    familyFindUniqueMock.mockImplementation(async () => familyRow);
+    familyCreateMock.mockImplementation(async ({ data }) => {
+      familyRow = { ...data, revokedAt: null };
+      return familyRow;
+    });
   });
 
   it('verifyToken：status=1 的正常用户通过', async () => {
@@ -40,7 +54,7 @@ describe('被禁用用户封禁', () => {
       status: 1,
     });
 
-    const token = signToken({
+    const token = await issueAuthToken({
       id: 'user-1',
       email: 'active@example.com',
       role: 'PRO',
@@ -65,7 +79,7 @@ describe('被禁用用户封禁', () => {
       status: 0,
     });
 
-    const token = signToken({
+    const token = await issueAuthToken({
       id: 'user-2',
       email: 'banned@example.com',
       role: 'PRO',
@@ -84,7 +98,7 @@ describe('被禁用用户封禁', () => {
       tokenVersion: 0,
       status: 1,
     });
-    const token = signToken({
+    const token = await issueAuthToken({
       id: 'user-3',
       email: 'check@example.com',
       role: 'FREE',
@@ -128,5 +142,6 @@ describe('被禁用用户封禁', () => {
     const result = await login('active@example.com', PASSWORD);
     expect(result.user.id).toBe('user-5');
     expect(typeof result.token).toBe('string');
+    expect(familyCreateMock).toHaveBeenCalledTimes(1);
   });
 });

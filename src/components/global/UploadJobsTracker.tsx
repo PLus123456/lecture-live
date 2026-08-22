@@ -24,6 +24,13 @@ import {
   type AsyncUploadStatus,
 } from '@/lib/transcribe/asyncUploadClient';
 import { useAuth } from '@/hooks/useAuth';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+  type AuthBoundarySnapshot,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
+import { ACCOUNT_BOUNDARY_CLEAR_EVENT } from '@/lib/clientAccountCleanup';
 import { useI18n } from '@/lib/i18n';
 
 const ACTIVE_STATUSES: UploadJob['status'][] = [
@@ -61,17 +68,40 @@ export default function UploadJobsTracker() {
   // store 从 localStorage 复水后才渲染，避免 SSR（空 store）与客户端 hydration 不一致
   const [mounted, setMounted] = useState(false);
   const reconciledRef = useRef(false);
+  const [accountBoundaryGeneration, setAccountBoundaryGeneration] = useState(0);
 
   useEffect(() => {
     setMounted(true);
   }, []);
 
+  // A/B 的 token 都是同一个 cookie-session sentinel，不能只靠 token dependency
+  // 重跑。cleanup 先撤销旧主体的一次性门闩；B commit 后才能开始自己的对账。
+  useEffect(() => {
+    const resetForAccountBoundary = () => {
+      reconciledRef.current = false;
+      setAccountBoundaryGeneration((value) => value + 1);
+    };
+    window.addEventListener(
+      ACCOUNT_BOUNDARY_CLEAR_EVENT,
+      resetForAccountBoundary,
+    );
+    return () => {
+      window.removeEventListener(
+        ACCOUNT_BOUNDARY_CLEAR_EVENT,
+        resetForAccountBoundary,
+      );
+    };
+  }, []);
+
   // ── 刷新后的僵尸 session 找回（每次会话只跑一次） ──
   useEffect(() => {
     if (!token || reconciledRef.current) return;
+    const expected = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
+    if (ownerSignal.aborted) return;
     reconciledRef.current = true;
-    void reconcileOrphans(token, t);
-  }, [token, t]);
+    void reconcileOrphans(token, t, expected, ownerSignal);
+  }, [token, t, accountBoundaryGeneration]);
 
   const handleCancel = useCallback((id: string) => {
     uploadJobs.cancel(id);
@@ -321,16 +351,66 @@ function createJobForSession(server: ActiveAsyncJob, t: Translate): string {
  * 同时把本地持久化但服务端已不在列表里的进行中 job（多半已完成/被删）清掉，
  * 避免 widget 永远卡着一条假的进行中任务。
  */
-async function reconcileOrphans(token: string, t: Translate): Promise<void> {
+async function commitTrackerOwner(
+  expected: AuthBoundarySnapshot,
+  ownerSignal: AbortSignal,
+  commit: () => void,
+): Promise<boolean> {
+  if (ownerSignal.aborted) return false;
+  try {
+    const result = await runAuthBoundaryCommit(expected, () => {
+      if (ownerSignal.aborted) return false;
+      commit();
+      return true;
+    });
+    return result.committed && result.value;
+  } catch {
+    // A failed shared-boundary check is not permission to persist a job.
+    return false;
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return Boolean(
+    error &&
+      typeof error === 'object' &&
+      'name' in error &&
+      error.name === 'AbortError',
+  );
+}
+
+function combineAbortSignals(first: AbortSignal, second: AbortSignal): AbortSignal {
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([first, second]);
+  }
+  const combined = new AbortController();
+  const abort = () => combined.abort();
+  first.addEventListener('abort', abort, { once: true });
+  second.addEventListener('abort', abort, { once: true });
+  if (first.aborted || second.aborted) abort();
+  return combined.signal;
+}
+
+async function reconcileOrphans(
+  token: string,
+  t: Translate,
+  expected: AuthBoundarySnapshot,
+  ownerSignal: AbortSignal,
+): Promise<void> {
   let serverJobs: ActiveAsyncJob[];
   try {
     const res = await fetch('/api/sessions/active-async', {
       headers: { Authorization: `Bearer ${token}` },
+      signal: ownerSignal,
     });
     if (!res.ok) return;
     const body = (await res.json()) as { jobs?: ActiveAsyncJob[] };
+    if (ownerSignal.aborted) return;
     serverJobs = Array.isArray(body.jobs) ? body.jobs : [];
-  } catch {
+  } catch (error) {
+    // In particular, never reinterpret an account-boundary AbortError as an
+    // empty/failed A reconciliation that is allowed to write under B.
+    if (ownerSignal.aborted || isAbortError(error)) return;
     return;
   }
 
@@ -339,38 +419,74 @@ async function reconcileOrphans(token: string, t: Translate): Promise<void> {
   // 清理本地"幽灵"进行中 job（本进程已无活跃 poll/pipeline）：
   //  - 有 sessionId 但服务端 active 列表里没有 —— 多半已完成或被删
   //  - 没 sessionId —— 刷新打断了 session 创建前的瞬态，无从恢复
-  for (const job of Object.values(useUploadJobsStore.getState().jobs)) {
-    if (
-      ACTIVE_STATUSES.includes(job.status) &&
-      !uploadJobs.hasCancel(job.id) &&
-      (!job.sessionId || !serverIds.has(job.sessionId))
-    ) {
-      uploadJobs.remove(job.id);
-    }
-  }
+  const cleanedGhosts = await commitTrackerOwner(
+    expected,
+    ownerSignal,
+    () => {
+      for (const job of Object.values(useUploadJobsStore.getState().jobs)) {
+        if (
+          ACTIVE_STATUSES.includes(job.status) &&
+          !uploadJobs.hasCancel(job.id) &&
+          (!job.sessionId || !serverIds.has(job.sessionId))
+        ) {
+          uploadJobs.remove(job.id);
+        }
+      }
+    },
+  );
+  if (!cleanedGhosts) return;
 
   for (const server of serverJobs) {
+    if (ownerSignal.aborted) return;
     if (server.asyncTranscribeStatus === 'failed') {
-      upsertFailedJob(
-        server,
-        server.asyncTranscribeError || t('upload.unknownError'),
-        t,
+      const committed = await commitTrackerOwner(
+        expected,
+        ownerSignal,
+        () => {
+          upsertFailedJob(
+            server,
+            server.asyncTranscribeError || t('upload.unknownError'),
+            t,
+          );
+        },
       );
+      if (!committed) return;
       continue;
     }
 
     if (server.asyncTranscribeStatus === 'uploading_chunks') {
       // 刷新后 File 句柄已丢，分片上传无法续传 —— 清服务端再标失败
-      await fetch(`/api/sessions/${server.id}/async-upload`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
-      }).catch(() => undefined);
-      upsertFailedJob(server, t('upload.interrupted'), t);
+      try {
+        await fetch(`/api/sessions/${server.id}/async-upload`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+          signal: ownerSignal,
+        });
+      } catch (error) {
+        // This was the concrete resurrection: cleanup aborted DELETE, the old
+        // catch swallowed it, then upsertFailedJob recreated A in B storage.
+        if (ownerSignal.aborted || isAbortError(error)) return;
+        // Preserve the old best-effort semantics for ordinary network errors:
+        // surface the interrupted local job even if server cleanup was unsure.
+      }
+      const committed = await commitTrackerOwner(
+        expected,
+        ownerSignal,
+        () => upsertFailedJob(server, t('upload.interrupted'), t),
+      );
+      if (!committed) return;
       continue;
     }
 
     if (SERVER_RUNNING_STATUSES.includes(server.asyncTranscribeStatus)) {
-      reattachPoll(server, token, t);
+      const attached = await reattachPoll(
+        server,
+        token,
+        t,
+        expected,
+        ownerSignal,
+      );
+      if (!attached) return;
     }
   }
 }
@@ -395,58 +511,82 @@ function upsertFailedJob(
  * 重新挂 poll：服务端 pipeline 的收尾步骤靠 client poll 驱动。
  * 已有活跃 poll（本进程内的 modal 还在跑）就跳过，避免重复 poll。
  */
-function reattachPoll(server: ActiveAsyncJob, token: string, t: Translate): void {
-  const existing = findJobBySession(server.id);
-  if (existing && uploadJobs.hasCancel(existing.id)) return;
+async function reattachPoll(
+  server: ActiveAsyncJob,
+  token: string,
+  t: Translate,
+  expected: AuthBoundarySnapshot,
+  ownerSignal: AbortSignal,
+): Promise<boolean> {
+  return commitTrackerOwner(expected, ownerSignal, () => {
+    const existing = findJobBySession(server.id);
+    if (existing && uploadJobs.hasCancel(existing.id)) return;
 
-  const jobId = existing?.id ?? createJobForSession(server, t);
-
-  uploadJobs.update(jobId, {
-    sessionId: server.id,
-    status: server.asyncTranscribeStatus as UploadJob['status'],
-  });
-
-  const abort = new AbortController();
-  uploadJobs.registerCancel(jobId, async () => {
-    abort.abort();
-    await fetch(`/api/sessions/${server.id}/async-upload`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-    }).catch(() => undefined);
-  });
-
-  void pollAsyncTranscribeStatus(server.id, token, {
-    signal: abort.signal,
-    initialStatus: server.asyncTranscribeStatus as AsyncUploadStatus,
-    onStatusChange: (status) =>
-      uploadJobs.update(jobId, { status: status as UploadJob['status'] }),
-    onProcessingProgress: (p) =>
-      uploadJobs.update(jobId, { processingProgress: p }),
-  })
-    .then((result) => {
-      uploadJobs.unregisterCancel(jobId);
-      if (result.finalStatus === 'completed') {
-        uploadJobs.update(jobId, { status: 'completed' });
-      } else if (result.finalStatus === 'failed') {
-        uploadJobs.update(jobId, {
-          status: 'failed',
-          errorMessage: result.error || t('upload.unknownError'),
-        });
-      } else if (result.finalStatus === 'canceled') {
-        uploadJobs.update(jobId, { status: 'canceled' });
-      }
-    })
-    .catch(() => {
-      uploadJobs.unregisterCancel(jobId);
-      // 取消（刷新后重挂的 poll 被 abort）会让 pollAsyncTranscribeStatus reject，
-      // 不应据此把任务持久化成 failed(unknown error)：按取消处理。
-      if (abort.signal.aborted) {
-        uploadJobs.update(jobId, { status: 'canceled' });
-        return;
-      }
-      uploadJobs.update(jobId, {
-        status: 'failed',
-        errorMessage: t('upload.unknownError'),
-      });
+    const jobId = existing?.id ?? createJobForSession(server, t);
+    uploadJobs.update(jobId, {
+      sessionId: server.id,
+      status: server.asyncTranscribeStatus as UploadJob['status'],
     });
+
+    const abort = new AbortController();
+    const pollSignal = combineAbortSignals(ownerSignal, abort.signal);
+    uploadJobs.registerCancel(jobId, async () => {
+      abort.abort();
+      await fetch(`/api/sessions/${server.id}/async-upload`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+        // User cancel still sends DELETE; only an owner change suppresses the
+        // stale request from observing the successor account's cookie.
+        signal: ownerSignal,
+      }).catch(() => undefined);
+    });
+
+    void pollAsyncTranscribeStatus(server.id, token, {
+      signal: pollSignal,
+      initialStatus: server.asyncTranscribeStatus as AsyncUploadStatus,
+      onStatusChange: (status) => {
+        void commitTrackerOwner(expected, ownerSignal, () => {
+          uploadJobs.update(jobId, {
+            status: status as UploadJob['status'],
+          });
+        });
+      },
+      onProcessingProgress: (p) => {
+        void commitTrackerOwner(expected, ownerSignal, () => {
+          uploadJobs.update(jobId, { processingProgress: p });
+        });
+      },
+    })
+      .then((result) => {
+        void commitTrackerOwner(expected, ownerSignal, () => {
+          uploadJobs.unregisterCancel(jobId);
+          if (result.finalStatus === 'completed') {
+            uploadJobs.update(jobId, { status: 'completed' });
+          } else if (result.finalStatus === 'failed') {
+            uploadJobs.update(jobId, {
+              status: 'failed',
+              errorMessage: result.error || t('upload.unknownError'),
+            });
+          } else if (result.finalStatus === 'canceled') {
+            uploadJobs.update(jobId, { status: 'canceled' });
+          }
+        });
+      })
+      .catch((error) => {
+        if (ownerSignal.aborted) return;
+        void commitTrackerOwner(expected, ownerSignal, () => {
+          uploadJobs.unregisterCancel(jobId);
+          // User cancellation remains a canceled terminal state. A boundary
+          // AbortError cannot enter this commit because owner validation fails.
+          if (abort.signal.aborted || isAbortError(error)) {
+            uploadJobs.update(jobId, { status: 'canceled' });
+            return;
+          }
+          uploadJobs.update(jobId, {
+            status: 'failed',
+            errorMessage: t('upload.unknownError'),
+          });
+        });
+      });
+  });
 }

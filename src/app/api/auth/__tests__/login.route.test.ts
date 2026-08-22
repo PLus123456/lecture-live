@@ -34,6 +34,7 @@ vi.mock('@/lib/auth', () => ({
     expiresInDays: days ?? 7,
     cookieMaxAge: (days ?? 7) * 24 * 60 * 60,
   }),
+  getAuthTokenSessionBinding: () => 'binding-login',
   login: loginMock,
   setAuthCookie: setAuthCookieMock,
 }));
@@ -70,6 +71,51 @@ describe('POST /api/auth/login', () => {
     );
   });
 
+  it('拒绝 sibling-origin text/plain login CSRF，且绝不签发/写 cookie', async () => {
+    const response = await POST(
+      new Request('https://app.example/api/auth/login', {
+        method: 'POST',
+        headers: {
+          Origin: 'https://evil.example',
+          'Sec-Fetch-Site': 'same-site',
+          'Content-Type': 'text/plain',
+        },
+        body: JSON.stringify({
+          email: 'attacker@example.com',
+          password: 'Password1',
+        }),
+      })
+    );
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get('set-cookie')).toBeNull();
+    expect(response.headers.get('clear-site-data')).toBeNull();
+    expect(loginMock).not.toHaveBeenCalled();
+    expect(setAuthCookieMock).not.toHaveBeenCalled();
+  });
+
+  it('全局门禁在读取正文、站点设置和账号桶之前拒绝', async () => {
+    const getReader = vi.fn();
+    const blocked = new Response('limited', { status: 429 });
+    enforceRateLimitMock.mockResolvedValueOnce(blocked);
+    const request = {
+      headers: new Headers(),
+      body: { getReader },
+    } as unknown as Request;
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(429);
+    expect(getReader).not.toHaveBeenCalled();
+    expect(getSiteSettingsMock).not.toHaveBeenCalled();
+    expect(loginMock).not.toHaveBeenCalled();
+    expect(enforceRateLimitMock).toHaveBeenCalledTimes(1);
+    expect(enforceRateLimitMock).toHaveBeenCalledWith(
+      request,
+      expect.objectContaining({ scope: 'auth:public:global', key: 'global' })
+    );
+  });
+
   it('返回登录用户并设置 HttpOnly cookie', async () => {
     loginMock.mockResolvedValue({
       user: {
@@ -100,6 +146,7 @@ describe('POST /api/auth/login', () => {
         role: 'ADMIN',
       },
       token: '__cookie_session__',
+      sessionBinding: 'binding-login',
     });
     expect(loginMock).toHaveBeenCalledWith(
       'alice@example.com',
@@ -112,6 +159,11 @@ describe('POST /api/auth/login', () => {
       expect.objectContaining({ maxAge: 14 * 24 * 60 * 60 })
     );
     expect(response.headers.get('set-cookie')).toContain('HttpOnly');
+    const accountGate = enforceRateLimitMock.mock.calls.find(
+      ([, options]) => options.scope === 'auth:login'
+    )?.[1];
+    expect(accountGate?.key).toMatch(/^email:sha256:[a-f0-9]{64}$/);
+    expect(accountGate?.key).not.toContain('alice@example.com');
     expect(logActionMock).toHaveBeenCalledWith(
       expect.any(Request),
       'user.login',

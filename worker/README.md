@@ -16,6 +16,7 @@ LectureLive 主服务器  ── HTTPS ──▶  nginx (443, TLS)  ──▶  w
 ## 依赖
 
 - **Node.js ≥ 20**（worker 是零 npm 依赖单文件，无需 `npm install`）
+- **systemd ≥ 249**（安装器会验证单元；旧版不得忽略解析器沙箱指令）
 - **ffmpeg / ffprobe**（`apt install ffmpeg`）
 - **deep-filter**（可选但强烈推荐；没有它会自动兜底 ffmpeg `afftdn`，降噪效果弱不少）
 
@@ -62,7 +63,8 @@ sudo chown -R llworker:llworker /opt/lecturelive-worker
 openssl rand -hex 32
 
 # 3. 配置 systemd（编辑其中的 AUDIO_WORKER_TOKEN）
-sudo cp lecturelive-enhance-worker.service /etc/systemd/system/
+sudo install -m 0600 lecturelive-enhance-worker.service /etc/systemd/system/lecturelive-enhance-worker.service  # 单元内含 Bearer token
+sudo systemd-analyze verify /etc/systemd/system/lecturelive-enhance-worker.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now lecturelive-enhance-worker
 
@@ -116,6 +118,7 @@ server {
 | `AUDIO_WORKER_MAX_INPUT_BYTES` | `2147483648` | 单文件输入上限（2GB） |
 | `AUDIO_WORKER_RETENTION_HOURS` | `24` | 任务产物保留时长，到期自动清 |
 | `AUDIO_WORKER_JOB_TIMEOUT_MINUTES` | `150` | 单步处理超时 |
+| `AUDIO_WORKER_PROBE_TIMEOUT_MS` | `60000` | 不可信媒体容器探测的硬超时（毫秒） |
 | `FFMPEG_BIN` / `FFPROBE_BIN` | `ffmpeg` / `ffprobe` | 可执行文件路径 |
 | `DEEP_FILTER_BIN` | （PATH 查找） | deep-filter 路径；不配则找 `deep-filter`/`deepFilter` |
 

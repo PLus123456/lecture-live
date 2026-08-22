@@ -143,8 +143,10 @@ export interface StreamAttribution {
 export async function fetchTemporaryApiKey(
   authToken: string,
   regionPreference?: SonioxRegionPreference,
-  attribution?: StreamAttribution
+  attribution?: StreamAttribution,
+  signal?: AbortSignal
 ): Promise<TemporaryApiKeyResponse> {
+  signal?.throwIfAborted();
   // auto 模式下，用客户端 ping 选延迟最低的区域
   let resolvedRegion: string | undefined;
   if (!regionPreference || regionPreference === 'auto') {
@@ -155,6 +157,7 @@ export async function fetchTemporaryApiKey(
   } else {
     resolvedRegion = regionPreference;
   }
+  signal?.throwIfAborted();
 
   const res = await fetch('/api/soniox/temporary-key', {
     method: 'POST',
@@ -168,12 +171,14 @@ export async function fetchTemporaryApiKey(
       sessionId: attribution?.sessionId,
       anchorId: attribution?.anchorId ?? undefined,
     }),
+    signal,
   });
   if (!res.ok) {
     const errorBody = await res.json().catch(() => ({})) as { error?: string };
     throw new Error(errorBody.error || 'Failed to get temporary API key');
   }
   const data = await res.json();
+  signal?.throwIfAborted();
   return data as TemporaryApiKeyResponse;
 }
 
@@ -200,8 +205,11 @@ export async function startSonioxRecording(
     regionPreference?: SonioxRegionPreference;
     attribution?: StreamAttribution;
     onAudioLevel?: (level: number) => void;
+    /** Account/session owner. Aborting it must prevent minting or publishing a late capability. */
+    signal?: AbortSignal;
   }
 ) {
+  options?.signal?.throwIfAborted();
   // ── E2E 测试接缝 ──
   // 真实 Soniox SDK 需要连 wss://stt-rt.soniox.com，无法在 e2e 环境运行。当页面显式设置
   // window.__E2E_FAKE_SONIOX__ 时（仅测试注入，生产永不置位），返回一个假转录连接，并把
@@ -241,13 +249,16 @@ export async function startSonioxRecording(
 
   // Dynamic import to ensure client-side only
   const { SonioxClient, BrowserPermissionResolver } = await import('@soniox/client');
+  options?.signal?.throwIfAborted();
 
   callbacks.onConnectionChange('connecting');
   const temporaryKey = await fetchTemporaryApiKey(
     authToken,
     options?.regionPreference,
-    options?.attribution
+    options?.attribution,
+    options?.signal
   );
+  options?.signal?.throwIfAborted();
   const wsBaseUrl = temporaryKey.ws_url ?? temporaryKey.ws_base_url;
   if (!wsBaseUrl) {
     throw new Error('Soniox temporary key response missing ws_url');

@@ -2,12 +2,17 @@ import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
 import { withRequestLogging } from '@/lib/requestLogger';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 import type { Prisma } from '@prisma/client';
 
 // 出账/进账台账：钱包流水列表（分页 + 按类型/用户筛选，附用户邮箱）
 export const GET = withRequestLogging('admin:recharge:ledger:list', async (req: Request) => {
-  const { response } = await requireAdminAccess(req, { scope: 'admin:recharge:ledger:list', limit: 60 });
+  const { user: admin, response } = await requireAdminAccess(req, {
+    scope: 'admin:recharge:ledger:list',
+    limit: 60,
+  });
   if (response) return response;
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
 
   const sp = new URL(req.url).searchParams;
   const page = Math.max(1, parseInt(sp.get('page') || '1', 10));
@@ -36,12 +41,34 @@ export const GET = withRequestLogging('admin:recharge:ledger:list', async (req: 
   });
   const byId = new Map(users.map((u) => [u.id, u]));
 
-  return NextResponse.json({
+  const payload = {
     transactions: items.map((t) => ({
       ...t,
       userEmail: byId.get(t.userId)?.email ?? null,
       userName: byId.get(t.userId)?.displayName ?? null,
     })),
     pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
-  });
+  };
+
+  try {
+    await writeSecurityAudit(req, {
+      event: 'recharge.ledger.read',
+      operator: { id: admin.id, email: admin.email, role: admin.role },
+      target: { type: 'recharge_ledger_collection' },
+      reason: 'admin_list',
+      outcome: 'SUCCESS',
+      metadata: {
+        filters: { type: type ?? null, userId: userId ?? null },
+        page,
+        pageSize,
+        count: payload.transactions.length,
+        total,
+      },
+    });
+  } catch (err) {
+    console.error('充值台账读取安全审计失败:', err);
+    return NextResponse.json({ error: '安全审计服务暂时不可用' }, { status: 503 });
+  }
+
+  return NextResponse.json(payload);
 });

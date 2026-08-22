@@ -12,6 +12,7 @@ const {
   tierFindUniqueMock,
   orderUpdateManyMock,
   createChargeMock,
+  linkPaymentProviderObjectsMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   enforceRateLimitMock: vi.fn(),
@@ -23,6 +24,7 @@ const {
   tierFindUniqueMock: vi.fn(),
   orderUpdateManyMock: vi.fn(),
   createChargeMock: vi.fn(),
+  linkPaymentProviderObjectsMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
@@ -40,10 +42,21 @@ vi.mock('@/lib/wallet', () => ({
   createPaymentOrder: createPaymentOrderMock,
   spendFromBalance: spendFromBalanceMock,
   DEFAULT_ORDER_CURRENCY: 'CNY',
-  WalletError: class WalletError extends Error {},
+  WalletError: class WalletError extends Error {
+    constructor(
+      message: string,
+      public readonly code: string
+    ) {
+      super(message);
+    }
+  },
+}));
+vi.mock('@/lib/payment/webhookInbox', () => ({
+  linkPaymentProviderObjects: linkPaymentProviderObjectsMock,
 }));
 
 import { POST } from '@/app/api/wallet/checkout/route';
+import { WalletError } from '@/lib/wallet';
 
 const TOPUP_TIER = {
   id: 'tier-1',
@@ -67,6 +80,7 @@ beforeEach(() => {
   tierFindUniqueMock.mockReset();
   orderUpdateManyMock.mockReset();
   createChargeMock.mockReset();
+  linkPaymentProviderObjectsMock.mockReset().mockResolvedValue(undefined);
 
   verifyAuthMock.mockResolvedValue({ id: 'u1', email: 'u@x.y', role: 'FREE' });
   enforceRateLimitMock.mockResolvedValue(null);
@@ -139,6 +153,13 @@ describe('checkout：下单落库', () => {
       where: { id: 'o1', status: 'pending' },
       data: { providerRef: 'pi_123' },
     });
+    expect(linkPaymentProviderObjectsMock).toHaveBeenCalledWith({
+      provider: 'stripe',
+      providerMode: 'unknown',
+      providerAccount: 'default',
+      orderId: 'o1',
+      objectRefs: [{ objectType: 'payment_intent', objectId: 'pi_123' }],
+    });
   });
 
   it('▶ 网关没给 providerRef → 不写空值', async () => {
@@ -196,5 +217,74 @@ describe('checkout：余额结算去抖（L13）', () => {
     );
 
     expect(spendFromBalanceMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ 冻结账户不得余额购买', async () => {
+    tierFindUniqueMock.mockResolvedValue({ ...TOPUP_TIER, kind: 'minutes' });
+    spendFromBalanceMock.mockRejectedValue(
+      new WalletError('账户存在未处理的支付争议', 'account_frozen')
+    );
+
+    const response = await POST(
+      createJsonRequest('http://localhost/api/wallet/checkout', {
+        method: 'POST',
+        body: { tierId: 'tier-1', mode: 'balance' },
+      })
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: 'account_frozen' });
+  });
+});
+
+describe('SEC-025：拒付冻结账户禁止新支付单', () => {
+  it('▶ createPaymentOrder 冻结闸拒绝后不调网关', async () => {
+    createPaymentOrderMock.mockRejectedValue(
+      new WalletError('账户存在未处理的支付争议', 'account_frozen')
+    );
+
+    const response = await pay();
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({ code: 'account_frozen' });
+    expect(createChargeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('SEC-023：存量 ADMIN 会员档 fail-closed', () => {
+  const legacyAdminTier = {
+    ...TOPUP_TIER,
+    id: 'tier-admin',
+    kind: 'membership',
+    name: '历史管理员商品',
+    grantRole: 'ADMIN',
+    durationDays: 30,
+    creditCents: null,
+  };
+
+  it('▶ 网关下单在建单和调用 Stripe 前拒绝', async () => {
+    tierFindUniqueMock.mockResolvedValueOnce(legacyAdminTier);
+
+    const res = await pay({ tierId: 'tier-admin' });
+
+    expect(res.status).toBe(400);
+    expect(createPaymentOrderMock).not.toHaveBeenCalled();
+    expect(getPaymentProviderMock).not.toHaveBeenCalled();
+    expect(createChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ 余额购买在限流和扣款事务前拒绝', async () => {
+    tierFindUniqueMock.mockResolvedValueOnce(legacyAdminTier);
+
+    const res = await POST(
+      createJsonRequest('http://localhost/api/wallet/checkout', {
+        method: 'POST',
+        body: { tierId: 'tier-admin', mode: 'balance' },
+      })
+    );
+
+    expect(res.status).toBe(400);
+    expect(spendFromBalanceMock).not.toHaveBeenCalled();
+    expect(enforceRateLimitMock).toHaveBeenCalledTimes(1); // 仅通用入口限流；不进入余额去抖/扣款
   });
 });

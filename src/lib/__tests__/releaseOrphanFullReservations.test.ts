@@ -2,16 +2,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * R4 兜底：releaseOrphanFullReservations —— 释放「已终态却仍残留在途预留」的完整版补全转录会话
- *（与 B1 的 releaseOrphanAsyncReservations 平行）。扫 findMany 命中的每个会话都过 settleFullReservation
- *（FOR UPDATE 读列→清零+释放，恰好一次）；释放额 >0 计数。
+ *（与 B1 的 releaseOrphanAsyncReservations 平行）。扫 findMany 命中的每个会话都在 Session 行锁内
+ * 重验 claim/终态/陈旧时间后结算；释放额 >0 计数。
  */
 
 const {
   sessionFindManyMock,
-  settleFullReservationMock,
+  releaseTerminalReservationMock,
 } = vi.hoisted(() => ({
   sessionFindManyMock: vi.fn(),
-  settleFullReservationMock: vi.fn(),
+  releaseTerminalReservationMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -23,7 +23,10 @@ vi.mock('@/lib/quota', () => ({
   resetExpiredTranscriptionQuotas: vi.fn(),
   reconcileStorageBytes: vi.fn(),
   settleAsyncReservation: vi.fn(),
-  settleFullReservation: settleFullReservationMock,
+}));
+vi.mock('@/lib/audio/fullTranscribeAdmission', () => ({
+  failFullTranscribeAttempt: vi.fn(),
+  releaseTerminalFullTranscribeReservation: releaseTerminalReservationMock,
 }));
 // billingMaintenance import 期会拉起下列模块的顶层绑定，桩占位避免真实副作用。
 vi.mock('@/lib/soniox/asyncFile', () => ({
@@ -44,8 +47,8 @@ const NOW = new Date('2026-07-11T12:00:00.000Z');
 describe('releaseOrphanFullReservations（R4 兜底释放终态残留预留）', () => {
   beforeEach(() => {
     sessionFindManyMock.mockReset();
-    settleFullReservationMock.mockReset();
-    settleFullReservationMock.mockResolvedValue(0);
+    releaseTerminalReservationMock.mockReset();
+    releaseTerminalReservationMock.mockResolvedValue(0);
   });
 
   it('只扫 fullReservedMinutes>0 且已终态(failed/completed)且 updatedAt 陈旧的会话', async () => {
@@ -63,38 +66,46 @@ describe('releaseOrphanFullReservations（R4 兜底释放终态残留预留）',
     );
   });
 
-  it('每个命中会话过 settleFullReservation；释放额>0 才计数', async () => {
+  it('每个命中会话过 claim-bound 终态重验；释放额>0 才计数', async () => {
     sessionFindManyMock.mockResolvedValueOnce([
-      { id: 's1', userId: 'u1', fullReservedMinutes: 4 },
-      { id: 's2', userId: 'u2', fullReservedMinutes: 2 },
+      { id: 's1', userId: 'u1', fullTranscribeClaimId: 'claim-1', fullReservedMinutes: 4 },
+      { id: 's2', userId: 'u2', fullTranscribeClaimId: 'claim-2', fullReservedMinutes: 2 },
     ]);
     // s1 结算释放 4；s2 已被并发路径结算 → settle 读到 0、返回 0（不重复释放）
-    settleFullReservationMock
+    releaseTerminalReservationMock
       .mockResolvedValueOnce(4)
       .mockResolvedValueOnce(0);
 
     const released = await releaseOrphanFullReservations(NOW);
 
     expect(released).toBe(1);
-    expect(settleFullReservationMock).toHaveBeenCalledWith('s1');
-    expect(settleFullReservationMock).toHaveBeenCalledWith('s2');
+    expect(releaseTerminalReservationMock).toHaveBeenCalledWith({
+      sessionId: 's1',
+      claimId: 'claim-1',
+      updatedAtLte: new Date(NOW.getTime() - 30 * 60_000),
+    });
+    expect(releaseTerminalReservationMock).toHaveBeenCalledWith({
+      sessionId: 's2',
+      claimId: 'claim-2',
+      updatedAtLte: new Date(NOW.getTime() - 30 * 60_000),
+    });
   });
 
-  it('settle 全部返回 0（已被别处结算）→ 计数 0', async () => {
+  it('claim-bound settle 全部返回 0（已被别处结算）→ 计数 0', async () => {
     sessionFindManyMock.mockResolvedValueOnce([
-      { id: 's1', userId: 'u1', fullReservedMinutes: 4 },
+      { id: 's1', userId: 'u1', fullTranscribeClaimId: 'claim-1', fullReservedMinutes: 4 },
     ]);
-    settleFullReservationMock.mockResolvedValue(0);
+    releaseTerminalReservationMock.mockResolvedValue(0);
 
     expect(await releaseOrphanFullReservations(NOW)).toBe(0);
   });
 
   it('settle 抛错被 .catch(()=>0) 吞 → 不计数、不影响其余会话', async () => {
     sessionFindManyMock.mockResolvedValueOnce([
-      { id: 's1', userId: 'u1', fullReservedMinutes: 4 },
-      { id: 's2', userId: 'u2', fullReservedMinutes: 3 },
+      { id: 's1', userId: 'u1', fullTranscribeClaimId: 'claim-1', fullReservedMinutes: 4 },
+      { id: 's2', userId: 'u2', fullTranscribeClaimId: 'claim-2', fullReservedMinutes: 3 },
     ]);
-    settleFullReservationMock
+    releaseTerminalReservationMock
       .mockRejectedValueOnce(new Error('db glitch'))
       .mockResolvedValueOnce(3);
 

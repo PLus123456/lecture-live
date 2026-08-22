@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import type { LlmPurpose } from '@/types/llm';
 import { verifyAuth } from '@/lib/auth';
+import { isPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
 import { callLLMWithHistoryStream, type LLMStreamEvent } from '@/lib/llm/gateway';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { LLMAccessError, resolveAuthorizedLlmSelection } from '@/lib/llm/access';
@@ -39,6 +40,12 @@ export async function POST(req: Request) {
   const user = await verifyAuth(req);
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  if (!(await isPaymentBenefitAvailable(user.id))) {
+    return NextResponse.json(
+      { error: '账户存在未处理的支付争议', code: 'payment_account_frozen' },
+      { status: 403 }
+    );
   }
 
   const rateLimited = await enforceApiRateLimit(req, {

@@ -68,7 +68,7 @@ describe('useAuth().logout 的本机清扫 (C51/P6-8 + C47/L27)', () => {
     await act(async () => {
       await result.current.logout();
     });
-    expect(clearAllAudioArchivesMock).toHaveBeenCalledTimes(1);
+    expect(clearAllAudioArchivesMock).toHaveBeenCalledTimes(2);
   });
 
   it('清空已浏览的分享链接（含 share token）以及它的 localStorage 键', async () => {
@@ -94,9 +94,9 @@ describe('useAuth().logout 的本机清扫 (C51/P6-8 + C47/L27)', () => {
     expect(localStorage.getItem(SHARE_LINKS_KEY)).toBeNull();
   });
 
-  it('归档清理失败也不阻断登出：仍清 auth store 并请求服务端清 cookie', async () => {
+  it('归档清理失败也不阻断登出：仍清 auth store 并请求服务端持久撤销', async () => {
     clearAllAudioArchivesMock.mockRejectedValueOnce(new Error('IndexedDB blocked'));
-    useAuthStore.getState().setAuth(
+    await useAuthStore.getState().setAuth(
       {
         id: 'u1',
         email: 'u@example.com',
@@ -104,18 +104,78 @@ describe('useAuth().logout 的本机清扫 (C51/P6-8 + C47/L27)', () => {
         role: 'FREE',
         createdAt: new Date().toISOString(),
       },
-      'token-1'
+      'token-1',
+      { sessionBinding: 'binding-1' }
     );
 
     const { result } = renderHook(() => useAuth());
+    let logoutResult: Awaited<ReturnType<typeof result.current.logout>>;
     await act(async () => {
-      await result.current.logout();
+      logoutResult = await result.current.logout();
     });
 
     expect(useAuthStore.getState().user).toBeNull();
+    expect(logoutResult!).toEqual({
+      durableRevocation: true,
+      status: 200,
+      pendingRevocation: false,
+    });
     expect(globalThis.fetch).toHaveBeenCalledWith(
       '/api/auth/logout',
-      expect.objectContaining({ method: 'POST' })
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          'X-Lecture-Live-Auth-Session': 'binding-1',
+        },
+      })
+    );
+  });
+
+  it('服务端未确认持久撤销时返回 incomplete，绝不让 UI 静默宣称安全登出', async () => {
+    await useAuthStore.getState().setAuth(
+      {
+        id: 'u2',
+        email: 'u2@example.com',
+        displayName: 'U2',
+        role: 'FREE',
+        createdAt: new Date().toISOString(),
+      },
+      'token-2',
+      { sessionBinding: 'binding-2' }
+    );
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      new Response('{"error":"unavailable"}', { status: 503 })
+    );
+
+    const { result } = renderHook(() => useAuth());
+    let logoutResult: Awaited<ReturnType<typeof result.current.logout>>;
+    await act(async () => {
+      logoutResult = await result.current.logout();
+    });
+
+    expect(useAuthStore.getState().user).toBeNull();
+    expect(logoutResult!).toEqual({
+      durableRevocation: false,
+      status: 503,
+      pendingRevocation: true,
+    });
+
+    let retryResult: Awaited<ReturnType<typeof result.current.logout>>;
+    await act(async () => {
+      retryResult = await result.current.logout();
+    });
+    expect(retryResult!).toEqual({
+      durableRevocation: true,
+      status: 200,
+      pendingRevocation: false,
+    });
+    expect(globalThis.fetch).toHaveBeenLastCalledWith(
+      '/api/auth/logout',
+      expect.objectContaining({
+        headers: {
+          'X-Lecture-Live-Auth-Session': 'binding-2',
+        },
+      })
     );
   });
 });

@@ -37,6 +37,41 @@ need_root() {
     [[ $EUID -eq 0 ]] || fatal "此操作需要 root 权限，请使用: sudo lecture-live $*"
 }
 
+# systemd unit 自身也有 ExecStartPre；这里再检查一次，覆盖从旧版升级过程中仍装着旧 unit、
+# 或回滚到旧运行产物的迁移窗口。失败时主动隔离任何仍在运行的旧服务。
+assert_payment_startup_preflight() {
+    local script="$APP_DIR/scripts/check-production-payment-config.mjs"
+    systemctl stop "$WEB_SERVICE" 2>/dev/null || true
+    systemctl stop "$WS_SERVICE" 2>/dev/null || true
+    if systemctl is-active --quiet "$WEB_SERVICE" || systemctl is-active --quiet "$WS_SERVICE"; then
+        fatal "无法确认旧服务已停止；拒绝进入生产启动检查"
+    fi
+    if [[ ! -f "$script" ]] || \
+       ! runuser -u lecturelive -- /usr/bin/node --env-file="$APP_DIR/.env" "$script"; then
+        fatal "生产支付配置未通过启动安全检查；服务已保持停止"
+    fi
+    if [[ ! -f "$APP_DIR/.runtime-security-version" ]] || \
+       ! grep -Fxq 'health-ready-v1' "$APP_DIR/.runtime-security-version"; then
+        fatal "运行产物早于受保护 readiness 路由；服务已保持停止，请升级到安全版本"
+    fi
+}
+
+quarantine_failed_start() {
+    systemctl stop "$WEB_SERVICE" 2>/dev/null || true
+    systemctl stop "$WS_SERVICE" 2>/dev/null || true
+    if systemctl is-active --quiet "$WEB_SERVICE" || systemctl is-active --quiet "$WS_SERVICE"; then
+        fatal "启动检查失败，且无法确认失败实例已停止"
+    fi
+    fatal "$1；所有服务已保持停止"
+}
+
+require_deep_readiness() {
+    if ! runuser -u lecturelive -- /usr/bin/node --env-file="$APP_DIR/.env" \
+        "$APP_DIR/scripts/check-readiness.mjs" --wait >/dev/null 2>&1; then
+        quarantine_failed_start "深度就绪检查失败"
+    fi
+}
+
 # ── 分隔线 ──
 divider() {
     echo -e "${DIM}────────────────────────────────────────${NC}"
@@ -99,20 +134,24 @@ service_memory() {
 
 cmd_start() {
     need_root start
+    assert_payment_startup_preflight
     step "启动 LectureLive 服务..."
-    systemctl start "$WEB_SERVICE" "$WS_SERVICE"
+    if ! systemctl start "$WEB_SERVICE" "$WS_SERVICE"; then
+        quarantine_failed_start "服务启动失败"
+    fi
     sleep 2
     # 检查启动结果
     local web_ok=false ws_ok=false
     systemctl is-active --quiet "$WEB_SERVICE" && web_ok=true
     systemctl is-active --quiet "$WS_SERVICE" && ws_ok=true
     if $web_ok && $ws_ok; then
+        require_deep_readiness
         info "所有服务已启动"
     else
         $web_ok || error "Web 服务启动失败"
         $ws_ok  || error "WebSocket 服务启动失败"
         echo ""
-        warn "请使用 lecture-live log 查看详细日志"
+        quarantine_failed_start "服务未全部进入 active 状态，请使用 lecture-live log 查看详细日志"
     fi
 }
 
@@ -126,18 +165,22 @@ cmd_stop() {
 
 cmd_restart() {
     need_root restart
+    assert_payment_startup_preflight
     step "重启 LectureLive 服务..."
-    systemctl restart "$WEB_SERVICE" "$WS_SERVICE"
+    if ! systemctl restart "$WEB_SERVICE" "$WS_SERVICE"; then
+        quarantine_failed_start "服务重启失败"
+    fi
     sleep 2
     local web_ok=false ws_ok=false
     systemctl is-active --quiet "$WEB_SERVICE" && web_ok=true
     systemctl is-active --quiet "$WS_SERVICE" && ws_ok=true
     if $web_ok && $ws_ok; then
+        require_deep_readiness
         info "所有服务已重启"
     else
         $web_ok || error "Web 服务重启失败"
         $ws_ok  || error "WebSocket 服务重启失败"
-        warn "请使用 lecture-live log 查看详细日志"
+        quarantine_failed_start "服务未全部进入 active 状态，请使用 lecture-live log 查看详细日志"
     fi
 }
 
@@ -177,7 +220,8 @@ cmd_status() {
 
     # 健康检查
     printf "  %-14s" "健康检查:"
-    if curl -fsS "http://127.0.0.1:${WEB_PORT}/api/health" >/dev/null 2>&1; then
+    if runuser -u lecturelive -- /usr/bin/node --env-file="$APP_DIR/.env" \
+        "$APP_DIR/scripts/check-readiness.mjs" >/dev/null 2>&1; then
         echo -e " ${GREEN}正常${NC}"
     else
         echo -e " ${RED}异常${NC}"
@@ -294,17 +338,28 @@ cmd_install() {
     (cd "$SRC_DIR" && npm ci)
 
     # 配置环境变量
+    local env_needs_edit=false
     if [[ ! -f "$APP_DIR/.env" ]]; then
         if [[ -f "$SRC_DIR/.env.example" ]]; then
             cp "$SRC_DIR/.env.example" "$APP_DIR/.env"
-            warn "已创建 .env 配置文件，请编辑: $APP_DIR/.env"
-            warn "编辑完成后运行: sudo lecture-live update"
-            echo ""
-            return
+            env_needs_edit=true
         elif [[ -f "$SRC_DIR/.env.local" ]]; then
             cp "$SRC_DIR/.env.local" "$APP_DIR/.env"
             warn "已从 .env.local 复制配置，请检查生产环境值"
         fi
+    fi
+    [[ -f "$APP_DIR/.env" ]] || fatal "未找到可用的环境配置模板"
+
+    # 必须在首次复制模板后、任何提前 return 之前生成引导密钥并收紧权限。
+    # 后续 deploy/install.sh 会幂等复核；这里保证等待管理员编辑期间也没有 0644 秘密文件。
+    bash "$SRC_DIR/deploy/ensure-security-env.sh" "$APP_DIR/.env"
+
+    if $env_needs_edit; then
+        _install_self "$SRC_DIR"
+        warn "已创建安全默认的 .env 配置文件，请编辑: $APP_DIR/.env"
+        warn "编辑完成后运行: sudo lecture-live update"
+        echo ""
+        return
     fi
 
     # 编译 + 部署
@@ -413,17 +468,75 @@ cmd_rollback() {
             echo -e '${CYAN}[→]${NC} 停止服务...'
             systemctl stop $WEB_SERVICE 2>/dev/null || true
             systemctl stop $WS_SERVICE 2>/dev/null || true
+            if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
+                echo -e '${RED}[✗]${NC} 无法确认旧服务已停止，拒绝覆盖运行中的回滚目标'
+                exit 1
+            fi
             echo -e '${CYAN}[→]${NC} 恢复备份...'
             find $APP_DIR -mindepth 1 -maxdepth 1 \
-                ! -name data ! -name .env ! -name backups \
+                ! -name data ! -name .env ! -name backups ! -name scripts \
                 -exec rm -rf {} +
             tar xzf '$selected' -C $APP_DIR
             chown -R lecturelive:lecturelive $APP_DIR
             chmod 600 $APP_DIR/.env
+            [[ -f $APP_DIR/.runtime-security-version ]] && \
+                grep -Fxq health-ready-v1 $APP_DIR/.runtime-security-version || {
+                echo -e '${RED}[✗]${NC} 该备份早于受保护 readiness 路由，服务保持停止'
+                exit 1
+            }
             [[ -d $WS_DIR ]] && ln -sfn $APP_DIR/data $WS_DIR/data && ln -sfn $APP_DIR/.env $WS_DIR/.env
+            [[ -f $APP_DIR/scripts/check-production-payment-config.mjs ]] || {
+                echo -e '${RED}[✗]${NC} 缺少生产支付启动检查脚本，回滚版本保持停止'
+                exit 1
+            }
+            runuser -u lecturelive -- /usr/bin/node --env-file=$APP_DIR/.env \
+                $APP_DIR/scripts/check-production-payment-config.mjs || {
+                echo -e '${RED}[✗]${NC} 生产支付配置未通过安全检查，回滚版本保持停止'
+                exit 1
+            }
             echo -e '${CYAN}[→]${NC} 启动服务...'
-            systemctl start $WEB_SERVICE $WS_SERVICE
+            systemctl start $WEB_SERVICE $WS_SERVICE || {
+                systemctl stop $WEB_SERVICE 2>/dev/null || true
+                systemctl stop $WS_SERVICE 2>/dev/null || true
+                if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
+                    echo -e '${RED}[✗]${NC} 回滚版本启动失败且无法确认服务已停止'
+                    exit 1
+                fi
+                echo -e '${RED}[✗]${NC} 回滚版本启动失败，服务已保持停止'
+                exit 1
+            }
             sleep 2
+            if ! systemctl is-active --quiet $WEB_SERVICE || ! systemctl is-active --quiet $WS_SERVICE; then
+                systemctl stop $WEB_SERVICE 2>/dev/null || true
+                systemctl stop $WS_SERVICE 2>/dev/null || true
+                if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
+                    echo -e '${RED}[✗]${NC} 回滚版本未全部进入 active 且无法确认服务已停止'
+                    exit 1
+                fi
+                echo -e '${RED}[✗]${NC} 回滚版本未全部进入 active，服务已保持停止'
+                exit 1
+            fi
+            runuser -u lecturelive -- /usr/bin/node --env-file=$APP_DIR/.env \
+                $APP_DIR/scripts/check-readiness.mjs --wait || {
+                systemctl stop $WEB_SERVICE 2>/dev/null || true
+                systemctl stop $WS_SERVICE 2>/dev/null || true
+                if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
+                    echo -e '${RED}[✗]${NC} readiness 失败且无法确认服务已停止'
+                    exit 1
+                fi
+                echo -e '${RED}[✗]${NC} readiness 失败，服务已保持停止'
+                exit 1
+            }
+            if ! systemctl is-active --quiet $WEB_SERVICE || ! systemctl is-active --quiet $WS_SERVICE; then
+                systemctl stop $WEB_SERVICE 2>/dev/null || true
+                systemctl stop $WS_SERVICE 2>/dev/null || true
+                if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
+                    echo -e '${RED}[✗]${NC} readiness 后服务状态变化，且无法确认全部停止'
+                    exit 1
+                fi
+                echo -e '${RED}[✗]${NC} readiness 后服务未全部 active，服务已保持停止'
+                exit 1
+            fi
             echo -e '${GREEN}[✓]${NC} 回滚完成'
         "
 }

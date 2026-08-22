@@ -40,7 +40,13 @@ export async function POST(
 
     const task = await prisma.translationTask.findUnique({
       where: { id },
-      select: { id: true, userId: true, status: true, estimatedCents: true },
+      select: {
+        id: true,
+        userId: true,
+        status: true,
+        estimatedCents: true,
+        updatedAt: true,
+      },
     });
     if (!task || task.userId !== user.id) {
       return NextResponse.json({ error: 'Not found' }, { status: 404 });
@@ -52,10 +58,17 @@ export async function POST(
       );
     }
 
+    const pendingAt = new Date(
+      Math.max(Date.now(), task.updatedAt.getTime() + 1)
+    );
     await prisma.$transaction(async (tx) => {
       const claimed = await tx.translationTask.updateMany({
-        where: { id: task.id, status: 'QUOTED' },
-        data: { status: 'PENDING', chargedCents: task.estimatedCents },
+        where: { id: task.id, status: 'QUOTED', updatedAt: task.updatedAt },
+        data: {
+          status: 'PENDING',
+          chargedCents: task.estimatedCents,
+          updatedAt: pendingAt,
+        },
       });
       if (claimed.count === 0) {
         throw new WalletError('任务已确认或已失效', 'bad_request');
@@ -76,11 +89,44 @@ export async function POST(
     const jobId = await enqueueDocTranslate(task.id, user.id);
     if (!jobId) {
       // 入队失败（极罕见）：终态失败 + 自动退款，用户可 retry
-      await prisma.translationTask.updateMany({
-        where: { id: task.id, status: 'PENDING' },
-        data: { status: 'FAILED', errorMessage: '任务入队失败，请重试' },
+      const failedAt = new Date(
+        Math.max(Date.now(), pendingAt.getTime() + 1)
+      );
+      const failed = await prisma.translationTask.updateMany({
+        where: {
+          id: task.id,
+          status: 'PENDING',
+          jobQueueId: null,
+          proxyGeneration: null,
+          updatedAt: pendingAt,
+        },
+        data: {
+          status: 'FAILED',
+          errorMessage: '任务入队失败，请重试',
+          updatedAt: failedAt,
+        },
       });
-      await refundTaskCharge(task.id, '入队失败退款');
+      if (failed.count !== 1) {
+        return NextResponse.json(
+          { error: '任务调度状态已变化，请刷新后重试', code: 'task_generation_changed' },
+          { status: 409 }
+        );
+      }
+      if (task.estimatedCents > 0) {
+        const refunded = await refundTaskCharge(task.id, '入队失败退款', {
+          status: 'FAILED',
+          jobQueueId: null,
+          proxyGeneration: null,
+          chargedCents: task.estimatedCents,
+          updatedAt: failedAt,
+        });
+        if (!refunded.claimed) {
+          return NextResponse.json(
+            { error: '任务生命周期已变化，请刷新后重试', code: 'task_generation_changed' },
+            { status: 409 }
+          );
+        }
+      }
       return NextResponse.json({ error: '任务入队失败，费用已退回' }, { status: 500 });
     }
     void runDocTranslateTick();

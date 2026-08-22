@@ -42,7 +42,10 @@ vi.mock('@/lib/prisma', () => ({
     $transaction: (cb: (tx: unknown) => Promise<unknown>) =>
       cb({
         $queryRaw: (...a: unknown[]) => txQueryRawMock(...a),
-        session: { update: (...a: unknown[]) => txSessionUpdateMock(...a) },
+        session: {
+          update: (...a: unknown[]) => txSessionUpdateMock(...a),
+          updateMany: (...a: unknown[]) => sessionUpdateManyMock(...a),
+        },
       }),
   },
 }));
@@ -73,10 +76,32 @@ vi.mock('@/lib/audio/ffmpegTranscode', () => ({
 }));
 vi.mock('@/lib/sessionPersistence', () => ({
   stageSessionAudioArtifact: vi.fn(() =>
-    Promise.resolve({ reference: 'recordings/s1-tmp.mp3' })
+    Promise.resolve({
+      category: 'recordings',
+      reference: 'recordings/s1-tmp.mp3',
+      localReference: 'recordings/s1-tmp.mp3',
+      storage: 'local',
+      previousReference: null,
+      storedArtifactId: 'artifact-1',
+      expectedPreviousArtifactId: null,
+      actualBytes: 3,
+      artifactType: 'recording',
+    })
   ),
-  finalizeStagedArtifactPublish: vi.fn(() => Promise.resolve({})),
+  settleStagedArtifactsInTransaction: vi.fn((_tx, staged) =>
+    Promise.resolve(
+      staged.map((entry: unknown) => ({
+        staged: entry,
+        settled: { artifact: { id: 'artifact-1' }, previous: null },
+      }))
+    )
+  ),
+  completeStagedArtifactPublishes: vi.fn(() => Promise.resolve([])),
   rollbackStagedArtifact: vi.fn(() => Promise.resolve(undefined)),
+}));
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_STATE: { ACTIVE: 'ACTIVE', RESERVED: 'RESERVED' },
+  getStoredArtifactById: vi.fn(() => Promise.resolve(null)),
 }));
 vi.mock('@/lib/soniox/env', () => ({
   resolveAndPersistTaskRegion: vi.fn(() =>

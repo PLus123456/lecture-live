@@ -29,6 +29,13 @@ const {
 
 vi.mock('@/lib/adminApi', () => ({ requireAdminAccess: requireAdminAccessMock }));
 vi.mock('@/lib/auditLog', () => ({ logAction: logActionMock }));
+vi.mock('@/lib/securityAudit', () => ({
+  getSecurityAuditRequestId: vi.fn(() => 'audit-request-id'),
+  writeSecurityAudit: vi.fn().mockResolvedValue({
+    requestId: 'audit-request-id',
+    action: 'admin.security.users.test',
+  }),
+}));
 vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: getSiteSettingsMock }));
 vi.mock('@/lib/auth', () => ({ validatePassword: vi.fn().mockReturnValue(null) }));
 vi.mock('@/lib/userRoles', () => ({

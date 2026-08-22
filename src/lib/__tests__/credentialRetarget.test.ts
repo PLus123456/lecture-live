@@ -50,6 +50,30 @@ describe('credentialRetarget — isEndpointRetargeted', () => {
       isEndpointRetargeted([{ current: 'https://a.tld', next: ' https://a.tld ' }])
     ).toBe(false);
   });
+
+  it('URL query 值末尾的斜杠必须保留并视为改靶', () => {
+    for (const suffix of ['/', '//', '///']) {
+      expect(
+        isEndpointRetargeted([
+          {
+            current: 'https://api.vendor.example/v1?tenant=a',
+            next: `https://api.vendor.example/v1?tenant=a${suffix}`,
+          },
+        ])
+      ).toBe(true);
+    }
+  });
+
+  it('URL fragment 末尾的斜杠同样不得被 pathname 归一误删', () => {
+    expect(
+      isEndpointRetargeted([
+        {
+          current: 'https://api.vendor.example/v1#tenant-a',
+          next: 'https://api.vendor.example/v1#tenant-a/',
+        },
+      ])
+    ).toBe(true);
+  });
 });
 
 describe('credentialRetarget — requiresSecretReentry', () => {

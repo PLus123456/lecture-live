@@ -284,7 +284,10 @@ describe('reclaimStaleInterpretSessions', () => {
       'interpret_cron',
       expect.anything()
     );
-    expect(deductMock).toHaveBeenCalledWith('u1', 20, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('u1', 20, expect.anything(), {
+      source: 'interpret_cron',
+      referenceId: 's1',
+    });
   });
 
   it('R1-L2：实测量超 6h 上限 → 仍封顶（防 Soniox 侧异常大值）', async () => {
@@ -295,7 +298,10 @@ describe('reclaimStaleInterpretSessions', () => {
 
     await reclaimStaleInterpretSessions(NOW);
 
-    expect(deductMock).toHaveBeenCalledWith('u1', 360, expect.anything());
+    expect(deductMock).toHaveBeenCalledWith('u1', 360, expect.anything(), {
+      source: 'interpret_cron',
+      referenceId: 's1',
+    });
   });
 
   it('认领输给 deduct(count=0) → 跳过、不扣费（互斥，不双扣）', async () => {

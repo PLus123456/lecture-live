@@ -7,7 +7,11 @@ import {
   EMPTY_CONVERSATION_RUNTIME,
   type ConversationMeta,
 } from '@/stores/chatStore';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundarySnapshot,
+  isAuthBoundaryCurrent,
+  useAuthStore,
+} from '@/stores/authStore';
 import type { ChatMessage, ChatModelsResponse, ThinkingDepth } from '@/types/llm';
 import { estimateTokens } from '@/lib/llm/tokenizer';
 import { findCompressionBoundary } from '@/lib/llm/chatCompression';
@@ -303,6 +307,8 @@ export function useChat(sessionId: string | null) {
       if (!token || !activeConversationId || contextFull) return;
       // 历史加载完成前不发：否则迟到的 setMessages（全量覆盖）会清掉这条乐观消息与流式占位。
       if (!historyLoadedRef.current) return;
+      const authBoundary = getAuthBoundarySnapshot();
+      const authCurrent = () => isAuthBoundaryCurrent(authBoundary);
 
       // 捕获本次发送绑定的 conversationId —— SSE 流的所有写入都打到这一片，
       // 即使用户流式途中切到别的对话/录音，旧流也只写回已非活跃的切片。
@@ -378,6 +384,7 @@ export function useChat(sessionId: string | null) {
               : {}),
           }),
         });
+        if (!authCurrent()) throw new DOMException('Auth boundary changed', 'AbortError');
 
         // 非 SSE 错误响应（鉴权/校验失败等）
         if (
@@ -401,7 +408,8 @@ export function useChat(sessionId: string | null) {
         let accumulatedThinking = '';
         let sawError = false;
 
-        await consumeSse(res.body, (event, payload) => {
+        await consumeSse(res.body, authCurrent, (event, payload) => {
+          if (!authCurrent()) return;
           if (event === 'thinking') {
             const now = Date.now();
             if (!thinkingFirstAt) thinkingFirstAt = now;
@@ -466,6 +474,8 @@ export function useChat(sessionId: string | null) {
           }
         });
 
+        if (!authCurrent()) return;
+
         // 流意外结束但既无 done 也无 error → 收尾占位消息
         if (!sawError) {
           updateMessage(conversationId, assistantId, { streaming: false });
@@ -473,12 +483,13 @@ export function useChat(sessionId: string | null) {
       } catch (error) {
         // 流被 abort（切换 session/卸载）—— 静默收尾，不写错误气泡。
         if ((error as { name?: string })?.name === 'AbortError') return;
+        if (!authCurrent()) return;
         updateMessage(conversationId, assistantId, {
           content: `Error: ${error instanceof Error ? error.message : 'Chat failed'}`,
           streaming: false,
         });
       } finally {
-        setLoading(conversationId, false);
+        if (authCurrent()) setLoading(conversationId, false);
       }
     },
     [
@@ -639,6 +650,7 @@ export function useChat(sessionId: string | null) {
  */
 async function consumeSse(
   body: ReadableStream<Uint8Array>,
+  isCurrent: () => boolean,
   onEvent: (event: string, payload: Record<string, unknown>) => void
 ): Promise<void> {
   const reader = body.getReader();
@@ -646,6 +658,7 @@ async function consumeSse(
   let buffer = '';
 
   const flushFrame = (frame: string) => {
+    if (!isCurrent()) throw new DOMException('Auth boundary changed', 'AbortError');
     let event = 'message';
     let dataLine = '';
     for (const rawLine of frame.split('\n')) {
@@ -665,7 +678,9 @@ async function consumeSse(
   };
 
   for (;;) {
+    if (!isCurrent()) throw new DOMException('Auth boundary changed', 'AbortError');
     const { done, value } = await reader.read();
+    if (!isCurrent()) throw new DOMException('Auth boundary changed', 'AbortError');
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     // SSE 帧以空行（\n\n）分隔

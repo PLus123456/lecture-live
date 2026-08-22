@@ -6,7 +6,15 @@ import {
   EMPTY_STREAMING_PREVIEW_TRANSLATION,
 } from '@/lib/transcriptPreview';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+  isAuthBoundaryCurrent,
+  isPersistedAuthBoundaryCurrent,
+  type AuthBoundarySnapshot,
+  useAuthStore,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
 import { TokenProcessor } from '@/lib/soniox/tokenProcessor';
 import { buildSonioxConfig, startSonioxRecording } from '@/lib/soniox/client';
 import type { RealtimeToken } from '@/types/soniox';
@@ -43,6 +51,12 @@ type RecordingHandle = {
   stop?: () => Promise<void> | void;
 };
 
+interface InterpretOwner {
+  generation: number;
+  boundary: AuthBoundarySnapshot;
+  signal: AbortSignal;
+}
+
 // R1-L1：key 的 max_session_duration_seconds 到点 Soniox 硬断连接；提前这么多秒主动平滑轮换。
 const ROTATION_LEAD_S = 30;
 
@@ -78,11 +92,31 @@ export function useInterpret() {
   const sonioxConfigRef = useRef<ReturnType<typeof buildSonioxConfig> | null>(null);
   const callbacksRef = useRef<Parameters<typeof startSonioxRecording>[2] | null>(null);
   const deviceIdRef = useRef<string | undefined>(undefined);
+  const lifecycleGenerationRef = useRef(0);
+  const activeOwnerRef = useRef<InterpretOwner | null>(null);
+
+  const ownerIsCurrent = useCallback((owner: InterpretOwner) => (
+    lifecycleGenerationRef.current === owner.generation &&
+    activeOwnerRef.current === owner &&
+    !owner.signal.aborted &&
+    isAuthBoundaryCurrent(owner.boundary) &&
+    isPersistedAuthBoundaryCurrent(owner.boundary)
+  ), []);
 
   const token = useAuthStore((s) => s.token);
 
   const deductQuota = useCallback(
-    async (durationMs: number, anchorId: string | null) => {
+    async (
+      durationMs: number,
+      anchorId: string | null,
+      expected: AuthBoundarySnapshot
+    ) => {
+      if (
+        !isAuthBoundaryCurrent(expected) ||
+        !isPersistedAuthBoundaryCurrent(expected)
+      ) {
+        return;
+      }
       const authToken = useAuthStore.getState().token;
       // 有服务端锚点时即使前端时长为 0 也要让服务端按墙钟结算；无锚点才依赖 durationMs
       if (!authToken || (durationMs <= 0 && !anchorId)) return;
@@ -98,7 +132,11 @@ export function useInterpret() {
         if (res.ok) {
           const data = (await res.json()) as { quotas?: Record<string, unknown> };
           if (data.quotas) {
-            useAuthStore.getState().setQuotas(data.quotas as never);
+            await runAuthBoundaryCommit(expected, () => {
+              useAuthStore
+                .getState()
+                .setQuotas(data.quotas as never, { expected });
+            });
           }
         }
       } catch (e) {
@@ -132,11 +170,19 @@ export function useInterpret() {
   // 关联本场锚点）。失败置 error（与断线同表现，用户可停止结算或重开）。
   const rotateConnection = useCallback(() => {
     void (async () => {
+      const owner = activeOwnerRef.current;
       const current = recordingRef.current;
       const callbacks = callbacksRef.current;
       const sonioxConfig = sonioxConfigRef.current;
       const authToken = useAuthStore.getState().token;
-      if (!current || !callbacks || !sonioxConfig || !authToken) {
+      if (
+        !owner ||
+        !ownerIsCurrent(owner) ||
+        !current ||
+        !callbacks ||
+        !sonioxConfig ||
+        !authToken
+      ) {
         return;
       }
       recordingRef.current = null;
@@ -146,7 +192,11 @@ export function useInterpret() {
         console.error('Interpret rotation: error stopping old connection:', e);
       }
       // stop 之后用户可能已同时点了停止（isStoppingRef/句柄已清）——不再重建
-      if (isStoppingRef.current || !startTimeRef.current) {
+      if (
+        !ownerIsCurrent(owner) ||
+        isStoppingRef.current ||
+        !startTimeRef.current
+      ) {
         return;
       }
       try {
@@ -156,8 +206,13 @@ export function useInterpret() {
           deviceId: deviceIdRef.current,
           regionPreference: settings.sonioxRegionPreference,
           attribution: { kind: 'interpret', anchorId: anchorIdRef.current },
+          signal: owner.signal,
         });
-        if (isStoppingRef.current || !startTimeRef.current) {
+        if (
+          !ownerIsCurrent(owner) ||
+          isStoppingRef.current ||
+          !startTimeRef.current
+        ) {
           // 轮换建连期间被停止：立刻拆掉刚建的连接，不留孤儿流
           try {
             await (result as { recording: RecordingHandle }).recording.stop?.();
@@ -168,10 +223,10 @@ export function useInterpret() {
         scheduleRotation(result.temporaryKey?.max_session_duration_seconds);
       } catch (error) {
         console.error('Interpret rotation failed:', error);
-        setConnectionState('error');
+        if (ownerIsCurrent(owner)) setConnectionState('error');
       }
     })();
-  }, [scheduleRotation]);
+  }, [ownerIsCurrent, scheduleRotation]);
 
   useEffect(() => {
     rotateConnectionRef.current = rotateConnection;
@@ -181,8 +236,15 @@ export function useInterpret() {
     async (langA: string, langB: string, deviceId?: string) => {
       if (!token) return;
       // U27：同步重入保护，快速双击不会派生两条 Soniox WS / 两路麦克风
-      if (isStartingRef.current || recordingRef.current) return;
+      if (isStartingRef.current || isStoppingRef.current || recordingRef.current) return;
       isStartingRef.current = true;
+      const owner: InterpretOwner = {
+        generation: lifecycleGenerationRef.current + 1,
+        boundary: getAuthBoundarySnapshot(),
+        signal: getAuthBoundaryAbortSignal(),
+      };
+      lifecycleGenerationRef.current = owner.generation;
+      activeOwnerRef.current = owner;
 
       langARef.current = langA;
       langBRef.current = langB;
@@ -212,6 +274,7 @@ export function useInterpret() {
       // 创建 TokenProcessor
       const processor = new TokenProcessor({
         onSegmentFinalized: (segment: TranscriptSegment) => {
+          if (!ownerIsCurrent(owner)) return;
           const line: InterpretLine = {
             id: segment.id,
             language: segment.language,
@@ -233,9 +296,11 @@ export function useInterpret() {
           previewLangRef.current = null;
         },
         onPreviewUpdate: (preview) => {
+          if (!ownerIsCurrent(owner)) return;
           setPreviewText(preview);
         },
         onTranslationToken: (text: string, segmentId: string, meta) => {
+          if (!ownerIsCurrent(owner)) return;
           const sourceLanguage = meta?.sourceLanguage ?? previewLangRef.current;
           const isLangA = sourceLanguage === langARef.current;
           const translatedLineId = `${segmentId}-tr`;
@@ -269,6 +334,7 @@ export function useInterpret() {
           }
         },
         onPreviewTranslationUpdate: (preview) => {
+          if (!ownerIsCurrent(owner)) return;
           setPreviewTranslation(preview);
         },
       });
@@ -281,6 +347,7 @@ export function useInterpret() {
       // 建立服务端时长锚点（反作弊：deduct 以服务端墙钟为计费权威）。
       // 失败不阻塞 interpret 启动，deduct 会降级信任前端时长。
       anchorIdRef.current = null;
+      let anchorId: string | null = null;
       try {
         const anchorRes = await fetch('/api/interpret/start', {
           method: 'POST',
@@ -292,11 +359,19 @@ export function useInterpret() {
         });
         if (anchorRes.ok) {
           const anchorData = (await anchorRes.json()) as { anchorId?: string | null };
-          anchorIdRef.current = anchorData.anchorId ?? null;
+          anchorId = anchorData.anchorId ?? null;
         }
       } catch {
         // 锚点是计费增强项，建立失败时静默降级
       }
+
+      if (!ownerIsCurrent(owner)) {
+        if (processorRef.current === processor) processorRef.current = null;
+        if (activeOwnerRef.current === owner) activeOwnerRef.current = null;
+        isStartingRef.current = false;
+        return;
+      }
+      anchorIdRef.current = anchorId;
 
       // 计时器
       startTimeRef.current = Date.now();
@@ -316,6 +391,7 @@ export function useInterpret() {
       // 段落不断，锚点/计时器不动，仍是同一场同传。
       const callbacks: Parameters<typeof startSonioxRecording>[2] = {
         onPartialResult: (tokens) => {
+          if (!ownerIsCurrent(owner)) return;
           const rtTokens = tokens as RealtimeToken[];
           // 原文 preview 侧仍基于当前转录 token 的 language 判断
           for (const t of rtTokens) {
@@ -324,16 +400,19 @@ export function useInterpret() {
               previewLangRef.current = t.language;
             }
           }
-          processorRef.current?.processTokens(rtTokens);
+          processor.processTokens(rtTokens);
         },
         onEndpoint: () => {
-          processorRef.current?.onEndpoint();
+          if (!ownerIsCurrent(owner)) return;
+          processor.onEndpoint();
         },
         onError: (error) => {
+          if (!ownerIsCurrent(owner)) return;
           console.error('Interpret Soniox error:', error);
           setConnectionState('error');
         },
         onConnectionChange: (state) => {
+          if (!ownerIsCurrent(owner)) return;
           setConnectionState(state);
         },
       };
@@ -353,26 +432,40 @@ export function useInterpret() {
             deviceId: deviceId || undefined,
             regionPreference: settings.sonioxRegionPreference,
             attribution: { kind: 'interpret', anchorId: anchorIdRef.current },
+            signal: owner.signal,
           }
         );
 
+        if (!ownerIsCurrent(owner) || isStoppingRef.current) {
+          try {
+            await (result as { recording: RecordingHandle }).recording.stop?.();
+          } catch { /* stale capability teardown is best effort */ }
+          return;
+        }
         recordingRef.current = result as { recording: RecordingHandle; client: unknown };
         scheduleRotation(result.temporaryKey?.max_session_duration_seconds);
       } catch (error) {
-        console.error('Failed to start interpret:', error);
-        setIsRunning(false);
-        setConnectionState('error');
-        if (timerRef.current) {
-          clearInterval(timerRef.current);
-          timerRef.current = null;
+        if (ownerIsCurrent(owner)) {
+          console.error('Failed to start interpret:', error);
+          setIsRunning(false);
+          setConnectionState('error');
+          if (timerRef.current) {
+            clearInterval(timerRef.current);
+            timerRef.current = null;
+          }
+          // 启动失败：清空计时基准，避免残留的 startTimeRef 让后续 stop 误计费
+          startTimeRef.current = null;
         }
-        // 启动失败：清空计时基准，避免残留的 startTimeRef 让后续 stop 误计费
-        startTimeRef.current = null;
       } finally {
-        isStartingRef.current = false;
+        if (
+          activeOwnerRef.current === owner ||
+          activeOwnerRef.current === null
+        ) {
+          isStartingRef.current = false;
+        }
       }
     },
-    [token, scheduleRotation]
+    [token, ownerIsCurrent, scheduleRotation]
   );
 
   const stop = useCallback(async () => {
@@ -381,6 +474,10 @@ export function useInterpret() {
     // 保证 deductQuota 对同一场同传至多以同一口径调用一次。
     if (isStoppingRef.current) return;
     isStoppingRef.current = true;
+    const owner = activeOwnerRef.current;
+    const expected = owner?.boundary ?? getAuthBoundarySnapshot();
+    lifecycleGenerationRef.current += 1;
+    activeOwnerRef.current = null;
 
     if (timerRef.current) {
       clearInterval(timerRef.current);
@@ -410,18 +507,23 @@ export function useInterpret() {
     processorRef.current?.onEndpoint();
     processorRef.current = null;
 
-    setIsRunning(false);
-    setConnectionState('disconnected');
-    setPreviewText(EMPTY_STREAMING_PREVIEW_TEXT);
-    setPreviewTranslation(EMPTY_STREAMING_PREVIEW_TRANSLATION);
-    setPreviewLang(null);
-    previewLangRef.current = null;
+    const boundaryStillCurrent =
+      isAuthBoundaryCurrent(expected) &&
+      isPersistedAuthBoundaryCurrent(expected);
+    if (boundaryStillCurrent) {
+      setIsRunning(false);
+      setConnectionState('disconnected');
+      setPreviewText(EMPTY_STREAMING_PREVIEW_TEXT);
+      setPreviewTranslation(EMPTY_STREAMING_PREVIEW_TRANSLATION);
+      setPreviewLang(null);
+      previewLangRef.current = null;
+    }
 
     // 扣除配额：带上服务端锚点 id，由服务端以墙钟为权威结算
     const anchorId = anchorIdRef.current;
     anchorIdRef.current = null;
-    if (duration > 0 || anchorId) {
-      void deductQuota(duration, anchorId);
+    if (boundaryStillCurrent && (duration > 0 || anchorId)) {
+      void deductQuota(duration, anchorId, expected);
     }
 
     // 释放重入锁，允许下一场同传重新开始/停止
@@ -431,13 +533,50 @@ export function useInterpret() {
   // C7：组件卸载（如 SPA 导航离开 /interpret）时拆掉进行中的录音并触发扣费，
   // 否则孤儿 Soniox WS + 麦克风会一直运行且整场同传不计费。
   // 用 ref 持有最新 stop，effect 依赖为空只在卸载时执行一次。
-  const stopRef = useRef(stop);
-  stopRef.current = stop;
   useEffect(() => {
-    return () => {
-      if (recordingRef.current) {
-        void stopRef.current();
+    const invalidateAndTeardown = (updateState: boolean) => {
+      lifecycleGenerationRef.current += 1;
+      activeOwnerRef.current = null;
+      isStartingRef.current = false;
+      isStoppingRef.current = false;
+      callbacksRef.current = null;
+      sonioxConfigRef.current = null;
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
       }
+      if (rotationTimerRef.current) {
+        clearTimeout(rotationTimerRef.current);
+        rotationTimerRef.current = null;
+      }
+      const current = recordingRef.current;
+      recordingRef.current = null;
+      processorRef.current = null;
+      startTimeRef.current = null;
+      anchorIdRef.current = null;
+      try {
+        void Promise.resolve(current?.recording.stop?.()).catch(() => undefined);
+      } catch { /* teardown must remain synchronous at the boundary */ }
+      if (updateState) {
+        setIsRunning(false);
+        setConnectionState('disconnected');
+        setPreviewText(EMPTY_STREAMING_PREVIEW_TEXT);
+        setPreviewTranslation(EMPTY_STREAMING_PREVIEW_TRANSLATION);
+        setPreviewLang(null);
+        previewLangRef.current = null;
+      }
+    };
+    const clearForBoundary = () => invalidateAndTeardown(true);
+    window.addEventListener(
+      'lecture-live:account-boundary-clear',
+      clearForBoundary
+    );
+    return () => {
+      window.removeEventListener(
+        'lecture-live:account-boundary-clear',
+        clearForBoundary
+      );
+      invalidateAndTeardown(false);
     };
   }, []);
 

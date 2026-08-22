@@ -2,8 +2,11 @@ import { NextResponse } from 'next/server';
 import { Prisma } from '@prisma/client';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
-import { logAction } from '@/lib/auditLog';
 import { settlePoolOnLimitChange } from '@/lib/quota';
+import {
+  getSecurityAuditRequestId,
+  writeSecurityAudit,
+} from '@/lib/securityAudit';
 import {
   resolveRoleQuotas,
   coerceThinkingDepthCap,
@@ -69,6 +72,28 @@ interface CustomGroupEntry {
   description: string;
   color: string;
   permissions: GroupPermissions;
+}
+
+function auditOperator(admin: {
+  id: string;
+  email?: string | null;
+  role?: string | null;
+}) {
+  return {
+    id: admin.id,
+    email: admin.email ?? null,
+    role: admin.role ?? null,
+  };
+}
+
+function customGroupForAudit(group: CustomGroupEntry) {
+  return {
+    id: group.id,
+    name: group.name,
+    description: group.description,
+    color: group.color,
+    permissions: group.permissions,
+  };
 }
 
 // 默认组权限配置（能力开关默认「全部允许」；FREE 思考深度沿用历史封顶 medium）
@@ -301,11 +326,12 @@ const RESERVED_GROUP_NAMES = ['free', 'pro', 'admin'];
  * 获取所有用户组（含真实用户数量和持久化配置）
  */
 export async function GET(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user: admin, response } = await requireAdminAccess(req, {
     scope: 'admin:groups:list',
     limit: 60,
   });
   if (response) return response;
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
 
   try {
     // 并行查询
@@ -373,7 +399,23 @@ export async function GET(req: Request) {
       isSystem: false,
     }));
 
-    return NextResponse.json({ groups: [...systemGroups, ...customGroupsOut] });
+    const groups = [...systemGroups, ...customGroupsOut];
+    await writeSecurityAudit(req, {
+      event: 'groups.read',
+      operator: auditOperator(admin),
+      target: { type: 'user_group_collection' },
+      before: null,
+      after: {
+        resultCount: groups.length,
+        systemGroupCount: systemGroups.length,
+        customGroupCount: customGroupsOut.length,
+      },
+      reason: 'admin_list',
+      outcome: 'SUCCESS',
+      requestId: getSecurityAuditRequestId(req),
+    });
+
+    return NextResponse.json({ groups });
   } catch (err) {
     console.error('获取用户组失败:', err);
     return NextResponse.json({ error: '查询失败' }, { status: 500 });
@@ -391,6 +433,7 @@ export async function POST(req: Request) {
     windowMs: 60_000,
   });
   if (response) return response;
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
 
   try {
     const body = await req.json();
@@ -439,6 +482,7 @@ export async function POST(req: Request) {
     };
 
     // Bug 4: 事务内读写，避免竞态
+    const requestId = getSecurityAuditRequestId(req);
     await prisma.$transaction(async (tx) => {
       const existing = await loadCustomGroups(tx);
 
@@ -449,11 +493,21 @@ export async function POST(req: Request) {
 
       existing.push(newGroup);
       await saveCustomGroups(existing, tx);
-    });
 
-    logAction(req, 'admin.group.create', {
-      user: admin,
-      detail: `创建自定义用户组: ${name} (${id})`,
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'groups.create',
+          operator: auditOperator(admin),
+          target: { type: 'user_group', id },
+          before: null,
+          after: customGroupForAudit(newGroup),
+          reason: 'admin_create',
+          outcome: 'SUCCESS',
+          requestId,
+        },
+        tx
+      );
     });
 
     return NextResponse.json({ success: true, group: { ...newGroup, userCount: 0, isSystem: false } }, { status: 201 });
@@ -477,6 +531,7 @@ export async function PUT(req: Request) {
     windowMs: 60_000,
   });
   if (response) return response;
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
 
   try {
     const body = await req.json();
@@ -508,6 +563,7 @@ export async function PUT(req: Request) {
     };
 
     const isSystemRole = (SYSTEM_ROLES as readonly string[]).includes(groupId);
+    const requestId = getSecurityAuditRequestId(req);
 
     if (isSystemRole) {
       // 系统角色：存储到 SiteSetting + 同步该角色下所有非自定义组用户的配额。
@@ -515,6 +571,20 @@ export async function PUT(req: Request) {
       // 「管理后台显示的配额」与「用户表实际配额」不一致（与下方自定义组分支对称）。
       const settingKey = `group_config_${groupId}`;
       await prisma.$transaction(async (tx) => {
+        const current = await tx.siteSetting.findUnique({
+          where: { key: settingKey },
+        });
+        let currentPermissions = DEFAULT_GROUP_PERMISSIONS[groupId];
+        if (current) {
+          try {
+            currentPermissions = normalizePermissions(
+              JSON.parse(current.value) as Partial<GroupPermissions>,
+              DEFAULT_GROUP_PERMISSIONS[groupId]
+            );
+          } catch {
+            // Invalid legacy JSON was already treated as the role default by GET.
+          }
+        }
         await tx.siteSetting.upsert({
           where: { key: settingKey },
           update: { value: JSON.stringify(sanitized) },
@@ -526,7 +596,7 @@ export async function PUT(req: Request) {
           { role: groupId as 'ADMIN' | 'PRO' | 'FREE', customGroupId: null },
           sanitized.transcriptionMinutesLimit
         );
-        await tx.user.updateMany({
+        const updatedUsers = await tx.user.updateMany({
           where: { role: groupId as 'ADMIN' | 'PRO' | 'FREE', customGroupId: null },
           data: {
             allowedModels: sanitized.allowedModels,
@@ -534,6 +604,25 @@ export async function PUT(req: Request) {
             storageHoursLimit: sanitized.storageHoursLimit,
           },
         });
+
+        await writeSecurityAudit(
+          req,
+          {
+            event: 'groups.update',
+            operator: auditOperator(admin),
+            target: { type: 'user_group', id: groupId },
+            before: { permissions: currentPermissions },
+            after: { permissions: sanitized },
+            reason: 'admin_update',
+            outcome: 'SUCCESS',
+            metadata: {
+              systemGroup: true,
+              affectedUsers: updatedUsers.count,
+            },
+            requestId,
+          },
+          tx
+        );
       });
     } else {
       // Bug 3: 更新名称时校验空名/保留名（与 POST 对称；否则传 name:"" 会把组名覆盖成空串）
@@ -553,6 +642,7 @@ export async function PUT(req: Request) {
         if (idx === -1) {
           throw new Error('GROUP_NOT_FOUND');
         }
+        const before = customGroupForAudit(groups[idx]);
 
         // Bug 3: 校验组名不与其他自定义组重名
         if (name !== undefined && name.trim()) {
@@ -575,7 +665,7 @@ export async function PUT(req: Request) {
           sanitized.transcriptionMinutesLimit
         );
         // 同步该自定义组内所有用户的配额（在事务内）
-        await tx.user.updateMany({
+        const updatedUsers = await tx.user.updateMany({
           where: { customGroupId: groupId },
           data: {
             allowedModels: sanitized.allowedModels,
@@ -583,13 +673,27 @@ export async function PUT(req: Request) {
             storageHoursLimit: sanitized.storageHoursLimit,
           },
         });
+
+        await writeSecurityAudit(
+          req,
+          {
+            event: 'groups.update',
+            operator: auditOperator(admin),
+            target: { type: 'user_group', id: groupId },
+            before,
+            after: customGroupForAudit(groups[idx]),
+            reason: 'admin_update',
+            outcome: 'SUCCESS',
+            metadata: {
+              systemGroup: false,
+              affectedUsers: updatedUsers.count,
+            },
+            requestId,
+          },
+          tx
+        );
       });
     }
-
-    logAction(req, 'admin.group.update', {
-      user: admin,
-      detail: `更新用户组配置: ${groupId}`,
-    });
 
     return NextResponse.json({ success: true, groupId, permissions: sanitized });
   } catch (err) {
@@ -615,6 +719,7 @@ export async function DELETE(req: Request) {
     windowMs: 60_000,
   });
   if (response) return response;
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
 
   try {
     const { searchParams } = new URL(req.url);
@@ -630,6 +735,7 @@ export async function DELETE(req: Request) {
     }
 
     // Bug 4 & 7: 事务内完成组删除和用户配额恢复
+    const requestId = getSecurityAuditRequestId(req);
     const result = await prisma.$transaction(async (tx) => {
       const groups = await loadCustomGroups(tx);
       const idx = groups.findIndex((g) => g.id === groupId);
@@ -673,12 +779,23 @@ export async function DELETE(req: Request) {
         }
       }
 
-      return { removedGroup, affectedCount: affectedUsers.length };
-    });
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'groups.delete',
+          operator: auditOperator(admin),
+          target: { type: 'user_group', id: groupId },
+          before: customGroupForAudit(removedGroup),
+          after: null,
+          reason: 'admin_delete',
+          outcome: 'SUCCESS',
+          metadata: { affectedUsers: affectedUsers.length },
+          requestId,
+        },
+        tx
+      );
 
-    logAction(req, 'admin.group.delete', {
-      user: admin,
-      detail: `删除自定义用户组: ${result.removedGroup.name} (${groupId}), 影响 ${result.affectedCount} 个用户`,
+      return { removedGroup, affectedCount: affectedUsers.length };
     });
 
     return NextResponse.json({ success: true, affectedUsers: result.affectedCount });

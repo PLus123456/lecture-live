@@ -41,6 +41,13 @@ vi.mock('@/lib/siteSettings', async () => {
 
 vi.mock('@/lib/crypto', () => ({ encrypt: (v: string) => `enc:${v}` }));
 vi.mock('@/lib/auditLog', () => ({ logAction: vi.fn() }));
+vi.mock('@/lib/securityAudit', () => ({
+  getSecurityAuditRequestId: () => 'request-1',
+  writeSecurityAudit: vi.fn().mockResolvedValue({
+    requestId: 'request-1',
+    action: 'admin.security.settings.update',
+  }),
+}));
 vi.mock('@/lib/soniox/env', () => ({ invalidateSonioxDbConfigCache: vi.fn() }));
 vi.mock('@/lib/clientIp', () => ({ invalidateTrustedProxyCache: vi.fn() }));
 vi.mock('@/lib/email/mailer', () => ({ invalidateMailer: vi.fn() }));
@@ -97,7 +104,18 @@ describe('PUT /api/admin/settings — 域名列表校验（#10）', () => {
       response: null,
     });
     siteSettingUpsertMock.mockImplementation((args) => args);
-    transactionMock.mockResolvedValue([]);
+    transactionMock.mockImplementation(
+      async (
+        operation: (tx: {
+          siteSetting: { upsert: typeof siteSettingUpsertMock };
+          user: { updateMany: typeof userUpdateManyMock };
+        }) => Promise<unknown>
+      ) =>
+        operation({
+          siteSetting: { upsert: siteSettingUpsertMock },
+          user: { updateMany: userUpdateManyMock },
+        })
+    );
     userUpdateManyMock.mockResolvedValue({ count: 0 });
     getSiteSettingsMock.mockResolvedValue({ ...SETTINGS_FIXTURE });
   });

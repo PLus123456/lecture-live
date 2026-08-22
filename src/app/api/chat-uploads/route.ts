@@ -8,19 +8,44 @@
 // 归属校验：用 Conversation.userId（创建时由服务端写入）。userId 命中当前用户才放行；
 // userId 为 NULL 的历史无主孤儿一律拒绝（此前的 orphan"宽进"已收紧）。
 
+import crypto from 'crypto';
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
-import { reserveStorageBytes, releaseStorageBytes } from '@/lib/quota';
 import { prisma } from '@/lib/prisma';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { CloudreveStorage } from '@/lib/storage/cloudreve';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { sanitizeHeaderFilename } from '@/lib/security';
 import {
+  DocumentParserError,
+} from '@/lib/documentParserProcess';
+import {
   extractTextFromBuffer,
   isExtractableMime,
 } from '@/lib/llm/fileExtractor';
+import {
+  assessChatAttachmentForLlm,
+  prepareExtractedTextForLlm,
+} from '@/lib/llm/chatAttachmentPolicy';
 import { logger, serializeError } from '@/lib/logger';
+import {
+  STORED_ARTIFACT_TYPE,
+  STORED_ARTIFACT_STATE,
+  StoredArtifactQuotaExceededError,
+  getStoredArtifactById,
+  markStoredArtifactOrphan,
+  recordReservedStoredArtifactLocation,
+  reserveStoredArtifact,
+  rollbackStoredArtifact,
+  settleStoredArtifactInTransaction,
+} from '@/lib/storage/storedArtifactLedger';
+import {
+  deleteCloudreveAttachmentFiles,
+} from '@/lib/storage/cloudreveFileDelete';
+import {
+  BoundedBodyError,
+  readBodyBytesBounded,
+} from '@/lib/boundedBody';
 
 const routeLogger = logger.child({ component: 'chat-uploads-api' });
 
@@ -125,22 +150,36 @@ export async function POST(req: Request) {
     return rateLimited;
   }
 
-  // Content-Length 预检：读 body 前按声明长度挡掉超过硬上限的请求，避免把超大 body
-  // 整个缓冲进内存（OOM 面）。这里用绝对硬上限兜底（精确的 chat_files_max_upload_mb
-  // 校验在下方按配置进行）；multipart 开销给 1MB 余量避免误杀。
-  const declaredLength = Number(req.headers.get('content-length') ?? '');
-  if (Number.isFinite(declaredLength) && declaredLength > ABSOLUTE_MAX_BYTES + 1024 * 1024) {
-    return NextResponse.json(
-      { error: `File too large (max ${Math.floor(ABSOLUTE_MAX_BYTES / (1024 * 1024))} MB)` },
-      { status: 413 }
-    );
-  }
+  // 在 formData() 物化 multipart 前就按管理员配置的真实流字节关闭失败。
+  // Content-Length 只是早拒绝；chunked/缺失/伪小头都会在越界时 cancel。
+  const siteSettings = await getSiteSettings();
+  const maxBytes = Math.min(
+    Math.max(1, siteSettings.chat_files_max_upload_mb) * 1024 * 1024,
+    ABSOLUTE_MAX_BYTES
+  );
+  const maxMultipartBytes = maxBytes + 1024 * 1024;
 
   // 解析 form data
   let formData: FormData;
+  let publicationAttempted = false;
   try {
-    formData = await req.formData();
-  } catch {
+    const body = await readBodyBytesBounded(req, maxMultipartBytes);
+    const boundedBody = new Uint8Array(body.byteLength);
+    boundedBody.set(body);
+    const headers = new Headers(req.headers);
+    headers.set('content-length', String(boundedBody.byteLength));
+    formData = await new Request(req.url, {
+      method: req.method,
+      headers,
+      body: boundedBody.buffer,
+    }).formData();
+  } catch (error) {
+    if (error instanceof BoundedBodyError && error.code === 'too_large') {
+      return NextResponse.json(
+        { error: `File too large (max ${Math.floor(maxBytes / (1024 * 1024))} MB)` },
+        { status: 413 }
+      );
+    }
     return NextResponse.json({ error: 'Invalid multipart body' }, { status: 400 });
   }
 
@@ -176,27 +215,12 @@ export async function POST(req: Request) {
   }
 
   // 单次上传大小限制（管理员配置，硬封顶 500MB）
-  const siteSettings = await getSiteSettings();
-  const maxBytes = Math.min(
-    Math.max(1, siteSettings.chat_files_max_upload_mb) * 1024 * 1024,
-    ABSOLUTE_MAX_BYTES
-  );
   if (file.size > maxBytes) {
     return NextResponse.json(
       {
         error: `File too large (max ${Math.floor(maxBytes / (1024 * 1024))} MB)`,
       },
       { status: 413 }
-    );
-  }
-
-  // 配额：原子预留 file.size 字节（条件扣减，杜绝并发击穿）。预留成功后若后续任一
-  // 步骤失败，必须 releaseStorageBytes 回滚，避免配额泄漏。
-  const reserved = await reserveStorageBytes(user.id, file.size);
-  if (!reserved) {
-    return NextResponse.json(
-      { error: 'Storage quota exceeded' },
-      { status: 403 }
     );
   }
 
@@ -210,9 +234,6 @@ export async function POST(req: Request) {
     .trim();
   const kind = classifyKind(mt);
   if (!kind) {
-    // 回滚预留的字节配额（MIME 不受支持，文件不会入库/入云，额度不应被占用）。
-    // 与下方 Cloudreve-fail / DB-insert-fail 两个退出口一致，杜绝配额泄漏。
-    await releaseStorageBytes(user.id, file.size).catch(() => undefined);
     return NextResponse.json(
       { error: `Unsupported MIME type: ${mt}` },
       { status: 415 }
@@ -237,60 +258,33 @@ export async function POST(req: Request) {
 
   // 读 buffer（后续上传 + 可选抽文本都要用同一份）
   const buffer = Buffer.from(await file.arrayBuffer());
+  const attachmentId = crypto.randomUUID();
 
-  // 上传 Cloudreve
-  let cloudrevePath: string;
-  try {
-    const storage = await CloudreveStorage.create();
-    cloudrevePath = await storage.upload(
-      user.id,
-      'chat-uploads',
-      composedFileName,
-      buffer
-    );
-  } catch (err) {
-    routeLogger.error(
-      { conversationId, userId: user.id, err: serializeError(err) },
-      'chat-uploads: Cloudreve upload failed'
-    );
-    // 回滚预留的字节配额（文件没传成功，不应占额度）
-    await releaseStorageBytes(user.id, file.size).catch(() => undefined);
-    return NextResponse.json(
-      { error: 'Upload failed' },
-      { status: 500 }
-    );
-  }
-
-  // 文档 / 文本类：尝试抽文本并把 .txt 也写回 Cloudreve（best-effort）
+  // 文档 / 文本类：先在内存中抽取，这样能在任何物理写入前对 raw +
+  // extracted 两份实际字节各自预留。抽取失败仍保留原文件的旧兼容语义。
   let extractedTextPath: string | null = null;
   let extractedTextPreview: string | null = null;
+  let extractedBuffer: Buffer | null = null;
   if (kind === 'document' || kind === 'text') {
     try {
-      const extracted = await extractTextFromBuffer(buffer, mt);
-      // 取前 500 字符给前端 preview；完整文本另写入 .txt（仅 document 必需，text 也写一份以便统一读取）
+      const extracted = await extractTextFromBuffer(buffer, mt, {
+        signal: req.signal,
+      });
       extractedTextPreview = extracted.text.slice(0, 500);
-
-      try {
-        const storage = await CloudreveStorage.create();
-        const extractedFileName = `${composedFileName}.extracted.txt`;
-        extractedTextPath = await storage.upload(
-          user.id,
-          'chat-uploads',
-          extractedFileName,
-          Buffer.from(extracted.text, 'utf8')
-        );
-      } catch (uploadErr) {
-        routeLogger.warn(
-          {
-            conversationId,
-            userId: user.id,
-            err: serializeError(uploadErr),
-          },
-          'chat-uploads: extracted text upload failed; attachment 仍会创建但 extractedTextPath = null'
-        );
-        extractedTextPath = null;
-      }
+      extractedBuffer = Buffer.from(
+        prepareExtractedTextForLlm(extracted.text),
+        'utf8'
+      );
     } catch (err) {
+      if (
+        req.signal.aborted ||
+        (err instanceof DocumentParserError && err.code === 'cancelled')
+      ) {
+        return NextResponse.json(
+          { error: 'Upload cancelled' },
+          { status: 499 }
+        );
+      }
       // 抽文本失败（损坏的 PDF 等）—— 不阻塞上传，仍记录 attachment 行，让用户至少能看到文件
       routeLogger.warn(
         {
@@ -304,39 +298,266 @@ export async function POST(req: Request) {
     }
   }
 
-  // 写 ChatAttachment 行（fileName 存原始 safeFileName，cloudrevePath 存 Cloudreve 返回的实际路径）
-  let attachmentId: string;
+  let rawReservation: Awaited<ReturnType<typeof reserveStoredArtifact>>;
   try {
-    const created = await prisma.chatAttachment.create({
-      data: {
-        conversationId,
-        userId: user.id,
-        kind,
-        fileName: safeFileName,
-        mimeType: mt,
-        bytes: BigInt(file.size),
-        cloudrevePath,
-        extractedTextPath,
-      },
-      select: { id: true },
+    rawReservation = await reserveStoredArtifact({
+      userId: user.id,
+      ownerType: 'chat_attachment',
+      ownerId: attachmentId,
+      conversationId,
+      artifactType: STORED_ARTIFACT_TYPE.CHAT_RAW,
+      expectedBytes: buffer.byteLength,
+      reservationKey: `chat-upload:${attachmentId}:raw`,
     });
-    attachmentId = created.id;
+  } catch (error) {
+    if (error instanceof StoredArtifactQuotaExceededError) {
+      return NextResponse.json({ error: 'Storage quota exceeded' }, { status: 403 });
+    }
+    throw error;
+  }
+
+  let extractedReservation: Awaited<ReturnType<typeof reserveStoredArtifact>> | null =
+    null;
+  if (extractedBuffer && extractedBuffer.byteLength > 0) {
+    try {
+      extractedReservation = await reserveStoredArtifact({
+        userId: user.id,
+        ownerType: 'chat_attachment',
+        ownerId: attachmentId,
+        conversationId,
+        artifactType: STORED_ARTIFACT_TYPE.CHAT_EXTRACTED,
+        expectedBytes: extractedBuffer.byteLength,
+        reservationKey: `chat-upload:${attachmentId}:extracted`,
+      });
+    } catch (error) {
+      if (!(error instanceof StoredArtifactQuotaExceededError)) {
+        await rollbackStoredArtifact(rawReservation.id).catch(() => undefined);
+        throw error;
+      }
+      // 抽取副本原本就是 best-effort：额度不足时只不发布该副本，
+      // 不能未预留便写盘，也不必拒绝已合法的原文件。
+      extractedBuffer = null;
+      extractedTextPreview = null;
+    }
+  }
+
+  let cloudrevePath: string | null = null;
+  try {
+    const storage = await CloudreveStorage.create();
+    cloudrevePath = await storage.upload(
+      user.id,
+      'chat-uploads',
+      composedFileName,
+      buffer
+    );
+    await recordReservedStoredArtifactLocation(rawReservation.id, {
+      actualBytes: buffer.byteLength,
+      storage: 'cloudreve',
+      reference: cloudrevePath,
+    });
+
+    if (extractedReservation && extractedBuffer) {
+      try {
+        const extractedFileName = `${composedFileName}.extracted.txt`;
+        extractedTextPath = await storage.upload(
+          user.id,
+          'chat-uploads',
+          extractedFileName,
+          extractedBuffer
+        );
+        await recordReservedStoredArtifactLocation(extractedReservation.id, {
+          actualBytes: extractedBuffer.byteLength,
+          storage: 'cloudreve',
+          reference: extractedTextPath,
+        });
+      } catch (uploadErr) {
+        routeLogger.warn(
+          {
+            conversationId,
+            userId: user.id,
+            err: serializeError(uploadErr),
+          },
+          'chat-uploads: extracted text upload failed; attachment 仍会创建但 extractedTextPath = null'
+        );
+        let deleted = true;
+        if (extractedTextPath) {
+          deleted = await deleteCloudreveAttachmentFiles([
+            { cloudrevePath: extractedTextPath, extractedTextPath: null },
+          ]);
+        }
+        if (deleted) {
+          await rollbackStoredArtifact(extractedReservation.id).catch(
+            () => undefined
+          );
+        } else {
+          await markStoredArtifactOrphan(extractedReservation.id).catch(
+            () => undefined
+          );
+        }
+        extractedReservation = null;
+        extractedTextPath = null;
+      }
+    }
+
+    // Owner row and both ledger identities publish in one DB transaction. A
+    // crash cannot expose a visible UPLOAD row whose RESERVED files are later
+    // reclaimed by the TTL worker.
+    if (!cloudrevePath) throw new Error('raw attachment upload returned no path');
+    const publishedRawPath = cloudrevePath;
+    const publishedExtractedPath = extractedTextPath;
+    publicationAttempted = true;
+    await prisma.$transaction(async (tx) => {
+      await tx.chatAttachment.create({
+        data: {
+          id: attachmentId,
+          conversationId,
+          userId: user.id,
+          kind,
+          fileName: safeFileName,
+          mimeType: mt,
+          bytes: BigInt(file.size),
+          cloudrevePath: publishedRawPath,
+          extractedTextPath: publishedExtractedPath,
+        },
+      });
+      // 当前工作树共享的 generated client 可能尚未包含新列；用参数化 SQL
+      // 将附件与账本行关联，避免为此绕过类型或改共享 node_modules。
+      await tx.$executeRaw`
+        UPDATE ChatAttachment
+        SET storedArtifactId = ${rawReservation.id}, source = 'UPLOAD'
+        WHERE id = ${attachmentId}
+      `;
+      await settleStoredArtifactInTransaction(tx, rawReservation.id, {
+        actualBytes: buffer.byteLength,
+        storage: 'cloudreve',
+        reference: publishedRawPath,
+      });
+      if (extractedReservation && publishedExtractedPath && extractedBuffer) {
+        await settleStoredArtifactInTransaction(tx, extractedReservation.id, {
+          actualBytes: extractedBuffer.byteLength,
+          storage: 'cloudreve',
+          reference: publishedExtractedPath,
+        });
+      }
+    });
   } catch (err) {
     routeLogger.error(
       { conversationId, userId: user.id, err: serializeError(err) },
-      'chat-uploads: DB insert failed'
+      'chat-uploads: publish failed'
     );
-    // 回滚预留的字节配额（行没建成，额度不应被占用）。
-    // 注意：此时 Cloudreve 上已有物理文件成为孤儿，留给清理 cron 兜底（与原行为一致）。
-    await releaseStorageBytes(user.id, file.size).catch(() => undefined);
-    return NextResponse.json(
-      { error: 'Failed to record attachment' },
-      { status: 500 }
-    );
+    let committedAfterReadback = false;
+    if (publicationAttempted) {
+      try {
+        const [rows, rawArtifact, extractedArtifact] = await Promise.all([
+          prisma.$queryRaw<
+            Array<{
+              storedArtifactId: string | null;
+              source: string;
+              cloudrevePath: string;
+              extractedTextPath: string | null;
+            }>
+          >`
+            SELECT storedArtifactId, source, cloudrevePath, extractedTextPath
+            FROM ChatAttachment WHERE id = ${attachmentId} LIMIT 1
+          `,
+          getStoredArtifactById(rawReservation.id),
+          extractedReservation
+            ? getStoredArtifactById(extractedReservation.id)
+            : Promise.resolve(null),
+        ]);
+        const owner = rows[0] ?? null;
+        const rawCommitted =
+          owner?.storedArtifactId === rawReservation.id &&
+          owner.source === 'UPLOAD' &&
+          owner.cloudrevePath === cloudrevePath &&
+          rawArtifact?.state === STORED_ARTIFACT_STATE.ACTIVE &&
+          rawArtifact.reference === cloudrevePath;
+        const extractedCommitted = extractedReservation
+          ? owner?.extractedTextPath === extractedTextPath &&
+            extractedArtifact?.state === STORED_ARTIFACT_STATE.ACTIVE &&
+            extractedArtifact.reference === extractedTextPath
+          : true;
+        if (rawCommitted && extractedCommitted) {
+          committedAfterReadback = true;
+          routeLogger.warn(
+            { attachmentId, conversationId },
+            'chat upload transaction returned failure but readback confirmed commit'
+          );
+        } else {
+          const definitelyNotCommitted =
+            owner === null &&
+            rawArtifact?.state === STORED_ARTIFACT_STATE.RESERVED &&
+            (!extractedReservation ||
+              extractedArtifact?.state === STORED_ARTIFACT_STATE.RESERVED);
+          if (!definitelyNotCommitted) {
+            routeLogger.error(
+              { attachmentId, conversationId },
+              'chat upload publication outcome unknown; preserving files and reservations'
+            );
+            return NextResponse.json(
+              { error: 'Upload publication status is being reconciled' },
+              { status: 503, headers: { 'Retry-After': '30' } }
+            );
+          }
+        }
+      } catch (readbackError) {
+        routeLogger.error(
+          {
+            attachmentId,
+            conversationId,
+            err: serializeError(readbackError),
+          },
+          'chat upload publication readback failed; preserving files and reservations'
+        );
+        return NextResponse.json(
+          { error: 'Upload publication status is being reconciled' },
+          { status: 503, headers: { 'Retry-After': '30' } }
+        );
+      }
+    }
+    if (committedAfterReadback) {
+      // Owner and both ledger rows are durably visible; treating the lost ACK
+      // as failure would delete a live attachment.
+    } else {
+      let deleted = true;
+      if (cloudrevePath) {
+        deleted = await deleteCloudreveAttachmentFiles([
+          { cloudrevePath, extractedTextPath },
+        ]);
+      }
+      if (deleted) {
+        await rollbackStoredArtifact(rawReservation.id).catch(() => undefined);
+        if (extractedReservation) {
+          await rollbackStoredArtifact(extractedReservation.id).catch(
+            () => undefined
+          );
+        }
+      } else {
+        await markStoredArtifactOrphan(rawReservation.id).catch(
+          () => undefined
+        );
+        if (extractedReservation) {
+          await markStoredArtifactOrphan(extractedReservation.id).catch(
+            () => undefined
+          );
+        }
+      }
+      return NextResponse.json(
+        {
+          error: cloudrevePath
+            ? 'Failed to record attachment'
+            : 'Upload failed',
+        },
+        { status: 500 }
+      );
+    }
   }
 
-  // 注意：字节配额已在上传前用 reserveStorageBytes 原子预留，这里不再重复扣减。
-  // 抽出的 .txt 算衍生产物，本就不计费。
+  const llmPolicy = assessChatAttachmentForLlm({
+    kind,
+    bytes: file.size,
+    hasExtractedText: Boolean(extractedTextPath),
+  });
 
   return NextResponse.json({
     attachmentId,
@@ -345,6 +566,8 @@ export async function POST(req: Request) {
     bytes: file.size,
     extractedTextPreview,
     fileName: safeFileName,
+    llmUsable: llmPolicy.llmUsable,
+    llmUnavailableReason: llmPolicy.llmUnavailableReason,
   });
 }
 
@@ -372,7 +595,8 @@ export async function GET(req: Request) {
   }
 
   const rows = await prisma.chatAttachment.findMany({
-    where: { conversationId },
+    // INLINE 行是历史消息的内部持久对象，不是可重用附件，必须默认隐藏。
+    where: { conversationId, source: 'UPLOAD' } as never,
     orderBy: { createdAt: 'asc' },
     select: {
       id: true,
@@ -382,6 +606,7 @@ export async function GET(req: Request) {
       bytes: true,
       createdAt: true,
       cloudrevePath: true,
+      extractedTextPath: true,
     },
   });
 
@@ -389,7 +614,7 @@ export async function GET(req: Request) {
   if (rows.length > 0) {
     try {
       await prisma.chatAttachment.updateMany({
-        where: { conversationId },
+        where: { conversationId, source: 'UPLOAD' } as never,
         data: { lastAccessedAt: new Date() },
       });
     } catch (err) {
@@ -401,14 +626,23 @@ export async function GET(req: Request) {
   }
 
   return NextResponse.json({
-    attachments: rows.map((r) => ({
-      id: r.id,
-      fileName: r.fileName,
-      mimeType: r.mimeType,
-      kind: r.kind,
-      bytes: Number(r.bytes),
-      createdAt: r.createdAt.toISOString(),
-      cloudrevePath: r.cloudrevePath,
-    })),
+    attachments: rows.map((r) => {
+      const llmPolicy = assessChatAttachmentForLlm({
+        kind: r.kind,
+        bytes: r.bytes,
+        hasExtractedText: Boolean(r.extractedTextPath),
+      });
+      return {
+        id: r.id,
+        fileName: r.fileName,
+        mimeType: r.mimeType,
+        kind: r.kind,
+        bytes: Number(r.bytes),
+        createdAt: r.createdAt.toISOString(),
+        cloudrevePath: r.cloudrevePath,
+        llmUsable: llmPolicy.llmUsable,
+        llmUnavailableReason: llmPolicy.llmUnavailableReason,
+      };
+    }),
   });
 }

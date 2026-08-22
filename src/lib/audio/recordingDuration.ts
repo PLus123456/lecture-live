@@ -5,7 +5,17 @@ import path from 'node:path';
 
 import type { Session } from '@prisma/client';
 import fixWebmDuration from 'fix-webm-duration';
-import { probeDurationSec } from '@/lib/audio/ffmpegTranscode';
+import {
+  measureDecodedAudioDurationSec,
+  probeAudioStreamCount,
+  probeDurationSec,
+  probeFormatName,
+  validateMediaContainer,
+} from '@/lib/audio/ffmpegTranscode';
+import {
+  copyFileRange,
+  scanWebmDocumentRanges,
+} from '@/lib/audio/webmDocuments';
 import { loadSessionTranscriptBundle } from '@/lib/sessionPersistence';
 import type { PersistedTranscriptBundle } from '@/lib/sessionPersistence';
 
@@ -90,6 +100,173 @@ const PROBE_EXTENSION_BY_MIME: Record<string, string> = {
   'audio/wav': '.wav',
   'audio/ogg': '.ogg',
 };
+
+const MAX_DATABASE_DURATION_MS = 2_147_483_647;
+const AUTHORITATIVE_MEASUREMENT_MAX_WALL_MS = 2 * 60 * 60_000;
+
+/**
+ * 前端到角色时长上限后要先同步状态再停止 MediaRecorder；慢请求和 codec 尾帧会让权威媒体时长
+ * 略超 UI 计时。允许一分钟收尾余量，超过才拒绝发布；余量内仍保存并计入真实实测时长。
+ */
+export const RECORDING_DURATION_LIMIT_GRACE_MS = 60_000;
+
+export class RecordingDurationMeasurementError extends Error {
+  constructor(
+    message = 'Could not determine recording duration',
+    options?: ErrorOptions
+  ) {
+    super(message, options);
+    this.name = 'RecordingDurationMeasurementError';
+  }
+}
+
+export interface AuthoritativeRecordingDurationOptions {
+  /** Claim-scoped work directory for temporary per-document files. */
+  tempRoot?: string;
+}
+
+function isEbmlMediaFormat(formatName: string): boolean {
+  return formatName
+    .split(',')
+    .map((part) => part.trim().toLowerCase())
+    .some((part) => part === 'webm' || part === 'matroska');
+}
+
+function remainingMeasurementTimeMs(deadlineMs: number): number {
+  const remaining = deadlineMs - Date.now();
+  if (remaining <= 0) throw new RecordingDurationMeasurementError();
+  return remaining;
+}
+
+async function measureOneRecordingDocument(
+  inputPath: string,
+  deadlineMs: number,
+  alreadyValidated = false
+): Promise<number> {
+  if (!alreadyValidated) await validateMediaContainer(inputPath);
+  if ((await probeAudioStreamCount(inputPath)) !== 1) {
+    throw new RecordingDurationMeasurementError();
+  }
+  const remainingMs = remainingMeasurementTimeMs(deadlineMs);
+  const durationSec = await measureDecodedAudioDurationSec(inputPath, {
+    idleTimeoutMs: Math.min(5 * 60_000, remainingMs),
+    maxTimeoutMs: remainingMs,
+  });
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    throw new RecordingDurationMeasurementError();
+  }
+  return durationSec;
+}
+
+/**
+ * 从调用方拥有的本地文件路径测量可发布录音的权威时长。
+ *
+ * 容器头里的 duration 同样属于攻击者可控字节，不能把一个伪造的小正值当成已验证。所有输入都
+ * 完整解码到 null muxer，并以固定采样率的累计解码样本重建单调时间轴。这样切换输入产生的多个
+ * 独立 WebM 文档即使 PTS 都从 0 重启，也会按各段总和计时。权威录音只接受恰好一个音频流：
+ * ffmpeg 的 progress 在多音轨 null 输出中可能只反映第一轨，直接接受多轨会允许用短 a:0 掩盖
+ * 长音轨。这同时兼容单音轨且没有 format.duration 的 streaming/headerless WebM。失败必须抛错，
+ * 调用方不得退回客户端、墙钟或转录时间戳后发布录音。函数从不改写或删除 inputPath。
+ */
+export async function measureAuthoritativeRecordingDurationMs(
+  inputPath: string,
+  options: AuthoritativeRecordingDurationOptions = {}
+): Promise<number> {
+  const deadlineMs = Date.now() + AUTHORITATIVE_MEASUREMENT_MAX_WALL_MS;
+  let documentTempDir: string | null = null;
+  try {
+    await validateMediaContainer(inputPath);
+    const formatName = await probeFormatName(inputPath);
+    if (!formatName) throw new RecordingDurationMeasurementError();
+
+    let durationSec: number;
+    if (!isEbmlMediaFormat(formatName)) {
+      durationSec = await measureOneRecordingDocument(
+        inputPath,
+        deadlineMs,
+        true
+      );
+    } else {
+      // MediaRecorder restarts are stored as byte-concatenated independent EBML documents. Whole-
+      // file ffprobe reports only the first track table, and ffmpeg may ignore an incompatible later
+      // document while exiting 0. Scan offsets with bounded heap, then validate/decode every document.
+      const ranges = await scanWebmDocumentRanges(inputPath);
+      if (ranges.length === 1) {
+        durationSec = await measureOneRecordingDocument(
+          inputPath,
+          deadlineMs,
+          true
+        );
+      } else {
+        const tempRoot = options.tempRoot ?? os.tmpdir();
+        await fs.mkdir(tempRoot, { recursive: true });
+        documentTempDir = await fs.mkdtemp(
+          path.join(tempRoot, 'll-audio-doc-measure-')
+        );
+        durationSec = 0;
+        for (let index = 0; index < ranges.length; index += 1) {
+          remainingMeasurementTimeMs(deadlineMs);
+          const documentPath = path.join(
+            documentTempDir,
+            `document-${index}.webm`
+          );
+          await copyFileRange(inputPath, ranges[index], documentPath);
+          durationSec += await measureOneRecordingDocument(
+            documentPath,
+            deadlineMs
+          );
+          await fs.rm(documentPath, { force: true });
+        }
+      }
+    }
+
+    const durationMs = Math.round(durationSec * 1000);
+    if (
+      !Number.isSafeInteger(durationMs) ||
+      durationMs <= 0 ||
+      durationMs > MAX_DATABASE_DURATION_MS
+    ) {
+      throw new RecordingDurationMeasurementError();
+    }
+    return durationMs;
+  } catch (error) {
+    if (error instanceof RecordingDurationMeasurementError) throw error;
+    throw new RecordingDurationMeasurementError(
+      'Could not determine recording duration',
+      { cause: error }
+    );
+  } finally {
+    if (documentTempDir) {
+      await fs
+        .rm(documentTempDir, { recursive: true, force: true })
+        .catch(() => undefined);
+    }
+  }
+}
+
+/**
+ * Buffer 入口仅负责建立受控临时文件；发布路径用完即删。路径版供已持有本地/下载临时文件的
+ * 后台任务复用，避免再次把整段录音读入内存。
+ */
+export async function measureAuthoritativeRecordingDurationMsFromBuffer(
+  buffer: Buffer,
+  mimeType?: string | null
+): Promise<number> {
+  if (!buffer || buffer.length === 0) {
+    throw new RecordingDurationMeasurementError();
+  }
+  const ext = PROBE_EXTENSION_BY_MIME[mimeType ?? ''] ?? '.bin';
+  const tmpPath = path.join(
+    os.tmpdir(),
+    `ll-audio-measure-${crypto.randomUUID()}${ext}`
+  );
+  try {
+    await fs.writeFile(tmpPath, buffer);
+    return await measureAuthoritativeRecordingDurationMs(tmpPath);
+  } finally {
+    await fs.rm(tmpPath, { force: true }).catch(() => undefined);
+  }
+}
 
 /**
  * P5-14：直接从音频字节读时长（ffprobe 兜底）。

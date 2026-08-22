@@ -21,7 +21,17 @@ const {
   transcriptDurationMock,
   serverDurationMock,
   mergeDraftMock,
+  deleteDraftMock,
+  unsealDraftMock,
+  stageAudioMock,
+  normalizeDurationMock,
+  measureDurationMock,
   persistTranscriptMock,
+  settleStagedArtifactsMock,
+  completeStagedPublishesMock,
+  readbackPublicationMock,
+  rollbackStagedMock,
+  deleteTranscriptDraftMock,
   loadDraftMock,
 } = vi.hoisted(() => ({
   sessionFindUniqueMock: vi.fn(),
@@ -35,7 +45,17 @@ const {
   transcriptDurationMock: vi.fn(),
   serverDurationMock: vi.fn(),
   mergeDraftMock: vi.fn(),
+  deleteDraftMock: vi.fn(),
+  unsealDraftMock: vi.fn(),
+  stageAudioMock: vi.fn(),
+  normalizeDurationMock: vi.fn(),
+  measureDurationMock: vi.fn(),
   persistTranscriptMock: vi.fn(),
+  settleStagedArtifactsMock: vi.fn(),
+  completeStagedPublishesMock: vi.fn(),
+  readbackPublicationMock: vi.fn(),
+  rollbackStagedMock: vi.fn(),
+  deleteTranscriptDraftMock: vi.fn(),
   loadDraftMock: vi.fn(),
 }));
 
@@ -53,19 +73,21 @@ vi.mock('@/lib/prisma', () => ({
 vi.mock('@/lib/security', () => ({ assertOwnership: vi.fn() }));
 vi.mock('@/lib/recordingDraftPersistence', () => ({
   mergeRecordingDraftChunks: mergeDraftMock,
-  deleteRecordingDraft: vi.fn().mockResolvedValue(undefined),
+  deleteRecordingDraft: deleteDraftMock,
   sealRecordingDraft: vi.fn().mockResolvedValue(undefined),
-  unsealRecordingDraft: vi.fn().mockResolvedValue(undefined),
+  unsealRecordingDraft: unsealDraftMock,
 }));
 vi.mock('@/lib/transcriptDraftPersistence', () => ({
   loadTranscriptDraft: loadDraftMock,
-  deleteTranscriptDraft: vi.fn().mockResolvedValue(undefined),
+  deleteTranscriptDraft: deleteTranscriptDraftMock,
 }));
 vi.mock('@/lib/sessionPersistence', () => ({
-  stageSessionAudioArtifact: vi.fn().mockResolvedValue(null),
-  finalizeStagedArtifactPublish: vi.fn().mockResolvedValue(undefined),
-  rollbackStagedArtifact: vi.fn().mockResolvedValue(undefined),
-  persistSessionTranscriptArtifacts: persistTranscriptMock,
+  stageSessionAudioArtifact: stageAudioMock,
+  stageSessionTranscriptArtifacts: persistTranscriptMock,
+  settleStagedArtifactsInTransaction: settleStagedArtifactsMock,
+  completeStagedArtifactPublishes: completeStagedPublishesMock,
+  readbackStagedArtifactPublication: readbackPublicationMock,
+  rollbackStagedArtifact: rollbackStagedMock,
   extractTranscriptText: vi.fn(() => ''),
   loadSessionTranscriptBundle: vi.fn().mockResolvedValue(null),
   persistSessionReport: vi.fn().mockResolvedValue({ path: 'rp/1.json' }),
@@ -73,13 +95,18 @@ vi.mock('@/lib/sessionPersistence', () => ({
 vi.mock('@/lib/audio/recordingDuration', () => ({
   resolveServerRecordingDurationMs: serverDurationMock,
   resolveTranscriptDurationMs: transcriptDurationMock,
-  normalizeRecordedAudioDuration: vi.fn().mockResolvedValue(Buffer.alloc(0)),
+  normalizeRecordedAudioDuration: normalizeDurationMock,
+  measureAuthoritativeRecordingDurationMsFromBuffer: measureDurationMock,
+  RECORDING_DURATION_LIMIT_GRACE_MS: 60_000,
+  RecordingDurationMeasurementError: class RecordingDurationMeasurementError extends Error {},
 }));
 // billing 是纯函数模块，复刻真实口径（clamp FREE 2h、ceil 到分钟）——它正是本条的计费口径本身。
 vi.mock('@/lib/billing', () => ({
   clampSessionDurationMs: (ms: number, role: string) =>
     role === 'ADMIN' ? ms : Math.min(ms, 2 * 60 * 60_000),
   getBillableMinutes: (ms: number) => (ms > 0 ? Math.ceil(ms / 60_000) : 0),
+  getMaxSessionDurationMs: (role: string) =>
+    role === 'ADMIN' ? null : 2 * 60 * 60_000,
 }));
 vi.mock('@/lib/quota', () => ({ deductTranscriptionMinutes: deductMock }));
 vi.mock('@/lib/email/quotaAlert', () => ({
@@ -92,6 +119,9 @@ vi.mock('@/lib/soniox/streamGrant', () => ({
 vi.mock('@/lib/userRoles', () => ({
   resolveUserFeatureFlags: vi.fn().mockResolvedValue({ allowFinalSummary: false }),
   resolveUserSummaryModels: vi.fn().mockResolvedValue({ finalSummaryModelId: null }),
+}));
+vi.mock('@/lib/payment/entitlementAdmission', () => ({
+  isPaymentBenefitAvailable: vi.fn().mockResolvedValue(true),
 }));
 vi.mock('@/lib/llm/gateway', () => ({ callLLM: vi.fn() }));
 vi.mock('@/lib/llm/summaryModel', () => ({
@@ -120,11 +150,17 @@ vi.mock('@/lib/apiResponseCache', () => ({
   invalidateSessionsApiCache: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('@/lib/logger', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  logger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    child: vi.fn(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() })),
+  },
   serializeError: (e: unknown) => e,
 }));
 
 import { finalizeSession } from '@/lib/sessionFinalization';
+import { RecordingDurationMeasurementError } from '@/lib/audio/recordingDuration';
 
 const SESSION = {
   id: 'sess-1',
@@ -170,11 +206,28 @@ beforeEach(() => {
   transcriptDurationMock.mockReset().mockReturnValue(0);
   serverDurationMock.mockReset().mockReturnValue(0);
   mergeDraftMock.mockReset().mockResolvedValue(null);
+  deleteDraftMock.mockReset().mockResolvedValue(undefined);
+  unsealDraftMock.mockReset().mockResolvedValue(undefined);
+  stageAudioMock.mockReset().mockResolvedValue({
+    reference: 'local:recordings/sess-1-measured.webm',
+    previousReference: null,
+  });
+  normalizeDurationMock
+    .mockReset()
+    .mockImplementation(async ({ buffer }: { buffer: Buffer }) => buffer);
+  measureDurationMock.mockReset().mockResolvedValue(10 * 60_000);
   loadDraftMock.mockReset().mockResolvedValue(null);
   persistTranscriptMock.mockReset().mockResolvedValue({
-    transcript: { path: 'tr/1.json' },
-    summary: { path: 'sm/1.json' },
+    transcript: { reference: 'tr/1.json' },
+    summary: { reference: 'sm/1.json' },
   });
+  settleStagedArtifactsMock.mockReset().mockResolvedValue([]);
+  completeStagedPublishesMock.mockReset().mockResolvedValue([]);
+  readbackPublicationMock
+    .mockReset()
+    .mockResolvedValue({ outcome: 'not_committed', publications: [] });
+  rollbackStagedMock.mockReset().mockResolvedValue(undefined);
+  deleteTranscriptDraftMock.mockReset().mockResolvedValue(undefined);
 });
 
 describe('finalizeSession — P5-6：Soniox 实测量恒为时长下限', () => {
@@ -255,5 +308,99 @@ describe('finalizeSession — P5-6：Soniox 实测量恒为时长下限', () => 
       expect.anything(),
       expect.anything()
     );
+  });
+
+  it('SEC-018：finalize 的草稿 fallback 也必须用媒体实测时长发布', async () => {
+    sessionFindUniqueMock.mockResolvedValue({
+      ...SESSION,
+      recordingPath: null,
+      durationMs: 1,
+    });
+    mergeDraftMock.mockResolvedValue({
+      buffer: Buffer.from('complete-webm'),
+      manifest: { mimeType: 'audio/webm', receivedSeqs: [0, 1] },
+      hasGap: false,
+    });
+    measureDurationMock.mockResolvedValue(10 * 60_000);
+
+    await finalizeSession({ sessionId: 'sess-1', actor: null });
+
+    expect(measureDurationMock).toHaveBeenCalledTimes(1);
+    expect(stageAudioMock).toHaveBeenCalledTimes(1);
+    expect(txSessionUpdateManyMock.mock.calls[0][0].data).toMatchObject({
+      recordingPath: 'local:recordings/sess-1-measured.webm',
+      durationMs: 10 * 60_000,
+    });
+  });
+
+  it('SEC-018：finalize 草稿测量失败时不 stage、不提交并保留草稿重试', async () => {
+    sessionFindUniqueMock.mockResolvedValue({
+      ...SESSION,
+      recordingPath: null,
+      durationMs: 1,
+    });
+    mergeDraftMock.mockResolvedValue({
+      buffer: Buffer.from('unreadable'),
+      manifest: { mimeType: 'audio/webm', receivedSeqs: [0] },
+      hasGap: false,
+    });
+    measureDurationMock.mockRejectedValue(
+      new RecordingDurationMeasurementError()
+    );
+
+    await expect(
+      finalizeSession({ sessionId: 'sess-1', actor: null })
+    ).rejects.toMatchObject({ status: 422 });
+
+    expect(stageAudioMock).not.toHaveBeenCalled();
+    expect(transactionMock).not.toHaveBeenCalled();
+    expect(deleteDraftMock).not.toHaveBeenCalled();
+    expect(unsealDraftMock).toHaveBeenCalled();
+  });
+
+  it('owner+ledger 已提交但 COMMIT ACK 丢失时按成功收口且不回滚 live artifact', async () => {
+    const committedPublications = [
+      { staged: { reference: 'tr/1.json' }, settled: {} },
+      { staged: { reference: 'sm/1.json' }, settled: {} },
+    ];
+    sessionFindUniqueMock
+      .mockResolvedValueOnce(SESSION)
+      .mockResolvedValueOnce({
+        status: 'COMPLETED',
+        recordingPath: SESSION.recordingPath,
+        transcriptPath: 'tr/1.json',
+        summaryPath: 'sm/1.json',
+        durationMs: 60_000,
+      });
+    transactionMock.mockImplementationOnce(
+      async (cb: (tx: unknown) => Promise<unknown>) => {
+        await cb({
+          session: {
+            updateMany: txSessionUpdateManyMock,
+            findUnique: txSessionFindUniqueMock,
+          },
+        });
+        throw new Error('commit acknowledgement lost');
+      }
+    );
+    readbackPublicationMock.mockResolvedValueOnce({
+      outcome: 'committed',
+      publications: committedPublications,
+    });
+
+    const result = await finalizeSession({ sessionId: 'sess-1', actor: null });
+
+    expect(result).toMatchObject({
+      success: true,
+      transcriptPath: 'tr/1.json',
+      summaryPath: 'sm/1.json',
+    });
+    expect(rollbackStagedMock).not.toHaveBeenCalled();
+    expect(completeStagedPublishesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'sess-1' }),
+      committedPublications
+    );
+    expect(deleteTranscriptDraftMock).toHaveBeenCalledTimes(1);
+    expect(unsealDraftMock).not.toHaveBeenCalled();
   });
 });

@@ -1,6 +1,6 @@
 # LectureLive 音频增强 worker 的 systemd 单元
 # 用法：填好 AUDIO_WORKER_TOKEN 后
-#   sudo cp lecturelive-enhance-worker.service /etc/systemd/system/
+#   sudo install -m 0600 lecturelive-enhance-worker.service /etc/systemd/system/lecturelive-enhance-worker.service
 #   sudo systemctl daemon-reload && sudo systemctl enable --now lecturelive-enhance-worker
 [Unit]
 Description=LectureLive Audio Enhance Worker
@@ -21,16 +21,43 @@ Environment=AUDIO_WORKER_PORT=8790
 Environment=AUDIO_WORKER_HOST=127.0.0.1
 Environment=AUDIO_WORKER_DATA_DIR=/opt/lecturelive-worker/data
 Environment=AUDIO_WORKER_CONCURRENCY=1
+Environment=AUDIO_WORKER_PROBE_TIMEOUT_MS=60000
 
 # 安全加固（与主项目 deploy/ 下单元保持同风格）
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/lecturelive-worker/data
 ProtectKernelTunables=true
 ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
 RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Worker 只由本机 nginx 反代访问；ffmpeg 也无法借子进程访问外网。
+IPAddressDeny=any
+IPAddressAllow=localhost
+UMask=0077
+
+# 解析器/模型的 OS 级爆炸半径。单任务仍有应用层墙钟超时并杀整个进程组。
+MemoryMax=4G
+CPUQuota=200%
+TasksMax=64
+LimitNOFILE=1024
+LimitFSIZE=8G
+LimitCORE=0
+OOMPolicy=stop
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target

@@ -3,6 +3,8 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { getSiteSettings, SETTING_SECRET_MASK } from '@/lib/siteSettings';
 import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
 import { pingEnhanceWorker, parseWorkerUrls } from '@/lib/audio/enhanceWorkerClient';
+import { JOB_STATUS, JOB_TYPE, trackJob } from '@/lib/jobQueue';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 /**
  * POST /api/admin/audio-enhance/verify — 音频增强 worker 连通性测试（支持多台）。
@@ -11,12 +13,12 @@ import { pingEnhanceWorker, parseWorkerUrls } from '@/lib/audio/enhanceWorkerCli
  * 「掩码=保持原值」语义一致。返回 { ok（全部可达）, workers: [逐台结果] }。
  */
 export async function POST(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user, response } = await requireAdminAccess(req, {
     scope: 'admin:audio-enhance:verify',
     limit: 10,
     windowMs: 60_000,
   });
-  if (response) return response;
+  if (response || !user) return response!;
 
   let body: { workerUrl?: unknown; workerToken?: unknown } = {};
   try {
@@ -65,29 +67,71 @@ export async function POST(req: Request) {
     }
   }
 
-  const workers = await Promise.all(
-    urls.map(async (url) => {
-      try {
-        const health = await pingEnhanceWorker({ baseUrl: url, token: rawToken });
-        // 未带鉴权详情（token 错也会拿到 {ok:true} 裸响应）：engines 缺失即视为鉴权失败
-        if (!health.engines) {
-          return { url, ok: false, error: 'worker 可达但 token 鉴权失败' };
-        }
-        return {
-          url,
-          ok: true,
-          version: health.version,
-          engines: health.engines,
-          queue: health.queue,
-        };
-      } catch (error) {
-        return {
-          url,
-          ok: false,
-          error: `无法连接: ${error instanceof Error ? error.message : 'unknown error'}`,
-        };
-      }
-    })
+  const workers = await trackJob(
+    {
+      type: JOB_TYPE.ADMIN_INTEGRATION,
+      userId: user.id,
+      triggeredBy: `admin:${user.id}`,
+      // Durable journal only records the operation shape, never worker URLs/tokens.
+      params: { operation: 'audio_enhance_verify', workerCount: urls.length },
+      resultSummary: (result) => ({
+        workerCount: result.length,
+        reachableCount: result.filter((worker) => worker.ok).length,
+      }),
+      terminalMutation: async (tx, terminal) => {
+        const success =
+          terminal.status === JOB_STATUS.SUCCESS
+            ? terminal.result.filter((worker) => worker.ok).length
+            : 0;
+        await writeSecurityAudit(
+          req,
+          {
+            event: 'audio_enhance.verify',
+            operator: user,
+            target: { type: 'audio_enhance_worker_pool' },
+            before: null,
+            after: {
+              workerCount: urls.length,
+              reachableCount: success,
+            },
+            reason: 'admin-requested-worker-connectivity-check',
+            outcome:
+              terminal.status === JOB_STATUS.FAILED
+                ? 'FAILED'
+                : success === urls.length
+                  ? 'SUCCESS'
+                  : 'PARTIAL',
+            metadata: { journaled: true },
+          },
+          tx
+        );
+      },
+    },
+    () =>
+      Promise.all(
+        urls.map(async (url) => {
+          try {
+            const health = await pingEnhanceWorker({ baseUrl: url, token: rawToken });
+            // 未带鉴权详情（token 错也会拿到 {ok:true} 裸响应）：engines 缺失即视为鉴权失败
+            if (!health.engines) {
+              return { url, ok: false as const, error: 'worker 可达但 token 鉴权失败' };
+            }
+            return {
+              url,
+              ok: true as const,
+              version: health.version,
+              engines: health.engines,
+              queue: health.queue,
+            };
+          } catch (error) {
+            return {
+              url,
+              ok: false as const,
+              error: `无法连接: ${error instanceof Error ? error.message : 'unknown error'}`,
+            };
+          }
+        })
+      )
   );
 
   return NextResponse.json({ ok: workers.every((w) => w.ok), workers });

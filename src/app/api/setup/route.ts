@@ -5,20 +5,28 @@ import { Prisma } from '@prisma/client';
 import { NextResponse } from 'next/server';
 import { timingSafeEqual } from 'node:crypto';
 import { prisma } from '@/lib/prisma';
+import type { UserPayload } from '@/lib/auth';
 import { getNextQuotaResetAt } from '@/lib/billing';
 import { enforceRateLimit } from '@/lib/rateLimit';
-import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
+import {
+  describeLlmEndpointForAudit,
+  validateLlmProviderBaseUrl,
+} from '@/lib/llm/outboundPolicy';
+import { requireLlmAdminCurrentPassword } from '@/lib/llm/adminReauth';
+import { writeLlmSecurityAudit } from '@/lib/llm/securityAudit';
 // P6-4：与 admin/soniox/route.ts 共用同一份实现，避免「同一防护只装在一条路径上」重演。
 import {
   validateSonioxRestUrl,
   validateSonioxWsUrl,
 } from '@/lib/sonioxUrlValidation';
 import bcrypt from 'bcryptjs';
+import { guardAuthMutationRequest } from '@/lib/publicAuth';
 
 // 「首个管理员已被认领」的 CAS 键。SiteSetting.key 上有唯一索引，create 抢锁天然原子；
 // MySQL 表达不了「role=ADMIN 只能一行」，findFirst + create 之间的空档足够并发造出
 // 第二个隐藏管理员（还会被 setAuthCookie 直接登录）。
 const ADMIN_CLAIM_KEY = 'setup_admin_claimed';
+const MIN_BOOTSTRAP_TOKEN_BYTES = 32;
 
 /** 事务内「已有管理员」的哨兵：与 P2002（唯一键冲突）区分开，好给出准确的错误文案。 */
 class AdminAlreadyExistsError extends Error {}
@@ -115,17 +123,6 @@ async function getSetupStatus(): Promise<SetupStatusPayload> {
 
   if (schemaReady) {
     setupComplete = await isSetupComplete();
-
-    // 自动检测：如果所有步骤（数据库 + admin + LLM + Soniox）已就绪但未标记完成，
-    // 说明是已有部署升级后首次访问，自动标记为完成
-    if (!setupComplete && dbConnected && hasAdmin && hasLlmProvider && hasSoniox) {
-      await prisma.siteSetting.upsert({
-        where: { key: 'setup_complete' },
-        update: { value: 'true' },
-        create: { key: 'setup_complete', value: 'true' },
-      });
-      setupComplete = true;
-    }
   }
 
   return {
@@ -152,25 +149,26 @@ function secretsMatch(a: string, b: string): boolean {
  * C02/P6-4：给公开的引导路由加门禁。中间件整条放行 `/api/setup`，此前唯一的门是
  * `setup_complete` 布尔 + 10 次/10 分钟限流，而完整接管只需要 3-4 个请求。
  *
- * 两条互补的通行证，任一成立即放行：
- *  1. `x-setup-token` 匹配 `SETUP_BOOTSTRAP_TOKEN`（若配了该环境变量）。这是运维显式
- *     关掉「首次部署匿名窗口」的开关：一旦配上，匿名者连 step=admin 都进不来。
- *  2. 已登录且角色是 ADMIN。向导里 step=admin 之后浏览器就持有该管理员 cookie
- *     （setup/page.tsx 的 fetch 带 credentials:'include'），故正常流程无感。
- *
- * 两条都不成立时：只有「库里一个管理员都没有 且 没配 SETUP_BOOTSTRAP_TOKEN」才放行——
- * 这就是真正的首次部署窗口，且只剩 step=admin 一条路径（被 ADMIN_CLAIM_KEY 的 CAS
- * 收成一次性的）。llm / soniox / complete 一律不再对匿名者开放。
+ * 授权随实例状态单向切换，不存在两把可长期并用的钥匙：
+ *  1. 库里没有管理员时，必须用至少 32 字节的 `SETUP_BOOTSTRAP_TOKEN`，且它只能调用
+ *     step=admin；缺配置、弱配置、错 token 全部关闭失败。
+ *  2. 首个管理员的 CAS 创建成功后，bootstrap token 立即失去全部能力，后续步骤只认
+ *     已登录 ADMIN。即使部署环境仍保留 token，也不会形成隐藏的长期管理凭据。
  */
-async function requireSetupAuthorization(req: Request): Promise<NextResponse | null> {
-  const bootstrapToken = process.env.SETUP_BOOTSTRAP_TOKEN?.trim();
-  if (bootstrapToken) {
-    const provided = req.headers.get('x-setup-token')?.trim() ?? '';
-    if (provided && secretsMatch(provided, bootstrapToken)) {
-      return null;
-    }
-  }
+type SetupAuthorization =
+  | { mode: 'bootstrap'; response: null }
+  | { mode: 'admin'; user: UserPayload; response: null }
+  | { mode: null; response: NextResponse };
 
+function readBootstrapToken(): string | null {
+  const token = process.env.SETUP_BOOTSTRAP_TOKEN?.trim();
+  if (!token || Buffer.byteLength(token, 'utf8') < MIN_BOOTSTRAP_TOKEN_BYTES) {
+    return null;
+  }
+  return token;
+}
+
+async function requireSetupAuthorization(req: Request): Promise<SetupAuthorization> {
   let adminCount = 0;
   try {
     adminCount = await prisma.user.count({ where: { role: 'ADMIN' } });
@@ -180,24 +178,50 @@ async function requireSetupAuthorization(req: Request): Promise<NextResponse | n
     adminCount = 0;
   }
 
-  // 还没有管理员：这时无人可登录。没配引导密钥就放行（首次部署窗口），配了就必须带密钥。
+  // 首个管理员只能由部署侧的一次性秘密认领。缺少/弱配置必须 fail-closed；否则把
+  // 服务启动在公网到管理员真正创建之间的窗口交给了最快发请求的人。
   if (adminCount === 0) {
-    if (!bootstrapToken) return null;
-    return NextResponse.json(
-      { error: '缺少或错误的部署引导密钥（x-setup-token）' },
-      { status: 401 }
-    );
+    const bootstrapToken = readBootstrapToken();
+    if (!bootstrapToken) {
+      return {
+        mode: null,
+        response: NextResponse.json(
+          {
+            error:
+              '服务器未配置有效的 SETUP_BOOTSTRAP_TOKEN（至少 32 字节），已拒绝首次管理员认领',
+          },
+          { status: 503 }
+        ),
+      };
+    }
+
+    const provided = req.headers.get('x-setup-token')?.trim() ?? '';
+    if (!provided || !secretsMatch(provided, bootstrapToken)) {
+      return {
+        mode: null,
+        response: NextResponse.json(
+          { error: '缺少或错误的部署引导密钥（x-setup-token）' },
+          { status: 401 }
+        ),
+      };
+    }
+    return { mode: 'bootstrap', response: null };
   }
 
+  // 管理员一旦存在，引导密钥立即永久失去授权能力。即使环境变量仍保留、甚至泄露，
+  // 也不能被拿来改写 LLM/Soniox 配置或提前完成向导；后续步骤只认当前 ADMIN 会话。
   const { verifyAuth } = await import('@/lib/auth');
   const user = await verifyAuth(req);
   if (!user || user.role !== 'ADMIN') {
-    return NextResponse.json(
-      { error: '实例已有管理员，请以管理员身份登录后再继续设置' },
-      { status: 403 }
-    );
+    return {
+      mode: null,
+      response: NextResponse.json(
+        { error: '实例已有管理员，请以管理员身份登录后再继续设置' },
+        { status: 403 }
+      ),
+    };
   }
-  return null;
+  return { mode: 'admin', user, response: null };
 }
 
 /** 检查是否已完成初始设置 */
@@ -244,6 +268,8 @@ export async function GET(req: Request) {
  * 根据 step 参数执行不同步骤
  */
 export async function POST(req: Request) {
+  const requestGuard = guardAuthMutationRequest(req, { requireJson: true });
+  if (requestGuard) return requestGuard;
   const rateLimited = await enforceRateLimit(req, {
     scope: 'setup:post',
     limit: 10,
@@ -263,19 +289,28 @@ export async function POST(req: Request) {
   }
 
   // 门禁失败 fail-closed：判定不了就别放行（判定本身要查库）。
-  let unauthorized: NextResponse | null;
+  let authorization: SetupAuthorization;
   try {
-    unauthorized = await requireSetupAuthorization(req);
+    authorization = await requireSetupAuthorization(req);
   } catch (error) {
     console.error('Setup authorization check failed:', error);
     return NextResponse.json({ error: getSetupErrorMessage(error) }, { status: 500 });
   }
-  if (unauthorized) {
-    return unauthorized;
+  if (authorization.response) {
+    return authorization.response;
   }
 
   const body = await req.json();
   const { step } = body;
+
+  // bootstrap token 的唯一权限是原子认领首个管理员。数据库检查、服务配置与 complete
+  // 都必须等管理员登录后执行，避免 token 变成长生命周期的隐形管理凭据。
+  if (authorization.mode === 'bootstrap' && step !== 'admin') {
+    return NextResponse.json(
+      { error: '部署引导密钥仅可用于创建首个管理员账号' },
+      { status: 403 }
+    );
+  }
 
   try {
     switch (step) {
@@ -284,7 +319,12 @@ export async function POST(req: Request) {
       case 'admin':
         return handleCreateAdmin(body);
       case 'llm':
-        return handleConfigureLlm(body);
+        // bootstrap 模式只能走 step=admin，已在上方统一拒绝；LLM 创建必须绑定
+        // 当前已认证管理员，供 inline password proof 与拒绝审计使用。
+        if (authorization.mode !== 'admin') {
+          return NextResponse.json({ error: 'LLM 配置需要管理员会话' }, { status: 403 });
+        }
+        return await handleConfigureLlm(req, body, authorization.user);
       case 'soniox':
         return handleConfigureSoniox(body);
       case 'complete':
@@ -329,7 +369,8 @@ async function handleCreateAdmin(body: {
   displayName?: string;
 }) {
   const {
-    signToken,
+    getAuthTokenSessionBinding,
+    issueAuthToken,
     setAuthCookie,
     CLIENT_SESSION_TOKEN,
     validatePassword,
@@ -403,7 +444,7 @@ async function handleCreateAdmin(body: {
   }
 
   // 自动登录：签发 token 并设置 cookie
-  const token = signToken({
+  const token = await issueAuthToken({
     id: user.id,
     email: user.email,
     role: user.role,
@@ -418,13 +459,16 @@ async function handleCreateAdmin(body: {
       role: user.role,
     },
     token: CLIENT_SESSION_TOKEN,
+    sessionBinding: getAuthTokenSessionBinding(token),
   });
   setAuthCookie(response, token);
+  response.headers.set('Clear-Site-Data', '"cache"');
   return response;
 }
 
 /** Step 3: 配置 LLM Provider */
-async function handleConfigureLlm(body: {
+async function handleConfigureLlm(req: Request, body: {
+  currentPassword?: unknown;
   providers?: Array<{
     name: string;
     apiKey: string;
@@ -439,7 +483,7 @@ async function handleConfigureLlm(body: {
       temperature?: number;
     }>;
   }>;
-}) {
+}, admin: UserPayload) {
   const { encrypt } = await import('@/lib/crypto');
   const { providers } = body;
   if (!providers || providers.length === 0) {
@@ -449,7 +493,12 @@ async function handleConfigureLlm(body: {
     );
   }
 
-  const created = [];
+  // 先验证整批，再做一次 password proof，之后才允许任何 provider 落库。
+  // 这既避免第二个 provider 拒绝时留下半批数据，也保证审计失败不会发生部分写入。
+  const validatedProviders: Array<{
+    provider: NonNullable<typeof providers>[number];
+    normalizedApiBase: string;
+  }> = [];
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
     if (!p.name || !p.apiKey || !p.apiBase) {
@@ -459,74 +508,114 @@ async function handleConfigureLlm(body: {
       );
     }
 
-    // C02/P6-4：apiBase 此前零校验直接落库，而管理员正规路由（admin/llm-providers）
-    // 有 validateCloudreveBaseUrl（http/https + 私网黑名单）。落库后 gateway 会把用户
-    // prompt 与转录持续发到这个地址，公开路径上更不能省。
+    // SEC-034：setup 与日常管理必须使用同一份精确 origin allowlist；否则向导会成为
+    // 绕过后台出站策略、直接落库任意 provider 地址的第二写入口。
     let normalizedApiBase: string;
     try {
-      normalizedApiBase = validateCloudreveBaseUrl(p.apiBase);
+      normalizedApiBase = await validateLlmProviderBaseUrl(p.apiBase);
     } catch {
+      await writeLlmSecurityAudit(req, 'llm-provider.create-rejected', {
+        user: admin,
+        detail: {
+          reason: 'setup_outbound_origin_policy',
+          setup: true,
+          providerIndex: i,
+          endpoint: describeLlmEndpointForAudit(p.apiBase),
+        },
+      });
       return NextResponse.json(
-        { error: `供应商 ${i + 1}: API 地址无效（需 http/https 且不得指向内网地址）` },
+        { error: `供应商 ${i + 1}: API 地址不在服务端 LLM origin 允许列表中` },
         { status: 400 }
       );
     }
 
-    // 加密 API Key 后存入数据库
-    const encryptedKey = encrypt(p.apiKey);
+    validatedProviders.push({ provider: p, normalizedApiBase });
+  }
 
-    const provider = await prisma.llmProvider.create({
-      data: {
-        name: p.name,
-        apiKey: encryptedKey,
-        apiBase: normalizedApiBase,
-        isAnthropic: p.isAnthropic ?? false,
-        sortOrder: i,
+  const reauth = await requireLlmAdminCurrentPassword(
+    req,
+    admin.id,
+    body.currentPassword
+  );
+  if (!reauth.ok) {
+    await writeLlmSecurityAudit(req, 'llm-provider.create-rejected', {
+      user: admin,
+      detail: {
+        reason: `setup_reauth_${reauth.reason}`,
+        setup: true,
+        providerCount: validatedProviders.length,
+        endpoints: validatedProviders.map(({ normalizedApiBase }) =>
+          describeLlmEndpointForAudit(normalizedApiBase)
+        ),
       },
     });
+    return reauth.response;
+  }
 
-    // 创建模型配置：先登记模型库条目（规格真源），再按用途建路由行（同一模型多用途共用条目）
-    if (p.models && p.models.length > 0) {
-      const registryByKey = new Map<string, string>(); // modelId::displayName → registryId
-      for (let j = 0; j < p.models.length; j++) {
-        const m = p.models[j];
-        const purpose =
-          (m.purpose as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING') ||
-          'CHAT';
-        const registryKey = `${m.modelId}::${m.displayName}`;
-        let registryId = registryByKey.get(registryKey);
-        if (!registryId) {
-          const registry = await prisma.llmRegistryModel.create({
+  // Provider、registry 和用途路由是一份高敏配置的单一逻辑批次。即使 allowlist 与
+  // reauth 已全部通过，任一后续数据库写失败也不能留下前半批凭据/端点，因此整批同进同退。
+  const created = await prisma.$transaction(async (tx) => {
+    const staged: Array<{ id: string; name: string }> = [];
+    for (let i = 0; i < validatedProviders.length; i++) {
+      const { provider: p, normalizedApiBase } = validatedProviders[i];
+
+      // 加密 API Key 后存入数据库
+      const encryptedKey = encrypt(p.apiKey);
+
+      const provider = await tx.llmProvider.create({
+        data: {
+          name: p.name,
+          apiKey: encryptedKey,
+          apiBase: normalizedApiBase,
+          isAnthropic: p.isAnthropic ?? false,
+          sortOrder: i,
+        },
+      });
+
+      // 创建模型配置：先登记模型库条目（规格真源），再按用途建路由行（同一模型多用途共用条目）
+      if (p.models && p.models.length > 0) {
+        const registryByKey = new Map<string, string>(); // modelId::displayName → registryId
+        for (let j = 0; j < p.models.length; j++) {
+          const m = p.models[j];
+          const purpose =
+            (m.purpose as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING') ||
+            'CHAT';
+          const registryKey = `${m.modelId}::${m.displayName}`;
+          let registryId = registryByKey.get(registryKey);
+          if (!registryId) {
+            const registry = await tx.llmRegistryModel.create({
+              data: {
+                providerId: provider.id,
+                modelId: m.modelId,
+                displayName: m.displayName,
+                kind: purpose === 'EMBEDDING' ? 'EMBEDDING' : 'TEXT',
+                maxTokens: m.maxTokens ?? 4096,
+                sortOrder: j,
+              },
+            });
+            registryId = registry.id;
+            registryByKey.set(registryKey, registryId);
+          }
+          await tx.llmModel.create({
             data: {
               providerId: provider.id,
+              registryId,
               modelId: m.modelId,
               displayName: m.displayName,
-              kind: purpose === 'EMBEDDING' ? 'EMBEDDING' : 'TEXT',
+              purpose,
+              isDefault: m.isDefault ?? (j === 0),
               maxTokens: m.maxTokens ?? 4096,
+              temperature: m.temperature ?? 0.3,
               sortOrder: j,
             },
           });
-          registryId = registry.id;
-          registryByKey.set(registryKey, registryId);
         }
-        await prisma.llmModel.create({
-          data: {
-            providerId: provider.id,
-            registryId,
-            modelId: m.modelId,
-            displayName: m.displayName,
-            purpose,
-            isDefault: m.isDefault ?? (j === 0),
-            maxTokens: m.maxTokens ?? 4096,
-            temperature: m.temperature ?? 0.3,
-            sortOrder: j,
-          },
-        });
       }
-    }
 
-    created.push({ id: provider.id, name: provider.name });
-  }
+      staged.push({ id: provider.id, name: provider.name });
+    }
+    return staged;
+  });
 
   return NextResponse.json({
     success: true,
@@ -633,9 +722,9 @@ async function handleConfigureSoniox(body: {
 
 /** 标记设置完成 */
 async function handleCompleteSetup() {
-  // C02/P6-4：此前零前置条件。全仓三处写 setup_complete 全写 'true'、无一处写回 false，
-  // 所以匿名者抢先置位就把实例锁死（要恢复必须直连数据库）。
-  // 至少要求管理员已存在——正常向导本来就先建管理员，不影响任何合法流程。
+  // C02/P6-4：这是全仓唯一允许写 setup_complete 的位置，且 POST 外层已经验证当前
+  // 请求是 ADMIN 会话。首页与公开 GET /api/setup 都只读，不能替操作者提前封闭向导。
+  // 再检查管理员确实存在，避免异常状态下写入不可恢复的完成标记。
   const adminCount = await prisma.user.count({ where: { role: 'ADMIN' } });
   if (adminCount === 0) {
     return NextResponse.json(

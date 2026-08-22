@@ -2,12 +2,20 @@
 // 原子守卫（WHERE gte 条件扣减）、余额不足/用户不存在语义、台账写入、外部事务透传。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { userUpdateMock, userUpdateManyMock, userFindUniqueMock, walletTxCreateMock } =
-  vi.hoisted(() => ({
+const {
+  userUpdateMock,
+  userUpdateManyMock,
+  userFindUniqueMock,
+  walletTxCreateMock,
+  executeRawMock,
+  queryRawMock,
+} = vi.hoisted(() => ({
     userUpdateMock: vi.fn(),
     userUpdateManyMock: vi.fn(),
     userFindUniqueMock: vi.fn(),
     walletTxCreateMock: vi.fn(),
+    executeRawMock: vi.fn(),
+    queryRawMock: vi.fn(),
   }));
 
 vi.mock('@/lib/prisma', () => {
@@ -18,6 +26,8 @@ vi.mock('@/lib/prisma', () => {
       findUnique: userFindUniqueMock,
     },
     walletTransaction: { create: walletTxCreateMock },
+    $executeRaw: executeRawMock,
+    $queryRaw: queryRawMock,
   };
   return {
     prisma: {
@@ -41,13 +51,23 @@ beforeEach(() => {
   userUpdateManyMock.mockReset();
   userFindUniqueMock.mockReset();
   walletTxCreateMock.mockReset();
+  executeRawMock.mockReset();
+  executeRawMock.mockResolvedValue(1);
+  queryRawMock.mockReset();
+  queryRawMock.mockImplementation(async (strings: TemplateStringsArray) => {
+    const sql = String(strings);
+    if (/FROM PaymentAccountHold/i.test(sql)) return [];
+    if (/FROM WalletFundingLot/i.test(sql)) return [];
+    if (/SELECT id FROM User/i.test(sql)) return [{ id: 'u1' }];
+    return [];
+  });
+  walletTxCreateMock.mockResolvedValue({ id: 'wallet-tx-1' });
 });
 
 describe('spendWalletCents', () => {
   it('余额充足：条件扣减 + 写台账（负 amountCents + 余额快照）', async () => {
     userUpdateManyMock.mockResolvedValue({ count: 1 });
     userFindUniqueMock.mockResolvedValue({ walletBalanceCents: 700 });
-    walletTxCreateMock.mockResolvedValue({});
 
     const result = await spendWalletCents({
       userId: 'u1',
@@ -86,6 +106,7 @@ describe('spendWalletCents', () => {
   it('用户不存在：count=0 且查无此人 → user_not_found', async () => {
     userUpdateManyMock.mockResolvedValue({ count: 0 });
     userFindUniqueMock.mockResolvedValue(null);
+    queryRawMock.mockResolvedValueOnce([]);
 
     await expect(
       spendWalletCents({ userId: 'ghost', amountCents: 300, type: 'translation' })
@@ -104,10 +125,20 @@ describe('spendWalletCents', () => {
   it('传入外部事务时不自开事务，直接用传入的 tx 客户端', async () => {
     const txUpdateMany = vi.fn().mockResolvedValue({ count: 1 });
     const txFindUnique = vi.fn().mockResolvedValue({ walletBalanceCents: 1 });
-    const txCreate = vi.fn().mockResolvedValue({});
+    const txCreate = vi.fn().mockResolvedValue({ id: 'external-wallet-tx-1' });
+    const txExecuteRaw = vi.fn().mockResolvedValue(1);
+    const txQueryRaw = vi.fn().mockImplementation(async (strings: TemplateStringsArray) => {
+      const sql = String(strings);
+      if (/FROM PaymentAccountHold/i.test(sql)) return [];
+      if (/FROM WalletFundingLot/i.test(sql)) return [];
+      if (/SELECT id FROM User/i.test(sql)) return [{ id: 'u1' }];
+      return [];
+    });
     const externalTx = {
       user: { updateMany: txUpdateMany, findUnique: txFindUnique },
       walletTransaction: { create: txCreate },
+      $executeRaw: txExecuteRaw,
+      $queryRaw: txQueryRaw,
     } as never;
 
     await spendWalletCents(
@@ -118,12 +149,25 @@ describe('spendWalletCents', () => {
     // 全局 prisma 的 mock 不应被触碰
     expect(userUpdateManyMock).not.toHaveBeenCalled();
   });
+
+  it('账户存在 active payment hold：拒绝扣款且不写台账/资金分摊', async () => {
+    queryRawMock
+      .mockResolvedValueOnce([{ id: 'u1' }])
+      .mockResolvedValueOnce([{ id: 'hold-1' }]);
+
+    await expect(
+      spendWalletCents({ userId: 'u1', amountCents: 300, type: 'translation' })
+    ).rejects.toMatchObject({ code: 'account_frozen' });
+
+    expect(userUpdateManyMock).not.toHaveBeenCalled();
+    expect(walletTxCreateMock).not.toHaveBeenCalled();
+    expect(executeRawMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('refundWalletCents', () => {
   it('入账 + 台账（正 amountCents）', async () => {
     userUpdateMock.mockResolvedValue({ walletBalanceCents: 1000 });
-    walletTxCreateMock.mockResolvedValue({});
 
     const result = await refundWalletCents({
       userId: 'u1',

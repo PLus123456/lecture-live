@@ -6,6 +6,7 @@
 
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
+import { isPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { prisma } from '@/lib/prisma';
 import { callLLM } from '@/lib/llm/gateway';
@@ -23,6 +24,12 @@ export async function POST(req: Request) {
   const user = await verifyAuth(req);
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  if (!(await isPaymentBenefitAvailable(user.id))) {
+    return NextResponse.json(
+      { error: 'Payment account frozen', code: 'payment_account_frozen' },
+      { status: 403 }
+    );
   }
 
   // 安全：压缩会直接调用 LLM（成本操作），按用户限流防成本型 DoS。

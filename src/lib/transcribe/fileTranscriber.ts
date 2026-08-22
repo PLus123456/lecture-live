@@ -17,6 +17,10 @@ import type { RealtimeToken } from '@/types/soniox';
 import { TokenProcessor } from '@/lib/soniox/tokenProcessor';
 import { startSonioxRecording, buildSonioxConfig } from '@/lib/soniox/client';
 import type { SessionConfig } from '@/types/transcript';
+import {
+  createAccountObjectUrl,
+  revokeAccountObjectUrl,
+} from '@/lib/accountObjectUrls';
 
 export interface FileTranscribeOptions {
   file: File;
@@ -39,13 +43,13 @@ export interface FileTranscribeResult {
  */
 export async function probeAudioDurationMs(file: File): Promise<number> {
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
+    const url = createAccountObjectUrl(file);
     const audio = document.createElement('audio');
     audio.preload = 'metadata';
     audio.src = url;
     audio.muted = true;
     const cleanup = () => {
-      URL.revokeObjectURL(url);
+      revokeAccountObjectUrl(url);
       audio.remove();
     };
     audio.addEventListener('loadedmetadata', () => {
@@ -85,7 +89,7 @@ export function startFileTranscribe(opts: FileTranscribeOptions): {
     try { recordingHandle?.recording.stop(); } catch { /* ignore */ }
     try { audioEl?.pause(); } catch { /* ignore */ }
     if (audioEl) { audioEl.src = ''; audioEl.remove(); audioEl = null; }
-    if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+    if (blobUrl) { revokeAccountObjectUrl(blobUrl); blobUrl = null; }
     if (audioCtx && audioCtx.state !== 'closed') { void audioCtx.close(); }
     audioCtx = null;
   };
@@ -94,7 +98,7 @@ export function startFileTranscribe(opts: FileTranscribeOptions): {
     const playbackRate = opts.playbackRate ?? 3;
 
     // 1. 准备 audio 元素
-    blobUrl = URL.createObjectURL(opts.file);
+    blobUrl = createAccountObjectUrl(opts.file);
     audioEl = document.createElement('audio');
     audioEl.src = blobUrl;
     audioEl.preload = 'auto';

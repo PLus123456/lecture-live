@@ -11,7 +11,50 @@ import type {
 
 interface BroadcasterCallbacks {
   onViewerCount?: (count: number) => void;
-  onError?: (error: { message: string }) => void;
+  onError?: (error: { message: string; code?: string }) => void;
+}
+
+export interface LiveBroadcasterAuthState {
+  token: string | null;
+  epoch: number;
+  userId: string | null;
+  sessionBinding: string | null;
+}
+
+interface BroadcasterReauthOptions {
+  initial: LiveBroadcasterAuthState;
+  getCurrent: () => LiveBroadcasterAuthState;
+}
+
+const BROADCASTER_AUTH_LEAF_EXPIRED = 'BROADCASTER_AUTH_LEAF_EXPIRED';
+
+function hasSameAuthBoundary(
+  initial: LiveBroadcasterAuthState,
+  current: LiveBroadcasterAuthState
+): boolean {
+  return (
+    initial.epoch === current.epoch &&
+    initial.userId !== null &&
+    initial.userId === current.userId &&
+    initial.sessionBinding === current.sessionBinding
+  );
+}
+
+/**
+ * 这里只决定“是否值得发起一次新 strict 握手”，不授予任何权限。最终仍由服务端用
+ * 当前 Cookie 的 current leaf 完整鉴权；generic revoke、登出和账号切换从不走此路径。
+ */
+export function shouldStrictlyReauthenticateBroadcaster(
+  errorCode: string | undefined,
+  initial: LiveBroadcasterAuthState,
+  current: LiveBroadcasterAuthState
+): boolean {
+  return (
+    errorCode === BROADCASTER_AUTH_LEAF_EXPIRED &&
+    typeof current.token === 'string' &&
+    current.token.length > 0 &&
+    hasSameAuthBoundary(initial, current)
+  );
 }
 
 interface SnapshotPayload {
@@ -35,6 +78,8 @@ export class LiveBroadcaster {
   // 保险，也是**重连后**对齐服务端的唯一手段（重连的 socket 没有首帧快照）。
   // 关键：增量必须折回本字段，否则补发的是开分享瞬间的旧态（见 foldIntoSnapshot）。
   private lastSnapshot: SnapshotPayload | null = null;
+  private pendingStrictReauth = false;
+  private intentionallyDisconnected = false;
 
   constructor(
     socketUrl: string,
@@ -43,6 +88,7 @@ export class LiveBroadcaster {
       token: string;
       shareToken: string;
       callbacks?: BroadcasterCallbacks;
+      reauth?: BroadcasterReauthOptions;
     }
   ) {
     this.sessionId = options.sessionId;
@@ -66,9 +112,59 @@ export class LiveBroadcaster {
     this.socket.on('viewer_count', (payload: { count: number }) => {
       options.callbacks?.onViewerCount?.(payload.count);
     });
-    this.socket.on('share_error', (error: { message: string }) => {
+    this.socket.on('share_error', (error: { message: string; code?: string }) => {
+      const currentAuth = options.reauth?.getCurrent();
+      if (
+        options.reauth &&
+        currentAuth &&
+        shouldStrictlyReauthenticateBroadcaster(
+          error.code,
+          options.reauth.initial,
+          currentAuth
+        )
+      ) {
+        // 服务端会紧接着发 `io server disconnect`。在 disconnect 前调用 connect 是
+        // no-op，所以这里只挂一次意图，真正重握手放到下面的 disconnect handler。
+        this.pendingStrictReauth = true;
+        return;
+      }
+      this.pendingStrictReauth = false;
       options.callbacks?.onError?.(error);
     });
+
+    this.socket.on('disconnect', (reason) => {
+      if (
+        reason !== 'io server disconnect' ||
+        !this.pendingStrictReauth ||
+        this.intentionallyDisconnected ||
+        !options.reauth
+      ) {
+        this.pendingStrictReauth = false;
+        return;
+      }
+
+      const currentAuth = options.reauth.getCurrent();
+      this.pendingStrictReauth = false;
+      if (
+        !shouldStrictlyReauthenticateBroadcaster(
+          BROADCASTER_AUTH_LEAF_EXPIRED,
+          options.reauth.initial,
+          currentAuth
+        )
+      ) {
+        return;
+      }
+
+      // token 通常仍是 __cookie_session__ sentinel；新权限来自浏览器此刻携带的最新
+      // HttpOnly Cookie。更新 auth 后显式 connect，服务端必须重新走 strict current leaf。
+      const auth = this.socket.auth;
+      this.socket.auth = {
+        ...(auth && typeof auth === 'object' ? auth : {}),
+        token: currentAuth.token,
+      };
+      this.socket.connect();
+    });
+
   }
 
   syncSnapshot(snapshot: SnapshotPayload) {
@@ -93,17 +189,16 @@ export class LiveBroadcaster {
     mutate(this.lastSnapshot);
   }
 
-  broadcastTranscriptDelta(delta: Partial<TranscriptSegment>) {
+  broadcastTranscriptDelta(delta: TranscriptSegment) {
     this.foldIntoSnapshot((snapshot) => {
-      const id = delta.id;
-      const index = id
-        ? snapshot.segments.findIndex((segment) => segment.id === id)
-        : -1;
+      const index = snapshot.segments.findIndex(
+        (segment) => segment.id === delta.id
+      );
       if (index === -1) {
-        snapshot.segments = [...snapshot.segments, delta as TranscriptSegment];
+        snapshot.segments = [...snapshot.segments, delta];
       } else {
         snapshot.segments = snapshot.segments.map((segment, i) =>
-          i === index ? (delta as TranscriptSegment) : segment
+          i === index ? delta : segment
         );
       }
     });
@@ -216,6 +311,8 @@ export class LiveBroadcaster {
   }
 
   disconnect() {
+    this.intentionallyDisconnected = true;
+    this.pendingStrictReauth = false;
     this.socket.disconnect();
   }
 }

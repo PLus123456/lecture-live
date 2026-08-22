@@ -41,26 +41,26 @@ model User {
 
   // 邮箱验证：null=未验证。开启站点级 email_verification 硬门禁后，未验证账号不得登录。
   // 初始 admin（setup）与关闭验证前已存在的老用户视为已验证（迁移时回填 createdAt）。
-  emailVerifiedAt DateTime?
+  emailVerifiedAt  DateTime?
   // 邮件通知订阅偏好（JSON：{ [category]: boolean }）。缺失/未列出的分类走该分类默认值；
   // 事务类邮件（验证/重置/安全通知）不受此开关影响，恒发。见 src/lib/email/preferences.ts。
-  emailPreferences String? @db.Text
+  emailPreferences String?   @db.Text
 
   // 配额
-  transcriptionMinutesUsed  Int       @default(0)
-  transcriptionMinutesLimit Int       @default(60) // FREE=60min/月, PRO=600, ADMIN=unlimited
-  quotaResetAt              DateTime?
+  transcriptionMinutesUsed        Int       @default(0)
+  transcriptionMinutesLimit       Int       @default(60) // FREE=60min/月, PRO=600, ADMIN=unlimited
+  quotaResetAt                    DateTime?
   // 充值系统（Model A）：限额下调结算（settlePoolOnLimitChange）会在**周期中途**把 used 归零，
   // 而对账窗口 cycleStart 按 quotaResetAt 月对齐仍指向月初 → 会把本周期结算前已计费的 session 误报为
   // drift（Q_MED）。此列记录「结算发生的时刻」作为对账下界：reconcile 用 max(cycleStart, 此列) 截断，
   // 排除结算前已计费的 session。正常月度重置后 cycleStart 自然越过此值（max 使其失效），无需清列。
   transcriptionUsageReconcileFrom DateTime?
-  storageHoursUsed          Float     @default(0)
-  storageHoursLimit         Float     @default(10) // FREE=10h录音, PRO=100h, ADMIN=unlimited
-  storageBytesUsed          BigInt    @default(0) // chat 上传文件累计字节
-  storageBytesLimit         BigInt    @default(104857600) // FREE 默认 100MB；admin 可调（PRO/ADMIN 通过 SiteSetting 配置）
-  allowedModels             String    @default("local") // 逗号分隔: "local,gpt,claude,deepseek"
-  customGroupId             String? // 自定义用户组 ID，指向 SiteSetting 中存储的自定义组
+  storageHoursUsed                Float     @default(0)
+  storageHoursLimit               Float     @default(10) // FREE=10h录音, PRO=100h, ADMIN=unlimited
+  storageBytesUsed                BigInt    @default(0) // chat 上传文件累计字节
+  storageBytesLimit               BigInt    @default(104857600) // FREE 默认 100MB；admin 可调（PRO/ADMIN 通过 SiteSetting 配置）
+  allowedModels                   String    @default("local") // 逗号分隔: "local,gpt,claude,deepseek"
+  customGroupId                   String? // 自定义用户组 ID，指向 SiteSetting 中存储的自定义组
 
   // 充值系统（钱包）
   walletBalanceCents      Int @default(0) // 钱包余额（分，整数避免浮点）
@@ -68,10 +68,34 @@ model User {
   // 只在「购买到账」与「月度重置结算溢出」两处变更；月内所有扣费/预留都不碰它。
   purchasedMinutesBalance Int @default(0)
 
-  sessions         Session[]
-  shareLinks       ShareLink[]
-  emailTokens      EmailToken[]
-  translationTasks TranslationTask[]
+  sessions          Session[]
+  shareLinks        ShareLink[]
+  emailTokens       EmailToken[]
+  authTokenFamilies AuthTokenFamily[]
+  translationTasks  TranslationTask[]
+}
+
+// ─── 认证令牌族（每次登录 / 每台设备独立） ───
+// JWT 只携带 familyId + generation + raw jti；数据库只保存 jti 的 SHA-256，绝不保存
+// 可直接重放的 JWT。refresh 以 (familyId, generation, currentJtiHash) 做 CAS，保证同一叶子
+// 只能消费一次；logout/reuse 只撤当前 family，不影响该用户其他设备。
+// legacyJtiHash 仅保留作 schema 向后兼容；安全 cutover 后 verifier 不接受或迁移无 family JWT。
+model AuthTokenFamily {
+  id               String    @id
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  currentJtiHash   String    @unique @db.Char(64)
+  legacyJtiHash    String?   @unique @db.Char(64)
+  generation       Int       @default(0)
+  sessionStartedAt DateTime
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  revokedReason    String?   @db.VarChar(64)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
 }
 
 // ─── 邮件令牌（邮箱验证 / 密码重置） ───
@@ -162,6 +186,9 @@ model Session {
   fullTranscribeStatus      String?
   fullTranscribeError       String?   @db.Text
   fullTranscribeStartedAt   DateTime?
+  // 每次触发生成随机 attempt id；所有后台状态 CAS 都携带它，防止被回收的旧 worker
+  // 在新一轮任务启动后误推进/覆盖新任务状态。
+  fullTranscribeClaimId     String?   @db.VarChar(64)
   fullSonioxFileId          String?
   fullSonioxTranscriptionId String?
   // R4：完整版补全转录入口的原子配额预留分钟（与 B1 的 asyncReservedMinutes 平行）。
@@ -219,10 +246,13 @@ model FolderKeyword {
 }
 
 model FolderSession {
-  folderId  String
-  folder    Folder  @relation(fields: [folderId], references: [id])
-  sessionId String
-  session   Session @relation(fields: [sessionId], references: [id])
+  folderId                  String
+  folder                    Folder   @relation(fields: [folderId], references: [id])
+  sessionId                 String
+  session                   Session  @relation(fields: [sessionId], references: [id])
+  // 同一 transcript+模型版本的自动关键词正结果或有效否定不会反复付费。
+  folderKeywordSourceHash   String?  @db.VarChar(64)
+  folderKeywordGeneratedAt DateTime?
 
   @@id([folderId, sessionId])
   @@index([sessionId])
@@ -309,6 +339,27 @@ model InterpretUsage {
   chargedAt     DateTime @default(now()) // 扣费时刻，对账按 quotaResetAt 周期窗口截断
 
   @@index([userId, chargedAt])
+}
+
+// SEC-030：所有真实转录扣费的不可变逐笔台账。Session.billedMinutes 是会话生命周期上的
+// 累计兼容字段，既会随 Session 物理删除而消失，也只有一个“最后扣费时间”，无法把跨周期的
+// 多笔扣费准确分期；因此对账不得再把它当真源。每次 User.transcriptionMinutesUsed increment
+// 都必须在同一事务插入一行本表。userId/referenceId 为审计冗余，不建外键，避免删除用户/会话
+// 时级联抹掉财务证据。
+model TranscriptionCharge {
+  id              String   @id
+  userId          String
+  source          String   @db.VarChar(64)
+  referenceId     String?
+  minutes         Int
+  chargedAt       DateTime @default(now())
+  // 升级切换时，存量 User counter 无法从累计 Session 字段可靠拆到各周期。迁移会为存量用户写
+  // 一笔 opening balance 并标记歧义；只要该行仍在当前周期，管理员修复必须 fail-closed。
+  legacyAmbiguous Boolean  @default(false)
+  createdAt       DateTime @default(now())
+
+  @@index([userId, chargedAt])
+  @@index([referenceId])
 }
 
 // B3：同声传译的服务端持久化会话。interpret 是浏览器直连 Soniox，服务端只在 /start 与 /deduct
@@ -462,24 +513,30 @@ model LlmModel {
 
 // ─── 后台任务队列 ───
 model JobQueue {
-  id          String    @id @default(cuid())
-  type        String // keyword_extraction, report_generation, quota_reset, stale_session_reclaim, reconciliation, storage_cleanup, storage_migration, billing_maintenance
-  status      String    @default("SUBMITTED") // SUBMITTED | PENDING | PROCESSING | SUCCESS | FAILED
-  params      String?   @db.Text // JSON 格式的任务参数
-  result      String?   @db.Text // JSON 格式的结果摘要
-  error       String?   @db.Text // 失败时的错误信息
-  sessionId   String? // 关联的会话 ID
-  userId      String? // 关联的用户 ID
-  triggeredBy String? // "system" | "admin:{userId}"
-  attempt     Int       @default(1) // 当前尝试次数
-  maxAttempts Int       @default(1) // 最大重试次数
-  createdAt   DateTime  @default(now())
-  startedAt   DateTime? // 开始处理时间
-  completedAt DateTime? // 处理完成时间
-  // P5-16：活跃任务互斥键，形如 "audio_enhance:{sessionId}"。仅在非终态时持有，落终态即置 null。
-  // MySQL 允许 NULL 重复，故这一列的 @unique 天然等价于「每个 key 至多一个活跃任务」的部分唯一索引，
-  // 把 check-then-act 的幂等判定收敛成一次插入冲突。
-  activeKey   String?   @unique
+  id            String    @id @default(cuid())
+  type          String // keyword_extraction, report_generation, quota_reset, stale_session_reclaim, reconciliation, storage_cleanup, storage_migration, billing_maintenance
+  status        String    @default("SUBMITTED") // SUBMITTED | PENDING | PROCESSING | SUCCESS | FAILED
+  params        String?   @db.Text // JSON 格式的任务参数
+  result        String?   @db.Text // JSON 格式的结果摘要
+  error         String?   @db.Text // 失败时的错误信息
+  sessionId     String? // 关联的会话 ID
+  userId        String? // 关联的用户 ID
+  triggeredBy   String? // "system" | "admin:{userId}"
+  attempt       Int       @default(1) // 当前尝试次数
+  maxAttempts   Int       @default(1) // 最大重试次数
+  createdAt     DateTime  @default(now())
+  startedAt     DateTime? // 开始处理时间
+  completedAt   DateTime? // 处理完成时间
+  // P5-16：任务互斥/幂等键，形如 "audio_enhance:{sessionId}"。普通任务仅在
+  // 非终态时持有；需要持久结果重放的资源任务可在 SUCCESS 后继续持有，直到账本清理。
+  // MySQL 允许 NULL 重复，@unique 把 check-then-act 收敛成一次插入冲突。
+  activeKey     String?   @unique
+  // 跨进程资源预留：scope 决定单位语义（如 llm_tokens）。非终态行的
+  // reservedUnits 是当前持有的 durable lease；终态 CAS 写 actualUnits 后释放未用部分，
+  // actualUnits 作为窗口内已消耗额继续占用 token/费用预算。
+  resourceScope String?
+  reservedUnits BigInt    @default(0)
+  actualUnits   BigInt?
 
   @@index([type])
   @@index([status])
@@ -487,6 +544,9 @@ model JobQueue {
   @@index([createdAt])
   @@index([userId])
   @@index([userId, status])
+  @@index([resourceScope, status, completedAt])
+  @@index([resourceScope, userId, status, completedAt])
+  @@index([resourceScope, type, sessionId, status])
 }
 
 // ─── Chat 对话历史（每次录音可有多个 Conversation，"新建对话"即关闭旧的开新的） ───
@@ -559,6 +619,13 @@ model ChatAttachment {
   bytes             BigInt // 文件大小，配额扣减依据
   cloudrevePath     String // /{userId}/chat-uploads/{conversationId}/{filename}
   extractedTextPath String? // 仅 document 类，抽取出的 .txt 在 Cloudreve 的路径
+  // UPLOAD = 用户显式上传，会出现在附件选择器；INLINE = 消息内联图片，
+  // 仅供历史消息回放/删除/配额追踪，不得进入通用附件选择器。
+  source            String       @default("UPLOAD") @db.VarChar(16)
+  // 指向同一物理对象的统一字节账本行；历史行由数据回填脚本补齐。
+  storedArtifactId  String?      @unique @db.VarChar(191)
+  // 只有未发布/孤儿内联图设 TTL；已被消息引用的 ACTIVE 图片保持 null。
+  expiresAt         DateTime?
   createdAt         DateTime     @default(now())
   lastAccessedAt    DateTime     @default(now()) // 用于 LRU 清理
 
@@ -566,6 +633,46 @@ model ChatAttachment {
   @@index([userId])
   @@index([createdAt])
   @@index([userId, lastAccessedAt])
+  @@index([conversationId, source])
+  @@index([source, expiresAt])
+}
+
+// ─── 统一持久 artifact 字节账本（SEC-009/013/016/019 共享真源） ───
+// 所有物理持久对象必须先建 RESERVED 行并原子预留 User.storageBytesUsed，
+// 写入后按实际字节结算为 ACTIVE；失败、替换和删除均通过同一行幂等释放。
+// owner/session/conversation 字段故意不建 cascade FK：owner 行先被删时，账本仍能
+// 保留物理引用和收费事实，由孤儿清理将其收敛到 DELETED。
+model StoredArtifact {
+  id                 String    @id @default(cuid())
+  userId             String    @db.VarChar(191)
+  ownerType          String    @db.VarChar(32) // session | conversation | chat_attachment | draft
+  ownerId            String    @db.VarChar(191)
+  sessionId          String?   @db.VarChar(191)
+  conversationId     String?   @db.VarChar(191)
+  artifactType       String    @db.VarChar(48)
+  storage            String    @db.VarChar(16) // local | cloudreve | pending
+  reference          String?   @db.VarChar(768)
+  state              String    @default("RESERVED") @db.VarChar(16)
+  bytes              BigInt    @default(0)
+  // 只有 billable live 行（RESERVED/ACTIVE/ORPHANED）为正数；终态必须归零。
+  chargedBytes       BigInt    @default(0)
+  // 逻辑槽唯一键，仅 ACTIVE 行持有；MySQL 允许多个 NULL，因此等价于部分唯一索引。
+  identityKey        String?   @unique @db.VarChar(191)
+  logicalKey         String    @db.VarChar(191)
+  // 调用方生成的稳定幂等键，网络重试不得重复预留。
+  reservationKey     String    @unique @db.VarChar(191)
+  replacesArtifactId String?   @db.VarChar(191)
+  expiresAt          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  deletedAt          DateTime?
+
+  @@index([userId, state])
+  @@index([ownerType, ownerId, state])
+  @@index([sessionId, state, artifactType])
+  @@index([conversationId, state, artifactType])
+  @@index([logicalKey, state])
+  @@index([state, expiresAt])
 }
 
 // ─── 充值系统：档位（会员卡 / 时间包 / 充值面额），admin CRUD ───
@@ -594,27 +701,207 @@ model RechargeTier {
 // verifyCallback 验签后按 outTradeNo 认领（status pending→paid 的条件原子 CAS，恰好一次），认领成功才
 // 加余额/发放档位。重复回调因 CAS 失败而无副作用（幂等）。userId 为冗余列、不建 relation（同 InterpretUsage）。
 model PaymentOrder {
-  id           String    @id @default(cuid())
-  userId       String
-  provider     String // 'alipay' | 'wechat' | 'stripe' | 'sandbox'
-  kind         String // 'topup'（充值到余额）| 'purchase'（直接买档位）
-  tierId       String? // kind='purchase' 时指向档位
-  outTradeNo   String    @unique // 我方订单号（传给网关、回调据此认领）
-  providerRef  String? // 网关侧订单号/流水号（审计）
-  amountCents  Int // 应付金额（分）
+  id              String @id @default(cuid())
+  userId          String
+  provider        String // 'alipay' | 'wechat' | 'stripe' | 'sandbox'
+  providerMode    String @default("unknown") // live | test | sandbox；与对象映射共同隔离环境
+  providerAccount String @default("default") // appId / mchId / Connect account；不保存密钥
+  kind            String // 'topup'（充值到余额）| 'purchase'（直接买档位）
+  tierId          String? // kind='purchase' 时指向档位
+  outTradeNo      String @unique // 我方订单号（传给网关、回调据此认领）
+  providerRef     String? // 兼容旧查询的主要网关引用
+  // Stripe Checkout / PaymentIntent / Charge 必须分别持久化。providerRef 单列无法从
+  // charge.refunded / dispute 的对象引用稳定反查我方订单。
+  providerCheckoutSessionRef String?
+  providerPaymentIntentRef   String?
+  providerChargeRef          String?
+  amountCents                Int // 应付金额（分）
   // P3-15：下单时锁定的 ISO-4217 币种码（大写）。回调必须比对 (amount, currency) 二元组——
   // 只比金额时 Stripe 侧「¥39 当成 $39」这类跨币种套利会静默过账。历史行只有金额，默认 CNY。
   currency     String    @default("CNY")
-  status       String    @default("pending") // pending | paid | failed | expired | canceled | refunded
+  status       String    @default("pending") // pending | paid | late_paid | failed | expired | canceled | refunded
   paidAt       DateTime?
   // P3-16：退款/拒付到账时刻。非 null 即表示这笔订单已被反向，权益应已冻结。
   refundedAt   DateTime?
+  // SEC-027：发放状态是数据库一等状态，不再把 grantedAt 塞进可变 metadata 做跨事务 CAS。
+  // 所有状态推进都在 PaymentOrder FOR UPDATE + User FOR UPDATE 的同一事务内完成。
+  fulfillmentStatus    String    @default("pending") @db.VarChar(32) // pending | processing | fulfilled | reversed | review
+  fulfillmentStartedAt DateTime?
+  fulfilledAt          DateTime?
+  fulfillmentError     String?   @db.Text
+  reviewReason         String?   @db.VarChar(191)
   metadataJson String?   @db.Text // 快照（档位内容/赠送等），审计
   createdAt    DateTime  @default(now())
   expiresAt    DateTime? // 超时未支付则由 cron 置 expired
 
   @@index([userId, createdAt])
   @@index([status, expiresAt])
+  @@index([provider, providerMode, providerAccount, providerRef], map: "payment_order_provider_ref_idx")
+  @@index([provider, providerMode, providerAccount, providerPaymentIntentRef], map: "payment_order_pi_ref_idx")
+  @@index([provider, providerMode, providerAccount, providerChargeRef], map: "payment_order_charge_ref_idx")
+  @@index([fulfillmentStatus, createdAt], map: "payment_order_fulfillment_idx")
+}
+
+// ─── 支付回调 durable inbox（SEC-026） ───
+// 只保存验签后、裁剪过的归一化业务字段，不保存签名头、API key 或完整原始报文。上层在成功 ACK
+// 之前必须先写入此表；未知对象保持 review/failed，供网关重投与人工处置，绝不静默吞掉。
+model PaymentWebhookEvent {
+  id              String    @id @default(cuid())
+  provider        String    @db.VarChar(32)
+  providerMode    String    @db.VarChar(16)
+  providerAccount String    @db.VarChar(191)
+  eventId         String    @db.VarChar(191)
+  eventType       String    @db.VarChar(191)
+  objectType      String?   @db.VarChar(64)
+  objectId        String?   @db.VarChar(191)
+  outTradeNo      String?   @db.VarChar(191)
+  payloadJson     String    @db.Text // <=16KiB，由写入 helper 强制；仅归一化字段
+  payloadSha256   String    @db.Char(64)
+  status          String    @default("received") @db.VarChar(32) // received | processing | processed | review | failed
+  attempts        Int       @default(0)
+  lastError       String?   @db.Text
+  receivedAt      DateTime  @default(now())
+  processedAt     DateTime?
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([provider, providerMode, providerAccount, eventId], map: "payment_webhook_event_identity_key")
+  @@index([status, receivedAt], map: "payment_webhook_status_received_idx")
+  @@index([provider, providerMode, providerAccount, objectType, objectId], map: "payment_webhook_object_idx")
+  @@index([outTradeNo], map: "payment_webhook_out_trade_no_idx")
+}
+
+// 网关对象到 PaymentOrder 的 durable 映射。唯一键必须含 provider+mode+account+type，避免
+// Stripe test/live、Connect 多账户或不同网关恰好复用相同 object id 时串单。
+model PaymentProviderObject {
+  id              String   @id @default(cuid())
+  provider        String   @db.VarChar(32)
+  providerMode    String   @db.VarChar(16)
+  providerAccount String   @db.VarChar(191)
+  objectType      String   @db.VarChar(64)
+  objectId        String   @db.VarChar(191)
+  orderId         String
+  firstEventId    String?  @db.VarChar(191)
+  createdAt       DateTime @default(now())
+  lastSeenAt      DateTime @updatedAt
+
+  @@unique([provider, providerMode, providerAccount, objectType, objectId], map: "payment_provider_object_identity_key")
+  @@index([orderId], map: "payment_provider_object_order_idx")
+}
+
+// 自动定位或安全反向失败时的人工复核队列。dedupeKey 使网关重复投递只产生一个 case。
+model PaymentReviewCase {
+  id             String    @id @default(cuid())
+  dedupeKey      String    @unique @db.Char(64)
+  userId         String?
+  orderId        String?
+  webhookEventId String?
+  reason         String    @db.VarChar(191)
+  detailJson     String?   @db.Text
+  status         String    @default("open") @db.VarChar(32) // open | resolved | dismissed
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  resolvedAt     DateTime?
+
+  @@index([status, createdAt], map: "payment_review_status_created_idx")
+  @@index([orderId], map: "payment_review_order_idx")
+  @@index([webhookEventId], map: "payment_review_webhook_idx")
+}
+
+// 每笔会员/分钟发放的可组合来源。反向流程先锁订单、再锁用户并锁此行，按 totalUnits/revokedUnits
+// 增量撤销，避免两笔并发退款都从同一个 roleExpiresAt 快照回写导致少减一期。
+model PaymentEntitlement {
+  id                  String    @id @default(cuid())
+  userId              String
+  sourceOrderId       String?
+  walletTransactionId String    @unique
+  kind                String    @db.VarChar(32) // membership | minutes
+  grantRole           String?   @db.VarChar(32)
+  totalUnits          Int       @db.UnsignedInt // membership=天，minutes=分钟
+  revokedUnits        Int       @default(0) @db.UnsignedInt
+  priceCents          Int       @db.UnsignedInt
+  status              String    @default("active") @db.VarChar(32) // active | partially_reversed | reversed | review
+  grantedAt           DateTime  @default(now())
+  reversedAt          DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([sourceOrderId], map: "payment_entitlement_order_idx")
+  @@index([userId, status, grantedAt], map: "payment_entitlement_user_status_idx")
+}
+
+// 每一笔进入钱包的资金都形成独立 lot；remainingCents 只随真实消费分配递减。
+// 退款/拒付只收回该 lot 尚未消费的余额，并沿 allocations 追缴下游权益，绝不粗暴扣整笔钱包。
+model WalletFundingLot {
+  id                  String    @id @default(cuid())
+  userId              String
+  sourceOrderId       String?   @unique
+  sourceTransactionId String?   @unique
+  sourceKind          String    @db.VarChar(32) // payment | admin | service_refund | legacy_unattributed
+  originalCents       Int       @db.UnsignedInt
+  remainingCents      Int       @db.UnsignedInt
+  reversedCents       Int       @default(0) @db.UnsignedInt
+  status              String    @default("active") @db.VarChar(32) // active | reversed | review
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  reversedAt          DateTime?
+
+  @@index([userId, status, createdAt], map: "wallet_funding_lot_user_status_idx")
+}
+
+// 消费按 FIFO 从一个或多个 lot 分配；entitlementUnits 在购买时一次性按金额比例切分，
+// 以后反向无需重新猜测价格/时长比例。每个 (lot, spend tx) 至多一条，重复回调不会双扣。
+model WalletFundingAllocation {
+  id                 String    @id @default(cuid())
+  fundingLotId       String
+  userId             String
+  spendTransactionId String
+  entitlementId      String?
+  targetKind         String    @db.VarChar(32) // membership | minutes | service | legacy
+  amountCents        Int       @db.UnsignedInt
+  entitlementUnits   Int       @default(0) @db.UnsignedInt
+  recoveredUnits     Int       @default(0) @db.UnsignedInt
+  debtCents          Int       @default(0) @db.UnsignedInt
+  reversedAt         DateTime?
+  createdAt          DateTime  @default(now())
+
+  @@unique([fundingLotId, spendTransactionId], map: "wallet_funding_allocation_identity_key")
+  @@index([spendTransactionId], map: "wallet_funding_allocation_spend_idx")
+  @@index([entitlementId], map: "wallet_funding_allocation_entitlement_idx")
+}
+
+// 已消费、无法从当前钱包/权益完整追回的拒付金额。债务只增不把 walletBalanceCents 写成负数。
+model PaymentDebt {
+  id             String    @id @default(cuid())
+  userId         String
+  sourceOrderId  String
+  sourceLotId    String?
+  amountCents    Int       @db.UnsignedInt
+  recoveredCents Int       @default(0) @db.UnsignedInt
+  reason         String    @db.VarChar(191)
+  status         String    @default("open") @db.VarChar(32) // open | resolved | waived
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  resolvedAt     DateTime?
+
+  @@unique([sourceOrderId, reason], map: "payment_debt_source_reason_key")
+  @@index([userId, status], map: "payment_debt_user_status_idx")
+}
+
+// 账户冻结独立于 User，避免与并行认证 schema 冲突；所有钱包下单/消费入口查询 active hold。
+model PaymentAccountHold {
+  id            String    @id @default(cuid())
+  dedupeKey     String    @unique @db.Char(64)
+  userId        String
+  sourceOrderId String?
+  debtId        String?
+  reason        String    @db.VarChar(191)
+  status        String    @default("active") @db.VarChar(32) // active | released
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  releasedAt    DateTime?
+
+  @@index([userId, status], map: "payment_account_hold_user_status_idx")
+  @@index([sourceOrderId], map: "payment_account_hold_order_idx")
 }
 
 // ─── 充值系统：钱包台账（进账出账统一账本） ───
@@ -686,6 +973,9 @@ model TranslationTask {
   llmInputTokens  Int       @default(0)
   llmOutputTokens Int       @default(0)
   proxyTokenHash  String?   @unique // sha256(任务级 LLM 代理 token)
+  // 每次 JobQueue claim 都换新；同一调度行自动回炉时也能区分新旧 dispatch。
+  // token 签发、代理准入、用量结算与收割均必须携带该代次。
+  proxyGeneration String?   @db.VarChar(64)
   workerId        String? // 派发绑定的 TranslationWorker id（审计）
   jobQueueId      String? // 关联 JobQueue 行
   errorMessage    String?   @db.Text

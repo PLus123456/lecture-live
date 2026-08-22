@@ -5,8 +5,14 @@ import type {
   CreateChargeResult,
   CallbackResult,
   CallbackAck,
+  PaymentProviderMode,
 } from '@/lib/payment/types';
 import type { RechargeSettings } from '@/lib/payment/settings';
+import {
+  getStripeKeyMode,
+  isStripeEventModeAllowed,
+  isStripeKeyAllowedForEnvironment,
+} from '@/lib/payment/stripeMode';
 
 /**
  * Stripe 渠道（Checkout Session + Webhook）。用 REST API 直连（不引入 stripe SDK 依赖）：
@@ -18,15 +24,23 @@ import type { RechargeSettings } from '@/lib/payment/settings';
  */
 export class StripeProvider implements PaymentProvider {
   readonly name = 'stripe' as const;
+  readonly mode: PaymentProviderMode;
+  readonly account = 'default';
   private readonly secretKey: string;
   private readonly webhookSecret: string;
 
   constructor(s: RechargeSettings) {
     this.secretKey = s.stripeSecretKey;
     this.webhookSecret = s.stripeWebhookSecret;
+    this.mode = getStripeKeyMode(this.secretKey) ?? 'unknown';
   }
 
   async createCharge(params: CreateChargeParams): Promise<CreateChargeResult> {
+    // SEC-024 纵深门禁：即使调用方绕过 provider 装配，生产 test/未知 key 也不得发起下单。
+    if (!isStripeKeyAllowedForEnvironment(this.secretKey)) {
+      throw new Error('Stripe createCharge: production requires a live mode key');
+    }
+
     // P3-15：币种由 checkout 显式传入（来自充值配置的 ISO-4217 码），不再从货币符号猜。
     const currency = params.currency.trim().toLowerCase();
     if (!/^[a-z]{3}$/.test(currency)) {
@@ -38,6 +52,10 @@ export class StripeProvider implements PaymentProvider {
     form.set('cancel_url', appendQuery(params.returnUrl, 'recharge', 'cancel'));
     form.set('client_reference_id', params.outTradeNo);
     form.set('metadata[out_trade_no]', params.outTradeNo);
+    // Checkout Session metadata is not sufficient for charge.refunded/dispute correlation.
+    // Copy our immutable order number to the PaymentIntent so downstream Charge/Dispute
+    // objects can carry or be linked back to the same order.
+    form.set('payment_intent_data[metadata][out_trade_no]', params.outTradeNo);
     form.set('line_items[0][price_data][currency]', currency);
     form.set('line_items[0][price_data][product_data][name]', params.subject);
     // unit_amount 为最小货币单位（分/cent），与我们存储的 amountCents 同口径。
@@ -56,7 +74,13 @@ export class StripeProvider implements PaymentProvider {
     if (!res.ok || !data.url) {
       throw new Error(`Stripe createCharge failed: ${data.error?.message ?? res.status}`);
     }
-    return { payUrl: data.url, providerRef: data.id };
+    return {
+      payUrl: data.url,
+      providerRef: data.id,
+      objectRefs: data.id
+        ? [{ objectType: 'checkout_session', objectId: data.id }]
+        : undefined,
+    };
   }
 
   async verifyCallback(req: Request, rawBody: string): Promise<CallbackResult | null> {
@@ -76,15 +100,28 @@ export class StripeProvider implements PaymentProvider {
     }
 
     let event: {
+      id?: string;
       type?: string;
       livemode?: boolean;
+      account?: string;
+      created?: number;
       data?: {
         object?: {
+          id?: string;
+          object?: string;
           client_reference_id?: string;
           metadata?: Record<string, string>;
           payment_status?: string;
+          status?: string;
           amount_total?: number;
+          amount_received?: number;
+          amount?: number;
+          amount_refunded?: number;
+          refunded?: boolean;
           currency?: string;
+          payment_intent?: string | { id?: string };
+          latest_charge?: string | { id?: string };
+          charge?: string | { id?: string };
         };
       };
     };
@@ -94,44 +131,130 @@ export class StripeProvider implements PaymentProvider {
       return null;
     }
 
-    // P3-4：live 密钥下只接受 livemode 事件。逐字段独立 upsert +「掩码=保持原值」使得
-    // 「把 sk_test 换成 sk_live 但 webhook 密钥没换」是一次正常保存动作 → 生产环境里
-    // 唯一验得过签名的反而是测试卡事件（真实支付因验签失败永远不到账）。
-    if (this.secretKey.startsWith('sk_live_') && event.livemode !== true) return null;
+    // SEC-024：签名体中的 livemode 必须与 sk/rk key 模式同侧；生产更只接受 live/live。
+    // 这同时封住「live API key + test webhook secret」以及直接在生产装配 test key 的路径。
+    if (!isStripeEventModeAllowed(this.secretKey, event.livemode)) return null;
 
     const obj = event.data?.object;
     if (!obj) return null;
     const outTradeNo = obj.client_reference_id || obj.metadata?.out_trade_no || '';
+    const providerMode = event.livemode === true ? 'live' : 'test';
+    const providerAccount = event.account?.trim() || 'default';
+    const primaryObjectType = normalizeStripeObjectType(obj.object, obj.id, event.type);
+    const paymentIntentId = objectId(obj.payment_intent);
+    const chargeId = objectId(obj.charge) || objectId(obj.latest_charge);
+    const objectRefs = uniqueObjectRefs([
+      obj.id && primaryObjectType
+        ? { objectType: primaryObjectType, objectId: obj.id }
+        : null,
+      paymentIntentId
+        ? { objectType: 'payment_intent', objectId: paymentIntentId }
+        : null,
+      chargeId ? { objectType: 'charge', objectId: chargeId } : null,
+    ]);
+    const occurredAt =
+      typeof event.created === 'number' && Number.isFinite(event.created)
+        ? new Date(event.created * 1000)
+        : undefined;
 
     // P3-16：退款 / 拒付 / 争议 → 反向流程（冻结权益 + 告警），绝不到账。
     // charge 对象上没有 client_reference_id，订单号只能从 metadata 取（createCharge 已写入）。
     // 拒付事件的 data.object 是 Dispute（自带 metadata，通常拿不到我方订单号）→ outTradeNo
     // 可能为空。此时仍标 reversal，由反向处理器记「无法定位订单」的告警，绝不静默吞掉。
-    if (REVERSAL_EVENT_TYPES.has(event.type ?? '')) {
+    const eventType = event.type ?? '';
+    const lifecycle = stripeReversalLifecycle(eventType, obj.status);
+    if (lifecycle) {
+      const refundResource = REFUND_RESOURCE_EVENT_TYPES.has(eventType);
+      const reversalAmountCents =
+        eventType === 'charge.refunded'
+          ? obj.amount_refunded
+          : obj.amount;
+      const fullReversal =
+        eventType === 'charge.refunded'
+          ? obj.refunded === true &&
+            Number.isSafeInteger(obj.amount) &&
+            Number.isSafeInteger(obj.amount_refunded) &&
+            obj.amount_refunded === obj.amount
+          : lifecycle === 'pending'
+            ? false
+            : undefined;
+      const reversal = lifecycle !== 'reinstated';
       return {
         outTradeNo,
         paid: false,
-        reversal: true,
+        reversal,
+        reversalAmountCents,
+        fullReversal,
+        reversalState: lifecycle,
+        ...(lifecycle === 'reinstated' ? { acknowledged: true } : {}),
         currency: normalizeCurrency(obj.currency),
-        rawStatus: event.type,
+        providerRef: obj.id,
+        rawStatus: `${eventType}:${obj.status ?? (refundResource ? 'unknown' : 'unknown')}`,
+        eventId: event.id,
+        eventType,
+        providerMode,
+        providerAccount,
+        occurredAt,
+        objectRefs,
       };
     }
 
-    if (!outTradeNo) return null;
+    const knownHarmlessNoop =
+      HARMLESS_NOOP_EVENT_TYPES.has(eventType) ||
+      (eventType === 'checkout.session.completed' && obj.payment_status !== 'paid');
 
-    // checkout.session.completed 且 payment_status='paid' 视为成功。
+    // A signed event with no local reference is still returned so the route can durably retain
+    // and review it. Only a narrowly enumerated terminal/no-op type may carry `acknowledged`;
+    // treating every future Stripe type as harmless would silently ACK new reversal semantics.
+    if (!outTradeNo) {
+      return {
+        outTradeNo: '',
+        paid: false,
+        ...(knownHarmlessNoop ? { acknowledged: true } : {}),
+        providerRef: obj.id,
+        rawStatus: event.type,
+        eventId: event.id,
+        eventType: event.type,
+        providerMode,
+        providerAccount,
+        occurredAt,
+        objectRefs,
+      };
+    }
+
+    // Checkout 的延迟支付方式会先发 completed(unpaid)，之后再发
+    // async_payment_succeeded。PaymentIntent 成功事件也是可靠的备用结算源；三者都要求
+    // 明确的 paid/succeeded 状态，未知值不猜测。
     const paid =
-      event.type === 'checkout.session.completed' && obj.payment_status === 'paid';
+      ((event.type === 'checkout.session.completed' ||
+        event.type === 'checkout.session.async_payment_succeeded') &&
+        obj.payment_status === 'paid') ||
+      (event.type === 'payment_intent.succeeded' && obj.status === 'succeeded');
     // amount_total 为最小货币单位（分/cent），与订单 amountCents 同口径，供上层对账。
     const amountCents =
-      typeof obj.amount_total === 'number' ? obj.amount_total : undefined;
+      typeof obj.amount_total === 'number'
+        ? obj.amount_total
+        : typeof obj.amount_received === 'number'
+          ? obj.amount_received
+          : typeof obj.amount === 'number'
+            ? obj.amount
+            : undefined;
     return {
       outTradeNo,
       paid,
       amountCents,
       // Stripe 回报的 currency 是小写码 → 统一成大写 ISO-4217 供上层比二元组（P3-15）。
       currency: normalizeCurrency(obj.currency),
+      providerRef: obj.id,
       rawStatus: event.type,
+      eventId: event.id,
+      eventType: event.type,
+      providerMode,
+      providerAccount,
+      occurredAt,
+      objectRefs,
+      // Only explicitly understood terminal/no-op events are safe to ACK.
+      ...(!paid && knownHarmlessNoop ? { acknowledged: true } : {}),
     };
   }
 
@@ -145,12 +268,83 @@ export class StripeProvider implements PaymentProvider {
   }
 }
 
-/**
- * 需要走反向流程的 Stripe 事件类型（退款 / 争议）。
- * 刻意只收「已发生」的两个：`charge.refund.updated` 之类可能描述一次**失败**的退款，
- * 据此冻结权益会误伤。
- */
-const REVERSAL_EVENT_TYPES = new Set(['charge.refunded', 'charge.dispute.created']);
+/** Stripe refund/dispute lifecycle events. Pending states freeze; terminal states settle them. */
+const REFUND_RESOURCE_EVENT_TYPES = new Set([
+  'refund.created',
+  'refund.failed',
+  'refund.updated',
+  'charge.refund.updated',
+]);
+const DISPUTE_EVENT_TYPES = new Set([
+  'charge.dispute.created',
+  'charge.dispute.updated',
+  'charge.dispute.closed',
+  'charge.dispute.funds_withdrawn',
+  'charge.dispute.funds_reinstated',
+]);
+
+function stripeReversalLifecycle(
+  eventType: string,
+  objectStatus: string | undefined
+): 'pending' | 'withdrawn' | 'reinstated' | null {
+  if (eventType === 'charge.refunded') return 'withdrawn';
+  if (REFUND_RESOURCE_EVENT_TYPES.has(eventType)) {
+    if (objectStatus === 'succeeded') return 'withdrawn';
+    if (objectStatus === 'failed' || objectStatus === 'canceled') return 'reinstated';
+    return 'pending';
+  }
+  if (DISPUTE_EVENT_TYPES.has(eventType)) {
+    if (objectStatus === 'lost') return 'withdrawn';
+    if (
+      objectStatus === 'won' ||
+      objectStatus === 'warning_closed' ||
+      eventType === 'charge.dispute.funds_reinstated'
+    ) {
+      return 'reinstated';
+    }
+    return 'pending';
+  }
+  return null;
+}
+
+/** Signed Stripe events whose terminal semantics cannot grant or revoke local value. */
+const HARMLESS_NOOP_EVENT_TYPES = new Set([
+  'checkout.session.async_payment_failed',
+  'checkout.session.expired',
+  'payment_intent.canceled',
+  'payment_intent.payment_failed',
+]);
+
+function objectId(value: string | { id?: string } | undefined): string | undefined {
+  return typeof value === 'string' ? value : value?.id;
+}
+
+function normalizeStripeObjectType(
+  declared: string | undefined,
+  id: string | undefined,
+  eventType: string | undefined
+): string | undefined {
+  if (declared === 'checkout.session') return 'checkout_session';
+  if (declared) return declared.replace(/\./g, '_');
+  if (id?.startsWith('cs_')) return 'checkout_session';
+  if (id?.startsWith('pi_')) return 'payment_intent';
+  if (id?.startsWith('ch_')) return 'charge';
+  if (id?.startsWith('dp_')) return 'dispute';
+  return eventType?.split('.')[0]?.replace(/\./g, '_');
+}
+
+function uniqueObjectRefs(
+  refs: Array<{ objectType: string; objectId: string } | null>
+): Array<{ objectType: string; objectId: string }> {
+  const seen = new Set<string>();
+  return refs.filter((ref): ref is { objectType: string; objectId: string } => {
+    if (!ref) return false;
+    const key = `${ref.objectType}:${ref.objectId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 function normalizeCurrency(v: string | undefined): string | undefined {
   return v ? v.trim().toUpperCase() : undefined;

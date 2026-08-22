@@ -66,7 +66,7 @@ export async function loadCloudreveContext(): Promise<CloudreveDeleteContext | n
 export async function deleteCloudreveFile(
   remotePath: string,
   ctx: CloudreveDeleteContext
-): Promise<void> {
+): Promise<boolean> {
   try {
     const fileUri = remotePath.startsWith('/')
       ? `cloudreve://my${remotePath}`
@@ -83,17 +83,24 @@ export async function deleteCloudreveFile(
       signal: AbortSignal.timeout(CLOUDREVE_DELETE_TIMEOUT_MS),
     });
 
+    // 幂等删除：远端已不存在与本次删除成功等价。
+    if (response.status === 404) {
+      return true;
+    }
     if (!response.ok) {
       fileLogger.warn(
         { remotePath, status: response.status },
         'Cloudreve DELETE non-2xx; 残留由清理工具兜底'
       );
+      return false;
     }
+    return true;
   } catch (err) {
     fileLogger.warn(
       { remotePath, err: serializeError(err) },
       'Cloudreve DELETE threw; 残留由清理工具兜底'
     );
+    return false;
   }
 }
 
@@ -113,11 +120,13 @@ export async function deleteCloudreveAttachmentFiles(
   if (attachments.length === 0) return true;
   const ctx = await loadCloudreveContext();
   if (!ctx) return false;
+  let deletedAll = true;
   for (const att of attachments) {
-    await deleteCloudreveFile(att.cloudrevePath, ctx);
+    deletedAll = (await deleteCloudreveFile(att.cloudrevePath, ctx)) && deletedAll;
     if (att.extractedTextPath) {
-      await deleteCloudreveFile(att.extractedTextPath, ctx);
+      deletedAll =
+        (await deleteCloudreveFile(att.extractedTextPath, ctx)) && deletedAll;
     }
   }
-  return true;
+  return deletedAll;
 }

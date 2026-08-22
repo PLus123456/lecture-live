@@ -1,30 +1,47 @@
 // src/lib/liveShare/server.ts
 // 服务端 socket.io 实时分享逻辑
 
-import fs from 'fs/promises';
 import path from 'path';
 import { Server as SocketIO, Socket } from 'socket.io';
 import { prisma } from '@/lib/prisma';
 import { assertWithinRoot, sanitizePath, sanitizeToken } from '@/lib/security';
 import { logger, serializeError } from '@/lib/logger';
 import {
-  EMPTY_STREAMING_PREVIEW_TEXT,
-  EMPTY_STREAMING_PREVIEW_TRANSLATION,
-  normalizePreviewText,
-  normalizePreviewTranslation,
-} from '@/lib/transcriptPreview';
-import {
   CLIENT_SESSION_TOKEN,
+  diagnoseEstablishedAuthFamilyToken,
   extractTokenFromCookieHeader,
   verifyAuthToken,
 } from '@/lib/auth';
-import { loadTranscriptDraft } from '@/lib/transcriptDraftPersistence';
-import type {
-  StreamingPreviewText,
-  StreamingPreviewTranslation,
-} from '@/types/transcript';
+import {
+  BoundedJsonFileError,
+  readJsonFileBounded,
+} from './boundedJsonFile';
+import {
+  canonicalizeLiveSnapshot,
+  createEmptyLiveSnapshot,
+  LiveSnapshotStore,
+  MAX_LIVE_INITIAL_STATE_BYTES_PER_SOCKET,
+  MAX_LIVE_PERSISTED_JSON_BYTES,
+  MAX_LIVE_SNAPSHOT_BYTES,
+  socketIoEventByteLength,
+  type CanonicalLiveSnapshot,
+  type LiveSnapshotPolicyErrorCode,
+} from './snapshotPolicy';
+import {
+  consumeViewerJoinAttempt,
+  createViewerInitialStateBudget,
+  createViewerJoinRateState,
+  parseViewerJoinToken,
+  reserveViewerInitialStateBytes,
+} from './viewerJoinPolicy';
+import { LiveSnapshotGenerationRegistry } from './snapshotGeneration';
 
 const TRANSCRIPT_DIR = path.join(process.cwd(), 'data', 'transcripts');
+const TRANSCRIPT_DRAFT_DIR = path.join(
+  process.cwd(),
+  'data',
+  'transcript-drafts'
+);
 const liveShareLogger = logger.child({ component: 'live-share' });
 
 interface BroadcasterAuthPayload {
@@ -33,32 +50,77 @@ interface BroadcasterAuthPayload {
   shareToken?: string;
 }
 
-interface LiveEventPayload {
-  type: 'transcript_delta' | 'translation_delta' | 'summary_update' | 'status_update' | 'preview_update';
-  payload: unknown;
-  timestamp: number;
+interface EstablishedBroadcasterContext {
+  rawJwt: string;
+  sessionId: string;
+  userId: string;
+  shareToken: string;
+  shareLinkId: string;
+  snapshotGenerationId: string;
+  snapshotGenerationChanged: boolean;
 }
 
-interface LiveSnapshot {
-  segments: unknown[];
-  translations: Record<string, string>;
-  summaryBlocks: unknown[];
-  status: string | null;
-  /** 当前正在说的流式预览文本（临时，不持久化） */
-  previewText: StreamingPreviewText;
-  previewTranslation: StreamingPreviewTranslation;
-  /** 翻译元数据 */
-  sourceLang: string | null;
-  targetLang: string | null;
-  translationMode: string | null;
-  updatedAt: number;
+class BroadcasterAuthLeafExpiredError extends Error {
+  constructor() {
+    super('Broadcaster authentication leaf expired');
+    this.name = 'BroadcasterAuthLeafExpiredError';
+  }
 }
 
-interface ViewerJoinPayload {
-  shareToken?: string;
+interface ActiveBroadcaster {
+  revalidate: (options?: { silent?: boolean }) => Promise<boolean>;
 }
 
-const snapshots = new Map<string, LiveSnapshot>();
+type BroadcasterRegistry = Map<string, Map<string, ActiveBroadcaster>>;
+
+// 内部撤销 HTTP handler 只有 io 实例；用 WeakMap 关联当前进程内的已认证主持人闭包，
+// raw JWT 只留在闭包，不写 socket.data，也不会被 adapter/fetchSockets 序列化出去。
+const activeBroadcastersByServer = new WeakMap<SocketIO, BroadcasterRegistry>();
+
+type LiveSnapshot = CanonicalLiveSnapshot;
+
+const snapshots = new LiveSnapshotStore();
+interface SnapshotLoadEntry {
+  generationId: string;
+  promise: Promise<LiveSnapshot>;
+}
+
+const snapshotLoadPromises = new Map<string, SnapshotLoadEntry>();
+// ShareLink.id 是当前直播分享世代。新链接接管同一 session 时先清掉旧世代的内存/读盘，
+// 防止已撤权 A 主持人的历史或迟到 promise 泄漏给 B 链接的新观众。
+const snapshotGenerations = new LiveSnapshotGenerationRegistry();
+
+function activateSnapshotGeneration(
+  sessionId: string,
+  linkId: string
+): { generationId: string; changed: boolean } {
+  const activated = snapshotGenerations.activate(sessionId, linkId);
+  if (activated.changed) {
+    snapshots.delete(sessionId);
+    snapshotLoadPromises.delete(sessionId);
+  }
+  return activated;
+}
+
+function isActiveSnapshotGeneration(
+  sessionId: string,
+  generationId: string
+): boolean {
+  return snapshotGenerations.isActive(sessionId, generationId);
+}
+
+/** expectedGeneration 不匹配表示新世代已接管；绝不能让旧连接删除新世代状态。 */
+function invalidateSnapshotGeneration(
+  sessionId: string,
+  expectedGeneration?: string
+): boolean {
+  if (!snapshotGenerations.invalidate(sessionId, expectedGeneration)) {
+    return false;
+  }
+  snapshots.delete(sessionId);
+  snapshotLoadPromises.delete(sessionId);
+  return true;
+}
 
 // C3/U11：主播 socket 断开时不立即宣告下线，先给一段宽限期。若主播在窗口内重连
 // （Wi-Fi 切换 / ping 超时导致的瞬断），取消宣告并保留内存快照；只有窗口内未回来
@@ -85,10 +147,12 @@ const SNAPSHOT_SWEEP_INTERVAL_MS = 5 * 60_000; // 每 5 分钟扫一次
 
 async function sweepStaleSnapshots(io: SocketIO) {
   const now = Date.now();
-  for (const [sessionId, snapshot] of snapshots) {
+  for (const [sessionId, snapshot] of snapshots.entries()) {
     if (now - snapshot.updatedAt < SNAPSHOT_TTL_MS) {
       continue;
     }
+    const expectedGeneration = snapshotGenerations.getActiveGenerationId(sessionId);
+    if (!expectedGeneration) continue;
     // 房间内仍有 socket（观众/主播）则保留；仅回收确无成员的僵尸条目。
     let roomEmpty = false;
     try {
@@ -98,104 +162,15 @@ async function sweepStaleSnapshots(io: SocketIO) {
       continue;
     }
     if (roomEmpty && !pendingHostOffline.has(sessionId)) {
-      snapshots.delete(sessionId);
-      liveShareLogger.info(
-        { sessionId, ageMs: now - snapshot.updatedAt },
-        'Reclaimed stale live snapshot with no active room members'
-      );
+      // fetchSockets 期间可能已有新分享世代接管；只允许回收扫描开始时看到的旧世代。
+      if (invalidateSnapshotGeneration(sessionId, expectedGeneration)) {
+        liveShareLogger.info(
+          { sessionId, ageMs: now - snapshot.updatedAt },
+          'Reclaimed stale live snapshot with no active room members'
+        );
+      }
     }
   }
-}
-
-// sync_snapshot / broadcast 快照体量上限：防止主播端（已认证，但可能因 bug 或滥用）
-// 推超大 snapshot 长期驻留服务端内存。maxHttpBufferSize(100KB) 已是消息体硬上限，
-// 这里是防御纵深 + 类型校验——超限截断（而非拒连），正常课堂远达不到此量级。
-const MAX_SNAPSHOT_SEGMENTS = 10_000;
-const MAX_SNAPSHOT_SUMMARY_BLOCKS = 10_000;
-const MAX_SNAPSHOT_TRANSLATIONS = 10_000;
-const MAX_TRANSLATION_LENGTH = 10_000;
-
-// 截断超量数组，保护服务端内存（非数组归一为空数组）
-function clampArray(input: unknown, max: number): unknown[] {
-  if (!Array.isArray(input)) return [];
-  return input.length > max ? input.slice(0, max) : input;
-}
-
-// 单条字符串长度封顶（仅截长度，类型不符时原样返回，由上层处理）
-function clampString(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  return value.length > MAX_TRANSLATION_LENGTH
-    ? value.slice(0, MAX_TRANSLATION_LENGTH)
-    : value;
-}
-
-// 原地截断 transcript segment 的文本字段长度，防止单条 segment.text 撑爆内存。
-// 数组条数已由 clampArray / MAX_SNAPSHOT_SEGMENTS 另行限制，这里只管单条长度。
-function sanitizeSegment(segment: unknown): unknown {
-  if (!segment || typeof segment !== 'object') return segment;
-  const seg = segment as { text?: unknown; translatedText?: unknown };
-  if (typeof seg.text === 'string') {
-    seg.text = clampString(seg.text);
-  }
-  if (typeof seg.translatedText === 'string') {
-    seg.translatedText = clampString(seg.translatedText);
-  }
-  return segment;
-}
-
-// 原地截断 summary block 内各字符串字段长度（summary / keyPoints[*] /
-// definitions 各 value / suggestedQuestions[*]），防止单条快照撑爆内存。
-// 数组/对象条数由 MAX_SNAPSHOT_SUMMARY_BLOCKS 等另行限制，这里只管单条长度。
-function sanitizeSummaryBlock(block: unknown): unknown {
-  if (!block || typeof block !== 'object') return block;
-  const b = block as {
-    summary?: unknown;
-    keyPoints?: unknown;
-    definitions?: unknown;
-    suggestedQuestions?: unknown;
-  };
-
-  if (typeof b.summary === 'string') {
-    b.summary = clampString(b.summary);
-  }
-
-  if (Array.isArray(b.keyPoints)) {
-    for (let i = 0; i < b.keyPoints.length; i += 1) {
-      b.keyPoints[i] = clampString(b.keyPoints[i]);
-    }
-  }
-
-  if (Array.isArray(b.suggestedQuestions)) {
-    for (let i = 0; i < b.suggestedQuestions.length; i += 1) {
-      b.suggestedQuestions[i] = clampString(b.suggestedQuestions[i]);
-    }
-  }
-
-  if (b.definitions && typeof b.definitions === 'object') {
-    const defs = b.definitions as Record<string, unknown>;
-    for (const key of Object.keys(defs)) {
-      defs[key] = clampString(defs[key]);
-    }
-  }
-
-  return block;
-}
-
-// 清洗 sync_snapshot 的 translations：仅接受 string 值，单条长度封顶 + 条目数封顶
-function sanitizeSnapshotTranslations(input: unknown): Record<string, string> {
-  if (!input || typeof input !== 'object') return {};
-  const out: Record<string, string> = {};
-  let count = 0;
-  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-    if (count >= MAX_SNAPSHOT_TRANSLATIONS) break;
-    if (typeof value !== 'string') continue;
-    out[key] =
-      value.length > MAX_TRANSLATION_LENGTH
-        ? value.slice(0, MAX_TRANSLATION_LENGTH)
-        : value;
-    count += 1;
-  }
-  return out;
 }
 
 function getRoomId(sessionId: string) {
@@ -215,21 +190,6 @@ function resolveSocketJwt(socket: Socket, authToken?: string) {
   return extractTokenFromCookieHeader(socket.handshake.headers.cookie);
 }
 
-function buildEmptySnapshot(): LiveSnapshot {
-  return {
-    segments: [],
-    translations: {},
-    summaryBlocks: [],
-    status: null,
-    previewText: EMPTY_STREAMING_PREVIEW_TEXT,
-    previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
-    sourceLang: null,
-    targetLang: null,
-    translationMode: null,
-    updatedAt: Date.now(),
-  };
-}
-
 function readSessionTranscriptPath(sessionId: string) {
   const safeSessionId = sanitizePath(sessionId);
   const fullPath = path.join(TRANSCRIPT_DIR, `${safeSessionId}.json`);
@@ -237,217 +197,147 @@ function readSessionTranscriptPath(sessionId: string) {
   return fullPath;
 }
 
-function buildSnapshotFrom(parsed: {
-  segments?: unknown[];
-  translations?: Record<string, string>;
-  summaries?: unknown[];
-  status?: string;
-}): LiveSnapshot {
+function readSessionTranscriptDraftPath(sessionId: string) {
+  const safeSessionId = sanitizePath(sessionId);
+  const fullPath = path.join(
+    TRANSCRIPT_DRAFT_DIR,
+    safeSessionId,
+    'transcript.json'
+  );
+  assertWithinRoot(fullPath, TRANSCRIPT_DRAFT_DIR);
+  return fullPath;
+}
+
+function toSnapshotCandidate(raw: unknown): Record<string, unknown> {
+  const input =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
   return {
-    segments: Array.isArray(parsed.segments) ? parsed.segments : [],
-    translations:
-      parsed.translations && typeof parsed.translations === 'object'
-        ? parsed.translations
-        : {},
-    summaryBlocks: Array.isArray(parsed.summaries) ? parsed.summaries : [],
-    status: typeof parsed.status === 'string' ? parsed.status : null,
-    previewText: EMPTY_STREAMING_PREVIEW_TEXT,
-    previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
-    sourceLang: null,
-    targetLang: null,
-    translationMode: null,
-    updatedAt: Date.now(),
+    segments: input.segments ?? [],
+    translations: input.translations ?? {},
+    // 正式稿/草稿历史格式使用 summaries；Socket canonical 格式使用 summaryBlocks。
+    summaryBlocks: input.summaryBlocks ?? input.summaries ?? [],
+    status: input.status ?? null,
+    previewText: input.previewText,
+    previewTranslation: input.previewTranslation,
+    sourceLang: input.sourceLang,
+    targetLang: input.targetLang,
+    translationMode: input.translationMode,
   };
+}
+
+async function loadCanonicalSnapshotFile(filePath: string): Promise<LiveSnapshot> {
+  const raw = await readJsonFileBounded(
+    filePath,
+    MAX_LIVE_PERSISTED_JSON_BYTES
+  );
+  const parsed = canonicalizeLiveSnapshot(toSnapshotCandidate(raw));
+  if (!parsed.ok) {
+    throw new Error(`Persisted live snapshot is invalid: ${parsed.message}`);
+  }
+  if (parsed.bytes > MAX_LIVE_SNAPSHOT_BYTES) {
+    throw new BoundedJsonFileError(
+      'Persisted live snapshot exceeds the session byte budget',
+      'FILE_TOO_LARGE'
+    );
+  }
+  return parsed.value;
+}
+
+function logPersistedSnapshotFailure(
+  sessionId: string,
+  source: 'transcript' | 'draft',
+  error: unknown
+) {
+  // 不存在是直播进行中的常态；只有已存在但超限/损坏/不合 schema 才记安全事件。
+  if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return;
+  liveShareLogger.warn(
+    { sessionId, source, err: serializeError(error) },
+    'Rejected persisted live snapshot during bounded recovery'
+  );
 }
 
 async function loadPersistedSnapshot(sessionId: string): Promise<LiveSnapshot> {
   try {
-    const fullPath = readSessionTranscriptPath(sessionId);
-    const raw = await fs.readFile(fullPath, 'utf-8');
-    return buildSnapshotFrom(
-      JSON.parse(raw) as Parameters<typeof buildSnapshotFrom>[0]
+    return await loadCanonicalSnapshotFile(readSessionTranscriptPath(sessionId));
+  } catch (error) {
+    logPersistedSnapshotFailure(sessionId, 'transcript', error);
+  }
+
+  // C16：data/transcripts/ 只有**收尾之后**才有文件；直播进行中转录稿在
+  // data/transcript-drafts/。两条路径都先有界读取再走同一 strict schema，磁盘副本
+  // 不能绕过 Socket 入站的 canonical/字节预算边界。
+  try {
+    return await loadCanonicalSnapshotFile(
+      readSessionTranscriptDraftPath(sessionId)
     );
-  } catch {
-    // C16：data/transcripts/ 只有**收尾之后**才有文件；直播进行中转录稿在
-    // data/transcript-drafts/。冷开分享（先录一段再点分享）时前者必然不存在，
-    // 只读它就等于观众永远拿不到开分享前的内容。故回退读草稿。
-    try {
-      const draft = await loadTranscriptDraft({ id: sessionId, userId: '' });
-      if (draft) {
-        return buildSnapshotFrom({
-          segments: draft.segments,
-          translations: draft.translations,
-          summaries: draft.summaries,
-        });
-      }
-    } catch {
-      // 草稿不可读也不算错：继续回退到空快照
-    }
-    return buildEmptySnapshot();
+  } catch (error) {
+    logPersistedSnapshotFailure(sessionId, 'draft', error);
+    return createEmptyLiveSnapshot();
   }
 }
 
-async function getSessionSnapshot(sessionId: string): Promise<LiveSnapshot> {
+async function getSessionSnapshot(
+  sessionId: string,
+  ownerId: string,
+  generationId: string
+): Promise<LiveSnapshot> {
+  if (!isActiveSnapshotGeneration(sessionId, generationId)) {
+    throw new Error('Live snapshot generation has been superseded');
+  }
   const inMemory = snapshots.get(sessionId);
   if (inMemory) {
+    if (snapshots.getOwnerId(sessionId) !== ownerId) {
+      throw new Error('Live snapshot owner does not match the session owner');
+    }
     return inMemory;
   }
 
-  const persisted = await loadPersistedSnapshot(sessionId);
-  // C16：读盘期间主播的首帧 sync_snapshot 可能已经落进内存（鉴权刚完成、initial_state
-  // 还在读盘的窗口正好重叠）。这里若无条件 set，就把刚到的全量快照抹回空盘态——
-  // 冷开分享的首帧正是这样丢的。重查一次，已有则以内存为准。
-  const current = snapshots.get(sessionId);
-  if (current) {
-    return current;
-  }
-  snapshots.set(sessionId, persisted);
-  return persisted;
-}
-
-function mergeTranscriptSegment(snapshot: LiveSnapshot, segment: unknown) {
-  if (!segment || typeof segment !== 'object') {
-    return snapshot;
-  }
-
-  sanitizeSegment(segment);
-
-  const maybeSegment = segment as { id?: string };
-  if (!maybeSegment.id) {
-    // 无 id 段落只能追加，无法去重——达到条数上限后拒绝新增，防止 broadcast
-    // 增量路径绕过 sync_snapshot 的 MAX_SNAPSHOT_SEGMENTS（U24）。
-    if (snapshot.segments.length < MAX_SNAPSHOT_SEGMENTS) {
-      snapshot.segments.push(segment);
+  const pending = snapshotLoadPromises.get(sessionId);
+  if (pending?.generationId === generationId) {
+    const snapshot = await pending.promise;
+    if (!isActiveSnapshotGeneration(sessionId, generationId)) {
+      throw new Error('Live snapshot generation has been superseded');
+    }
+    if (snapshots.getOwnerId(sessionId) !== ownerId) {
+      throw new Error('Live snapshot owner does not match the session owner');
     }
     return snapshot;
   }
 
-  const index = snapshot.segments.findIndex((item) => {
-    if (!item || typeof item !== 'object') return false;
-    return (item as { id?: string }).id === maybeSegment.id;
-  });
-
-  if (index === -1) {
-    // 新 id：仅在未达上限时追加（已存在的 id 走原地替换，不增长，故不受限）。
-    if (snapshot.segments.length < MAX_SNAPSHOT_SEGMENTS) {
-      snapshot.segments.push(segment);
+  const loadPromise = (async () => {
+    const persisted = await loadPersistedSnapshot(sessionId);
+    if (!isActiveSnapshotGeneration(sessionId, generationId)) {
+      throw new Error('Live snapshot generation has been superseded');
     }
-  } else {
-    snapshot.segments[index] = segment;
-  }
-
-  return snapshot;
-}
-
-function mergeSummaryBlock(snapshot: LiveSnapshot, block: unknown) {
-  if (!block || typeof block !== 'object') {
-    return snapshot;
-  }
-
-  sanitizeSummaryBlock(block);
-
-  const maybeBlock = block as { id?: string; blockIndex?: number };
-  const index = snapshot.summaryBlocks.findIndex((item) => {
-    if (!item || typeof item !== 'object') return false;
-    const existing = item as { id?: string; blockIndex?: number };
-    if (maybeBlock.id && existing.id) {
-      return existing.id === maybeBlock.id;
+    // C16：读盘期间主播的首帧 sync_snapshot 可能已经落进内存。setIfAbsent
+    // 保证首帧永远优先；singleflight 同时阻止大量观众在冷态重复读盘/JSON.parse。
+    const admitted = snapshots.setIfAbsent(sessionId, ownerId, persisted);
+    if (!admitted.ok) {
+      liveShareLogger.warn(
+        {
+          sessionId,
+          ownerId,
+          code: admitted.code,
+          bytes: admitted.bytes,
+          limit: admitted.limit,
+        },
+        'Rejected live snapshot because an aggregate byte budget was exceeded'
+      );
+      throw new Error(admitted.message);
     }
-    if (typeof maybeBlock.blockIndex === 'number' && typeof existing.blockIndex === 'number') {
-      return existing.blockIndex === maybeBlock.blockIndex;
+    return admitted.value.snapshot;
+  })();
+  const entry: SnapshotLoadEntry = { generationId, promise: loadPromise };
+  snapshotLoadPromises.set(sessionId, entry);
+  const clearEntry = () => {
+    if (snapshotLoadPromises.get(sessionId) === entry) {
+      snapshotLoadPromises.delete(sessionId);
     }
-    return false;
-  });
-
-  if (index === -1) {
-    // 新增 summary block：仅在未达上限时追加，防止 broadcast 增量路径绕过
-    // MAX_SNAPSHOT_SUMMARY_BLOCKS（U24）。已存在的走原地替换，不增长。
-    if (snapshot.summaryBlocks.length < MAX_SNAPSHOT_SUMMARY_BLOCKS) {
-      snapshot.summaryBlocks.push(block);
-    }
-  } else {
-    snapshot.summaryBlocks[index] = block;
-  }
-
-  return snapshot;
-}
-
-function mergeEventIntoSnapshot(
-  snapshot: LiveSnapshot,
-  event: LiveEventPayload
-): LiveSnapshot {
-  switch (event.type) {
-    case 'transcript_delta':
-      mergeTranscriptSegment(snapshot, event.payload);
-      break;
-    case 'translation_delta': {
-      if (
-        event.payload &&
-        typeof event.payload === 'object' &&
-        typeof (event.payload as { segmentId?: string }).segmentId === 'string' &&
-        typeof (event.payload as { translation?: string }).translation === 'string'
-      ) {
-        const payload = event.payload as {
-          segmentId: string;
-          translation: string;
-          sourceLang?: string;
-          targetLang?: string;
-          translationMode?: string;
-        };
-        // 新 segmentId 达到条目上限时拒绝新增，防止 broadcast 增量路径绕过
-        // MAX_SNAPSHOT_TRANSLATIONS（U24）。已存在的 key 走覆盖，不增长。
-        const isNewTranslationKey = !Object.prototype.hasOwnProperty.call(
-          snapshot.translations,
-          payload.segmentId
-        );
-        if (
-          !isNewTranslationKey ||
-          Object.keys(snapshot.translations).length < MAX_SNAPSHOT_TRANSLATIONS
-        ) {
-          snapshot.translations[payload.segmentId] =
-            payload.translation.length > MAX_TRANSLATION_LENGTH
-              ? payload.translation.slice(0, MAX_TRANSLATION_LENGTH)
-              : payload.translation;
-        }
-        // 更新翻译元数据（如果 delta 中携带）
-        if (typeof payload.sourceLang === 'string') snapshot.sourceLang = payload.sourceLang;
-        if (typeof payload.targetLang === 'string') snapshot.targetLang = payload.targetLang;
-        if (typeof payload.translationMode === 'string') snapshot.translationMode = payload.translationMode;
-      }
-      break;
-    }
-    case 'summary_update':
-      mergeSummaryBlock(snapshot, event.payload);
-      break;
-    case 'status_update': {
-      if (
-        event.payload &&
-        typeof event.payload === 'object' &&
-        typeof (event.payload as { status?: string }).status === 'string'
-      ) {
-        snapshot.status = (event.payload as { status: string }).status;
-      }
-      break;
-    }
-    case 'preview_update': {
-      if (event.payload && typeof event.payload === 'object') {
-        const p = event.payload as {
-          previewText?: StreamingPreviewText | string;
-          previewTranslation?: StreamingPreviewTranslation | string;
-        };
-        snapshot.previewText = p.previewText
-          ? normalizePreviewText(p.previewText)
-          : EMPTY_STREAMING_PREVIEW_TEXT;
-        snapshot.previewTranslation = p.previewTranslation
-          ? normalizePreviewTranslation(p.previewTranslation)
-          : EMPTY_STREAMING_PREVIEW_TRANSLATION;
-      }
-      break;
-    }
-  }
-
-  snapshot.updatedAt = Date.now();
-  return snapshot;
+  };
+  void loadPromise.then(clearEntry, clearEntry);
+  return loadPromise;
 }
 
 async function resolveViewerLink(shareToken: string) {
@@ -458,6 +348,7 @@ async function resolveViewerLink(shareToken: string) {
         select: {
           id: true,
           status: true,
+          userId: true,
         },
       },
     },
@@ -471,10 +362,56 @@ async function resolveViewerLink(shareToken: string) {
     throw new Error('Share link expired');
   }
 
+  if (
+    link.session.id !== link.sessionId ||
+    link.createdBy !== link.session.userId
+  ) {
+    throw new Error('Invalid share link owner');
+  }
+
   return link;
 }
 
-async function authenticateBroadcaster(socket: Socket) {
+async function resolveBroadcasterShareLink(
+  sessionId: string,
+  shareToken: string,
+  userId: string,
+  expectedLinkId?: string
+) {
+  const shareLink = await prisma.shareLink.findUnique({
+    where: { token: shareToken },
+    include: {
+      session: {
+        select: {
+          id: true,
+          userId: true,
+        },
+      },
+    },
+  });
+
+  if (
+    !shareLink ||
+    !shareLink.isLive ||
+    (expectedLinkId !== undefined && shareLink.id !== expectedLinkId) ||
+    shareLink.sessionId !== sessionId ||
+    shareLink.session.id !== sessionId ||
+    shareLink.createdBy !== userId ||
+    shareLink.session.userId !== userId
+  ) {
+    throw new Error('Broadcaster is not authorized for this session');
+  }
+
+  if (shareLink.expiresAt && shareLink.expiresAt < new Date()) {
+    throw new Error('Share link expired');
+  }
+
+  return shareLink;
+}
+
+async function authenticateBroadcaster(
+  socket: Socket
+): Promise<EstablishedBroadcasterContext> {
   const auth = (socket.handshake.auth ?? {}) as BroadcasterAuthPayload;
   if (!auth.sessionId || !auth.shareToken) {
     throw new Error('Missing broadcaster auth');
@@ -492,38 +429,63 @@ async function authenticateBroadcaster(socket: Socket) {
 
   const sessionId = sanitizePath(auth.sessionId);
   const shareToken = sanitizeToken(auth.shareToken);
-  const shareLink = await prisma.shareLink.findUnique({
-    where: { token: shareToken },
-    include: {
-      session: {
-        select: {
-          id: true,
-          userId: true,
-        },
-      },
-    },
-  });
-
-  if (
-    !shareLink ||
-    !shareLink.isLive ||
-    shareLink.sessionId !== sessionId ||
-    shareLink.createdBy !== session.user.id ||
-    shareLink.session.userId !== session.user.id
-  ) {
-    throw new Error('Broadcaster is not authorized for this session');
-  }
-
-  if (shareLink.expiresAt && shareLink.expiresAt < new Date()) {
-    throw new Error('Share link expired');
-  }
+  const shareLink = await resolveBroadcasterShareLink(
+    sessionId,
+    shareToken,
+    session.user.id
+  );
 
   socket.data.isHost = true;
   socket.data.sessionId = sessionId;
   socket.data.userId = session.user.id;
   socket.join(getRoomId(sessionId));
+  const snapshotGeneration = activateSnapshotGeneration(
+    sessionId,
+    shareLink.id
+  );
 
-  return { sessionId };
+  return {
+    rawJwt: jwtToken,
+    sessionId,
+    userId: session.user.id,
+    shareToken,
+    shareLinkId: shareLink.id,
+    snapshotGenerationId: snapshotGeneration.generationId,
+    snapshotGenerationChanged: snapshotGeneration.changed,
+  };
+}
+
+async function validateEstablishedBroadcaster(
+  context: EstablishedBroadcasterContext
+): Promise<void> {
+  const diagnosis = await diagnoseEstablishedAuthFamilyToken(context.rawJwt);
+  if (
+    diagnosis.status === 'revoked' ||
+    (diagnosis.status === 'valid' &&
+      diagnosis.session.user.id !== context.userId)
+  ) {
+    throw new Error('Broadcaster authentication has been revoked');
+  }
+
+  await resolveBroadcasterShareLink(
+    context.sessionId,
+    context.shareToken,
+    context.userId,
+    context.shareLinkId
+  );
+  if (
+    !isActiveSnapshotGeneration(
+      context.sessionId,
+      context.snapshotGenerationId
+    )
+  ) {
+    throw new Error('Broadcaster share generation has been superseded');
+  }
+  // leaf_expired 不授予继续广播的权限；只有用户/family/link/generation 全部仍有效后，
+  // 才用专用错误要求客户端携当前 Cookie 重新走一次 strict current-leaf 握手。
+  if (diagnosis.status === 'leaf_expired') {
+    throw new BroadcasterAuthLeafExpiredError();
+  }
 }
 
 async function emitViewerCount(io: SocketIO, sessionId: string) {
@@ -533,15 +495,39 @@ async function emitViewerCount(io: SocketIO, sessionId: string) {
 }
 
 function createShareErrorHandler(socket: Socket) {
-  return (message: string) => {
-    socket.emit('share_error', { message });
+  return (message: string, code?: string) => {
+    socket.emit('share_error', code ? { message, code } : { message });
   };
+}
+
+type EmitShareError = ReturnType<typeof createShareErrorHandler>;
+
+function emitSnapshotPolicyError(
+  socket: Socket,
+  emitError: EmitShareError,
+  code: LiveSnapshotPolicyErrorCode,
+  detail: string,
+  bytes?: number,
+  limit?: number
+) {
+  liveShareLogger.warn(
+    {
+      socketId: socket.id,
+      sessionId: socket.data.sessionId,
+      code,
+      detail,
+      bytes,
+      limit,
+    },
+    'Rejected live share state at the canonical snapshot boundary'
+  );
+  emitError('Live share payload rejected', code);
 }
 
 // SHARE-REVOKE-001：观众 token 只在 join 时校验一次，撤销/轮换/过期对已连接
 // socket 原本永久无效。复核间隔是"错过撤销通知（WS 重启、内部请求失败）或链接
 // 自然过期"时被驱逐的最坏延迟；撤销主路径走内部通知即时生效，不依赖这个间隔。
-const VIEWER_REVALIDATE_INTERVAL_MS = 60_000;
+const LIVE_AUTH_REVALIDATE_INTERVAL_MS = 60_000;
 
 const ROOM_PREFIX = 'live:';
 
@@ -622,6 +608,26 @@ export async function revalidateSessionViewers(
   return evicted;
 }
 
+/**
+ * 复核握手时已经严格认证成功的主持人。routine refresh 后旧 leaf 可由 established
+ * 校验继续使用；family 撤销/过期、用户封禁/版本变化、DB 故障或分享链接换代则断连。
+ */
+export async function revalidateSessionBroadcasters(
+  io: SocketIO,
+  sessionId: string,
+  options: { silent?: boolean } = {}
+): Promise<number> {
+  const sessionBroadcasters = activeBroadcastersByServer.get(io)?.get(sessionId);
+  if (!sessionBroadcasters || sessionBroadcasters.size === 0) return 0;
+
+  let revoked = 0;
+  // revalidate 失败会同步触发 disconnect 并修改 registry，故先复制闭包快照再串行执行。
+  for (const broadcaster of [...sessionBroadcasters.values()]) {
+    if (!(await broadcaster.revalidate(options))) revoked += 1;
+  }
+  return revoked;
+}
+
 /** 对所有 live 房间跑一遍观众复核（周期兜底用），串行避免 DB 并发尖峰。 */
 export async function revalidateAllLiveRooms(io: SocketIO): Promise<void> {
   const sessionIds: string[] = [];
@@ -640,15 +646,69 @@ export async function revalidateAllLiveRooms(io: SocketIO): Promise<void> {
         'Periodic live share viewer revalidation failed'
       );
     }
+    try {
+      await revalidateSessionBroadcasters(io, sessionId);
+    } catch (error) {
+      liveShareLogger.warn(
+        { sessionId, err: serializeError(error) },
+        'Periodic live share broadcaster revalidation failed'
+      );
+    }
   }
+}
+
+/**
+ * 观众拿着另一个仍合法的同 session 链接加入，不代表主持人世代已经换代。先按 DB 复核
+ * 当前房间；只在旧世代已经没有任何合法连接时才 CAS 退役它并激活新 link。这样并存的
+ * 合法观看链接不会误踢主持人，而 A 已撤权且通知丢失时，B 仍会清空 A 快照后接管。
+ */
+async function selectViewerSnapshotGeneration(
+  io: SocketIO,
+  sessionId: string,
+  linkId: string
+): Promise<{ generationId: string; changed: boolean }> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const current = snapshotGenerations.getActive(sessionId);
+    if (!current || current.linkId === linkId) {
+      return activateSnapshotGeneration(sessionId, linkId);
+    }
+
+    await revalidateSessionViewers(io, sessionId);
+    await revalidateSessionBroadcasters(io, sessionId);
+
+    const afterRevalidation = snapshotGenerations.getActive(sessionId);
+    if (!afterRevalidation) {
+      return activateSnapshotGeneration(sessionId, linkId);
+    }
+    if (afterRevalidation.generationId !== current.generationId) {
+      continue;
+    }
+
+    const roomSockets = await io.in(getRoomId(sessionId)).fetchSockets();
+    if (roomSockets.length > 0) {
+      return {
+        generationId: afterRevalidation.generationId,
+        changed: false,
+      };
+    }
+
+    if (
+      invalidateSnapshotGeneration(sessionId, afterRevalidation.generationId)
+    ) {
+      return activateSnapshotGeneration(sessionId, linkId);
+    }
+  }
+
+  throw new Error('Live share generation changed too many times');
 }
 
 // sync_snapshot / broadcast 的处理体。抽成模块级函数，是为了让 C16 的监听器能在
 // 鉴权 await 之前同步注册（见 setupLiveShare 里的注释），逻辑本身与此前逐字一致。
 function handleSyncSnapshot(
   socket: Socket,
-  emitError: (message: string) => void,
-  payload: Partial<LiveSnapshot>
+  emitError: EmitShareError,
+  payload: unknown,
+  generationId?: string
 ) {
   if (!socket.data.isHost) {
     emitError('Only the broadcaster may sync snapshots');
@@ -656,102 +716,88 @@ function handleSyncSnapshot(
   }
 
   const sessionId = socket.data.sessionId as string;
-  const ext = payload as {
-    previewText?: StreamingPreviewText | string;
-    previewTranslation?: StreamingPreviewTranslation | string;
-    sourceLang?: string;
-    targetLang?: string;
-    translationMode?: string;
-  };
-
-  const rawSegmentCount = Array.isArray(payload.segments)
-    ? payload.segments.length
-    : 0;
-  const rawSummaryCount = Array.isArray(payload.summaryBlocks)
-    ? payload.summaryBlocks.length
-    : 0;
-  const rawTranslationCount =
-    payload.translations && typeof payload.translations === 'object'
-      ? Object.keys(payload.translations).length
-      : 0;
+  const ownerId = socket.data.userId as string;
   if (
-    rawSegmentCount > MAX_SNAPSHOT_SEGMENTS ||
-    rawSummaryCount > MAX_SNAPSHOT_SUMMARY_BLOCKS ||
-    rawTranslationCount > MAX_SNAPSHOT_TRANSLATIONS
+    !generationId ||
+    !isActiveSnapshotGeneration(sessionId, generationId)
   ) {
-    liveShareLogger.warn(
-      {
-        socketId: socket.id,
-        sessionId,
-        rawSegmentCount,
-        rawSummaryCount,
-        rawTranslationCount,
-      },
-      'sync_snapshot exceeded size limits; snapshot truncated'
+    emitError('Broadcaster share generation has been superseded');
+    return;
+  }
+  const parsed = canonicalizeLiveSnapshot(payload);
+  if (!parsed.ok) {
+    emitSnapshotPolicyError(
+      socket,
+      emitError,
+      parsed.code,
+      parsed.message,
+      parsed.bytes,
+      parsed.limit
+    );
+    return;
+  }
+  const admitted = snapshots.set(sessionId, ownerId, parsed.value);
+  if (!admitted.ok) {
+    emitSnapshotPolicyError(
+      socket,
+      emitError,
+      admitted.code,
+      admitted.message,
+      admitted.bytes,
+      admitted.limit
     );
   }
-
-  const nextSnapshot: LiveSnapshot = {
-    segments: clampArray(payload.segments, MAX_SNAPSHOT_SEGMENTS).map(
-      sanitizeSegment
-    ),
-    translations: sanitizeSnapshotTranslations(payload.translations),
-    summaryBlocks: clampArray(
-      payload.summaryBlocks,
-      MAX_SNAPSHOT_SUMMARY_BLOCKS
-    ).map(sanitizeSummaryBlock),
-    status: typeof payload.status === 'string' ? payload.status : null,
-    previewText: ext.previewText
-      ? normalizePreviewText(ext.previewText)
-      : EMPTY_STREAMING_PREVIEW_TEXT,
-    previewTranslation: ext.previewTranslation
-      ? normalizePreviewTranslation(ext.previewTranslation)
-      : EMPTY_STREAMING_PREVIEW_TRANSLATION,
-    sourceLang: typeof ext.sourceLang === 'string' ? ext.sourceLang : null,
-    targetLang: typeof ext.targetLang === 'string' ? ext.targetLang : null,
-    translationMode:
-      typeof ext.translationMode === 'string' ? ext.translationMode : null,
-    updatedAt: Date.now(),
-  };
-
-  snapshots.set(sessionId, nextSnapshot);
 }
 
 async function handleBroadcast(
   socket: Socket,
-  emitError: (message: string) => void,
-  event: LiveEventPayload
+  emitError: EmitShareError,
+  event: unknown,
+  generationId?: string
 ) {
   if (!socket.data.isHost) {
     emitError('Only the broadcaster may publish events');
     return;
   }
 
+  const sessionId = socket.data.sessionId as string;
+  const ownerId = socket.data.userId as string;
   if (
-    !event ||
-    typeof event !== 'object' ||
-    typeof event.type !== 'string' ||
-    typeof event.timestamp !== 'number'
+    !generationId ||
+    !isActiveSnapshotGeneration(sessionId, generationId)
   ) {
-    emitError('Invalid broadcast payload');
+    emitError('Broadcaster share generation has been superseded');
     return;
   }
-
-  const sessionId = socket.data.sessionId as string;
-  const snapshot = await getSessionSnapshot(sessionId);
-  mergeEventIntoSnapshot(snapshot, event);
-  snapshots.set(sessionId, snapshot);
+  await getSessionSnapshot(sessionId, ownerId, generationId);
+  if (!isActiveSnapshotGeneration(sessionId, generationId)) return;
+  const applied = snapshots.applyEvent(sessionId, ownerId, event);
+  if (!applied.ok) {
+    emitSnapshotPolicyError(
+      socket,
+      emitError,
+      applied.code,
+      applied.message,
+      applied.bytes,
+      applied.limit
+    );
+    return;
+  }
 
   liveShareLogger.debug(
     {
       socketId: socket.id,
       sessionId,
-      eventType: event.type,
+      eventType: applied.value.event.type,
+      snapshotBytes: applied.bytes,
     },
     'Broadcasted live share event'
   );
 
-  socket.to(getRoomId(sessionId)).emit(event.type, event.payload);
+  // 只广播 canonical 副本；原始 payload 的未知/嵌套字段永远不会到达观众。
+  socket
+    .to(getRoomId(sessionId))
+    .emit(applied.value.event.type, applied.value.event.payload);
 }
 
 /**
@@ -760,21 +806,31 @@ async function handleBroadcast(
  * teardown 主要用于测试隔离与优雅关停（避免模块级定时器 / 快照跨用例泄漏）。
  */
 export function setupLiveShare(io: SocketIO): () => void {
+  const broadcasterRegistry: BroadcasterRegistry = new Map();
+  activeBroadcastersByServer.set(io, broadcasterRegistry);
+
   // U61：后台 TTL 清扫僵尸快照。unref 避免阻塞进程退出。
   const sweepTimer = setInterval(() => {
     void sweepStaleSnapshots(io).catch(() => undefined);
   }, SNAPSHOT_SWEEP_INTERVAL_MS);
   sweepTimer.unref?.();
 
-  // SHARE-REVOKE-001：周期复核所有房间的观众 token，兜底"撤销通知丢失/链接自然
-  // 过期"两类没有即时驱逐信号的失效。撤销主路径由内部通知即时触发,不等这个周期。
+  // SHARE-REVOKE-001 / SEC-022：周期复核所有房间的观众 token 与主持人身份/分享世代，
+  // 兜底撤销通知丢失、账号状态变化、链接删除或自然过期；主路径仍由内部通知即时触发。
   const revalidateTimer = setInterval(() => {
     void revalidateAllLiveRooms(io).catch(() => undefined);
-  }, VIEWER_REVALIDATE_INTERVAL_MS);
+  }, LIVE_AUTH_REVALIDATE_INTERVAL_MS);
   revalidateTimer.unref?.();
 
   io.on('connection', async (socket) => {
     const emitError = createShareErrorHandler(socket);
+    const viewerJoinState = {
+      queue: Promise.resolve(),
+      rate: createViewerJoinRateState(),
+      initialStateBudget: createViewerInitialStateBudget(),
+      currentToken: null as string | null,
+      currentSessionId: null as string | null,
+    };
 
     // C16：主播客户端在底层 'connect' 触发的同一刻就补发 sync_snapshot，而鉴权是异步的
     // （verifyAuthToken + 两次 DB 查询）。若把 socket.on 注册在 await 之后，这一帧会落在
@@ -787,32 +843,172 @@ export function setupLiveShare(io: SocketIO): () => void {
     const broadcasterAuth = hasBroadcasterAuth
       ? authenticateBroadcaster(socket)
       : null;
+    let broadcasterHandshakeSettled = false;
+    let authenticatedBroadcasterContext: EstablishedBroadcasterContext | null = null;
     // 下面 await 之前若先 reject 会触发 unhandledRejection；挂一个空 catch 占位，
     // 真正的失败处理仍在下面的 try/catch 里（同一个 promise 可被多次 await）。
-    broadcasterAuth?.catch(() => undefined);
-    const awaitBroadcasterAuth = async () => {
-      if (!broadcasterAuth) return;
+    if (broadcasterAuth) {
+      void broadcasterAuth.then(
+        (context) => {
+          authenticatedBroadcasterContext = context;
+          broadcasterHandshakeSettled = true;
+        },
+        () => {
+          broadcasterHandshakeSettled = true;
+        }
+      );
+    }
+    let broadcasterValidationPromise: Promise<void> | null = null;
+    let broadcasterRevoked = false;
+    const revalidateBroadcaster = async (
+      options: { silent?: boolean } = {}
+    ): Promise<boolean> => {
+      if (!broadcasterAuth || broadcasterRevoked || !socket.connected) {
+        return false;
+      }
+
+      let context: EstablishedBroadcasterContext;
       try {
-        await broadcasterAuth;
+        context = await broadcasterAuth;
       } catch {
-        // 鉴权失败：isHost 保持未置位，由各 handler 的 isHost 守卫拒绝
+        // 严格握手失败由下方主流程统一记录、报错和断连。
+        return false;
+      }
+
+      if (!broadcasterValidationPromise) {
+        const validation = validateEstablishedBroadcaster(context);
+        broadcasterValidationPromise = validation;
+        // 只合并并发中的复核，不缓存已完成的成功；下一敏感事件必须重新查权威状态。
+        void validation.then(
+          () => {
+            if (broadcasterValidationPromise === validation) {
+              broadcasterValidationPromise = null;
+            }
+          },
+          () => {
+            if (broadcasterValidationPromise === validation) {
+              broadcasterValidationPromise = null;
+            }
+          }
+        );
+      }
+
+      try {
+        await broadcasterValidationPromise;
+        return true;
+      } catch (error) {
+        if (!broadcasterRevoked) {
+          broadcasterRevoked = true;
+          const leafExpired = error instanceof BroadcasterAuthLeafExpiredError;
+          const isolatedOldGeneration = invalidateSnapshotGeneration(
+            context.sessionId,
+            context.snapshotGenerationId
+          );
+          // 安全撤权不是网络瞬断：立即隔离旧世代并宣告下线，绝不能走 15 秒 grace。
+          if (isolatedOldGeneration) {
+            cancelPendingHostOffline(context.sessionId);
+            io.to(getRoomId(context.sessionId)).emit('status_update', {
+              status: 'SHARE_OFFLINE',
+            });
+          }
+          liveShareLogger.warn(
+            {
+              socketId: socket.id,
+              sessionId: context.sessionId,
+              userId: context.userId,
+              err: serializeError(error),
+            },
+            'Disconnected broadcaster after established authorization failed'
+          );
+          if (!options.silent) {
+            emitError(
+              leafExpired
+                ? 'Broadcaster authentication leaf expired'
+                : 'Broadcaster authorization revoked',
+              leafExpired
+                ? 'BROADCASTER_AUTH_LEAF_EXPIRED'
+                : 'BROADCASTER_AUTH_REVOKED'
+            );
+          }
+          socket.disconnect(true);
+        }
+        return false;
       }
     };
 
-    socket.on('sync_snapshot', async (payload: Partial<LiveSnapshot>) => {
-      await awaitBroadcasterAuth();
-      handleSyncSnapshot(socket, emitError, payload);
+    socket.on('sync_snapshot', (payload: unknown) => {
+      // connect 首帧可能在严格握手查询尚未完成时先到。该 strict 查询本身发生在事件
+      // 之后且完整校验 current leaf + 用户 + 分享链接，直接复用它可保住 C16 首帧；
+      // 握手已经结束后才到的每个事件仍必须走 established-family 权威复核。
+      const queuedDuringStrictHandshake = Boolean(
+        broadcasterAuth && !broadcasterHandshakeSettled
+      );
+      void (async () => {
+        let generationId: string | undefined;
+        if (broadcasterAuth) {
+          if (!queuedDuringStrictHandshake && !(await revalidateBroadcaster())) {
+            return;
+          }
+          const context = await broadcasterAuth;
+          if (!socket.connected || broadcasterRevoked) return;
+          generationId = context.snapshotGenerationId;
+        }
+        handleSyncSnapshot(socket, emitError, payload, generationId);
+      })().catch((error) => {
+        liveShareLogger.warn(
+          { socketId: socket.id, err: serializeError(error) },
+          'Failed to process live snapshot'
+        );
+        emitError('Failed to process live snapshot');
+      });
     });
 
-    socket.on('broadcast', async ({ event }: { event: LiveEventPayload }) => {
-      await awaitBroadcasterAuth();
-      await handleBroadcast(socket, emitError, event);
+    socket.on('broadcast', (message: unknown) => {
+      const queuedDuringStrictHandshake = Boolean(
+        broadcasterAuth && !broadcasterHandshakeSettled
+      );
+      void (async () => {
+        let generationId: string | undefined;
+        if (broadcasterAuth) {
+          if (!queuedDuringStrictHandshake && !(await revalidateBroadcaster())) {
+            return;
+          }
+          const context = await broadcasterAuth;
+          if (!socket.connected || broadcasterRevoked) return;
+          generationId = context.snapshotGenerationId;
+        }
+        const event =
+          message && typeof message === 'object' && !Array.isArray(message)
+            ? (message as { event?: unknown }).event
+            : undefined;
+        await handleBroadcast(socket, emitError, event, generationId);
+      })().catch((error) => {
+        liveShareLogger.warn(
+          { socketId: socket.id, err: serializeError(error) },
+          'Failed to process live broadcast'
+        );
+        emitError('Failed to process live broadcast');
+      });
     });
 
-    if (hasBroadcasterAuth) {
+    if (hasBroadcasterAuth && broadcasterAuth) {
       try {
-        await broadcasterAuth;
-        const sessionId = socket.data.sessionId as string;
+        const context = await broadcasterAuth;
+        if (!socket.connected || broadcasterRevoked) return;
+        const sessionId = context.sessionId;
+        let sessionBroadcasters = broadcasterRegistry.get(sessionId);
+        if (!sessionBroadcasters) {
+          sessionBroadcasters = new Map();
+          broadcasterRegistry.set(sessionId, sessionBroadcasters);
+        }
+        sessionBroadcasters.set(socket.id, {
+          revalidate: revalidateBroadcaster,
+        });
+        if (context.snapshotGenerationChanged) {
+          await revalidateSessionViewers(io, sessionId);
+          await revalidateSessionBroadcasters(io, sessionId);
+          if (!socket.connected || broadcasterRevoked) return;
+        }
         liveShareLogger.info(
           {
             socketId: socket.id,
@@ -826,7 +1022,11 @@ export function setupLiveShare(io: SocketIO): () => void {
         // 并向房间广播 SHARE_LIVE，让此前误判为"已结束"的观众恢复实时视图。
         cancelPendingHostOffline(sessionId);
         socket.to(getRoomId(sessionId)).emit('status_update', { status: 'SHARE_LIVE' });
-        const snapshot = await getSessionSnapshot(sessionId);
+        const snapshot = await getSessionSnapshot(
+          sessionId,
+          socket.data.userId as string,
+          context.snapshotGenerationId
+        );
         socket.emit('initial_state', snapshot);
         await emitViewerCount(io, sessionId);
       } catch (error) {
@@ -843,49 +1043,138 @@ export function setupLiveShare(io: SocketIO): () => void {
       }
     }
 
-    socket.on('join', async ({ shareToken }: ViewerJoinPayload) => {
-      try {
-        const safeToken = sanitizeToken(shareToken ?? '');
-        const link = await resolveViewerLink(safeToken);
-        const sessionId = link.sessionId;
+    socket.on('join', (payload: unknown) => {
+      // 同一 socket 的 join 严格串行。这样首个授权尚在 DB 查询时到达的 40 个重复
+      // 事件会在首个成功后全部命中幂等早退，不会各自查询/发快照/扫描房间。
+      viewerJoinState.queue = viewerJoinState.queue.then(async () => {
+        try {
+          if (hasBroadcasterAuth || socket.data.isHost) {
+            emitError('Broadcaster sockets cannot join as viewers');
+            return;
+          }
 
-        // 安全：一个 socket 反复 join 不同 token 时，先退出上一个房间并刷新其计数，
-        // 避免跨房间累积成员资格（viewer_count 虚高）以及被滥用强制驻留多房间。
-        const previousSessionId = socket.data.sessionId as string | undefined;
-        if (previousSessionId && previousSessionId !== sessionId) {
-          socket.leave(getRoomId(previousSessionId));
-          await emitViewerCount(io, previousSessionId);
-        }
+          const parsedToken = parseViewerJoinToken(payload);
+          if (
+            parsedToken.ok &&
+            viewerJoinState.currentToken === parsedToken.token &&
+            viewerJoinState.currentSessionId === socket.data.sessionId
+          ) {
+            return;
+          }
 
-        socket.data.isHost = false;
-        socket.data.sessionId = sessionId;
-        // SHARE-REVOKE-001：记录观众所持 token，撤销/过期复核时按它重新校验；
-        // 没有这条记录就无法定位"持已撤销 token 的 socket"。
-        socket.data.shareToken = safeToken;
-        socket.join(getRoomId(sessionId));
+          // 无效 token 也消耗成本令牌，避免随机高基数 token 绕开 DB 前门禁。
+          if (!consumeViewerJoinAttempt(viewerJoinState.rate)) {
+            emitError('Too many live share join attempts', 'JOIN_RATE_LIMITED');
+            return;
+          }
+          if (!parsedToken.ok) {
+            emitError(parsedToken.message, parsedToken.code);
+            return;
+          }
 
-        liveShareLogger.info(
-          {
-            socketId: socket.id,
+          const safeToken = parsedToken.token;
+          const link = await resolveViewerLink(safeToken);
+          const sessionId = link.sessionId;
+          const ownerId = link.session.userId;
+          if (typeof ownerId !== 'string' || !ownerId) {
+            throw new Error('Invalid share link owner');
+          }
+
+          const generation = await selectViewerSnapshotGeneration(
+            io,
             sessionId,
-            role: 'viewer',
-          },
-          'Viewer joined live share session'
-        );
+            link.id
+          );
+          if (generation.changed) {
+            await revalidateSessionViewers(io, sessionId);
+            await revalidateSessionBroadcasters(io, sessionId);
+            if (!socket.connected) return;
+          }
+          await getSessionSnapshot(
+            sessionId,
+            ownerId,
+            generation.generationId
+          );
+          // await continuation 与 getSessionSnapshot 内最后一次检查之间仍可能被新世代插队；
+          // emit 前重新取得当前对象，使 A 的迟到读盘结果永远不能发给 B token 的观众。
+          if (!isActiveSnapshotGeneration(sessionId, generation.generationId)) {
+            throw new Error('Live snapshot generation has been superseded');
+          }
+          const snapshot = snapshots.get(sessionId);
+          const snapshotBytes = snapshots.getBytes(sessionId);
+          if (!snapshot || snapshotBytes === undefined) {
+            throw new Error('Live snapshot is unavailable');
+          }
+          const responseBytes = socketIoEventByteLength(
+            'initial_state',
+            snapshotBytes
+          );
+          if (!socket.connected) return;
+          if (
+            !reserveViewerInitialStateBytes(
+              viewerJoinState.initialStateBudget,
+              responseBytes,
+              MAX_LIVE_INITIAL_STATE_BYTES_PER_SOCKET
+            )
+          ) {
+            emitError(
+              'Live share initial state response budget exceeded',
+              'INITIAL_STATE_BUDGET_EXCEEDED'
+            );
+            return;
+          }
 
-        const snapshot = await getSessionSnapshot(sessionId);
-        socket.emit('initial_state', snapshot);
-        await emitViewerCount(io, sessionId);
-      } catch (error) {
-        liveShareLogger.warn(
-          {
-            socketId: socket.id,
-            err: serializeError(error),
-          },
-          'Viewer failed to join live share session'
-        );
-        emitError(error instanceof Error ? error.message : 'Failed to join live share');
-      }
+          // 所有可能失败的授权/读取/预算检查都在房间变更之前完成。切换 B 失败时，
+          // socket 仍留在 A，不会因为攻击性请求丢失原本合法的观看资格。
+          const previousSessionId = viewerJoinState.currentSessionId;
+          const membershipChanged = previousSessionId !== sessionId;
+          if (previousSessionId && membershipChanged) {
+            socket.leave(getRoomId(previousSessionId));
+          }
+          if (membershipChanged) {
+            socket.join(getRoomId(sessionId));
+          }
+
+          socket.data.isHost = false;
+          socket.data.sessionId = sessionId;
+          // SHARE-REVOKE-001：记录观众所持 token，撤销/过期复核时按它重新校验。
+          socket.data.shareToken = safeToken;
+          viewerJoinState.currentToken = safeToken;
+          viewerJoinState.currentSessionId = sessionId;
+          socket.emit('initial_state', snapshot);
+
+          liveShareLogger.info(
+            {
+              socketId: socket.id,
+              sessionId,
+              role: 'viewer',
+              initialStateBytes: responseBytes,
+              cumulativeInitialStateBytes:
+                viewerJoinState.initialStateBudget.sentBytes,
+            },
+            'Viewer joined live share session'
+          );
+
+          // Socket.IO room membership 本身幂等；只有真实迁移才扫描/广播 count。
+          if (membershipChanged) {
+            if (previousSessionId) {
+              await emitViewerCount(io, previousSessionId).catch(() => undefined);
+            }
+            await emitViewerCount(io, sessionId).catch(() => undefined);
+          }
+        } catch (error) {
+          liveShareLogger.warn(
+            {
+              socketId: socket.id,
+              err: serializeError(error),
+            },
+            'Viewer failed to join live share session'
+          );
+          emitError(
+            error instanceof Error ? error.message : 'Failed to join live share'
+          );
+        }
+      });
     });
 
     socket.on('disconnect', async () => {
@@ -895,32 +1184,50 @@ export function setupLiveShare(io: SocketIO): () => void {
       }
 
       if (socket.data.isHost) {
-        // C3/U11：不立即宣告 SHARE_OFFLINE / 删除快照，先起宽限计时。若主播在窗口内
-        // 于新 socket 上重连，authenticateBroadcaster 会 cancelPendingHostOffline 取消
-        // 本计时并保留快照；只有窗口内未回来才广播下线并回收内存。计时器 unref，避免
-        // 阻塞进程退出。回调内再次核验房间内确无主播 socket，防止极端时序下误报下线。
-        cancelPendingHostOffline(sessionId);
-        const timer = setTimeout(() => {
-          pendingHostOffline.delete(sessionId);
-          void (async () => {
-            try {
-              const roomSockets = await io.in(getRoomId(sessionId)).fetchSockets();
-              const hostStillConnected = roomSockets.some((s) => s.data.isHost);
-              if (hostStillConnected) {
+        const sessionBroadcasters = broadcasterRegistry.get(sessionId);
+        sessionBroadcasters?.delete(socket.id);
+        if (sessionBroadcasters?.size === 0) {
+          broadcasterRegistry.delete(sessionId);
+        }
+        // 安全撤权已经同步隔离旧世代并宣告下线，不允许重新进入网络断线 grace。
+        if (!broadcasterRevoked) {
+          // C3/U11：不立即宣告 SHARE_OFFLINE / 删除快照，先起宽限计时。若主播在窗口内
+          // 于新 socket 上重连，authenticateBroadcaster 会 cancelPendingHostOffline 取消
+          // 本计时并保留快照；只有窗口内未回来才广播下线并回收内存。计时器 unref，避免
+          // 阻塞进程退出。回调内再次核验房间内确无主播 socket，防止极端时序下误报下线。
+          cancelPendingHostOffline(sessionId);
+          const expectedGeneration =
+            authenticatedBroadcasterContext?.snapshotGenerationId;
+          const timer = setTimeout(() => {
+            pendingHostOffline.delete(sessionId);
+            void (async () => {
+              try {
+                const roomSockets = await io.in(getRoomId(sessionId)).fetchSockets();
+                const hostStillConnected = roomSockets.some((s) => s.data.isHost);
+                if (hostStillConnected) {
+                  return;
+                }
+              } catch {
+                // fetchSockets 失败（如服务器正在关闭）——保守地跳过下线广播，
+                // 快照由 U61 的 TTL 清扫兜底回收。
                 return;
               }
-            } catch {
-              // fetchSockets 失败（如服务器正在关闭）——保守地跳过下线广播，
-              // 快照由 U61 的 TTL 清扫兜底回收。
-              return;
-            }
-            io.to(getRoomId(sessionId)).emit('status_update', { status: 'SHARE_OFFLINE' });
-            // 宽限期满仍无主播：回收内存快照，防止无限增长。
-            snapshots.delete(sessionId);
-          })();
-        }, HOST_OFFLINE_GRACE_MS);
-        timer.unref?.();
-        pendingHostOffline.set(sessionId, timer);
+              // fetchSockets 等待期间可能已有 B 世代接管；先 compare-and-invalidate，
+              // 只有确实退役本 socket 的旧世代时才允许向房间宣告下线。
+              if (
+                !expectedGeneration ||
+                !invalidateSnapshotGeneration(sessionId, expectedGeneration)
+              ) {
+                return;
+              }
+              io.to(getRoomId(sessionId)).emit('status_update', {
+                status: 'SHARE_OFFLINE',
+              });
+            })();
+          }, HOST_OFFLINE_GRACE_MS);
+          timer.unref?.();
+          pendingHostOffline.set(sessionId, timer);
+        }
       }
 
       liveShareLogger.info(
@@ -943,6 +1250,10 @@ export function setupLiveShare(io: SocketIO): () => void {
       clearTimeout(timer);
     }
     pendingHostOffline.clear();
+    broadcasterRegistry.clear();
+    activeBroadcastersByServer.delete(io);
+    snapshotLoadPromises.clear();
     snapshots.clear();
+    snapshotGenerations.clear();
   };
 }

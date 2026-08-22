@@ -21,6 +21,7 @@ const {
   deleteFileMock,
   deleteTranscriptionMock,
   resolveSonioxMock,
+  failAttemptMock,
 } = vi.hoisted(() => ({
   sessionFindManyMock: vi.fn(),
   sessionUpdateManyMock: vi.fn(),
@@ -29,6 +30,7 @@ const {
   deleteFileMock: vi.fn(),
   deleteTranscriptionMock: vi.fn(),
   resolveSonioxMock: vi.fn(),
+  failAttemptMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -39,11 +41,9 @@ vi.mock('@/lib/prisma', () => ({
 vi.mock('@/lib/audio/fullTranscribeFinalize', () => ({
   finalizeFullTranscription: finalizeMock,
 }));
-// R4：僵尸标 failed 后走 settleFullReservation 释放入口预留。保留真实 quota 其余导出（billingMaintenance
-// 在 import 期取多个绑定），仅把 settleFullReservation 覆写为桩，避免它内部自开 prisma 事务干扰本用例。
-vi.mock('@/lib/quota', async (importActual) => ({
-  ...(await importActual<typeof import('@/lib/quota')>()),
-  settleFullReservation: vi.fn(async () => 0),
+vi.mock('@/lib/audio/fullTranscribeAdmission', () => ({
+  failFullTranscribeAttempt: failAttemptMock,
+  releaseTerminalFullTranscribeReservation: vi.fn(),
 }));
 vi.mock('@/lib/soniox/asyncFile', () => ({
   getSonioxTranscription: getSonioxTranscriptionMock,
@@ -70,6 +70,7 @@ function candidate(overrides: Record<string, unknown>) {
     id: 's1',
     userId: 'u1',
     fullTranscribeStatus: 'transcribing',
+    fullTranscribeClaimId: 'claim-1',
     fullSonioxFileId: 'f1',
     fullSonioxTranscriptionId: 't1',
     targetLang: 'zh',
@@ -84,6 +85,7 @@ beforeEach(() => {
   sessionUpdateManyMock.mockResolvedValue({ count: 1 });
   deleteFileMock.mockResolvedValue(undefined);
   deleteTranscriptionMock.mockResolvedValue(undefined);
+  failAttemptMock.mockResolvedValue(true);
 });
 
 describe('reclaimStaleFullTranscribes', () => {
@@ -149,9 +151,11 @@ describe('reclaimStaleFullTranscribes', () => {
 
     expect(n).toBe(1);
     expect(finalizeMock).not.toHaveBeenCalled();
-    expect(sessionUpdateManyMock).toHaveBeenCalledWith(
+    expect(failAttemptMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ fullTranscribeStatus: 'failed' }),
+        sessionId: 's1',
+        claimId: 'claim-1',
+        allowedStatuses: ['pending', 'transcoding', 'transcribing', 'finalizing'],
       })
     );
     expect(deleteFileMock).toHaveBeenCalledWith(SONIOX, 'f4');
@@ -167,13 +171,12 @@ describe('reclaimStaleFullTranscribes', () => {
 
     expect(n).toBe(1);
     expect(getSonioxTranscriptionMock).not.toHaveBeenCalled();
-    expect(sessionUpdateManyMock).toHaveBeenCalledWith(
+    expect(failAttemptMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({
-          id: 's2',
-          fullTranscribeStatus: { in: ['pending', 'transcoding', 'transcribing', 'finalizing'] },
-        }),
-        data: expect.objectContaining({ fullTranscribeStatus: 'failed' }),
+        sessionId: 's2',
+        claimId: 'claim-1',
+        allowedStatuses: ['pending', 'transcoding', 'transcribing', 'finalizing'],
+        startedAtLte: expect.any(Date),
       })
     );
   });
@@ -210,10 +213,7 @@ describe('reclaimStaleFullTranscribes', () => {
     expect(getSonioxTranscriptionMock).not.toHaveBeenCalled();
     expect(finalizeMock).not.toHaveBeenCalled();
     // 绝不标 failed
-    const failedCall = sessionUpdateManyMock.mock.calls.find(
-      (c) => c[0]?.data?.fullTranscribeStatus === 'failed'
-    );
-    expect(failedCall).toBeUndefined();
+    expect(failAttemptMock).not.toHaveBeenCalled();
   });
 
   it('按 fullTranscribeStartedAt 超阈值筛选（transcribing 且 startedAt<=阈值）', async () => {

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { siteSettingFindManyMock, siteSettingUpsertMock } = vi.hoisted(() => ({
   siteSettingFindManyMock: vi.fn(),
@@ -77,8 +77,13 @@ const HALF_CONFIGURED = {
 
 beforeEach(() => {
   siteSettingFindManyMock.mockReset();
+  siteSettingFindManyMock.mockResolvedValue([]);
   siteSettingUpsertMock.mockReset();
   siteSettingUpsertMock.mockResolvedValue({});
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe('updateRechargeSettings：布尔严格解析（P3-10）', () => {
@@ -145,10 +150,10 @@ describe('updateRechargeSettings：币种与 Stripe 模式一致性', () => {
     ).rejects.toBeInstanceOf(RechargeSettingsError);
   });
 
-  it('▶ 两个密钥模式不一致 → 拒绝', async () => {
+  it.each(['sk_live_new', 'rk_live_new'])('▶ %s 与 test webhook 模式不一致 → 拒绝', async (key) => {
     await expect(
       updateRechargeSettings({
-        stripeSecretKey: 'sk_live_new',
+        stripeSecretKey: key,
         stripeWebhookSecret: 'whsec_test_old',
       })
     ).rejects.toBeInstanceOf(RechargeSettingsError);
@@ -160,6 +165,83 @@ describe('updateRechargeSettings：币种与 Stripe 模式一致性', () => {
         alipayEnabled: true,
         stripeSecretKey: SETTING_SECRET_MASK,
         stripeWebhookSecret: SETTING_SECRET_MASK,
+      })
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe('SEC-024：生产环境保存 Stripe 配置 fail-closed', () => {
+  it.each(['sk_test_new', 'rk_test_new', 'proxy_secret'])(
+    '▶ 新存 %s → 拒绝且不写任何字段',
+    async (key) => {
+      vi.stubEnv('NODE_ENV', 'production');
+      await expect(
+        updateRechargeSettings({
+          stripeSecretKey: key,
+          stripeWebhookSecret: 'whsec_current',
+        })
+      ).rejects.toBeInstanceOf(RechargeSettingsError);
+      expect(siteSettingUpsertMock).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['sk_live_new', 'rk_live_new'])('▶ 新存 %s + webhook secret → 允许', async (key) => {
+    vi.stubEnv('NODE_ENV', 'production');
+    await expect(
+      updateRechargeSettings({
+        stripeSecretKey: key,
+        stripeWebhookSecret: 'whsec_current',
+      })
+    ).resolves.toBeUndefined();
+  });
+
+  it('▶ 启用时 key 留掩码：读取现有 test key 后拒绝，不允许历史脏配置复活', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    siteSettingFindManyMock.mockResolvedValue([
+      { key: 'recharge_stripe_secret_key', value: 'enc:sk_test_existing' },
+    ]);
+
+    await expect(
+      updateRechargeSettings({
+        stripeEnabled: true,
+        stripeSecretKey: SETTING_SECRET_MASK,
+        stripeWebhookSecret: SETTING_SECRET_MASK,
+      })
+    ).rejects.toBeInstanceOf(RechargeSettingsError);
+    expect(siteSettingUpsertMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ 启用时 key 留掩码：现有 rk_live key 通过且只在保存请求期读取数据库', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    siteSettingFindManyMock.mockResolvedValue([
+      { key: 'recharge_stripe_secret_key', value: 'enc:rk_live_existing' },
+    ]);
+
+    await expect(
+      updateRechargeSettings({
+        stripeEnabled: true,
+        stripeSecretKey: SETTING_SECRET_MASK,
+        stripeWebhookSecret: SETTING_SECRET_MASK,
+      })
+    ).resolves.toBeUndefined();
+    expect(siteSettingFindManyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('▶ 生产仍可关闭历史 test 配置；开发环境仍可正常保存 test key', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    await expect(
+      updateRechargeSettings({
+        stripeEnabled: false,
+        stripeSecretKey: SETTING_SECRET_MASK,
+        stripeWebhookSecret: SETTING_SECRET_MASK,
+      })
+    ).resolves.toBeUndefined();
+
+    vi.stubEnv('NODE_ENV', 'development');
+    await expect(
+      updateRechargeSettings({
+        stripeSecretKey: 'rk_test_local',
+        stripeWebhookSecret: 'whsec_local',
       })
     ).resolves.toBeUndefined();
   });
@@ -217,6 +299,56 @@ describe('沙箱渠道：生产环境不得出现在公开配置里（P3-5 附�
 
   it('▶ 非生产 → 列出', () => {
     expect(toPublicRechargeConfig(s).providers).toEqual(['sandbox']);
+  });
+});
+
+describe('SEC-024：公开配置与 checkout/callback provider 共享生产模式门禁', () => {
+  const stripe = (secretKey: string) =>
+    full({
+      stripeEnabled: true,
+      stripeSecretKey: secretKey,
+      stripeWebhookSecret: 'whsec_x',
+      stripePublishableKey: 'pk_configured_x',
+    });
+
+  it.each(['sk_test_x', 'rk_test_x', 'proxy_x'])(
+    '▶ 生产 %s：不公开、不装配 checkout、也不装配 callback',
+    async (key) => {
+      vi.stubEnv('NODE_ENV', 'production');
+      const s = stripe(key);
+
+      expect(hasChannelCredentials(s, 'stripe')).toBe(false);
+      expect(toPublicRechargeConfig(s)).toMatchObject({
+        providers: [],
+        stripePublishableKey: '',
+      });
+      expect(await getPaymentProvider('stripe', s)).toBeNull();
+      expect(await getCallbackPaymentProvider('stripe', s)).toBeNull();
+    }
+  );
+
+  it.each(['sk_live_x', 'rk_live_x'])(
+    '▶ 生产 %s：完整 live 配置正常公开并双向装配',
+    async (key) => {
+      vi.stubEnv('NODE_ENV', 'production');
+      const s = stripe(key);
+
+      expect(hasChannelCredentials(s, 'stripe')).toBe(true);
+      expect(toPublicRechargeConfig(s)).toMatchObject({
+        providers: ['stripe'],
+        stripePublishableKey: 'pk_configured_x',
+      });
+      expect(await getPaymentProvider('stripe', s)).not.toBeNull();
+      expect(await getCallbackPaymentProvider('stripe', s)).not.toBeNull();
+    }
+  );
+
+  it('▶ 开发环境的 test key 仍正常公开并双向装配', async () => {
+    vi.stubEnv('NODE_ENV', 'development');
+    const s = stripe('rk_test_local');
+    expect(toPublicRechargeConfig(s).providers).toEqual(['stripe']);
+    expect(await getPaymentProvider('stripe', s)).not.toBeNull();
+    expect(await getCallbackPaymentProvider('stripe', s)).not.toBeNull();
   });
 });
 

@@ -1,4 +1,5 @@
 import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 
 export const LLM_PURPOSES = [
   'CHAT',
@@ -37,7 +38,8 @@ export function pickDefaultModelIdsByPurpose(models: DefaultableModel[]) {
 }
 
 export async function normalizeDefaultModelsByPurpose(
-  defaults: Partial<Record<LlmAdminPurpose, string>>
+  defaults: Partial<Record<LlmAdminPurpose, string>>,
+  db: Pick<Prisma.TransactionClient, 'llmModel'> = prisma
 ) {
   for (const purpose of LLM_PURPOSES) {
     const keepModelId = defaults[purpose];
@@ -45,7 +47,7 @@ export async function normalizeDefaultModelsByPurpose(
       continue;
     }
 
-    await prisma.llmModel.updateMany({
+    await db.llmModel.updateMany({
       where: {
         purpose,
         id: { not: keepModelId },
@@ -53,7 +55,7 @@ export async function normalizeDefaultModelsByPurpose(
       data: { isDefault: false },
     });
 
-    await prisma.llmModel.update({
+    await db.llmModel.update({
       where: { id: keepModelId },
       data: { isDefault: true },
     });

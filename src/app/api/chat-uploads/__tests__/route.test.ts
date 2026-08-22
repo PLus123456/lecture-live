@@ -6,41 +6,72 @@ import {
 
 const {
   verifyAuthMock,
-  reserveStorageBytesMock,
-  releaseStorageBytesMock,
+  reserveStoredArtifactMock,
+  recordReservedStoredArtifactLocationMock,
+  settleStoredArtifactMock,
+  rollbackStoredArtifactMock,
+  markStoredArtifactOrphanMock,
+  deleteCloudreveAttachmentFilesMock,
   enforceApiRateLimitMock,
   getSiteSettingsMock,
   uploadMock,
   createCloudreveStorageMock,
   conversationFindUniqueMock,
   chatAttachmentCreateMock,
+  chatAttachmentDeleteManyMock,
   chatAttachmentFindManyMock,
   chatAttachmentUpdateManyMock,
+  executeRawMock,
   extractTextFromBufferMock,
   isExtractableMimeMock,
+  queryRawMock,
+  getStoredArtifactMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
-  reserveStorageBytesMock: vi.fn(),
-  releaseStorageBytesMock: vi.fn(),
+  reserveStoredArtifactMock: vi.fn(),
+  recordReservedStoredArtifactLocationMock: vi.fn(),
+  settleStoredArtifactMock: vi.fn(),
+  rollbackStoredArtifactMock: vi.fn(),
+  markStoredArtifactOrphanMock: vi.fn(),
+  deleteCloudreveAttachmentFilesMock: vi.fn(),
   enforceApiRateLimitMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
   uploadMock: vi.fn(),
   createCloudreveStorageMock: vi.fn(),
   conversationFindUniqueMock: vi.fn(),
   chatAttachmentCreateMock: vi.fn(),
+  chatAttachmentDeleteManyMock: vi.fn(),
   chatAttachmentFindManyMock: vi.fn(),
   chatAttachmentUpdateManyMock: vi.fn(),
+  executeRawMock: vi.fn(),
   extractTextFromBufferMock: vi.fn(),
   isExtractableMimeMock: vi.fn(),
+  queryRawMock: vi.fn(),
+  getStoredArtifactMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({
   verifyAuth: verifyAuthMock,
 }));
 
-vi.mock('@/lib/quota', () => ({
-  reserveStorageBytes: reserveStorageBytesMock,
-  releaseStorageBytes: releaseStorageBytesMock,
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_STATE: { RESERVED: 'RESERVED', ACTIVE: 'ACTIVE' },
+  STORED_ARTIFACT_TYPE: {
+    CHAT_RAW: 'chat_raw',
+    CHAT_EXTRACTED: 'chat_extracted',
+  },
+  StoredArtifactQuotaExceededError: class StoredArtifactQuotaExceededError extends Error {},
+  reserveStoredArtifact: reserveStoredArtifactMock,
+  recordReservedStoredArtifactLocation: recordReservedStoredArtifactLocationMock,
+  settleStoredArtifact: settleStoredArtifactMock,
+  rollbackStoredArtifact: rollbackStoredArtifactMock,
+  markStoredArtifactOrphan: markStoredArtifactOrphanMock,
+  settleStoredArtifactInTransaction: settleStoredArtifactMock,
+  getStoredArtifactById: getStoredArtifactMock,
+}));
+
+vi.mock('@/lib/storage/cloudreveFileDelete', () => ({
+  deleteCloudreveAttachmentFiles: deleteCloudreveAttachmentFilesMock,
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -50,9 +81,18 @@ vi.mock('@/lib/prisma', () => ({
     },
     chatAttachment: {
       create: chatAttachmentCreateMock,
+      deleteMany: chatAttachmentDeleteManyMock,
       findMany: chatAttachmentFindManyMock,
       updateMany: chatAttachmentUpdateManyMock,
     },
+    $executeRaw: executeRawMock,
+    $queryRaw: queryRawMock,
+    $transaction: vi.fn(async (callback) =>
+      callback({
+        chatAttachment: { create: chatAttachmentCreateMock },
+        $executeRaw: executeRawMock,
+      })
+    ),
   },
 }));
 
@@ -92,16 +132,38 @@ vi.mock('@/lib/logger', () => {
 });
 
 import { POST, GET } from '@/app/api/chat-uploads/route';
+import {
+  CHAT_ATTACHMENT_TEXT_MAX_BYTES,
+  CHAT_ATTACHMENT_TEXT_MAX_CHARS,
+} from '@/lib/llm/chatAttachmentPolicy';
+import { DocumentParserError } from '@/lib/documentParserProcess';
+import { StoredArtifactQuotaExceededError } from '@/lib/storage/storedArtifactLedger';
 
 describe('POST /api/chat-uploads', () => {
   beforeEach(() => {
+    let reservationSequence = 0;
     verifyAuthMock.mockResolvedValue({
       id: 'user-1',
       email: 'alice@example.com',
       role: 'PRO',
     });
-    reserveStorageBytesMock.mockResolvedValue(true);
-    releaseStorageBytesMock.mockResolvedValue(null);
+    reserveStoredArtifactMock.mockImplementation(
+      async (input: { artifactType: string; expectedBytes: number }) => ({
+        id: `artifact-${input.artifactType}-${++reservationSequence}`,
+        userId: 'user-1',
+        logicalKey: `logical-${input.artifactType}`,
+        expectedBytes: BigInt(input.expectedBytes),
+        state: 'RESERVED',
+        reservationKey: `reservation-${reservationSequence}`,
+      })
+    );
+    recordReservedStoredArtifactLocationMock.mockResolvedValue(undefined);
+    settleStoredArtifactMock.mockResolvedValue({ artifact: {}, previous: null });
+    rollbackStoredArtifactMock.mockResolvedValue(true);
+    markStoredArtifactOrphanMock.mockResolvedValue(undefined);
+    queryRawMock.mockResolvedValue([]);
+    getStoredArtifactMock.mockResolvedValue({ state: 'RESERVED' });
+    deleteCloudreveAttachmentFilesMock.mockResolvedValue(true);
     enforceApiRateLimitMock.mockResolvedValue(null);
     getSiteSettingsMock.mockResolvedValue({ chat_files_max_upload_mb: 100 });
     // 默认 conversation 归属当前用户（Conversation.userId）
@@ -117,6 +179,8 @@ describe('POST /api/chat-uploads', () => {
         `/user-1/chat-uploads/${fileName}`
     );
     chatAttachmentCreateMock.mockResolvedValue({ id: 'att-1' });
+    chatAttachmentDeleteManyMock.mockResolvedValue({ count: 1 });
+    executeRawMock.mockResolvedValue(1);
     // 默认所有 MIME 都被 isExtractableMime 报告为可抽 (text/plain 走前缀匹配也会进 fileExtractor)
     isExtractableMimeMock.mockImplementation((mt: string) => {
       const lower = mt.toLowerCase();
@@ -161,11 +225,15 @@ describe('POST /api/chat-uploads', () => {
       bytes: number;
       extractedTextPreview: string | null;
       fileName: string;
+      llmUsable: boolean;
+      llmUnavailableReason: string | null;
     }>(response);
-    expect(body.attachmentId).toBe('att-1');
+    expect(body.attachmentId).toEqual(expect.any(String));
     expect(body.kind).toBe('text');
     expect(body.fileName).toBe('notes.txt');
     expect(body.extractedTextPreview).toBe('extracted body');
+    expect(body.llmUsable).toBe(true);
+    expect(body.llmUnavailableReason).toBeNull();
 
     // 上传两次：原文件 + 抽出的 .txt
     expect(uploadMock).toHaveBeenCalledTimes(2);
@@ -184,8 +252,39 @@ describe('POST /api/chat-uploads', () => {
     expect(createArgs.data.fileName).toBe('notes.txt');
     expect(createArgs.data.extractedTextPath).toBeTruthy();
 
-    // 预留配额（bytes 等于 file.size = 'hello world'.length = 11）
-    expect(reserveStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
+    // 原文件和提取文本各有唯一账本预留，不再另改 User 计数。
+    expect(reserveStoredArtifactMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user-1',
+        conversationId: 'conv-1',
+        artifactType: 'chat_raw',
+        expectedBytes: 11,
+      })
+    );
+    expect(reserveStoredArtifactMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        artifactType: 'chat_extracted',
+        expectedBytes: Buffer.byteLength('extracted body'),
+      })
+    );
+  });
+
+  it('persists only the bounded LLM extract even when parser output is much larger', async () => {
+    extractTextFromBufferMock.mockResolvedValueOnce({
+      text: '文'.repeat(CHAT_ATTACHMENT_TEXT_MAX_CHARS + 100),
+      truncated: false,
+    });
+
+    const response = await POST(makeRequest());
+    expect(response.status).toBe(200);
+    const extractedUpload = uploadMock.mock.calls[1]?.[3] as Buffer;
+    expect(extractedUpload).toBeInstanceOf(Buffer);
+    expect(extractedUpload.byteLength).toBeLessThanOrEqual(
+      CHAT_ATTACHMENT_TEXT_MAX_BYTES
+    );
+    expect(extractedUpload.toString('utf8')).toContain(
+      'truncated due to size limit'
+    );
   });
 
   it('upload image/png → kind=image，不调用 extractTextFromBuffer', async () => {
@@ -197,11 +296,14 @@ describe('POST /api/chat-uploads', () => {
       })
     );
     expect(response.status).toBe(200);
-    const body = await readJson<{ kind: string; extractedTextPreview: string | null }>(
-      response
-    );
+    const body = await readJson<{
+      kind: string;
+      extractedTextPreview: string | null;
+      llmUsable: boolean;
+    }>(response);
     expect(body.kind).toBe('image');
     expect(body.extractedTextPreview).toBeNull();
+    expect(body.llmUsable).toBe(true);
     expect(extractTextFromBufferMock).not.toHaveBeenCalled();
     // 只上传一次（无副 .txt）
     expect(uploadMock).toHaveBeenCalledTimes(1);
@@ -217,11 +319,16 @@ describe('POST /api/chat-uploads', () => {
       })
     );
     expect(response.status).toBe(200);
-    const body = await readJson<{ kind: string; extractedTextPreview: string | null }>(
-      response
-    );
+    const body = await readJson<{
+      kind: string;
+      extractedTextPreview: string | null;
+      llmUsable: boolean;
+      llmUnavailableReason: string | null;
+    }>(response);
     expect(body.kind).toBe('document');
     expect(body.extractedTextPreview).toBeNull();
+    expect(body.llmUsable).toBe(false);
+    expect(body.llmUnavailableReason).toBe('extracted_text_unavailable');
     // 仅原文件被上传（extraction 失败 → 没有 .txt 上传）
     expect(uploadMock).toHaveBeenCalledTimes(1);
 
@@ -229,6 +336,24 @@ describe('POST /api/chat-uploads', () => {
       data: Record<string, unknown>;
     };
     expect(createArgs.data.extractedTextPath).toBeNull();
+  });
+
+  it('解析子进程取消后立即 499，且不预留、不上传、不落库', async () => {
+    extractTextFromBufferMock.mockRejectedValueOnce(
+      new DocumentParserError('cancelled', 'cancelled')
+    );
+    const response = await POST(
+      makeRequest({
+        fileName: 'cancelled.pdf',
+        contents: new Uint8Array([1, 2, 3, 4]),
+        type: 'application/pdf',
+      })
+    );
+
+    expect(response.status).toBe(499);
+    expect(reserveStoredArtifactMock).not.toHaveBeenCalled();
+    expect(uploadMock).not.toHaveBeenCalled();
+    expect(chatAttachmentCreateMock).not.toHaveBeenCalled();
   });
 
   it('未登录返回 401', async () => {
@@ -284,34 +409,128 @@ describe('POST /api/chat-uploads', () => {
     // 设 max=1MB, 上传 2MB 文件 → 拒绝
     getSiteSettingsMock.mockResolvedValueOnce({ chat_files_max_upload_mb: 1 });
     const bigPayload = new Uint8Array(2 * 1024 * 1024); // 2MB
-    const response = await POST(
-      makeRequest({
-        fileName: 'big.bin',
-        contents: bigPayload,
-        type: 'text/plain',
-      })
-    );
+    const request = makeRequest({
+      fileName: 'big.bin',
+      contents: bigPayload,
+      type: 'text/plain',
+    });
+    request.headers.set('content-length', String(3 * 1024 * 1024));
+    const response = await POST(request);
     expect(response.status).toBe(413);
     expect(uploadMock).not.toHaveBeenCalled();
   });
 
-  it('配额超限（reserveStorageBytes 返回 false）→ 403，不上传', async () => {
-    reserveStorageBytesMock.mockResolvedValueOnce(false);
+  it('chunked/缺 Content-Length 的超限 multipart 仍按实际流字节 413', async () => {
+    getSiteSettingsMock.mockResolvedValueOnce({ chat_files_max_upload_mb: 1 });
+    // Parsing is never reached: the actual streamed bytes cross the cap first.
+    // Use a raw network-like stream instead of undici's FormData encoder, whose
+    // older Node implementation emits an unrelated enqueue-after-cancel error.
+    const encoded = new Uint8Array(2 * 1024 * 1024 + 32);
+    const headers = new Headers({
+      'content-type': 'multipart/form-data; boundary=bounded-test',
+    });
+    const chunked = {
+      url: 'http://localhost:3000/api/chat-uploads',
+      method: 'POST',
+      headers,
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoded);
+          controller.close();
+        },
+      }),
+    } as Request;
+
+    const response = await POST(chunked);
+
+    expect(response.status).toBe(413);
+    expect(conversationFindUniqueMock).not.toHaveBeenCalled();
+    expect(uploadMock).not.toHaveBeenCalled();
+  });
+
+  it('原文件账本预留超限 → 403，不上传', async () => {
+    reserveStoredArtifactMock.mockRejectedValueOnce(
+      new StoredArtifactQuotaExceededError()
+    );
     const response = await POST(makeRequest());
     expect(response.status).toBe(403);
     expect(uploadMock).not.toHaveBeenCalled();
   });
 
-  it('预留成功但写 ChatAttachment 失败 → 500，且回滚已预留的字节配额', async () => {
+  it('预留成功但写 ChatAttachment 失败 → 500，且回滚两个账本预留', async () => {
     chatAttachmentCreateMock.mockRejectedValueOnce(new Error('db down'));
     const response = await POST(makeRequest());
     expect(response.status).toBe(500);
-    // 先预留、后回滚，bytes 一致（'hello world' = 11）
-    expect(reserveStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
-    expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 11);
+    const reservationIds = reserveStoredArtifactMock.mock.results.map(
+      (result) => result.value
+    );
+    const resolvedReservations = await Promise.all(reservationIds);
+    expect(rollbackStoredArtifactMock).toHaveBeenCalledWith(
+      resolvedReservations[0]?.id
+    );
+    expect(rollbackStoredArtifactMock).toHaveBeenCalledWith(
+      resolvedReservations[1]?.id
+    );
   });
 
-  it('未知 MIME → 415，且回滚已预留的字节配额（U5）', async () => {
+  it('附件行写入后账本发布失败 → 事务失败且删除文件、回滚两个预留', async () => {
+    settleStoredArtifactMock.mockRejectedValueOnce(new Error('settle failed'));
+
+    const response = await POST(makeRequest());
+
+    expect(response.status).toBe(500);
+    expect(chatAttachmentCreateMock).toHaveBeenCalledTimes(1);
+    // 事务已回滚且 readback 证明 owner 不存在，不需要再做危险的盲删 owner。
+    expect(chatAttachmentDeleteManyMock).not.toHaveBeenCalled();
+    expect(deleteCloudreveAttachmentFilesMock).toHaveBeenCalledWith([
+      expect.objectContaining({
+        cloudrevePath: expect.stringContaining('/conv-1_notes.txt'),
+        extractedTextPath: expect.stringContaining(
+          '/conv-1_notes.txt.extracted.txt'
+        ),
+      }),
+    ]);
+
+    const resolvedReservations = await Promise.all(
+      reserveStoredArtifactMock.mock.results.map((result) => result.value)
+    );
+    expect(rollbackStoredArtifactMock).toHaveBeenCalledWith(
+      resolvedReservations[0]?.id
+    );
+    expect(rollbackStoredArtifactMock).toHaveBeenCalledWith(
+      resolvedReservations[1]?.id
+    );
+  });
+
+  it('事务 ACK 丢失但 owner+两条 ledger readback 已提交时按成功返回且不删文件', async () => {
+    settleStoredArtifactMock.mockRejectedValueOnce(new Error('commit ACK lost'));
+    queryRawMock.mockImplementation(async () => {
+      const data = chatAttachmentCreateMock.mock.calls[0]?.[0]?.data;
+      const rawReservation = await reserveStoredArtifactMock.mock.results[0].value;
+      return [
+        {
+          storedArtifactId: rawReservation.id,
+          source: 'UPLOAD',
+          cloudrevePath: data.cloudrevePath,
+          extractedTextPath: data.extractedTextPath,
+        },
+      ];
+    });
+    getStoredArtifactMock.mockImplementation(async (artifactId: string) => {
+      const locationCall = recordReservedStoredArtifactLocationMock.mock.calls.find(
+        (call) => call[0] === artifactId
+      );
+      return { state: 'ACTIVE', reference: locationCall?.[1]?.reference };
+    });
+
+    const response = await POST(makeRequest());
+
+    expect(response.status).toBe(200);
+    expect(deleteCloudreveAttachmentFilesMock).not.toHaveBeenCalled();
+    expect(rollbackStoredArtifactMock).not.toHaveBeenCalled();
+  });
+
+  it('未知 MIME → 415，且在任何账本预留或物理写入前拒绝', async () => {
     isExtractableMimeMock.mockReturnValueOnce(false);
     const response = await POST(
       makeRequest({
@@ -322,10 +541,8 @@ describe('POST /api/chat-uploads', () => {
     );
     expect(response.status).toBe(415);
     expect(uploadMock).not.toHaveBeenCalled();
-    // U5：415 退出口也要 releaseStorageBytes，避免泄漏 reserveStorageBytes 已预留的字节。
-    // 3 字节内容 → 预留 3、回滚 3。
-    expect(reserveStorageBytesMock).toHaveBeenCalledWith('user-1', 3);
-    expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 3);
+    expect(reserveStoredArtifactMock).not.toHaveBeenCalled();
+    expect(rollbackStoredArtifactMock).not.toHaveBeenCalled();
   });
 
   it('超长文件名被截断，使 fileName / cloudrevePath / extractedTextPath 均 ≤191（U32）', async () => {
@@ -393,6 +610,7 @@ describe('GET /api/chat-uploads?conversationId=...', () => {
         bytes: BigInt(11),
         createdAt: new Date('2026-01-01T00:00:00Z'),
         cloudrevePath: '/user-1/chat-uploads/conv-1_a.txt',
+        extractedTextPath: null,
       },
     ]);
     chatAttachmentUpdateManyMock.mockResolvedValue({ count: 1 });
@@ -405,13 +623,21 @@ describe('GET /api/chat-uploads?conversationId=...', () => {
     const response = await GET(req);
     expect(response.status).toBe(200);
     const body = await readJson<{
-      attachments: Array<{ id: string; bytes: number; fileName: string }>;
+      attachments: Array<{
+        id: string;
+        bytes: number;
+        fileName: string;
+        llmUsable: boolean;
+        llmUnavailableReason: string | null;
+      }>;
     }>(response);
     expect(body.attachments).toHaveLength(1);
     expect(body.attachments[0]?.bytes).toBe(11);
     expect(body.attachments[0]?.fileName).toBe('a.txt');
+    expect(body.attachments[0]?.llmUsable).toBe(true);
+    expect(body.attachments[0]?.llmUnavailableReason).toBeNull();
     expect(chatAttachmentUpdateManyMock).toHaveBeenCalledWith({
-      where: { conversationId: 'conv-1' },
+      where: { conversationId: 'conv-1', source: 'UPLOAD' },
       data: { lastAccessedAt: expect.any(Date) },
     });
   });

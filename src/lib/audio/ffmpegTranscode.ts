@@ -190,6 +190,13 @@ export interface TranscodeResult {
   outputSize: number;
 }
 
+export interface DecodeDurationOptions {
+  /** ffmpeg 连续无输出的超时，默认 5 分钟。 */
+  idleTimeoutMs?: number;
+  /** ffmpeg 解码的绝对硬上限，默认 2 小时。 */
+  maxTimeoutMs?: number;
+}
+
 /**
  * ffprobe 空转超时（ms）：正常 probe 应在数秒内返回，坏/不响应输入不能永久挂起。
  */
@@ -282,6 +289,28 @@ export async function probeDurationSec(filePath: string): Promise<number> {
 }
 
 /**
+ * Count audio streams without decoding them. A probe failure is represented as 0 so callers that
+ * require one authoritative recording stream can fail closed.
+ */
+export async function probeAudioStreamCount(filePath: string): Promise<number> {
+  const { code, stdout, timedOut } = await runProbe([
+    '-v', 'error',
+    '-select_streams', 'a',
+    '-show_entries', 'stream=index',
+    '-of', 'csv=p=0',
+    filePath,
+  ]);
+  if (timedOut || code !== 0) return 0;
+
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.some((line) => !/^\d+$/.test(line))) return 0;
+  return lines.length;
+}
+
+/**
  * 用 ffprobe 读取容器 format_name（可能是逗号分隔候选集）。读不到返回 ''。
  */
 export async function probeFormatName(filePath: string): Promise<string> {
@@ -354,6 +383,135 @@ export async function transcodeToMp3(opts: TranscodeOptions): Promise<TranscodeR
   } finally {
     releaseFfmpegSlot();
   }
+}
+
+/**
+ * 完整解码第一条音频流并返回实际解码时长（秒），不生成输出文件。
+ *
+ * MediaRecorder 产生的 streaming/headerless WebM 经常没有可供 ffprobe 读取的
+ * `format.duration`，但音频帧本身完全可解码。这里让 ffmpeg 解码到 null muxer，使用
+ * `-progress` 的 out_time_us 作为服务端测量值。与转码共用同一把信号量，且沿用协议白名单、
+ * stdin 隔离及双超时，避免发布请求绕过现有的 ffmpeg 资源与输入安全边界。
+ */
+export async function measureDecodedAudioDurationSec(
+  inputPath: string,
+  options: DecodeDurationOptions = {}
+): Promise<number> {
+  await acquireFfmpegSlot();
+  try {
+    return await runDecodedAudioDurationMeasurement(inputPath, options);
+  } finally {
+    releaseFfmpegSlot();
+  }
+}
+
+function runDecodedAudioDurationMeasurement(
+  inputPath: string,
+  options: DecodeDurationOptions
+): Promise<number> {
+  const idleTimeoutMs = options.idleTimeoutMs ?? 5 * 60_000;
+  const maxTimeoutMs = options.maxTimeoutMs ?? 2 * 60 * 60_000;
+  const args = [
+    '-nostdin',
+    '-protocol_whitelist', PROTOCOL_WHITELIST,
+    '-i', inputPath,
+    // 权威发布调用方必须先通过 probeAudioStreamCount 确认恰好一个音频流。显式映射该流，
+    // 避免 ffmpeg 的默认流选择受攻击者控制的 disposition/metadata 影响。
+    '-map', '0:a:0',
+    '-vn',
+    '-sn',
+    '-dn',
+    // MediaRecorder 在切换输入时会把多个独立 WebM 文档直接按字节拼接，各文档 PTS 都从 0
+    // 重启。直接看 progress 只会得到“最长一段”而非总录音。先固定采样率，再按累计解码样本
+    // 重建单调 PTS，使时长等于所有实际解码音频帧之和，也不再信任攻击者控制的容器时间戳。
+    '-af', 'aresample=48000,asetpts=N/SR/TB',
+    '-f', 'null',
+    '-progress', 'pipe:2',
+    '-nostats',
+    '-',
+  ];
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(FFMPEG_BIN, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    proc.stdout.on('data', () => {});
+
+    let settled = false;
+    let killedReason: 'idle' | 'max' | null = null;
+    let progressRemainder = '';
+    let maxDecodedUs = 0;
+    let stderrTail = '';
+
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        killedReason = 'idle';
+        proc.kill('SIGKILL');
+      }, idleTimeoutMs);
+    };
+    const hardTimer = setTimeout(() => {
+      killedReason = 'max';
+      proc.kill('SIGKILL');
+    }, maxTimeoutMs);
+    const clearTimers = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      clearTimeout(hardTimer);
+    };
+    const finish = (result: { durationSec: number } | { error: Error }) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      if ('error' in result) reject(result.error);
+      else resolve(result.durationSec);
+    };
+    const readProgressLine = (line: string) => {
+      const match = /^(?:out_time_us|out_time_ms)=(\d+)$/.exec(line.trim());
+      if (!match) return;
+      const value = Number.parseInt(match[1], 10);
+      if (Number.isFinite(value)) {
+        // ffmpeg 的 progress 协议里 out_time_ms 历史上同样以微秒为单位。
+        maxDecodedUs = Math.max(maxDecodedUs, value);
+      }
+    };
+
+    resetIdleTimer();
+    proc.stderr.on('data', (chunk: Buffer) => {
+      resetIdleTimer();
+      const text = chunk.toString();
+      stderrTail = (stderrTail + text).slice(-16_384);
+      progressRemainder += text;
+      const lines = progressRemainder.split(/\r?\n/);
+      progressRemainder = lines.pop() ?? '';
+      for (const line of lines) readProgressLine(line);
+    });
+
+    proc.on('error', (error) => {
+      finish({ error: new Error(`ffmpeg spawn failed: ${error.message}`) });
+    });
+    proc.on('close', (code) => {
+      readProgressLine(progressRemainder);
+      if (killedReason) {
+        const detail =
+          killedReason === 'idle'
+            ? `no output for ${Math.round(idleTimeoutMs / 1000)}s`
+            : `exceeded ${Math.round(maxTimeoutMs / 60_000)}min hard limit`;
+        finish({ error: new Error(`ffmpeg duration measurement timed out (${detail})`) });
+        return;
+      }
+      if (code !== 0) {
+        logger.error(
+          { code, errTail: stderrTail.slice(-1024) },
+          'ffmpeg duration measurement failed'
+        );
+        finish({ error: new Error(`ffmpeg duration measurement exited with code ${code}`) });
+        return;
+      }
+      finish({ durationSec: maxDecodedUs > 0 ? maxDecodedUs / 1_000_000 : 0 });
+    });
+  });
 }
 
 async function runTranscodeToMp3(opts: TranscodeOptions): Promise<TranscodeResult> {

@@ -12,6 +12,15 @@ const {
   releaseStorageBytesMock,
   loadCloudreveContextMock,
   deleteCloudreveFileMock,
+  findBillableStoredArtifactsByOwnerMock,
+  markStoredArtifactOrphanMock,
+  releaseStoredArtifactMock,
+  transactionMock,
+  executeRawMock,
+  markStoredArtifactsDeletePendingInTransactionMock,
+  assertStoredArtifactBackfillCompleteMock,
+  assertStoredArtifactReferencesCoveredMock,
+  areStoredArtifactDeleteIntentsDurableMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   attachmentFindUniqueMock: vi.fn(),
@@ -19,6 +28,15 @@ const {
   releaseStorageBytesMock: vi.fn(),
   loadCloudreveContextMock: vi.fn(),
   deleteCloudreveFileMock: vi.fn(),
+  findBillableStoredArtifactsByOwnerMock: vi.fn(),
+  markStoredArtifactOrphanMock: vi.fn(),
+  releaseStoredArtifactMock: vi.fn(),
+  transactionMock: vi.fn(),
+  executeRawMock: vi.fn(),
+  markStoredArtifactsDeletePendingInTransactionMock: vi.fn(),
+  assertStoredArtifactBackfillCompleteMock: vi.fn(),
+  assertStoredArtifactReferencesCoveredMock: vi.fn(),
+  areStoredArtifactDeleteIntentsDurableMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
@@ -28,12 +46,28 @@ vi.mock('@/lib/prisma', () => ({
       findUnique: attachmentFindUniqueMock,
       delete: attachmentDeleteMock,
     },
+    $transaction: transactionMock,
   },
 }));
 vi.mock('@/lib/quota', () => ({ releaseStorageBytes: releaseStorageBytesMock }));
 vi.mock('@/lib/storage/cloudreveFileDelete', () => ({
   loadCloudreveContext: loadCloudreveContextMock,
   deleteCloudreveFile: deleteCloudreveFileMock,
+}));
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_TYPE: { CHAT_EXTRACTED: 'chat_extracted' },
+  assertStoredArtifactBackfillComplete:
+    assertStoredArtifactBackfillCompleteMock,
+  assertStoredArtifactReferencesCovered:
+    assertStoredArtifactReferencesCoveredMock,
+  areStoredArtifactDeleteIntentsDurable:
+    areStoredArtifactDeleteIntentsDurableMock,
+  findBillableStoredArtifactsByOwner:
+    findBillableStoredArtifactsByOwnerMock,
+  markStoredArtifactsDeletePendingInTransaction:
+    markStoredArtifactsDeletePendingInTransactionMock,
+  markStoredArtifactOrphan: markStoredArtifactOrphanMock,
+  releaseStoredArtifact: releaseStoredArtifactMock,
 }));
 
 import { DELETE } from '@/app/api/chat-uploads/[id]/route';
@@ -61,6 +95,21 @@ describe('DELETE /api/chat-uploads/[id] — 只读对话守卫（M5）', () => {
     attachmentDeleteMock.mockResolvedValue({});
     releaseStorageBytesMock.mockResolvedValue(undefined);
     loadCloudreveContextMock.mockResolvedValue(null);
+    findBillableStoredArtifactsByOwnerMock.mockResolvedValue([]);
+    markStoredArtifactOrphanMock.mockResolvedValue(undefined);
+    releaseStoredArtifactMock.mockResolvedValue(true);
+    executeRawMock.mockResolvedValue(1);
+    markStoredArtifactsDeletePendingInTransactionMock.mockResolvedValue([]);
+    assertStoredArtifactBackfillCompleteMock.mockResolvedValue(undefined);
+    assertStoredArtifactReferencesCoveredMock.mockReturnValue(undefined);
+    areStoredArtifactDeleteIntentsDurableMock.mockResolvedValue(true);
+    transactionMock.mockImplementation(
+      async (run: (tx: unknown) => Promise<unknown>) =>
+        run({
+          chatAttachment: { delete: attachmentDeleteMock },
+          $executeRaw: executeRawMock,
+        })
+    );
   });
 
   it('对话已关闭（endedAt 非空）→ 409，且不删文件/DB 行', async () => {
@@ -93,5 +142,45 @@ describe('DELETE /api/chat-uploads/[id] — 只读对话守卫（M5）', () => {
     const res = await DELETE(...del('att-1'));
     expect(res.status).toBe(403);
     expect(attachmentDeleteMock).not.toHaveBeenCalled();
+  });
+
+  it('owner/DELETE_PENDING 事务失败且 owner 仍在时不删物理文件', async () => {
+    attachmentFindUniqueMock.mockResolvedValue(OPEN_ATTACHMENT);
+    transactionMock.mockRejectedValueOnce(new Error('db down'));
+
+    const res = await DELETE(...del('att-1'));
+
+    expect(res.status).toBe(500);
+    expect(deleteCloudreveFileMock).not.toHaveBeenCalled();
+    expect(releaseStoredArtifactMock).not.toHaveBeenCalled();
+  });
+
+  it('物理删除失败时保留 DELETE_PENDING 收费行，绝不提前 release', async () => {
+    attachmentFindUniqueMock.mockResolvedValue(OPEN_ATTACHMENT);
+    findBillableStoredArtifactsByOwnerMock.mockResolvedValueOnce([
+      {
+        id: 'artifact-1',
+        artifactType: 'chat_raw',
+        reference: OPEN_ATTACHMENT.cloudrevePath,
+      },
+    ]);
+    markStoredArtifactsDeletePendingInTransactionMock.mockResolvedValueOnce([
+      { id: 'artifact-1' },
+    ]);
+    loadCloudreveContextMock.mockResolvedValueOnce({
+      baseUrl: 'https://storage.test',
+      accessToken: 'token',
+    });
+    deleteCloudreveFileMock.mockResolvedValueOnce(false);
+
+    const res = await DELETE(...del('att-1'));
+
+    expect(res.status).toBe(200);
+    expect(markStoredArtifactsDeletePendingInTransactionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      ['artifact-1']
+    );
+    expect(deleteCloudreveFileMock).toHaveBeenCalled();
+    expect(releaseStoredArtifactMock).not.toHaveBeenCalled();
   });
 });

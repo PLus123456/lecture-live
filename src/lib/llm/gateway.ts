@@ -1,10 +1,16 @@
 // src/lib/llm/gateway.ts
 // 多 Provider LLM 网关 — 优先从数据库读取配置，回退到环境变量
 
+import crypto from 'node:crypto';
 import type { ThinkingDepth, LlmPurpose } from '@/types/llm';
 import { prisma } from '@/lib/prisma';
 import { decrypt } from '@/lib/crypto';
 import { logger, serializeError } from '@/lib/logger';
+import { completeActiveJob, failActiveJob, JOB_TYPE } from '@/lib/jobQueue';
+import {
+  claimLlmTokenBudget,
+} from '@/lib/llm/resourceBudget';
+import { fetchLlmOutbound } from '@/lib/llm/outboundPolicy';
 
 /** 安全：截断上游 API 错误响应，避免泄露 API key 或敏感信息 */
 function sanitizeApiError(text: string, maxLen = 200): string {
@@ -44,7 +50,7 @@ async function fetchStreamWithHeadersTimeout(
   }
   const timer = setTimeout(() => controller.abort(), headersTimeoutMs);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    return await fetchLlmOutbound(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -433,10 +439,26 @@ function buildThinkingParams(
   return { ...empty, reasoning_effort: provider.thinkingDepth };
 }
 
-interface LLMCallUsage {
+export interface LLMCallUsage {
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
+}
+
+function completeTokenUsage(
+  inputTokens: number | undefined,
+  outputTokens: number | undefined
+): LLMCallUsage {
+  const complete =
+    Number.isSafeInteger(inputTokens) &&
+    (inputTokens ?? -1) >= 0 &&
+    Number.isSafeInteger(outputTokens) &&
+    (outputTokens ?? -1) >= 0;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: complete ? (inputTokens as number) + (outputTokens as number) : undefined,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -579,6 +601,24 @@ interface CallOptions {
   purpose?: LlmPurpose;
   modelId?: string;
   /**
+   * 安全敏感调用方持久化的数据库模型快照。指定后，实际 fetch 前解析出的
+   * provider 必须仍是同一 DB model 且用途未变化；删除/改用途/DB fallback
+   * 一律关闭失败，不能静默改走环境变量或另一用途的默认模型。
+   */
+  expectedModel?: { dbModelId: string; purpose: LlmPurpose };
+  /**
+   * 调用方已预留的单次输出上限。网关将 provider 快照锁到该值，避免管理员
+   * 在 planner 与真实 fetch 之间修改 maxTokens，使实际请求突破已预留边界。
+   */
+  maxOutputTokens?: number;
+  /**
+   * 流式正文的 UTF-8 上限。网关会由此推导一个包含 SSE/JSON 转义开销的
+   * wire 上限，在单行拼接或 JSON.parse 前 cancel 超大上游响应。
+   */
+  maxResponseUtf8Bytes?: number;
+  /** 非流式调用成功返回时上报 provider usage，供外层结算。 */
+  onUsage?: (usage: LLMCallUsage | undefined) => void;
+  /**
    * 外部取消信号（如客户端断开时由路由层 abort）。透传到出站 provider fetch：一旦 abort，
    * 进行中的响应体 read 会立即中断，停止继续拉流 / 继续计费 / 长时间占用连接。
    */
@@ -600,6 +640,24 @@ async function resolveProviderAndPref(options?: CallOptions): Promise<{
     provider = providers[options.providerOverride] ?? getActiveProvider();
   } else {
     provider = getActiveProvider();
+  }
+
+  if (
+    options?.expectedModel &&
+    (provider.dbModelId !== options.expectedModel.dbModelId ||
+      provider.purpose !== options.expectedModel.purpose)
+  ) {
+    throw new Error('LLM model snapshot mismatch');
+  }
+
+  if (options?.maxOutputTokens !== undefined) {
+    if (
+      !Number.isSafeInteger(options.maxOutputTokens) ||
+      options.maxOutputTokens <= 0
+    ) {
+      throw new Error('Invalid LLM max output token override');
+    }
+    provider = { ...provider, maxTokens: options.maxOutputTokens };
   }
 
   const pref =
@@ -627,15 +685,18 @@ export async function callLLM(
       messageCount: 1,
       purpose: options?.purpose,
     },
-    () =>
-      provider.isAnthropic
-        ? callAnthropic(provider, systemPrompt, userMessage, thinkingParams)
-        : callOpenAICompatible(
+    async () => {
+      const result = provider.isAnthropic
+        ? await callAnthropic(provider, systemPrompt, userMessage, thinkingParams)
+        : await callOpenAICompatible(
             provider,
             systemPrompt,
             userMessage,
             thinkingParams
-          )
+          );
+      options?.onUsage?.(result.usage);
+      return result;
+    }
   );
 }
 
@@ -693,34 +754,82 @@ export async function callLLMWithHistory(
  */
 async function readSseLines(
   res: Response,
-  onData: (data: string) => void
+  onData: (data: string) => void,
+  maxWireBytes = 16 * 1024 * 1024
 ): Promise<void> {
   const body = res.body;
   if (!body) throw new Error('Streaming response has no body');
+  const declared = res.headers.get('content-length')?.trim();
+  if (declared && /^\d+$/.test(declared)) {
+    try {
+      if (BigInt(declared) > BigInt(maxWireBytes)) {
+        await body.cancel('LLM SSE response exceeds byte limit').catch(() => undefined);
+        throw new Error('LLM streaming response exceeded byte limit');
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('exceeded byte limit')) {
+        throw error;
+      }
+      await body.cancel('LLM SSE response has invalid length').catch(() => undefined);
+      throw new Error('LLM streaming response exceeded byte limit');
+    }
+  }
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let receivedBytes = 0;
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      receivedBytes += value.byteLength;
+      if (receivedBytes > maxWireBytes) {
+        await reader.cancel('LLM SSE response exceeds byte limit').catch(() => undefined);
+        throw new Error('LLM streaming response exceeded byte limit');
+      }
+      buffer += decoder.decode(value, { stream: true });
+      // 即使上游不发换行，buffer 也不得越过 wire 上限继续增长。
+      if (buffer.length > maxWireBytes) {
+        await reader.cancel('LLM SSE line exceeds byte limit').catch(() => undefined);
+        throw new Error('LLM streaming response line exceeded byte limit');
+      }
 
-    // SSE 事件以空行分隔；逐行处理 data: 前缀
-    let newlineIdx: number;
-    while ((newlineIdx = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, newlineIdx).replace(/\r$/, '');
-      buffer = buffer.slice(newlineIdx + 1);
-      if (line.startsWith('data:')) {
-        onData(line.slice(5).trim());
+      // SSE 事件以空行分隔；逐行处理 data: 前缀
+      let newlineIdx: number;
+      while ((newlineIdx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newlineIdx).replace(/\r$/, '');
+        buffer = buffer.slice(newlineIdx + 1);
+        if (line.startsWith('data:')) {
+          onData(line.slice(5).trim());
+        }
       }
     }
+    // flush 残留行
+    const tail = buffer.replace(/\r$/, '');
+    if (tail.startsWith('data:')) {
+      onData(tail.slice(5).trim());
+    }
+  } catch (error) {
+    await reader.cancel('LLM SSE processing failed').catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-  // flush 残留行
-  const tail = buffer.replace(/\r$/, '');
-  if (tail.startsWith('data:')) {
-    onData(tail.slice(5).trim());
+}
+
+function streamingWireByteLimit(maxResponseUtf8Bytes?: number): number {
+  if (
+    !Number.isSafeInteger(maxResponseUtf8Bytes) ||
+    (maxResponseUtf8Bytes ?? 0) <= 0
+  ) {
+    return 16 * 1024 * 1024;
   }
+  // JSON \uXXXX 转义最多约6倍，再给 event/usage 帧 64KiB。
+  return Math.min(
+    16 * 1024 * 1024,
+    Math.max(64 * 1024, (maxResponseUtf8Bytes as number) * 8 + 64 * 1024)
+  );
 }
 
 /**
@@ -749,7 +858,8 @@ export async function callLLMWithHistoryStream(
           messages,
           thinkingParams,
           onEvent,
-          options.signal
+          options.signal,
+          options.maxResponseUtf8Bytes
         )
       : await streamOpenAICompatibleWithHistory(
           provider,
@@ -757,7 +867,8 @@ export async function callLLMWithHistoryStream(
           messages,
           thinkingParams,
           onEvent,
-          options.signal
+          options.signal,
+          options.maxResponseUtf8Bytes
         );
     llmLogger.info(
       {
@@ -865,7 +976,7 @@ async function callAnthropic(
     body.thinking = params.thinking;
   }
 
-  const res = await fetch(`${provider.apiBase}/v1/messages`, {
+  const res = await fetchLlmOutbound(`${provider.apiBase}/v1/messages`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -902,12 +1013,10 @@ async function callAnthropic(
   return {
     text,
     thinking: thinking || undefined,
-    usage: {
-      inputTokens: data.usage?.input_tokens,
-      outputTokens: data.usage?.output_tokens,
-      totalTokens:
-        (data.usage?.input_tokens ?? 0) + (data.usage?.output_tokens ?? 0),
-    },
+    usage: completeTokenUsage(
+      data.usage?.input_tokens,
+      data.usage?.output_tokens
+    ),
   };
 }
 
@@ -929,7 +1038,7 @@ async function callAnthropicWithHistory(
     body.thinking = params.thinking;
   }
 
-  const res = await fetch(`${provider.apiBase}/v1/messages`, {
+  const res = await fetchLlmOutbound(`${provider.apiBase}/v1/messages`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -966,12 +1075,10 @@ async function callAnthropicWithHistory(
   return {
     text,
     thinking: thinking || undefined,
-    usage: {
-      inputTokens: data.usage?.input_tokens,
-      outputTokens: data.usage?.output_tokens,
-      totalTokens:
-        (data.usage?.input_tokens ?? 0) + (data.usage?.output_tokens ?? 0),
-    },
+    usage: completeTokenUsage(
+      data.usage?.input_tokens,
+      data.usage?.output_tokens
+    ),
   };
 }
 
@@ -986,7 +1093,8 @@ async function streamAnthropicWithHistory(
   messages: ReadonlyArray<ChatHistoryMessage>,
   params: ThinkingParams,
   onEvent: (ev: LLMStreamEvent) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  maxResponseUtf8Bytes?: number
 ): Promise<LLMStreamResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
@@ -1023,7 +1131,11 @@ async function streamAnthropicWithHistory(
   );
 
   if (!res.ok) {
-    const errText = await res.text();
+    const errText = await readResponseTextBounded(
+      res,
+      64 * 1024,
+      'Anthropic API'
+    );
     throw new Error(
       `Anthropic API error (${res.status}): ${sanitizeApiError(errText)}`
     );
@@ -1073,14 +1185,14 @@ async function streamAnthropicWithHistory(
     if (eventType === 'content_block_delta') {
       const delta = parsed.delta as Record<string, unknown> | undefined;
       if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
-        text += delta.text;
         onEvent({ type: 'text', delta: delta.text });
+        text += delta.text;
       } else if (
         delta?.type === 'thinking_delta' &&
         typeof delta.thinking === 'string'
       ) {
-        thinking += delta.thinking;
         onEvent({ type: 'thinking', delta: delta.thinking });
+        thinking += delta.thinking;
       }
     } else if (eventType === 'message_start') {
       const msg = parsed.message as Record<string, unknown> | undefined;
@@ -1101,7 +1213,7 @@ async function streamAnthropicWithHistory(
         onEvent({ type: 'usage', outputTokens });
       }
     }
-  });
+  }, streamingWireByteLimit(maxResponseUtf8Bytes));
 
   if (streamError) {
     throw new Error(`Anthropic streaming error: ${streamError}`);
@@ -1168,7 +1280,7 @@ async function callOpenAICompatible(
     body.reasoning_effort = params.reasoning_effort;
   }
 
-  const res = await fetch(`${provider.apiBase}/chat/completions`, {
+  const res = await fetchLlmOutbound(`${provider.apiBase}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1221,7 +1333,7 @@ async function callOpenAICompatibleWithHistory(
     body.reasoning_effort = params.reasoning_effort;
   }
 
-  const res = await fetch(`${provider.apiBase}/chat/completions`, {
+  const res = await fetchLlmOutbound(`${provider.apiBase}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1269,7 +1381,8 @@ async function streamOpenAICompatibleWithHistory(
   messages: ReadonlyArray<ChatHistoryMessage>,
   params: ThinkingParams,
   onEvent: (ev: LLMStreamEvent) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  maxResponseUtf8Bytes?: number
 ): Promise<LLMStreamResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
@@ -1308,7 +1421,11 @@ async function streamOpenAICompatibleWithHistory(
   );
 
   if (!res.ok) {
-    const errText = await res.text();
+    const errText = await readResponseTextBounded(
+      res,
+      64 * 1024,
+      'OpenAI-compatible API'
+    );
     throw new Error(
       `OpenAI-compatible API error (${res.status}): ${sanitizeApiError(errText)}`
     );
@@ -1354,8 +1471,8 @@ async function streamOpenAICompatibleWithHistory(
     const delta = choices?.[0]?.delta as Record<string, unknown> | undefined;
     if (delta) {
       if (typeof delta.content === 'string' && delta.content) {
-        text += delta.content;
         onEvent({ type: 'text', delta: delta.content });
+        text += delta.content;
       }
       const reasoning =
         typeof delta.reasoning_content === 'string'
@@ -1364,8 +1481,8 @@ async function streamOpenAICompatibleWithHistory(
             ? delta.reasoning
             : '';
       if (reasoning) {
-        thinking += reasoning;
         onEvent({ type: 'thinking', delta: reasoning });
+        thinking += reasoning;
       }
     }
     // finish_reason 非空 = 本条 choice 已收尾（stop / length / content_filter…）。
@@ -1385,7 +1502,7 @@ async function streamOpenAICompatibleWithHistory(
       }
       onEvent({ type: 'usage', inputTokens, outputTokens });
     }
-  });
+  }, streamingWireByteLimit(maxResponseUtf8Bytes));
 
   if (streamError) {
     throw new Error(`OpenAI-compatible streaming error: ${streamError}`);
@@ -1423,16 +1540,124 @@ async function streamOpenAICompatibleWithHistory(
  */
 function getEmbeddingBatchSize(): number {
   const raw = parseInt(process.env.LLM_EMBEDDING_BATCH_SIZE || '', 10);
-  if (Number.isFinite(raw) && raw >= 1) return raw;
+  if (Number.isFinite(raw) && raw >= 1) return Math.min(32, Math.floor(raw));
   return 32;
+}
+
+export const EMBEDDING_MAX_INPUTS = 512;
+export const EMBEDDING_MAX_BATCHES = 16;
+export const EMBEDDING_MAX_INPUT_UTF8_BYTES = 64 * 1024;
+export const EMBEDDING_MAX_TOTAL_UTF8_BYTES = 512 * 1024;
+// 以 UTF-8 bytes 作为 byte-BPE token 的确定上界，避免 admission 对多个
+// 高度可压缩 64KiB 输入做同步 BPE 而阻塞事件循环数十秒。
+export const EMBEDDING_MAX_TOTAL_TOKENS = 512 * 1024;
+export const EMBEDDING_MAX_RESPONSE_UTF8_BYTES = 8 * 1024 * 1024;
+export const EMBEDDING_MAX_VECTOR_DIMENSIONS = 8192;
+const EMBEDDING_BATCH_PROTOCOL_TOKENS = 64;
+const EMBEDDING_INPUT_PROTOCOL_TOKENS = 8;
+
+export class EmbeddingAdmissionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EmbeddingAdmissionError';
+  }
+}
+
+export interface EmbeddingCallOptions {
+  /** 共享 llm_tokens 日账的用户归属；所有生产调用必须显式提供。 */
+  userId: string;
+  sessionId?: string;
+}
+
+function embeddingBatchReservation(texts: ReadonlyArray<string>): number {
+  const encoder = new TextEncoder();
+  return (
+    texts.reduce((sum, text) => sum + encoder.encode(text).byteLength, 0) +
+    texts.length * EMBEDDING_INPUT_PROTOCOL_TOKENS +
+    EMBEDDING_BATCH_PROTOCOL_TOKENS
+  );
+}
+
+function trustedEmbeddingUsageTokens(
+  usage: LLMCallUsage | undefined,
+  reservation: number
+): number | null {
+  // OpenAI embeddings 只有 prompt_tokens/total_tokens，没有 completion_tokens。
+  // total_tokens 一旦出现即必须自身可信；不允许用较小的 prompt
+  // 值掩盖一个异常的零/夸大 total。只在 total 缺失时才接受 input。
+  const candidate =
+    usage?.totalTokens !== undefined
+      ? usage.totalTokens
+      : usage?.inputTokens;
+  return Number.isSafeInteger(candidate) &&
+    (candidate ?? 0) > 0 &&
+    (candidate as number) <= reservation
+    ? (candidate as number)
+    : null;
+}
+
+async function readResponseTextBounded(
+  response: Response,
+  maxBytes: number,
+  source: string
+): Promise<string> {
+  const declared = response.headers.get('content-length')?.trim();
+  if (declared && /^\d+$/.test(declared)) {
+    try {
+      if (BigInt(declared) > BigInt(maxBytes)) {
+        await response.body
+          ?.cancel(`${source} response exceeds byte limit`)
+          .catch(() => undefined);
+        throw new Error(`${source} response exceeded byte limit`);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('exceeded byte limit')) {
+        throw error;
+      }
+      throw new Error(`${source} response exceeded byte limit`);
+    }
+  }
+  if (!response.body) throw new Error(`${source} response has no body`);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        await reader
+          .cancel(`${source} response exceeds byte limit`)
+          .catch(() => undefined);
+        throw new Error(`${source} response exceeded byte limit`);
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader
+      .cancel(`${source} response processing failed`)
+      .catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 }
 
 /** 对单批文本调用 /embeddings 端点，返回与输入等长、按 index 有序的向量数组 */
 async function callEmbeddingBatch(
   provider: LLMProviderConfig,
   texts: string[]
-): Promise<number[][]> {
-  const res = await fetch(`${provider.apiBase}/embeddings`, {
+): Promise<{ vectors: number[][]; usage?: LLMCallUsage }> {
+  const res = await fetchLlmOutbound(`${provider.apiBase}/embeddings`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1446,13 +1671,19 @@ async function callEmbeddingBatch(
   });
 
   if (!res.ok) {
-    const errText = await res.text();
+    const errText = await readResponseTextBounded(res, 64 * 1024, 'Embedding API');
     throw new Error(
       `Embedding API error (${res.status}): ${sanitizeApiError(errText)}`
     );
   }
 
-  const data = (await res.json()) as {
+  const data = JSON.parse(
+    await readResponseTextBounded(
+      res,
+      EMBEDDING_MAX_RESPONSE_UTF8_BYTES,
+      'Embedding API'
+    )
+  ) as {
     data?: Array<{ embedding?: number[]; index?: number }>;
     usage?: { prompt_tokens?: number; total_tokens?: number };
   };
@@ -1463,20 +1694,89 @@ async function callEmbeddingBatch(
     );
   }
 
-  // 按 index 重排（OpenAI 协议保证按输入顺序，但保险起见排序）
-  const sorted = [...data.data].sort(
-    (a, b) => (a.index ?? 0) - (b.index ?? 0)
-  );
-  return sorted.map((item) => {
-    if (!Array.isArray(item.embedding)) {
+  // 按 index 重排。一旦某项提供 index，就要求全部是 0..N-1 且不重复；
+  // 否则攻击性/异常上游可把向量与 transcript chunk 错位。
+  const hasAnyIndex = data.data.some((item) => item.index !== undefined);
+  if (
+    hasAnyIndex &&
+    (!data.data.every(
+      (item) =>
+        Number.isSafeInteger(item.index) &&
+        (item.index as number) >= 0 &&
+        (item.index as number) < texts.length
+    ) ||
+      new Set(data.data.map((item) => item.index)).size !== texts.length)
+  ) {
+    throw new Error('Embedding API response contains invalid indices');
+  }
+  const sorted = hasAnyIndex
+    ? [...data.data].sort((a, b) => (a.index as number) - (b.index as number))
+    : data.data;
+  let vectorDimensions: number | null = null;
+  const vectors = sorted.map((item) => {
+    if (
+      !Array.isArray(item.embedding) ||
+      item.embedding.length === 0 ||
+      item.embedding.length > EMBEDDING_MAX_VECTOR_DIMENSIONS ||
+      !item.embedding.every(
+        (value) => typeof value === 'number' && Number.isFinite(value)
+      )
+    ) {
       throw new Error('Embedding API response missing embedding array');
+    }
+    if (vectorDimensions === null) vectorDimensions = item.embedding.length;
+    else if (item.embedding.length !== vectorDimensions) {
+      throw new Error('Embedding API response has inconsistent dimensions');
     }
     return item.embedding;
   });
+  return {
+    vectors,
+    usage: {
+      inputTokens: data.usage?.prompt_tokens,
+      totalTokens: data.usage?.total_tokens,
+    },
+  };
 }
 
-export async function callEmbedding(texts: string[]): Promise<number[][]> {
+export async function callEmbedding(
+  texts: string[],
+  options: EmbeddingCallOptions
+): Promise<number[][]> {
   if (texts.length === 0) return [];
+
+  if (!options?.userId || texts.length > EMBEDDING_MAX_INPUTS) {
+    throw new EmbeddingAdmissionError('Embedding input count exceeded');
+  }
+  const encoder = new TextEncoder();
+  let totalBytes = 0;
+  let totalTokens = 0;
+  for (const text of texts) {
+    if (typeof text !== 'string') {
+      throw new EmbeddingAdmissionError('Embedding input must be text');
+    }
+    if (text.length > EMBEDDING_MAX_INPUT_UTF8_BYTES) {
+      throw new EmbeddingAdmissionError('Embedding input is too large');
+    }
+    const bytes = encoder.encode(text).byteLength;
+    if (bytes > EMBEDDING_MAX_INPUT_UTF8_BYTES) {
+      throw new EmbeddingAdmissionError('Embedding input is too large');
+    }
+    totalBytes += bytes;
+    if (totalBytes > EMBEDDING_MAX_TOTAL_UTF8_BYTES) {
+      throw new EmbeddingAdmissionError('Embedding total input size exceeded');
+    }
+    totalTokens += bytes;
+    if (totalTokens > EMBEDDING_MAX_TOTAL_TOKENS) {
+      throw new EmbeddingAdmissionError('Embedding total token limit exceeded');
+    }
+  }
+
+  const batchSize = getEmbeddingBatchSize();
+  const batchCount = Math.ceil(texts.length / batchSize);
+  if (batchCount > EMBEDDING_MAX_BATCHES) {
+    throw new EmbeddingAdmissionError('Embedding batch count exceeded');
+  }
 
   const provider = await getProviderForPurpose('EMBEDDING');
 
@@ -1489,16 +1789,124 @@ export async function callEmbedding(texts: string[]): Promise<number[][]> {
   }
 
   const startedAt = Date.now();
-  const batchSize = getEmbeddingBatchSize();
+  const reservedTokens =
+    totalBytes +
+    texts.length * EMBEDDING_INPUT_PROTOCOL_TOKENS +
+    batchCount * EMBEDDING_BATCH_PROTOCOL_TOKENS;
+  if (!Number.isSafeInteger(reservedTokens) || reservedTokens <= 0) {
+    throw new EmbeddingAdmissionError('Embedding reservation is invalid');
+  }
+  const sourceHasher = crypto
+    .createHash('sha256')
+    .update('embedding-operation-v1\0')
+    .update(provider.dbModelId ?? `${provider.name}:${provider.model}`)
+    .update('\0');
+  // 长度前缀避免 ["a\0b", "c"] 与 ["a", "b\0c"] 这类 NUL 分隔碰撞。
+  for (const text of texts) {
+    sourceHasher.update(String(text.length)).update(':').update(text).update(';');
+  }
+  const sourceHash = sourceHasher.digest('hex');
+  const jobId = await claimLlmTokenBudget({
+    type: JOB_TYPE.EMBEDDING,
+    userId: options.userId,
+    sessionId: options.sessionId,
+    triggeredBy: 'system',
+    activeKey: `embedding:${options.userId}:${sourceHash}`,
+    units: reservedTokens,
+    params: {
+      sourceHash,
+      inputCount: texts.length,
+      batchCount,
+      reservedTokens,
+      modelKey: provider.dbModelId ?? provider.model,
+    },
+  });
 
   // 分批：单请求输入条数超供应商上限会整批 400（被上层静默吞成空串导致 RAG 永久失效），
   // 故按 batchSize 切片循环调用，再按输入顺序合并（各批向量顺序已在 callEmbeddingBatch
   // 内按 index 归位）。
   const vectors: number[][] = [];
-  for (let offset = 0; offset < texts.length; offset += batchSize) {
-    const batch = texts.slice(offset, offset + batchSize);
-    const batchVectors = await callEmbeddingBatch(provider, batch);
-    for (const v of batchVectors) vectors.push(v);
+  let expectedVectorDimensions: number | null = null;
+  let actualTokens = 0;
+  let providerMeasuredBatches = 0;
+  let conservativeFallbackBatches = 0;
+  let successSettlementStarted = false;
+  try {
+    // 故意串行：batch concurrency=1 是硬上限；总批数已在首个 fetch 前检查。
+    for (let offset = 0; offset < texts.length; offset += batchSize) {
+      const batch = texts.slice(offset, offset + batchSize);
+      const batchReservation = embeddingBatchReservation(batch);
+      let result: Awaited<ReturnType<typeof callEmbeddingBatch>>;
+      try {
+        result = await callEmbeddingBatch(provider, batch);
+      } catch (error) {
+        actualTokens += batchReservation;
+        conservativeFallbackBatches += 1;
+        throw error;
+      }
+      const batchDimensions = result.vectors[0]?.length ?? 0;
+      if (
+        batchDimensions <= 0 ||
+        (expectedVectorDimensions !== null &&
+          batchDimensions !== expectedVectorDimensions)
+      ) {
+        // 上游已经收到本批；响应结构异常时不能信任 usage，按本批最坏量结算。
+        actualTokens += batchReservation;
+        conservativeFallbackBatches += 1;
+        throw new Error(
+          'Embedding API response has inconsistent dimensions across batches'
+        );
+      }
+      expectedVectorDimensions = batchDimensions;
+      const measured = trustedEmbeddingUsageTokens(
+        result.usage,
+        batchReservation
+      );
+      actualTokens += measured ?? batchReservation;
+      if (measured === null) conservativeFallbackBatches += 1;
+      else providerMeasuredBatches += 1;
+      if (
+        !Number.isSafeInteger(actualTokens) ||
+        actualTokens > reservedTokens
+      ) {
+        actualTokens = reservedTokens;
+        throw new Error('Embedding usage exceeded reserved budget');
+      }
+      for (const vector of result.vectors) vectors.push(vector);
+    }
+
+    successSettlementStarted = true;
+    await completeActiveJob(
+      jobId,
+      {
+        sourceHash,
+        reservedTokens,
+        actualTokens,
+        inputCount: texts.length,
+        batchCount,
+        providerMeasuredBatches,
+        conservativeFallbackBatches,
+      },
+      actualTokens
+    );
+  } catch (error) {
+    if (!successSettlementStarted) {
+      await failActiveJob(
+        jobId,
+        error,
+        {
+          sourceHash,
+          reservedTokens,
+          actualTokens,
+          inputCount: texts.length,
+          batchCount,
+          providerMeasuredBatches,
+          conservativeFallbackBatches,
+        },
+        actualTokens
+      ).catch(() => undefined);
+    }
+    throw error;
   }
 
   llmLogger.info(
@@ -1508,7 +1916,7 @@ export async function callEmbedding(texts: string[]): Promise<number[][]> {
       purpose: 'EMBEDDING',
       inputCount: texts.length,
       batchSize,
-      batches: Math.ceil(texts.length / batchSize),
+      batches: batchCount,
       dim: vectors[0]?.length ?? 0,
       durationMs: Date.now() - startedAt,
     },

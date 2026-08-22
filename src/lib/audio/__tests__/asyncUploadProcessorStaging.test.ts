@@ -17,6 +17,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const {
   sessionFindUniqueMock,
   sessionUpdateManyMock,
+  txSessionUpdateManyMock,
   deleteAsyncUploadMock,
   loadManifestMock,
   mergeChunksMock,
@@ -24,14 +25,17 @@ const {
   transcodeMock,
   validateContainerMock,
   stageAudioMock,
-  finalizePublishMock,
+  settlePublishMock,
+  completePublishMock,
   rollbackStagedMock,
   readFileMock,
   uploadSonioxFileMock,
   resolveRegionMock,
+  getStoredArtifactByIdMock,
 } = vi.hoisted(() => ({
   sessionFindUniqueMock: vi.fn(),
   sessionUpdateManyMock: vi.fn(),
+  txSessionUpdateManyMock: vi.fn(),
   deleteAsyncUploadMock: vi.fn(),
   loadManifestMock: vi.fn(),
   mergeChunksMock: vi.fn(),
@@ -39,11 +43,13 @@ const {
   transcodeMock: vi.fn(),
   validateContainerMock: vi.fn(),
   stageAudioMock: vi.fn(),
-  finalizePublishMock: vi.fn(),
+  settlePublishMock: vi.fn(),
+  completePublishMock: vi.fn(),
   rollbackStagedMock: vi.fn(),
   readFileMock: vi.fn(),
   uploadSonioxFileMock: vi.fn(),
   resolveRegionMock: vi.fn(),
+  getStoredArtifactByIdMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -57,7 +63,10 @@ vi.mock('@/lib/prisma', () => ({
     $transaction: (cb: (tx: unknown) => Promise<unknown>) =>
       cb({
         $queryRaw: () => Promise.resolve([{ asyncReservedMinutes: 999 }]),
-        session: { update: vi.fn(() => Promise.resolve(undefined)) },
+        session: {
+          update: vi.fn(() => Promise.resolve(undefined)),
+          updateMany: txSessionUpdateManyMock,
+        },
       }),
   },
 }));
@@ -82,8 +91,16 @@ vi.mock('@/lib/audio/ffmpegTranscode', () => ({
 }));
 vi.mock('@/lib/sessionPersistence', () => ({
   stageSessionAudioArtifact: stageAudioMock,
-  finalizeStagedArtifactPublish: finalizePublishMock,
+  settleStagedArtifactsInTransaction: settlePublishMock,
+  completeStagedArtifactPublishes: completePublishMock,
   rollbackStagedArtifact: rollbackStagedMock,
+}));
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_STATE: {
+    ACTIVE: 'ACTIVE',
+    RESERVED: 'RESERVED',
+  },
+  getStoredArtifactById: getStoredArtifactByIdMock,
 }));
 vi.mock('@/lib/soniox/env', () => ({
   resolveAndPersistTaskRegion: resolveRegionMock,
@@ -107,6 +124,10 @@ const STAGED = {
   localReference: STAGED_TEMP,
   storage: 'local' as const,
   previousReference: EXISTING_RECORDING,
+  storedArtifactId: 'artifact-1',
+  expectedPreviousArtifactId: 'artifact-old',
+  actualBytes: 9,
+  artifactType: 'recording' as const,
 };
 
 beforeEach(() => {
@@ -135,8 +156,15 @@ beforeEach(() => {
   transcodeMock.mockResolvedValue(undefined);
   readFileMock.mockResolvedValue(Buffer.from('mp3-bytes'));
   stageAudioMock.mockResolvedValue(STAGED);
-  finalizePublishMock.mockResolvedValue({ path: STAGED_TEMP, storage: 'local' });
+  settlePublishMock.mockResolvedValue([
+    {
+      staged: STAGED,
+      settled: { artifact: { id: 'artifact-1' }, previous: null },
+    },
+  ]);
+  completePublishMock.mockResolvedValue([{ path: STAGED_TEMP, storage: 'local' }]);
   rollbackStagedMock.mockResolvedValue(undefined);
+  getStoredArtifactByIdMock.mockResolvedValue(null);
   uploadSonioxFileMock.mockResolvedValue({ id: 'file-1' });
   resolveRegionMock.mockResolvedValue({ region: 'eu', restBaseUrl: 'https://x', apiKey: 'k' });
 });
@@ -144,9 +172,8 @@ beforeEach(() => {
 describe('processAsyncUpload 录音产物 stage→CAS→publish (P0-6r)', () => {
   it('▶ 负向：transcode 与 publish 之间会话被 finalize 到 COMPLETED（发布 CAS count 0）→ 回滚临时对象、不删已定稿录音、halt', async () => {
     // 第 1 次 setStatus('transcoding') 通过；第 2 次（发布 recordingPath）CAS 未命中（会话已 COMPLETED）。
-    sessionUpdateManyMock
-      .mockResolvedValueOnce({ count: 1 })
-      .mockResolvedValueOnce({ count: 0 });
+    sessionUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    txSessionUpdateManyMock.mockResolvedValueOnce({ count: 0 });
 
     await expect(processAsyncUpload({ sessionId: 's1' })).resolves.toBeUndefined();
 
@@ -155,10 +182,10 @@ describe('processAsyncUpload 录音产物 stage→CAS→publish (P0-6r)', () => 
     expect(rollbackStagedMock).toHaveBeenCalledWith(expect.anything(), STAGED);
 
     // ② 发布（唯一会删 previousReference=已定稿录音的路径）绝不被调用 → 旧录音不被删/覆盖。
-    expect(finalizePublishMock).not.toHaveBeenCalled();
+    expect(completePublishMock).not.toHaveBeenCalled();
 
     // ③ 发布 CAS 的 where 必须带 session.status 终态闸（否则拦不住独立 finalize 竞态）。
-    const publishCall = sessionUpdateManyMock.mock.calls.find(
+    const publishCall = txSessionUpdateManyMock.mock.calls.find(
       (c) => c[0]?.data && 'recordingPath' in c[0].data
     );
     expect(publishCall).toBeTruthy();
@@ -179,14 +206,18 @@ describe('processAsyncUpload 录音产物 stage→CAS→publish (P0-6r)', () => 
     // 置 count0，让管线在上传 Soniox 后尽早 halt 收束（避免打真实网络），本例只验证发布路径。
     sessionUpdateManyMock
       .mockResolvedValueOnce({ count: 1 }) // transcoding
-      .mockResolvedValueOnce({ count: 1 }) // 发布 recordingPath
       .mockResolvedValue({ count: 0 }); // 后续步骤 halt
+    txSessionUpdateManyMock.mockResolvedValueOnce({ count: 1 });
 
     await expect(processAsyncUpload({ sessionId: 's1' })).resolves.toBeUndefined();
 
     // 发布被调用（删旧 previousReference），未回滚 staged。
-    expect(finalizePublishMock).toHaveBeenCalledTimes(1);
-    expect(finalizePublishMock).toHaveBeenCalledWith(expect.anything(), STAGED);
+    expect(settlePublishMock).toHaveBeenCalledTimes(1);
+    expect(settlePublishMock).toHaveBeenCalledWith(expect.anything(), [STAGED]);
+    expect(completePublishMock).toHaveBeenCalledTimes(1);
+    expect(completePublishMock).toHaveBeenCalledWith(expect.anything(), [
+      expect.objectContaining({ staged: STAGED }),
+    ]);
     expect(rollbackStagedMock).not.toHaveBeenCalled();
   });
 });

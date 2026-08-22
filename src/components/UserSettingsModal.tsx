@@ -13,6 +13,16 @@ import { toast } from '@/stores/toastStore';
 import { Settings, Globe, Cpu, Mic, Lock, Tags, Scissors, Languages, Palette, X } from 'lucide-react';
 import type { ChatModelOption, ChatModelsResponse } from '@/types/llm';
 import ThemeSwitcher from '@/components/ThemeSwitcher';
+import {
+  getAuthBoundarySnapshot,
+  isPersistedAuthBoundaryCurrent,
+  useAuthStore,
+} from '@/stores/authStore';
+import {
+  consumeAuthMutationJson,
+  revokeUncommittedAuthSession,
+  runAuthCookieMutation,
+} from '@/lib/clientAuthCookieMutation';
 
 function clampNumber(value: string, fallback: number, min: number, max: number) {
   const parsed = Number.parseInt(value, 10);
@@ -134,6 +144,7 @@ export default function UserSettingsModal() {
   };
 
   const handleChangePassword = async () => {
+    const expected = getAuthBoundarySnapshot();
     setPwMsg(null);
     if (!currentPassword || !newPassword || !confirmPassword) {
       const msg = t('auth.fillAllFields');
@@ -155,28 +166,53 @@ export default function UserSettingsModal() {
     }
     setPwLoading(true);
     try {
-      const res = await fetch('/api/auth/change-password', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        credentials: 'include',
-        body: JSON.stringify({ currentPassword, newPassword }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        const msg = data.error || t('auth.changeFailed');
-        setPwMsg({ type: 'error', text: msg });
-        toast.error(t('auth.changeFailed'), data.error);
-      } else {
+      await runAuthCookieMutation(async () => {
+        if (!isPersistedAuthBoundaryCurrent(expected)) {
+          throw new DOMException('Stale auth request', 'AbortError');
+        }
+        const res = await fetch('/api/auth/change-password', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          credentials: 'include',
+          body: JSON.stringify({ currentPassword, newPassword }),
+        });
+        const { data, sessionBinding } =
+          await consumeAuthMutationJson<{
+            sessionBinding?: unknown;
+            error?: string;
+          }>(res, { expected });
+        if (!res.ok) {
+          const msg = data.error || t('auth.changeFailed');
+          setPwMsg({ type: 'error', text: msg });
+          toast.error(t('auth.changeFailed'), data.error);
+          return;
+        }
+        if (!sessionBinding) {
+          await revokeUncommittedAuthSession(null, expected);
+          throw new Error('Password-change session binding missing');
+        }
+        if (!isPersistedAuthBoundaryCurrent(expected)) {
+          await revokeUncommittedAuthSession(sessionBinding, expected);
+          return;
+        }
+        if (
+          !useAuthStore
+            .getState()
+            .adoptSessionBinding(sessionBinding, { expected })
+        ) {
+          await revokeUncommittedAuthSession(sessionBinding, expected);
+          return;
+        }
         const msg = t('auth.passwordChanged');
         setPwMsg({ type: 'success', text: msg });
         toast.success(msg);
         setCurrentPassword('');
         setNewPassword('');
         setConfirmPassword('');
-      }
+      });
     } catch {
       const msg = t('auth.networkError');
       setPwMsg({ type: 'error', text: msg });

@@ -13,16 +13,20 @@ import {
 } from '@/lib/recordingDraftPersistence';
 import {
   stageSessionAudioArtifact,
-  finalizeStagedArtifactPublish,
+  settleStagedArtifactsInTransaction,
+  completeStagedArtifactPublishes,
+  readbackStagedArtifactPublication,
   rollbackStagedArtifact,
 } from '@/lib/sessionPersistence';
 import {
   MAX_DURATION_FIX_BYTES,
+  measureAuthoritativeRecordingDurationMsFromBuffer,
   normalizeRecordedAudioDuration,
-  probeAudioDurationMsFromBuffer,
-  resolveExpectedRecordingDurationMs,
+  RECORDING_DURATION_LIMIT_GRACE_MS,
+  RecordingDurationMeasurementError,
 } from '@/lib/audio/recordingDuration';
-import { clampSessionDurationMs } from '@/lib/billing';
+import { getMaxSessionDurationMs } from '@/lib/billing';
+import { StoredArtifactQuotaExceededError } from '@/lib/storage/storedArtifactLedger';
 
 export async function POST(
   req: Request,
@@ -92,25 +96,21 @@ export async function POST(
       );
     }
 
-    // G2：按角色上界 clamp durationMs 后再落库（同 /audio 路由），防伪造 transcript
-    // globalEndMs 撑高 SUM(durationMs) 存储小时用量。
-    let durationMs = clampSessionDurationMs(
-      await resolveExpectedRecordingDurationMs(session),
-      user.role
+    // SEC-018：无论 session/墙钟/转录已有 0、1ms 还是任意正值，发布草稿前都必须测量合并后
+    // 的真实媒体。测量失败会进入 catch：unseal 草稿并保持全部分片，绝不 stage/写库/删除。
+    const durationMs = await measureAuthoritativeRecordingDurationMsFromBuffer(
+      merged.buffer,
+      merged.manifest.mimeType
     );
-    if (durationMs <= 0) {
-      // session-persist#143：三个来源（session.durationMs / transcript / serverStartedAt）都建立在
-      // 「走过实时链路」的前提上。CREATED 会话可以先灌满草稿分片，再把 CREATED→RECORDING→FINALIZING
-      // 一气呵成（serverStartedAt 与 serverPausedAt 相隔毫秒 → serverDuration≈0），三源同时为 0：
-      // durationMs 不写、recordingPath 照常发布 → 该录音对 storage_hours 贡献恒为 0，随后
-      // /full-transcribe 按 durationMs=0 算 estimatedMinutes 跳过预留、finalize 实扣同样是 0，
-      // 得到完全免费的整段 Soniox 转录。直传口 /audio 早有 ffprobe 兜底（P5-14），这里补齐同款。
-      durationMs = clampSessionDurationMs(
-        await probeAudioDurationMsFromBuffer(
-          merged.buffer,
-          merged.manifest.mimeType
-        ),
-        user.role
+    const maxDurationMs = getMaxSessionDurationMs(user.role);
+    if (
+      maxDurationMs !== null &&
+      durationMs > maxDurationMs + RECORDING_DURATION_LIMIT_GRACE_MS
+    ) {
+      await unsealRecordingDraft(session).catch(() => undefined);
+      return NextResponse.json(
+        { error: 'Recording exceeds the maximum session duration' },
+        { status: 422 }
       );
     }
     // P4-1：normalizeRecordedAudioDuration 会在合并结果之上再做 3-4 份整份拷贝（切段 → Blob →
@@ -139,17 +139,48 @@ export async function POST(
       merged.manifest.mimeType
     );
     // G3：原子条件更新，仅在会话仍非终态时写入。
-    const persisted = await prisma.session.updateMany({
-      where: {
-        id: id,
-        status: { notIn: ['COMPLETED', 'ARCHIVED'] },
-      },
-      data: {
-        recordingPath: staged.reference,
-        ...(durationMs > 0 ? { durationMs } : {}),
-      },
-    });
-    if (persisted.count === 0) {
+    let publication: Awaited<
+      ReturnType<typeof settleStagedArtifactsInTransaction>
+    > | null;
+    try {
+      publication = await prisma.$transaction(async (tx) => {
+        const persisted = await tx.session.updateMany({
+          where: {
+            id: id,
+            status: { notIn: ['COMPLETED', 'ARCHIVED'] },
+          },
+          data: {
+            recordingPath: staged.reference,
+            ...(durationMs > 0 ? { durationMs } : {}),
+          },
+        });
+        if (persisted.count === 0) return null;
+        return settleStagedArtifactsInTransaction(tx, [staged]);
+      });
+    } catch (error) {
+      try {
+        const owner = await prisma.session.findUnique({
+          where: { id },
+          select: { recordingPath: true },
+        });
+        const readback = await readbackStagedArtifactPublication(
+          [staged],
+          [owner?.recordingPath]
+        );
+        if (readback.outcome === 'committed') {
+          publication = readback.publications;
+        } else {
+          if (readback.outcome === 'not_committed') {
+            await rollbackStagedArtifact(session, staged).catch(() => undefined);
+          }
+          throw error;
+        }
+      } catch (readbackError) {
+        if (readbackError === error) throw error;
+        throw error;
+      }
+    }
+    if (!publication) {
       await rollbackStagedArtifact(session, staged);
       // 会话已被并发推到终态：本次未提交，释放封存（草稿保留，终态录音由对方定稿，不被本次触碰）。
       await unsealRecordingDraft(session).catch(() => undefined);
@@ -158,7 +189,8 @@ export async function POST(
         { status: 409 }
       );
     }
-    const stored = await finalizeStagedArtifactPublish(session, staged);
+    const [stored] = await completeStagedArtifactPublishes(session, publication);
+    if (!stored) throw new Error('recording artifact publication was incomplete');
     await invalidateSessionsApiCache(user.id);
     await deleteRecordingDraft(session);
 
@@ -180,6 +212,24 @@ export async function POST(
           maxTotalBytes: MAX_DRAFT_TOTAL_BYTES,
         },
         { status: 413 }
+      );
+    }
+    if (error instanceof StoredArtifactQuotaExceededError) {
+      return NextResponse.json(
+        {
+          error: 'Storage quota exceeded; draft was retained',
+          quota: 'storage_bytes',
+        },
+        { status: 402 }
+      );
+    }
+    if (error instanceof RecordingDurationMeasurementError) {
+      return NextResponse.json(
+        {
+          error: 'Could not verify recording duration; draft was retained',
+          retryable: true,
+        },
+        { status: 422 }
       );
     }
     console.error('Finalize draft audio error:', error);

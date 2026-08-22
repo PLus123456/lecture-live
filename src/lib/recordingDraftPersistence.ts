@@ -1,6 +1,24 @@
 import fs from 'fs/promises';
 import path from 'path';
+import crypto from 'crypto';
 import type { Session } from '@prisma/client';
+import {
+  STORED_ARTIFACT_STATE,
+  STORED_ARTIFACT_TYPE,
+  StoredArtifactPublishConflictError,
+  StoredArtifactPublishOutcomeUnknownError,
+  buildStoredArtifactLogicalKey,
+  findBillableStoredArtifactsByOwner,
+  getActiveStoredArtifactByLogicalKey,
+  getStoredArtifactById,
+  markStoredArtifactsDeletePending,
+  recordReservedStoredArtifactLocation,
+  releaseStoredArtifact,
+  reserveStoredArtifact,
+  rollbackStoredArtifact,
+  settleStoredArtifact,
+  type StoredArtifactRow,
+} from '@/lib/storage/storedArtifactLedger';
 
 const DRAFTS_ROOT = path.join(process.cwd(), 'data', 'recording-drafts');
 
@@ -120,11 +138,60 @@ function getDraftManifestPath(session: DraftSessionSource) {
   return path.join(getDraftDir(session), 'manifest.json');
 }
 
+function getDraftManifestLogicalKey(session: DraftSessionSource) {
+  return buildStoredArtifactLogicalKey(
+    'draft',
+    `${session.id}:manifest`,
+    STORED_ARTIFACT_TYPE.RECORDING_DRAFT
+  );
+}
+
 function getChunkFilePath(session: DraftSessionSource, seq: number) {
   return path.join(
     getDraftChunksDir(session),
     `${String(seq).padStart(8, '0')}.chunk`
   );
+}
+
+function getDraftLocalReference(session: DraftSessionSource, fileName: string) {
+  return `local:recording-drafts/${normalizeSessionId(session.id)}/${fileName}`;
+}
+
+function pathForRecordingDraftReference(
+  session: DraftSessionSource,
+  reference: string | null
+): string | null {
+  const prefix = `local:recording-drafts/${normalizeSessionId(session.id)}/`;
+  if (!reference?.startsWith(prefix)) return null;
+  const relative = reference.slice(prefix.length);
+  if (
+    !/^[a-zA-Z0-9._/-]+$/.test(relative) ||
+    relative.split('/').some((part) => !part || part === '..')
+  ) {
+    return null;
+  }
+  const resolved = path.resolve(getDraftDir(session), relative);
+  const root = `${path.resolve(getDraftDir(session))}${path.sep}`;
+  return resolved.startsWith(root) ? resolved : null;
+}
+
+async function resolveDraftManifestPath(
+  session: DraftSessionSource
+): Promise<string | null> {
+  const active = await getActiveStoredArtifactByLogicalKey(
+    getDraftManifestLogicalKey(session)
+  );
+  if (!active) return getDraftManifestPath(session);
+  if (
+    active.userId !== session.userId ||
+    active.ownerType !== 'draft' ||
+    active.ownerId !== session.id ||
+    active.artifactType !== STORED_ARTIFACT_TYPE.RECORDING_DRAFT ||
+    active.storage !== 'local'
+  ) {
+    return null;
+  }
+  return pathForRecordingDraftReference(session, active.reference);
 }
 
 async function ensureDraftDir(session: DraftSessionSource) {
@@ -189,7 +256,8 @@ async function scanChunkStatsOnDisk(
 async function readStoredManifestMetadata(
   session: DraftSessionSource
 ): Promise<StoredManifestMetadata | null> {
-  const manifestPath = getDraftManifestPath(session);
+  const manifestPath = await resolveDraftManifestPath(session);
+  if (!manifestPath) return null;
   if (!(await fileExists(manifestPath))) {
     return null;
   }
@@ -274,13 +342,25 @@ async function updateStoredManifestMetadata<T>(
   } | null
 ): Promise<T | null> {
   return withManifestLock(session, async () => {
-    const current = await readStoredManifestMetadata(session);
-    const next = await mutator(current);
-    if (!next) {
-      return null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await readStoredManifestMetadata(session);
+      const next = await mutator(current);
+      if (!next) {
+        return null;
+      }
+      try {
+        await writeStoredManifestMetadata(session, next.metadata);
+        return next.result;
+      } catch (error) {
+        if (
+          !(error instanceof StoredArtifactPublishConflictError) ||
+          attempt === 2
+        ) {
+          throw error;
+        }
+      }
     }
-    await writeStoredManifestMetadata(session, next.metadata);
-    return next.result;
+    return null;
   });
 }
 
@@ -294,16 +374,93 @@ async function writeStoredManifestMetadata(
   metadata: StoredManifestMetadata
 ) {
   await ensureDraftDir(session);
-  const manifestPath = getDraftManifestPath(session);
+  const serialized = JSON.stringify(metadata, null, 2);
+  const bytes = Buffer.byteLength(serialized, 'utf8');
+  const generation = crypto.randomUUID();
+  const fileName = `manifest-${generation}.json`;
+  const manifestPath = path.join(getDraftDir(session), fileName);
+  const reference = getDraftLocalReference(session, fileName);
+  const reservation = await reserveStoredArtifact({
+    userId: session.userId,
+    ownerType: 'draft',
+    ownerId: session.id,
+    sessionId: session.id,
+    artifactType: STORED_ARTIFACT_TYPE.RECORDING_DRAFT,
+    expectedBytes: bytes,
+    logicalKey: getDraftManifestLogicalKey(session),
+  });
   const tmpPath = `${manifestPath}.tmp.${process.pid}.${Date.now()}.${Math.random()
     .toString(36)
     .slice(2)}`;
+  let previous: StoredArtifactRow | null = null;
   try {
-    await fs.writeFile(tmpPath, JSON.stringify(metadata, null, 2), 'utf-8');
+    // Publish the final immutable reference to the reservation before touching the
+    // filesystem, so a crash after rename is still discoverable by TTL cleanup.
+    await recordReservedStoredArtifactLocation(reservation.id, {
+      actualBytes: bytes,
+      storage: 'local',
+      reference,
+    });
+    await fs.writeFile(tmpPath, serialized, 'utf-8');
     await fs.rename(tmpPath, manifestPath);
+    const settled = await settleStoredArtifact(reservation.id, {
+      actualBytes: bytes,
+      storage: 'local',
+      reference,
+      expectedPreviousArtifactId: reservation.replacesArtifactId,
+    });
+    previous = settled.previous;
   } catch (error) {
     await fs.rm(tmpPath, { force: true }).catch(() => {});
-    throw error;
+    let row: StoredArtifactRow | null;
+    try {
+      row = await getStoredArtifactById(reservation.id);
+    } catch {
+      throw new StoredArtifactPublishOutcomeUnknownError();
+    }
+    const committed =
+      row?.state === STORED_ARTIFACT_STATE.ACTIVE &&
+      row.reference === reference &&
+      row.identityKey === reservation.logicalKey;
+    if (!committed) {
+      const definitelyNotCommitted =
+        row?.state === STORED_ARTIFACT_STATE.RESERVED &&
+        row.reference === reference;
+      if (definitelyNotCommitted) {
+        const deleted = await fs
+          .rm(manifestPath, { force: true })
+          .then(() => true)
+          .catch(() => false);
+        if (deleted) {
+          await rollbackStoredArtifact(reservation.id).catch(() => undefined);
+        }
+        throw error;
+      }
+      throw new StoredArtifactPublishOutcomeUnknownError();
+    }
+    previous = reservation.replacesArtifactId
+      ? await getStoredArtifactById(reservation.replacesArtifactId).catch(
+          () => null
+        )
+      : null;
+  }
+
+  if (previous) {
+    const previousPath = pathForRecordingDraftReference(
+      session,
+      previous.reference
+    );
+    if (previousPath) {
+      const deleted = await fs
+        .rm(previousPath, { force: true })
+        .then(() => true)
+        .catch(() => false);
+      if (deleted) {
+        await releaseStoredArtifact(previous.id, 'REPLACED').catch(
+          () => undefined
+        );
+      }
+    }
   }
 }
 
@@ -456,7 +613,80 @@ export async function persistRecordingDraftChunk(
       if (projectedBytes > MAX_DRAFT_TOTAL_BYTES) {
         throw new RecordingDraftTooLargeError(projectedBytes);
       }
-      await fs.writeFile(chunkPath, options.data);
+      const reservation = await reserveStoredArtifact({
+        userId: session.userId,
+        ownerType: 'draft',
+        ownerId: session.id,
+        sessionId: session.id,
+        artifactType: STORED_ARTIFACT_TYPE.RECORDING_DRAFT,
+        expectedBytes: options.data.length,
+        logicalKey: buildStoredArtifactLogicalKey(
+          'draft',
+          `${session.id}:chunk:${options.seq}`,
+          STORED_ARTIFACT_TYPE.RECORDING_DRAFT
+        ),
+      });
+      const reference = getDraftLocalReference(
+        session,
+        `chunks/${String(options.seq).padStart(8, '0')}.chunk`
+      );
+      let previous: StoredArtifactRow | null = null;
+      try {
+        await recordReservedStoredArtifactLocation(reservation.id, {
+          actualBytes: options.data.length,
+          storage: 'local',
+          reference,
+        });
+        await fs.writeFile(chunkPath, options.data);
+        const settled = await settleStoredArtifact(reservation.id, {
+          actualBytes: options.data.length,
+          storage: 'local',
+          reference,
+          expectedPreviousArtifactId: reservation.replacesArtifactId,
+        });
+        previous = settled.previous;
+      } catch (error) {
+        let row: StoredArtifactRow | null;
+        try {
+          row = await getStoredArtifactById(reservation.id);
+        } catch {
+          throw new StoredArtifactPublishOutcomeUnknownError();
+        }
+        const committed =
+          row?.state === STORED_ARTIFACT_STATE.ACTIVE &&
+          row.reference === reference &&
+          row.identityKey === reservation.logicalKey;
+        if (!committed) {
+          const definitelyNotCommitted =
+            row?.state === STORED_ARTIFACT_STATE.RESERVED &&
+            row.reference === reference;
+          if (definitelyNotCommitted) {
+            const deleted = await fs
+              .rm(chunkPath, { force: true })
+              .then(() => true)
+              .catch(() => false);
+            if (deleted) {
+              await rollbackStoredArtifact(reservation.id).catch(
+                () => undefined
+              );
+            }
+            throw error;
+          }
+          throw new StoredArtifactPublishOutcomeUnknownError();
+        }
+        previous = reservation.replacesArtifactId
+          ? await getStoredArtifactById(reservation.replacesArtifactId).catch(
+              () => null
+            )
+          : null;
+      }
+      // The old physical chunk was already absent (priorChunk === null), so it is
+      // safe to retire its stale ledger row without touching the newly-written path.
+      if (previous) {
+        await releaseStoredArtifact(previous.id, 'REPLACED').catch(
+          () => undefined
+        );
+      }
     }
 
     // 新写入的分片才递增计数；幂等重传（seq 已在盘）不重复计。
@@ -604,7 +834,18 @@ async function mergeContiguousChunksSequential(
 export async function deleteRecordingDraft(
   session: DraftSessionSource
 ): Promise<void> {
+  const artifacts = await findBillableStoredArtifactsByOwner('draft', session.id);
+  const recordingArtifacts = artifacts.filter(
+    (artifact) =>
+      artifact.artifactType === STORED_ARTIFACT_TYPE.RECORDING_DRAFT
+  );
+  await markStoredArtifactsDeletePending(
+    recordingArtifacts.map((artifact) => artifact.id)
+  );
   await fs.rm(getDraftDir(session), { recursive: true, force: true });
+  for (const artifact of recordingArtifacts) {
+    await releaseStoredArtifact(artifact.id);
+  }
 }
 
 /** P4-1：草稿目录清扫的默认年龄阈值（48h）。远大于任何一次合法录音 + 补传窗口。 */
@@ -660,7 +901,18 @@ export async function sweepStaleRecordingDrafts(options?: {
       continue;
     }
     try {
+      const artifacts = await findBillableStoredArtifactsByOwner('draft', entry);
+      const recordingArtifacts = artifacts.filter(
+        (artifact) =>
+          artifact.artifactType === STORED_ARTIFACT_TYPE.RECORDING_DRAFT
+      );
+      await markStoredArtifactsDeletePending(
+        recordingArtifacts.map((artifact) => artifact.id)
+      );
       await fs.rm(dir, { recursive: true, force: true });
+      for (const artifact of recordingArtifacts) {
+        await releaseStoredArtifact(artifact.id);
+      }
       removed += 1;
     } catch {
       // 单个目录删除失败不阻断整轮清扫。

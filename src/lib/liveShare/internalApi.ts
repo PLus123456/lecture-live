@@ -2,7 +2,7 @@
 // Next.js API 进程 → 独立 WS 进程的内部撤销通知协议（SHARE-REVOKE-001）。
 //
 // 撤销/轮换分享链接只写 DB，而观众 socket 的 token 校验只在 join 时执行一次，
-// 因此撤销必须额外通知 WS 进程对该 session 的房间做一次复核驱逐。两个进程只共享
+// 因此撤销必须额外通知 WS 进程对该 session 的观众和主持人做一次复核驱逐。两个进程只共享
 // DB 与环境变量，这里用 JWT_SECRET 派生的 HMAC 对通知做鉴权：伪造者拿不到签名，
 // 而即使签名被重放，接收端也只是触发一次"按 DB 现状复核"（fail-safe，见
 // revalidateSessionViewers），不会驱逐仍然合法的观众。

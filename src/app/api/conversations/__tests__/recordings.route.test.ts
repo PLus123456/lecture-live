@@ -7,7 +7,9 @@ const {
   conversationSessionFindManyMock,
   conversationSessionCreateManyMock,
   conversationSessionDeleteManyMock,
-  sessionCountMock,
+  sessionFindManyMock,
+  queryRawMock,
+  transactionMock,
   invalidateRagCacheForRecordingsMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
@@ -15,7 +17,9 @@ const {
   conversationSessionFindManyMock: vi.fn(),
   conversationSessionCreateManyMock: vi.fn(),
   conversationSessionDeleteManyMock: vi.fn(),
-  sessionCountMock: vi.fn(),
+  sessionFindManyMock: vi.fn(),
+  queryRawMock: vi.fn(),
+  transactionMock: vi.fn(),
   invalidateRagCacheForRecordingsMock: vi.fn(),
 }));
 
@@ -51,8 +55,10 @@ vi.mock('@/lib/prisma', () => ({
       deleteMany: conversationSessionDeleteManyMock,
     },
     session: {
-      count: sessionCountMock,
+      findMany: sessionFindManyMock,
     },
+    $queryRaw: queryRawMock,
+    $transaction: transactionMock,
   },
 }));
 
@@ -66,6 +72,9 @@ function mockOwnedConversation(opts?: { userId?: string | null; endedAt?: Date |
     id: 'c1',
     userId: opts?.userId ?? 'user-1',
     endedAt: opts?.endedAt ?? null,
+    sessionId: null,
+    session: null,
+    sessions: [],
   });
 }
 
@@ -77,6 +86,22 @@ describe('recordings route', () => {
       email: 'u@example.com',
       role: 'PRO',
     });
+    queryRawMock.mockImplementation((query: { strings?: string[] }) =>
+      query.strings?.join('').includes('SiteSetting')
+        ? Promise.resolve([{ value: 'complete' }])
+        : Promise.resolve([])
+    );
+    transactionMock.mockImplementation(async (callback) =>
+      callback({
+        conversation: { findUnique: conversationFindUniqueMock },
+        conversationSession: {
+          createMany: conversationSessionCreateManyMock,
+          deleteMany: conversationSessionDeleteManyMock,
+        },
+        session: { findMany: sessionFindManyMock },
+        $queryRaw: queryRawMock,
+      })
+    );
   });
 
   describe('GET', () => {
@@ -159,7 +184,7 @@ describe('recordings route', () => {
 
     it('录音不属于当前用户返回 403', async () => {
       mockOwnedConversation();
-      sessionCountMock.mockResolvedValue(0);
+      sessionFindManyMock.mockResolvedValue([]);
       const response = await POST(
         createJsonRequest('http://localhost:3000/api/conversations/c1/recordings', {
           method: 'POST',
@@ -172,7 +197,10 @@ describe('recordings route', () => {
 
     it('成功挂载录音并返回更新后的列表', async () => {
       mockOwnedConversation();
-      sessionCountMock.mockResolvedValue(2);
+      sessionFindManyMock.mockResolvedValue([
+        { id: 's1', durationMs: 1 },
+        { id: 's2', durationMs: 1 },
+      ]);
       conversationSessionFindManyMock.mockResolvedValue([
         {
           sessionId: 's1',

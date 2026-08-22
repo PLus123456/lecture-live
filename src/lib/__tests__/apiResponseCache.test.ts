@@ -125,3 +125,89 @@ describe('apiResponseCache', () => {
     );
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  L51：singleflight + 失效时序保护                                     */
+/* ------------------------------------------------------------------ */
+
+describe('L51 getOrSetApiCache —— 并发 miss 不再击穿', () => {
+  beforeEach(async () => {
+    const { __resetApiCacheState } = await import('@/lib/apiResponseCache');
+    __resetApiCacheState();
+    redisGetMock.mockReset().mockResolvedValue(null); // 恒 miss
+    redisSetMock.mockReset().mockResolvedValue('OK');
+    redisScanMock.mockReset().mockResolvedValue(['0', []]);
+    redisDelMock.mockReset().mockResolvedValue(0);
+    getRedisClientMock.mockReturnValue({
+      status: 'ready',
+      get: redisGetMock,
+      set: redisSetMock,
+      scan: redisScanMock,
+      del: redisDelMock,
+    });
+  });
+
+  it('同一 key 的并发 miss 只跑一次 loader', async () => {
+    const { getOrSetApiCache: get } = await import('@/lib/apiResponseCache');
+    let calls = 0;
+    const loader = async () => {
+      calls += 1;
+      await new Promise((r) => setTimeout(r, 10));
+      return { n: calls };
+    };
+
+    const results = await Promise.all([
+      get('folders:user:u1:list', 30, loader),
+      get('folders:user:u1:list', 30, loader),
+      get('folders:user:u1:list', 30, loader),
+    ]);
+
+    expect(calls).toBe(1);
+    expect(results.map((r) => r.value)).toEqual([{ n: 1 }, { n: 1 }, { n: 1 }]);
+  });
+
+  it('不同 key 各跑各的', async () => {
+    const { getOrSetApiCache: get } = await import('@/lib/apiResponseCache');
+    let calls = 0;
+    const loader = async () => {
+      calls += 1;
+      return { n: calls };
+    };
+
+    await Promise.all([
+      get('folders:user:u1:list', 30, loader),
+      get('folders:user:u2:list', 30, loader),
+    ]);
+
+    expect(calls).toBe(2);
+  });
+
+  it('loader 期间发生失效 → 值照常返回但不写回缓存（不复活陈旧数据）', async () => {
+    const { getOrSetApiCache: get, invalidateFoldersApiCache: invalidate } =
+      await import('@/lib/apiResponseCache');
+
+    let releaseLoader: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      releaseLoader = resolve;
+    });
+
+    const pending = get('folders:user:u1:list', 30, async () => {
+      await gate;
+      return { stale: true };
+    });
+
+    // loader 还没返回时，另一个请求提交了写入并失效了这个前缀
+    await invalidate('u1');
+    releaseLoader!();
+
+    const result = await pending;
+    expect(result.value).toEqual({ stale: true });
+    expect(redisSetMock).not.toHaveBeenCalled();
+  });
+
+  it('没有并发失效时照常写回缓存', async () => {
+    const { getOrSetApiCache: get } = await import('@/lib/apiResponseCache');
+    await get('folders:user:u9:list', 30, async () => ({ ok: 1 }));
+    expect(redisSetMock).toHaveBeenCalledTimes(1);
+  });
+});

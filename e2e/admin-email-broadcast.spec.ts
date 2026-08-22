@@ -172,8 +172,15 @@ test('群发面板：可先给自己发测试信（不触碰收件人列表）',
   await fillBroadcast(page);
 
   await page.getByRole('button', { name: /Send test to myself|发测试信给自己/i }).click();
+  // 断言必须钉住**成功提示**本身，而不是「页面上任何地方出现了管理员邮箱」——
+  // 侧边栏账号区一直显示同一个邮箱（`text-[10px] text-charcoal-400 truncate`），
+  // 旧写法 `getByText(/admin@lecturelive.com/i)` 会先匹配到它：发测试信功能整个坏掉
+  // 也照样绿（假测试），而成功提示一旦渲染出来又变成 strict mode 两元素冲突而偶发失败。
+  // 这里改用 i18n 里 broadcastTestSent 的两种语言形态（en/zh，e2e 跑在 en）+ 邮箱一起匹配。
   await expect(
-    page.getByText(new RegExp(`${adminUser.email}`, 'i'))
+    page.getByText(
+      new RegExp(`(Test email sent to|测试邮件已发送至)\\s*${adminUser.email}`, 'i')
+    )
   ).toBeVisible({ timeout: 15_000 });
 
   expect(broadcastCalls.at(-1)?.mode).toBe('test');

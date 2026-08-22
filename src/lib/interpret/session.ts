@@ -31,6 +31,17 @@ export const INTERPRET_RECLAIM_STALE_MS = 7 * 60 * 60_000;
 // anchorId」的精确键控（届时 deduct 按 anchorId 命中即可、无需本墙钟启发式）。
 const FALLBACK_ANCHOR_SKEW_MS = 5_000;
 
+// L26：回退认领的**上界**。诚实客户端的时序是「/start 拿 anchorId → 立刻 mint 取 key」，
+// mint 补建的那条 null-anchor 锚点(B) 因此必定紧跟在 /start 之后；之后整场的 re-mint（寿命
+// 轮换）都会被 ensureActiveInterpretSession 复用同一条，不再新建。留 10 分钟远够覆盖「用户
+// 在麦克风授权弹窗前发呆」这类极端情形。
+// 没有上界时（旧实现只有下界 `startedAt >= anchorStartedAt - 5s` + `orderBy desc`），两个标签页
+// 并发同传的场景会翻车：先结束的流 A 按 desc 取到**最新**的 null-anchor 锚点，那可能是后启动的
+// 流 B 的 —— A 把 B 的锚点结算掉，B 结束时自己已无锚点可认领、走 no_record 再扣一次（B 被双扣，
+// 而 B 那条流的真实用量还留在被 A 结掉的锚点上）。改成「上下界夹住 + 取最早一条(asc)」：
+// 自己的 B 是第一条落在这个窗口里的，绝不会跨到后启动的流上去。
+const FALLBACK_ANCHOR_MINT_WINDOW_MS = 10 * 60_000;
+
 /**
  * /start：为一次同传会话落一行未结算记录。anchorId 供 /deduct 精确认领（Redis 不可用时为 null）。
  * best-effort：建行失败不阻塞 interpret 启动（退化到旧行为——纯靠 /deduct 计费、无 cron 兜底）。
@@ -180,9 +191,16 @@ export async function claimInterpretSessionForDeduct(
         userId,
         settledAt: null,
         anchorId: null,
-        startedAt: { gte: new Date(anchorStartedAt - FALLBACK_ANCHOR_SKEW_MS) },
+        startedAt: {
+          gte: new Date(anchorStartedAt - FALLBACK_ANCHOR_SKEW_MS),
+          // L26：上界 —— 只认「紧跟在本次 /start 之后建出来的」那条 mint 锚点。没有它时，
+          // 并发标签页里**后启动**的流的锚点也满足下界，会被本流按 desc 抢先结算掉。
+          lte: new Date(anchorStartedAt + FALLBACK_ANCHOR_MINT_WINDOW_MS),
+        },
       },
-      orderBy: { startedAt: 'desc' },
+      // L26：取窗口内**最早**的一条。本流的 mint 紧跟自己的 /start，必是窗口内第一条；
+      // 旧的 desc 恰好相反地优先选中最晚的（= 最可能属于别的流的）那条。
+      orderBy: { startedAt: 'asc' },
       select: { id: true, settledAt: true },
     });
   }

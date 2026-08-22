@@ -190,6 +190,15 @@ export async function performChatFileCleanup(input: {
   // U6：事务外 best-effort 删 Cloudreve 物理文件（原文件 + 抽取的 .txt），再删 DB 行。
   // 顺序刻意放在删行前：一旦行删掉，cloudrevePath 就永久丢失、cron 也再扫不到。
   // 与 conversationCascade.ts 同一范式；失败仅内部 warn，不阻塞 DB 清理。
+  //
+  // M25/M28 复核（2026-08-22）：conversationCascade 那边存在的「快照外新增行」缺口
+  // 在这里**不成立**，因为两处的删除谓词形状不同：
+  //   - conversationCascade：`deleteMany({ conversationId })` 是**范围**谓词，
+  //     会连带删掉快照之后才插入的新附件（其路径从没进过物理删除的入参）；
+  //   - 这里：锁读与删除都是 `id IN (${ids})`，ids 就是 toDelete 的主键列表。
+  //     lockedRows ⊆ toDelete，deleteMany 的目标 ⊆ lockedRows —— 本函数**不可能**
+  //     删到快照之外的任何一行，故不存在「行被删掉但物理文件没删」的孤儿窗口。
+  // 另：cloudrevePath 建行后永不更新，快照里的路径与锁定行的路径必然一致。
   await deleteCloudreveAttachmentFiles(toDelete);
 
   await prisma.$transaction(async (tx) => {

@@ -74,14 +74,35 @@ export async function DELETE(
   }
 
   // DB 删除 + 配额释放（按附件 owner 释放，admin 跨用户删也要还给原用户）
+  //
+  // L62：这里刻意用 deleteMany + count 而不是 delete。两个并发 DELETE 打同一个 id 时，
+  // 双方都能通过上面的 findUnique 检查、都会走到这一步；`prisma.delete` 对已被对方删掉的
+  // 行抛 P2025，旧代码把它当 DB 故障回 500 —— 用户看到「删除失败」而文件其实已经删干净了
+  // （前端 removeAttachment 还会因此回滚 chip 并 toast 报错）。
+  //
+  // 更要紧的是配额：count 是「本请求真的删掉了几行」的权威口径。只有 count===1 才释放字节，
+  // 与 chatFileCleanup 的 B8 / conversationCascade 的 P5-13 同一条不变量 ——
+  // 任一行的字节至多被释放一次，杜绝并发双删各退一份的凭空配额。
+  let deletedCount: number;
   try {
-    await prisma.chatAttachment.delete({ where: { id } });
+    const result = await prisma.chatAttachment.deleteMany({ where: { id } });
+    deletedCount = result.count;
   } catch (err) {
     routeLogger.error(
       { id, err: serializeError(err) },
       'chat-uploads-delete: DB delete failed'
     );
     return NextResponse.json({ error: 'Delete failed' }, { status: 500 });
+  }
+
+  if (deletedCount === 0) {
+    // 并发的另一路已经删掉了这一行（并已释放过它的字节）。删除语义上已达成，
+    // 回 200 保持幂等；**绝不能**在这里 releaseStorageBytes，那就是重复退额度。
+    routeLogger.info(
+      { id },
+      'chat-uploads-delete: 行已被并发请求删除；跳过配额释放（幂等返回）'
+    );
+    return NextResponse.json({ ok: true, alreadyDeleted: true });
   }
 
   try {

@@ -8,6 +8,7 @@
 // 归属校验：用 Conversation.userId（创建时由服务端写入）。userId 命中当前用户才放行；
 // userId 为 NULL 的历史无主孤儿一律拒绝（此前的 orphan"宽进"已收紧）。
 
+import { randomBytes } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { reserveStorageBytes, releaseStorageBytes } from '@/lib/quota';
@@ -16,6 +17,7 @@ import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { CloudreveStorage } from '@/lib/storage/cloudreve';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { sanitizeHeaderFilename } from '@/lib/security';
+import { parseFormDataWithLimit, isUploadedFile } from '@/lib/requestBodyLimit';
 import {
   extractTextFromBuffer,
   isExtractableMime,
@@ -56,22 +58,45 @@ const ATTACHMENT_COLUMN_MAX = 191;
 const EXTRACTED_SUFFIX = '.extracted.txt';
 
 /**
+ * L61：远程文件名的唯一化段长度（hex 字符数）。
+ *
+ * 此前 remote 名是 `${conversationId}_${safeFileName}` —— **完全确定性、零随机成分**。
+ * 同一对话里重传同名文件会得到同一个 cloudrevePath（`CloudreveStorage.upload()`
+ * 返回的是本地拼出来的 remotePath，不是服务端实际落盘路径，所以即便 Cloudreve 端
+ * 改名/冲突处理了，DB 里两行记的仍是同一个字符串）→ DELETE 其中任一行都会物理删掉
+ * 另一行还在用的那个文件，剩下的行变成永久悬空引用（下载/LLM 注入 404）。
+ *
+ * 6 字节 = 12 hex 字符 = 48 bit 随机，同名重传的碰撞概率可忽略。
+ */
+const UNIQUE_SEGMENT_HEX_LEN = 12;
+
+/** 生成远程文件名的唯一化段（12 hex）。 */
+function makeUniqueSegment(): string {
+  return randomBytes(UNIQUE_SEGMENT_HEX_LEN / 2).toString('hex');
+}
+
+/**
  * U32：把清洗后的文件名截断到能让 fileName / cloudrevePath / extractedTextPath 三列
  * 都 ≤ VARCHAR(191)。最紧约束是 extractedTextPath：
- *   `/{userId}/chat-uploads/{conversationId}_{name}.extracted.txt`
+ *   `/{userId}/chat-uploads/{conversationId}_{unique}_{name}.extracted.txt`
  * 反推出 name 的最大可用长度，仅在超限时截断（尽量保留文件扩展名）。
+ *
+ * L61 后固定开销多了 `{unique}_`（12 hex + 1 个下划线 = 13 字符），三列上限重新核对过。
  */
 function truncateSafeFileName(
   name: string,
   userId: string,
   conversationId: string
 ): string {
-  // 固定开销：`/` + userId + `/chat-uploads/` + conversationId + `_` + …name… + `.extracted.txt`
+  // 固定开销：`/` + userId + `/chat-uploads/` + conversationId + `_`
+  //           + unique + `_` + …name… + `.extracted.txt`
   const fixed =
     1 +
     userId.length +
     '/chat-uploads/'.length +
     conversationId.length +
+    1 +
+    UNIQUE_SEGMENT_HEX_LEN +
     1 +
     EXTRACTED_SUFFIX.length;
   // fileName 列本身也受 191 限；取两者更紧的上限。
@@ -125,35 +150,45 @@ export async function POST(req: Request) {
     return rateLimited;
   }
 
-  // Content-Length 预检：读 body 前按声明长度挡掉超过硬上限的请求，避免把超大 body
-  // 整个缓冲进内存（OOM 面）。这里用绝对硬上限兜底（精确的 chat_files_max_upload_mb
-  // 校验在下方按配置进行）；multipart 开销给 1MB 余量避免误杀。
-  const declaredLength = Number(req.headers.get('content-length') ?? '');
-  if (Number.isFinite(declaredLength) && declaredLength > ABSOLUTE_MAX_BYTES + 1024 * 1024) {
-    return NextResponse.json(
-      { error: `File too large (max ${Math.floor(ABSOLUTE_MAX_BYTES / (1024 * 1024))} MB)` },
-      { status: 413 }
-    );
-  }
+  // M29：单次上传大小限制必须在**读 body 之前**就位，因为它同时决定了 body 的内存闸门。
+  // 旧写法先 `req.formData()`（整份 body 进内存）再看 file.size，唯一的前置闸是
+  // `Number(header ?? '')` —— chunked 请求没有 content-length，`Number('')` 得 0，
+  // `Number.isFinite(0)` 真而 `0 > MAX` 假 → 预检整段被跳过，"绝对硬上限"形同虚设。
+  const siteSettings = await getSiteSettings();
+  const maxBytes = Math.min(
+    Math.max(1, siteSettings.chat_files_max_upload_mb) * 1024 * 1024,
+    ABSOLUTE_MAX_BYTES
+  );
+  // multipart 的 boundary/header 开销给 1MB 余量，避免刚好卡在上限的合法文件被误杀。
+  const bodyCapBytes = maxBytes + 1024 * 1024;
 
-  // 解析 form data
-  let formData: FormData;
-  try {
-    formData = await req.formData();
-  } catch {
+  // 解析 form data —— 流式累计字节，越线立刻断流（不依赖对端声明的 content-length）。
+  const parsed = await parseFormDataWithLimit(req, bodyCapBytes);
+  if (!parsed.ok) {
+    if (parsed.reason === 'too-large') {
+      return NextResponse.json(
+        { error: `File too large (max ${Math.floor(maxBytes / (1024 * 1024))} MB)` },
+        { status: 413 }
+      );
+    }
     return NextResponse.json({ error: 'Invalid multipart body' }, { status: 400 });
   }
+  const formData = parsed.value;
 
-  const file = formData.get('file') as File | null;
+  const fileRaw = formData.get('file');
   const conversationIdRaw = formData.get('conversationId');
   const mimeOverrideRaw = formData.get('mimeTypeOverride');
 
-  if (!file || typeof conversationIdRaw !== 'string' || !conversationIdRaw) {
+  // L60：`formData.get('file') as File` 只是类型断言。攻击者把 `file` 发成普通字符串
+  // 字段时，`.size` 是 undefined —— `size <= 0` 与 `size > maxBytes` 双双为 false，
+  // 两道大小检查全绕过，一路走到 try 之外的 `file.arrayBuffer()` 抛 TypeError → 稳定 500。
+  if (!isUploadedFile(fileRaw) || typeof conversationIdRaw !== 'string' || !conversationIdRaw) {
     return NextResponse.json(
       { error: 'file and conversationId are required' },
       { status: 400 }
     );
   }
+  const file = fileRaw;
   if (file.size <= 0) {
     return NextResponse.json({ error: 'Empty file' }, { status: 400 });
   }
@@ -175,12 +210,8 @@ export async function POST(req: Request) {
     );
   }
 
-  // 单次上传大小限制（管理员配置，硬封顶 500MB）
-  const siteSettings = await getSiteSettings();
-  const maxBytes = Math.min(
-    Math.max(1, siteSettings.chat_files_max_upload_mb) * 1024 * 1024,
-    ABSOLUTE_MAX_BYTES
-  );
+  // 单次上传大小限制（管理员配置，硬封顶 500MB）——
+  // maxBytes 已在读 body 前解析（见上方 M29 注释），这里做精确的单文件校验。
   if (file.size > maxBytes) {
     return NextResponse.json(
       {
@@ -233,7 +264,10 @@ export async function POST(req: Request) {
     user.id,
     conversationId
   );
-  const composedFileName = `${conversationId}_${safeFileName}`;
+  // L61：远程名插入随机段，保证「同对话 + 同文件名」的两次上传落到两个不同的
+  // cloudrevePath；否则删掉其中一行会把另一行的物理文件一并删掉。
+  // DB 的 fileName 列仍存用户可见的原始名（safeFileName），随机段只进远程路径。
+  const composedFileName = `${conversationId}_${makeUniqueSegment()}_${safeFileName}`;
 
   // 读 buffer（后续上传 + 可选抽文本都要用同一份）
   const buffer = Buffer.from(await file.arrayBuffer());
@@ -371,6 +405,9 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
+  // L65：不要 select cloudrevePath —— 它是服务器内部存储布局（`/{userId}/chat-uploads/...`），
+  // 对客户端零用处（AttachmentChipData 只吃 id/fileName/bytes/kind），返回它等于白送
+  // 一份用户 id 与目录结构的情报。下载走 /api/chat-uploads/[id] 一类的间接入口，不靠路径。
   const rows = await prisma.chatAttachment.findMany({
     where: { conversationId },
     orderBy: { createdAt: 'asc' },
@@ -381,7 +418,6 @@ export async function GET(req: Request) {
       kind: true,
       bytes: true,
       createdAt: true,
-      cloudrevePath: true,
     },
   });
 
@@ -408,7 +444,6 @@ export async function GET(req: Request) {
       kind: r.kind,
       bytes: Number(r.bytes),
       createdAt: r.createdAt.toISOString(),
-      cloudrevePath: r.cloudrevePath,
     })),
   });
 }

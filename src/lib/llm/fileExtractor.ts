@@ -101,7 +101,13 @@ export async function extractTextFromBuffer(
       // DOCX 是 ZIP 容器：先做解压炸弹防护再交给 mammoth 解压。
       await loadZipGuarded(buffer);
       const mammoth = await import('mammoth');
-      const result = await mammoth.extractRawText({ buffer });
+      // L36：解析时长同样要封顶（此前只有 PDF 有）。loadZipGuarded 只挡住"解压后总字节"，
+      // 挡不住「体积合法但 XML 嵌套极深/元素数极多」的病态文档 —— 那种文档能让
+      // mammoth/exceljs/officeparser 长时间占住 CPU。
+      const result = await withParseTimeout(
+        mammoth.extractRawText({ buffer }),
+        'DOCX'
+      );
       const { text, truncated } = clamp(result.value || '');
       return { text, truncated };
     }
@@ -116,7 +122,11 @@ export async function extractTextFromBuffer(
       const wb = new ExcelJS.Workbook();
       // exceljs 接受 Buffer|ArrayBuffer；用 Uint8Array.from 复制出独立 ArrayBuffer，
       // 规避 @types/node 的 Buffer<ArrayBufferLike> 与库声明 Buffer 的泛型不兼容。
-      await wb.xlsx.load(Uint8Array.from(buffer).buffer);
+      // L36：与 DOCX 同理，给 load 阶段封顶（真正的重活都在这一步）。
+      await withParseTimeout(
+        wb.xlsx.load(Uint8Array.from(buffer).buffer),
+        'XLSX'
+      );
       const parts: string[] = [];
       wb.eachSheet((sheet) => {
         const rows: string[] = [];
@@ -148,7 +158,8 @@ export async function extractTextFromBuffer(
       if (typeof parseFn !== 'function') {
         throw new Error('officeparser.parseOffice not found');
       }
-      const ast = await parseFn(buffer);
+      // L36：与 DOCX/XLSX 同理封顶。
+      const ast = await withParseTimeout(parseFn(buffer), 'PPTX');
       const raw = typeof ast?.toText === 'function' ? ast.toText() : '';
       const { text, truncated } = clamp(raw);
       return { text, truncated };

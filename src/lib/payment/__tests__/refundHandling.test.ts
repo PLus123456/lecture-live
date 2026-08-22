@@ -7,6 +7,7 @@ const {
   userUpdateMock,
   walletTxCreateMock,
   executeRawMock,
+  queryRawMock,
   logSystemEventMock,
 } = vi.hoisted(() => ({
   orderFindUniqueMock: vi.fn(),
@@ -15,6 +16,7 @@ const {
   userUpdateMock: vi.fn(),
   walletTxCreateMock: vi.fn(),
   executeRawMock: vi.fn(),
+  queryRawMock: vi.fn(),
   logSystemEventMock: vi.fn(),
 }));
 
@@ -24,6 +26,7 @@ vi.mock('@/lib/prisma', () => {
     user: { findUnique: userFindUniqueMock, update: userUpdateMock },
     walletTransaction: { create: walletTxCreateMock },
     $executeRaw: executeRawMock,
+    $queryRaw: queryRawMock,
   };
   return {
     prisma: { ...tx, $transaction: (cb: (t: typeof tx) => unknown) => cb(tx) },
@@ -69,6 +72,7 @@ beforeEach(() => {
     userUpdateMock,
     walletTxCreateMock,
     executeRawMock,
+    queryRawMock,
     logSystemEventMock,
   ]) {
     m.mockReset();
@@ -76,6 +80,13 @@ beforeEach(() => {
   executeRawMock.mockResolvedValue(1);
   walletTxCreateMock.mockResolvedValue({});
   userUpdateMock.mockResolvedValue({});
+  // M6：freezeEntitlements 的用户快照读改成 `SELECT … FOR UPDATE` 锁读（对齐 wallet.ts
+  // applyGrantTx 的 P3-6）。替身把它接到 userFindUniqueMock，既有用例照旧用
+  // userFindUniqueMock 配置「用户当前状态」即可（第一个 Once = 锁读，第二个 = 余额回读）。
+  queryRawMock.mockImplementation(async () => {
+    const row = await userFindUniqueMock();
+    return row ? [row] : [];
+  });
 });
 
 describe('handlePaymentReversal（P3-16）', () => {
@@ -150,6 +161,31 @@ describe('handlePaymentReversal（P3-16）', () => {
     expect((data.roleExpiresAt as Date).getTime()).toBe(expiry.getTime() - 30 * 86_400_000);
   });
 
+  it('▶ M6 用户行必须走 `SELECT … FOR UPDATE` 锁读（对齐 applyGrantTx 的 P3-6）', async () => {
+    orderFindUniqueMock.mockResolvedValue(MEMBERSHIP_ORDER);
+    orderUpdateManyMock.mockResolvedValue({ count: 1 });
+    userFindUniqueMock
+      .mockResolvedValueOnce({
+        walletBalanceCents: 0,
+        purchasedMinutesBalance: 0,
+        role: 'PRO',
+        originalRole: 'FREE',
+        roleExpiresAt: new Date(Date.now() + 90 * 86_400_000),
+      })
+      .mockResolvedValueOnce({ walletBalanceCents: 0 });
+
+    await handlePaymentReversal({ outTradeNo: 'LL1', provider: 'stripe' });
+
+    // 结构闸：会员分支是读-改-写绝对值，快照读在并发下必然 lost update（行为证据见
+    // refundHandling.concurrency.test.ts）。这里只锁住「锁读没有被人改回 findUnique」。
+    const lockSql = queryRawMock.mock.calls.map((c) =>
+      Array.isArray(c[0]) ? c[0].join('?') : String(c[0])
+    );
+    expect(lockSql.some((sql) => /FROM User WHERE id = \?\s*FOR UPDATE/.test(sql))).toBe(
+      true
+    );
+  });
+
   it('▶ ADMIN 永不被退款降级', async () => {
     orderFindUniqueMock.mockResolvedValue(MEMBERSHIP_ORDER);
     orderUpdateManyMock.mockResolvedValue({ count: 1 });
@@ -196,6 +232,7 @@ describe('handlePaymentReversal（P3-16）', () => {
     expect(res).toEqual({ handled: true, outcome: 'already' });
     expect(walletTxCreateMock).not.toHaveBeenCalled();
     expect(executeRawMock).not.toHaveBeenCalled();
+    expect(queryRawMock).not.toHaveBeenCalled(); // 连锁读都不该发生
   });
 
   it('▶ 订单还在 pending（未到账）→ not_paid，不动任何权益', async () => {

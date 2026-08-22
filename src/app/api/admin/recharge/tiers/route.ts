@@ -89,6 +89,9 @@ function normalizeTier(
   if (!kind || !TIER_KINDS.includes(kind as TierKind)) {
     return { error: '档位类型无效（membership | minutes | topup）' };
   }
+  // 换 kind 时 grantRole 等四列是派生的，必须跟着写（见 KIND_DERIVED_KEYS）。提前算出来，
+  // 好让下面的 ADMIN 硬拒判断知道「本次请求到底会不会写 grantRole」。
+  const kindChanged = partial && given('kind') && body.kind !== current?.kind;
   const name = (merged.name ?? '').trim();
   if (!name) return { error: '档位名称不能为空' };
   const priceCents = intOrNull(merged.priceCents);
@@ -114,6 +117,14 @@ function normalizeTier(
   if (kind === 'membership') {
     const role = (merged.grantRole ?? 'PRO') as UserRole;
     if (!['ADMIN', 'PRO', 'FREE'].includes(role)) return { error: '授予角色无效' };
+    // M7：ADMIN 绝不可作为可购买档位的 grantRole —— 买到即得终身计费豁免 + 全部 admin API。
+    // 从前这里明确放行 ADMIN，仅靠 describeTier 的事后审计流水兜底（P6-15 自认无代码防线）。
+    // 只拦「本次请求真的要写 grantRole」的情况（新建 / 显式给了 grantRole / 换 kind 触发派生重写），
+    // 与 P3-7 的 0 元档同款口径：否则存量的 ADMIN 档连「停用」「改名」都改不动。
+    // 发放侧（wallet.ts applyGrantTx）另有一道硬拒，存量脏数据同样发不出去。
+    if (role === 'ADMIN' && (!partial || given('grantRole') || kindChanged)) {
+      return { error: '授予角色无效（不得创建授予管理员的档位）' };
+    }
     const days = intOrNull(merged.durationDays);
     if (!days || days <= 0) return { error: '会员档位必须设置正的时长天数' };
     data.grantRole = role;
@@ -130,7 +141,6 @@ function normalizeTier(
 
   if (!partial) return { data };
 
-  const kindChanged = given('kind') && body.kind !== current?.kind;
   const patch: Record<string, unknown> = {};
   for (const k of TIER_KEYS) {
     if (given(k) || (kindChanged && KIND_DERIVED_KEYS.includes(k))) patch[k] = data[k];

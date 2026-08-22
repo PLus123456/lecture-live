@@ -176,6 +176,34 @@ export default function InterpretPage() {
   const [selectedMic, setSelectedMic] = useState('');
   const [micTesting, setMicTesting] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
+  /**
+   * L48：麦克风测试（3 秒）持有的资源句柄。此前 setInterval / setTimeout / MediaStream /
+   * AudioContext 全是裸创建、不注册卸载清理 —— 测试途中离开页面时定时器还在对已卸载组件
+   * setState，麦克风与 AudioContext 也要等那条 3 秒 timeout 自己跑完才释放（若 timeout
+   * 被浏览器后台节流则更久）。这里统一存 ref，由卸载 effect 一次性收干净。
+   */
+  const micTestIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const micTestTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const micTestStreamRef = useRef<MediaStream | null>(null);
+  const micTestCtxRef = useRef<AudioContext | null>(null);
+  // 只读 ref，不依赖任何 render 值 → 引用恒定，可安全用于卸载 effect。
+  const releaseMicTest = useCallback(() => {
+    if (micTestIntervalRef.current) {
+      clearInterval(micTestIntervalRef.current);
+      micTestIntervalRef.current = null;
+    }
+    if (micTestTimeoutRef.current) {
+      clearTimeout(micTestTimeoutRef.current);
+      micTestTimeoutRef.current = null;
+    }
+    micTestStreamRef.current?.getTracks().forEach((track) => track.stop());
+    micTestStreamRef.current = null;
+    if (micTestCtxRef.current) {
+      void micTestCtxRef.current.close();
+      micTestCtxRef.current = null;
+    }
+  }, []);
+  useEffect(() => releaseMicTest, [releaseMicTest]);
 
   useEffect(() => {
     navigator.mediaDevices?.enumerateDevices().then((devices) => {
@@ -229,29 +257,32 @@ export default function InterpretPage() {
         audio: selectedMic ? { deviceId: selectedMic } : true,
       });
       const ctx = new AudioContext();
+      micTestStreamRef.current = stream;
+      micTestCtxRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
       source.connect(analyser);
       const data = new Uint8Array(analyser.frequencyBinCount);
 
-      const interval = setInterval(() => {
+      micTestIntervalRef.current = setInterval(() => {
         analyser.getByteFrequencyData(data);
         const avg = data.reduce((a, b) => a + b, 0) / data.length;
         setMicLevel(avg / 255);
       }, 50);
 
-      setTimeout(() => {
-        clearInterval(interval);
-        stream.getTracks().forEach((track) => track.stop());
-        void ctx.close();
+      micTestTimeoutRef.current = setTimeout(() => {
+        // L48：定时器/流/AudioContext 统一由 releaseMicTest 收（卸载路径复用同一份逻辑）。
+        releaseMicTest();
         setMicTesting(false);
         setMicLevel(0);
       }, 3000);
     } catch {
+      // 取流失败：可能已经拿到过 stream/ctx（后续步骤抛错），一并收干净。
+      releaseMicTest();
       setMicTesting(false);
     }
-  }, [micTesting, selectedMic]);
+  }, [micTesting, selectedMic, releaseMicTest]);
 
   // 录制中离开页面时提示数据丢失
   useEffect(() => {
@@ -291,8 +322,11 @@ export default function InterpretPage() {
           )}
 
         <div className="flex-1 flex flex-col items-center justify-center gap-8 px-4 animate-fade-in-up">
-          {/* 大麦克风按钮 */}
+          {/* 大麦克风按钮 —— 页面的主操作，但内部只有一个 SVG 图标，此前**没有任何可
+              访问名称**（a11y 树里就是一个裸 button，屏幕阅读器读不出它是干什么的）。
+              补 aria-label 既是无障碍修复，也让 e2e 能按角色+名称稳定定位它。 */}
           <button
+            aria-label={t('interpret.start')}
             onClick={() => void handleStart()}
             disabled={!canStart}
             className="group relative w-28 h-28 rounded-full text-white flex items-center justify-center

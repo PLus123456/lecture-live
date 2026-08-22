@@ -137,6 +137,47 @@ async function computePoolOwed(
   return Math.max(0, committedUsed - Math.max(0, limit));
 }
 
+/**
+ * L15（P5-11 同款，补到请求路径）：算 owed 的两个输入（`used` 与在途预留聚合）必须**同龄**。
+ * 旧实现里 `used` 取自 ensureQuotaWindow 开头那次 findUnique 的快照、在途预留在其后逐个 aggregate，
+ * 两次读之间（窗口到期的毫秒级并发窗口内）新建的预留只进 inflight 不进那份陈旧的 used →
+ * committedUsed 偏小 → owed 偏小 → 少扣池，池结算口径漂移。P5-11 的修复只落在 cron 路径，
+ * 请求路径这条一直是非事务的两阶段读。
+ *
+ * db 已经是事务客户端时（finalize 扣费等把配额校正并进外层事务的调用方），外层事务本就保证
+ * 所有一致性读共享同一快照，直接跑即可；db 是顶层 PrismaClient 时自开一个交互式事务，把
+ * 「重读 used/limit + 聚合在途预留」收进同一快照（InnoDB REPEATABLE READ）。
+ * 判据用 `$transaction` 是否存在：Prisma 的 TransactionClient 结构上就没有这个方法。
+ */
+async function computePoolOwedSameAge(
+  userId: string,
+  db: QuotaDbClient
+): Promise<number> {
+  const run = async (tx: QuotaDbClient): Promise<number> => {
+    const fresh = await tx.user.findUnique({
+      where: { id: userId },
+      select: {
+        transcriptionMinutesUsed: true,
+        transcriptionMinutesLimit: true,
+      },
+    });
+    // 用户在本次调用中途被删 → 无池可结算
+    if (!fresh) return 0;
+    return computePoolOwed(
+      userId,
+      fresh.transcriptionMinutesUsed,
+      fresh.transcriptionMinutesLimit,
+      tx
+    );
+  };
+  const client = db as unknown as {
+    $transaction?: (cb: (tx: QuotaDbClient) => Promise<number>) => Promise<number>;
+  };
+  return typeof client.$transaction === 'function'
+    ? client.$transaction(run)
+    : run(db);
+}
+
 async function ensureQuotaWindow(
   userId: string,
   now = new Date(),
@@ -169,14 +210,10 @@ async function ensureQuotaWindow(
 
   // 充值系统（Model A）：在清预留 + 归零 used 之前，先算持池用户本周期已消费的池子分钟（owed），
   // 稍后随重置从 gross 池扣减。owed 用**清空前**的预留快照并排除在途预留（见 computePoolOwed）。
+  // L15：used 与在途预留必须同龄 —— 见 computePoolOwedSameAge（不再复用本函数开头那份快照）。
   const poolOwed =
     user.purchasedMinutesBalance > 0
-      ? await computePoolOwed(
-          userId,
-          user.transcriptionMinutesUsed,
-          user.transcriptionMinutesLimit,
-          db
-        )
+      ? await computePoolOwedSameAge(userId, db)
       : 0;
 
   // B1（防跨周期二次释放，审查 R1）：**先清**该用户在途预留列，**再**把 used 归零。

@@ -14,9 +14,9 @@ import {
 } from '@/lib/transcriptDraftPersistence';
 import {
   stageSessionAudioArtifact,
+  stageSessionTranscriptArtifacts,
   finalizeStagedArtifactPublish,
   rollbackStagedArtifact,
-  persistSessionTranscriptArtifacts,
   extractTranscriptText,
   loadSessionTranscriptBundle,
   persistSessionReport,
@@ -214,6 +214,20 @@ export async function finalizeSession(
     });
   }
 
+  // M5 + L20：本次收尾 stage 出来的全部版本化临时对象（录音 / 转录 / 摘要）。声明在 try **之外**，
+  // 因为 catch 也要负责回滚 —— `$transaction` 自身抛错（死锁/超时/连接断开）时 CAS 没生效，
+  // 而 stage 出的文件已经落盘，旧实现只在 lockLost 分支回滚、抛错路径直接漏成无主孤儿（L20）。
+  const stagedArtifacts: StagedArtifact[] = [];
+  // CAS 是否已提交。提交之后这些临时对象已被 DB 引用（并已 publish），catch 里**绝不能**再删——
+  // 那会删掉刚定稿的录音/转录。
+  let casCommitted = false;
+  const rollbackStagedArtifacts = async () => {
+    for (const staged of stagedArtifacts) {
+      await rollbackStagedArtifact(session, staged).catch(() => undefined);
+    }
+    stagedArtifacts.length = 0;
+  };
+
   try {
     // P1-7 契约3：持锁后先封存草稿，阻断收尾期间迟到的 audio 分片 / transcript 草稿写入
     // （seal 后两者一律 409），杜绝在「读取草稿快照 → 合并 → 删草稿」窗口内到达的写丢数据。
@@ -332,6 +346,7 @@ export async function finalizeSession(
           normalizedBuffer,
           merged.manifest.mimeType
         );
+        stagedArtifacts.push(stagedAudio);
         recordingPath = stagedAudio.reference;
         recordingPathResolvedHere = true;
         shouldDeleteRecordingDraft = true;
@@ -340,13 +355,24 @@ export async function finalizeSession(
       }
     }
 
+    // M5：转录/摘要与录音同走两阶段（stage → CAS → publish/rollback）。旧实现用的
+    // persistSessionTranscriptArtifacts 写的是**固定 key** `{id}.json` 且写在 CAS 事务之前：
+    // finalizer A 若因大文件 ffmpeg 超过 FINALIZE_LOCK_STALE_MS 被 B 接管，B 先提交自己的
+    // bundle，A 随后 count===0 走 lockLost —— 旧代码只回滚 stagedAudio，A 已经覆盖掉的固定 key
+    // 转录/摘要**留在原地**，而 DB 指向的正是这个 path → 最终存储的转录 ≠ 提交时审计的转录。
+    // 版本化对象天然不同名，A 永远碰不到 B 的文件；CAS 输了就整组删掉。
+    let stagedTranscript: StagedArtifact | null = null;
+    let stagedSummary: StagedArtifact | null = null;
     if (!transcriptPath) {
-      const stored = await persistSessionTranscriptArtifacts(
+      const staged = await stageSessionTranscriptArtifacts(
         session,
         bundle ?? EMPTY_TRANSCRIPT_BUNDLE
       );
-      transcriptPath = stored.transcript.path;
-      summaryPath = stored.summary.path;
+      stagedTranscript = staged.transcript;
+      stagedSummary = staged.summary;
+      stagedArtifacts.push(stagedTranscript, stagedSummary);
+      transcriptPath = stagedTranscript.reference;
+      summaryPath = stagedSummary.reference;
       shouldDeleteTranscriptDraft = true;
     }
 
@@ -422,11 +448,9 @@ export async function finalizeSession(
     // U43：锁在处理期间被接管/会话已被对方 COMPLETED —— 本次不做任何写入/扣费/后台任务，
     // 按"已完成"返回当前库中真实状态，避免重复收尾。
     if (commit.lockLost) {
-      // P0-6：锁被接管/对方已 COMPLETED —— 本次 CAS 未生效，删掉刚 stage 的版本化临时对象，
-      // 绝不残留孤儿，也绝不动对方已发布的终态录音。
-      if (stagedAudio) {
-        await rollbackStagedArtifact(session, stagedAudio).catch(() => undefined);
-      }
+      // P0-6 + M5：锁被接管/对方已 COMPLETED —— 本次 CAS 未生效，删掉刚 stage 的**全部**版本化
+      // 临时对象（录音 + 转录 + 摘要），绝不残留孤儿，也绝不动对方已发布的终态产物。
+      await rollbackStagedArtifacts();
       const latest = await prisma.session.findUnique({
         where: { id: options.sessionId },
         select: {
@@ -446,6 +470,11 @@ export async function finalizeSession(
       };
     }
 
+    // CAS 已提交：这些 staged 引用已经被 DB 指向，从此**不可回滚**（L20 的 catch 据此放行）。
+    // 这是唯一的闸 —— 别再加第二道「清空数组」的冗余，否则 catch 里那句 `if (!casCommitted)`
+    // 就成了永远测不出来的死条件。
+    casCommitted = true;
+
     const updatedSession = commit.updated!;
 
     // 转录配额「快用完」提醒（事务已提交后，fire-and-forget，仅在本次真扣了分钟时触发）。
@@ -456,6 +485,19 @@ export async function finalizeSession(
     // P0-6：CAS 成功，recordingPath 已落库；发布 staged 录音（删旧 previousReference，此路径通常无旧值）。
     if (stagedAudio) {
       await finalizeStagedArtifactPublish(session, stagedAudio).catch(() => undefined);
+    }
+    // M5：转录/摘要同样在 CAS 之后发布。二者不追踪 previousReference（见 sessionPersistence
+    // stageSessionTranscriptArtifacts 注释：旧行为即覆盖固定 key，无旧文件可删），故 publish
+    // 只是把引用交回、无副作用；保留调用是为了与录音走同一套 stage→CAS→publish 语义。
+    if (stagedTranscript) {
+      await finalizeStagedArtifactPublish(session, stagedTranscript).catch(
+        () => undefined
+      );
+    }
+    if (stagedSummary) {
+      await finalizeStagedArtifactPublish(session, stagedSummary).catch(
+        () => undefined
+      );
     }
 
     // 录音音频增强（后处理）：录音已发布且事务已提交，按站点/用户组门禁自动入队，
@@ -543,6 +585,13 @@ export async function finalizeSession(
       recordingMissing,
     };
   } catch (error) {
+    // L20：`$transaction` 自身抛错（死锁/锁等待超时/连接断开）时 CAS 从未生效，但此刻已经
+    // stage 出了版本化录音/转录/摘要（本地 + 可能的 Cloudreve 远程副本）。旧实现只有 lockLost
+    // 分支回滚，这条路径直接把它们漏成无主孤儿（无任何 DB 行引用 → 删会话时也扫不到）。
+    // casCommitted 之后抛的错（发布/删草稿/后台任务阶段）绝不能进这里 —— 那些对象已被 DB 引用。
+    if (!casCommitted) {
+      await rollbackStagedArtifacts();
+    }
     // P1-7：本次收尾未提交（含草稿缺片抛 409 / 其它错误）—— 释放草稿封存，让客户端补传缺失
     // 分片后重试收尾，避免 seal 后永久 409 挡住补传的死锁。best-effort，不影响错误上抛。
     await unsealRecordingDraft(session).catch(() => undefined);

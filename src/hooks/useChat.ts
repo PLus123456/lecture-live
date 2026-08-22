@@ -72,33 +72,42 @@ function deriveBudgetFromModel(
 }
 
 export function useChat(sessionId: string | null) {
-  const {
-    selectedModel,
-    selectedThinkingPreference,
-    availableModels,
-    modelsLoaded,
-    activeConversationId,
-    conversations,
-    byConversation,
-    setLoading,
-    setSelectedModel,
-    setSelectedThinkingPreference,
-    setAvailableModels,
-    setActiveConversation,
-    setConversations,
-    setMessages,
-    addMessage,
-    updateMessage,
-    setTokenUsage,
-    setContextFull,
-    resetSession,
-  } = useChatStore();
+  // L49：原本是无 selector 的 `useChatStore()`，等于订阅整个 store —— 任意一个对话的 SSE
+  // 每来一个 delta（updateMessage 重建 byConversation）就让所有使用方全量重渲染。改成逐字段
+  // selector：actions 在 create() 里定义一次、引用恒定；运行时切片只订阅**活跃对话**那一片。
+  // 语义不变（读到的值完全相同），只是不再为别的对话的 delta 重渲染。
+  const selectedModel = useChatStore((s) => s.selectedModel);
+  const selectedThinkingPreference = useChatStore(
+    (s) => s.selectedThinkingPreference
+  );
+  const availableModels = useChatStore((s) => s.availableModels);
+  const modelsLoaded = useChatStore((s) => s.modelsLoaded);
+  const activeConversationId = useChatStore((s) => s.activeConversationId);
+  const conversations = useChatStore((s) => s.conversations);
+  const setLoading = useChatStore((s) => s.setLoading);
+  const setSelectedModel = useChatStore((s) => s.setSelectedModel);
+  const setSelectedThinkingPreference = useChatStore(
+    (s) => s.setSelectedThinkingPreference
+  );
+  const setAvailableModels = useChatStore((s) => s.setAvailableModels);
+  const setActiveConversation = useChatStore((s) => s.setActiveConversation);
+  const setConversations = useChatStore((s) => s.setConversations);
+  const setMessages = useChatStore((s) => s.setMessages);
+  const addMessage = useChatStore((s) => s.addMessage);
+  const updateMessage = useChatStore((s) => s.updateMessage);
+  const setTokenUsage = useChatStore((s) => s.setTokenUsage);
+  const setContextFull = useChatStore((s) => s.setContextFull);
+  const resetSession = useChatStore((s) => s.resetSession);
 
   // 当前活跃对话的运行时切片 —— messages/isLoading/tokenUsage/contextFull/archived
   // 全从这里派生（按 conversationId 隔离，不再读全局单例字段）。
-  const activeRuntime =
-    (activeConversationId && byConversation[activeConversationId]) ||
-    EMPTY_CONVERSATION_RUNTIME;
+  // selector 返回 store 内已存在的对象引用（缺省时是模块级常量 EMPTY_CONVERSATION_RUNTIME），
+  // 引用稳定，不会触发 zustand v5 的 "getSnapshot should be cached" 无限循环。
+  const activeRuntime = useChatStore(
+    (s) =>
+      (s.activeConversationId && s.byConversation[s.activeConversationId]) ||
+      EMPTY_CONVERSATION_RUNTIME
+  );
   const { messages, archivedMessages, isLoading, tokenUsage, contextFull } =
     activeRuntime;
 

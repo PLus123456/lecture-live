@@ -12,12 +12,14 @@ const {
   conversationFindUniqueMock,
   conversationMessageCreateMock,
   callLLMMock,
+  resolveAuthorizedLlmSelectionMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   enforceApiRateLimitMock: vi.fn(),
   conversationFindUniqueMock: vi.fn(),
   conversationMessageCreateMock: vi.fn(),
   callLLMMock: vi.fn(),
+  resolveAuthorizedLlmSelectionMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
@@ -29,6 +31,15 @@ vi.mock('@/lib/prisma', () => ({
   },
 }));
 vi.mock('@/lib/llm/gateway', () => ({ callLLM: callLLMMock }));
+vi.mock('@/lib/llm/access', () => ({
+  LLMAccessError: class LLMAccessError extends Error {
+    constructor(msg: string) {
+      super(msg);
+      this.name = 'LLMAccessError';
+    }
+  },
+  resolveAuthorizedLlmSelection: resolveAuthorizedLlmSelectionMock,
+}));
 
 import { POST } from '@/app/api/llm/chat/compress/route';
 
@@ -46,6 +57,12 @@ describe('POST /api/llm/chat/compress', () => {
     enforceApiRateLimitMock.mockResolvedValue(null);
     callLLMMock.mockResolvedValue('summary');
     conversationMessageCreateMock.mockResolvedValue({ id: 'm1' });
+    resolveAuthorizedLlmSelectionMock.mockResolvedValue({
+      user: { role: 'PRO' },
+      modelId: undefined,
+      providerName: undefined,
+      featureFlags: {},
+    });
   });
 
   it('对话不存在 → 404', async () => {
@@ -96,5 +113,69 @@ describe('POST /api/llm/chat/compress', () => {
     });
     const res = await POST(makeReq({ conversationId: 'c-closed' }));
     expect(res.status).toBe(409);
+  });
+
+  /**
+   * M16：主动压缩把「早期对话原文」发给 LLM，此前硬编码 `{ purpose: 'CHAT' }` ——
+   * 受限组用户被授权只能用模型 X，其对话原文却被送到全局默认 CHAT 模型上，
+   * 组绑定的 chatModelId 也被绕过。
+   */
+  describe('M16：压缩调用走用户已授权的模型路由', () => {
+    function conversationWithTurns() {
+      const messages = [];
+      for (let i = 0; i < 4; i++) {
+        messages.push({
+          id: `u${i}`,
+          role: 'user',
+          content: `问题 ${i}`,
+          transcriptOffsetMs: i * 1000,
+          createdAt: new Date(),
+        });
+        messages.push({
+          id: `a${i}`,
+          role: 'assistant',
+          content: `回答 ${i}`,
+          transcriptOffsetMs: i * 1000,
+          createdAt: new Date(),
+        });
+      }
+      return {
+        id: 'c-ok',
+        userId: 'user-1',
+        session: { userId: 'user-1', targetLang: 'zh' },
+        endedAt: null,
+        messages,
+      };
+    }
+
+    it('组绑定/受限用户解析出的 modelId 被透传给 compressHistory 的 callLLM', async () => {
+      conversationFindUniqueMock.mockResolvedValue(conversationWithTurns());
+      resolveAuthorizedLlmSelectionMock.mockResolvedValue({
+        user: { role: 'FREE' },
+        modelId: 'model-allowed-only',
+        featureFlags: {},
+      });
+
+      const res = await POST(makeReq({ conversationId: 'c-ok' }));
+      expect(res.status).toBe(200);
+
+      expect(callLLMMock).toHaveBeenCalledTimes(1);
+      expect(callLLMMock.mock.calls[0][2]).toEqual({
+        modelId: 'model-allowed-only',
+      });
+      expect(callLLMMock.mock.calls[0][2]).not.toEqual({ purpose: 'CHAT' });
+    });
+
+    it('用户无权使用默认模型时 403，而不是偷偷用它压缩', async () => {
+      conversationFindUniqueMock.mockResolvedValue(conversationWithTurns());
+      const { LLMAccessError } = await import('@/lib/llm/access');
+      resolveAuthorizedLlmSelectionMock.mockRejectedValue(
+        new LLMAccessError('Requested model is not allowed')
+      );
+
+      const res = await POST(makeReq({ conversationId: 'c-ok' }));
+      expect(res.status).toBe(403);
+      expect(callLLMMock).not.toHaveBeenCalled();
+    });
   });
 });

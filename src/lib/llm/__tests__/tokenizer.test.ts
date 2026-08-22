@@ -54,10 +54,43 @@ describe('estimateTokens 超长输入短路', () => {
   it('truncateToTokensFromEnd 的 encode 工作量随 maxTokens 而非输入长度增长', () => {
     const huge = 'a'.repeat(2_000_000);
     truncateToTokensFromEnd(huge, 1000);
-    expect(encodeMock).toHaveBeenCalledTimes(1);
     // 旧实现把整份 200 万字符喂进 encode；新实现先粗切尾部再 encode。
-    const encoded = encodeMock.mock.calls[0][0] as string;
-    expect(encoded.length).toBeLessThan(huge.length);
-    expect(encoded.length).toBeLessThanOrEqual(200_000);
+    // 校正循环（L38①）可能多编码几次，但每次的输入都被粗切上界钉住。
+    expect(encodeMock.mock.calls.length).toBeLessThanOrEqual(4);
+    for (const [encoded] of encodeMock.mock.calls as Array<[string]>) {
+      expect(encoded.length).toBeLessThan(huge.length);
+      expect(encoded.length).toBeLessThanOrEqual(200_000);
+    }
+  });
+});
+
+/**
+ * L38①：按字符比例反推截断点会在「尾部 token 密度高于全文」时**超出** maxTokens。
+ * 这里用一个刻意非均匀的 encode 桩（CJK 2 token/字，ASCII 0.25 token/字）把这个
+ * 场景固定下来：全文平均密度低，尾部是密集的 CJK。
+ */
+describe('truncateToTokensFromEnd 不得超出 maxTokens', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    encodeMock.mockImplementation((text: string) => {
+      let total = 0;
+      for (const ch of text) {
+        total += /[一-鿿]/.test(ch) ? 2 : 0.25;
+      }
+      return new Array(Math.ceil(total)).fill(0);
+    });
+  });
+
+  it('尾部密度高于全文时，返回值的真实 token 数仍 ≤ maxTokens', () => {
+    // 8000 个 'a'（2000 token）+ 200 个汉字（400 token）：全文 2400 token / 8200 字符。
+    // 纯比例反推会保留最后 ~3417 字符 = 400 + 804 ≈ 1205 token，超出 1000。
+    const text = 'a'.repeat(8000) + '一'.repeat(200);
+    const out = truncateToTokensFromEnd(text, 1000);
+
+    expect(encodeMock(out).length).toBeLessThanOrEqual(1000);
+    // 也不能收得太狠（否则等于把预算白白浪费掉）
+    expect(encodeMock(out).length).toBeGreaterThan(700);
+    // 必须仍然是原文的尾巴
+    expect(text.endsWith(out)).toBe(true);
   });
 });

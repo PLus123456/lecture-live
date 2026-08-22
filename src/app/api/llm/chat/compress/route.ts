@@ -15,6 +15,11 @@ import {
   encodeCompressedHistorySystemMessage,
   findCompressionBoundary,
 } from '@/lib/llm/chatCompression';
+import {
+  LLMAccessError,
+  resolveAuthorizedLlmSelection,
+} from '@/lib/llm/access';
+import { buildLlmRoutingOptions } from '@/lib/llm/llmRoutingOptions';
 import { logger, serializeError } from '@/lib/logger';
 
 const apiLogger = logger.child({ component: 'chat-compress' });
@@ -132,13 +137,28 @@ export async function POST(req: Request) {
 
   const language = conversation.session.targetLang || 'zh';
 
+  // M16：压缩把「早期对话原文」发给 LLM，必须走这个用户已授权的路由（组绑定 chatModelId /
+  // allowedModels 内的模型），不能硬编码 purpose:'CHAT' 掉回全局默认模型。
+  // 与 chat 主链路同口径：不带 requestedIdentifier，由 access 解析组默认 / 全局默认并校验授权。
+  let routingOptions: ReturnType<typeof buildLlmRoutingOptions>;
+  try {
+    const selection = await resolveAuthorizedLlmSelection(user.id);
+    routingOptions = buildLlmRoutingOptions(selection, 'CHAT');
+  } catch (err) {
+    if (err instanceof LLMAccessError) {
+      const status = err.message === 'User not found' ? 404 : 403;
+      return NextResponse.json({ error: err.message }, { status });
+    }
+    throw err;
+  }
+
   let summary: string;
   let recentKept: ReadonlyArray<ConversationTurn>;
   try {
     const result = await compressHistory({
       history: turns,
       keepTurns,
-      callLLM: (s: string, u: string) => callLLM(s, u, { purpose: 'CHAT' }),
+      callLLM: (s: string, u: string) => callLLM(s, u, { ...routingOptions }),
       language,
     });
     if (!result) {

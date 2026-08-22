@@ -12,7 +12,61 @@ function buildNamespacedKey(key: string): string {
   return `${API_RESPONSE_CACHE_PREFIX}:${key}`;
 }
 
+/* ------------------------------------------------------------------ */
+/*  L51：singleflight + 失效时序保护                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 同一 key 的并发 miss 只跑一次 loader（cache stampede / 缓存击穿）。
+ * 旧实现里 N 个并发请求 miss 同一个键就是 N 次全量 DB 查询——列表页在缓存过期的
+ * 那一瞬间会把 DB 打出一个尖峰，键越热尖峰越高。
+ */
+const inFlightLoads = new Map<string, Promise<unknown>>();
+
+/**
+ * 「读 miss → loader 读到旧值 → 另一个请求提交写入并删 key → 我们把旧值写回」
+ * 这条时序会让**已经失效**的数据复活最多一个 TTL。
+ *
+ * 这里记下每个前缀最近一次失效的时刻：loader 开始之前先取一次时间戳，
+ * 写回缓存前若发现该前缀在这期间被失效过，就**只返回值、不写缓存**。
+ * 注意这是**进程内**的保护 —— 多实例部署下另一个进程的失效仍看不到，
+ * 残留窗口 ≤ TTL（30s），与正常缓存陈旧度同量级，故不再加分布式墓碑。
+ */
+const lastInvalidatedAt = new Map<string, number>();
+
+/** 仅供测试：重置进程内状态。 */
+export function __resetApiCacheState(): void {
+  inFlightLoads.clear();
+  lastInvalidatedAt.clear();
+}
+
+function markInvalidated(prefix: string) {
+  lastInvalidatedAt.set(prefix, Date.now());
+  // 前缀数量随用户数增长，做个上界防泄漏（超限时丢最旧的一半）
+  if (lastInvalidatedAt.size > 10_000) {
+    const entries = Array.from(lastInvalidatedAt.entries()).sort(
+      (a, b) => a[1] - b[1]
+    );
+    for (let i = 0; i < entries.length / 2; i += 1) {
+      lastInvalidatedAt.delete(entries[i][0]);
+    }
+  }
+}
+
+/** key 落在哪些已记录的失效前缀下 —— 取其中最新的一次失效时刻。 */
+function latestInvalidationFor(key: string): number {
+  let latest = 0;
+  lastInvalidatedAt.forEach((at, prefix) => {
+    if (key.startsWith(prefix) && at > latest) latest = at;
+  });
+  return latest;
+}
+
 async function deleteByPrefix(prefix: string): Promise<number> {
+  // 失效时刻要先记，且不受 Redis 可用性影响 —— 否则 Redis 抖动期间的失效
+  // 会被后续写回悄悄抹掉。
+  markInvalidated(prefix);
+
   const redis = getRedisClient();
   if (!redis || redis.status !== 'ready') {
     return 0;
@@ -62,20 +116,45 @@ export async function getOrSetApiCache<T>(
     }
   }
 
-  const value = await loader();
-
-  if (redis && redis.status === 'ready') {
-    try {
-      await redis.set(namespacedKey, JSON.stringify(value), 'EX', ttlSeconds);
-    } catch {
-      // 写缓存失败不影响主流程。
-    }
+  // L51 singleflight：同一 key 已有在途 loader 就搭它的车，不再各自打 DB。
+  const existing = inFlightLoads.get(namespacedKey);
+  if (existing) {
+    return { hit: false, value: (await existing) as T };
   }
 
-  return {
-    hit: false,
-    value,
-  };
+  const startedAt = Date.now();
+  const load = (async () => {
+    const value = await loader();
+
+    // L51 时序保护：loader 期间该前缀被失效过 → 这份值可能已经过时，只返回不写回。
+    const invalidatedDuringLoad = latestInvalidationFor(key) >= startedAt;
+
+    if (!invalidatedDuringLoad) {
+      const writeRedis = getRedisClient();
+      if (writeRedis && writeRedis.status === 'ready') {
+        try {
+          await writeRedis.set(
+            namespacedKey,
+            JSON.stringify(value),
+            'EX',
+            ttlSeconds
+          );
+        } catch {
+          // 写缓存失败不影响主流程。
+        }
+      }
+    }
+
+    return value;
+  })();
+
+  inFlightLoads.set(namespacedKey, load);
+  try {
+    const value = await load;
+    return { hit: false, value };
+  } finally {
+    inFlightLoads.delete(namespacedKey);
+  }
 }
 
 export function buildFoldersApiCacheKey(userId: string): string {

@@ -43,12 +43,37 @@ import { logger, serializeError } from '@/lib/logger';
  *
  * 推进途径：1) ws 进程 startDocTranslateLoop 周期 tick；2) 任务状态路由 fire-and-forget
  * 踢一脚。多进程并发安全靠 claim 的条件 updateMany 抢占。
+ *
+ * ─── 代次不变式（generation invariant，本文件最重要的一条规矩）───
+ *
+ * `TranslationTask.jobQueueId` 是**代次令牌**：它指向"当前这一代"调度行。
+ * 用户 retry 会把任务重置回 PENDING、重新扣一次费、并换一条全新的调度行
+ *（retry 路由事务里先把 jobQueueId 置 null，再由 enqueueDocTranslate 绑到新行）。
+ * 于是同一个 taskId 上可能同时存在**上一代的在途逻辑**和**新一代的任务行**。
+ *
+ * 不变式：**调度器里所有对 TranslationTask 的写、以及所有对任务目录的 rm -rf，
+ * 都必须带 `jobQueueId: <自己这一代的 jobId>` 谓词。**
+ *
+ * 漏一处的后果都是真金白银级的（这一簇 bug 全部出自"漏了谓词"）：
+ *   - harvest 漏 → 旧代产物把新一代标成 COMPLETED，新代收割再 rm -rf 删光整个目录
+ *     = 用户看到"已完成"但文件 404，且新扣的钱不退（H4）；
+ *   - markTaskTranslating 漏 → 旧 worker 的 workerId 被写进新一代，用户取消时停错台（M12）；
+ *   - 进度回写漏 → 旧代低进度反复盖掉新代真实进度，进度条回跳（M13）；
+ *   - issueProxyToken 漏 → 唯一索引互相覆盖，其中一台 worker 的 LLM 调用全 401（M11）；
+ *   - 绑定漏 → 双进程孤儿扫描各建一行都绑定成功，同一份 PDF 翻两遍（M11）。
+ *
+ * 两道防线：① 入口的 `isSupersededGeneration` 早退（省掉无谓的 worker 往返与副作用）；
+ * ② 每一次写都带谓词（原子、不受 TOCTOU 影响，这才是权威防线）。只有 ① 没有 ② 不作数。
  */
 
 const translateLogger = logger.child({ component: 'doc-translate' });
 
-/** 单任务在 worker 侧最长滞留：大文档（数百页 × QPS 限速）给足 3 小时 */
-const MAX_WORKER_RUNTIME_MS = 180 * 60_000;
+/**
+ * 单任务在 worker 侧最长滞留：大文档（数百页 × QPS 限速）给足 3 小时。
+ * H5：导出是为了让单测能钉住「僵尸回收阈值必须严格大于它」这条跨模块不变式 ——
+ * 这两个常量当初就是各改各的漂移开的（jobQueue 的 2h < 这里的 3h），必然误杀。
+ */
+export const MAX_WORKER_RUNTIME_MS = 180 * 60_000;
 /** 自动重试退避（按已消耗 attempt 索引） */
 const RETRY_BACKOFF_MS = [5 * 60_000, 20 * 60_000, 45 * 60_000];
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -58,6 +83,12 @@ const DEFAULT_MAX_ATTEMPTS = 3;
  * 取 2 分钟足以避开正常窗口，又不至于让真正的孤儿等太久。
  */
 const ORPHAN_TASK_GRACE_MS = 2 * 60_000;
+/**
+ * H6：绑定台连续不可达多久之后解绑重派。
+ * 断电/域名失效的 worker 会让对账每轮都在 getTranslateJob 上抛错，任务干等着那台复活。
+ * 取 10 分钟：足够跨过一次重启/短暂网络抖动，又不至于让用户等上小时级。
+ */
+const WORKER_UNREACHABLE_REBIND_MS = 10 * 60_000;
 
 interface TranslateJobParams {
   /** 业务行 id（TranslationTask） */
@@ -66,6 +97,8 @@ interface TranslateJobParams {
   workerId?: string;
   nextRetryAt?: string;
   progress?: { stage: string | null; percent: number; at: string };
+  /** H6：绑定台首次不可达的时刻（ISO）；任何一次成功对账即清除 */
+  unreachableSince?: string;
   [key: string]: unknown;
 }
 
@@ -85,6 +118,41 @@ async function writeJobParams(jobId: string, params: TranslateJobParams): Promis
     .catch(() => undefined);
 }
 
+/**
+ * 代次门的**入口版**（见文件头的代次不变式）：任务是不是已经改嫁给了别的调度行。
+ *
+ * 注意 `null` 刻意**不算**过期。enqueueDocTranslate 是「先 createJob 再回写 jobQueueId」
+ * 两步，中间那几毫秒里别的进程的 tick 完全可能已经把这条 SUBMITTED 行捞去派发；
+ * 此时若判它过期并终态化，任务会停在 PENDING、jobQueueId 随后又被写上，
+ * 孤儿扫描（要求 jobQueueId=null）再也捞不回来 —— 拿一个更狠的死锁换一个竞态，不划算。
+ * 只有明确指向**另一条**调度行才是确凿的过期代次。
+ *
+ * 这只是省往返用的快速判断，权威防线是每一次写 task 时都带的 `jobQueueId` 谓词。
+ */
+function isSupersededGeneration(
+  task: { jobQueueId: string | null },
+  jobId: string
+): boolean {
+  return task.jobQueueId !== null && task.jobQueueId !== jobId;
+}
+
+/**
+ * 放弃一条已被新一代取代的调度行：只终态化调度行，**一个字都不碰 TranslationTask**。
+ * 刻意不写 params.nextRetryAt —— 过期代次不该被自动重试捞回来复活。
+ */
+async function abandonSupersededJob(jobId: string): Promise<void> {
+  await prisma.jobQueue
+    .updateMany({
+      where: { id: jobId, status: { in: [JOB_STATUS.SUBMITTED, JOB_STATUS.PROCESSING] } },
+      data: {
+        status: JOB_STATUS.FAILED,
+        error: '调度行已被新一代取代（用户重试）',
+        completedAt: new Date(),
+      },
+    })
+    .catch(() => undefined);
+}
+
 // ─── 入队（由确认扣费路由调用） ───
 
 /**
@@ -97,7 +165,8 @@ export async function enqueueDocTranslate(taskId: string, userId: string): Promi
       where: { id: taskId },
       select: { jobQueueId: true },
     });
-    if (task?.jobQueueId) {
+    if (!task) return null; // 行已被删：别留一条没人认领的调度行占派发槽
+    if (task.jobQueueId) {
       const existing = await prisma.jobQueue.findUnique({
         where: { id: task.jobQueueId },
         select: { id: true, status: true },
@@ -121,8 +190,15 @@ export async function enqueueDocTranslate(taskId: string, userId: string): Promi
     // L23：绑定失败（任务被并发取消/删除、或状态已不是 PENDING）时必须把刚建的调度行
     // 就地终态化。原来用的是会抛的 prisma.update：抛出后外层 catch 只 return null，
     // 那行永远留在 SUBMITTED 里，每轮 tick 都被捞进 take(totalSlots)、白占一个全局派发槽。
+    // M11：绑定必须是对**读到的那个代次令牌**的 CAS，不能只看 status。
+    // tick 同时跑在 ws 进程和每个 API 进程里（runDocTranslateTick 的 globalThis 互斥仅
+    // 进程内），两个进程的孤儿扫描可以同时捞到同一条 jobQueueId=null 的任务、各自 createJob，
+    // 只带 `status: 'PENDING'` 的话两次绑定会**先后都成功**：两条 SUBMITTED 行都被派发，
+    // 同一份 PDF 翻两遍、两笔 worker 费用，且 issueProxyToken 互相覆盖唯一索引，
+    // 其中一台的 LLM 调用当场全 401。
+    // 用读到的旧值做谓词（null 或上一条已终态的行 id）→ 只有第一个写入者能命中。
     const bound = await prisma.translationTask.updateMany({
-      where: { id: taskId, status: 'PENDING' },
+      where: { id: taskId, status: 'PENDING', jobQueueId: task.jobQueueId },
       data: { jobQueueId: jobId },
     });
     if (bound.count === 0) {
@@ -195,9 +271,9 @@ async function executeTick(): Promise<void> {
   });
   const now = Date.now();
   for (const job of failed) {
-    if (job.attempt >= job.maxAttempts) continue;
     const params = parseJobParams(job.params);
     if (!params.nextRetryAt) continue;
+    if (job.attempt >= job.maxAttempts) continue;
     if (new Date(params.nextRetryAt).getTime() > now) continue;
     const retried = await retryJob(job.id);
     if (retried) {
@@ -206,6 +282,55 @@ async function executeTick(): Promise<void> {
         '文档翻译任务自动重试回炉'
       );
     }
+  }
+
+  // 2.4) H5：断链任务自愈 —— 调度行已终态，业务行却还停在非终态。
+  //
+  // 通用僵尸回收（jobQueue.reclaimStaleProcessingJobs）是 updateMany 直改 job 行、
+  // **绕过 failJob**：它不回写 TranslationTask、不退 chargedCents、不发通知、
+  // 也不写 params.nextRetryAt（上面那圈自动重试要求该字段存在，没有就直接 continue）。
+  // 结果是任务永久停在 TRANSLATING（前端一直转圈）、钱滞留在系统里，而且行已非 PROCESSING
+  // → 上面第 1 步的对账永远捞不到它，worker 就算翻完也没人收割。
+  // 进程在 failJob 的「先写 job 行、再写 task 行」中间被 kill、以及 admin 手动改状态，
+  // 都会落到同一形态。
+  //
+  // 这里按业务行反查（在途任务数量受机队容量约束，很小）：只要它绑定的调度行已终态
+  // 且没有排定自动重试，就补跑一次 failJob —— 还有 attempt 就排退避重试，
+  // 用光了就终态失败 + 全额退款 + 通知。failJob 自带代次谓词，跨代不会误伤。
+  const strandedTasks = await prisma.translationTask.findMany({
+    where: {
+      status: { in: ['PENDING', 'TRANSLATING'] },
+      jobQueueId: { not: null },
+      updatedAt: { lt: new Date(now - ORPHAN_TASK_GRACE_MS) },
+    },
+    select: { id: true, jobQueueId: true },
+    orderBy: { updatedAt: 'asc' },
+    take: 20,
+  });
+  for (const stranded of strandedTasks) {
+    const jobId = stranded.jobQueueId;
+    if (!jobId) continue;
+    const jobRow = await prisma.jobQueue.findUnique({
+      where: { id: jobId },
+      select: { id: true, type: true, status: true, params: true },
+    });
+    if (!jobRow || jobRow.type !== JOB_TYPE.DOC_TRANSLATE) continue;
+    if (jobRow.status !== JOB_STATUS.FAILED && jobRow.status !== JOB_STATUS.SUCCESS) {
+      continue; // 还在途，正常推进中
+    }
+    if (parseJobParams(jobRow.params).nextRetryAt) continue; // 已排重试，等它自己回炉
+    translateLogger.warn(
+      { jobId, taskId: stranded.id, jobStatus: jobRow.status },
+      '调度链断裂（调度行已终态但任务未结算），补做失败结算'
+    );
+    await failJob(jobId, new Error('调度中断，已自动补做结算'), {
+      retryable: true,
+    }).catch((error) =>
+      translateLogger.warn(
+        { jobId, taskId: stranded.id, err: serializeError(error) },
+        '断链任务补结算失败（下轮重试）'
+      )
+    );
   }
 
   // 2.5) L23：捞回「扣了费但没有调度行」的孤儿任务。
@@ -384,15 +509,22 @@ function parseGlossary(raw: string | null): { src: string; dst: string }[] | nul
   }
 }
 
-/** 生成任务级 LLM 代理凭据：明文只下发给 worker，库里只存 sha256（同 EmailToken 惯例） */
-async function issueProxyToken(taskId: string): Promise<string> {
+/**
+ * 生成任务级 LLM 代理凭据：明文只下发给 worker，库里只存 sha256（同 EmailToken 惯例）。
+ *
+ * M11：带代次谓词，返回 null = 本代已过期（调用方必须放弃派发）。
+ * proxyTokenHash 是唯一索引，一个任务只存得下一份凭据 —— 旧代派发晚到一步就会把
+ * 新一代刚下发给 worker 的凭据覆盖掉，那台 worker 的所有 LLM 调用当场全 401，
+ * 而它自己的凭据也已被后来者作废，两代一起废。
+ */
+async function issueProxyToken(taskId: string, jobId: string): Promise<string | null> {
   const raw = crypto.randomBytes(32).toString('hex');
   const hash = crypto.createHash('sha256').update(raw).digest('hex');
-  await prisma.translationTask.update({
-    where: { id: taskId },
+  const claimed = await prisma.translationTask.updateMany({
+    where: { id: taskId, jobQueueId: jobId },
     data: { proxyTokenHash: hash },
   });
-  return raw;
+  return claimed.count > 0 ? raw : null;
 }
 
 async function dispatchJob(
@@ -406,6 +538,19 @@ async function dispatchJob(
   const task = await loadTask(params.taskId);
   if (!task) {
     await failJob(jobId, new Error('翻译任务已删除'), { retryable: false });
+    return;
+  }
+  if (isSupersededGeneration(task, jobId)) {
+    // 代次门：任务已改嫁给新一代调度行（用户 retry）。继续派发会白翻一遍、
+    // 抢掉 issueProxyToken 的唯一索引让新一代 worker 的 LLM 全 401，
+    // 收割时还会回写/删掉新一代的产物。只终态化自己这条行，不碰 task。
+    const staleWorker = workerById(fleet, params.workerId);
+    if (staleWorker) await deleteTranslateJob(staleWorker, jobId).catch(() => undefined);
+    await abandonSupersededJob(jobId);
+    translateLogger.info(
+      { jobId, taskId: task.id, currentJobId: task.jobQueueId },
+      '过期代次调度行，放弃派发'
+    );
     return;
   }
   if (task.status === 'CANCELED' || task.status === 'COMPLETED') {
@@ -447,7 +592,7 @@ async function dispatchJob(
       return;
     }
     if (located.remote.status === 'queued' || located.remote.status === 'running') {
-      await markTaskTranslating(task.id, located.worker.id);
+      await markTaskTranslating(task.id, jobId, located.worker.id);
       return;
     }
     // created / failed：留在这台重推
@@ -483,15 +628,27 @@ async function dispatchJob(
       ? resolved.provider.dbModelId
       : null;
   if (resolvedDbId && !task.modelId) {
+    // 代次谓词 + modelId:null 双条件：只定格「本代、且确实还没定格过」的快照，
+    // 不去改写新一代（用户 retry 时可能挑了别的模型）已经定下来的选择。
     await prisma.translationTask
-      .updateMany({ where: { id: task.id }, data: { modelId: resolvedDbId } })
+      .updateMany({
+        where: { id: task.id, jobQueueId: jobId, modelId: null },
+        data: { modelId: resolvedDbId },
+      })
       .catch(() => undefined);
   }
   const modelLabel = buildWorkerModelLabel(resolved?.provider ?? null);
 
   try {
     await uploadTranslateInput(target, jobId, source);
-    const proxyToken = await issueProxyToken(task.id);
+    const proxyToken = await issueProxyToken(task.id, jobId);
+    if (!proxyToken) {
+      // 上传期间用户 retry 换了代：别 start，把刚传上去的源文件清掉再放弃本代。
+      await deleteTranslateJob(target, jobId).catch(() => undefined);
+      await abandonSupersededJob(jobId);
+      translateLogger.info({ jobId, taskId: task.id }, '上传后代次已变更，放弃派发');
+      return;
+    }
     await startTranslateJob(target, jobId, {
       langIn: task.sourceLang,
       langOut: task.targetLang,
@@ -506,7 +663,11 @@ async function dispatchJob(
     });
   } catch (error) {
     if (error instanceof TranslateWorkerError && error.status === 429) {
-      // 这台队列满：清绑定让位，下轮重选别台，不消耗 attempt
+      // 这台队列满：清绑定让位，下轮重选别台，不消耗 attempt。
+      // L28：让位前先删掉本次已经传上去的源文件 —— uploadTranslateInput 很可能已经成功，
+      // 只是 startTranslateJob 撞上队列上限。不清的话这份 PDF 会一直躺在那台 worker 上
+      // 干等它自己的定期自清扫；队列长期满时（正是 429 频发的场景）垃圾持续累积。
+      await deleteTranslateJob(target, jobId).catch(() => undefined);
       await writeJobParams(jobId, { ...params, workerId: undefined });
       await prisma.jobQueue.updateMany({
         where: { id: jobId, status: JOB_STATUS.PROCESSING },
@@ -529,16 +690,27 @@ async function dispatchJob(
 
   await writeJobParams(jobId, { ...params, workerId: target.id });
   busyByWorkerId.set(target.id, (busyByWorkerId.get(target.id) ?? 0) + 1);
-  await markTaskTranslating(task.id, target.id);
+  await markTaskTranslating(task.id, jobId, target.id);
   translateLogger.info(
     { jobId, taskId: task.id, worker: target.name },
     '文档翻译任务已派发给 worker'
   );
 }
 
-async function markTaskTranslating(taskId: string, workerId: string): Promise<void> {
+/**
+ * M12：代次谓词不能省。旧代调度行被回炉重派（404 找回路径）时，若只按
+ * `{ id, status in [PENDING,TRANSLATING] }` 写，它会把用户 retry 出来的**新一代**
+ * PENDING 任务改写成 TRANSLATING 并写进**旧 worker** 的 workerId；
+ * 之后用户点取消，DELETE 路由按 task.workerId 去停机 —— 停错台，
+ * 真正在跑的那台照跑不误（钱照烧、产物照产、用户以为已经停了）。
+ */
+async function markTaskTranslating(
+  taskId: string,
+  jobId: string,
+  workerId: string
+): Promise<void> {
   await prisma.translationTask.updateMany({
-    where: { id: taskId, status: { in: ['PENDING', 'TRANSLATING'] } },
+    where: { id: taskId, jobQueueId: jobId, status: { in: ['PENDING', 'TRANSLATING'] } },
     data: { status: 'TRANSLATING', workerId, errorMessage: null },
   });
 }
@@ -565,7 +737,7 @@ async function reconcileProcessingJob(
     // L24：deleteTaskFiles 是对整个任务目录的 `rm -rf`（含源文件）。用户「取消 → 重试」
     // 之后源文件必须留着给新一代用，而上一代的对账可能才刚跑到这里读到 CANCELED 快照。
     // 只有任务仍绑在本代调度行上时才允许清盘。
-    if (task && task.jobQueueId === job.id) {
+    if (task && (await stillOwnedByGeneration(task.id, job.id))) {
       await deleteTaskFiles(task.id).catch(() => undefined);
     }
     await prisma.jobQueue.updateMany({
@@ -576,6 +748,33 @@ async function reconcileProcessingJob(
         completedAt: new Date(),
       },
     });
+    return;
+  }
+
+  if (isSupersededGeneration(task, job.id)) {
+    // 代次门：本代已被 retry 换掉。继续对账只会白占派发槽位
+    //（totalSlots = 机队容量 − PROCESSING 行数），还可能把新一代的进度/状态写花。
+    const staleWorker = workerById(fleet, params.workerId);
+    if (staleWorker) await deleteTranslateJob(staleWorker, job.id).catch(() => undefined);
+    await abandonSupersededJob(job.id);
+    translateLogger.info(
+      { jobId: job.id, taskId: task.id, currentJobId: task.jobQueueId },
+      '过期代次调度行，停止对账'
+    );
+    return;
+  }
+
+  // H6：整体超时判定必须放在**接触 worker 之前**。
+  // 原来它藏在下面 `switch (remote.status)` 的 default 分支里 —— 只有成功拿到 remote
+  // 状态才会执行。而 getTranslateJob 抛非 404（连接超时/5xx/域名解析失败）时直接 throw，
+  // 被 executeTick 的 per-job catch 吞成「下轮重试」：worker 断电或域名失效时，
+  // MAX_WORKER_RUNTIME_MS 形同虚设，任务无限期挂在 PROCESSING，
+  // 只等着被通用僵尸回收以错误方式（绕过 failJob、不退款）误杀。
+  const startedAtMs = job.startedAt?.getTime() ?? Date.now();
+  if (Date.now() - startedAtMs > MAX_WORKER_RUNTIME_MS) {
+    const staleWorker = workerById(fleet, params.workerId);
+    if (staleWorker) await deleteTranslateJob(staleWorker, job.id).catch(() => undefined);
+    await failJob(job.id, new Error('worker 翻译超时'), { retryable: true });
     return;
   }
 
@@ -606,7 +805,43 @@ async function reconcileProcessingJob(
       );
       return;
     }
+    // H6 下半段：绑定台连不上（断电 / 域名失效 / 持续 5xx）。原来一路 throw 上去，
+    // 由 executeTick 吞成「下轮重试」，任务就干等着那台自己复活 —— 可能永远不会。
+    // 连续不可达超过阈值就解绑回炉，让 pickWorker（带健康探测）把它挪到活着的台上。
+    const firstFailureMs = Number.isFinite(
+      new Date(params.unreachableSince ?? '').getTime()
+    )
+      ? new Date(params.unreachableSince as string).getTime()
+      : Date.now();
+    if (Date.now() - firstFailureMs >= WORKER_UNREACHABLE_REBIND_MS) {
+      await writeJobParams(job.id, {
+        ...params,
+        workerId: undefined,
+        unreachableSince: undefined,
+      });
+      await prisma.jobQueue.updateMany({
+        where: { id: job.id, status: JOB_STATUS.PROCESSING },
+        data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
+      });
+      translateLogger.warn(
+        { jobId: job.id, taskId: task.id, worker: bound.name },
+        'worker 持续不可达，解绑重派'
+      );
+      return;
+    }
+    if (!params.unreachableSince) {
+      await writeJobParams(job.id, {
+        ...params,
+        unreachableSince: new Date(firstFailureMs).toISOString(),
+      });
+    }
     throw error;
+  }
+
+  // 拿到状态了 = 那台还活着，清掉不可达计时（否则一次抖动会永久拉高后续判定的基线）
+  if (params.unreachableSince) {
+    params.unreachableSince = undefined;
+    await writeJobParams(job.id, { ...params, unreachableSince: undefined });
   }
 
   switch (remote.status) {
@@ -629,23 +864,42 @@ async function reconcileProcessingJob(
           ...params,
           progress: { stage: remote.stage ?? null, percent, at: new Date().toISOString() },
         });
+        // M13：代次谓词。跨代窗口里旧代拿到的是**它自己那次翻译**的低进度，
+        // 不带谓词就会反复盖掉新一代的真实进度，前端进度条来回跳。
         await prisma.translationTask
           .updateMany({
-            where: { id: task.id, status: 'TRANSLATING' },
+            where: { id: task.id, jobQueueId: job.id, status: 'TRANSLATING' },
             data: { progress: percent },
           })
           .catch(() => undefined);
       }
-      const startedAt = job.startedAt?.getTime() ?? Date.now();
-      if (Date.now() - startedAt > MAX_WORKER_RUNTIME_MS) {
-        await deleteTranslateJob(bound, job.id).catch(() => undefined);
-        await failJob(job.id, new Error('worker 翻译超时'), { retryable: true });
-      }
+      // 超时判定已前移到本函数入口（H6）：它不能依赖「成功拿到 remote 状态」这个前提。
     }
   }
 }
 
 // ─── 收割与失败 ───
+
+/**
+ * 清盘（`rm -rf` 整个任务目录）前的代次复核：**必须重读**，不能用调用方手里的快照。
+ *
+ * 判定口径：
+ *   - 行已不存在 → 允许清（DELETE 路由已经删过一次，我们刚 saveOutputFile 又把目录建了回来）；
+ *   - 行还在且仍绑本代 → 允许清；
+ *   - 行还在但绑了别代（用户已 retry）→ **不许清**，那是新一代的源文件；
+ *   - 查询本身失败 → 不许清（保守：宁可留垃圾也不能误删源文件）。
+ */
+async function stillOwnedByGeneration(taskId: string, jobId: string): Promise<boolean> {
+  try {
+    const fresh = await prisma.translationTask.findUnique({
+      where: { id: taskId },
+      select: { jobQueueId: true },
+    });
+    return fresh === null || fresh.jobQueueId === jobId;
+  } catch {
+    return false;
+  }
+}
 
 async function harvestJob(
   jobId: string,
@@ -663,11 +917,30 @@ async function harvestJob(
     }
   }
 
+  // H4：落盘前先复核代次。产物目录按 taskId 共享，而上面的下载对大文档要几十秒 ——
+  // 这段时间里用户完全可能已经 retry。抢先落盘会把新一代的 mono/dual 覆盖掉
+  //（内容是同一份原文的译文，但进度/计费口径已经错位）。
+  if (!(await stillOwnedByGeneration(task.id, jobId))) {
+    await abandonSupersededJob(jobId);
+    await deleteTranslateJob(worker, jobId).catch(() => undefined);
+    translateLogger.info(
+      { jobId, taskId: task.id },
+      '下载期间代次已变更，丢弃本代产物'
+    );
+    return;
+  }
+
   const monoPath = await saveOutputFile(task.id, 'mono', mono.data);
   const dualPath = dual ? await saveOutputFile(task.id, 'dual', dual.data) : null;
 
+  // H4：**必须**带 jobQueueId 代次谓词（文件头的代次不变式）。
+  // 少了它，上一代的迟到收割会命中用户 retry 出来的新一代任务：用旧产物把它标成
+  // COMPLETED、顺手吊销 proxyTokenHash（新一代那台 worker 的 LLM 当场全 401）；
+  // 随后新一代自己翻完来收割时 count===0，而彼时 task.jobQueueId 恰恰等于它自己，
+  // 于是走进下面的清盘分支把**整个任务目录 rm -rf**（含源文件）——
+  // 终态是「界面显示已完成 + 下载 404 + 新扣的钱不退 + 想重试还提示源文件已清理」。
   const updated = await prisma.translationTask.updateMany({
-    where: { id: task.id, status: { in: ['PENDING', 'TRANSLATING'] } },
+    where: { id: task.id, jobQueueId: jobId, status: { in: ['PENDING', 'TRANSLATING'] } },
     data: {
       status: 'COMPLETED',
       progress: 100,
@@ -679,9 +952,12 @@ async function harvestJob(
     },
   });
   if (updated.count === 0) {
-    // 任务在下载期间被取消/删除：清落盘产物，调度行终态
-    // L24：同上，只清本代的盘（用户可能已经 retry，新一代还要用源文件）
-    if (task.jobQueueId === jobId) {
+    // 任务在下载期间被取消/删除、或已被 retry 换代：清落盘产物，调度行终态。
+    // L24：只清本代的盘（用户可能已经 retry，新一代还要用源文件）。
+    // 这里刻意**重读**而不是用 task 快照：loadTask 到这里之间隔着整段下载
+    //（大文档几十 MB，几秒到几十秒），快照里的 jobQueueId 完全可能已经过期 ——
+    // 拿过期快照判「还是我的」再 rm -rf，删掉的正是新一代的源文件。
+    if (await stillOwnedByGeneration(task.id, jobId)) {
       await deleteTaskFiles(task.id).catch(() => undefined);
     }
     await prisma.jobQueue.updateMany({

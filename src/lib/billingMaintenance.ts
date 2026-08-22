@@ -3,7 +3,7 @@ import path from 'path';
 import { prisma } from '@/lib/prisma';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
-import { trackJob, createJob, markJobProcessing, markJobSuccess, markJobFailed, JOB_TYPE, reclaimStaleProcessingJobs } from '@/lib/jobQueue';
+import { trackJob, createJob, markJobProcessing, markJobSuccess, markJobFailed, JOB_TYPE, reclaimAllStaleProcessingJobs } from '@/lib/jobQueue';
 import {
   loadRecordingDraftManifest,
   sweepStaleRecordingDrafts,
@@ -343,9 +343,14 @@ export async function runBillingMaintenance(options?: {
 
   // 僵尸任务回收：把卡在 PROCESSING 超时的 JobQueue 记录标失败（解锁前端指示器、可被 retryJob 重试）。
   // 不为本步骤单独建 job —— 它是对 job 表自身的清道夫，建 job 反而引入"清道夫卡住谁来清"的递归。
+  //
+  // H5：必须走**分档**入口。原来是不分 type 的 `reclaimStaleProcessingJobs(now)`（统一 2h），
+  // 而文档翻译的合法运行时上限是 3h（translateProcessor.MAX_WORKER_RUNTIME_MS），
+  // 每 15 分钟一次的本循环必然在它跑到一半时把调度行打成 FAILED —— 且是 updateMany 直改、
+  // 绕过 failJob：任务停在 TRANSLATING、钱不退、不排自动重试、也不再被对账捞到。
   let reclaimedStaleJobs = 0;
   try {
-    reclaimedStaleJobs = await reclaimStaleProcessingJobs(now);
+    reclaimedStaleJobs = await reclaimAllStaleProcessingJobs(now);
   } catch (err) {
     billingLogger.error(
       { err: serializeError(err) },

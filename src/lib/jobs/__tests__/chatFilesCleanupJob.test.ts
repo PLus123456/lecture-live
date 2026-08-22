@@ -231,7 +231,12 @@ describe('runChatFilesCleanup', () => {
 
     const firstCallArgs = chatAttachmentFindManyMock.mock.calls[0][0];
     expect(firstCallArgs.where.userId).toBe('u-a');
-    expect(firstCallArgs.orderBy).toEqual({ lastAccessedAt: 'asc' });
+    // L57：软上限清理改成分页拉取（take + 稳定排序），排序意图不变
+    expect(firstCallArgs.orderBy).toEqual([
+      { lastAccessedAt: 'asc' },
+      { id: 'asc' },
+    ]);
+    expect(firstCallArgs.take).toBeGreaterThan(0);
 
     const secondCallArgs = chatAttachmentFindManyMock.mock.calls[1][0];
     expect(secondCallArgs.where.userId).toBe('u-b');

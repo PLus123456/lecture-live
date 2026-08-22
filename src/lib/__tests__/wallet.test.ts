@@ -234,7 +234,9 @@ describe('creditPaidOrder：幂等到账', () => {
       expect.objectContaining({
         where: expect.objectContaining({
           outTradeNo: 'LLPROV',
-          status: 'pending',
+          // pending + expired 两态可认领：清扫器打上的 expired 只表示「我们不再等了」，
+          // 不表示网关不会再来 —— 详见 walletOrderExpiry.test.ts 的防资损闸。
+          status: { in: ['pending', 'expired'] },
           provider: 'stripe',
         }),
       })

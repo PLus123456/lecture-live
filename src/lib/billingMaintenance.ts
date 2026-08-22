@@ -42,6 +42,7 @@ import { finalizeAsyncTranscription } from '@/lib/audio/asyncTranscribeFinalize'
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
 import { reclaimStaleInterpretSessions } from '@/lib/interpret/session';
 import { reconcileSonioxStreamUsage } from '@/lib/soniox/usageReconciliation';
+import { expireStalePaymentOrders } from '@/lib/wallet';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
 // FINALIZING 专项：已发起收尾但卡住的会话（前端崩/断网/服务端重启导致 finalize 没跑完）
@@ -88,6 +89,7 @@ export interface BillingMaintenanceSummary {
   reclaimedAsyncUploads: number;
   reclaimedFullTranscribes: number;
   reclaimedStaleJobs: number;
+  expiredPaymentOrders: number;
   releasedOrphanReservations: number;
   releasedOrphanFullReservations: number;
   cleanedOrphanSoniox: number;
@@ -359,6 +361,23 @@ export async function runBillingMaintenance(options?: {
     // 不 rethrow —— 其他维护任务结果仍要返回
   }
 
+  // 未支付订单回收：过了 expiresAt + 72h 宽限期仍 pending 的订单置 expired。
+  // 从前 PaymentOrder.expiresAt 与 @@index([status, expiresAt]) 是一对死列，pending 无限堆积。
+  //
+  // 宽限期远大于建单时写入的 ORDER_TTL_MS（30min）：那 30 分钟只是给前端展示「订单已超时」，
+  // 按它回收会撞进网关重投窗口。真正的资损闸不在这里，而在 creditPaidOrder 的认领 CAS —— 它
+  // 收 pending+expired 两态，所以清扫早了也只是状态难看，晚到的真实回调照样恰好入账一次。
+  let expiredPaymentOrders = 0;
+  try {
+    expiredPaymentOrders = await expireStalePaymentOrders({ now });
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'stale payment order expiry failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
   // 每日对账
   const reconciliationRunId = await maybeRunDailyReconciliation(now);
 
@@ -479,6 +498,7 @@ export async function runBillingMaintenance(options?: {
         reclaimedAsyncUploads,
         reclaimedFullTranscribes,
         reclaimedStaleJobs,
+        expiredPaymentOrders,
         releasedOrphanReservations,
         releasedOrphanFullReservations,
         cleanedOrphanSoniox,
@@ -500,6 +520,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedAsyncUploads,
     reclaimedFullTranscribes,
     reclaimedStaleJobs,
+    expiredPaymentOrders,
     releasedOrphanReservations,
     releasedOrphanFullReservations,
     cleanedOrphanSoniox,

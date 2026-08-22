@@ -5,6 +5,7 @@ const {
   getSiteSettingsMock,
   resolveUserFeatureFlagsMock,
   taskFindUniqueMock,
+  userFindUniqueMock,
   taskUpdateManyMock,
   transactionMock,
   txTaskUpdateManyMock,
@@ -18,6 +19,7 @@ const {
   getSiteSettingsMock: vi.fn(),
   resolveUserFeatureFlagsMock: vi.fn(),
   taskFindUniqueMock: vi.fn(),
+  userFindUniqueMock: vi.fn(),
   taskUpdateManyMock: vi.fn(),
   transactionMock: vi.fn(),
   txTaskUpdateManyMock: vi.fn(),
@@ -35,6 +37,8 @@ vi.mock('@/lib/userRoles', () => ({
 }));
 vi.mock('@/lib/prisma', () => ({
   prisma: {
+    // #232/#233 之后路由以 DB 行判角色与组，prisma mock 缺 user 键会直接 TypeError。
+    user: { findUnique: userFindUniqueMock },
     translationTask: {
       findUnique: taskFindUniqueMock,
       updateMany: taskUpdateManyMock,
@@ -81,6 +85,11 @@ describe('translation retry generation/refund admission', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     verifyAuthMock.mockResolvedValue({ id: 'user-1' });
+    userFindUniqueMock.mockResolvedValue({
+      id: 'user-1',
+      role: 'PRO',
+      customGroupId: null,
+    });
     getSiteSettingsMock.mockResolvedValue({ translation_doc_enabled: true });
     resolveUserFeatureFlagsMock.mockResolvedValue({
       allowDocTranslation: true,

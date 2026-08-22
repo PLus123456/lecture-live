@@ -61,11 +61,22 @@ vi.mock('@/lib/translate/taskStorage', () => ({
   saveSourceFile: saveSourceFileMock,
   deleteTaskFiles: vi.fn(),
 }));
-vi.mock('pdf-parse', () => ({
-  PDFParse: class {
-    getInfo = getInfoMock;
-    destroy = async () => undefined;
+// PDF 解析已搬进受限子进程；路由不再直接 import('pdf-parse')。
+vi.mock('@/lib/documentParserProcess', () => ({
+  DocumentParserError: class DocumentParserError extends Error {
+    constructor(
+      message: string,
+      readonly code: string
+    ) {
+      super(message);
+      this.name = 'DocumentParserError';
+    }
   },
+  inspectPdfDocument: getInfoMock,
+}));
+// 合并后路由在 try 之前先过权益准入闸，未 mock 会直接打到真实 $queryRaw。
+vi.mock('@/lib/payment/entitlementAdmission', () => ({
+  isPaymentBenefitAvailable: vi.fn().mockResolvedValue(true),
 }));
 
 import { POST } from '@/app/api/translate/documents/route';
@@ -126,7 +137,7 @@ describe('POST /api/translate/documents 模型选择', () => {
     taskFindUniqueMock.mockResolvedValue(null);
     taskDeleteManyMock.mockResolvedValue({ count: 1 });
     saveSourceFileMock.mockResolvedValue('/tmp/task-1/source.pdf');
-    getInfoMock.mockResolvedValue({ total: 12 });
+    getInfoMock.mockResolvedValue({ pages: 12 });
   });
 
   it('用户选的模型（在 allowedModels 内）定格进任务快照', async () => {

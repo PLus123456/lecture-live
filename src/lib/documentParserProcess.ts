@@ -3,21 +3,30 @@ import 'server-only';
 import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
+import { logger } from '@/lib/logger';
 import {
   inspectDocumentArchive,
   UnsafeDocumentArchiveError,
 } from '../../scripts/document-archive-preflight.mjs';
 
 export const DOCUMENT_PARSE_TIMEOUT_MS = 30_000;
-export const DOCUMENT_PARSER_MAX_OLD_SPACE_MB = 256;
-export const DOCUMENT_PARSER_MAX_INPUT_BYTES = 64 * 1024 * 1024;
+// 解析子进程的堆上限。256MB 会打死**正常文档**：实测 10 万段落的 276KB .docx
+// 与 20 万行的 6.3MB .xlsx 都直接 SIGABRT（reached heap limit）。这类文件以前在
+// Next 进程里按默认堆解析、超出只截断到 MAX_OUTPUT_CHARS，不会失败。
+// 1GB 仍然把爆炸半径限制在单个可终止的子进程内，同时给真实讲义留出余量。
+export const DOCUMENT_PARSER_MAX_OLD_SPACE_MB = 1024;
+// 对齐 chat_files_max_upload_mb 的默认值（100MB）。低于上传上限时，65–100MB 的
+// 附件能传上去却静默拿不到抽取文本 —— 用户看不到任何提示，只是「AI 读不到这份文件」。
+// 文档翻译另有 translation_doc_max_mb=30 的更严限制，不受此影响。
+export const DOCUMENT_PARSER_MAX_INPUT_BYTES = 100 * 1024 * 1024;
 export const DOCUMENT_PARSER_MAX_CONCURRENCY = 2;
 export const DOCUMENT_PARSER_MAX_QUEUED_BYTES = 128 * 1024 * 1024;
 export const DOCUMENT_PARSER_MAX_QUEUE_ITEMS = 16;
 export const DOCUMENT_PARSER_QUEUE_TIMEOUT_MS = 10_000;
 
 const MAX_RESULT_BYTES = 32 * 1024 * 1024;
-const MAX_STDERR_BYTES = 64 * 1024;
+// 只保留子进程 stderr 的尾部用于诊断，不再拿它当终止条件。
+const MAX_STDERR_TAIL_BYTES = 64 * 1024;
 
 const MIME_PDF = 'application/pdf';
 const MIME_DOCX =
@@ -343,6 +352,27 @@ export async function runRestrictedDocumentParser(
       let resultBytes = 0;
       let stderrBytes = 0;
       const resultChunks: Buffer[] = [];
+      const stderrTail: Buffer[] = [];
+      const stderrText = (): string =>
+        Buffer.concat(stderrTail)
+          .subarray(-MAX_STDERR_TAIL_BYTES)
+          .toString('utf8')
+          .trim();
+      const logChildFailure = (reason: string, exitCode: number | null): void => {
+        const detail = stderrText();
+        if (!detail) return;
+        logger.error(
+          {
+            component: 'document-parser',
+            operation,
+            reason,
+            exitCode,
+            stderrBytes,
+            stderrTail: detail,
+          },
+          'Document parser subprocess failed'
+        );
+      };
 
       const requestTermination = (error: DocumentParserError): void => {
         terminalError ??= error;
@@ -375,12 +405,25 @@ export async function runRestrictedDocumentParser(
         });
       }
 
+      // Keep a bounded TAIL of the child's stderr instead of killing the parse over it.
+      //
+      // Two reasons. First, pdfjs logs through console.warn, and one bad embedded font
+      // subset emits thousands of `Warning: TT: undefined function` lines — well past
+      // 64 KiB — so the old code SIGKILLed the child and threw away a result it had
+      // very likely already produced. Chatty diagnostics are not an attack.
+      //
+      // Second, the worker collapses every non-allowlisted failure into
+      // `invalid_document`, which the translate route reports as
+      // 「PDF 解析失败（可能已加密或损坏）」. Counting these bytes and discarding the
+      // content meant a missing package in the deployed tree — the #229/#231 failure
+      // mode, twice in production — would read as "the user uploaded a bad file" with
+      // nothing at all in journald. Both incidents at least printed a stack.
       child.stderr?.on('data', (chunk: Buffer) => {
         stderrBytes += chunk.length;
-        if (stderrBytes > MAX_STDERR_BYTES) {
-          requestTermination(
-            new DocumentParserError('Document parser logs exceeded their limit', 'worker_failed')
-          );
+        stderrTail.push(chunk);
+        let tailBytes = stderrTail.reduce((sum, part) => sum + part.length, 0);
+        while (stderrTail.length > 1 && tailBytes > MAX_STDERR_TAIL_BYTES) {
+          tailBytes -= stderrTail.shift()!.length;
         }
       });
       child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
@@ -399,6 +442,7 @@ export async function runRestrictedDocumentParser(
         clearTimeout(timer);
         options.signal?.removeEventListener('abort', onAbort);
         if (terminalError) {
+          logChildFailure(terminalError.code, code);
           reject(terminalError);
           return;
         }
@@ -407,6 +451,7 @@ export async function runRestrictedDocumentParser(
           const response = normalizeWorkerResponse(payload, operation);
           if (code === 0) resolve(response);
           else {
+            logChildFailure('nonzero_exit', code);
             reject(
               new DocumentParserError(
                 'Document parser exited unsuccessfully',
@@ -415,6 +460,7 @@ export async function runRestrictedDocumentParser(
             );
           }
         } catch (error) {
+          logChildFailure('unparseable_response', code);
           reject(error);
         }
       });

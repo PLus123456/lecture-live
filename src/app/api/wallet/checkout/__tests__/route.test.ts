@@ -42,6 +42,7 @@ vi.mock('@/lib/wallet', () => ({
   createPaymentOrder: createPaymentOrderMock,
   spendFromBalance: spendFromBalanceMock,
   DEFAULT_ORDER_CURRENCY: 'CNY',
+  ORDER_TTL_MS: 60 * 60_000,
   WalletError: class WalletError extends Error {
     constructor(
       message: string,
@@ -57,6 +58,10 @@ vi.mock('@/lib/payment/webhookInbox', () => ({
 
 import { POST } from '@/app/api/wallet/checkout/route';
 import { WalletError } from '@/lib/wallet';
+
+// 网关必须拿到与我方 expiresAt 完全相同的截止时间，否则超时支付仍会被收钱、
+// 而 creditPaidOrder 判 late_paid 不发任何权益。
+const ORDER_EXPIRES_AT = new Date('2026-08-22T13:00:00.000Z');
 
 const TOPUP_TIER = {
   id: 'tier-1',
@@ -95,6 +100,7 @@ beforeEach(() => {
     id: 'o1',
     outTradeNo: 'LLTEST',
     amountCents: 10000,
+    expiresAt: ORDER_EXPIRES_AT,
   });
   createChargeMock.mockResolvedValue({ payUrl: 'https://pay', providerRef: 'pi_123' });
   getPaymentProviderMock.mockResolvedValue({ name: 'stripe', createCharge: createChargeMock });
@@ -126,6 +132,17 @@ describe('checkout：币种端到端绑定（P3-15）', () => {
     );
     expect(createPaymentOrderMock).toHaveBeenCalledWith(
       expect.objectContaining({ currency: 'USD' })
+    );
+  });
+
+  it('▶ 把订单失效时刻原样下发给网关（不给网关留开口窗）', async () => {
+    // 网关侧不设截止时间的话，Stripe Checkout 默认 24h、支付宝 15 天、微信 2h：
+    // 用户在我方 expiresAt 之后付款照样被扣钱，而 creditPaidOrder 判 late_paid，
+    // 不加余额、不发权益，也没有任何管理端动作能补发。
+    await pay();
+
+    expect(createChargeMock).toHaveBeenCalledWith(
+      expect.objectContaining({ expiresAt: ORDER_EXPIRES_AT })
     );
   });
 

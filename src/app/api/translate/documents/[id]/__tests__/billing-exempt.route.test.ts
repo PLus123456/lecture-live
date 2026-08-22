@@ -92,6 +92,17 @@ function chargedCentsWritten(): number | undefined {
 }
 
 describe('文档翻译扣费：管理员豁免', () => {
+  // 合并后 confirm/retry 用 updatedAt 做乐观 CAS，retry 还会核对 chargedCents /
+  // refundedAt / jobQueueId / proxyGeneration。缺这些列会在 task.updatedAt.getTime()
+  // 上直接 TypeError，整条用例变 500。
+  const TASK_CAS_FIELDS = {
+    updatedAt: new Date('2026-08-22T10:00:00.000Z'),
+    chargedCents: 0,
+    refundedAt: null,
+    jobQueueId: null,
+    proxyGeneration: null,
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
     verifyAuthMock.mockResolvedValue({ id: 'admin-1', email: 'a@x.com', role: 'ADMIN' });
@@ -103,6 +114,7 @@ describe('文档翻译扣费：管理员豁免', () => {
       userId: 'admin-1',
       status: 'QUOTED',
       estimatedCents: 1200,
+      ...TASK_CAS_FIELDS,
     });
     txTaskUpdateManyMock.mockResolvedValue({ count: 1 });
     taskUpdateManyMock.mockResolvedValue({ count: 1 });
@@ -128,6 +140,7 @@ describe('文档翻译扣费：管理员豁免', () => {
       userId: 'user-1',
       status: 'QUOTED',
       estimatedCents: 1200,
+      ...TASK_CAS_FIELDS,
     });
 
     const res = await CONFIRM(makeReq('confirm'), { params });
@@ -158,6 +171,7 @@ describe('文档翻译扣费：管理员豁免', () => {
       userId: 'admin-1',
       status: 'FAILED',
       estimatedCents: 1200,
+      ...TASK_CAS_FIELDS,
     });
 
     const res = await RETRY(makeReq('retry'), { params });
@@ -175,6 +189,7 @@ describe('文档翻译扣费：管理员豁免', () => {
       userId: 'user-1',
       status: 'FAILED',
       estimatedCents: 1200,
+      ...TASK_CAS_FIELDS,
     });
 
     const res = await RETRY(makeReq('retry'), { params });

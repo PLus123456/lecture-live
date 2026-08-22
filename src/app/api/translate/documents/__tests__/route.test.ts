@@ -8,6 +8,7 @@ const {
   inspectPdfDocumentMock,
   translationTaskCreateMock,
   saveSourceFileMock,
+  userFindUniqueMock,
   MockDocumentParserError,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
@@ -17,6 +18,7 @@ const {
   inspectPdfDocumentMock: vi.fn(),
   translationTaskCreateMock: vi.fn(),
   saveSourceFileMock: vi.fn(),
+  userFindUniqueMock: vi.fn(),
   MockDocumentParserError: class DocumentParserError extends Error {
     constructor(
       message: string,
@@ -39,6 +41,9 @@ vi.mock('@/lib/userRoles', () => ({
   resolveUserTranslationModelId: vi.fn().mockResolvedValue(null),
 }));
 vi.mock('@/lib/llm/gateway', () => ({ getModelById: vi.fn() }));
+vi.mock('@/lib/translate/modelAccess', () => ({
+  isTranslationModelAllowed: vi.fn().mockResolvedValue(true),
+}));
 vi.mock('@/lib/documentParserProcess', () => ({
   DocumentParserError: MockDocumentParserError,
   inspectPdfDocument: inspectPdfDocumentMock,
@@ -65,7 +70,7 @@ vi.mock('@/lib/prisma', () => ({
       findUnique: vi.fn(),
       deleteMany: vi.fn(),
     },
-    user: { findUnique: vi.fn() },
+    user: { findUnique: userFindUniqueMock },
   },
 }));
 
@@ -98,6 +103,13 @@ describe('POST /api/translate/documents parser boundary', () => {
       default_target_lang: 'zh',
     });
     resolveUserFeatureFlagsMock.mockResolvedValue({ allowDocTranslation: true });
+    // 合并后路由以 DB 行（而非 JWT 载荷）判角色/组/模型门禁，见 #232/#233。
+    userFindUniqueMock.mockResolvedValue({
+      id: 'user-1',
+      role: 'PRO',
+      customGroupId: null,
+      allowedModels: '',
+    });
   });
 
   it.each([

@@ -66,6 +66,13 @@ describe('translation confirm enqueue generation guard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     verifyAuthMock.mockResolvedValue({ id: 'user-1' });
+    // #232/#233 之后路由以 DB 行判角色（豁免/门禁都不看 JWT 载荷）；
+    // 不配置这个桩会让每条用例都在「用户不存在」上 404。
+    userFindUniqueMock.mockResolvedValue({
+      id: 'user-1',
+      role: 'PRO',
+      customGroupId: null,
+    });
     getSiteSettingsMock.mockResolvedValue({ translation_doc_enabled: true });
     resolveUserFeatureFlagsMock.mockResolvedValue({
       allowDocTranslation: true,

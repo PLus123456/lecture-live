@@ -69,3 +69,7 @@ TRANSLATION_WORKER_PROTOCOL.md
 /test-results/
 /playwright-report/
 /artifacts/
+
+# 安全审计/整改计划等分析类文档只留本地，不进仓库
+SECURITY_HARDENING_PLAN_*.md
+AUDIT_*.md

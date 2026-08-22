@@ -43,7 +43,11 @@ info "Node: $(node -v) ($NODE_BIN)"
 command -v systemd-analyze &>/dev/null || error "未找到 systemd-analyze，无法验证 worker 沙箱"
 SYSTEMD_VERSION="$(systemd-analyze --version | awk 'NR==1 {print $2}')"
 [[ "$SYSTEMD_VERSION" =~ ^[0-9]+$ ]] || error "无法识别 systemd 版本"
-[[ "$SYSTEMD_VERSION" -ge 249 ]] || error "systemd 版本过低（当前 ${SYSTEMD_VERSION}），需要 ≥ 249 才能完整执行安全沙箱"
+# 门槛按**实际用到的最严指令**定：ProtectProc= / ProcSubset= 是 systemd 247 引入的。
+# 卡 249 会把 Debian 11(247) 连同存量 worker 一起挡在升级之外，而 247 上沙箱是完整生效的。
+# Ubuntu 20.04(245) / RHEL 8(239) 仍然拒绝——那里这些指令会被静默忽略，
+# 运维会误以为解析器已受约束。
+[[ "$SYSTEMD_VERSION" -ge 247 ]] || error "systemd 版本过低（当前 ${SYSTEMD_VERSION}），需要 ≥ 247 才能完整执行安全沙箱（ProtectProc/ProcSubset 自 247 起支持）"
 info "systemd: ${SYSTEMD_VERSION}"
 
 # ── 2. 依赖：ffmpeg（缺失且有 apt 时自动安装） ──

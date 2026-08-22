@@ -83,6 +83,40 @@ describe('PDF 解析的打包契约', () => {
     expect(translateRoute).not.toContain("import('pdf-parse')");
   });
 
+  it('DOCUMENT_PARSER_RUNTIME_DEPENDENCIES 覆盖 worker 里的每一个裸依赖', () => {
+    // 解析搬进子进程后，应用侧再没有任何模块 import 这几个包了 —— nft 能把它们
+    // 追进 .next/standalone，靠的**只有** documentParserProcess.ts 里那串
+    // require.resolve()。而那个常量零引用，长得就像「清理未使用导出」会顺手删掉的
+    // 死代码；删掉就是第三次重演 #229/#231，而且这次症状更难查（子进程 stderr
+    // 被折叠成「PDF 解析失败（可能已加密或损坏）」）。
+    // 这条测试就是那串 require.resolve 的存在理由，写在这里免得下次没人看懂。
+    const worker = fs.readFileSync(
+      path.join(ROOT, 'scripts/document-parser-worker.mjs'),
+      'utf8'
+    );
+    const bareImports = new Set<string>();
+    for (const match of worker.matchAll(/import\(\s*'([^']+)'\s*\)/g)) {
+      if (!match[1].startsWith('node:') && !match[1].startsWith('.')) {
+        bareImports.add(match[1]);
+      }
+    }
+    expect(bareImports.size).toBeGreaterThan(0);
+
+    const anchorSource = fs.readFileSync(
+      path.join(ROOT, 'src/lib/documentParserProcess.ts'),
+      'utf8'
+    );
+    const anchored = new Set(
+      [...anchorSource.matchAll(/require\.resolve\('([^']+)'\)/g)].map((m) => m[1])
+    );
+
+    const unanchored = [...bareImports].filter((name) => !anchored.has(name));
+    expect(
+      unanchored,
+      `worker 依赖未被 DOCUMENT_PARSER_RUNTIME_DEPENDENCIES 锚定：${unanchored.join(', ')}`
+    ).toEqual([]);
+  });
+
   it('native install and upgrade copy every parser runtime script', () => {
     for (const deployScript of ['deploy/install.sh', 'deploy/upgrade.sh']) {
       const source = fs.readFileSync(path.join(ROOT, deployScript), 'utf8');

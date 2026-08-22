@@ -69,8 +69,12 @@ describe('restricted document parser process', () => {
     });
   });
 
-  it('has an explicit V8 heap ceiling', () => {
-    expect(DOCUMENT_PARSER_MAX_OLD_SPACE_MB).toBe(256);
+  it('has an explicit V8 heap ceiling, high enough for ordinary documents', () => {
+    // 上限存在是必需的（爆炸半径限制在可终止的子进程里），但不能低到打死正常文件：
+    // 实测 10 万段落的 276KB .docx 和 20 万行的 6.3MB .xlsx 在 256MB 下直接 SIGABRT，
+    // 而它们在改成子进程解析之前只会被截断、不会失败。
+    expect(DOCUMENT_PARSER_MAX_OLD_SPACE_MB).toBe(1024);
+    expect(DOCUMENT_PARSER_MAX_OLD_SPACE_MB).toBeGreaterThanOrEqual(512);
   });
 
   it('rejects a high-ratio OOXML archive before spawning the parser', async () => {

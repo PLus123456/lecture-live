@@ -46,12 +46,29 @@ function runSecurityEnv(envPath: string) {
 function runRequiredDatabase(extraEnv: Record<string, string> = {}) {
   const env = { ...process.env, ...extraEnv };
   delete env.DATABASE_URL;
+  // Run from an EMPTY temp directory, not the repo root.
+  //
+  // ensure-database.mjs calls loadEnvFileIfNeeded(process.cwd()), so with cwd=ROOT it
+  // re-read the developer's .env.local, recovered a real DATABASE_URL, sailed past the
+  // gate this test is asserting, and went on to run `prisma db push` **against that
+  // developer's actual database**. Only Prisma's data-loss guard stopped it — and the
+  // test then failed on every machine that follows the repo's own .env.local convention,
+  // which is why the suite is only green where no env file exists.
+  //
+  // The gate under test fires before any Prisma call, so an empty cwd is all it needs.
+  const cwd = mkdtempSync(path.join(tmpdir(), 'lecturelive-db-gate-'));
+  tempDirs.push(cwd);
   return spawnSync(
     process.execPath,
     [path.join(ROOT, 'scripts/ensure-database.mjs'), '--require-database'],
-    { cwd: ROOT, encoding: 'utf8', env }
+    { cwd, encoding: 'utf8', env }
   );
 }
+
+// LLM 出站白名单是必填项：为空时 parseLlmAllowedOrigins 抛异常，而它挂在每一次出站
+// 调用上，聊天/摘要/关键词/报告/翻译会全部 500。升级闸在此拦下，不让它拖到运行时才炸。
+const LLM_ORIGINS_LINE =
+  'LLM_PROVIDER_ALLOWED_ORIGINS=https://api.vendor.example';
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -60,7 +77,8 @@ afterEach(() => {
 describe('deployment security environment initialization', () => {
   it('generates a non-logged bootstrap token, applies one-hop defaults and chmod 600 idempotently', () => {
     const envPath = makeEnv(
-      'SETUP_BOOTSTRAP_TOKEN=\nTRUSTED_PROXY_HOPS=\nTRUSTED_PROXY_CIDRS=\n'
+      'SETUP_BOOTSTRAP_TOKEN=\nTRUSTED_PROXY_HOPS=\nTRUSTED_PROXY_CIDRS=\n' +
+        `${LLM_ORIGINS_LINE}\n`
     );
 
     const first = runSecurityEnv(envPath);
@@ -87,6 +105,7 @@ describe('deployment security environment initialization', () => {
         `SETUP_BOOTSTRAP_TOKEN=${'a'.repeat(64)}`,
         'TRUSTED_PROXY_HOPS=2',
         'TRUSTED_PROXY_CIDRS=',
+        LLM_ORIGINS_LINE,
         '',
       ].join('\n')
     );
@@ -95,6 +114,39 @@ describe('deployment security environment initialization', () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('TRUSTED_PROXY_CIDRS');
     expect(statSync(envPath).mode & 0o777).toBe(0o600);
+  });
+
+  it('refuses to upgrade with no LLM outbound allowlist instead of failing at runtime', () => {
+    // 缺这一项不会让服务起不来，只会让每一次出站 LLM 调用 500：聊天、摘要、关键词、
+    // 报告、embedding、翻译全灭，而且没有任何启动期提示。在升级闸拦下才有人看得见。
+    const envPath = makeEnv(
+      [
+        `SETUP_BOOTSTRAP_TOKEN=${'a'.repeat(64)}`,
+        'TRUSTED_PROXY_HOPS=1',
+        'TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128',
+        '',
+      ].join('\n')
+    );
+
+    const result = runSecurityEnv(envPath);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('LLM_PROVIDER_ALLOWED_ORIGINS');
+  });
+
+  it('rejects the .env.example placeholder origin as if it were unset', () => {
+    const envPath = makeEnv(
+      [
+        `SETUP_BOOTSTRAP_TOKEN=${'a'.repeat(64)}`,
+        'TRUSTED_PROXY_HOPS=1',
+        'TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128',
+        'LLM_PROVIDER_ALLOWED_ORIGINS=https://replace-with-your-llm-provider.example',
+        '',
+      ].join('\n')
+    );
+
+    const result = runSecurityEnv(envPath);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('占位值');
   });
 });
 
@@ -156,10 +208,14 @@ describe('all systemd deployment entrypoints share the security and DB gates', (
     const missingUrl = runRequiredDatabase();
     expect(missingUrl.status).not.toBe(0);
     expect(missingUrl.stderr).toContain('DATABASE_URL is required');
+    // The gate must short-circuit before any schema work; reaching `db push` here would
+    // mean the test is talking to a real database.
+    expect(missingUrl.stdout).not.toContain('db push');
 
     const disabled = runRequiredDatabase({ AUTO_DB_PUSH: 'false' });
     expect(disabled.status).not.toBe(0);
     expect(disabled.stderr).toContain('AUTO_DB_PUSH cannot be disabled');
+    expect(disabled.stdout).not.toContain('db push');
   });
 
   it('Docker uses the same required database gate before launching either server', () => {

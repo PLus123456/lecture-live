@@ -8,7 +8,7 @@
  *      —— 用户离线、前端不再 poll 时，回收路径查到 Soniox 已完成后自动收尾。
  *
  * 收尾口径（三处必须完全一致，改动即为红线）：
- *   - 拉 transcript → 转 segments → 落盘（persistSessionTranscriptArtifacts）
+ *   - 拉 transcript → 转 segments → 两阶段落盘（stageSessionTranscriptArtifacts → CAS → publish）
  *   - 计费：ceil(getBillableMinutes(durationMs) × async_upload_billing_multiplier) 分钟，
  *     倍率默认 0.8、可在 admin 设置；与对账侧口径一致。
  *   - 幂等：依赖两道条件原子 updateMany —
@@ -33,7 +33,12 @@ import {
   convertAsyncTokensToSegments,
   extractTranslationsByTokens,
 } from '@/lib/soniox/asyncTranscriptConverter';
-import { persistSessionTranscriptArtifacts } from '@/lib/sessionPersistence';
+import {
+  stageSessionTranscriptArtifacts,
+  finalizeStagedArtifactPublish,
+  rollbackStagedArtifact,
+  type StagedArtifact,
+} from '@/lib/sessionPersistence';
 import { runBackgroundLLMTasks } from '@/lib/sessionFinalization';
 import {
   deductTranscriptionMinutes,
@@ -135,7 +140,22 @@ export async function finalizeAsyncTranscription(
     summaries: [],
     translations,
   };
-  const persisted = await persistSessionTranscriptArtifacts(session, bundle);
+  // ── M5：转录/摘要走两阶段写盘（stage → CAS → publish/rollback）──────────────────
+  // 旧实现是 persistSessionTranscriptArtifacts：写**固定 key** `{sessionId}.json`，且写在下面
+  // 那个终态 CAS 事务**之前**。拉 transcript / 写盘期间用户仍可能取消（cancelAsyncUpload 允许
+  // finalizing→canceled），CAS 于是 count===0 —— 但文件已经落在固定 key 上了。若该会话此前已有
+  // 实时转录定稿在同一个固定 key，这一路就是**直接覆盖掉终态转录**；否则至少留一份没有任何 DB 行
+  // 引用的孤儿。与 sessionFinalization 里修掉的 M5 是同一形态，只是换了个文件。
+  //
+  // 版本化对象天然不同名（`{id}-{stamp}.json`），谁都碰不到谁；CAS 输了就整组删掉。
+  const staged = await stageSessionTranscriptArtifacts(session, bundle);
+  const stagedArtifacts: StagedArtifact[] = [staged.transcript, staged.summary];
+  const rollbackStagedArtifacts = async () => {
+    for (const artifact of stagedArtifacts) {
+      await rollbackStagedArtifact(session, artifact).catch(() => undefined);
+    }
+    stagedArtifacts.length = 0;
+  };
 
   // ── 终态 CAS + 计费：同一事务（P5-7）──
   // 完成写入必须带状态守卫（原 route U60 注释）：上面的 claim 把状态置 'finalizing'，但拉
@@ -162,8 +182,8 @@ export async function finalizeAsyncTranscription(
         where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
         data: {
           asyncTranscribeStatus: 'completed',
-          transcriptPath: persisted.transcript.path,
-          summaryPath: persisted.summary.path,
+          transcriptPath: staged.transcript.reference,
+          summaryPath: staged.summary.reference,
           // P1-17：**不再**在 CAS 提交里清 Soniox 引用 —— 改到确认 DELETE 成功/404 之后才清（见文末）。
           // 此前先清 ID 再 best-effort 删，删失败即永久失去重试依据、Soniox 侧文件/转录孤儿泄漏。
           status: 'COMPLETED',
@@ -203,17 +223,33 @@ export async function finalizeAsyncTranscription(
       { err: billingErr, sessionId: session.id },
       'async upload finalize+billing tx failed; rolled back to transcribing for retry'
     );
-    await prisma.session
+    const reverted = await prisma.session
       .updateMany({
         where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
         data: { asyncTranscribeStatus: 'transcribing' },
       })
-      .catch(() => undefined);
+      .catch(() => ({ count: 0 }));
+    // M5：临时对象的回滚闸就是上面这条 CAS 的 count —— 这里**刻意不用** casCommitted 布尔。
+    // 本 try 里除了那个事务再无别的语句，「抛错」⇒「未提交」在此几乎恒成立，加个布尔只会得到一个
+    // 永远为 false 的死条件（sessionFinalization 里那段注释警告的正是这个）。而 count 能真正分辨
+    // 那个唯一的例外：
+    //   count===1 → 行仍是 finalizing ⇒ 终态 CAS 必未生效 ⇒ 这两个版本化对象无人引用，删。
+    //   count===0 → 行已不是 finalizing。最要命的一种是「事务其实已提交、只是响应丢失」
+    //     （上面的注释早就点明这种可能）——此时 DB 的 transcriptPath 正指着它们，删了就是把
+    //     刚定稿的转录删掉。保守放过：多留两个小 JSON 远好过删掉被引用的终态产物。
+    if (reverted.count === 1) {
+      await rollbackStagedArtifacts();
+    }
     // 与「对方已抢先」同一语义：调用方读最新状态返回，交由下一轮重试（绝不删 Soniox 资源）。
     return { outcome: 'claim_lost' };
   }
 
   if (canceledDuringFinalize) {
+    // M5：终态 CAS 抢不到 ⇒ DB 的 transcriptPath/summaryPath 绝不指向本次 stage 的版本化对象，
+    // 删掉它们。旧实现在这条路径上什么都不做，固定 key 的转录/摘要就那么留在盘上（甚至覆盖了
+    // 已有的实时转录定稿）。
+    await rollbackStagedArtifacts();
+
     // 收尾守卫抢不到（finalizing 期间状态已变）。P1-19：**只有确认会话确实被取消（canceled）**才删
     // Soniox 资源——否则可能是并发 finalizer 的失败回退把状态改回 transcribing（转录仍需要），此时删
     // 外部资源会让后续 salvage getSoniox 404、会话永久卡死（回归红线）。非 canceled → 保留资源交对方/重试。
@@ -244,6 +280,12 @@ export async function finalizeAsyncTranscription(
     return { outcome: 'canceled_during_finalize' };
   }
 
+  // M5：CAS 已提交，DB 的 transcriptPath/summaryPath 已原子指向这两个版本化对象 —— 从此
+  // **不可回滚**。发布（转录/摘要不追踪 previousReference，故 publish 无旧文件可删、纯粹是把
+  // 引用交回；保留调用是为了与录音走同一套 stage→CAS→publish 语义）。
+  await finalizeStagedArtifactPublish(session, staged.transcript).catch(() => undefined);
+  await finalizeStagedArtifactPublish(session, staged.summary).catch(() => undefined);
+
   // 终态 + 计费已一并提交之后的副作用（route：失效 sessions API 缓存）。P5-7 之前它排在计费之前，
   // 现在计费与终态同事务提交，缓存失效必须等提交成功——否则事务回滚后缓存却已按「已完成」失效。
   if (options.onCompleted) {
@@ -254,8 +296,8 @@ export async function finalizeAsyncTranscription(
   void runBackgroundLLMTasks({
     sessionId: session.id,
     userId: session.userId,
-    transcriptPath: persisted.transcript.path,
-    summaryPath: persisted.summary.path,
+    transcriptPath: staged.transcript.reference,
+    summaryPath: staged.summary.reference,
     recordingPath: session.recordingPath,
     title: session.title,
     titleAutoGenerated: session.titleAutoGenerated,
@@ -289,8 +331,8 @@ export async function finalizeAsyncTranscription(
 
   return {
     outcome: 'completed',
-    transcriptPath: persisted.transcript.path,
-    summaryPath: persisted.summary.path,
+    transcriptPath: staged.transcript.reference,
+    summaryPath: staged.summary.reference,
     segmentCount: segments.length,
   };
 }

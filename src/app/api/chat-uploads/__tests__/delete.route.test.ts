@@ -4,7 +4,7 @@ const {
   verifyAuthMock,
   releaseStorageBytesMock,
   chatAttachmentFindUniqueMock,
-  chatAttachmentDeleteMock,
+  chatAttachmentDeleteManyMock,
   siteSettingFindUniqueMock,
   resolveCloudreveConfigMock,
   decryptMock,
@@ -13,7 +13,7 @@ const {
   verifyAuthMock: vi.fn(),
   releaseStorageBytesMock: vi.fn(),
   chatAttachmentFindUniqueMock: vi.fn(),
-  chatAttachmentDeleteMock: vi.fn(),
+  chatAttachmentDeleteManyMock: vi.fn(),
   siteSettingFindUniqueMock: vi.fn(),
   resolveCloudreveConfigMock: vi.fn(),
   decryptMock: vi.fn(),
@@ -32,7 +32,7 @@ vi.mock('@/lib/prisma', () => ({
   prisma: {
     chatAttachment: {
       findUnique: chatAttachmentFindUniqueMock,
-      delete: chatAttachmentDeleteMock,
+      deleteMany: chatAttachmentDeleteManyMock,
     },
     siteSetting: {
       findUnique: siteSettingFindUniqueMock,
@@ -81,7 +81,7 @@ describe('DELETE /api/chat-uploads/[id]', () => {
       cloudrevePath: '/user-1/chat-uploads/conv-1_foo.pdf',
       extractedTextPath: '/user-1/chat-uploads/conv-1_foo.pdf.extracted.txt',
     });
-    chatAttachmentDeleteMock.mockResolvedValue(undefined);
+    chatAttachmentDeleteManyMock.mockResolvedValue({ count: 1 });
     releaseStorageBytesMock.mockResolvedValue(null);
     // 默认 Cloudreve 已配置且有 access_token，物理删除会被调
     resolveCloudreveConfigMock.mockResolvedValue({
@@ -125,7 +125,7 @@ describe('DELETE /api/chat-uploads/[id]', () => {
       expect.objectContaining({ method: 'DELETE' })
     );
 
-    expect(chatAttachmentDeleteMock).toHaveBeenCalledWith({
+    expect(chatAttachmentDeleteManyMock).toHaveBeenCalledWith({
       where: { id: 'att-1' },
     });
     expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 1024);
@@ -139,7 +139,7 @@ describe('DELETE /api/chat-uploads/[id]', () => {
     });
     const response = await DELETE(makeReq(), makeParams('att-1'));
     expect(response.status).toBe(403);
-    expect(chatAttachmentDeleteMock).not.toHaveBeenCalled();
+    expect(chatAttachmentDeleteManyMock).not.toHaveBeenCalled();
     expect(releaseStorageBytesMock).not.toHaveBeenCalled();
   });
 
@@ -158,7 +158,7 @@ describe('DELETE /api/chat-uploads/[id]', () => {
     chatAttachmentFindUniqueMock.mockResolvedValueOnce(null);
     const response = await DELETE(makeReq(), makeParams('nope'));
     expect(response.status).toBe(404);
-    expect(chatAttachmentDeleteMock).not.toHaveBeenCalled();
+    expect(chatAttachmentDeleteManyMock).not.toHaveBeenCalled();
   });
 
   it('未登录 → 401', async () => {
@@ -172,7 +172,7 @@ describe('DELETE /api/chat-uploads/[id]', () => {
     const response = await DELETE(makeReq(), makeParams('att-1'));
     expect(response.status).toBe(200);
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(chatAttachmentDeleteMock).toHaveBeenCalled();
+    expect(chatAttachmentDeleteManyMock).toHaveBeenCalled();
     expect(releaseStorageBytesMock).toHaveBeenCalled();
   });
 
@@ -180,7 +180,7 @@ describe('DELETE /api/chat-uploads/[id]', () => {
     fetchMock.mockResolvedValue(new Response('err', { status: 500 }));
     const response = await DELETE(makeReq(), makeParams('att-1'));
     expect(response.status).toBe(200);
-    expect(chatAttachmentDeleteMock).toHaveBeenCalled();
+    expect(chatAttachmentDeleteManyMock).toHaveBeenCalled();
   });
 
   it('extractedTextPath = null 时只调一次 Cloudreve DELETE', async () => {
@@ -197,9 +197,40 @@ describe('DELETE /api/chat-uploads/[id]', () => {
   });
 
   it('DB delete 失败 → 500', async () => {
-    chatAttachmentDeleteMock.mockRejectedValueOnce(new Error('db fail'));
+    chatAttachmentDeleteManyMock.mockRejectedValueOnce(new Error('db fail'));
     const response = await DELETE(makeReq(), makeParams('att-1'));
     expect(response.status).toBe(500);
     expect(releaseStorageBytesMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * L62：两个并发 DELETE 打同一个 id。双方都能通过 findUnique（读到同一行），
+   * 都会走到删除这一步；只有一方真的删掉了行。
+   *
+   * 旧实现用 prisma.delete —— 输的那一方吃 P2025 被当作 DB 故障回 500，
+   * 前端 removeAttachment 于是回滚 chip 并 toast「操作失败」，而文件其实早已删干净。
+   * 现在用 deleteMany 的 count 做权威口径：count===0 → 幂等 200，且**绝不退配额**
+   * （退了就是与赢家叠加的重复退款，撞上 B8/P5-13 那条不变量）。
+   */
+  it('L62：并发 DELETE 的输家（count=0）→ 200 幂等，且不重复释放配额', async () => {
+    chatAttachmentDeleteManyMock.mockResolvedValueOnce({ count: 0 });
+
+    const response = await DELETE(makeReq(), makeParams('att-1'));
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({ ok: true, alreadyDeleted: true });
+    // 关键：字节只能被赢家退一次。
+    expect(releaseStorageBytesMock).not.toHaveBeenCalled();
+  });
+
+  it('L62：赢家（count=1）照常释放配额一次', async () => {
+    chatAttachmentDeleteManyMock.mockResolvedValueOnce({ count: 1 });
+
+    const response = await DELETE(makeReq(), makeParams('att-1'));
+
+    expect(response.status).toBe(200);
+    expect(releaseStorageBytesMock).toHaveBeenCalledTimes(1);
+    expect(releaseStorageBytesMock).toHaveBeenCalledWith('user-1', 1024);
   });
 });

@@ -8,14 +8,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const {
   verifyAuthMock,
   attachmentFindUniqueMock,
-  attachmentDeleteMock,
+  attachmentDeleteManyMock,
   releaseStorageBytesMock,
   loadCloudreveContextMock,
   deleteCloudreveFileMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   attachmentFindUniqueMock: vi.fn(),
-  attachmentDeleteMock: vi.fn(),
+  attachmentDeleteManyMock: vi.fn(),
   releaseStorageBytesMock: vi.fn(),
   loadCloudreveContextMock: vi.fn(),
   deleteCloudreveFileMock: vi.fn(),
@@ -26,7 +26,7 @@ vi.mock('@/lib/prisma', () => ({
   prisma: {
     chatAttachment: {
       findUnique: attachmentFindUniqueMock,
-      delete: attachmentDeleteMock,
+      deleteMany: attachmentDeleteManyMock,
     },
   },
 }));
@@ -58,7 +58,7 @@ describe('DELETE /api/chat-uploads/[id] — 只读对话守卫（M5）', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     verifyAuthMock.mockResolvedValue({ id: 'user-1', role: 'PRO' });
-    attachmentDeleteMock.mockResolvedValue({});
+    attachmentDeleteManyMock.mockResolvedValue({ count: 1 });
     releaseStorageBytesMock.mockResolvedValue(undefined);
     loadCloudreveContextMock.mockResolvedValue(null);
   });
@@ -71,7 +71,7 @@ describe('DELETE /api/chat-uploads/[id] — 只读对话守卫（M5）', () => {
 
     const res = await DELETE(...del('att-1'));
     expect(res.status).toBe(409);
-    expect(attachmentDeleteMock).not.toHaveBeenCalled();
+    expect(attachmentDeleteManyMock).not.toHaveBeenCalled();
     expect(deleteCloudreveFileMock).not.toHaveBeenCalled();
     expect(releaseStorageBytesMock).not.toHaveBeenCalled();
   });
@@ -81,7 +81,7 @@ describe('DELETE /api/chat-uploads/[id] — 只读对话守卫（M5）', () => {
 
     const res = await DELETE(...del('att-1'));
     expect(res.status).toBe(200);
-    expect(attachmentDeleteMock).toHaveBeenCalledWith({ where: { id: 'att-1' } });
+    expect(attachmentDeleteManyMock).toHaveBeenCalledWith({ where: { id: 'att-1' } });
   });
 
   it('非本人且非 ADMIN → 403（不受 endedAt 影响的既有校验）', async () => {
@@ -92,6 +92,6 @@ describe('DELETE /api/chat-uploads/[id] — 只读对话守卫（M5）', () => {
 
     const res = await DELETE(...del('att-1'));
     expect(res.status).toBe(403);
-    expect(attachmentDeleteMock).not.toHaveBeenCalled();
+    expect(attachmentDeleteManyMock).not.toHaveBeenCalled();
   });
 });

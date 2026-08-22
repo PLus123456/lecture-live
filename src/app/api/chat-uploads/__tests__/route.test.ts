@@ -169,9 +169,10 @@ describe('POST /api/chat-uploads', () => {
 
     // 上传两次：原文件 + 抽出的 .txt
     expect(uploadMock).toHaveBeenCalledTimes(2);
-    // 第一次上传 fileName 应该是 ${conversationId}_${safeFileName}
-    expect(uploadMock.mock.calls[0]?.[2]).toBe('conv-1_notes.txt');
-    expect(uploadMock.mock.calls[1]?.[2]).toBe('conv-1_notes.txt.extracted.txt');
+    // L61：远程名是 `${conversationId}_${12位随机hex}_${safeFileName}`（随机段防同名互删）
+    const composed = uploadMock.mock.calls[0]?.[2] as string;
+    expect(composed).toMatch(/^conv-1_[0-9a-f]{12}_notes\.txt$/);
+    expect(uploadMock.mock.calls[1]?.[2]).toBe(`${composed}.extracted.txt`);
 
     // ChatAttachment.create 调用参数
     expect(chatAttachmentCreateMock).toHaveBeenCalledTimes(1);
@@ -356,6 +357,132 @@ describe('POST /api/chat-uploads', () => {
     expect(savedFileName.endsWith('.pdf')).toBe(true);
   });
 
+  /* ────────────────────────────────────────────────────────────────
+     L61：远程文件名必须唯一 —— 同对话重传同名文件不得共用 cloudrevePath
+     （共用的后果：DELETE 任一行会物理删掉另一行还在用的那个文件）
+     ──────────────────────────────────────────────────────────────── */
+  it('L61：同对话上传两次同名文件 → 两个不同的远程路径', async () => {
+    const first = await POST(makeRequest({ fileName: 'report.pdf', type: 'application/pdf' }));
+    const second = await POST(makeRequest({ fileName: 'report.pdf', type: 'application/pdf' }));
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+
+    // 两次原文件上传用的远程名（.extracted.txt 是派生的，第 0/2 次调用是原文件）
+    const firstComposed = uploadMock.mock.calls[0]?.[2] as string;
+    const secondComposed = uploadMock.mock.calls[2]?.[2] as string;
+    expect(firstComposed).not.toBe(secondComposed);
+
+    // 落库的 cloudrevePath 同样必须不同 —— 这才是 DELETE 真正拿去删文件的那个值。
+    const paths = chatAttachmentCreateMock.mock.calls.map(
+      (call) => (call[0] as { data: { cloudrevePath: string } }).data.cloudrevePath
+    );
+    expect(paths).toHaveLength(2);
+    expect(new Set(paths).size).toBe(2);
+
+    // 用户可见的 fileName 列不受影响，仍是原始名。
+    const names = chatAttachmentCreateMock.mock.calls.map(
+      (call) => (call[0] as { data: { fileName: string } }).data.fileName
+    );
+    expect(names).toEqual(['report.pdf', 'report.pdf']);
+  });
+
+  it('L61：加了随机段之后，三列仍然全部 ≤191（U32 上限重新核对）', async () => {
+    // 用超长 userId / conversationId / 文件名一起顶到最紧的情况。
+    const longUserId = 'u'.repeat(30);
+    verifyAuthMock.mockResolvedValue({
+      id: longUserId,
+      email: 'alice@example.com',
+      role: 'PRO',
+    });
+    conversationFindUniqueMock.mockResolvedValue({
+      userId: longUserId,
+      endedAt: null,
+    });
+    uploadMock.mockImplementation(
+      async (_uid: string, _cat: string, fileName: string) =>
+        `/${longUserId}/chat-uploads/${fileName}`
+    );
+    const response = await POST(
+      makeRequest({
+        conversationId: 'c'.repeat(30),
+        fileName: `${'n'.repeat(240)}.pdf`,
+        contents: new Uint8Array([1, 2, 3, 4]),
+        type: 'application/pdf',
+      })
+    );
+    expect(response.status).toBe(200);
+
+    const composed = uploadMock.mock.calls[0]?.[2] as string;
+    const remotePath = `/${longUserId}/chat-uploads/${composed}`;
+    expect(remotePath.length).toBeLessThanOrEqual(191);
+    expect(`${remotePath}.extracted.txt`.length).toBeLessThanOrEqual(191);
+
+    const createArgs = chatAttachmentCreateMock.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    expect((createArgs.data.fileName as string).length).toBeLessThanOrEqual(191);
+    expect((createArgs.data.cloudrevePath as string).length).toBeLessThanOrEqual(191);
+    expect((createArgs.data.extractedTextPath as string).length).toBeLessThanOrEqual(191);
+  });
+
+  /* ────────────────────────────────────────────────────────────────
+     M29：无 content-length（chunked）的超大 body 必须被流式上限拦下
+     ──────────────────────────────────────────────────────────────── */
+  it('M29：chunked 超大 body → 413，且不读完全部分块、不预留配额', async () => {
+    getSiteSettingsMock.mockResolvedValue({ chat_files_max_upload_mb: 1 });
+
+    let pulled = 0;
+    const CHUNKS = 500; // 500 × 64KB ≈ 32MB，远超 1MB+1MB 的闸门
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled >= CHUNKS) {
+          controller.close();
+          return;
+        }
+        pulled++;
+        controller.enqueue(new Uint8Array(64 * 1024));
+      },
+    });
+    const req = new Request('http://localhost:3000/api/chat-uploads', {
+      method: 'POST',
+      body: stream,
+      headers: { 'content-type': 'multipart/form-data; boundary=----zzz' },
+      // @ts-expect-error duplex 是流式 body 的必填项，TS lib 尚未收录
+      duplex: 'half',
+    });
+    // 前提复刻：这个请求确实没有 content-length，旧预检算出来就是 0。
+    expect(req.headers.get('content-length')).toBeNull();
+
+    const response = await POST(req);
+
+    expect(response.status).toBe(413);
+    expect(reserveStorageBytesMock).not.toHaveBeenCalled();
+    expect(uploadMock).not.toHaveBeenCalled();
+    // 断流生效：没有把 32MB 全部拉进内存。
+    expect(pulled).toBeLessThan(CHUNKS / 2);
+  });
+
+  /* ────────────────────────────────────────────────────────────────
+     L60：`file` 是普通字符串字段时不得 500
+     ──────────────────────────────────────────────────────────────── */
+  it('L60：file 字段是字符串 → 400（旧代码在 arrayBuffer() 抛 TypeError，且不在 try 内 → 500）', async () => {
+    const form = new FormData();
+    form.set('conversationId', 'conv-1');
+    form.set('file', 'not-a-file'); // 普通文本字段，不是文件
+    const req = new Request('http://localhost:3000/api/chat-uploads', {
+      method: 'POST',
+      body: form,
+    });
+
+    const response = await POST(req);
+
+    expect(response.status).toBe(400);
+    // 两道大小检查此前都被绕过，配额与上传都不该发生。
+    expect(reserveStorageBytesMock).not.toHaveBeenCalled();
+    expect(uploadMock).not.toHaveBeenCalled();
+    expect(chatAttachmentCreateMock).not.toHaveBeenCalled();
+  });
+
   it('空 conversationId → 400', async () => {
     const response = await POST(
       createMultipartRequest(
@@ -414,6 +541,22 @@ describe('GET /api/chat-uploads?conversationId=...', () => {
       where: { conversationId: 'conv-1' },
       data: { lastAccessedAt: expect.any(Date) },
     });
+  });
+
+  it('L65：列表不得回传内部 cloudrevePath', async () => {
+    const req = new Request(
+      'http://localhost:3000/api/chat-uploads?conversationId=conv-1'
+    );
+    const response = await GET(req);
+    const body = await readJson<{ attachments: Array<Record<string, unknown>> }>(
+      response
+    );
+    expect(body.attachments[0]).not.toHaveProperty('cloudrevePath');
+    // select 里也不该出现（不查就不会泄）
+    const selectArg = chatAttachmentFindManyMock.mock.calls[0]?.[0] as {
+      select: Record<string, unknown>;
+    };
+    expect(selectArg.select).not.toHaveProperty('cloudrevePath');
   });
 
   it('缺 conversationId → 400', async () => {

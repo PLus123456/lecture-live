@@ -304,6 +304,13 @@ interface BuildState {
   userInput: string;
   /** L4+ 用：压缩后的历史（如果已生成） */
   compressedHistory: Awaited<ReturnType<typeof compressHistory>> | null;
+  /**
+   * L33：`compressedHistory` 是用哪个 keepTurns 压出来的。
+   * 设计上 L4 保留 5 轮、L5+ 只保留 3 轮；缓存若不带这个标记，经 L4 升到 L5 时会
+   * 直接复用 5 轮的结果——L5 在"历史"这一维上其实没有比 L4 更收紧，token 占用偏大、
+   * 更容易被推到 L6/L7（RAG + 截 summary，代价更大）。
+   */
+  compressedHistoryKeepTurns: number | null;
   /** L6+ 用：RAG 检索回调 */
   ragRetrieve?: ChatContextInput['ragRetrieve'];
   /** 已截断后的 report 文本；undefined 表示调用方未提供。仅用于 token 预算估算与回传。 */
@@ -400,6 +407,7 @@ export async function buildChatContext(
     history: input.history,
     userInput: input.userInput,
     compressedHistory: null,
+    compressedHistoryKeepTurns: null,
     ragRetrieve: input.ragRetrieve,
     reportText: truncatedReport,
     reportTokens: truncatedReport ? estimateTokens(truncatedReport) : 0,
@@ -427,15 +435,20 @@ export async function buildChatContext(
   ) {
     const lv = level as DegradationLevel;
 
-    // L4+ 需要压缩历史：第一次进入 L4 时才做（成本高）
-    if (lv >= 4 && !state.compressedHistory) {
+    // L4+ 需要压缩历史：第一次进入 L4 时才做（成本高）。
+    // L33：缓存按 keepTurns 区分 —— L4 用 5 轮、L5+ 用 3 轮，两者不是同一个结果。
+    // 缓存命中的判据是「已压过 **且** 当时用的 keepTurns 与本级要求的一致」；
+    // 从 L4 升到 L5 时会为 3 轮重压一次（整条降级链最多两次压缩调用，仍远低于
+    // 「每级都重压」的旧 EOL 路径）。
+    const requiredKeepTurns = lv >= 5 ? 3 : 5;
+    if (lv >= 4 && state.compressedHistoryKeepTurns !== requiredKeepTurns) {
       state.compressedHistory = await compressHistory({
         history: input.history,
-        // L4: 保留 5 轮；L5+: 保留 3 轮
-        keepTurns: lv >= 5 ? 3 : 5,
+        keepTurns: requiredKeepTurns,
         callLLM: input.callLLM,
         language: input.language,
       });
+      state.compressedHistoryKeepTurns = requiredKeepTurns;
     }
 
     const candidate = await buildAtLevel(lv, state, input.inputBudget);

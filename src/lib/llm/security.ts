@@ -147,8 +147,29 @@ export function sanitizePromptValue(value: string): string {
     .replace(/>/g, '&gt;');
 }
 
+/** 「围栏恰好包裹整个响应」的形状；只有命中它才剥围栏。 */
+const WRAPPING_CODE_FENCE =
+  /^```[a-zA-Z0-9_-]*[ \t]*\r?\n?([\s\S]*?)\r?\n?```$/;
+const LEADING_CODE_FENCE = /^```[a-zA-Z0-9_-]*[ \t]*\r?\n?/;
+
+/**
+ * 剥掉 LLM 习惯性给 JSON 套的 markdown 代码围栏。
+ *
+ * L38②：此前是 `raw.replace(/```json|```/gi, '')` —— **全局**删掉所有围栏。
+ * 报告/关键词这类响应的字符串值里完全可能合法地出现 ```（讲座讲到 markdown、
+ * 转录里贴了代码块……），全局删除会改写正文；模型在围栏之外再补一句说明时，
+ * 剩下的碎片还会 JSON.parse 失败 → 上层一律翻成 502「Invalid LLM response format」。
+ * 改成只在「围栏恰好包裹整个响应」时剥一层，正文里的围栏原样保留。
+ */
 function stripJsonCodeFences(raw: string): string {
-  return raw.replace(/```json|```/gi, '').trim();
+  const trimmed = raw.trim();
+  const wrapped = trimmed.match(WRAPPING_CODE_FENCE);
+  if (wrapped) return wrapped[1].trim();
+  // 只有开头围栏、没有收尾（响应被 max_tokens 截断）：剥掉开头那一行，尽力而为。
+  if (trimmed.startsWith('```')) {
+    return trimmed.replace(LEADING_CODE_FENCE, '').trim();
+  }
+  return trimmed;
 }
 
 function parseJsonObject(raw: string, label: string): JsonObject {
@@ -334,18 +355,33 @@ export interface TitleGenerationResult {
   en: string;
 }
 
-/** 解析标题生成 LLM 响应 — 保留内容标点，不截断 */
+/**
+ * 标题落库长度上限（L40）。
+ *
+ * `Session.title` 在 schema 里是 `String` → MySQL `VARCHAR(191)`；此前本函数对 zh/en
+ * **不做任何截断**（其余所有字段都走 toBoundedString），模型一旦吐出超长标题，
+ * `prisma.session.update` 直接抛错，整个标题任务失败（连带 fallback 也失败）。
+ * 120 远小于 191（留足多字节与后缀余量），也远大于常规 25 字 / 15 词的期望长度 ——
+ * 词数超限的重试逻辑不受影响：截断后的超长标题依然超词数，照常触发重试。
+ */
+const TITLE_MAX_CHARS = 120;
+
+/** 解析标题生成 LLM 响应 — 保留内容标点，仅在超长时按落库上限截断 */
 export function parseTitleGenerationResult(raw: string): TitleGenerationResult {
   const parsed = parseJsonObject(raw, 'title generation response');
 
   const zh = ensureString(parsed.zh, 'zh')
     .replace(PROMPT_CONTROL_CHARS, ' ')
     .replace(/\n/g, ' ')
+    .trim()
+    .slice(0, TITLE_MAX_CHARS)
     .trim();
 
   const en = ensureString(parsed.en, 'en')
     .replace(PROMPT_CONTROL_CHARS, ' ')
     .replace(/\n/g, ' ')
+    .trim()
+    .slice(0, TITLE_MAX_CHARS)
     .trim();
 
   if (!zh || !en) {

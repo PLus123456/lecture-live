@@ -180,22 +180,83 @@ describe('档位 PATCH：局部更新', () => {
 describe('档位审计日志', () => {
   // P6-15：只写 name + kind 的话，卖 ADMIN 的会员档和卖 PRO 的在审计流水里完全一样——
   // 「档位被偷偷改成授予 ADMIN」事后无从发现。
+  // 注：样本从 ADMIN 换成 PRO —— M7 之后 grantRole='ADMIN' 会被硬拒到 400，
+  // 审计明细带 grantRole 的契约本身不变（它管的是「卖 PRO 和卖 FREE 在流水里能不能分辨」）。
   it('▶ P6-15 create 的审计明细带 grantRole', async () => {
     await post({
       kind: 'membership',
       name: '超级档',
       priceCents: 100,
-      grantRole: 'ADMIN',
+      grantRole: 'PRO',
       durationDays: 3650,
     });
     const detail = logActionMock.mock.calls[0][2].detail as string;
-    expect(detail).toContain('ADMIN');
+    expect(detail).toContain('grantRole=PRO');
   });
 
   it('▶ P6-15 update 的审计明细带新旧 grantRole', async () => {
-    await patch({ id: 't1', grantRole: 'ADMIN' });
+    await patch({ id: 't1', grantRole: 'PRO' });
     const detail = logActionMock.mock.calls[0][2].detail as string;
-    expect(detail).toContain('ADMIN'); // 新值
+    expect(detail).toContain('PRO'); // 新值
     expect(detail).toContain('FREE'); // 原值
+  });
+});
+
+describe('M7：档位不得授予 ADMIN', () => {
+  // 从前这里明确放行 ADMIN（`['ADMIN','PRO','FREE'].includes(role)`），唯一的"防线"是
+  // describeTier 写进审计流水 —— 事后可查，事前不挡。买到即得终身计费豁免 + 全部 admin API。
+  it('▶ create 会员档 grantRole=ADMIN → 400，不落库', async () => {
+    const res = await post({
+      kind: 'membership',
+      name: '至尊档',
+      priceCents: 100,
+      grantRole: 'ADMIN',
+      durationDays: 3650,
+    });
+    expect(res.status).toBe(400);
+    expect(tierCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ PATCH 显式把档位改成授予 ADMIN → 400，不落库', async () => {
+    const res = await patch({ id: 't1', grantRole: 'ADMIN' });
+    expect(res.status).toBe(400);
+    expect(tierUpdateMock).not.toHaveBeenCalled();
+  });
+
+  // 与 P3-7 的历史 ¥0 档同款口径：存量脏档位必须还能停用/改名，否则修 bug 反把补救手段锁死。
+  it('▶ 存量 ADMIN 档不改 grantRole 时仍可停用（且 patch 不回写 grantRole）', async () => {
+    tierFindUniqueMock.mockResolvedValueOnce({ ...EXISTING, grantRole: 'ADMIN' });
+    const res = await patch({ id: 't1', active: false });
+    expect(res.status).toBe(200);
+    const data = tierUpdateMock.mock.calls[0][0].data as Record<string, unknown>;
+    expect(data).toEqual({ active: false });
+    expect(data.grantRole).toBeUndefined();
+  });
+
+  // 换 kind 会触发派生列重写（KIND_DERIVED_KEYS）——那条路径同样不能把 ADMIN 写回去。
+  it('▶ 把存量 ADMIN 脏行换成 membership（派生重写路径）→ 400', async () => {
+    tierFindUniqueMock.mockResolvedValueOnce({
+      ...EXISTING,
+      kind: 'minutes',
+      grantRole: 'ADMIN',
+      grantMinutes: 100,
+    });
+    const res = await patch({ id: 't1', kind: 'membership' });
+    expect(res.status).toBe(400);
+    expect(tierUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ 正常的 PRO 会员档不受影响', async () => {
+    const res = await post({
+      kind: 'membership',
+      name: 'PRO月卡',
+      priceCents: 3900,
+      grantRole: 'PRO',
+      durationDays: 30,
+    });
+    expect(res.status).toBe(200);
+    expect(tierCreateMock).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ grantRole: 'PRO' }) })
+    );
   });
 });

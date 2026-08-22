@@ -496,6 +496,18 @@ async function applyGrantTx(
   if (priceCents <= 0) {
     throw new WalletError('档位价格无效（必须大于 0）', 'tier_unavailable');
   }
+  // M7：**绝不**通过购买发放 ADMIN。此前发放侧只挡「买家已经是 ADMIN」（下方 admin_no_membership），
+  // 完全不看 spec.grantRole，而档位管理口的 `['ADMIN','PRO','FREE'].includes(role)` 明确放行 ADMIN
+  // —— 一旦有人（误操作 / 被接管的管理员账号 / 直接改库）建出 grantRole='ADMIN' 的会员档，任何
+  // FREE 用户花钱即得管理员：终身计费豁免 + 全部 admin API。P6-15 自认「只靠事后审计流水」不是防线。
+  // 与 P3-7 的 0 元档同款双侧防护：档位管理口已拒绝写入（tiers 路由），这里再挡一道 ——
+  // 冻结快照与存量档位行都可能来自收紧之前，且回调结算按快照发放、根本不读 live 档位。
+  if (spec.kind === 'membership' && spec.grantRole === 'ADMIN') {
+    throw new WalletError(
+      '该档位不可发放（不得通过购买获得管理员角色）',
+      'tier_unavailable'
+    );
+  }
   // 锁读（P3-6）：会员发放对 roleExpiresAt / originalRole 是读-改-写，快照读在并发网关回调下
   // 必然 lost update —— 两笔各扣一次钱、到期只延一期，且台账看起来完全正常。FOR UPDATE 让第二笔
   // 排在第一笔提交之后再读（同 quota.ts / chatFileCleanup.ts 的锁读 idiom）。

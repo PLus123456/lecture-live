@@ -122,17 +122,36 @@ async function freezeEntitlements(
   amountCents: number,
   meta: OrderGrantMeta
 ): Promise<void> {
-  const user = await tx.user.findUnique({
-    where: { id: userId },
-    select: {
-      walletBalanceCents: true,
-      purchasedMinutesBalance: true,
-      role: true,
-      originalRole: true,
-      roleExpiresAt: true,
-    },
-  });
-  if (!user) return;
+  // M6 锁读（与 wallet.ts applyGrantTx 的 P3-6 同款 idiom）：余额与分钟池两条线走的是
+  // `GREATEST(0, col - n)` 相对更新，本就并发安全；但**会员分支是读-改-写绝对值**
+  // （roleExpiresAt = 快照到期日 − 本单天数），快照读在并发下必然 lost update：
+  //  ① 同一用户两笔订单同时退款 → 都基于同一份快照算，后写覆盖先写，只缩回一期，
+  //     另一笔已退款的会员期被白留（平台资损）；
+  //  ② 退款与余额购买并发 → freeze 在购买提交前读快照、提交后写回，刚买的 30 天被抹掉、
+  //     或 originalRole 被错误清空（用户资损）。
+  // FOR UPDATE 让第二笔排在第一笔提交之后再读，两笔各缩一期。锁顺序与 applyGrantTx 一致
+  // （PaymentOrder → User），不引入新的死锁环。
+  const rows = await tx.$queryRaw<
+    Array<{
+      walletBalanceCents: number;
+      purchasedMinutesBalance: number;
+      role: UserRole;
+      originalRole: UserRole | null;
+      roleExpiresAt: Date | string | null;
+    }>
+  >`
+    SELECT walletBalanceCents, purchasedMinutesBalance, role, originalRole, roleExpiresAt
+    FROM User WHERE id = ${userId} FOR UPDATE
+  `;
+  const row = rows?.[0];
+  if (!row) return;
+  const user = {
+    walletBalanceCents: Number(row.walletBalanceCents),
+    purchasedMinutesBalance: Number(row.purchasedMinutesBalance),
+    role: row.role,
+    originalRole: row.originalRole,
+    roleExpiresAt: row.roleExpiresAt ? new Date(row.roleExpiresAt) : null,
+  };
 
   // 1) 余额：退回本单到账额（topup 可能含赠送 → 按 creditCents）。
   const creditCents = Math.max(0, Math.round(meta.creditCents ?? amountCents));

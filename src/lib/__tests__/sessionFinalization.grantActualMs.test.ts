@@ -21,7 +21,7 @@ const {
   transcriptDurationMock,
   serverDurationMock,
   mergeDraftMock,
-  persistTranscriptMock,
+  stageTranscriptMock,
   loadDraftMock,
 } = vi.hoisted(() => ({
   sessionFindUniqueMock: vi.fn(),
@@ -35,7 +35,7 @@ const {
   transcriptDurationMock: vi.fn(),
   serverDurationMock: vi.fn(),
   mergeDraftMock: vi.fn(),
-  persistTranscriptMock: vi.fn(),
+  stageTranscriptMock: vi.fn(),
   loadDraftMock: vi.fn(),
 }));
 
@@ -65,7 +65,7 @@ vi.mock('@/lib/sessionPersistence', () => ({
   stageSessionAudioArtifact: vi.fn().mockResolvedValue(null),
   finalizeStagedArtifactPublish: vi.fn().mockResolvedValue(undefined),
   rollbackStagedArtifact: vi.fn().mockResolvedValue(undefined),
-  persistSessionTranscriptArtifacts: persistTranscriptMock,
+  stageSessionTranscriptArtifacts: stageTranscriptMock,
   extractTranscriptText: vi.fn(() => ''),
   loadSessionTranscriptBundle: vi.fn().mockResolvedValue(null),
   persistSessionReport: vi.fn().mockResolvedValue({ path: 'rp/1.json' }),
@@ -171,9 +171,10 @@ beforeEach(() => {
   serverDurationMock.mockReset().mockReturnValue(0);
   mergeDraftMock.mockReset().mockResolvedValue(null);
   loadDraftMock.mockReset().mockResolvedValue(null);
-  persistTranscriptMock.mockReset().mockResolvedValue({
-    transcript: { path: 'tr/1.json' },
-    summary: { path: 'sm/1.json' },
+  // M5：转录/摘要改走两阶段 stage —— 返回的是版本化引用，CAS 成功后才 publish。
+  stageTranscriptMock.mockReset().mockResolvedValue({
+    transcript: { category: 'transcripts', reference: 'local:transcripts/sess-1-a1.json', localReference: 'local:transcripts/sess-1-a1.json', storage: 'local', previousReference: null },
+    summary: { category: 'summaries', reference: 'local:summaries/sess-1-a1.json', localReference: 'local:summaries/sess-1-a1.json', storage: 'local', previousReference: null },
   });
 });
 

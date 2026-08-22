@@ -68,6 +68,18 @@ install -o "$APP_USER" -g "$APP_USER" -m 0644 \
     "$SRC_DIR/scripts/stripe-key-mode.mjs" "$APP_DIR/scripts/"
 install -o "$APP_USER" -g "$APP_USER" -m 0644 \
     "$SRC_DIR/scripts/check-readiness.mjs" "$APP_DIR/scripts/"
+# 替换 unit 前先把现役 unit 存一份。新 unit 带 marker/preflight/readiness 三道
+# ExecStartPre/Post 闸，旧应用产物一定过不去；没有这份备份，首次升级中途失败就会
+# 卡在「服务已停 + 新 unit 起不来 + 所有历史备份都被 rollback.sh 拒绝」的死角。
+# rollback.sh 按同一时间戳成对退回 unit 与产物，绝不会出现旧应用配新 unit。
+mkdir -p "$BACKUP_DIR"
+if [[ -f /etc/systemd/system/lecturelive-web.service ]]; then
+    tar czf "$BACKUP_DIR/systemd-${TIMESTAMP}.tar.gz" -C /etc/systemd/system \
+        lecturelive-web.service lecturelive-ws.service 2>/dev/null \
+        && info "已备份现役 systemd unit: systemd-${TIMESTAMP}.tar.gz" \
+        || warn "备份现役 systemd unit 失败，回滚将只能选择更新的备份"
+fi
+
 install -m 0644 "$SCRIPT_DIR/lecturelive-web.service" /etc/systemd/system/
 install -m 0644 "$SCRIPT_DIR/lecturelive-ws.service" /etc/systemd/system/
 systemctl daemon-reload
@@ -90,6 +102,8 @@ fi
 
 # 只保留最近 5 个备份
 ls -t "$BACKUP_DIR"/app-*.tar.gz 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
+# unit 备份与产物备份成对使用，保留同样的代数，否则回滚时会出现「有产物没 unit」。
+ls -t "$BACKUP_DIR"/systemd-*.tar.gz 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
 
 # ── 2. 安装依赖 ──
 info "安装依赖..."

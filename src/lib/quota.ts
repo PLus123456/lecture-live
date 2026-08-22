@@ -1,7 +1,10 @@
 import { Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { prisma } from '@/lib/prisma';
-import { isStoredArtifactBackfillComplete } from '@/lib/storage/storedArtifactLedger';
+import {
+  CHAT_QUOTA_ARTIFACT_TYPE_LIST,
+  isStoredArtifactBackfillComplete,
+} from '@/lib/storage/storedArtifactLedger';
 import {
   assertPaymentBenefitAvailable,
   isPaymentBenefitAvailable,
@@ -873,11 +876,16 @@ export async function reconcileStorageBytes(): Promise<{
       `;
       if (locked.length !== 1) return 0;
 
+      // 只重建「chat 文件」这一维：storageBytesUsed/storageBytesLimit 的口径就是
+      // chat_files_quota_*_mb。录音/转录/草稿虽然同样进账本（对账与孤儿清理需要），
+      // 但归 storageHoursLimit 管；把它们算进来会让 FREE 用户 100MB 的 chat 额度
+      // 被一场讲座直接吃满。见 CHAT_QUOTA_ARTIFACT_TYPES。
       const sums = await tx.$queryRaw<Array<{ actual: bigint | null }>>`
         SELECT SUM(chargedBytes) AS actual
         FROM StoredArtifact
         WHERE userId = ${user.id}
           AND chargedBytes > 0
+          AND artifactType IN (${Prisma.join([...CHAT_QUOTA_ARTIFACT_TYPE_LIST])})
       `;
       const actual = sums[0]?.actual ?? BigInt(0);
       if (actual === locked[0].storageBytesUsed) return 0;

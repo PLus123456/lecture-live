@@ -135,6 +135,50 @@ describe('PATCH /api/admin/llm-providers/[id] — SEC-034 凭据换靶闸', () =
 
   afterEach(() => vi.unstubAllEnvs());
 
+  // 真实 MySQL 下 $queryRaw 把 TINYINT(1) 回成 number(0/1)，而类型化客户端回 boolean。
+  // 这两个 fixture 刻意复刻那个类型落差：之前 mock 用的是真 boolean，所以 `1 !== true`
+  // 恒真导致「每次保存都 409」的 bug 在测试里完全看不见。
+  // GatewayModal 每次保存都把 apiBase + isAnthropic 一起回传，所以哪怕只是改名，
+  // touchesCredentialBinding 也恒为真——这正是线上「改任何字段都 409」的真实路径。
+  it('$queryRaw 回 TINYINT number 时，UI 式改名（回传 apiBase/isAnthropic）仍放行', async () => {
+    providerFindUniqueMock.mockResolvedValue({
+      ...EXISTING,
+      isAnthropic: false,
+      models: [],
+    });
+    queryRawMock.mockResolvedValue([{ ...EXISTING, isAnthropic: 0 }]);
+
+    const res = await PATCH(
+      makeRequest({
+        name: 'vendor-renamed',
+        apiBase: EXISTING.apiBase,
+        isAnthropic: false,
+      }),
+      { params }
+    );
+
+    expect(res.status).toBe(200);
+    expect(providerUpdateMock.mock.calls[0][0].data).toMatchObject({
+      name: 'vendor-renamed',
+    });
+  });
+
+  it('$queryRaw 回 TINYINT number 时，isAnthropic 未变不触发重填密钥', async () => {
+    providerFindUniqueMock.mockResolvedValue({
+      ...EXISTING,
+      isAnthropic: true,
+      models: [],
+    });
+    queryRawMock.mockResolvedValue([{ ...EXISTING, isAnthropic: 1 }]);
+
+    const res = await PATCH(makeRequest({ name: 'vendor2', isAnthropic: true }), {
+      params,
+    });
+
+    expect(res.status).toBe(200);
+    expect(providerUpdateMock).toHaveBeenCalled();
+  });
+
   it('只改 apiBase、apiKey 不传 → 拒绝，不可外带旧密钥', async () => {
     const res = await PATCH(
       makeRequest({ apiBase: 'https://llm2.corp.example/v1' }),

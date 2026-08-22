@@ -31,6 +31,32 @@ type LockedProviderBinding = {
   updatedAt: Date;
 };
 
+/**
+ * `$queryRaw` returns MySQL `TINYINT(1)` as a **number** (0/1) while the typed Prisma
+ * client returns a **boolean**. Every comparison below is `!==` against a typed row, so
+ * without this normalization `1 !== true` is always true, `bindingChangedSincePreflight`
+ * is unconditionally set, and every provider PATCH fails with a 409. Normalize once at
+ * the raw-SQL boundary rather than at each comparison site.
+ */
+type RawLockedProviderBinding = Omit<LockedProviderBinding, 'isAnthropic'> & {
+  isAnthropic: boolean | number | bigint | Buffer | null;
+};
+
+function normalizeLockedBinding(
+  row: RawLockedProviderBinding
+): LockedProviderBinding {
+  const raw = row.isAnthropic;
+  const isAnthropic =
+    typeof raw === 'boolean'
+      ? raw
+      : typeof raw === 'bigint'
+        ? raw !== BigInt(0)
+        : Buffer.isBuffer(raw)
+          ? raw.length > 0 && raw[0] !== 0
+          : Number(raw ?? 0) !== 0;
+  return { ...row, isAnthropic };
+}
+
 class ConcurrentProviderBindingError extends Error {
   constructor(
     readonly reason:
@@ -248,14 +274,15 @@ export async function PATCH(
       // SEC-034: the binding row is the serialization point. It must be the first database read in
       // this transaction; all secret-reentry and reauth decisions below are recomputed from this
       // current-read value, not the stale preliminary read used for cheap validation.
-      const lockedRows = await tx.$queryRaw<LockedProviderBinding[]>`
+      const lockedRows = await tx.$queryRaw<RawLockedProviderBinding[]>`
         SELECT id, name, apiKey, apiBase, isAnthropic, updatedAt
         FROM LlmProvider
         WHERE id = ${id}
         FOR UPDATE
       `;
-      const locked = lockedRows[0];
-      if (!locked) throw new Error('PROVIDER_NOT_FOUND');
+      const rawLocked = lockedRows[0];
+      if (!rawLocked) throw new Error('PROVIDER_NOT_FOUND');
+      const locked = normalizeLockedBinding(rawLocked);
 
       // A partial binding patch (for example apiKey-only) was prepared against `existing` above.
       // If another writer changed endpoint/protocol/key before this row lock, applying that patch to

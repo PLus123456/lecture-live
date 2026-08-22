@@ -58,6 +58,35 @@ export const STORED_ARTIFACT_TYPE = {
 export type StoredArtifactType =
   (typeof STORED_ARTIFACT_TYPE)[keyof typeof STORED_ARTIFACT_TYPE];
 
+/**
+ * `User.storageBytesUsed` / `storageBytesLimit` is the **chat files** byte quota —
+ * admin panel「Chat 文件」→ `chat_files_quota_{free,pro,admin}_mb`, FREE 默认 100MB
+ * (see resolveRoleStorageBytesLimit). Durable recording-class artifacts live on a
+ * completely different dimension, `storageHoursLimit` (FREE 10h), enforced at the
+ * recording entry points.
+ *
+ * The ledger deliberately records bytes for **every** artifact — that is what makes
+ * SEC-019's reconciliation exact and what stopped inline images from bypassing
+ * accounting (SEC-016). Only the chat-quota *counter* is restricted to chat-class
+ * artifacts. Charging a 10-hour recording entitlement against a 100MB chat budget
+ * makes recording structurally impossible for every non-ADMIN user: draft chunks
+ * 402 mid-recording and finalize leaves the session stuck in FINALIZING forever.
+ */
+const CHAT_QUOTA_ARTIFACT_TYPES: ReadonlySet<string> = new Set<string>([
+  STORED_ARTIFACT_TYPE.CHAT_RAW,
+  STORED_ARTIFACT_TYPE.CHAT_EXTRACTED,
+  STORED_ARTIFACT_TYPE.INLINE_IMAGE,
+]);
+
+/** SQL list form of {@link CHAT_QUOTA_ARTIFACT_TYPES}, for ledger-sourced rebuilds. */
+export const CHAT_QUOTA_ARTIFACT_TYPE_LIST: readonly string[] = Object.freeze([
+  ...CHAT_QUOTA_ARTIFACT_TYPES,
+]);
+
+export function countsTowardChatStorageQuota(artifactType: string): boolean {
+  return CHAT_QUOTA_ARTIFACT_TYPES.has(artifactType);
+}
+
 export class StoredArtifactQuotaExceededError extends Error {
   constructor() {
     super('storage byte quota exceeded');
@@ -222,9 +251,14 @@ async function adjustUserStorageBytes(
   tx: Prisma.TransactionClient,
   userId: string,
   delta: bigint,
+  artifactType: string,
   enforceLimit: boolean
 ): Promise<void> {
   if (delta === BigInt(0)) return;
+  // Non-chat artifacts are ledgered but never billed to the chat-files counter,
+  // in both directions — skipping only the charge would drift the counter negative
+  // on release. See CHAT_QUOTA_ARTIFACT_TYPES.
+  if (!countsTowardChatStorageQuota(artifactType)) return;
 
   if (delta < BigInt(0)) {
     await tx.$executeRaw`
@@ -309,7 +343,13 @@ export async function reserveStoredArtifact(
       }
     }
 
-    await adjustUserStorageBytes(tx, input.userId, expectedBytes, true);
+    await adjustUserStorageBytes(
+      tx,
+      input.userId,
+      expectedBytes,
+      input.artifactType,
+      true
+    );
     const previous = await findArtifactByIdentityKey(tx, logicalKey);
     const id = crypto.randomUUID();
     await tx.$executeRaw`
@@ -371,6 +411,7 @@ async function settleStoredArtifactWithTx(
     tx,
     row.userId,
     actualBytes - row.chargedBytes,
+    row.artifactType,
     true
   );
 
@@ -485,6 +526,7 @@ export async function recordReservedStoredArtifactLocation(
       tx,
       row.userId,
       actualBytes - row.chargedBytes,
+      row.artifactType,
       true
     );
     await tx.$executeRaw`
@@ -516,7 +558,13 @@ async function releaseStoredArtifactWithTx(
   if (!row) return false;
   if (row.chargedBytes === BigInt(0)) return false;
 
-  await adjustUserStorageBytes(tx, row.userId, -row.chargedBytes, false);
+  await adjustUserStorageBytes(
+    tx,
+    row.userId,
+    -row.chargedBytes,
+    row.artifactType,
+    false
+  );
   await tx.$executeRaw`
     UPDATE StoredArtifact
     SET state = ${terminalState},

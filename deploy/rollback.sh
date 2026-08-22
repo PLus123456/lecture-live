@@ -34,6 +34,13 @@ fi
 
 info "回滚到: $(basename "$BACKUP_FILE")"
 
+# 同一时间戳的 systemd unit 备份（upgrade.sh 在替换 unit 前写入）。只在产物早于
+# readiness 路由时才会用到，用来保证 unit 与产物永远同代退回。
+BACKUP_STAMP="$(basename "$BACKUP_FILE")"
+BACKUP_STAMP="${BACKUP_STAMP#app-}"
+BACKUP_STAMP="${BACKUP_STAMP%.tar.gz}"
+UNIT_BACKUP="$BACKUP_DIR/systemd-${BACKUP_STAMP}.tar.gz"
+
 # 列出备份内容概要
 echo ""
 echo "  备份包含:"
@@ -65,7 +72,20 @@ chmod 600 "$APP_DIR/.env"
 RUNTIME_SECURITY_MARKER="$APP_DIR/.runtime-security-version"
 if [[ ! -f "$RUNTIME_SECURITY_MARKER" ]] || \
    ! grep -Fxq 'health-ready-v1' "$RUNTIME_SECURITY_MARKER"; then
-    error "该备份早于受保护 readiness 路由，拒绝重新上线；服务已保持停止"
+    # 该备份早于受保护 readiness 路由。禁止的是「旧产物 + 新 unit」这个组合——
+    # 新 unit 的 ExecStartPre(marker/preflight) 与 ExecStartPost(readiness --wait)
+    # 旧产物一概过不去，会卡成起不来又回不去。
+    # 但只要能把 systemd unit 一并退回同一代，旧 unit + 旧产物本身是自洽的一代，
+    # 升级失败时必须留这条退路，否则首次升级中途失败就没有任何可上线的目标。
+    if [[ -f "$UNIT_BACKUP" ]]; then
+        info "备份早于 readiness 路由，同代回退 systemd unit: $(basename "$UNIT_BACKUP")"
+        tar xzf "$UNIT_BACKUP" -C /etc/systemd/system
+        systemctl daemon-reload
+        warn "已退回旧版 systemd unit：本次上线不含 readiness/支付预检启动闸，"
+        warn "请尽快重新执行 upgrade.sh 前滚，不要长期停留在此状态。"
+    else
+        error "该备份早于受保护 readiness 路由，且缺少配套的 systemd unit 备份（$(basename "$UNIT_BACKUP")）无法同代回退；拒绝重新上线，服务已保持停止"
+    fi
 fi
 
 # 恢复 ws-server 的软链接

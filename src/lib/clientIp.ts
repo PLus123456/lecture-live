@@ -213,12 +213,22 @@ function resolveTrustedHeaders(
 ): string | null {
   const forwardedClient = resolveForwardedClientIp(forwardedFor, config);
 
-  // In the standard single-nginx topology both headers are overwritten from $remote_addr and
-  // must agree. Reject disagreement rather than choosing whichever attacker prefers.
+  // In the standard single-nginx topology both headers are overwritten from $remote_addr.
+  // When both are present they must agree — reject disagreement rather than choosing
+  // whichever an attacker prefers.
+  //
+  // X-Real-IP being absent is NOT ambiguous, though: at one hop the right-most XFF entry
+  // was written by the trusted proxy itself. Requiring both headers collapsed every
+  // deployment whose proxy sets only X-Forwarded-For (Traefik, most k8s ingresses, plenty
+  // of hand-rolled nginx) into the single `unknown` bucket, so one shared rate limit 429'd
+  // the entire site.
   if (config.hops === 1) {
-    const normalizedRealIp = normalizeClientIp(realIp);
-    if (!forwardedClient || !normalizedRealIp) {
+    if (!forwardedClient) {
       return null;
+    }
+    const normalizedRealIp = normalizeClientIp(realIp);
+    if (!normalizedRealIp) {
+      return forwardedClient;
     }
     return forwardedClient === normalizedRealIp ? forwardedClient : null;
   }
@@ -256,6 +266,19 @@ export function resolveSocketClientIp(input: SocketClientIpInput): string {
   const peerIp = normalizeClientIp(input.peerIp);
   if (!peerIp) return 'unknown';
   if (config.hops === 0 || !isTrustedProxyIp(peerIp, config)) {
+    return peerIp;
+  }
+
+  // A peer inside a trusted CIDR that presents no proxy headers at all is not a proxy
+  // relaying somebody else — it is a direct connection from that host: `npm run dev:ws`
+  // reached at ws://localhost:3001, an SSH tunnel, a local probe. Its socket address comes
+  // from the kernel and cannot be spoofed, so keying on it is safe and is what the
+  // pre-hardening code did. Loopback is *always* in the trusted set, so without this the
+  // WS handshake resolved `unknown` and websocket.ts rejected every local connection —
+  // live share and realtime transcription were dead in development.
+  //
+  // Fail closed only for the genuinely ambiguous case: headers present but unresolvable.
+  if (!input.forwardedFor && !input.realIp) {
     return peerIp;
   }
 

@@ -95,6 +95,62 @@ function authMutationRejection(message: string, status: 403 | 415): NextResponse
   return response;
 }
 
+function firstHeaderValue(value: string | null): string | null {
+  return value?.split(',')[0]?.trim() || null;
+}
+
+/**
+ * Origins a browser may legitimately have addressed this request to.
+ *
+ * `new URL(req.url).origin` is NOT one of them on its own: in a Next standalone
+ * server `req.url` is rebuilt from the process bind address (HOSTNAME/PORT), not
+ * from the public Host header, so behind nginx it is always `http://localhost:3000`
+ * while the browser sends the real site origin. Comparing the two rejected every
+ * authenticated mutation in production.
+ *
+ * Deriving the expected origin from Host / X-Forwarded-Host keeps the CSRF property
+ * intact: in a cross-site attack the attacker cannot forge `Origin` (the browser sets
+ * it), and the browser derives `Host` from the URL the user actually visited, so the
+ * two only agree for a genuine same-origin request.
+ */
+export function acceptableAuthMutationOrigins(req: Request): Set<string> {
+  const origins = new Set<string>();
+  const add = (value: string | null | undefined) => {
+    if (!value) return;
+    try {
+      origins.add(new URL(value).origin);
+    } catch {
+      /* not a usable origin — ignore */
+    }
+  };
+
+  let requestUrl: URL | null = null;
+  try {
+    requestUrl = new URL(req.url);
+  } catch {
+    requestUrl = null;
+  }
+
+  const protocol =
+    firstHeaderValue(req.headers.get('x-forwarded-proto'))?.replace(/:$/, '') ||
+    requestUrl?.protocol.replace(/:$/, '') ||
+    'http';
+
+  for (const host of [
+    firstHeaderValue(req.headers.get('x-forwarded-host')),
+    firstHeaderValue(req.headers.get('host')),
+  ]) {
+    if (host) add(`${protocol}://${host}`);
+  }
+
+  // Configured canonical origin, and the bind-address origin so that direct local
+  // development and the e2e harness keep working without a proxy in front.
+  add(process.env.NEXT_PUBLIC_APP_URL?.trim());
+  if (requestUrl) add(requestUrl.origin);
+
+  return origins;
+}
+
 /**
  * Browser-side auth mutations must be same-origin. In particular, a sibling
  * subdomain can submit a no-CORS text/plain login form and the browser will
@@ -115,11 +171,13 @@ export function guardAuthMutationRequest(
 
   const origin = req.headers.get('origin');
   if (origin) {
+    let normalizedOrigin: string;
     try {
-      if (new URL(origin).origin !== new URL(req.url).origin) {
-        return authMutationRejection('Cross-origin auth mutation rejected', 403);
-      }
+      normalizedOrigin = new URL(origin).origin;
     } catch {
+      return authMutationRejection('Cross-origin auth mutation rejected', 403);
+    }
+    if (!acceptableAuthMutationOrigins(req).has(normalizedOrigin)) {
       return authMutationRejection('Cross-origin auth mutation rejected', 403);
     }
   }

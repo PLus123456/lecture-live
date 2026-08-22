@@ -97,14 +97,29 @@ describe('HTTP trusted proxy topology', () => {
     ).toBe('unknown');
   });
 
-  it('单跳缺少任一由 nginx 覆盖的客户端头时 fail closed', () => {
+  it('单跳只有 X-Forwarded-For 时仍解析出客户端（不退化为共享桶）', () => {
+    // 一跳下 XFF 的最右一项就是受信代理自己写的，缺 X-Real-IP 并不含糊。
+    // 曾要求两个头同时存在，导致只设 XFF 的代理（Traefik / 多数 k8s ingress /
+    // 手写 nginx）把全站请求塞进同一个 'unknown' 桶，一个限流额度 429 掉所有人。
     expect(
-      resolveRequestClientIp(
-        request({ 'x-forwarded-for': '198.51.100.10' })
-      )
-    ).toBe('unknown');
+      resolveRequestClientIp(request({ 'x-forwarded-for': '198.51.100.10' }))
+    ).toBe('198.51.100.10');
+  });
+
+  it('单跳只有 X-Real-IP、没有转发链时 fail closed', () => {
     expect(
       resolveRequestClientIp(request({ 'x-real-ip': '198.51.100.10' }))
+    ).toBe('unknown');
+  });
+
+  it('两个头同时存在但不一致时 fail closed（伪造伴随头不得放行）', () => {
+    expect(
+      resolveRequestClientIp(
+        request({
+          'x-forwarded-for': '198.51.100.10',
+          'x-real-ip': '203.0.113.7',
+        })
+      )
     ).toBe('unknown');
   });
 
@@ -182,8 +197,25 @@ describe('WebSocket peer + forwarded chain', () => {
     ).toBe('198.51.100.10');
   });
 
-  it('受信 nginx 缺少客户端头时 fail closed，不退化为共享 loopback 桶', () => {
-    expect(resolveSocketClientIp({ peerIp: '127.0.0.1' })).toBe('unknown');
+  it('受信 CIDR 内的 peer 完全不带代理头时按直连处理，用它自己的 socket 地址', () => {
+    // 回环恒在受信集合里，所以本地 `npm run dev:ws` 的直连也会走到这条分支。
+    // 曾一律判 'unknown'，而 websocket.ts 对 'unknown' 直接拒握手 —— 开发环境下
+    // 直播分享与实时转录整个连不上。peer 地址来自内核、无法伪造，按它计数是安全的。
+    expect(resolveSocketClientIp({ peerIp: '127.0.0.1' })).toBe('127.0.0.1');
+    expect(resolveSocketClientIp({ peerIp: '::1' })).toBe('::1');
+  });
+
+  it('受信 peer 带了代理头但解析不出一致链条时仍 fail closed', () => {
+    expect(
+      resolveSocketClientIp({
+        peerIp: '127.0.0.1',
+        forwardedFor: '198.51.100.10',
+        realIp: '203.0.113.7',
+      })
+    ).toBe('unknown');
+    expect(
+      resolveSocketClientIp({ peerIp: '127.0.0.1', realIp: '198.51.100.10' })
+    ).toBe('unknown');
   });
 
   it('非受信直接 peer 永远使用 socket 地址，忽略伪造头', () => {

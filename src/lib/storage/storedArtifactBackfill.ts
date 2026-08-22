@@ -11,6 +11,7 @@ import {
   CloudreveStorage,
 } from '@/lib/storage/cloudreve';
 import {
+  CHAT_QUOTA_ARTIFACT_TYPE_LIST,
   STORED_ARTIFACT_BACKFILL_COMPLETE,
   STORED_ARTIFACT_BACKFILL_MARKER,
   STORED_ARTIFACT_STATE,
@@ -725,12 +726,20 @@ async function finishBackfill() {
       // before this transaction finish first; later ones wait until the snapshot,
       // counter rebuild and marker publication are atomically visible.
       await tx.$queryRaw`SELECT id FROM User ORDER BY id ASC FOR UPDATE`;
+      // Rebuild only the chat-files dimension — the same filter reconcileStorageBytes
+      // uses. Recording/transcript/draft rows stay in the ledger (that is the point of
+      // the unified inventory) but must not be billed to the 100MB chat quota, or the
+      // backfill itself puts every existing FREE user over limit.
+      const chatTypes = CHAT_QUOTA_ARTIFACT_TYPE_LIST.map(
+        (type) => `'${type.replace(/'/g, "''")}'`
+      ).join(', ');
       await tx.$executeRawUnsafe(`
         UPDATE \`User\` \`u\`
         LEFT JOIN (
           SELECT \`userId\`, COALESCE(SUM(\`chargedBytes\`), 0) AS \`used\`
           FROM \`StoredArtifact\`
           WHERE \`chargedBytes\` > 0
+            AND \`artifactType\` IN (${chatTypes})
           GROUP BY \`userId\`
         ) \`a\` ON \`a\`.\`userId\` = \`u\`.\`id\`
         SET \`u\`.\`storageBytesUsed\` = COALESCE(\`a\`.\`used\`, 0)

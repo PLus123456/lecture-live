@@ -11,6 +11,7 @@ const {
   transactionMock,
   grantCreateMock,
   grantCountMock,
+  txGrantCountMock,
   grantAggregateMock,
   grantUpdateManyMock,
   queryRawMock,
@@ -22,10 +23,12 @@ const {
   const grantCreateMock = vi.fn();
   const grantUpdateManyMock = vi.fn();
   const queryRawMock = vi.fn();
+  const txGrantCountMock = vi.fn();
   return {
     transactionMock: vi.fn(),
     grantCreateMock,
     grantCountMock: vi.fn(),
+    txGrantCountMock,
     grantAggregateMock: vi.fn(),
     grantUpdateManyMock,
     queryRawMock,
@@ -38,6 +41,8 @@ const {
       sonioxStreamGrant: {
         create: grantCreateMock,
         updateMany: grantUpdateManyMock,
+        // L19：并发流数闸移进预扣事务后，tx 也要能 count。
+        count: txGrantCountMock,
       },
     },
   };
@@ -74,6 +79,7 @@ beforeEach(() => {
   transactionMock.mockReset();
   grantCreateMock.mockReset();
   grantCountMock.mockReset();
+  txGrantCountMock.mockReset();
   grantAggregateMock.mockReset();
   grantUpdateManyMock.mockReset();
   queryRawMock.mockReset();
@@ -91,6 +97,7 @@ beforeEach(() => {
   grantUpdateManyMock.mockResolvedValue({ count: 0 });
   queryRawMock.mockResolvedValue([]);
   grantCountMock.mockResolvedValue(0);
+  txGrantCountMock.mockResolvedValue(0);
   grantAggregateMock.mockResolvedValue({ _sum: { actualMs: null } });
 });
 
@@ -258,5 +265,70 @@ describe('countActiveStreamGrants', () => {
         mintedAt: { gte: new Date(NOW.getTime() - STREAM_GRANT_ACTIVE_WINDOW_MS) },
       },
     });
+  });
+});
+
+describe('L19 并发流数闸必须在预扣事务内生效', () => {
+  const INPUT = {
+    userId: 'u1',
+    kind: 'realtime' as const,
+    sessionId: 's1',
+    region: 'eu',
+  };
+
+  it('不传 maxActiveGrants → 完全不查（保持旧行为，路由不传时零影响）', async () => {
+    const r = await createStreamGrantWithReservation(INPUT);
+
+    expect(r.ok).toBe(true);
+    expect(txGrantCountMock).not.toHaveBeenCalled();
+  });
+
+  it('事务内数到已达上限 → 拒发，且**不留下悬挂预扣**（必须靠抛错回滚，不能 return）', async () => {
+    // 路由那道 countActiveStreamGrants 预检读到的是旧计数（并发脚本可以让 N 个请求同时通过），
+    // 真正的闸在预扣事务里 —— 上面 reserveTranscriptionMinutesUpTo 已对用户行 FOR UPDATE，
+    // 到这里同一用户的并发 mint 已被串行化，「数一遍 + 建行」才是原子的。
+    txGrantCountMock.mockResolvedValueOnce(7);
+
+    let rolledBack = false;
+    transactionMock.mockImplementationOnce(
+      async (cb: (tx: unknown) => Promise<unknown>) => {
+        try {
+          return await cb(TX);
+        } catch (err) {
+          // Prisma 只在回调**抛出**时回滚；正常 return 一律提交。预扣此刻已写进 used，
+          // 若实现用 return 表达「拒发」，这笔预留就会被提交、且永远没人释放。
+          rolledBack = true;
+          throw err;
+        }
+      }
+    );
+
+    const r = await createStreamGrantWithReservation({
+      ...INPUT,
+      maxActiveGrants: 7,
+    });
+
+    expect(r).toEqual({ ok: false, reason: 'too_many_streams' });
+    expect(rolledBack).toBe(true);
+    expect(grantCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('事务内数到未达上限 → 正常签发', async () => {
+    txGrantCountMock.mockResolvedValueOnce(6);
+
+    const r = await createStreamGrantWithReservation({
+      ...INPUT,
+      maxActiveGrants: 7,
+    });
+
+    expect(r.ok).toBe(true);
+    expect(txGrantCountMock).toHaveBeenCalledWith({
+      where: {
+        userId: 'u1',
+        settledAt: null,
+        mintedAt: { gte: expect.any(Date) },
+      },
+    });
+    expect(grantCreateMock).toHaveBeenCalled();
   });
 });

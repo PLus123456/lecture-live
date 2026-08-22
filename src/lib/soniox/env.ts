@@ -5,6 +5,7 @@ import {
 } from '@/types/transcript';
 import { prisma } from '@/lib/prisma';
 import { decrypt } from '@/lib/crypto';
+import { getTrustedForwardedIp, shouldTrustProxyHeaders } from '@/lib/clientIp';
 
 const DEFAULT_REGION: SonioxRegion = 'us';
 
@@ -134,9 +135,21 @@ function detectRegionFromHeaders(headers?: Headers): SonioxRegion | null {
     }
   }
 
-  const forwardedFor = headers.get('x-forwarded-for')?.split(',')[0]?.trim();
-  const realIp = headers.get('x-real-ip')?.trim();
-  const clientIp = forwardedFor || realIp || '';
+  // L10：这里曾取 X-Forwarded-For 的**最左**段，与全项目 IP 安全口径正好相反 ——
+  // `clientIp.ts:getTrustedForwardedIp` 白纸黑字写着：nginx 的 `$proxy_add_x_forwarded_for`
+  // 会把客户端自带的 XFF 原样透传、再在**末尾**追加真实 remote_addr，所以最左段是攻击者可
+  // 随手伪造的，最后一段才是本机反代写入的。改为复用同一套解析：
+  //   ① 不信任代理头（TRUSTED_PROXY 未开）时压根不看这两个头 —— 直连场景它们只能来自客户端；
+  //   ② 信任时优先 X-Real-IP（nginx 设为 $remote_addr，覆盖伪造值），再回退 XFF 最后一段。
+  // 影响面本就很小（只决定「有公网客户端 IP 时用同步 env 默认区，否则用 DB 默认区」），
+  // 但没有理由在一个文件里留一份和全项目相反的 IP 口径。
+  if (!shouldTrustProxyHeaders()) {
+    return null;
+  }
+  const clientIp =
+    headers.get('x-real-ip')?.trim() ||
+    getTrustedForwardedIp(headers.get('x-forwarded-for')) ||
+    '';
 
   if (clientIp && !isPrivateIp(clientIp)) {
     return getDefaultRegion();

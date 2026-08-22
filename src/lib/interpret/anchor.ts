@@ -17,8 +17,10 @@ const ANCHOR_TTL_SECONDS = 12 * 60 * 60;
 export const MAX_INTERPRET_DURATION_MS = 6 * 60 * 60_000;
 // 容差：吸收 deduct 相对 stop 的网络延迟 + 前端计时抖动，避免冤枉诚实用户
 const ANCHOR_TOLERANCE_MS = 60_000;
-// anchorId 由本服务用 randomUUID 生成；deduct 收到的是前端回传值，须校验格式防 Redis key 注入
-const ANCHOR_ID_RE = /^[0-9a-fA-F-]{36}$/;
+// anchorId 由本服务用 randomUUID 生成；deduct 收到的是前端回传值，须校验格式防 Redis key 注入。
+// L30：导出供 /api/interpret/deduct 在入口处一次性收窄 —— 那里除了拼 Redis key 还会把它直接
+// 用于 InterpretSession 的 DB 查询/写入，不能只在 Redis 侧防。
+export const ANCHOR_ID_RE = /^[0-9a-fA-F-]{36}$/;
 
 function anchorKey(userId: string, anchorId: string): string {
   return `${ANCHOR_KEY_PREFIX}${userId}:${anchorId}`;
@@ -48,9 +50,21 @@ export async function createInterpretAnchor(
   }
 }
 
+// M8：老 Redis（< 6.2，GETDEL 会回 "unknown command"）下的原子回退。Lua 脚本在 Redis 服务端
+// 整体原子执行，语义与 GETDEL 等价。经 client.call('EVAL', ...) 下发（纯 Redis 命令，与 JS 的
+// eval 无关）。
+const ATOMIC_GET_DEL_LUA =
+  "local v = redis.call('GET', KEYS[1]); if v then redis.call('DEL', KEYS[1]) end; return v";
+
 /**
  * 读取并删除（一次性消费）会话锚点，返回 startedAt(ms) 或 null。
  * 删除保证同一锚点不会被重复扣费；查不到（过期 / 已消费 / 伪造）返回 null。
+ *
+ * M8：这一步必须是**原子**的。旧实现是 `get` 之后再 `del` 两条独立命令 —— 两个并发 /deduct
+ * （前端超时重试 / 双击）能同时读到同一个 startedAt，各自判为 anchored 并按服务端墙钟各扣
+ * 一次（双扣，自伤型）。改用 Redis 6.2 的 GETDEL：读与删在服务端同一条命令内完成，天然只有
+ * 一方拿得到值，另一方拿到 null → 走 anchored=false 的降级路径，再被 deduct 路由的一次性
+ * 扣费凭据挡住（见 route.ts 的 no_record 分支）。
  */
 export async function consumeInterpretAnchor(
   userId: string,
@@ -62,8 +76,15 @@ export async function consumeInterpretAnchor(
 
   const key = anchorKey(userId, anchorId);
   try {
-    const raw = await redis.get(key);
-    await redis.del(key); // 无论是否命中都删，确保一次性
+    let raw: string | null;
+    try {
+      raw = await redis.getdel(key);
+    } catch {
+      // GETDEL 不可用（Redis < 6.2）：Lua 脚本同样原子。
+      raw = (await redis.call('EVAL', ATOMIC_GET_DEL_LUA, '1', key)) as
+        | string
+        | null;
+    }
     if (!raw) return null;
     const startedAt = Number(raw);
     return Number.isFinite(startedAt) ? startedAt : null;

@@ -3,6 +3,7 @@ import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { assertOwnership } from '@/lib/security';
 import {
+  TranscriptDraftRejectedError,
   deleteTranscriptDraft,
   loadTranscriptDraft,
   loadTranscriptDraftManifest,
@@ -133,13 +134,43 @@ export async function PUT(
       currentSessionIndex: typeof body.currentSessionIndex === 'number' ? body.currentSessionIndex : undefined,
     };
 
-    const manifest = await persistTranscriptDraft(result.session, payload);
+    // L17②：上面那两道终态守卫查完之后，还要 req.text() + JSON.parse 一份最大 8MiB 的载荷；
+    // 这段时间足够 finalize 跑完（seal → 读快照 → 删草稿目录）。把守卫做成回调传下去，由
+    // persistTranscriptDraft 在临界区内紧贴写盘前后各求值一次：写前拒 = 一个字节都不落，
+    // 写后拒 = 补偿删除刚被重建出来的孤儿草稿目录。
+    const stillWritable = async () => {
+      if (await isRecordingDraftSealed(result.session)) {
+        return false;
+      }
+      // finalize 收尾会连录音草稿一起删掉（sealedAt 随之消失），所以不能只看 seal —— 再按
+      // **当前** DB 状态复核一次终态（入口读到的 session 快照此刻已经陈旧）。
+      const fresh = await prisma.session.findUnique({
+        where: { id },
+        select: { status: true },
+      });
+      if (!fresh) return false;
+      return fresh.status !== 'COMPLETED' && fresh.status !== 'ARCHIVED';
+    };
+
+    const manifest = await persistTranscriptDraft(result.session, payload, {
+      guard: stillWritable,
+    });
     return NextResponse.json({
       success: true,
       segmentCount: manifest.segmentCount,
       updatedAt: manifest.updatedAt,
     });
   } catch (error) {
+    if (error instanceof TranscriptDraftRejectedError) {
+      return NextResponse.json(
+        {
+          error:
+            'Recording draft is sealed; transcript draft writes no longer accepted',
+          sealed: true,
+        },
+        { status: 409 }
+      );
+    }
     console.error('保存转录稿草稿失败:', error);
     return NextResponse.json(
       { error: 'Failed to save transcript draft' },

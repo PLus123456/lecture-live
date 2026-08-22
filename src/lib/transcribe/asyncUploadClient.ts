@@ -95,22 +95,32 @@ export function startAsyncUpload(opts: StartOptions): {
     // ── 2. 分片上传（并发 + 进度） ──
     opts.onStatusChange?.('uploading_chunks');
     let uploadedCount = 0;
-    await runWithConcurrency(totalChunks, CONCURRENCY, async (seq) => {
-      const start = seq * CHUNK_SIZE;
-      const end = Math.min(opts.file.size, start + CHUNK_SIZE);
-      const blob = opts.file.slice(start, end);
+    // L18：分片阶段专属的 abort 控制器，与外部 composed（用户取消）合并。某一分片 fatal 时
+    // 只 abort 这一个 —— composed 保持未 abort，故外层 catch 仍能把真实错误报成 failed，
+    // 而不是被误判成用户主动 canceled。
+    const chunkAbort = new AbortController();
+    const chunkSignal = anySignal([composed, chunkAbort.signal]);
+    await runWithConcurrency(
+      totalChunks,
+      CONCURRENCY,
+      async (seq) => {
+        const start = seq * CHUNK_SIZE;
+        const end = Math.min(opts.file.size, start + CHUNK_SIZE);
+        const blob = opts.file.slice(start, end);
 
-      await uploadOneChunkWithRetry({
-        sessionId: opts.sessionId,
-        seq,
-        blob,
-        token: opts.authToken,
-        signal: composed,
-      });
+        await uploadOneChunkWithRetry({
+          sessionId: opts.sessionId,
+          seq,
+          blob,
+          token: opts.authToken,
+          signal: chunkSignal,
+        });
 
-      uploadedCount += 1;
-      opts.onUploadProgress?.(uploadedCount / totalChunks);
-    });
+        uploadedCount += 1;
+        opts.onUploadProgress?.(uploadedCount / totalChunks);
+      },
+      chunkAbort
+    );
 
     // ── 3. finalize ──
     await callJson(
@@ -327,25 +337,50 @@ async function uploadOneChunk(args: {
   }
 }
 
+/**
+ * 有界并发执行 worker(0..total-1)。
+ *
+ * L18：任一分片彻底失败（重试用尽）即视为 fatal —— 整条 pipeline 已经注定失败，兄弟 runner
+ * 必须立刻停手。旧实现用 `Promise.all`：它在第一个 reject 时就把结果抛给调用方，但**其余
+ * runner 照常继续取分片、继续 POST**，于是 finalize 永远不会被调用、服务端留下一个永不
+ * finalize 的分片目录（只能等 TTL 回收），而用户这边的上传带宽还在被白白吃掉。
+ * 现在：① 记下首个错误并让其它 runner 在下一轮循环里直接退出；② 通过 `onFatal` 触发外部
+ * AbortController 打断**在途**的 fetch 与退避 sleep；③ `allSettled` 等所有 runner 真正落地
+ * 之后才抛出首个错误 —— 调用方拿到 reject 时保证已经没有在途请求。
+ */
 async function runWithConcurrency<T>(
   total: number,
   concurrency: number,
-  worker: (index: number) => Promise<T>
+  worker: (index: number) => Promise<T>,
+  onFatal?: AbortController
 ): Promise<void> {
   let nextIndex = 0;
+  let firstError: unknown = null;
   const runners: Promise<void>[] = [];
   for (let i = 0; i < Math.min(concurrency, total); i++) {
     runners.push(
       (async () => {
         while (true) {
+          if (firstError !== null) return; // 兄弟 runner 已 fatal
           const idx = nextIndex++;
           if (idx >= total) return;
-          await worker(idx);
+          try {
+            await worker(idx);
+          } catch (err) {
+            if (firstError === null) {
+              firstError = err;
+              onFatal?.abort();
+            }
+            return;
+          }
         }
       })()
     );
   }
-  await Promise.all(runners);
+  await Promise.allSettled(runners);
+  if (firstError !== null) {
+    throw firstError;
+  }
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

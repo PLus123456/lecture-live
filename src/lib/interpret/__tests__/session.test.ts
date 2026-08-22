@@ -162,15 +162,24 @@ describe('claimInterpretSessionForDeduct', () => {
     const r = await claimInterpretSessionForDeduct('u1', 'a1', ANCHOR_TS);
 
     expect(r).toEqual({ outcome: 'claimed', sessionId: 's-mint-B' });
-    // 精确回退：只认 null-anchor(不动别流的 anchorId 非空行) 且 startedAt >= 本流锚点起点(排除上一场残留)
+    // 精确回退：只认 null-anchor(不动别流的 anchorId 非空行)，且 startedAt 被**上下界夹住**、
+    // 取窗口内最早一条（L26）。
+    //   下界 = 锚点起点 - 5s 时钟容差：排除上一场/更早的残留锚点；
+    //   上界 = 锚点起点 + 10min：诚实客户端「/start 拿 anchorId → 立刻 mint」，本流的 mint 锚点
+    //          必定紧跟其后。没有上界时（旧实现只有下界 + orderBy desc），并发标签页里**后启动**
+    //          的流的锚点也满足条件，且恰好排在最前 → 先结束的流把后启动那条流的锚点结算掉，
+    //          后者结束时无锚点可认领、走 no_record 再扣一次（被双扣）。
     expect(findFirstMock).toHaveBeenNthCalledWith(2, {
       where: {
         userId: 'u1',
         settledAt: null,
         anchorId: null,
-        startedAt: { gte: new Date(ANCHOR_TS - 5_000) },
+        startedAt: {
+          gte: new Date(ANCHOR_TS - 5_000),
+          lte: new Date(ANCHOR_TS + 10 * 60_000),
+        },
       },
-      orderBy: { startedAt: 'desc' },
+      orderBy: { startedAt: 'asc' },
       select: { id: true, settledAt: true },
     });
     expect(updateManyMock).toHaveBeenCalledWith({

@@ -13,6 +13,7 @@ import { getBillableMinutes } from '@/lib/billing';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger } from '@/lib/logger';
 import {
+  ANCHOR_ID_RE,
   MAX_INTERPRET_DURATION_MS,
   consumeInterpretAnchor,
   resolveBillableInterpretMs,
@@ -53,11 +54,20 @@ export async function POST(req: Request) {
     return rateLimited;
   }
 
-  const body = (await req.json()) as {
+  // L30：畸形 JSON 不能变成未捕获异常返回 500 —— 那是客户端错误，语义上必须是 400。
+  let body: {
     durationMs?: number;
     translationMode?: TranslationMode;
     anchorId?: string;
   };
+  try {
+    body = (await req.json()) as typeof body;
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
+  }
 
   const now = Date.now();
   const frontendMs =
@@ -65,11 +75,23 @@ export async function POST(req: Request) {
       ? body.durationMs
       : 0;
 
+  // L30：anchorId 是本服务用 randomUUID 生成的，格式固定。此前不做任何校验就直接拿去查 DB
+  // （consumeInterpretAnchor 内部有同款正则，但 claimInterpretSessionForDeduct 的 DB 查询之前
+  // 一道都没有）。这里在入口收窄。
+  // **刻意 400 而不是「当没带 anchorId 处理」**：后者会把畸形输入悄悄改道到「降级盲认领最旧
+  // 未结算锚点」那条路径上去 —— 换了一条完全不同的结算语义，是比不校验更糟的惊喜。真实客户端
+  // 只会送 null 或一个 randomUUID，送出畸形值的必然是坏掉/改装的客户端，明确拒绝即可
+  // （本场锚点原地不动，交给 cron 按实测兜底）。
+  const rawAnchorId = typeof body.anchorId === 'string' ? body.anchorId : null;
+  if (rawAnchorId !== null && !ANCHOR_ID_RE.test(rawAnchorId)) {
+    return NextResponse.json({ error: 'Invalid anchorId' }, { status: 400 });
+  }
+  const anchorIdForClaim = rawAnchorId;
+
   // 消费服务端锚点（一次性，读取后即删，防重复扣）
-  const anchorStartedAt =
-    typeof body.anchorId === 'string'
-      ? await consumeInterpretAnchor(payload.id, body.anchorId)
-      : null;
+  const anchorStartedAt = anchorIdForClaim
+    ? await consumeInterpretAnchor(payload.id, anchorIdForClaim)
+    : null;
 
   // 无锚点且前端也没报有效时长：保持旧行为返回 400
   if (anchorStartedAt === null && frontendMs <= 0) {
@@ -100,9 +122,6 @@ export async function POST(req: Request) {
       'interpret deduct without server anchor; trusting client durationMs'
     );
   }
-
-  const anchorIdForClaim =
-    typeof body.anchorId === 'string' ? body.anchorId : null;
 
   // B3：把「认领会话 + 扣费 + 记台账 + 回填实扣」放进**一个事务**原子提交。任一步失败整体回滚 →
   // 会话保持未结算(settledAt=null)、由 cron 兜底，杜绝「已结算却没扣费」的静默免单（审查 R2/R7）。
@@ -156,6 +175,33 @@ export async function POST(req: Request) {
         claim.outcome === 'already_settled' ||
         (claim.outcome === 'no_record' && anchorIdForClaim === null) ||
         billableMinutes <= 0;
+
+      // M8：`no_record + 有 anchorId` 是「正常扣费兜底」路径，可它没有任何幂等闸 ——
+      // settledAt CAS 互斥的前提是有行可认领，而这条路径的成因恰恰是**没有行**（/start 落
+      // InterpretSession 是 best-effort，DB 一抖就只 warn 吞错，锚点却已返给客户端）。于是
+      // 同一 anchorId 重复 POST（前端超时重试 / 双击）会被扣两次。
+      // 一次性扣费凭据：就地把这条缺失的锚点行补上，settledAt 直接置位=已结算。它与扣费**同
+      // 事务**提交（同生共死，不需要任何补偿逻辑），此后同一 anchorId 的 deduct 会在
+      // claimInterpretSessionForDeduct 里按 anchorId 命中它 → already_settled → 跳过扣费。
+      // 无论本次是否真扣到钱都要写（billableMinutes=0 的空场同样要占住这个 anchorId，否则
+      // 重试时客户端换一个更大的 durationMs 就能把降级路径再走一遍）。
+      // 顺带补上了原本完全缺失的审计行。
+      if (claim.outcome === 'no_record' && anchorIdForClaim !== null) {
+        await tx.interpretSession.create({
+          data: {
+            userId: payload.id,
+            anchorId: anchorIdForClaim,
+            startedAt:
+              anchorStartedAt != null
+                ? new Date(anchorStartedAt)
+                : new Date(now - chargeMs),
+            settledAt: new Date(now),
+            settledBy: 'deduct_no_record',
+            billedMinutes: skip ? 0 : billableMinutes,
+          },
+        });
+      }
+
       if (skip) {
         return { charged: false, billableMinutes: 0, snapshot: null };
       }

@@ -40,16 +40,22 @@ async function measureClientLatency(url: string): Promise<number | null> {
 
 /**
  * 测量单个区域的延迟（3 次取中位数）。
+ *
+ * L21：三次必须**串行**。旧实现是 `Promise.all([...三次...])` —— 三个请求几乎同时发出，
+ * 第 2、3 次会复用第 1 次正在建立/已建立的 TCP+TLS 连接（HTTP keep-alive / HTTP2 多路复用），
+ * 只剩 1×RTT，而我们要测的恰恰是「建一条新连接到这个区域要多久」。于是中位数系统性偏小、
+ * 且偏小的幅度因区域而异（握手成本越高的区域被低估越多），选区决策被系统性带偏。
+ * 串行发出后每次都完整承担一次请求往返，样本口径才与真实建连成本一致。
+ * 代价：单区域测量从 ~1 个 RTT 变成 ~3 个（三区仍并行，总耗时不变量级），且结果缓存 5 分钟。
  */
 async function pingRegion(
   region: string,
   target: { label: string; url: string }
 ): Promise<ClientPingResult> {
-  const pings = await Promise.all([
-    measureClientLatency(target.url),
-    measureClientLatency(target.url),
-    measureClientLatency(target.url),
-  ]);
+  const pings: Array<number | null> = [];
+  for (let i = 0; i < 3; i++) {
+    pings.push(await measureClientLatency(target.url));
+  }
   const valid = pings
     .filter((p): p is number => p !== null)
     .sort((a, b) => a - b);

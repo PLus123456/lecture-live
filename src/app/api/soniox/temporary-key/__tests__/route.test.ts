@@ -217,6 +217,9 @@ describe('POST temporary-key — 成功路径的 Soniox 参数（L1 三件套）
       sessionId: 'sess-1',
       interpretSessionId: null,
       region: 'eu',
+      // L19：同一个流数上限也传进预扣事务 —— 上面那道 countActiveStreamGrants 预检是
+      // 「读完再建行」的 check-then-act 近似值，并发请求可以集体越闸；事务内那道才是真闸。
+      maxActiveGrants: 3,
     });
 
     const body = JSON.parse(fetchMock.mock.calls[0][1].body as string);

@@ -87,6 +87,15 @@ export class TokenProcessor {
 
   private static SENTENCE_END_RE = /[.!?。！？；]\s*$/;
   private static readonly MAX_RECENT_TRANSLATION_SEGMENTS = 64;
+  /**
+   * L16：待归属翻译 token 的硬上限。`pendingTranslationTokens` 装的是「当前既落不进任何在册
+   * 已结算段、也落不进当前段」的翻译 token，等后续段落结算时再试。可 `recentTranslationSegments`
+   * 只保留最近 64 段（FIFO 淘汰），一旦某个 token 对应的段被淘汰，它就**永远**匹配不上 ——
+   * 旧实现既不丢弃也不设上限，于是数小时双向同传 + 时间戳漂移下它只增不减，而每次段落结算
+   * 都要对整个数组全量重扫（flushPendingTranslationTokens），内存与 CPU 一起缓慢劣化。
+   * 现在双管齐下：入队时 FIFO 封顶，flush 时按「最老在册段的起点」为地平线丢弃已无望的 token。
+   */
+  private static readonly MAX_PENDING_TRANSLATION_TOKENS = 512;
 
   private onSegmentFinalized?: (segment: TranscriptSegment) => void;
   private onPreviewUpdate?: (preview: StreamingPreviewText) => void;
@@ -589,7 +598,14 @@ export class TokenProcessor {
         continue;
       }
 
+      // L16：入队即封顶（FIFO 丢最老的）。最老的那些正是最没希望再匹配上的。
       this.pendingTranslationTokens.push(queuedToken);
+      if (
+        this.pendingTranslationTokens.length >
+        TokenProcessor.MAX_PENDING_TRANSLATION_TOKENS
+      ) {
+        this.pendingTranslationTokens.shift();
+      }
     }
 
     for (const [segmentId, groupedTokens] of finalizedGroups.entries()) {
@@ -611,6 +627,15 @@ export class TokenProcessor {
   private flushPendingTranslationTokens() {
     if (this.pendingTranslationTokens.length === 0) return;
 
+    // L16：地平线 = 最老一条**仍在册**的已结算段的起点（减去匹配容差）。段落淘汰是 FIFO 且
+    // 时间只向前走，所以早于这个点的 token 既配不上任何在册段（更老的都被淘汰了），也配不上
+    // 当前段（它比在册段更晚）—— 永久无望，就地丢弃。没有在册段时不设地平线（刚开始录，
+    // 后面的段还没结算出来，此时的 pending 仍有希望）。
+    const oldestTracked = this.recentTranslationSegments[0];
+    const horizonMs = oldestTracked
+      ? oldestTracked.startMs - TRANSLATION_MATCH_TOLERANCE_MS
+      : null;
+
     const unresolved: PendingTranslationToken[] = [];
     for (const token of this.pendingTranslationTokens) {
       if (token.globalTimeMs != null) {
@@ -624,11 +649,24 @@ export class TokenProcessor {
           this.applyTokensToCurrentPreview([token]);
           continue;
         }
+
+        if (horizonMs != null && token.globalTimeMs < horizonMs) {
+          continue; // 对应段已被淘汰，永远匹配不上了
+        }
       }
 
       unresolved.push(token);
     }
 
+    // 兜底封顶（例如长时间没有任何段结算、地平线一直为 null 的病态形态）。
+    if (
+      unresolved.length > TokenProcessor.MAX_PENDING_TRANSLATION_TOKENS
+    ) {
+      unresolved.splice(
+        0,
+        unresolved.length - TokenProcessor.MAX_PENDING_TRANSLATION_TOKENS
+      );
+    }
     this.pendingTranslationTokens = unresolved;
   }
 
@@ -760,11 +798,16 @@ export class TokenProcessor {
   buildAllSegments(): TranscriptSegment[] {
     const segments: TranscriptSegment[] = [];
     for (const session of this.sessions) {
+      // L22：段 id 曾是 `${session.index}-${start_ms ?? 0}` —— start_ms 缺失时全部塌成
+      // `<idx>-0`，同一毫秒起点的相邻 token 也会撞成同一个 id。下游（asyncTranscriptConverter
+      // 的回退路径）按 id 索引译文，重复 id 会把译文串到别的段上。补一个会话内单调递增的序号
+      // 做 tiebreaker：仍保留原来的 index/start_ms 前缀（可读、可排序），但保证全局唯一。
+      let ordinal = 0;
       for (const token of session.finalTokens) {
         const globalStartMs = session.timeOffsetMs + (token.start_ms ?? 0);
         const globalEndMs = session.timeOffsetMs + (token.end_ms ?? 0);
         segments.push({
-          id: `${session.index}-${token.start_ms ?? 0}`,
+          id: `${session.index}-${token.start_ms ?? 0}-${ordinal++}`,
           sessionIndex: session.index,
           speaker: token.speaker || '1',
           language: token.language || 'en',

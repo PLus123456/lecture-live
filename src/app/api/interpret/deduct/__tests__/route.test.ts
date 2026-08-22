@@ -17,6 +17,7 @@ const {
   resolveBillableMock,
   transactionMock,
   interpretSessionUpdateMock,
+  interpretSessionCreateMock,
   logSystemEventMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
@@ -30,6 +31,7 @@ const {
   resolveBillableMock: vi.fn(),
   transactionMock: vi.fn(),
   interpretSessionUpdateMock: vi.fn(),
+  interpretSessionCreateMock: vi.fn(),
   logSystemEventMock: vi.fn(),
 }));
 
@@ -57,6 +59,8 @@ vi.mock('@/lib/billing', () => ({
 vi.mock('@/lib/auditLog', () => ({ logSystemEvent: logSystemEventMock }));
 vi.mock('@/lib/interpret/anchor', () => ({
   MAX_INTERPRET_DURATION_MS: 6 * 60 * 60_000,
+  // L30：路由入口现在用它校验 anchorId 形状（畸形值 400），mock 里要给出真值。
+  ANCHOR_ID_RE: /^[0-9a-fA-F-]{36}$/,
   consumeInterpretAnchor: consumeAnchorMock,
   resolveBillableInterpretMs: resolveBillableMock,
 }));
@@ -88,17 +92,27 @@ beforeEach(() => {
   recordUsageMock.mockReset().mockResolvedValue(undefined);
   getSnapshotMock.mockReset().mockResolvedValue({ role: 'FREE' });
   interpretSessionUpdateMock.mockReset().mockResolvedValue(undefined);
+  interpretSessionCreateMock.mockReset().mockResolvedValue({ id: 'is-new' });
   logSystemEventMock.mockReset();
   transactionMock
     .mockReset()
     .mockImplementation(async (cb: (tx: unknown) => Promise<unknown>) =>
-      cb({ interpretSession: { update: interpretSessionUpdateMock } })
+      cb({
+        interpretSession: {
+          update: interpretSessionUpdateMock,
+          // M8：no_record + 有 anchorId 时要在同事务补一行「一次性扣费凭据」。
+          create: interpretSessionCreateMock,
+        },
+      })
     );
 });
 
+// L30：anchorId 现在在路由入口按 randomUUID 的形状校验（畸形值 400）。测试夹具改用真 UUID 形状。
+const ANCHOR_ID = '11111111-2222-4333-8444-555555555555';
+
 describe('POST interpret/deduct — R1-L2 grants 结算挂钩', () => {
   it('claimed → 事务内 settleStreamGrants({interpretSessionId}) + 扣费', async () => {
-    const res = await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
+    const res = await POST(req({ durationMs: 600_000, anchorId: ANCHOR_ID }));
     expect(res.status).toBe(200);
     expect(settleGrantsMock).toHaveBeenCalledWith(
       { interpretSessionId: 'is-1' },
@@ -114,7 +128,7 @@ describe('POST interpret/deduct — R1-L2 grants 结算挂钩', () => {
       mismatch: false,
       anchored: true,
     });
-    const res = await POST(req({ durationMs: 0, anchorId: 'a1' }));
+    const res = await POST(req({ durationMs: 0, anchorId: ANCHOR_ID }));
     expect(res.status).toBe(200);
     expect(settleGrantsMock).toHaveBeenCalledTimes(1);
     expect(deductMock).not.toHaveBeenCalled();
@@ -122,7 +136,7 @@ describe('POST interpret/deduct — R1-L2 grants 结算挂钩', () => {
 
   it('already_settled（cron 已兜底）→ 不结算 grants、不扣费', async () => {
     claimMock.mockResolvedValueOnce({ outcome: 'already_settled', sessionId: 'is-1' });
-    const res = await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
+    const res = await POST(req({ durationMs: 600_000, anchorId: ANCHOR_ID }));
     expect(res.status).toBe(200);
     expect(settleGrantsMock).not.toHaveBeenCalled();
     expect(deductMock).not.toHaveBeenCalled();
@@ -130,10 +144,91 @@ describe('POST interpret/deduct — R1-L2 grants 结算挂钩', () => {
 
   it('no_record（无锚点行）→ 不结算 grants（无键可循，留给 usage cron），有 anchorId 时仍扣费', async () => {
     claimMock.mockResolvedValueOnce({ outcome: 'no_record', sessionId: null });
-    const res = await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
+    const res = await POST(req({ durationMs: 600_000, anchorId: ANCHOR_ID }));
     expect(res.status).toBe(200);
     expect(settleGrantsMock).not.toHaveBeenCalled();
     expect(deductMock).toHaveBeenCalledWith('user-1', 10, expect.anything());
+  });
+});
+
+describe('M8 no_record + 有 anchorId：一次性扣费凭据', () => {
+  it('扣费的同一事务里补一行 settledAt 已置位的锚点，堵住重复 POST 双扣', async () => {
+    // 成因：/start 落 InterpretSession 是 best-effort（DB 一抖只 warn 吞错），可 anchorId 已经
+    // 返给客户端了。于是 deduct 走 no_record + 有 anchorId 这条「正常扣费兜底」，而它没有任何
+    // 幂等闸（settledAt CAS 的前提是有行可认领，这条路径恰恰没有行）→ 同一 anchorId 重复 POST
+    // （前端超时重试/双击）被扣两次。
+    claimMock.mockResolvedValueOnce({ outcome: 'no_record', sessionId: null });
+
+    const res = await POST(req({ durationMs: 600_000, anchorId: ANCHOR_ID }));
+
+    expect(res.status).toBe(200);
+    expect(interpretSessionCreateMock).toHaveBeenCalledTimes(1);
+    const created = interpretSessionCreateMock.mock.calls[0][0].data;
+    expect(created).toMatchObject({
+      userId: 'user-1',
+      anchorId: ANCHOR_ID,
+      settledBy: 'deduct_no_record',
+      billedMinutes: 10,
+    });
+    // settledAt 必须**已置位** —— 它就是凭据本身：第二次同 anchorId 的 deduct 会在
+    // claimInterpretSessionForDeduct 里按 anchorId 命中它 → already_settled → 跳过扣费。
+    expect(created.settledAt).toBeInstanceOf(Date);
+  });
+
+  it('本次没扣到钱（billable=0 的空场）也要占住这个 anchorId', async () => {
+    // 否则重试时客户端换一个更大的 durationMs 就能把这条降级路径再走一遍。
+    claimMock.mockResolvedValueOnce({ outcome: 'no_record', sessionId: null });
+    resolveBillableMock.mockReturnValueOnce({
+      effectiveMs: 0,
+      mismatch: false,
+      anchored: true,
+    });
+
+    await POST(req({ durationMs: 0, anchorId: ANCHOR_ID }));
+
+    expect(deductMock).not.toHaveBeenCalled();
+    expect(interpretSessionCreateMock).toHaveBeenCalledTimes(1);
+    expect(interpretSessionCreateMock.mock.calls[0][0].data).toMatchObject({
+      anchorId: ANCHOR_ID,
+      billedMinutes: 0,
+    });
+  });
+
+  it('降级路径（不带 anchorId）不建凭据行 —— 无 anchorId 可占，建了反而污染 cron 扫描', async () => {
+    claimMock.mockResolvedValueOnce({ outcome: 'no_record', sessionId: null });
+    consumeAnchorMock.mockResolvedValueOnce(null);
+    resolveBillableMock.mockReturnValueOnce({
+      effectiveMs: 60_000,
+      mismatch: false,
+      anchored: false,
+    });
+
+    await POST(req({ durationMs: 60_000 }));
+
+    expect(interpretSessionCreateMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('L30 请求体校验', () => {
+  it('畸形 JSON → 400（旧代码是未捕获异常 500）', async () => {
+    const bad = new Request('http://localhost/api/interpret/deduct', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{not json',
+    });
+
+    const res = await POST(bad);
+
+    expect(res.status).toBe(400);
+    expect(claimMock).not.toHaveBeenCalled();
+  });
+
+  it('anchorId 形状不合法 → 400，且绝不改道去走「降级盲认领最旧锚点」', async () => {
+    const res = await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
+
+    expect(res.status).toBe(400);
+    expect(consumeAnchorMock).not.toHaveBeenCalled();
+    expect(claimMock).not.toHaveBeenCalled();
   });
 });
 
@@ -208,7 +303,7 @@ describe('POST interpret/deduct — P3-8 降级路径（无 anchorId 盲认领�
       actualMsTotal: 42 * 60_000,
     });
 
-    await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
+    await POST(req({ durationMs: 600_000, anchorId: ANCHOR_ID }));
 
     expect(deductMock).toHaveBeenCalledWith('user-1', 10, expect.anything());
   });
@@ -220,7 +315,7 @@ describe('POST interpret/deduct — P6-7 按用户限流', () => {
       new Response(JSON.stringify({ error: 'Too many requests' }), { status: 429 })
     );
 
-    const res = await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
+    const res = await POST(req({ durationMs: 600_000, anchorId: ANCHOR_ID }));
 
     expect(res.status).toBe(429);
     expect(claimMock).not.toHaveBeenCalled();
@@ -229,7 +324,7 @@ describe('POST interpret/deduct — P6-7 按用户限流', () => {
   });
 
   it('限流按 user 分桶（scope + key），且在鉴权之后', async () => {
-    await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
+    await POST(req({ durationMs: 600_000, anchorId: ANCHOR_ID }));
 
     expect(enforceRateLimitMock).toHaveBeenCalledWith(
       expect.anything(),
@@ -243,7 +338,7 @@ describe('POST interpret/deduct — P6-7 按用户限流', () => {
   it('未鉴权 → 401 且不进限流（先鉴权后按 user 分桶）', async () => {
     verifyAuthMock.mockResolvedValueOnce(null);
 
-    const res = await POST(req({ durationMs: 600_000, anchorId: 'a1' }));
+    const res = await POST(req({ durationMs: 600_000, anchorId: ANCHOR_ID }));
 
     expect(res.status).toBe(401);
     expect(enforceRateLimitMock).not.toHaveBeenCalled();

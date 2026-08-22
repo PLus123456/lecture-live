@@ -60,6 +60,15 @@ export function useInterpret() {
   const [elapsedMs, setElapsedMs] = useState(0);
 
   const recordingRef = useRef<{ recording: RecordingHandle; client: unknown } | null>(null);
+  // H3：同传的运行代次。start() 有两个 await 窗口（建锚点的 fetch、startSonioxRecording 的
+  // mint key + WS 握手，合计可达数秒），窗口里点「停止」或导航离开时 stop()/卸载读到的
+  // recordingRef 还是 null → 句柄相关全部 no-op，但照常结算扣费并置 isRunning(false)；随后
+  // start 的后半段无条件把句柄/计时器/轮换定时器装回去，于是麦克风常亮、转录持续、**永不
+  // 再计费**，而 scheduleRotation 建的轮换定时器每 ~15 分钟自我重建一条 Soniox 连接，孤儿
+  // 自我续命。isStartingRef 那把重入锁只挡并发 start，挡不住 stop。
+  // 不变式：stop() 与卸载清理在**任何 await 之前**同步 bump 本代次；start/rotate 的每个
+  // await 之后都必须复查代次，过期即就地拆掉已经建起来的资源（停 WS、清定时器），绝不发布。
+  const runIdRef = useRef(0);
   const processorRef = useRef<TokenProcessor | null>(null);
   const startTimeRef = useRef<number | null>(null);
   const anchorIdRef = useRef<string | null>(null);
@@ -132,6 +141,10 @@ export function useInterpret() {
   // 关联本场锚点）。失败置 error（与断线同表现，用户可停止结算或重开）。
   const rotateConnection = useCallback(() => {
     void (async () => {
+      // H3：捕获本次轮换的代次。停旧连接与建新连接之间的 await 里若发生 stop/卸载（bump 代次），
+      // 这条轮换整体作废——否则「停止 → 立刻开新一场」的窗口里，上一场的在途轮换会把一条属于
+      // 旧场的连接挂到新场上。isStoppingRef 只在 stop() 执行期间为 true，覆盖不到这个窗口。
+      const genAtStart = runIdRef.current;
       const current = recordingRef.current;
       const callbacks = callbacksRef.current;
       const sonioxConfig = sonioxConfigRef.current;
@@ -146,7 +159,11 @@ export function useInterpret() {
         console.error('Interpret rotation: error stopping old connection:', e);
       }
       // stop 之后用户可能已同时点了停止（isStoppingRef/句柄已清）——不再重建
-      if (isStoppingRef.current || !startTimeRef.current) {
+      if (
+        runIdRef.current !== genAtStart ||
+        isStoppingRef.current ||
+        !startTimeRef.current
+      ) {
         return;
       }
       try {
@@ -157,7 +174,11 @@ export function useInterpret() {
           regionPreference: settings.sonioxRegionPreference,
           attribution: { kind: 'interpret', anchorId: anchorIdRef.current },
         });
-        if (isStoppingRef.current || !startTimeRef.current) {
+        if (
+          runIdRef.current !== genAtStart ||
+          isStoppingRef.current ||
+          !startTimeRef.current
+        ) {
           // 轮换建连期间被停止：立刻拆掉刚建的连接，不留孤儿流
           try {
             await (result as { recording: RecordingHandle }).recording.stop?.();
@@ -168,7 +189,9 @@ export function useInterpret() {
         scheduleRotation(result.temporaryKey?.max_session_duration_seconds);
       } catch (error) {
         console.error('Interpret rotation failed:', error);
-        setConnectionState('error');
+        if (runIdRef.current === genAtStart) {
+          setConnectionState('error');
+        }
       }
     })();
   }, [scheduleRotation]);
@@ -183,6 +206,9 @@ export function useInterpret() {
       // U27：同步重入保护，快速双击不会派生两条 Soniox WS / 两路麦克风
       if (isStartingRef.current || recordingRef.current) return;
       isStartingRef.current = true;
+      // H3：本次启动的代次。stop()/卸载会 bump 它；下面每个 await 之后据此判断这条启动
+      // 是否已被作废。注意不能在这里 bump —— 那会让「start 之前已排队的 stop」失效。
+      const runId = runIdRef.current;
 
       langARef.current = langA;
       langBRef.current = langB;
@@ -281,6 +307,7 @@ export function useInterpret() {
       // 建立服务端时长锚点（反作弊：deduct 以服务端墙钟为计费权威）。
       // 失败不阻塞 interpret 启动，deduct 会降级信任前端时长。
       anchorIdRef.current = null;
+      let pendingAnchorId: string | null = null;
       try {
         const anchorRes = await fetch('/api/interpret/start', {
           method: 'POST',
@@ -292,11 +319,26 @@ export function useInterpret() {
         });
         if (anchorRes.ok) {
           const anchorData = (await anchorRes.json()) as { anchorId?: string | null };
-          anchorIdRef.current = anchorData.anchorId ?? null;
+          pendingAnchorId = anchorData.anchorId ?? null;
         }
       } catch {
         // 锚点是计费增强项，建立失败时静默降级
       }
+
+      // H3 窗口①：stop()/卸载落在建锚点的 fetch 期间。此时 stop 读到的 startTimeRef 与
+      // recordingRef 都还是 null（duration=0、无句柄），扣费与句柄清理全是 no-op；若照常往下
+      // 走，setInterval 会永久泄漏、setIsRunning(true) 还会在 stop 之后把 UI 假复活。
+      // 就地中止，并把刚建好的服务端锚点顺手结算掉（durationMs=0 + anchorId → 服务端按墙钟
+      // ≈0 结算并消费 Redis 锚点），免得它悬挂到 cron 7h 兜底。
+      if (runIdRef.current !== runId) {
+        processorRef.current = null;
+        if (pendingAnchorId) {
+          void deductQuota(0, pendingAnchorId);
+        }
+        isStartingRef.current = false;
+        return;
+      }
+      anchorIdRef.current = pendingAnchorId;
 
       // 计时器
       startTimeRef.current = Date.now();
@@ -314,8 +356,12 @@ export function useInterpret() {
 
       // 回调与配置存 ref：寿命轮换（rotateConnection）重建连接时原样复用——processor 延续、
       // 段落不断，锚点/计时器不动，仍是同一场同传。
+      // H3：回调全部带代次门闩。孤儿连接（stop 之后才 open 的 WS、或拆连接期间迟到的帧）
+      // 不得再回写 UI —— 否则「已停止」的界面会被重新点亮成 connected/出字。轮换重建连接时
+      // 复用同一套回调，而轮换不 bump 代次，故门闩对同一场同传恒成立。
       const callbacks: Parameters<typeof startSonioxRecording>[2] = {
         onPartialResult: (tokens) => {
+          if (runIdRef.current !== runId) return;
           const rtTokens = tokens as RealtimeToken[];
           // 原文 preview 侧仍基于当前转录 token 的 language 判断
           for (const t of rtTokens) {
@@ -327,13 +373,16 @@ export function useInterpret() {
           processorRef.current?.processTokens(rtTokens);
         },
         onEndpoint: () => {
+          if (runIdRef.current !== runId) return;
           processorRef.current?.onEndpoint();
         },
         onError: (error) => {
+          if (runIdRef.current !== runId) return;
           console.error('Interpret Soniox error:', error);
           setConnectionState('error');
         },
         onConnectionChange: (state) => {
+          if (runIdRef.current !== runId) return;
           setConnectionState(state);
         },
       };
@@ -356,10 +405,26 @@ export function useInterpret() {
           }
         );
 
+        // H3 窗口②（主窗口）：stop()/卸载落在 startSonioxRecording 的 mint key + WS 握手期间。
+        // stop 先于此处执行，读到 recordingRef=null 而全部 no-op（却照常结算扣费、置
+        // isRunning(false)）；若照常发布，麦克风与 Soniox WS 就成了永不计费的孤儿，更糟的是
+        // scheduleRotation 会在 stop 清空 rotationTimerRef **之后**重新排上定时器，此后每
+        // ~15 分钟自动重建一条连接 —— 孤儿自我续命。代次过期就地拆连接，绝不发布。
+        if (runIdRef.current !== runId) {
+          try {
+            await (result as { recording: RecordingHandle }).recording.stop?.();
+          } catch { /* silent */ }
+          return;
+        }
         recordingRef.current = result as { recording: RecordingHandle; client: unknown };
         scheduleRotation(result.temporaryKey?.max_session_duration_seconds);
       } catch (error) {
         console.error('Failed to start interpret:', error);
+        // 代次已过期（stop/卸载已经把 UI 与计费收拾干净）：不要再回写 isRunning/连接状态，
+        // 否则会覆盖 stop 刚设好的终态。
+        if (runIdRef.current !== runId) {
+          return;
+        }
         setIsRunning(false);
         setConnectionState('error');
         if (timerRef.current) {
@@ -372,7 +437,7 @@ export function useInterpret() {
         isStartingRef.current = false;
       }
     },
-    [token, scheduleRotation]
+    [token, scheduleRotation, deductQuota]
   );
 
   const stop = useCallback(async () => {
@@ -381,6 +446,9 @@ export function useInterpret() {
     // 保证 deductQuota 对同一场同传至多以同一口径调用一次。
     if (isStoppingRef.current) return;
     isStoppingRef.current = true;
+    // H3：在任何 await 之前同步作废当前代次。在途的 start()/rotateConnection() 由此得知
+    // 「这一场已经结束」，会就地拆掉刚建的连接、不发布句柄、不排轮换定时器。
+    runIdRef.current += 1;
 
     if (timerRef.current) {
       clearInterval(timerRef.current);
@@ -435,7 +503,12 @@ export function useInterpret() {
   stopRef.current = stop;
   useEffect(() => {
     return () => {
-      if (recordingRef.current) {
+      // H3：先同步作废代次，再决定要不要 stop。旧代码只在 `recordingRef.current` 非空时才
+      // stop —— 启动中卸载（句柄还没赋值）时整条清理被跳过，而 start 的后半段随后照常把
+      // 麦克风、WS、计时器、轮换定时器装起来，孤儿彻底脱离组件生命周期。bump 之后 start
+      // 会自行拆掉刚建的资源；已经跑起来的一场仍走正常 stop（结算扣费 + 停流）。
+      runIdRef.current += 1;
+      if (recordingRef.current || isStartingRef.current || startTimeRef.current) {
         void stopRef.current();
       }
     };

@@ -19,6 +19,7 @@ import {
 import {
   buildTextTranslationPrompt,
   consumeDailyTextQuota,
+  isSupportedLanguageCode,
   releaseDailyTextQuota,
 } from '@/lib/translate/textTranslation';
 
@@ -61,6 +62,12 @@ export async function POST(req: Request) {
     const sourceLang =
       readOptionalText(body.sourceLang, 'sourceLang', 32) || 'auto';
     const targetLang = readRequiredText(body.targetLang, 'targetLang', 32);
+
+    // L31：两个语言代码都会被拼进 system prompt，必须先过白名单
+    // （已知代码表 + 严格 BCP-47 形状），否则就是一段 ≤32 字符的 prompt 注入窗口。
+    if (!isSupportedLanguageCode(sourceLang) || !isSupportedLanguageCode(targetLang)) {
+      return NextResponse.json({ error: '不支持的语言代码' }, { status: 400 });
+    }
     const requestedModelId = readOptionalIdentifier(body.modelId, 'modelId', 128);
 
     // 组能力门禁（组配置为唯一真源；identifier 传 undefined，翻译模型另行解析）

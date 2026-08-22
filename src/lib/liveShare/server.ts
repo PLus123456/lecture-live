@@ -1,6 +1,7 @@
 // src/lib/liveShare/server.ts
 // 服务端 socket.io 实时分享逻辑
 
+import fs from 'node:fs/promises';
 import path from 'path';
 import { Server as SocketIO, Socket } from 'socket.io';
 import { prisma } from '@/lib/prisma';
@@ -197,15 +198,53 @@ function readSessionTranscriptPath(sessionId: string) {
   return fullPath;
 }
 
-function readSessionTranscriptDraftPath(sessionId: string) {
+/**
+ * 定位会话最新的转录稿草稿文件。
+ *
+ * transcriptDraftPersistence 写的是 `transcript-<uuid>.json`（每次落盘换一个代号，
+ * tmp+rename 原子发布），裸 `transcript.json` 只是升级前的历史文件名。硬编码后者会让
+ * 冷启动恢复对**这次部署之后写的每一份草稿**都 ENOENT —— 观众在主持人第一帧
+ * sync_snapshot 之前进来、或 WS 进程中途重启，看到的就是一块空白板。
+ *
+ * 这里只做目录列举 + 取最新，不走账本：WS 进程因此不依赖 StoredArtifact 是否已回填，
+ * 读取本身仍是有界的，磁盘副本照样过同一套 canonical/字节预算。
+ */
+async function resolveSessionTranscriptDraftPath(
+  sessionId: string
+): Promise<string> {
   const safeSessionId = sanitizePath(sessionId);
-  const fullPath = path.join(
-    TRANSCRIPT_DRAFT_DIR,
-    safeSessionId,
-    'transcript.json'
+  const dir = path.join(TRANSCRIPT_DRAFT_DIR, safeSessionId);
+  assertWithinRoot(dir, TRANSCRIPT_DRAFT_DIR);
+
+  const entries = await fs.readdir(dir).catch(() => [] as string[]);
+  const candidates = entries.filter(
+    (name) => name === 'transcript.json' || /^transcript-[\w.-]+\.json$/.test(name)
   );
-  assertWithinRoot(fullPath, TRANSCRIPT_DRAFT_DIR);
-  return fullPath;
+  if (candidates.length === 0) {
+    // 让调用方的 catch 拿到一致的 ENOENT 语义。
+    const legacy = path.join(dir, 'transcript.json');
+    assertWithinRoot(legacy, TRANSCRIPT_DRAFT_DIR);
+    return legacy;
+  }
+
+  let newestPath = '';
+  let newestAt = -Infinity;
+  for (const name of candidates) {
+    const candidate = path.join(dir, name);
+    assertWithinRoot(candidate, TRANSCRIPT_DRAFT_DIR);
+    const stat = await fs.stat(candidate).catch(() => null);
+    if (!stat?.isFile()) continue;
+    if (stat.mtimeMs > newestAt) {
+      newestAt = stat.mtimeMs;
+      newestPath = candidate;
+    }
+  }
+  if (!newestPath) {
+    const legacy = path.join(dir, 'transcript.json');
+    assertWithinRoot(legacy, TRANSCRIPT_DRAFT_DIR);
+    return legacy;
+  }
+  return newestPath;
 }
 
 function toSnapshotCandidate(raw: unknown): Record<string, unknown> {
@@ -270,7 +309,7 @@ async function loadPersistedSnapshot(sessionId: string): Promise<LiveSnapshot> {
   // 不能绕过 Socket 入站的 canonical/字节预算边界。
   try {
     return await loadCanonicalSnapshotFile(
-      readSessionTranscriptDraftPath(sessionId)
+      await resolveSessionTranscriptDraftPath(sessionId)
     );
   } catch (error) {
     logPersistedSnapshotFailure(sessionId, 'draft', error);

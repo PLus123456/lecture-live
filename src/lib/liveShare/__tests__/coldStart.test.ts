@@ -251,6 +251,45 @@ describe('直播冷开分享的历史回填（C16/U11）', () => {
     }
   });
 
+  it('回退读的是 transcriptDraftPersistence 真正写出的 transcript-<代号>.json', async () => {
+    // 写入侧每次落盘换一个代号（tmp+rename 原子发布），裸 transcript.json 只是
+    // 升级前的历史文件名。冷启动恢复若硬编码后者，这次部署之后写的每一份草稿都
+    // 读不到 —— 观众进来看到空白板，而单测只要自己手写 transcript.json 就永远发现不了。
+    const draftDir = path.join(
+      process.cwd(),
+      'data',
+      'transcript-drafts',
+      'session-draft'
+    );
+    await fs.mkdir(draftDir, { recursive: true });
+    await fs.writeFile(
+      path.join(draftDir, 'transcript-3f8c1d2e-9a44-4b17-8e5c-2b6d0f1a7c93.json'),
+      JSON.stringify({
+        segments: [
+          makeTranscriptSegment({ id: 'seg-uuid', text: '代号文件里的历史' }),
+        ],
+        translations: { 'seg-uuid': 'from generational draft' },
+        summaries: [],
+        clientTs: Date.now(),
+      }),
+      'utf-8'
+    );
+
+    try {
+      const state = await joinUntil<{
+        segments: Array<{ id: string }>;
+        translations: Record<string, string>;
+      }>('draft-token', (s) => s.segments.length > 0);
+
+      expect(state.segments).toMatchObject([
+        { id: 'seg-uuid', text: '代号文件里的历史' },
+      ]);
+      expect(state.translations).toEqual({ 'seg-uuid': 'from generational draft' });
+    } finally {
+      await fs.rm(draftDir, { recursive: true, force: true });
+    }
+  });
+
   it('P7-4：主播重连补发的快照含开分享后累积的增量（不把服务端内存抹回旧态）', async () => {
     const broadcaster = new LiveBroadcaster(baseUrl, {
       sessionId: 'session-1',

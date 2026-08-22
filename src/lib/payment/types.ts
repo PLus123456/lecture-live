@@ -40,6 +40,15 @@ export interface CreateChargeParams {
    * 收款、约 7.1× 超收。币种必须是显式配置项，绝不可从展示用符号反推。
    */
   currency: string;
+  /**
+   * 我方订单失效时刻（PaymentOrder.expiresAt），必须原样下发给网关。
+   *
+   * 结算侧会把「网关签名时间 >= expiresAt」的支付判为 late_paid：不加余额、不发权益、
+   * 只进人工复核。如果网关侧没有同一个截止时间，它会照常收钱（Stripe Checkout 默认 24h、
+   * 支付宝 page.pay 默认 15 天、微信 Native 默认 2h），于是用户被扣款却什么都拿不到。
+   * 两侧口径必须一致。
+   */
+  expiresAt: Date;
 }
 
 /** 发起支付的结果：跳转 URL 或扫码内容，二选一（或都给）。 */

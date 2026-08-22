@@ -13,6 +13,7 @@ import {
   spendFromBalance,
   WalletError,
   DEFAULT_ORDER_CURRENCY,
+  ORDER_TTL_MS,
 } from '@/lib/wallet';
 import { enforceRateLimit } from '@/lib/rateLimit';
 
@@ -163,6 +164,10 @@ export async function POST(req: Request) {
       returnUrl,
       notifyUrl,
       currency,
+      // 与 creditPaidOrder 的 late_paid 判定共用同一个 expiresAt：网关先拒收，
+      // 我方才不会出现「钱收了但权益不发」的单子。createPaymentOrder 恒会写这一列，
+      // 兜底只为满足 schema 上的可空性。
+      expiresAt: order.expiresAt ?? new Date(Date.now() + ORDER_TTL_MS),
     });
     // P3-14：网关侧流水号在这里就拿到了，从前直接丢掉 → Stripe 订单的 providerRef 恒 null，
     // 对账时手里只有我方单号，网关后台那笔对不上。回调里再补是补不齐的（回调可能永远不来）。

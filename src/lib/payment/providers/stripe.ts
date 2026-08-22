@@ -61,6 +61,13 @@ export class StripeProvider implements PaymentProvider {
     // unit_amount 为最小货币单位（分/cent），与我们存储的 amountCents 同口径。
     form.set('line_items[0][price_data][unit_amount]', String(params.amountCents));
     form.set('line_items[0][quantity]', '1');
+    // 让 Stripe 自己在同一时刻关闭会话。不设的话 Checkout 默认 24 小时有效，用户在
+    // 我方 expiresAt 之后付款会被 creditPaidOrder 判 late_paid —— 钱进了 Stripe，
+    // 权益一分不发。Stripe 要求 expires_at 至少为 30 分钟后（ORDER_TTL_MS 取 60 分钟）。
+    form.set(
+      'expires_at',
+      String(Math.floor(params.expiresAt.getTime() / 1000))
+    );
 
     const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
       method: 'POST',

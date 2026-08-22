@@ -68,6 +68,9 @@ export class WechatProvider implements PaymentProvider {
       description: params.subject,
       out_trade_no: params.outTradeNo,
       notify_url: params.notifyUrl,
+      // 与我方 expiresAt 同一时刻关单（Native 默认 2 小时）。网关不设截止时间的话，
+      // 超时支付照收，而 creditPaidOrder 会判 late_paid、不发放任何权益。
+      time_expire: formatWechatTimestamp(params.expiresAt),
       amount: {
         total: Math.max(0, Math.round(params.amountCents)),
         currency: WECHAT_CURRENCY,
@@ -254,6 +257,20 @@ export class WechatProvider implements PaymentProvider {
       `signature="${signature}"`
     );
   }
+}
+
+/**
+ * 微信支付 v3 的 time_expire 要求 RFC3339，形如 `2026-08-22T19:30:00+08:00`。
+ * 统一按东八区表示（与 formatAlipayTimestamp 同口径），时刻本身仍是绝对时间。
+ */
+function formatWechatTimestamp(date: Date): string {
+  const shifted = new Date(date.getTime() + 8 * 3600 * 1000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${shifted.getUTCFullYear()}-${p(shifted.getUTCMonth() + 1)}-` +
+    `${p(shifted.getUTCDate())}T${p(shifted.getUTCHours())}:` +
+    `${p(shifted.getUTCMinutes())}:${p(shifted.getUTCSeconds())}+08:00`
+  );
 }
 
 function parseWechatDate(value: string | undefined): Date | undefined {

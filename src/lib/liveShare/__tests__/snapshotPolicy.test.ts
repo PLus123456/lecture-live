@@ -106,6 +106,44 @@ describe('live snapshot canonical schema', () => {
     expect(arbitraryEvent).toMatchObject({ ok: false, code: 'INVALID_EVENT' });
   });
 
+  it('术语表允许 constructor / prototype 这类词条，且不污染原型', () => {
+    // definitions 的键是 LLM 生成的术语，不是标识符。一堂讲 constructor 的编程课
+    // 必须能正常出摘要：策略违规会 emit share_error，客户端据此整场拆掉直播分享。
+    // 结果记录用 Object.create(null) 构造，这些名字在里面只是普通字符串键。
+    const parsed = canonicalizeLiveSnapshot(
+      snapshotInput({
+        summaryBlocks: [
+          {
+            ...summary('sum-cs'),
+            definitions: {
+              constructor: '构造函数：创建并初始化对象的特殊方法',
+              prototype: '原型：JavaScript 的对象继承机制',
+              __proto__: '指向原型对象的访问器',
+            },
+          },
+        ],
+      })
+    );
+
+    expect(parsed).toMatchObject({ ok: true });
+    if (!parsed.ok) throw new Error('expected the snapshot to be accepted');
+    const definitions = parsed.value.summaryBlocks[0].definitions;
+    expect(definitions.constructor).toBe(
+      '构造函数：创建并初始化对象的特殊方法'
+    );
+    expect(definitions.prototype).toBe('原型：JavaScript 的对象继承机制');
+    expect(Object.getPrototypeOf(definitions)).toBeNull();
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('translations 的键仍是标识符，危险 record key 照旧拒绝', () => {
+    expect(
+      canonicalizeLiveSnapshot(
+        snapshotInput({ translations: JSON.parse('{"constructor":"x"}') })
+      )
+    ).toMatchObject({ ok: false, code: 'INVALID_SNAPSHOT' });
+  });
+
   it('按 JSON UTF-8 精确计量多字节文本和 Socket.IO envelope', () => {
     const parsed = canonicalizeLiveSnapshot(
       snapshotInput({ segments: [segment('seg-emoji', '😀中文')] }),

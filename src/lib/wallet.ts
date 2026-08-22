@@ -73,7 +73,12 @@ function generateOutTradeNo(): string {
   return `LL${Date.now().toString(36)}${crypto.randomBytes(6).toString('hex')}`.toUpperCase();
 }
 
-const ORDER_TTL_MS = 30 * 60_000; // 未支付订单 30 分钟过期
+// 未支付订单有效期。这个值现在会**同时**下发给网关（Stripe expires_at /
+// 支付宝 time_expire / 微信 time_expire），网关自己就会拒收超时支付 —— 否则我方
+// 判定 late_paid 时钱已经被收走了，而 late_paid 不发放任何权益。
+// 取 60 分钟而非 30：Stripe 要求 expires_at 至少为 30 分钟后，卡在下限上会因为
+// 请求往返的几百毫秒被拒单。
+export const ORDER_TTL_MS = 60 * 60_000;
 const MAX_PROVIDER_CLOCK_SKEW_MS = 5 * 60_000;
 
 /** 归一化 ISO-4217 币种码（大写、去空白）；非法/空值回 ''，由调用方决定回落。 */

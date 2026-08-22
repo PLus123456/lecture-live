@@ -98,6 +98,7 @@ import {
   spendFromBalance,
   adminAdjust,
   WalletError,
+  ORDER_TTL_MS,
 } from '@/lib/wallet';
 
 beforeEach(() => {
@@ -183,8 +184,12 @@ describe('createPaymentOrder：拒付冻结与建单并发闸', () => {
     }
 
     const expiresAt = paymentOrderCreateMock.mock.calls[0][0].data.expiresAt as Date;
-    expect(expiresAt.toISOString()).toBe('2026-08-20T10:30:00.000Z');
+    // 从 ORDER_TTL_MS 推导而不是写死时刻：这个 TTL 现在还要下发给网关
+    // （Stripe expires_at 最小 30 分钟），调整时不该让这条断言假挂。
+    // 断言的重点是「向下对齐到整秒」，不是具体几点。
+    expect(expiresAt.getTime()).toBe(Math.floor((now + ORDER_TTL_MS) / 1000) * 1000);
     expect(expiresAt.getMilliseconds()).toBe(0);
+    expect(expiresAt.getTime()).toBeLessThanOrEqual(now + ORDER_TTL_MS);
   });
 });
 

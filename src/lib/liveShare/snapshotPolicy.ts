@@ -271,6 +271,22 @@ function requireRecordKey(value: unknown, label: string): string {
   return key;
 }
 
+/**
+ * summary.definitions 的键是 LLM 生成的**术语**，不是我方标识符，两点因此不同：
+ *
+ * 1. 不拒绝 `__proto__`/`constructor`/`prototype`。结果记录用 `Object.create(null)`
+ *    构造，这些名字在里面只是普通字符串键，原型污染结构上就不可能。按保留字拒绝的代价
+ *    是：一堂讲到「constructor」或「prototype」的编程课，summary_update 会被判违规，
+ *    而策略违规要 emit share_error，客户端据此把整场直播分享拆掉。
+ * 2. 字节上限单独放宽。上游按 120 **字符** 截断术语，120 个中日韩字符是 360 UTF-8
+ *    字节，会越过标识符用的 MAX_ID_BYTES(256)。
+ */
+const MAX_DEFINITION_KEY_BYTES = 512;
+
+function requireDefinitionKey(value: unknown, label: string): string {
+  return requireString(value, label, MAX_DEFINITION_KEY_BYTES);
+}
+
 function canonicalizeSegment(value: unknown): CanonicalTranscriptSegment {
   const input = requireRecord(value, 'segment');
   const segment: CanonicalTranscriptSegment = {
@@ -320,7 +336,7 @@ function canonicalizeDefinitions(value: unknown): Record<string, string> {
 
   const definitions: Record<string, string> = Object.create(null);
   for (const [rawKey, rawValue] of entries) {
-    const key = requireRecordKey(rawKey, 'summary.definitions key');
+    const key = requireDefinitionKey(rawKey, 'summary.definitions key');
     definitions[key] = requireString(
       rawValue,
       `summary.definitions.${key}`,

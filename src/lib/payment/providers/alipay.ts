@@ -49,6 +49,10 @@ export class AlipayProvider implements PaymentProvider {
       product_code: 'FAST_INSTANT_TRADE_PAY',
       total_amount: centsToYuan(params.amountCents),
       subject: params.subject,
+      // 与我方 expiresAt 同一时刻关单。page.pay 默认允许 15 天内付款，而我方
+      // creditPaidOrder 超过 expiresAt 就判 late_paid（不加余额、不发权益），
+      // 两侧不一致就会出现「用户已付款、系统当作过期」的单子。
+      time_expire: formatAlipayTimestamp(params.expiresAt),
     });
     const common: Record<string, string> = {
       app_id: this.appId,

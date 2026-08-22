@@ -15,6 +15,10 @@ import {
 
 const settings = (o: Partial<RechargeSettings>) => o as unknown as RechargeSettings;
 
+// 订单失效时刻现在是 createCharge 的必填参数：网关必须与我方 expiresAt 同一时刻关单，
+// 否则超时支付照收、我方却判 late_paid 不发权益。
+const CHARGE_EXPIRES_AT = new Date('2026-08-22T12:00:00.000Z');
+
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
@@ -31,6 +35,7 @@ describe('SandboxProvider', () => {
       currency: 'CNY',
       returnUrl: 'https://app.test/home',
       notifyUrl: 'https://app.test/api/wallet/callback/sandbox',
+      expiresAt: CHARGE_EXPIRES_AT,
     });
     expect(res.payUrl).toBe('https://app.test/api/wallet/sandbox/pay?out_trade_no=LL123');
   });
@@ -126,6 +131,7 @@ describe('支付宝待签名串：请求方向与通知方向规则不同（P3-1
       currency: 'CNY',
       returnUrl: 'https://app.test/home',
       notifyUrl: 'https://app.test/api/wallet/callback/alipay',
+      expiresAt: CHARGE_EXPIRES_AT,
     });
     const query = new URL(res.payUrl!).searchParams;
     const sign = query.get('sign')!;
@@ -156,6 +162,7 @@ describe('支付宝待签名串：请求方向与通知方向规则不同（P3-1
         currency: 'USD',
         returnUrl: 'https://app.test/home',
         notifyUrl: 'https://app.test/api/wallet/callback/alipay',
+        expiresAt: CHARGE_EXPIRES_AT,
       })
     ).rejects.toThrow(/CNY/);
   });
@@ -522,6 +529,7 @@ describe('Stripe verifyCallback', () => {
         currency: 'CNY',
         returnUrl: 'https://app.test/home',
         notifyUrl: 'https://app.test/api/wallet/callback/stripe',
+        expiresAt: CHARGE_EXPIRES_AT,
       })
     ).rejects.toThrow(/live mode key/i);
   });
@@ -542,6 +550,7 @@ describe('Stripe verifyCallback', () => {
       currency: 'USD',
       returnUrl: 'https://app.test/home',
       notifyUrl: 'https://app.test/api/wallet/callback/stripe',
+      expiresAt: CHARGE_EXPIRES_AT,
     });
     const request = fetchMock.mock.calls[0][1] as RequestInit;
     const form = new URLSearchParams(String(request.body));
@@ -653,6 +662,7 @@ describe('Stripe verifyCallback', () => {
         currency: '元',
         returnUrl: 'https://app.test/home',
         notifyUrl: 'https://app.test/api/wallet/callback/stripe',
+        expiresAt: CHARGE_EXPIRES_AT,
       })
     ).rejects.toThrow(/currency/i);
   });
@@ -823,6 +833,7 @@ describe('微信 verifyCallback', () => {
         currency: 'USD',
         returnUrl: 'https://app.test/home',
         notifyUrl: 'https://app.test/api/wallet/callback/wechat',
+        expiresAt: CHARGE_EXPIRES_AT,
       })
     ).rejects.toThrow(/CNY/);
   });

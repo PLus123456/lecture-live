@@ -669,6 +669,22 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
 });
 
 describe('runAudioEnhanceTick — 自动重试', () => {
+  /**
+   * L25：retryJob 的回炉是**条件**更新（`where: { id, status: FAILED }`，
+   * Prisma 5 的 extendedWhereUnique；不命中抛 P2025）。这个替身把条件建模出来，
+   * 否则「行其实已经不是 FAILED 了」这种竞态在测试里会被无声放过。
+   */
+  function arrangeConditionalUpdate(row: { id: string; status: string }) {
+    prismaMock.jobQueue.update.mockImplementation(
+      async (args: { where: { id: string; status?: string } }) => {
+        if (args.where.status !== undefined && args.where.status !== row.status) {
+          throw Object.assign(new Error('Record to update not found'), { code: 'P2025' });
+        }
+        return { ...row, ...args };
+      }
+    );
+  }
+
   it('FAILED 且过了 nextRetryAt：retryJob 回炉（attempt+1 → SUBMITTED）', async () => {
     const failedJob = jobRow({
       status: 'FAILED',
@@ -679,17 +695,39 @@ describe('runAudioEnhanceTick — 自动重试', () => {
       .mockResolvedValueOnce([]) // PROCESSING
       .mockResolvedValueOnce([failedJob]) // FAILED
       .mockResolvedValueOnce([]); // SUBMITTED
-    // retryJob 内部：findUnique + update
+    // retryJob 内部：findUnique + 条件 update
     prismaMock.jobQueue.findUnique.mockResolvedValue(failedJob);
+    arrangeConditionalUpdate(failedJob);
 
     await runAudioEnhanceTick();
 
     expect(prismaMock.jobQueue.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 'job-1' },
+        // L25：谓词必须压进 UPDATE 语句本身，不能只靠 findUnique 预检 ——
+        // 两个进程同一轮回炉同一行会让 attempt 一次跳 2、烧掉一格退避档位。
+        where: { id: 'job-1', status: 'FAILED' },
         data: expect.objectContaining({ status: 'SUBMITTED', attempt: { increment: 1 } }),
       })
     );
+  });
+
+  it('回炉时行已不是 FAILED（别的进程抢先）：条件不命中 → 不重复 +1 attempt', async () => {
+    const failedJob = jobRow({
+      status: 'FAILED',
+      attempt: 1,
+      params: JSON.stringify({ nextRetryAt: new Date(Date.now() - 1000).toISOString() }),
+    });
+    prismaMock.jobQueue.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([failedJob])
+      .mockResolvedValueOnce([]);
+    prismaMock.jobQueue.findUnique.mockResolvedValue(failedJob);
+    // 预检读到的还是 FAILED 快照，但真正落 UPDATE 时行已被抢先回炉成 SUBMITTED
+    arrangeConditionalUpdate({ id: 'job-1', status: 'SUBMITTED' });
+
+    // P2025 必须被 retryJob 吞成"竞态输家"，不能冒泡成 tick 异常
+    await expect(runAudioEnhanceTick()).resolves.toBeUndefined();
+    expect(prismaMock.jobQueue.update).toHaveBeenCalledTimes(1);
   });
 
   it('未到 nextRetryAt / 无重试标记 / attempt 用尽：一律不回炉', async () => {

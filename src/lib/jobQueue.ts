@@ -75,6 +75,15 @@ function isUniqueConstraintError(error: unknown): boolean {
   );
 }
 
+/** P2025：`update`/`delete` 的 where 没命中任何行（条件更新的竞态输家）。 */
+function isRecordNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'P2025'
+  );
+}
+
 // ─── 创建任务 ───
 interface CreateJobOptions {
   type: JobType;
@@ -251,8 +260,16 @@ export async function retryJob(jobId: string): Promise<boolean> {
       : {};
 
   try {
+    // L25：回炉必须是**条件**更新。上面那几条 findUnique 预检只是 check-then-act 的
+    // "check"，真正的抢占得压进 UPDATE 的 WHERE 里：doc_translate 的 tick 同时跑在 ws
+    // 进程和每个 API 进程里（`runDocTranslateTick` 的 globalThis 互斥仅进程内），
+    // 同一轮里两处都可能读到同一条 FAILED 行并决定回炉。非条件 update 会让两次回炉
+    // 都生效 —— `attempt` 一次跳 2，白烧掉一格退避档位（3 档退避直接少一次重试机会），
+    // 且第二次的 `startedAt: null` 会抹掉第一次回炉后已经开始派发的时间戳。
+    // Prisma 5 的 extendedWhereUnique 允许在 update 的 where 里带非唯一过滤：
+    // 不匹配即抛 P2025，等价于 updateMany 的 count===0。
     await prisma.jobQueue.update({
-      where: { id: jobId },
+      where: { id: jobId, status: JOB_STATUS.FAILED },
       data: {
         status: JOB_STATUS.SUBMITTED,
         attempt: { increment: 1 },
@@ -265,6 +282,8 @@ export async function retryJob(jobId: string): Promise<boolean> {
     });
   } catch (error) {
     if (isUniqueConstraintError(error)) return false;
+    // P2025 = 条件没命中（别的进程同一轮已经回炉过了）：不是错误，是竞态输家。
+    if (isRecordNotFoundError(error)) return false;
     throw error;
   }
 
@@ -280,18 +299,59 @@ export async function retryJob(jobId: string): Promise<boolean> {
 // 等最重的任务也在分钟级），避免误杀正在执行的任务（含 billing maintenance 自身）。
 export const STALE_PROCESSING_JOB_THRESHOLD_MS = 2 * 60 * 60_000;
 
+/**
+ * H5：按 job type 覆盖的更长阈值。
+ *
+ * 上面那句"最重的任务也在分钟级"是 doc_translate（PR#227）上线**之前**写的，属于注释漂移：
+ * `translateProcessor.MAX_WORKER_RUNTIME_MS` 白纸黑字给大文档 3 小时，2h 的通用阈值必然
+ * 在合法运行途中把它误杀 —— 而且是 `updateMany` 直改、绕过 `failJob`，于是 TranslationTask
+ * 停在 TRANSLATING、chargedCents 不退、不写 params.nextRetryAt（自动重试要求该字段存在），
+ * 行也不再是 PROCESSING 从而永远不被对账捞到 = 用户永久"翻译中"+ 钱滞留。
+ *
+ * 这里的值必须**严格大于**该类型的合法最大运行时，并留出至少一个维护周期（15min）的余量。
+ * 真正的终态化仍由 translateProcessor 的对账（3h 入口超时 → failJob）负责；本表只是
+ * "连 tick 都卡死了"时的最后一道网，且网住之后 executeTick 的自愈扫描会补做结算。
+ */
+export const STALE_PROCESSING_THRESHOLD_BY_TYPE: Readonly<Record<string, number>> = {
+  [JOB_TYPE.DOC_TRANSLATE]: 4 * 60 * 60_000,
+};
+
+/** 有自定义阈值的类型（通用扫描必须把它们排除，否则 2h 照杀不误）。 */
+export const LONG_RUNNING_JOB_TYPES: readonly string[] = Object.keys(
+  STALE_PROCESSING_THRESHOLD_BY_TYPE
+);
+
+interface ReclaimScopeOptions {
+  /** 只回收这些 type（按类型分档扫描时用） */
+  onlyTypes?: readonly string[];
+  /** 排除这些 type（通用扫描把长跑类型让给它们各自的档位） */
+  excludeTypes?: readonly string[];
+}
+
+/**
+ * 注意：`options` 缺省是**不分类型**的全表扫描（保持历史语义，供单测与临时脚本直接调用）。
+ * 生产入口是 billingMaintenance，它必须按 `reclaimAllStaleProcessingJobs` 的分档方式调用 ——
+ * 直接裸调 `reclaimStaleProcessingJobs(now)` 会把长跑类型按 2h 误杀。
+ */
 export async function reclaimStaleProcessingJobs(
   now: Date = new Date(),
-  thresholdMs: number = STALE_PROCESSING_JOB_THRESHOLD_MS
+  thresholdMs: number = STALE_PROCESSING_JOB_THRESHOLD_MS,
+  options: ReclaimScopeOptions = {}
 ): Promise<number> {
   const threshold = new Date(now.getTime() - thresholdMs);
   const thresholdHours = Math.round(thresholdMs / 3_600_000);
+  const typeFilter = options.onlyTypes
+    ? { type: { in: [...options.onlyTypes] } }
+    : options.excludeTypes && options.excludeTypes.length > 0
+      ? { type: { notIn: [...options.excludeTypes] } }
+      : {};
   // PROCESSING 必然已由 markJobProcessing 写过 startedAt（status 与 startedAt 同一次 update 落库），
   // 故以 startedAt 为超时判据；条件原子更新，避免与正常的 markJobSuccess/Failed 竞争。
   const result = await prisma.jobQueue.updateMany({
     where: {
       status: JOB_STATUS.PROCESSING,
       startedAt: { lte: threshold },
+      ...typeFilter,
     },
     data: {
       status: JOB_STATUS.FAILED,
@@ -302,4 +362,20 @@ export async function reclaimStaleProcessingJobs(
     },
   });
   return result.count;
+}
+
+/**
+ * H5：生产用的分档回收入口 —— 通用类型走 2h，长跑类型各走自己的阈值。
+ * billingMaintenance 只该调这一个。
+ */
+export async function reclaimAllStaleProcessingJobs(
+  now: Date = new Date()
+): Promise<number> {
+  let count = await reclaimStaleProcessingJobs(now, STALE_PROCESSING_JOB_THRESHOLD_MS, {
+    excludeTypes: LONG_RUNNING_JOB_TYPES,
+  });
+  for (const [type, ms] of Object.entries(STALE_PROCESSING_THRESHOLD_BY_TYPE)) {
+    count += await reclaimStaleProcessingJobs(now, ms, { onlyTypes: [type] });
+  }
+  return count;
 }

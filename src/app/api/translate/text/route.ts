@@ -7,9 +7,10 @@ import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { LLMAccessError, resolveAuthorizedLlmSelection } from '@/lib/llm/access';
 import { resolveUserTranslationModelId } from '@/lib/userRoles';
 import { resolveGroupBoundModel } from '@/lib/llm/summaryModel';
-import { getModelById } from '@/lib/llm/gateway';
+import { isTranslationModelAllowed } from '@/lib/translate/modelAccess';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { spendWalletCents, WalletError } from '@/lib/wallet';
+import { isBillingExempt } from '@/lib/billing';
 import {
   LLMValidationError,
   readOptionalIdentifier,
@@ -95,24 +96,12 @@ export async function POST(req: Request) {
       purpose: 'TRANSLATION',
     };
     if (requestedModelId) {
-      const cfg = await getModelById(requestedModelId).catch(() => null);
-      const purposeOk = cfg?.dbModelId === requestedModelId && cfg.purpose === 'TRANSLATION';
-      // allowedModels 门禁与 /api/llm/models 同口径：'*' 全允许；token 命中 DB id/底层 modelId/网关名
-      const allowedTokens = selection.user.allowedModels
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const accessOk =
-        purposeOk &&
-        cfg !== null &&
-        (selection.user.role === 'ADMIN' ||
-          selection.user.allowedModels === '*' ||
-          // L21：组绑定模型就是 /api/translate/models 下发的默认项，必须与那边同口径放行，
-          // 否则「按默认值提交」这条最常见路径恒 403。
-          requestedModelId === groupModelId ||
-          allowedTokens.some(
-            (tkn) => tkn === requestedModelId || tkn === cfg.model || tkn === cfg.name
-          ));
+      // 门禁口径见 isTranslationModelAllowed（与文档翻译共用；组绑定模型豁免 allowedModels）
+      const accessOk = await isTranslationModelAllowed(
+        selection.user,
+        requestedModelId,
+        groupModelId
+      );
       if (!accessOk) {
         return NextResponse.json(
           { error: '所选模型不可用或未授权' },
@@ -124,9 +113,14 @@ export async function POST(req: Request) {
       routing = (await resolveGroupBoundModel(groupModelId, 'TRANSLATION')).routing;
     }
 
-    // 计费：free=每日额度（请求时预消耗，彻底失败回滚）；per_char=钱包按千字符扣分
+    // 计费：free=每日额度（请求时预消耗，彻底失败回滚）；per_char=钱包按千字符扣分。
+    // ADMIN 两条线都豁免（role 取自 DB，见 isBillingExempt 的调用约定）：与配额哨兵同口径，
+    // 管理员既不扣钱包也不占每日免费次数。
     let chargedCents = 0;
-    if (settings.translation_text_billing_mode === 'per_char') {
+    const billingExempt = isBillingExempt(selection.user.role);
+    if (billingExempt) {
+      // 不计费：既不扣钱包也不消耗每日额度
+    } else if (settings.translation_text_billing_mode === 'per_char') {
       const cents =
         Math.ceil(text.length / 1000) *
         Math.max(0, settings.translation_text_price_cents_per_kchar);

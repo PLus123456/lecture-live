@@ -18,6 +18,8 @@ export interface TranslationTaskView {
   progress: number;
   sourceLang: string;
   targetLang: string;
+  /** 本单定格的翻译模型（LlmModel DB id）；null = 跟随全局 TRANSLATION 默认 */
+  modelId: string | null;
   estimatedCents: number;
   chargedCents: number;
   refunded: boolean;
@@ -37,6 +39,7 @@ interface TaskRowForView {
   progress: number;
   sourceLang: string;
   targetLang: string;
+  modelId: string | null;
   estimatedCents: number;
   chargedCents: number;
   refundedAt: Date | null;
@@ -56,6 +59,7 @@ export const TASK_VIEW_SELECT = {
   progress: true,
   sourceLang: true,
   targetLang: true,
+  modelId: true,
   estimatedCents: true,
   chargedCents: true,
   refundedAt: true,
@@ -76,6 +80,7 @@ export function toTaskView(row: TaskRowForView): TranslationTaskView {
     progress: row.progress,
     sourceLang: row.sourceLang,
     targetLang: row.targetLang,
+    modelId: row.modelId,
     estimatedCents: row.estimatedCents,
     chargedCents: row.chargedCents,
     refunded: Boolean(row.refundedAt),

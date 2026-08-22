@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, fulfillSse, installBrowserStubs } from './helpers';
+import { fulfillJson, fulfillSse, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 翻译页烟测 —— 全量 route mock、无真实 DB / worker。
@@ -9,9 +9,12 @@ import { fulfillJson, fulfillSse, installBrowserStubs } from './helpers';
  *  2) 文档 tab：任务列表渲染（完成任务显示下载/双语按钮；失败任务显示重试与退款标记）。
  *  3) 上传 PDF → 报价确认弹窗 → 确认后调 /confirm。
  *  4) 组能力关闭（docEnabled=false）时文档 tab 显示不可用文案。
+ *  5) 免计费账号（管理员）：价格提示全部换成「免费」，报价弹窗不谈钱、按钮不是「付费并翻译」。
+ *  6) 文档 tab 选模型：默认选中下发的 defaultModel → 换一个 → 上传时随 multipart 提交，
+ *     任务行回显模型名；两个 tab 的选择互不串（文本 tab 换模型不动文档 tab）。
  */
 
-const user = {
+const user: Record<string, unknown> = {
   id: 'user-1',
   email: 'stu@example.com',
   displayName: 'Student',
@@ -19,8 +22,10 @@ const user = {
 };
 
 let capturedTextBody: Record<string, unknown> | null = null;
+let capturedUploadModelId: string | null = null;
 let capturedConfirmId: string | null = null;
 let docEnabled = true;
+let billingExempt = false;
 let tasks: Array<Record<string, unknown>> = [];
 
 const quotedTask = {
@@ -32,6 +37,7 @@ const quotedTask = {
   progress: 0,
   sourceLang: 'en',
   targetLang: 'zh',
+  modelId: null as string | null,
   estimatedCents: 120,
   chargedCents: 0,
   refunded: false,
@@ -44,8 +50,11 @@ const quotedTask = {
 
 test.beforeEach(async ({ page }) => {
   capturedTextBody = null;
+  capturedUploadModelId = null;
   capturedConfirmId = null;
   docEnabled = true;
+  billingExempt = false;
+  user.role = 'FREE';
   tasks = [];
   await installBrowserStubs(page);
 
@@ -68,11 +77,13 @@ test.beforeEach(async ({ page }) => {
       return fulfillJson(route, {
         models: [
           { id: 'm-trans', displayName: 'DeepSeek V3', modelId: 'deepseek-chat' },
+          { id: 'm-strong', displayName: 'Claude Opus', modelId: 'claude-opus' },
         ],
         defaultModel: 'm-trans',
         config: {
           textEnabled: true,
           docEnabled,
+          billingExempt,
           textBillingMode: 'free',
           textDailyFreeLimit: 100,
           textPriceCentsPerKchar: 1,
@@ -95,12 +106,26 @@ test.beforeEach(async ({ page }) => {
       return fulfillJson(route, { tasks });
     }
     if (p === '/api/translate/documents' && method === 'POST') {
-      tasks = [quotedTask, ...tasks];
-      return fulfillJson(route, { task: quotedTask, walletBalanceCents: 10000 });
+      // multipart 里挑出 modelId 字段（服务端就是这么收的）
+      const raw = request.postData() ?? '';
+      const matched = /name="modelId"\r?\n\r?\n([^\r\n]*)/.exec(raw);
+      capturedUploadModelId = matched ? matched[1] : null;
+      // 服务端对免计费账号直接出 0 报价（见 /api/translate/documents 的 isBillingExempt 分支）
+      const quoted = {
+        ...quotedTask,
+        modelId: capturedUploadModelId,
+        ...(billingExempt ? { estimatedCents: 0 } : {}),
+      };
+      tasks = [quoted, ...tasks];
+      return fulfillJson(route, { task: quoted, walletBalanceCents: 10000 });
     }
     if (/^\/api\/translate\/documents\/[^/]+\/confirm$/.test(p) && method === 'POST') {
       capturedConfirmId = p.split('/')[4];
-      const started = { ...quotedTask, status: 'PENDING', chargedCents: 120 };
+      const started = {
+        ...(tasks.find((task) => task.id === p.split('/')[4]) ?? quotedTask),
+        status: 'PENDING',
+        chargedCents: 120,
+      };
       tasks = [started];
       return fulfillJson(route, { task: started, walletBalanceCents: 9880 });
     }
@@ -130,11 +155,11 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function login(page: import('@playwright/test').Page) {
-  await page.goto('/login');
-  await page.locator('input[type="email"]').fill('stu@example.com');
-  await page.locator('input[type="password"]').fill('whatever');
-  await page.locator('button[type="submit"]').first().click();
-  await page.waitForURL(/\/home(\?|$)/, { timeout: 30_000 });
+  await loginViaForm(page, {
+    email: 'stu@example.com',
+    password: 'whatever',
+    prewarm: ['/translate'],
+  });
 }
 
 test('文本翻译：输入 → SSE 流式译文渲染 + 请求体带语言与模型', async ({ page }) => {
@@ -224,4 +249,93 @@ test('站点/组关闭文档翻译时显示不可用文案', async ({ page }) =>
   await expect(
     page.getByText(/Document translation is not available|当前账号不可使用文档翻译/)
   ).toBeVisible({ timeout: 15_000 });
+});
+
+test('免计费账号（管理员）：价格提示换成免费，报价弹窗不谈钱', async ({ page }) => {
+  billingExempt = true;
+  user.role = 'ADMIN';
+  await login(page);
+
+  // 文本 tab：只出免费提示，不出「每千字符 ¥x 扣费」
+  await page.goto('/translate');
+  await expect(
+    page.getByText(/Administrator account · translation is free|管理员账号 · 翻译不计费/)
+  ).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/per 1,000 characters|每千字符/)).toHaveCount(0);
+
+  // 文档 tab：单价提示换成免费，仍保留页数/体积上限
+  await page.goto('/translate?tab=doc');
+  await expect(
+    page.getByText(/Free for admins · up to 300 pages|管理员免费 · 上限 300 页/)
+  ).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/\/page ·|\/页 ·/)).toHaveCount(0);
+
+  // 报价弹窗：没有「费用/钱包余额」行，按钮不是「付费并翻译」
+  await page.setInputFiles('input[type="file"]', {
+    name: 'paper.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4 fake'),
+  });
+  await expect(page.getByText(/Confirm translation|确认翻译/)).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/Administrator account — no charge|管理员账号不计费/)).toBeVisible();
+  await expect(page.getByText(/wallet balance|钱包余额/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Pay & translate|付费并翻译/ })).toHaveCount(0);
+
+  await page.getByRole('button', { name: /Start translation|开始翻译/ }).click();
+  await expect(page.getByText(/Queued|排队中/).first()).toBeVisible({ timeout: 15_000 });
+  expect(capturedConfirmId).toBe('task-q1');
+});
+
+test('文档 tab：选模型 → 随上传提交 → 任务行回显模型名', async ({ page }) => {
+  await login(page);
+  await page.goto('/translate?tab=doc');
+  await expect(page.getByText(/Click or drop a PDF|点击或拖入 PDF/)).toBeVisible({
+    timeout: 15_000,
+  });
+
+  // 默认选中 /api/translate/models 下发的 defaultModel（组绑定 > 全局默认）
+  const modelSelect = page.getByLabel(/^(Model|模型)$/);
+  await expect(modelSelect).toHaveValue('m-trans');
+
+  await modelSelect.selectOption('m-strong');
+  await page.setInputFiles('input[type="file"]', {
+    name: 'paper.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4 fake'),
+  });
+
+  await expect(page.getByText(/Confirm translation|确认翻译/)).toBeVisible({ timeout: 15_000 });
+  // 选的模型进了 multipart（服务端据此定格 task.modelId）
+  expect(capturedUploadModelId).toBe('m-strong');
+
+  await page.getByRole('button', { name: /Pay & translate|付费并翻译/ }).click();
+  await expect(page.getByText(/Queued|排队中/).first()).toBeVisible({ timeout: 15_000 });
+  // 任务行回显这单实际用的模型（限定到任务行里找，否则先撞上下拉里的 <option>）
+  await expect(
+    page.getByRole('listitem').filter({ hasText: 'paper.pdf' })
+  ).toContainText('Claude Opus');
+});
+
+test('文本 tab 换模型不串到文档 tab（文档单独一份选择）', async ({ page }) => {
+  await login(page);
+  await page.goto('/translate');
+
+  const textModelSelect = page.getByLabel(/^(Model|模型)$/);
+  await expect(textModelSelect).toHaveValue('m-trans');
+  await textModelSelect.selectOption('m-strong');
+
+  await page.getByRole('button', { name: /^(Documents|文档)$/ }).click();
+  await expect(page.getByText(/Click or drop a PDF|点击或拖入 PDF/)).toBeVisible({
+    timeout: 15_000,
+  });
+  // 文档 tab 仍是默认模型
+  await expect(page.getByLabel(/^(Model|模型)$/)).toHaveValue('m-trans');
+
+  await page.setInputFiles('input[type="file"]', {
+    name: 'paper.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4 fake'),
+  });
+  await expect(page.getByText(/Confirm translation|确认翻译/)).toBeVisible({ timeout: 15_000 });
+  expect(capturedUploadModelId).toBe('m-trans');
 });

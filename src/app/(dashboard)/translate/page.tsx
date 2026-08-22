@@ -43,6 +43,8 @@ interface TranslateModelOption {
 interface TranslateConfig {
   textEnabled: boolean;
   docEnabled: boolean;
+  /** 该账号免计费（当前=管理员）。服务端才是权威，这里只用于把价格提示换成「免费」 */
+  billingExempt?: boolean;
   textBillingMode: 'free' | 'per_char';
   textDailyFreeLimit: number;
   textPriceCentsPerKchar: number;
@@ -60,6 +62,8 @@ interface DocTask {
   progress: number;
   sourceLang: string;
   targetLang: string;
+  /** 本单定格的翻译模型（LlmModel DB id）；null = 跟随全局默认 */
+  modelId: string | null;
   estimatedCents: number;
   chargedCents: number;
   refunded: boolean;
@@ -115,6 +119,41 @@ async function consumeSse(
   }
 }
 
+/** 模型下拉：文本/文档两 tab 共用；没有可选模型（组没配/全局默认唯一）时整个隐藏 */
+function ModelSelect({
+  models,
+  value,
+  onChange,
+  className = '',
+}: {
+  models: TranslateModelOption[];
+  value: string;
+  onChange: (v: string) => void;
+  className?: string;
+}) {
+  const { t } = useI18n();
+  if (models.length === 0) return null;
+  return (
+    <div className={`relative ${className}`}>
+      <select
+        aria-label={t('translate.model')}
+        title={t('translate.model')}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="appearance-none pl-3 pr-8 py-2 text-sm border border-cream-200 rounded-lg bg-white
+                   text-charcoal-700 focus:outline-none focus:ring-2 focus:ring-rust-200"
+      >
+        {models.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.displayName}
+          </option>
+        ))}
+      </select>
+      <ChevronDown className="w-3.5 h-3.5 text-charcoal-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+    </div>
+  );
+}
+
 /* ────────────────────────── 页面 ────────────────────────── */
 
 export default function TranslatePage() {
@@ -130,6 +169,9 @@ export default function TranslatePage() {
 
   const [models, setModels] = useState<TranslateModelOption[]>([]);
   const [modelId, setModelId] = useState('');
+  // 文档 tab 单独存一份：文本 tab 是边打字边译的试验田，别让那边随手换的模型
+  // 顺带改掉按页收费的文档任务用的模型。两边初值都是组绑定/全局默认。
+  const [docModelId, setDocModelId] = useState('');
   const [config, setConfig] = useState<TranslateConfig | null>(null);
 
   useEffect(() => {
@@ -141,7 +183,9 @@ export default function TranslatePage() {
         const data = await res.json();
         if (!alive) return;
         setModels(Array.isArray(data.models) ? data.models : []);
-        setModelId(typeof data.defaultModel === 'string' ? data.defaultModel : '');
+        const fallback = typeof data.defaultModel === 'string' ? data.defaultModel : '';
+        setModelId(fallback);
+        setDocModelId(fallback);
         setConfig(data.config ?? null);
       } catch {
         // 静默：页面按默认配置渲染
@@ -196,7 +240,12 @@ export default function TranslatePage() {
         {tab === 'text' ? (
           <TextTranslateTab models={models} modelId={modelId} setModelId={setModelId} config={config} />
         ) : (
-          <DocTranslateTab config={config} />
+          <DocTranslateTab
+            models={models}
+            modelId={docModelId}
+            setModelId={setDocModelId}
+            config={config}
+          />
         )}
       </div>
     </div>
@@ -367,23 +416,12 @@ function TextTranslateTab({
           excludeCodes={sourceLang ? [sourceLang] : []}
           className="w-44"
         />
-        {models.length > 0 && (
-          <div className="relative ml-auto">
-            <select
-              value={modelId}
-              onChange={(e) => setModelId(e.target.value)}
-              className="appearance-none pl-3 pr-8 py-2 text-sm border border-cream-200 rounded-lg bg-white
-                         text-charcoal-700 focus:outline-none focus:ring-2 focus:ring-rust-200"
-            >
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.displayName}
-                </option>
-              ))}
-            </select>
-            <ChevronDown className="w-3.5 h-3.5 text-charcoal-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-          </div>
-        )}
+        <ModelSelect
+          models={models}
+          value={modelId}
+          onChange={setModelId}
+          className="ml-auto"
+        />
       </div>
 
       {/* 双栏 */}
@@ -451,13 +489,15 @@ function TextTranslateTab({
       {/* 计费提示 */}
       {config && (
         <p className="text-[11px] text-charcoal-400">
-          {config.textBillingMode === 'per_char'
-            ? t('translate.perCharHint', {
-                price: yuan(config.textPriceCentsPerKchar),
-              })
-            : config.textDailyFreeLimit > 0
-              ? t('translate.freeDailyHint', { n: config.textDailyFreeLimit })
-              : t('translate.freeUnlimitedHint')}
+          {config.billingExempt
+            ? t('translate.exemptHint')
+            : config.textBillingMode === 'per_char'
+              ? t('translate.perCharHint', {
+                  price: yuan(config.textPriceCentsPerKchar),
+                })
+              : config.textDailyFreeLimit > 0
+                ? t('translate.freeDailyHint', { n: config.textDailyFreeLimit })
+                : t('translate.freeUnlimitedHint')}
         </p>
       )}
     </div>
@@ -468,7 +508,17 @@ function TextTranslateTab({
 
 const ACTIVE_STATUSES = new Set(['PENDING', 'TRANSLATING']);
 
-function DocTranslateTab({ config }: { config: TranslateConfig | null }) {
+function DocTranslateTab({
+  models,
+  modelId,
+  setModelId,
+  config,
+}: {
+  models: TranslateModelOption[];
+  modelId: string;
+  setModelId: (v: string) => void;
+  config: TranslateConfig | null;
+}) {
   const { t } = useI18n();
   const [tasks, setTasks] = useState<DocTask[]>([]);
   const [loading, setLoading] = useState(true);
@@ -482,6 +532,13 @@ function DocTranslateTab({ config }: { config: TranslateConfig | null }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const disabled = config ? !config.docEnabled : false;
+
+  // 任务行回显「这单用的哪个模型」：任务存的是 DB id，名字从下发的候选列表里取；
+  // 取不到（模型已下架 / 该单跟随全局默认）就不显示，不编一个名字出来。
+  const modelNameById = useMemo(
+    () => new Map(models.map((m) => [m.id, m.displayName])),
+    [models]
+  );
 
   const reload = useCallback(async () => {
     try {
@@ -540,6 +597,8 @@ function DocTranslateTab({ config }: { config: TranslateConfig | null }) {
       form.append('file', file);
       form.append('sourceLang', sourceLang);
       form.append('targetLang', targetLang);
+      // 空 = 交给服务端按「组绑定 > 全局 TRANSLATION 默认」解析
+      if (modelId) form.append('modelId', modelId);
       const res = await fetch('/api/translate/documents', { method: 'POST', body: form });
       const data = await res.json().catch(() => null);
       if (!res.ok) {
@@ -635,13 +694,19 @@ function DocTranslateTab({ config }: { config: TranslateConfig | null }) {
         <LanguageSelect value={sourceLang} onChange={setSourceLang} excludeCodes={[targetLang]} className="w-44" />
         <ArrowLeftRight className="w-4 h-4 text-charcoal-300" />
         <LanguageSelect value={targetLang} onChange={setTargetLang} excludeCodes={[sourceLang]} className="w-44" />
+        <ModelSelect models={models} value={modelId} onChange={setModelId} />
         {config && (
           <span className="ml-auto text-[11px] text-charcoal-400">
-            {t('translate.docPricingHint', {
-              price: yuan(config.docPriceCentsPerPage),
-              pages: config.docMaxPages,
-              mb: config.docMaxMb,
-            })}
+            {config.billingExempt
+              ? t('translate.docPricingHintFree', {
+                  pages: config.docMaxPages,
+                  mb: config.docMaxMb,
+                })
+              : t('translate.docPricingHint', {
+                  price: yuan(config.docPriceCentsPerPage),
+                  pages: config.docMaxPages,
+                  mb: config.docMaxMb,
+                })}
           </span>
         )}
       </div>
@@ -702,6 +767,7 @@ function DocTranslateTab({ config }: { config: TranslateConfig | null }) {
               <TaskRow
                 key={task.id}
                 task={task}
+                modelLabel={(task.modelId && modelNameById.get(task.modelId)) || null}
                 onRetry={() => handleRetry(task)}
                 onDelete={() => setDeleteTarget(task)}
               />
@@ -715,15 +781,26 @@ function DocTranslateTab({ config }: { config: TranslateConfig | null }) {
         title={t('translate.quoteTitle')}
         message={
           quote
-            ? t('translate.quoteMessage', {
-                file: quote.task.fileName,
-                pages: quote.task.pageCount,
-                price: yuan(quote.task.estimatedCents),
-                balance: yuan(quote.balance),
-              })
+            ? config?.billingExempt
+              ? t('translate.quoteMessageFree', {
+                  file: quote.task.fileName,
+                  pages: quote.task.pageCount,
+                })
+              : t('translate.quoteMessage', {
+                  file: quote.task.fileName,
+                  pages: quote.task.pageCount,
+                  price: yuan(quote.task.estimatedCents),
+                  balance: yuan(quote.balance),
+                })
             : ''
         }
-        confirmText={confirming ? t('common.loading') : t('translate.confirmStart')}
+        confirmText={
+          confirming
+            ? t('common.loading')
+            : config?.billingExempt
+              ? t('translate.confirmStartFree')
+              : t('translate.confirmStart')
+        }
         loading={confirming}
         danger={false}
         onConfirm={handleConfirm}
@@ -758,10 +835,12 @@ function DocTranslateTab({ config }: { config: TranslateConfig | null }) {
 /** 任务行：状态徽章 + 进度条 + 操作（下载/预览/重试/删除） */
 function TaskRow({
   task,
+  modelLabel,
   onRetry,
   onDelete,
 }: {
   task: DocTask;
+  modelLabel: string | null;
   onRetry: () => void;
   onDelete: () => void;
 }) {
@@ -792,6 +871,7 @@ function TaskRow({
         </span>
         {badge()}
         <span className="ml-auto text-[11px] text-charcoal-400 tabular-nums flex-shrink-0">
+          {modelLabel && `${modelLabel} · `}
           {task.pageCount} {t('translate.pages')} · {fmtBytes(task.fileBytes)}
           {task.chargedCents > 0 && !task.refunded && ` · ${yuan(task.chargedCents)}`}
           {task.refunded && ` · ${t('translate.refunded')}`}

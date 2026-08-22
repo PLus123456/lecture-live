@@ -4,6 +4,7 @@ import { prisma } from '@/lib/prisma';
 import { spendWalletCents, WalletError } from '@/lib/wallet';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { resolveUserFeatureFlags } from '@/lib/userRoles';
+import { isBillingExempt } from '@/lib/billing';
 import { TASK_VIEW_SELECT, toTaskView } from '@/lib/translate/taskApi';
 import {
   enqueueDocTranslate,
@@ -33,7 +34,16 @@ export async function POST(
     if (!settings.translation_doc_enabled) {
       return NextResponse.json({ error: '站点未开启文档翻译' }, { status: 403 });
     }
-    const flags = await resolveUserFeatureFlags(user);
+    // 组能力与计费豁免都按 DB 行解析（同 /api/translate/documents 的理由：JWT 载荷没有
+    // customGroupId，role 在降级后还会陈旧一段时间）。
+    const dbUser = await prisma.user.findUnique({
+      where: { id: user.id },
+      select: { role: true, customGroupId: true },
+    });
+    if (!dbUser) {
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    }
+    const flags = await resolveUserFeatureFlags(dbUser);
     if (!flags.allowDocTranslation) {
       return NextResponse.json({ error: '当前用户组未开通文档翻译' }, { status: 403 });
     }
@@ -58,6 +68,10 @@ export async function POST(
       );
     }
 
+    // ADMIN 免单：实扣与台账都记 0（报价侧已出 0，这里再兜一次 —— 覆盖「报价后才升管理员」
+    // 与任何遗留的非零报价行）。chargedCents=0 也让退款闸（gt:0）天然跳过，不会凭空退钱。
+    const billableCents = isBillingExempt(dbUser.role) ? 0 : task.estimatedCents;
+
     const pendingAt = new Date(
       Math.max(Date.now(), task.updatedAt.getTime() + 1)
     );
@@ -66,18 +80,18 @@ export async function POST(
         where: { id: task.id, status: 'QUOTED', updatedAt: task.updatedAt },
         data: {
           status: 'PENDING',
-          chargedCents: task.estimatedCents,
+          chargedCents: billableCents,
           updatedAt: pendingAt,
         },
       });
       if (claimed.count === 0) {
         throw new WalletError('任务已确认或已失效', 'bad_request');
       }
-      if (task.estimatedCents > 0) {
+      if (billableCents > 0) {
         await spendWalletCents(
           {
             userId: user.id,
-            amountCents: task.estimatedCents,
+            amountCents: billableCents,
             type: 'translation',
             note: `doc-translate:${task.id}`,
           },
@@ -112,12 +126,15 @@ export async function POST(
           { status: 409 }
         );
       }
-      if (task.estimatedCents > 0) {
+      // 必须用 billableCents（= 实际写进 chargedCents 的值），不是 estimatedCents：
+      // ADMIN 免单时行上是 0，拿 estimatedCents 做 CAS 期望值会永远匹配不上，
+      // 把「入队失败」误报成 task_generation_changed。
+      if (billableCents > 0) {
         const refunded = await refundTaskCharge(task.id, '入队失败退款', {
           status: 'FAILED',
           jobQueueId: null,
           proxyGeneration: null,
-          chargedCents: task.estimatedCents,
+          chargedCents: billableCents,
           updatedAt: failedAt,
         });
         if (!refunded.claimed) {

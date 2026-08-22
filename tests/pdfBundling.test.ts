@@ -14,7 +14,12 @@ import { createRequire } from 'node:module';
  *  2. pdfjs 的 worker/CMap 是运行时按路径加载的，nft 追踪不到 → standalone 产物缺文件，
  *     dev 正常但生产抛 "Setting up fake worker failed: Cannot find module …/pdf.worker.mjs"。
  *     install.sh 与 Dockerfile 都只拷 .next/standalone，缺了就是线上炸。
- * 第 2 条的 include 路径是写死的（前缀 ** 的 glob 会把 build 打成 V8 OOM），一旦 npm 的
+ *  3. @napi-rs/canvas 同样追踪不到（pdf.mjs 走 createRequire() 动态 require，二进制还在平台专属
+ *     包里）。它不是「渲染才用」的可选件：pdf.mjs 顶层就有 `const SCALE_MATRIX = new DOMMatrix()`，
+ *     polyfill 补不上就在**模块求值阶段**抛 ReferenceError，而 `await import('pdf-parse')` 在路由的
+ *     getInfo try 之外 → 又是一个不可读的 500。生产实测链：
+ *     "Cannot load @napi-rs/canvas" → "Cannot polyfill DOMMatrix" → "DOMMatrix is not defined"。
+ * 第 2、3 条的 include 路径是写死的（前缀 ** 的 glob 会把 build 打成 V8 OOM），一旦 npm 的
  * hoisting 结构变化就会静默失效——所以这里连磁盘上是否真有这些文件一起断言。
  */
 
@@ -46,9 +51,13 @@ describe('PDF 解析的打包契约', () => {
     }
   });
 
-  it('声明的资源目录在磁盘上真实存在（防 hoisting 变化后静默失效）', () => {
+  it('声明的 pdfjs 资源目录在磁盘上真实存在（防 hoisting 变化后静默失效）', () => {
+    // 只管 pdfjs 那批：它们是写死的确定路径，缺一条就是静默失效。
+    // @napi-rs 那批不在这里断言——平台专属包按设计只命中一个，顶层那份还可能被 npm hoist 掉；
+    // 它们由下面「解析得到的 canvas 必须被 include 覆盖」按 pdfjs 自己的解析口径守，无缺口。
     const includes: string[] = nextConfig.outputFileTracingIncludes[PDF_ROUTES[0]];
     const missing = includes
+      .filter((glob) => !glob.includes('@napi-rs'))
       .map((glob) => glob.replace(/\/\*\*$/, '').replace(/^\.\//, ''))
       .filter((dir) => !fs.existsSync(path.join(ROOT, dir)));
     expect(missing).toEqual([]);
@@ -87,6 +96,44 @@ describe('PDF 解析的打包契约', () => {
     }
   });
 
+  it('pdf-parse 用的那份 pdfjs 能解析到 @napi-rs/canvas，且被 tracing include 覆盖', () => {
+    const pdfjsEntry = path.join(
+      ROOT,
+      'node_modules/pdf-parse/node_modules/pdfjs-dist/legacy/build/pdf.mjs'
+    );
+    // 按 pdfjs 自己的解析口径找包（createRequire(pdf.mjs) → require('@napi-rs/canvas')）
+    const canvasEntry = createRequire(pdfjsEntry).resolve('@napi-rs/canvas');
+    // worktree 里 node_modules 是软链到主仓库的，realpath 后再相对化，才能和
+    // include 里 "./node_modules/…" 的写法对齐（否则算出 ../../../ 跑到仓库外）
+    const nodeModules = fs.realpathSync(path.join(ROOT, 'node_modules'));
+    const canvasDir = path.posix.join(
+      'node_modules',
+      path.relative(nodeModules, path.dirname(canvasEntry))
+    );
+    expect(canvasDir.startsWith('..'), `canvas 落在 node_modules 外: ${canvasDir}`).toBe(false);
+
+    // 平台二进制是另一个包（canvas-linux-x64-gnu / canvas-darwin-arm64 …），单独确认存在
+    const binding = fs
+      .readdirSync(path.dirname(path.dirname(canvasEntry)))
+      .filter((name) => name.startsWith('canvas-'));
+    expect(binding.length, '没装任何 @napi-rs/canvas-<平台> 二进制包').toBeGreaterThan(0);
+
+    const patterns: RegExp[] = nextConfig.outputFileTracingIncludes[PDF_ROUTES[0]].map(globToRegExp);
+    const covered = (rel: string) => patterns.some((re) => re.test(rel));
+    expect(covered(`${canvasDir}/index.js`), `include 没盖住 ${canvasDir}`).toBe(true);
+    for (const name of binding) {
+      const rel = `${path.dirname(canvasDir)}/${name}`;
+      expect(covered(`${rel}/package.json`), `include 没盖住 ${rel}`).toBe(true);
+    }
+  });
+
+  it('import pdf-parse 之后 DOMMatrix 必须被补上（补不上则模块求值即崩）', async () => {
+    await import('pdf-parse');
+    // pdf.mjs 顶层的 `new DOMMatrix()` 依赖这个全局；缺了不是「渲染略糊」而是整条链路 500
+    expect(typeof globalThis.DOMMatrix, 'DOMMatrix 未被 polyfill').toBe('function');
+    expect(() => new (globalThis.DOMMatrix as new () => unknown)()).not.toThrow();
+  });
+
   it('两份 pdfjs-dist 的 worker 文件都存在（pdf-parse 内嵌 + officeparser 顶层）', () => {
     const workers = [
       'node_modules/pdf-parse/node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs',
@@ -110,6 +157,23 @@ describe('PDF 解析的打包契约', () => {
     }
   });
 });
+
+/**
+ * 把 outputFileTracingIncludes 的 glob 转成正则，用来判断某个相对路径是否被声明覆盖。
+ * `**` 跨层匹配，`*` 只在单层内匹配——与 nft 的口径一致。
+ */
+function globToRegExp(glob: string): RegExp {
+  const source = glob
+    .replace(/^\.\//, '')
+    .split('/')
+    .map((segment) =>
+      segment === '**'
+        ? '.*'
+        : segment.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*')
+    )
+    .join('/');
+  return new RegExp(`^${source}$`);
+}
 
 /** 最小合法单页 PDF（内联生成，避免往仓库塞二进制夹具） */
 function makeMinimalPdf(): Buffer {

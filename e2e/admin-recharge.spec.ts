@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * Admin 充值面板烟测 —— 全量 route mock、无真实 DB。
@@ -39,8 +39,8 @@ test.beforeEach(async ({ page }) => {
     const method = request.method();
 
     if (p === '/api/site-config') return fulfillJson(route, { site_name: 'QA', allow_registration: true });
-    if (p === '/api/auth/login' && method === 'POST') return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
-    if (p === '/api/auth/refresh' && method === 'GET') return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+    if (p === '/api/auth/login' && method === 'POST') return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     if (p === '/api/users/quota') {
       return fulfillJson(route, {
         quotas: { id: 'admin-1', role: 'ADMIN', transcriptionMinutesUsed: 0, transcriptionMinutesLimit: 999999, remainingTranscriptionMinutes: 999999, remainingTranscriptionMs: 0, storageHoursUsed: 0, storageHoursLimit: 999999, storageBytesUsed: 0, storageBytesLimit: 1000000000, remainingStorageBytes: 1000000000, allowedModels: '*', quotaResetAt: null },

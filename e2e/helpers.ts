@@ -2,6 +2,17 @@ import { test } from '@playwright/test';
 import type { Page, Route } from '@playwright/test';
 
 /**
+ * 认证突变响应里的会话绑定（PR#234 的 token family 引入）。
+ *
+ * 真实的 /api/auth/login 与 /api/auth/refresh 现在都会回一个 sessionBinding，
+ * 而 useAuth 拿不到它就判定会话未建立、直接停在登录页并显示
+ * 「Login session binding missing」。所以任何 mock 掉这两个端点的 e2e 都必须一起给出来，
+ * 否则整条登录链路在 e2e 里是断的 —— 值本身对客户端不透明（服务端是一段 HMAC capability），
+ * 这里给个固定串即可。
+ */
+export const E2E_SESSION_BINDING = '__e2e_session_binding__';
+
+/**
  * 表单登录并等浏览器落到 /home。
  *
  * NAS 上 dev server 首次编译一条路由可能超过全局 30s test timeout（并行 worker

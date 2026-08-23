@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 录音健壮性端到端：会话被服务端回收（reclaim）后停止收尾不再静默删库丢录音（审计 critical）。
@@ -93,6 +93,7 @@ interface MockOptions {
   sessionGetFails?: boolean; // GET /api/sessions/:id 返回 500（模拟拉取失败）
   patchLog?: string[]; // 记录所有 PATCH /api/sessions/:id 的目标 status
   draftFullPayload?: unknown; // GET transcript/draft?full=true（冷恢复读取）
+  draftFinalizeStatus?: number; // 草稿收尾返回的状态码（402 = 存储配额不足）
 }
 
 function installSessionApiMocks(page: Page, opts: MockOptions = {}) {
@@ -102,6 +103,7 @@ function installSessionApiMocks(page: Page, opts: MockOptions = {}) {
     sessionGetFails = false,
     patchLog,
     draftFullPayload,
+    draftFinalizeStatus,
   } = opts;
 
   // 有状态 mock：POST /finalize 后 GET 会话返回 COMPLETED，忠实于真实后端（finalize 即置
@@ -127,14 +129,14 @@ function installSessionApiMocks(page: Page, opts: MockOptions = {}) {
     if (p === '/api/auth/login' && method === 'POST') {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
     // 整页导航到会话页后，token 不持久化，靠 refresh 从 cookie 恢复会话
-    if (p === '/api/auth/refresh' && method === 'GET') {
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
     if (p === '/api/sessions' && url.searchParams.get('limit') === '50') {
@@ -184,6 +186,16 @@ function installSessionApiMocks(page: Page, opts: MockOptions = {}) {
       return fulfillJson(route, { seqs: [] });
     }
     if (p === `/api/sessions/${SESSION_ID}/audio/draft/finalize`) {
+      if (draftFinalizeStatus && draftFinalizeStatus !== 200) {
+        return fulfillJson(
+          route,
+          {
+            error: 'Storage quota exceeded; cannot save recording draft',
+            quota: 'storage_bytes',
+          },
+          draftFinalizeStatus
+        );
+      }
       return fulfillJson(route, { success: true });
     }
     // 会话已被回收 → finalize 幂等短路（或正常成功，视 finalizeBody）
@@ -332,4 +344,45 @@ test('会话状态拉取失败 + 本地在录：兜底 live-refresh 保留本地
     window.sessionStorage.getItem('lecture-live-transcript')
   );
   expect(snap).not.toBeNull();
+});
+
+test('草稿收尾被存储配额拒绝(402)：本地录音必须保留，不静默丢课', async ({
+  page,
+}) => {
+  // 统一 artifact 账本把录音也纳入了字节配额，超限时草稿收尾会 402。
+  // 服务端那侧的口径由单测把关（录音归 storageHoursLimit、不吃 chat 文件配额）；
+  // e2e 无库，探不到账目本身，能且只能守住用户侧那半条命：
+  // 收尾失败时**唯一完整的那份录音在本地**，绝不能被清掉、也不能假装成功跳走。
+  await installSessionApiMocks(page, { draftFinalizeStatus: 402 });
+  await loginThroughUi(page);
+  await seedRecordingSnapshot(page);
+
+  await page.goto(`/session/${SESSION_ID}`);
+  await expect(page).toHaveURL(new RegExp(`/session/${SESSION_ID}$`));
+
+  const stopButton = page.getByRole('button', { name: 'Stop', exact: true }).first();
+  await expect(stopButton).toBeVisible({ timeout: 15_000 });
+  await stopButton.click();
+
+  // 断言 1：本地转录副本还在（收尾失败不得清缓存）
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() =>
+          window.sessionStorage.getItem('lecture-live-transcript')
+        ),
+      { timeout: 10_000 }
+    )
+    .not.toBeNull();
+
+  // 断言 2：停在会话页，没有假装收尾成功跳去回放
+  await expect(page).toHaveURL(new RegExp(`/session/${SESSION_ID}$`));
+
+  // 断言 3：留了一小会儿也不会被异步清理顺手抹掉
+  await page.waitForTimeout(1500);
+  expect(
+    await page.evaluate(() =>
+      window.sessionStorage.getItem('lecture-live-transcript')
+    )
+  ).not.toBeNull();
 });

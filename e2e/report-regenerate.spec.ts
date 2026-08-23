@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 回放页「报告」区：生成失败 / 缺失时的「重新生成报告」按钮端到端。
@@ -120,13 +120,13 @@ function installReportMocks(page: Page, opts: ReportMockOptions = {}) {
     if (p === '/api/auth/login' && method === 'POST') {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
-    if (p === '/api/auth/refresh' && method === 'GET') {
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
 

@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs } from './helpers';
 
 // 邮箱验证 / 忘记密码 / 重置密码的前端 UX e2e。
 // 说明：e2e webServer 指向不可达 DB（无真库），认证真链路（令牌/发信/DB）够不到，
@@ -208,10 +208,10 @@ test('验证邮件页：挂载即验证，成功显示回执', async ({ page }) 
     const method = route.request().method();
     if (p === '/api/site-config') return fulfillJson(route, {});
     if (p === '/api/auth/verify-email' && method === 'POST') {
-      return fulfillJson(route, { verified: true, user: publicUser, token: '__cookie_session__' });
+      return fulfillJson(route, { verified: true, user: publicUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
     // /home 外壳兜底（成功后会跳转）
-    if (p === '/api/auth/refresh') return fulfillJson(route, { user: publicUser, token: '__cookie_session__' });
+    if (p === '/api/auth/refresh') return fulfillJson(route, { user: publicUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     return fulfillJson(route, {});
   });
 

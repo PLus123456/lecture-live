@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson, loginViaForm } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, loginViaForm } from './helpers';
 
 /**
  * 断网续采端到端：录音中网络断开时，本地录音继续、只中断转录（审计后新增功能）。
@@ -53,13 +53,13 @@ function installMocks(page: Page) {
     if (p === '/api/auth/login' && method === 'POST') {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
-    if (p === '/api/auth/refresh' && method === 'GET') {
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
     if (p === '/api/sessions' && method === 'GET') {

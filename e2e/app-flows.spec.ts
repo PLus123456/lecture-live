@@ -1,6 +1,6 @@
 import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 const quotaPayload = {
   quotas: {
@@ -47,7 +47,7 @@ async function mockLoginAndHomeApis(page: Page) {
           displayName: 'Alice',
           role: 'ADMIN',
         },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
 
@@ -178,7 +178,7 @@ test('录音流程可以从首页创建新会话并跳转到会话页', async ({
           displayName: 'Alice',
           role: 'ADMIN',
         },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
 

@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs } from './helpers';
 
 /**
  * 管理员群发邮件面板（审计 #14）。
@@ -42,10 +42,10 @@ test.beforeEach(async ({ page }) => {
       });
     }
     if (p === '/api/auth/login' && method === 'POST') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
-    if (p === '/api/auth/refresh' && method === 'GET') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
 
     if (p === '/api/admin/settings' && method === 'GET') {
@@ -172,8 +172,17 @@ test('群发面板：可先给自己发测试信（不触碰收件人列表）',
   await fillBroadcast(page);
 
   await page.getByRole('button', { name: /Send test to myself|发测试信给自己/i }).click();
+
+  // 必须等的是**发送成功提示**，不能只等页面上出现管理员邮箱 —— 侧边栏本来就一直显示
+  // 登录用户的邮箱，光匹配邮箱会在请求发出之前就命中，断言随即跑在拦截之前（实测
+  // 断言先打印 len=0、拦截日志后到）。等这条带邮箱的成功文案才是真的等到了回包。
   await expect(
-    page.getByText(new RegExp(`${adminUser.email}`, 'i'))
+    page.getByText(
+      new RegExp(
+        `(Test email sent to|测试邮件已发送至)\\s*${adminUser.email}`,
+        'i'
+      )
+    )
   ).toBeVisible({ timeout: 15_000 });
 
   expect(broadcastCalls.at(-1)?.mode).toBe('test');

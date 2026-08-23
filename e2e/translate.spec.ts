@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, fulfillSse, installBrowserStubs, loginViaForm } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, fulfillSse, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 翻译页烟测 —— 全量 route mock、无真实 DB / worker。
@@ -67,10 +67,10 @@ test.beforeEach(async ({ page }) => {
       return fulfillJson(route, { site_name: 'LectureLive QA', allow_registration: true });
     }
     if (p === '/api/auth/login' && method === 'POST') {
-      return fulfillJson(route, { user, token: '__cookie_session__' });
+      return fulfillJson(route, { user, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
-    if (p === '/api/auth/refresh' && method === 'GET') {
-      return fulfillJson(route, { user, token: '__cookie_session__' });
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
+      return fulfillJson(route, { user, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
 
     if (p === '/api/translate/models') {

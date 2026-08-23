@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 完整版补全转录（阶段B）端到端：回放页「生成完整版转录」→ 收费确认弹窗 → 触发 → 状态轮询
@@ -118,14 +118,14 @@ function installFullTranscribeMocks(page: Page, opts: FullMockOptions = {}) {
     if (p === '/api/auth/login' && method === 'POST') {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
     // 整页导航到回放页后 token 不持久化，靠 refresh 从 cookie 恢复会话
-    if (p === '/api/auth/refresh' && method === 'GET') {
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
 

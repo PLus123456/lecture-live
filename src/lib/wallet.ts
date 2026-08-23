@@ -65,7 +65,31 @@ function generateOutTradeNo(): string {
   return `LL${Date.now().toString(36)}${crypto.randomBytes(6).toString('hex')}`.toUpperCase();
 }
 
-const ORDER_TTL_MS = 30 * 60_000; // 未支付订单 30 分钟过期
+const ORDER_TTL_MS = 30 * 60_000; // 未支付订单 30 分钟过期（**仅用于前端展示「订单已超时」**）
+
+/**
+ * 回调可认领的订单状态。
+ *
+ * 这里为什么必须包含 `expired`：认领 CAS 是「钱有没有入账」的唯一锚点，而 `expired` 是
+ * expireStalePaymentOrders 这个纯清扫器打上的标记 —— 它表达的是「我们这边不再等了」，
+ * **不是**「网关那边不会再来了」。支付宝/微信的异步通知重投窗口约 24h、Stripe 的 webhook
+ * 重投窗口长达 3 天，只认 pending 的话，一条被清扫过的订单遇到晚到的真实回调就再也抢不到
+ * CAS：网关收了用户的钱，我们这边永远不入账。这是净资损，比「死列」严重得多。
+ *
+ * `failed` / `canceled` 不在此列：那是我方或用户**主动**判定的终态（发起支付失败、用户取消），
+ * 不是超时推断，不该被一条晚到的通知复活。`refunded` 由前置的 refundedAt 检查单独挡死。
+ */
+const CLAIMABLE_ORDER_STATUSES = ['pending', 'expired'] as const;
+
+/**
+ * 未支付订单回收的**宽限期**：从 expiresAt 再往后推这么久才置 expired。
+ *
+ * 绝不能用 ORDER_TTL_MS（30 分钟）—— 那 30 分钟是给前端展示「订单已超时」用的，不是安全的
+ * 回收地平线，按它回收会正面撞进网关重投窗口。取 72h 覆盖最长的一家（Stripe 约 3 天；
+ * 支付宝/微信各约 24h）。即便如此，回收本身也不是资金闸 —— 真正兜底的是上面那条
+ * CLAIMABLE_ORDER_STATUSES：清扫早了也只是状态难看，钱照样能入账。
+ */
+export const PAYMENT_ORDER_EXPIRE_GRACE_MS = 72 * 60 * 60_000;
 
 /** 归一化 ISO-4217 币种码（大写、去空白）；非法/空值回 ''，由调用方决定回落。 */
 function normalizeCurrency(v: string | null | undefined): string {
@@ -141,6 +165,39 @@ export async function createPaymentOrder(input: {
       expiresAt: new Date(Date.now() + ORDER_TTL_MS),
     },
   });
+}
+
+/**
+ * 未支付订单清扫：把过了 expiresAt + 宽限期仍是 pending 的订单置为 expired。
+ *
+ * 在此之前 `PaymentOrder.expiresAt` 与 `@@index([status, expiresAt])` 是一对**死列** ——
+ * 建单时写入、全仓无人读，`expired` 这个状态从来没在生产里存在过，pending 订单无限堆积。
+ *
+ * **落地顺序有硬依赖**：本函数必须晚于 creditPaidOrder 的认领 CAS 放宽（CLAIMABLE_ORDER_STATUSES
+ * 收 expired）才允许启用，否则被扫过的订单遇到晚到的真实回调将永远无法入账。
+ *
+ * 只动 pending：failed/canceled/paid/refunded 都是已决终态，清扫器绝不覆写。
+ */
+export async function expireStalePaymentOrders(options?: {
+  graceMs?: number;
+  now?: Date;
+}): Promise<number> {
+  const now = options?.now ?? new Date();
+  const graceMs = Math.max(0, options?.graceMs ?? PAYMENT_ORDER_EXPIRE_GRACE_MS);
+  const cutoff = new Date(now.getTime() - graceMs);
+  const result = await prisma.paymentOrder.updateMany({
+    // expiresAt 为 NULL 的历史行不参与（SQL 三值逻辑下 NULL < cutoff 本就不成立，
+    // 这里显式写出来是给读代码的人看的）。命中 @@index([status, expiresAt])。
+    where: { status: 'pending', expiresAt: { not: null, lt: cutoff } },
+    data: { status: 'expired' },
+  });
+  if (result.count > 0) {
+    logSystemEvent(
+      'recharge.order.expired_sweep',
+      `count=${result.count} cutoff=${cutoff.toISOString()} graceMs=${graceMs}`
+    );
+  }
+  return result.count;
 }
 
 export interface CreditResult {
@@ -281,9 +338,14 @@ export async function creditPaidOrder(
     const claim = await tx.paymentOrder.updateMany({
       // 绑定回调渠道到订单 provider（H3 纵深）：回调渠道须与下单渠道一致才认领，防止用某渠道
       // （尤其无验签的 sandbox）替另一渠道的订单结算。正常回调渠道恒等于下单渠道，不影响业务。
+      //
+      // status 收 pending + expired 两态（见 CLAIMABLE_ORDER_STATUSES）：被清扫器打成 expired
+      // 的订单遇到晚到的真实回调仍要恰好入账一次。并发上二者不会互相踩 —— 清扫器自己带
+      // `status: 'pending'` 谓词，行锁下无论谁先跑，终态都对：先扫后认领 = expired→paid；
+      // 先认领后扫 = paid，清扫器不再匹配。
       where: {
         outTradeNo,
-        status: 'pending',
+        status: { in: [...CLAIMABLE_ORDER_STATUSES] },
         ...(expectedProvider ? { provider: expectedProvider } : {}),
       },
       data: {
@@ -294,7 +356,8 @@ export async function creditPaidOrder(
     });
 
     if (claim.count === 0) {
-      // 未认领到：已被处理过（重复回调）或非 pending。幂等，不再到账。
+      // 未认领到：已被处理过（重复回调）或已是不可认领的终态（failed/canceled/refunded），
+      // 也可能是渠道不匹配。幂等，不再到账 —— 下面按 order 的**认领前快照**判定是否补发放。
       return { order, meta, claimedNow: false, reject: null as RejectReason };
     }
 

@@ -74,6 +74,27 @@ const translateLogger = logger.child({ component: 'doc-translate' });
  * 这两个常量当初就是各改各的漂移开的（jobQueue 的 2h < 这里的 3h），必然误杀。
  */
 export const MAX_WORKER_RUNTIME_MS = 180 * 60_000;
+/**
+ * 任务级**绝对死线**：一个 TranslationTask 允许停留在非终态（PENDING/TRANSLATING）的总时长。
+ *
+ * 为什么单有 MAX_WORKER_RUNTIME_MS 不够：`job.startedAt` 在**每一次重派时都被清空**
+ *（回炉 SUBMITTED 的五处、以及 retryJob），所以那 3 小时其实是「每一次派发」的预算，
+ * 不是任务总预算。整个 worker 机队长期不可达时，任务就在 SUBMITTED ↔ PROCESSING 之间
+ * 无限弹跳、永不终态：用户侧永远显示「翻译中」，而 chargedCents 一直押着不退。
+ * 机队被整个删掉/停用（getTranslateFleetConfig 返回 null）时更彻底 —— 连 tick 都直接早退。
+ *
+ * 取值 24h 的理由：一次完整的合法重试链最长 ≈ 3 次派发 × 3h + 退避(5+20+45min) ≈ 9.5h，
+ * 24h 留了 2.5 倍余量；同时必须严格大于僵尸回收阈值（4h）与单次运行上限（3h），
+ * 三者的序关系由 translateGeneration.test.ts 的跨模块不变式测试钉死 —— 它们当初就是
+ * 各改各的漂移开的（H5 的成因）。
+ *
+ * **锚点**是 `max(TranslationTask.createdAt, 本代 JobQueue 行的 createdAt)`，不是裸的任务
+ * createdAt：用户 retry 复用同一个 TranslationTask 行（createdAt 不变）但会换一条全新的调度行，
+ * 若只看任务 createdAt，隔天来点一次重试会被本扫描当场打死 —— 钱虽然退了，重试却等于不可用。
+ * 而调度行的 createdAt 在「弹跳」这条真正的病态路径上是稳定的（五处回炉只清 startedAt、
+ * 不新建行），死线照样咬得住。
+ */
+export const MAX_TASK_LIFETIME_MS = 24 * 60 * 60_000;
 /** 自动重试退避（按已消耗 attempt 索引） */
 const RETRY_BACKOFF_MS = [5 * 60_000, 20 * 60_000, 45 * 60_000];
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -245,6 +266,16 @@ export function runDocTranslateTick(): Promise<void> {
 
 async function executeTick(): Promise<void> {
   const fleet = await getTranslateFleetConfig();
+
+  // 0) 任务级绝对死线。**必须排在下面 `if (!fleet)` 早退之前** —— 机队被停用/删空正是
+  // 任务永久挂起的形态之一（连 tick 都进不来），死线放在早退之后就永远够不着它。
+  await enforceTaskLifetimeDeadlines(fleet).catch((error) =>
+    translateLogger.warn(
+      { err: serializeError(error) },
+      '任务生存期死线扫描异常（下轮重试）'
+    )
+  );
+
   if (!fleet) {
     return; // 文档翻译未启用/无可用 worker：入队任务保留，配置好后自动推进
   }
@@ -386,6 +417,74 @@ async function executeTick(): Promise<void> {
       );
       await failJob(job.id, error, { retryable: true });
     });
+  }
+}
+
+/**
+ * 任务级绝对死线扫描：把在非终态停留超过 MAX_TASK_LIFETIME_MS 的任务终态化 + **退款**。
+ *
+ * 必须走 `failJob(..., { retryable: false })`，不能图省事用裸 updateMany —— 只有 failJob 会
+ * 跑 refundTaskCharge（释放押着的 chargedCents，这正是本扫描存在的全部意义）、发失败通知、
+ * 并带上 L24 代次谓词。绕过它就等于没修。
+ *
+ * 与既有机制的关系：
+ *  - retryable:false ⇒ failJob 会 `delete params.nextRetryAt`，第 2 步的到期自动重试因此
+ *    不会把它再捞回炉（那圈明确要求 nextRetryAt 存在）；
+ *  - 任务随即变 FAILED，第 2.4 步 H5 断链自愈的 `status in [PENDING, TRANSLATING]` 不再匹配，
+ *    两者不会互相打架，也没有造出 H5 捞不到的新形态；
+ *  - 退避（RETRY_BACKOFF_MS / params.nextRetryAt）不受影响：它只作用于 retryable 的失败。
+ */
+async function enforceTaskLifetimeDeadlines(
+  fleet: TranslateFleetConfig | null,
+  now: number = Date.now()
+): Promise<void> {
+  const cutoff = new Date(now - MAX_TASK_LIFETIME_MS);
+  // 命中 @@index([status, createdAt])。jobQueueId 非空是硬前提：failJob 的入参就是代次令牌，
+  // 没有调度行的孤儿由第 2.5 步补入队，下一轮再落到这里。
+  const candidates = await prisma.translationTask.findMany({
+    where: {
+      status: { in: ['PENDING', 'TRANSLATING'] },
+      createdAt: { lt: cutoff },
+      jobQueueId: { not: null },
+    },
+    select: { id: true, jobQueueId: true, createdAt: true },
+    orderBy: { createdAt: 'asc' },
+    take: 20,
+  });
+
+  for (const task of candidates) {
+    const jobId = task.jobQueueId;
+    if (!jobId) continue;
+    const job = await prisma.jobQueue.findUnique({
+      where: { id: jobId },
+      select: { id: true, type: true, status: true, params: true, createdAt: true },
+    });
+    if (!job || job.type !== JOB_TYPE.DOC_TRANSLATE) continue;
+    // 锚点取较晚者（见 MAX_TASK_LIFETIME_MS 注释）：本代调度行还年轻 = 用户刚重试过，放行。
+    if (job.createdAt.getTime() >= cutoff.getTime()) continue;
+
+    // best-effort 收掉 worker 侧可能还在的那份任务（机队不可达时必然失败，无所谓）。
+    const bound = fleet ? workerById(fleet, parseJobParams(job.params).workerId) : null;
+    if (bound) await deleteTranslateJob(bound, job.id).catch(() => undefined);
+
+    translateLogger.warn(
+      {
+        jobId,
+        taskId: task.id,
+        taskCreatedAt: task.createdAt.toISOString(),
+        jobCreatedAt: job.createdAt.toISOString(),
+        jobStatus: job.status,
+      },
+      '文档翻译任务超过最长生存期，终止并退款'
+    );
+    await failJob(jobId, new Error('文档翻译超时未完成，已终止并退款'), {
+      retryable: false,
+    }).catch((error) =>
+      translateLogger.warn(
+        { jobId, taskId: task.id, err: serializeError(error) },
+        '死线终止失败（下轮重试）'
+      )
+    );
   }
 }
 

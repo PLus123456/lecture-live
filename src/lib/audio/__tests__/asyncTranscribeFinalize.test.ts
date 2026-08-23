@@ -16,7 +16,9 @@ const {
   sessionTxUpdateMock,
   transactionMock,
   getSonioxTranscriptMock,
-  persistMock,
+  stageMock,
+  publishMock,
+  rollbackMock,
   runBackgroundLLMTasksMock,
   deductMock,
   settleMock,
@@ -31,7 +33,9 @@ const {
   sessionTxUpdateMock: vi.fn(),
   transactionMock: vi.fn(),
   getSonioxTranscriptMock: vi.fn(),
-  persistMock: vi.fn(),
+  stageMock: vi.fn(),
+  publishMock: vi.fn(),
+  rollbackMock: vi.fn(),
   runBackgroundLLMTasksMock: vi.fn(),
   deductMock: vi.fn(),
   settleMock: vi.fn(),
@@ -63,7 +67,10 @@ vi.mock('@/lib/soniox/asyncTranscriptConverter', () => ({
 }));
 
 vi.mock('@/lib/sessionPersistence', () => ({
-  persistSessionTranscriptArtifacts: persistMock,
+  // M5：改走两阶段（stage → CAS → publish/rollback）。
+  stageSessionTranscriptArtifacts: stageMock,
+  finalizeStagedArtifactPublish: publishMock,
+  rollbackStagedArtifact: rollbackMock,
 }));
 
 vi.mock('@/lib/sessionFinalization', () => ({
@@ -110,10 +117,22 @@ describe('finalizeAsyncTranscription', () => {
     getSonioxTranscriptMock.mockResolvedValue({ tokens: [{ text: 'a' }] });
     convertMock.mockReturnValue([{ id: 'seg1' }]);
     extractMock.mockReturnValue([]);
-    persistMock.mockResolvedValue({
-      transcript: { path: '/t/s1' },
-      summary: { path: '/s/s1' },
+    stageMock.mockResolvedValue({
+      transcript: {
+        category: 'transcripts',
+        reference: '/t/s1',
+        localReference: 'local:transcripts/s1-stamp.json',
+        storage: 'local',
+      },
+      summary: {
+        category: 'summaries',
+        reference: '/s/s1',
+        localReference: 'local:summaries/s1-stamp.json',
+        storage: 'local',
+      },
     });
+    publishMock.mockResolvedValue({ path: '/t/s1', storage: 'local' });
+    rollbackMock.mockResolvedValue(undefined);
     getSiteSettingsMock.mockResolvedValue({ async_upload_billing_multiplier: 0.8 });
     deductMock.mockResolvedValue(undefined);
     settleMock.mockResolvedValue(0);
@@ -198,7 +217,7 @@ describe('finalizeAsyncTranscription', () => {
 
     expect(result).toEqual({ outcome: 'claim_lost' });
     expect(getSonioxTranscriptMock).not.toHaveBeenCalled();
-    expect(persistMock).not.toHaveBeenCalled();
+    expect(stageMock).not.toHaveBeenCalled();
     expect(deductMock).not.toHaveBeenCalled();
     expect(runBackgroundLLMTasksMock).not.toHaveBeenCalled();
     expect(deleteSonioxFileMock).not.toHaveBeenCalled();
@@ -308,7 +327,7 @@ describe('finalizeAsyncTranscription', () => {
       })
     ).rejects.toThrow('HTTP 503');
 
-    expect(persistMock).not.toHaveBeenCalled();
+    expect(stageMock).not.toHaveBeenCalled();
     expect(deductMock).not.toHaveBeenCalled();
   });
 

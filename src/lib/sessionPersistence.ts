@@ -513,24 +513,6 @@ export async function deleteSessionArtifacts(
   }
 }
 
-export async function persistSessionTranscriptArtifacts(
-  session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
-  bundle: PersistedTranscriptBundle
-): Promise<{
-  transcript: PersistedArtifactResult;
-  summary: PersistedArtifactResult;
-}> {
-  const transcriptJson = JSON.stringify(bundle, null, 2);
-  const summaryJson = JSON.stringify(bundle.summaries, null, 2);
-
-  const [transcript, summary] = await Promise.all([
-    persistArtifact(session, 'transcripts', transcriptJson),
-    persistArtifact(session, 'summaries', summaryJson),
-  ]);
-
-  return { transcript, summary };
-}
-
 /**
  * P0-6：转录 + 摘要的两阶段写入。先写版本化临时对象；调用方 DB CAS 成功后
  * finalizeStagedArtifactPublish、失败 rollbackStagedArtifact。转录/摘要不追踪 previousReference

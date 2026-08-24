@@ -34,7 +34,15 @@ vi.mock('@/lib/audio/ffmpegTranscode', () => ({
   transcodeToMp3: vi.fn(),
   validateMediaContainer: vi.fn(),
 }));
-vi.mock('@/lib/sessionPersistence', () => ({ persistSessionAudioArtifact: vi.fn() }));
+// 承重的模块桩：asyncUploadProcessor 确实 import sessionPersistence（会拉起 fs/cloudreve），
+// 但 P0-6r 之后 import 的是 staging 三件套，不再是已删除的 persistSessionAudioArtifact。
+// 桩里少给的名字只在**被访问时**才抛「No X export is defined on the mock」，cancelAsyncUpload
+// 路径碰不到它们，所以这行错了两年也一直是绿的。
+vi.mock('@/lib/sessionPersistence', () => ({
+  stageSessionAudioArtifact: vi.fn(),
+  finalizeStagedArtifactPublish: vi.fn(),
+  rollbackStagedArtifact: vi.fn(),
+}));
 vi.mock('@/lib/soniox/env', () => ({
   resolveAndPersistTaskRegion: vi.fn(),
   resolveSonioxConfigForSessionRegion: resolveConfigMock,

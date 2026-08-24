@@ -368,17 +368,6 @@ export async function persistArtifact(
   return result;
 }
 
-export async function persistSessionAudioArtifact(
-  session: Pick<SessionArtifactsSource, 'id' | 'userId' | 'recordingPath'>,
-  data: Buffer,
-  mimeType?: string | null
-): Promise<PersistedArtifactResult> {
-  return persistArtifact(session, 'recordings', data, {
-    mimeType,
-    previousReference: session.recordingPath,
-  });
-}
-
 // ── P0-6：artifact 临时对象 + CAS 发布 ─────────────────────────────────────────
 // 旧的 persistArtifact 先物理覆盖固定 key `{sessionId}.{ext}` 并删旧文件，再由调用方做
 // 数据库状态 guard。并发 finalize 已完成时，路由虽返回 409，但终态物理文件已被覆盖/删除

@@ -1,6 +1,11 @@
 import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
+import {
+  E2E_SESSION_BINDING,
+  fulfillJson,
+  installBrowserStubs,
+  loginAsAdmin,
+} from './helpers';
 
 /**
  * 同传（/interpret）启动竞态 —— H3 的端到端守卫。
@@ -71,11 +76,21 @@ async function setupInterpretRoutes(page: Page) {
     if (p === '/api/site-config') {
       return fulfillJson(route, { site_name: 'LectureLive QA', allow_registration: true });
     }
+    // 登录响应必须带 sessionBinding，否则 useAuth 判会话未建立、停在登录页；
+    // 会话恢复既可能是 GET 也可能是 POST（refresh 走 POST 之后 GET 只剩兼容路径）。
     if (p === '/api/auth/login' && method === 'POST') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+      return fulfillJson(route, {
+        user: adminUser,
+        token: '__cookie_session__',
+        sessionBinding: E2E_SESSION_BINDING,
+      });
     }
-    if (p === '/api/auth/refresh' && method === 'GET') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
+      return fulfillJson(route, {
+        user: adminUser,
+        token: '__cookie_session__',
+        sessionBinding: E2E_SESSION_BINDING,
+      });
     }
     if (p === '/api/users/quota') return fulfillJson(route, { quotas: quota });
     if (p === '/api/folders') return fulfillJson(route, []);

@@ -130,9 +130,13 @@ test.describe('认证同源闸：反代拓扑', () => {
         });
 
         expect(res.status()).toBe(403);
-        await expect(res.json()).resolves.toMatchObject({
-          error: CROSS_ORIGIN_MESSAGE,
-        });
+        // 两道闸都可能先命中：中间件的边缘 CSRF 检查（Cross-site request blocked）
+        // 或路由级的同源闸（Cross-origin auth mutation rejected）。谁先拒不重要，
+        // 本用例要钉的是「跨站写请求必须 403 且不落到业务逻辑」。
+        const body = (await res.json()) as { error?: string };
+        expect(body.error).toMatch(
+          new RegExp(`${CROSS_ORIGIN_MESSAGE}|Cross-site request blocked`)
+        );
       });
     }
 

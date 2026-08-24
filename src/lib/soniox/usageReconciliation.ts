@@ -22,7 +22,12 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { logger } from '@/lib/logger';
 import { logSystemEvent } from '@/lib/auditLog';
-import { clampSessionDurationMs, getBillableMinutes } from '@/lib/billing';
+import {
+  clampSessionDurationMs,
+  getBillableMinutes,
+  type AppUserRole,
+} from '@/lib/billing';
+import { MAX_INTERPRET_DURATION_MS } from '@/lib/interpret/anchor';
 import { deductTranscriptionMinutes } from '@/lib/quota';
 import { getRegionConfigAsync } from '@/lib/soniox/env';
 import { settleStreamGrants } from '@/lib/soniox/streamGrant';
@@ -37,8 +42,19 @@ const INITIAL_LOOKBACK_MS = 24 * 60 * 60_000;
 const MAX_WINDOW_MS = 30 * 24 * 60 * 60_000;
 /** 孤儿判定：mintedAt + key TTL + 连接硬上限之后再等这么久（等 usage-log 落账+回填）。 */
 const ORPHAN_SETTLE_GRACE_MS = 30 * 60_000;
-/** 每轮孤儿结算批量上限（维护循环 15min 一轮，积压会被后续轮次消化）。 */
+/** 每轮孤儿结算批量上限：本轮**真正处理**（尝试结算）的 grant 数上限，被跳过的不计入。 */
 const ORPHAN_BATCH_SIZE = 200;
+/** 孤儿扫描单页大小（游标分页；被跳过的行靠翻页绕过，不占 ORPHAN_BATCH_SIZE 名额）。 */
+const ORPHAN_SCAN_PAGE_SIZE = 200;
+/**
+ * M10：单轮最多扫描多少行。旧实现是「最老 200 条」一刀切，而循环里对**仍属活跃 Session /
+ * 未结算锚点**的 grant 只是 `continue` 跳过 —— 被跳过的行照样占满这 200 个名额。上课高峰下
+ * 约 13 个并发 4h 长会话（每 15 分钟一条 grant）就能让最老 200 条全是活跃 grant，每轮全被
+ * 跳过，真孤儿（客户端崩溃、页面被杀）永远进不了窗口，从「设计上延迟 30 分钟」变成饿死。
+ * 改为游标分页：翻页绕过被跳过项，直到攒够 ORPHAN_BATCH_SIZE 个真正处理的，或扫到本上限。
+ * 上限存在的意义只是防病态数据把维护周期拖死（15min 一轮，下轮从头再扫）。
+ */
+const MAX_ORPHAN_SCAN_ROWS = 5_000;
 
 const WATERMARK_KEY_PREFIX = 'billing_soniox_usage_watermark_';
 const SONIOX_REGIONS = ['us', 'eu', 'jp'] as const;
@@ -179,10 +195,25 @@ async function computeLateTopUpMinutes(
       select: { billedMinutes: true },
     });
     const charged = Math.max(0, anchor?.billedMinutes ?? 0);
-    return Math.max(
-      0,
-      getBillableMinutes(measuredMs) - charged - grantChargedMinutes
+    // M9：角色时长上限（FREE 2h / PRO 4h）是刻意的用户保护，补扣不得绕过它 —— 下面的
+    // realtime 分支早就写明并做了 clamp，interpret 分支此前直接拿 measuredMs 算差额，
+    // 于是「锚点异常长寿（cron 兜底前持续 mint）+ usage-log 迟到回填」会让 FREE 用户被
+    // 足额补扣超出保护上限的那一段。这里补齐同款两道封顶：
+    //   ① interpret 自己的单场硬上限 MAX_INTERPRET_DURATION_MS(6h) —— deduct 路由的 chargeMs
+    //      与 cron 兜底的 elapsedMs 都封了，只有本分支漏封；
+    //   ② 角色 clamp（ADMIN 无上限，clampSessionDurationMs 原样返回）。
+    const owner = await tx.user.findUnique({
+      where: { id: grant.userId },
+      select: { role: true },
+    });
+    if (!owner) return 0; // 用户已删：与 realtime 分支的 `if (!session) return 0` 同口径
+    const measuredMinutes = getBillableMinutes(
+      clampSessionDurationMs(
+        Math.min(measuredMs, MAX_INTERPRET_DURATION_MS),
+        owner.role as AppUserRole
+      )
     );
+    return Math.max(0, measuredMinutes - charged - grantChargedMinutes);
   }
 
   const session = await tx.session.findUnique({
@@ -229,6 +260,30 @@ async function applyUsageLogToGrant(
       data: { actualMs, usageLogUuid: entry.uuid },
     });
     if (backfill.count === 0) {
+      // L23：CAS 没写进去有两种成因，此前被一视同仁地静默丢弃：
+      //   ① 重叠窗重拉到**同一条** log（uuid 相同）—— 完全正常，幂等设计就是要这样；
+      //   ② 同一 grant 冒出**第二条不同的** log（uuid 不同）—— 这是「一条连接 = 一条
+      //      usage-log」这个上游约定被打破了，第二条的用量从此永久不入账（系统性漏账），
+      //      而系统一声不吭。
+      // 这里把二者分开：② 记审计事件 + warn，供告警聚合发现约定漂移（不自动补扣 —— 真出现
+      // 时要先确认 Soniox 侧语义，盲目按第二条补扣可能重复收费）。
+      const existing = await tx.sonioxStreamGrant.findUnique({
+        where: { id: ref.grantId },
+        select: { usageLogUuid: true, actualMs: true },
+      });
+      if (
+        existing?.usageLogUuid &&
+        existing.usageLogUuid !== entry.uuid &&
+        actualMs > 0
+      ) {
+        return {
+          outcome: 'conflicting_log' as const,
+          minutes: 0,
+          userId: ref.userId,
+          knownUuid: existing.usageLogUuid,
+          knownActualMs: existing.actualMs ?? 0,
+        };
+      }
       return { outcome: 'skipped' as const, minutes: 0, userId: '' };
     }
     if (actualMs <= 0) {
@@ -300,6 +355,31 @@ async function applyUsageLogToGrant(
       })
     );
   }
+  if (result.outcome === 'conflicting_log') {
+    // L23：同一 grant 的第二条不同 usage-log。不自动补扣（语义待确认），但必须留痕告警 ——
+    // 否则「一条连接=一条 log」的上游约定一旦漂移，漏账会长期静默发生。
+    logSystemEvent(
+      'soniox.conflicting_usage_log',
+      JSON.stringify({
+        grantId: ref.grantId,
+        userId: result.userId,
+        knownUsageLogUuid: result.knownUuid,
+        knownActualMs: result.knownActualMs,
+        ignoredUsageLogUuid: entry.uuid,
+        ignoredActualMs: actualMs,
+      })
+    );
+    usageLogger.warn(
+      {
+        grantId: ref.grantId,
+        knownUsageLogUuid: result.knownUuid,
+        ignoredUsageLogUuid: entry.uuid,
+        ignoredActualMs: actualMs,
+      },
+      'second distinct usage-log for the same grant; ignored (one-connection-one-log contract broken)'
+    );
+    return 'skipped';
+  }
   return result.outcome;
 }
 
@@ -319,24 +399,56 @@ async function settleOrphanGrants(now: Date): Promise<{
   let orphanCharged = 0;
   let orphanRefunded = 0;
 
-  const candidates = await prisma.sonioxStreamGrant.findMany({
-    where: { settledAt: null },
-    select: {
-      id: true,
-      userId: true,
-      kind: true,
-      sessionId: true,
-      interpretSessionId: true,
-      reservedMinutes: true,
-      maxSessionSeconds: true,
-      mintedAt: true,
-      actualMs: true,
-    },
-    orderBy: { mintedAt: 'asc' },
-    take: ORPHAN_BATCH_SIZE,
-  });
+  // M10：时间闸的**必要条件**下推到 SQL —— 完整判据是
+  // `mintedAt + 60s + maxSessionSeconds*1000 + grace <= now`，因 maxSessionSeconds >= 0，
+  // `mintedAt <= now - 60s - grace` 是它的必要条件。把「肯定还没到期」的新行直接挡在查询外，
+  // 扫描名额只花在真正的候选上（精确判定仍留在循环里，maxSessionSeconds 逐行不同）。
+  const mintedBefore = new Date(
+    now.getTime() - 60_000 - ORPHAN_SETTLE_GRACE_MS
+  );
 
-  for (const grant of candidates) {
+  let processed = 0;
+  let scanned = 0;
+  let cursorId: string | null = null;
+
+  // M10：游标分页取代「最老 200 条一刀切」。被跳过的行（未到期 / 仍属活跃实体）不再占用
+  // ORPHAN_BATCH_SIZE 名额，翻页继续找真孤儿。orderBy 带上 id 做 tiebreaker，保证 mintedAt
+  // 相同的行也有确定顺序（游标分页的正确性前提）。
+  scan: while (processed < ORPHAN_BATCH_SIZE && scanned < MAX_ORPHAN_SCAN_ROWS) {
+    const page: Array<{
+      id: string;
+      userId: string;
+      kind: string;
+      sessionId: string | null;
+      interpretSessionId: string | null;
+      reservedMinutes: number;
+      maxSessionSeconds: number;
+      mintedAt: Date;
+      actualMs: number | null;
+    }> = await prisma.sonioxStreamGrant.findMany({
+      where: { settledAt: null, mintedAt: { lte: mintedBefore } },
+      select: {
+        id: true,
+        userId: true,
+        kind: true,
+        sessionId: true,
+        interpretSessionId: true,
+        reservedMinutes: true,
+        maxSessionSeconds: true,
+        mintedAt: true,
+        actualMs: true,
+      },
+      orderBy: [{ mintedAt: 'asc' }, { id: 'asc' }],
+      take: ORPHAN_SCAN_PAGE_SIZE,
+      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+    });
+    if (page.length === 0) {
+      break;
+    }
+    scanned += page.length;
+    cursorId = page[page.length - 1].id;
+
+    for (const grant of page) {
     const expiresAtMs =
       grant.mintedAt.getTime() +
       60_000 + // key TTL：过期后无法再建连
@@ -367,6 +479,9 @@ async function settleOrphanGrants(now: Date): Promise<{
         continue;
       }
     }
+
+    // 到这里才算「本轮真正处理了一条」——上面所有 continue 都不占批量名额（M10 的要害）。
+    processed += 1;
 
     const actualMs = grant.actualMs ?? 0;
     try {
@@ -427,6 +542,23 @@ async function settleOrphanGrants(now: Date): Promise<{
         'orphan grant settlement failed; will retry next cycle'
       );
     }
+
+    if (processed >= ORPHAN_BATCH_SIZE) {
+      break scan;
+    }
+    }
+
+    // 最后一页不足一页 ⇒ 已扫到表尾，没有更多候选。
+    if (page.length < ORPHAN_SCAN_PAGE_SIZE) {
+      break;
+    }
+  }
+
+  if (scanned >= MAX_ORPHAN_SCAN_ROWS && processed < ORPHAN_BATCH_SIZE) {
+    usageLogger.warn(
+      { scanned, processed },
+      'orphan grant scan hit row cap without filling the batch;积压将由后续周期消化'
+    );
   }
 
   return { orphanCharged, orphanRefunded };

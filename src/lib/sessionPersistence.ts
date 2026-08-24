@@ -608,17 +608,6 @@ export async function persistArtifact(
   }
 }
 
-export async function persistSessionAudioArtifact(
-  session: Pick<SessionArtifactsSource, 'id' | 'userId' | 'recordingPath'>,
-  data: Buffer,
-  mimeType?: string | null
-): Promise<PersistedArtifactResult> {
-  return persistArtifact(session, 'recordings', data, {
-    mimeType,
-    previousReference: session.recordingPath,
-  });
-}
-
 // ── P0-6：artifact 临时对象 + CAS 发布 ─────────────────────────────────────────
 // 旧的 persistArtifact 先物理覆盖固定 key `{sessionId}.{ext}` 并删旧文件，再由调用方做
 // 数据库状态 guard。并发 finalize 已完成时，路由虽返回 409，但终态物理文件已被覆盖/删除
@@ -965,36 +954,6 @@ export async function deleteSessionArtifacts(
     if (deleted) {
       await releaseStoredArtifact(row.id).catch(() => undefined);
     }
-  }
-}
-
-export async function persistSessionTranscriptArtifacts(
-  session: Pick<SessionArtifactsSource, 'id' | 'userId'>,
-  bundle: PersistedTranscriptBundle
-): Promise<{
-  transcript: PersistedArtifactResult;
-  summary: PersistedArtifactResult;
-}> {
-  // Shared last-mile boundary: async Soniox finalize and any future internal
-  // caller must obey the same persisted object-graph/byte limits as HTTP.
-  const staged = await stageSessionTranscriptArtifacts(session, bundle);
-  try {
-    const [transcript, summary] = await finalizeStagedArtifactPublishes(session, [
-      staged.transcript,
-      staged.summary,
-    ]);
-    if (!transcript || !summary) {
-      throw new Error('transcript artifact publication was incomplete');
-    }
-    return { transcript, summary };
-  } catch (error) {
-    // Atomic settle either publishes both or leaves both RESERVED. Remove both
-    // staged objects on failure so a quota error can never leak the first half.
-    await Promise.all([
-      rollbackStagedArtifact(session, staged.transcript).catch(() => undefined),
-      rollbackStagedArtifact(session, staged.summary).catch(() => undefined),
-    ]);
-    throw error;
   }
 }
 

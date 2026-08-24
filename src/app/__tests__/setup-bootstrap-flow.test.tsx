@@ -124,7 +124,7 @@ describe('bootstrap token -> homepage -> explicit ADMIN completion', () => {
     }
   });
 
-  it('首页不会因首管已创建而提前封门；只有 ADMIN complete 会写标记', async () => {
+  it('首页判定不落库；标记只由 ADMIN 显式 complete 写入', async () => {
     const claim = await POST(
       setupRequest(
         'admin',
@@ -141,7 +141,9 @@ describe('bootstrap token -> homepage -> explicit ADMIN completion', () => {
     expect(harness.state.setupComplete).toBe(false);
     expect(harness.siteSettingUpsert).not.toHaveBeenCalled();
 
-    await expect(RootPage()).rejects.toThrow('NEXT_REDIRECT:/setup');
+    // M24：首页对「有管理员但没有 setup_complete 键」的存量部署按已完成处理
+    // （否则升级后所有访客都被丢回 /setup），但**判定归判定，一个字都不写**。
+    await expect(RootPage()).resolves.toBeTruthy();
     expect(harness.state.setupComplete).toBe(false);
     expect(harness.siteSettingUpsert).not.toHaveBeenCalled();
 

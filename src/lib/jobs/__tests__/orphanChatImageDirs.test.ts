@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const {
   readdirMock,
   rmMock,
+  statMock,
   findManyMock,
   findBillableStoredArtifactsByConversationsMock,
   findBillableStoredArtifactsByOwnerMock,
@@ -10,6 +11,7 @@ const {
 } = vi.hoisted(() => ({
   readdirMock: vi.fn(),
   rmMock: vi.fn(),
+  statMock: vi.fn(),
   findManyMock: vi.fn(),
   findBillableStoredArtifactsByConversationsMock: vi.fn(),
   findBillableStoredArtifactsByOwnerMock: vi.fn(),
@@ -17,7 +19,7 @@ const {
 }));
 
 vi.mock('fs/promises', () => ({
-  default: { readdir: readdirMock, rm: rmMock },
+  default: { readdir: readdirMock, rm: rmMock, stat: statMock },
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -64,6 +66,8 @@ import { cleanupOrphanChatImageDirs } from '@/lib/jobs/chatFilesCleanupJob';
 
 describe('cleanupOrphanChatImageDirs', () => {
   beforeEach(() => {
+  // L52：孤儿目录必须"足够旧"才会被删。默认给一天前，宽限期本身另有用例覆盖。
+  statMock.mockResolvedValue({ mtimeMs: Date.now() - 24 * 60 * 60 * 1000 });
     vi.clearAllMocks();
     rmMock.mockResolvedValue(undefined);
     findBillableStoredArtifactsByConversationsMock.mockResolvedValue([]);

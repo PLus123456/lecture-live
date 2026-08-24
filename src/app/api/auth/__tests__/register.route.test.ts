@@ -162,3 +162,95 @@ describe('POST /api/auth/register', () => {
     expect(loggerErrorMock).toHaveBeenCalled();
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  L6 / L7                                                            */
+/* ------------------------------------------------------------------ */
+
+import { Prisma } from '@prisma/client';
+
+/** 真实的 P2002（唯一键冲突）—— 路由用 instanceof 判定，假对象过不去。 */
+function duplicateEmailError() {
+  return new Prisma.PrismaClientKnownRequestError('dup', {
+    code: 'P2002',
+    clientVersion: 'test',
+    meta: { target: ['email'] },
+  });
+}
+
+describe('POST /api/auth/register —— L6 邮箱枚举 / L7 displayName 归一化', () => {
+  const post = (body: Record<string, unknown>) =>
+    POST(
+      createJsonRequest('http://localhost/api/auth/register', {
+        method: 'POST',
+        body,
+      })
+    );
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getSiteSettingsMock.mockResolvedValue({ ...BASE_SETTINGS });
+    enforceRateLimitMock.mockResolvedValue(null);
+    resolveRequestClientIpMock.mockReturnValue('unknown');
+    isEmailEnabledMock.mockResolvedValue(true);
+    sendVerificationEmailMock.mockResolvedValue({ ok: true });
+    validatePasswordMock.mockReturnValue(null);
+    registerWithOptionsMock.mockResolvedValue({
+      user: CREATED_USER,
+      token: 'jwt',
+    });
+  });
+
+  const body = {
+    email: 'user@example.com',
+    password: 'Abcd1234',
+    displayName: '张三',
+  };
+
+  /**
+   * L6：邮箱已存在返 400、成功返 201 —— 光看状态码就能枚举已注册邮箱，
+   * 与 forgot-password 的「恒定响应」标准不一致。
+   * 开了邮箱验证时可以做到真正不可区分（成功路径本来也只回「请去查收」）。
+   */
+  it('开启邮箱验证时：邮箱已存在与注册成功的响应完全一致', async () => {
+    const success = await post(body);
+    const successJson = await readJson(success);
+
+    registerWithOptionsMock.mockRejectedValueOnce(duplicateEmailError());
+    const duplicate = await post(body);
+    const duplicateJson = await readJson(duplicate);
+
+    expect(duplicate.status).toBe(success.status);
+    expect(duplicate.status).toBe(201);
+    expect(duplicateJson).toEqual(successJson);
+  });
+
+  it('关闭邮箱验证时维持 400（成功路径必须下发会话，结构上藏不住），文案保持中性', async () => {
+    getSiteSettingsMock.mockResolvedValue({
+      ...BASE_SETTINGS,
+      email_verification: false,
+    });
+    registerWithOptionsMock.mockRejectedValueOnce(duplicateEmailError());
+
+    const res = await post(body);
+    const json = await readJson(res);
+
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(json)).not.toContain('user@example.com');
+    expect(JSON.stringify(json)).not.toMatch(/exist|已存在|已被注册/i);
+  });
+
+  it('L7：displayName 落库前 trim + 截断到 64 字符', async () => {
+    await post({ ...body, displayName: `  ${'字'.repeat(500)}  ` });
+
+    expect(registerWithOptionsMock).toHaveBeenCalledTimes(1);
+    const passed = registerWithOptionsMock.mock.calls[0][2] as string;
+    expect(passed).toBe('字'.repeat(64));
+  });
+
+  it('L7：全空白 displayName 视为缺失（400）', async () => {
+    const res = await post({ ...body, displayName: '   \t\n ' });
+    expect(res.status).toBe(400);
+    expect(registerWithOptionsMock).not.toHaveBeenCalled();
+  });
+});

@@ -556,16 +556,45 @@ export default function ActiveSessionPage() {
   const [sessionChecked, setSessionChecked] = useState(false);
   const [backendStatus, setBackendStatus] = useState<string | null>(null);
 
+  // M19：本页面当前绑定的 sessionId 的**最新值**。App Router 下 /session/A → /session/B
+  // 属同一动态段，页面组件实例被复用、只重跑 effect，所有异步回调里的 `sessionId` 都是
+  // 发起那一刻的旧闭包值，自己跟自己比永远相等 —— 必须比对这个 ref 才能识别「响应到达时
+  // 页面已经换会话了」。
+  const currentSessionIdRef = useRef(sessionId);
+  useEffect(() => {
+    currentSessionIdRef.current = sessionId;
+  }, [sessionId]);
+
   useEffect(() => {
     if (!token || !sessionId) return;
     setSessionMetaReady(false);
-    fetch(`/api/sessions/${sessionId}`, {
+    // M19：A→B 互跳时 A 的慢响应会晚于 B 落地，把 A 的标题/语言/backendStatus 覆盖到 B 上；
+    // A 若是 COMPLETED 还会把用户 replace 到 A 的回放页。两道守卫：
+    //   ① AbortController —— 切走即中止在途请求（cleanup 同步跑在新 effect 之前）；
+    //   ② 响应归属校验 —— 已解析但尚未落地的响应，用 requestedSessionId 比对最新 ref 值，
+    //      任一不符一律丢弃，绝不写 state / 不跳转。
+    const controller = new AbortController();
+    const requestedSessionId = sessionId;
+    const isStale = () =>
+      controller.signal.aborted ||
+      currentSessionIdRef.current !== requestedSessionId;
+
+    fetch(`/api/sessions/${requestedSessionId}`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
     })
-      .then((r) => r.json())
+      .then((r) => {
+        // L45：此前不看 res.ok —— 500 的 JSON 错误体（{error:...}）会被当成「没有 title、
+        // 没有 status」的合法会话元信息静默放行，服务不可用信号被吞。非 2xx 一律抛进 catch。
+        if (!r.ok) {
+          throw new Error(`HTTP ${r.status}`);
+        }
+        return r.json();
+      })
       .then((data) => {
+        if (isStale()) return;
         if (data.status === 'COMPLETED' || data.status === 'ARCHIVED') {
-          router.replace(`/session/${sessionId}/playback`);
+          router.replace(`/session/${requestedSessionId}/playback`);
           return;
         }
         if (data.title) setSessionTitle(data.title);
@@ -579,7 +608,20 @@ export default function ActiveSessionPage() {
         setBackendStatus(data.status ?? null);
         setSessionChecked(true);
       })
-      .catch(() => setSessionChecked(true));
+      .catch((err) => {
+        if (isStale()) return;
+        // L45：给出可见反馈（此前完全静默）。但仍然放行 sessionChecked —— 拉不到 status 时
+        // backendStatus 保持 null，deriveRecoveryMode 会按本地录音态保守走 live-refresh
+        // 保护本地数据；若卡在 pending，冷恢复/刷新续录/状态回写会一起停摆。
+        console.error('加载会话元信息失败:', err);
+        toast.error(t('playback.loadFailed'));
+        setSessionChecked(true);
+      });
+
+    return () => controller.abort();
+    // t 刻意不入依赖（与下方 FINALIZING 轮询 effect 同口径）：它只用于一次性错误文案，
+    // 入依赖会让「换语言」重新拉一次会话元信息。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, sessionId, router]);
 
   // 刷新恢复的单一权威：由后端 status + 挂载时本地 recordingState 快照共同决定。
@@ -695,6 +737,9 @@ export default function ActiveSessionPage() {
     },
   });
   const { init: initSummary, onNewSentence, triggerManual, reset: resetSummary } = useSummary();
+  // L46：已喂给「摘要 + 本地翻译」管线的最后一条段落 id。冷恢复批量灌入历史段落时先置成
+  // 最后一条恢复段落的 id，避免历史段落被当成新句子重跑一轮 LLM 增量摘要与本地翻译。
+  const lastPipelineSegmentIdRef = useRef<string | null>(null);
   const prevSegmentCountRef = useRef(0);
   const prevSummaryCountRef = useRef(0);
   const prevTranslationsRef = useRef<Record<string, string>>({});
@@ -827,6 +872,11 @@ export default function ActiveSessionPage() {
         if (draftSegments.length === 0) return;
 
         // 恢复转录数据
+        // L46：先把管线水位推到最后一条恢复段落 —— 这些都是历史段落，不是刚说出的新句子。
+        // 必须在 addFinalSegment 之前置位：批量灌入是同一批 render，effect 在本同步块之后
+        // 才跑，但提前置位可以杜绝任何交错窗口。
+        lastPipelineSegmentIdRef.current =
+          draftSegments[draftSegments.length - 1]?.id ?? null;
         const tStore = useTranscriptStore.getState();
         for (const seg of draftSegments) {
           tStore.addFinalSegment(seg);
@@ -977,8 +1027,20 @@ export default function ActiveSessionPage() {
   }, [translationMode, sourceLang, targetLang, initLocal, destroyTranslator]);
 
   useEffect(() => {
-    if (segments.length === 0) return;
+    if (segments.length === 0) {
+      lastPipelineSegmentIdRef.current = null;
+      return;
+    }
     const latestSegment = segments[segments.length - 1];
+    // L46：冷恢复（resume-cold / finalizing 从后端 draft 批量灌入 N 条历史段落）会让
+    // segments.length 一次性从 0 跳到 N，这里本来会把「第 N 条历史段落」当成刚说出的新句子，
+    // 白跑一轮增量摘要（真花 LLM 调用）＋一次本地翻译（draft 里的译文已经恢复过了）。
+    // 冷恢复处会先把 lastPipelineSegmentIdRef 置成最后一条恢复段落的 id，这里据此跳过。
+    // 用 id 而不是计数：clearAll → 重新录制时计数水位会失效，id 天然自愈。
+    if (lastPipelineSegmentIdRef.current === latestSegment.id) {
+      return;
+    }
+    lastPipelineSegmentIdRef.current = latestSegment.id;
     // 仅在用户组开通实时摘要时喂给摘要管理器
     if (realtimeSummaryEnabled) {
       onNewSentence(latestSegment.text);
@@ -994,6 +1056,15 @@ export default function ActiveSessionPage() {
     if (!sessionChecked) return;
     if (finalizingError) return;
     if (recordingState !== 'recording' && recordingState !== 'paused') return;
+    // M19 同族（页面实例跨会话复用）：recordingState 来自**全局单例** store。会话 A 录音中
+    // 用 SPA 导航打开会话 B 时，页面组件实例被复用 —— 这里读到的 'recording' 属于 A，而
+    // recordingControlRef（A 点开始时置位的 ref）与 initialRecordingState（挂载时的一次性
+    // 快照）都不会随 sessionId 复位，两道守卫双双失效，于是「只是看一眼 B」就把 B PATCH 成
+    // RECORDING：既在服务端造出幽灵录制中（下次进 B 命中 resume-cold），又白占 B4 的并发
+    // 在途额度。按 P0-3 的既有口径把关：store 绑定到别的会话就一律不回写。
+    // （activeSessionId 为空 = P0-3 之前的旧快照，保守放行，不回归刷新恢复。）
+    const boundSessionId = useTranscriptStore.getState().activeSessionId;
+    if (boundSessionId != null && boundSessionId !== sessionId) return;
     // 只有本标签取得录音控制权（主动开始/继续），或是同标签刷新恢复（live-refresh，原录音
     // 标签），才回写录制态。否则「另一标签打开正在录音的会话」(resume-cold 观察者，本地被
     // 冷恢复设为 paused) 会 PATCH 后端 PAUSED、掐停另一标签正在进行的录音（审计 medium）。
@@ -1005,7 +1076,14 @@ export default function ActiveSessionPage() {
       // （P2-1）；真正防丢在停止时的 finalize 分支。
       if (isSessionReclaimedResult(result)) setSessionReclaimed(true);
     });
-  }, [finalizingError, recordingState, sessionChecked, syncSessionStatus, recoveryMode]);
+  }, [
+    finalizingError,
+    recordingState,
+    sessionChecked,
+    sessionId,
+    syncSessionStatus,
+    recoveryMode,
+  ]);
 
   // 会话被回收的持久提示：从 false→true 只触发一次，让用户在录制途中就知情，而不是
   // 等到停止时才发现续录内容没保存。
@@ -1548,8 +1626,19 @@ export default function ActiveSessionPage() {
     quotaLimitReachedRef.current = false;
     maxDurationReachedRef.current = false;
 
-    void syncSessionStatus('RECORDING');
     await startRecording();
+
+    // L47：此前是「先 void syncSessionStatus('RECORDING') 再 await startRecording()」——
+    // 麦克风授权被拒 / 取流失败时 startNewRecording 会把本地态落回 idle，但后端已经被置成
+    // RECORDING，刷新后命中 resume-cold，出现「幽灵录制中」。改成开麦有结果之后再回写，
+    // 且只在本地确实进入 recording/paused 时回写。
+    // 注：真正起录时下面那条「录制态回写后端」的 effect 也会 PATCH 同一状态，同态迁移在
+    // 服务端是幂等放行的（VALID_TRANSITIONS 之前先判 nextStatus === session.status），
+    // 这里保留显式回写作为 effect 被任何守卫短路时的兜底。
+    const stateAfterStart = useTranscriptStore.getState().recordingState;
+    if (stateAfterStart === 'recording' || stateAfterStart === 'paused') {
+      void syncSessionStatus('RECORDING');
+    }
   }, [
     loadQuotaSnapshot,
     recordingState,
@@ -1680,12 +1769,20 @@ export default function ActiveSessionPage() {
     settings.setPendingSessionTerms(sessionId, updatedSessionTerms);
 
     if (recordingState === 'recording' || recordingState === 'paused') {
+      // M20：**不要**在 await 之后补 pauseRecording()。rebuildSession → startNewRecording
+      // 已用 preservePauseStateUntilConnected 内建「保持暂停直至连上，连上后由
+      // onConnectionChange('connected') 分支统一恢复」。外部再补一次 pause 有两种交错，
+      // 两种都是错的：
+      //   ① connected 先发生 → 已恢复录音，补 pause 把它拉回暂停（中间那段真实录音已计费）；
+      //   ② pause 先执行 → connected 分支因 keepPausedUntilConnected 为真无条件 resume，
+      //      用户明明在暂停态注入关键词，最终却被静默恢复录音（还顺带清掉刚 schedule 的
+      //      寿命轮换定时器）。
+      // 且判断依据是 await 前捕获的陈旧闭包 recordingState，本身就不可信。
+      // 同类路径（SettingsDrawer Apply → rebuildSession、switchMicrophone）都不补 pause，
+      // 这里与它们对齐。
       await rebuildSession();
-      if (recordingState === 'paused') {
-        pauseRecording();
-      }
     }
-  }, [pauseRecording, recordingState, rebuildSession, sessionId, setTerms]);
+  }, [recordingState, rebuildSession, sessionId, setTerms]);
 
   const isRecording = recordingState === 'recording';
   const isPaused = recordingState === 'paused';

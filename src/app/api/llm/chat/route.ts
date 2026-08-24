@@ -422,8 +422,13 @@ function streamChatResponse(
               minLevel: currentLevel,
               inputBudget: args.inputBudget,
               buildSystemPrompt: args.buildSystemPrompt,
+              // M16：历史压缩把「早期对话原文」发给 LLM，必须走用户**已授权**的同一条
+              // 路由（modelId / providerOverride / purpose），不能硬编码 purpose:'CHAT'
+              // 回到全局默认模型 —— 否则受限组用户的对话原文会被送到他没被授权的模型上，
+              // 组绑定的 chatModelId 也一并被绕过，成本归属同样落错。
+              // 只透传路由，不带 thinkingPreference：压缩不需要思考。
               callLLM: (s: string, u: string) =>
-                callLLM(s, u, { purpose: 'CHAT' }),
+                callLLM(s, u, { ...args.routingOptions }),
               language: args.language,
               ragRetrieve: args.ragRetriever,
               reportText: args.reportText,

@@ -201,6 +201,15 @@ async function lockActiveJobResourceScope(
   );
 }
 
+/** P2025：`update`/`delete` 的 where 没命中任何行（条件更新的竞态输家）。 */
+function isRecordNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'P2025'
+  );
+}
+
 // ─── 创建任务 ───
 interface CreateJobOptions {
   type: JobType;
@@ -888,6 +897,8 @@ export async function retryJob(
     if (updated.count !== 1) return false;
   } catch (error) {
     if (isUniqueConstraintError(error)) return false;
+    // P2025 = 条件没命中（别的进程同一轮已经回炉过了）：不是错误，是竞态输家。
+    if (isRecordNotFoundError(error)) return false;
     throw error;
   }
 
@@ -903,8 +914,43 @@ export async function retryJob(
 // 等最重的任务也在分钟级），避免误杀正在执行的任务（含 billing maintenance 自身）。
 export const STALE_PROCESSING_JOB_THRESHOLD_MS = 2 * 60 * 60_000;
 
+/**
+ * H5：按 job type 覆盖的更长阈值。
+ *
+ * 上面那句"最重的任务也在分钟级"是 doc_translate（PR#227）上线**之前**写的，属于注释漂移：
+ * `translateProcessor.MAX_WORKER_RUNTIME_MS` 白纸黑字给大文档 3 小时，2h 的通用阈值必然
+ * 在合法运行途中把它误杀 —— 而且是 `updateMany` 直改、绕过 `failJob`，于是 TranslationTask
+ * 停在 TRANSLATING、chargedCents 不退、不写 params.nextRetryAt（自动重试要求该字段存在），
+ * 行也不再是 PROCESSING 从而永远不被对账捞到 = 用户永久"翻译中"+ 钱滞留。
+ *
+ * 这里的值必须**严格大于**该类型的合法最大运行时，并留出至少一个维护周期（15min）的余量。
+ * 真正的终态化仍由 translateProcessor 的对账（3h 入口超时 → failJob）负责；本表只是
+ * "连 tick 都卡死了"时的最后一道网，且网住之后 executeTick 的自愈扫描会补做结算。
+ */
+export const STALE_PROCESSING_THRESHOLD_BY_TYPE: Readonly<Record<string, number>> = {
+  [JOB_TYPE.DOC_TRANSLATE]: 4 * 60 * 60_000,
+};
+
+/** 有自定义阈值的类型（通用扫描必须把它们排除，否则 2h 照杀不误）。 */
+export const LONG_RUNNING_JOB_TYPES: readonly string[] = Object.keys(
+  STALE_PROCESSING_THRESHOLD_BY_TYPE
+);
+
+interface ReclaimScopeOptions {
+  /** 只回收这些 type（按类型分档扫描时用） */
+  onlyTypes?: readonly string[];
+  /** 排除这些 type（通用扫描把长跑类型让给它们各自的档位） */
+  excludeTypes?: readonly string[];
+}
+
+/**
+ * 注意：`options` 缺省是**不分类型**的全表扫描（保持历史语义，供单测与临时脚本直接调用）。
+ * 生产入口是 billingMaintenance，它必须按 `reclaimAllStaleProcessingJobs` 的分档方式调用 ——
+ * 直接裸调 `reclaimStaleProcessingJobs(now)` 会把长跑类型按 2h 误杀。
+ */
 export async function reclaimStaleProcessingJobs(
-  thresholdMs: number = STALE_PROCESSING_JOB_THRESHOLD_MS
+  thresholdMs: number = STALE_PROCESSING_JOB_THRESHOLD_MS,
+  options: ReclaimScopeOptions = {}
 ): Promise<number> {
   if (!Number.isSafeInteger(thresholdMs) || thresholdMs <= 0) {
     throw new Error('Invalid stale processing job threshold');
@@ -912,6 +958,15 @@ export async function reclaimStaleProcessingJobs(
   const thresholdHours = Math.round(thresholdMs / 3_600_000);
   const thresholdMicros = thresholdMs * 1000;
   const error = `自动回收：任务卡在 PROCESSING 超过 ${thresholdHours} 小时（疑似进程中断）`;
+  // H5：按 type 分档。通用扫描（2h）必须把长跑类型让出去，否则文档翻译的合法 3h 运行
+  // 必然在跑到一半时被打成 FAILED —— 且是直改 status、绕过 failJob：任务停在 TRANSLATING、
+  // 钱不退、不排重试、也不再被对账捞到。过滤条件拼进**每一条** SQL 的 WHERE。
+  const typeFilter =
+    options.onlyTypes && options.onlyTypes.length > 0
+      ? Prisma.sql` AND type IN (${Prisma.join([...options.onlyTypes])})`
+      : options.excludeTypes && options.excludeTypes.length > 0
+        ? Prisma.sql` AND type NOT IN (${Prisma.join([...options.excludeTypes])})`
+        : Prisma.empty;
   const staleScopes = await prisma.$queryRaw<Array<{ resourceScope: string }>>(
     Prisma.sql`SELECT DISTINCT resourceScope
                FROM JobQueue
@@ -919,7 +974,7 @@ export async function reclaimStaleProcessingJobs(
                  AND resourceScope IS NOT NULL
                  AND startedAt <= DATE_SUB(
                    UTC_TIMESTAMP(3), INTERVAL ${thresholdMicros} MICROSECOND
-                 )`
+                 )${typeFilter}`
   );
   let reclaimed = 0;
 
@@ -939,7 +994,7 @@ export async function reclaimStaleProcessingJobs(
                      AND resourceScope = ${resourceScope}
                      AND startedAt <= DATE_SUB(
                        UTC_TIMESTAMP(3), INTERVAL ${thresholdMicros} MICROSECOND
-                     )`
+                     )${typeFilter}`
       );
     });
   }
@@ -955,7 +1010,23 @@ export async function reclaimStaleProcessingJobs(
                  AND resourceScope IS NULL
                  AND startedAt <= DATE_SUB(
                    UTC_TIMESTAMP(3), INTERVAL ${thresholdMicros} MICROSECOND
-                 )`
+                 )${typeFilter}`
   );
   return reclaimed;
+}
+
+/**
+ * H5：生产用的分档回收入口 —— 通用类型走 2h，长跑类型各走自己的阈值。
+ * billingMaintenance 只该调这一个。
+ */
+export async function reclaimAllStaleProcessingJobs(): Promise<number> {
+  // 注意：不接受 `now`。超时判定与盖章统一用**数据库** UTC 时钟（见 reclaimStaleProcessingJobs
+  // 的 SQL），应用主机时钟漂移不得提前释放 activeKey 或把用量记进错误的日窗。
+  let count = await reclaimStaleProcessingJobs(STALE_PROCESSING_JOB_THRESHOLD_MS, {
+    excludeTypes: LONG_RUNNING_JOB_TYPES,
+  });
+  for (const [type, ms] of Object.entries(STALE_PROCESSING_THRESHOLD_BY_TYPE)) {
+    count += await reclaimStaleProcessingJobs(ms, { onlyTypes: [type] });
+  }
+  return count;
 }

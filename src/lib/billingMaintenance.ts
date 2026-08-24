@@ -1,7 +1,7 @@
 import { prisma } from '@/lib/prisma';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
-import { trackJob, createJob, markJobProcessing, markJobSuccess, markJobFailed, JOB_TYPE, reclaimStaleProcessingJobs } from '@/lib/jobQueue';
+import { trackJob, createJob, markJobProcessing, markJobSuccess, markJobFailed, JOB_TYPE, reclaimAllStaleProcessingJobs } from '@/lib/jobQueue';
 import {
   loadRecordingDraftManifest,
   sweepStaleRecordingDrafts,
@@ -46,7 +46,7 @@ import { cleanupFullTranscribeWorkDir } from '@/lib/audio/fullTranscribeInput';
 import { reclaimStaleInterpretSessions } from '@/lib/interpret/session';
 import { reconcileSonioxStreamUsage } from '@/lib/soniox/usageReconciliation';
 import { cleanupExpiredStoredArtifacts } from '@/lib/storage/storedArtifactCleanup';
-import { expirePendingPaymentOrders } from '@/lib/payment/orderExpiry';
+import { expireStalePaymentOrders } from '@/lib/wallet';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
 // FINALIZING 专项：已发起收尾但卡住的会话（前端崩/断网/服务端重启导致 finalize 没跑完）
@@ -216,20 +216,6 @@ export async function runBillingMaintenance(options?: {
     // 不 rethrow —— 其他维护任务结果仍要返回
   }
 
-  // SEC-029：把超过 expiresAt 且尚未被回调认领的订单显式推进为 expired。
-  // 这是状态可见性扫描；真正的权益安全闸仍在 creditPaidOrder 的订单行锁事务内，
-  // 用 provider-signed paidAt 与 expiresAt 比较，因此扫描与回调任何一方先拿锁都不会误发权益。
-  let expiredPaymentOrders = 0;
-  try {
-    expiredPaymentOrders = await expirePendingPaymentOrders(now);
-  } catch (err) {
-    billingLogger.error(
-      { err: serializeError(err) },
-      'pending payment order expiry failed'
-    );
-    // 不 rethrow：回调事务自身仍会 fail-closed 判定过期，其他维护任务继续。
-  }
-
   // 注：会员到期前提醒挪到本函数**末尾**执行（原本在这里）。它是整个维护循环里唯一
   // 依赖外部网络（SMTP）的步骤，一旦邮件服务商变慢/不可达，串行发信会把后面所有步骤
   // ——会话回收、异步上传回收、孤儿预留释放、Soniox 对账——一起拖住；而 triggerRun 的
@@ -363,13 +349,36 @@ export async function runBillingMaintenance(options?: {
 
   // 僵尸任务回收：把卡在 PROCESSING 超时的 JobQueue 记录标失败（解锁前端指示器、可被 retryJob 重试）。
   // 不为本步骤单独建 job —— 它是对 job 表自身的清道夫，建 job 反而引入"清道夫卡住谁来清"的递归。
+  //
+  // H5：必须走**分档**入口。原来是不分 type 的 `reclaimStaleProcessingJobs(now)`（统一 2h），
+  // 而文档翻译的合法运行时上限是 3h（translateProcessor.MAX_WORKER_RUNTIME_MS），
+  // 每 15 分钟一次的本循环必然在它跑到一半时把调度行打成 FAILED —— 且是 updateMany 直改、
+  // 绕过 failJob：任务停在 TRANSLATING、钱不退、不排自动重试、也不再被对账捞到。
   let reclaimedStaleJobs = 0;
   try {
-    reclaimedStaleJobs = await reclaimStaleProcessingJobs();
+    reclaimedStaleJobs = await reclaimAllStaleProcessingJobs();
   } catch (err) {
     billingLogger.error(
       { err: serializeError(err) },
       'stale processing job reclaim failed'
+    );
+    // 不 rethrow —— 其他维护任务结果仍要返回
+  }
+
+  // 未支付订单回收：过了 expiresAt + 72h 宽限期仍 pending 的订单置 expired。
+  // 从前 PaymentOrder.expiresAt 与 @@index([status, expiresAt]) 是一对死列，pending 无限堆积。
+  //
+  // 宽限期远大于建单时写入的 ORDER_TTL_MS（60min，且已下发给网关做硬过期）：按 TTL 回收会
+  // 撞进网关重投窗口。真正的资损闸不在这里，而在 creditPaidOrder 的行锁认领 —— 它的 UPDATE
+  // 收 pending/expired/failed 三态，所以清扫早了也只是状态难看，晚到的真实回调照样恰好入账一次；
+  // 真正晚于 expiresAt 的支付则被隔离成 late_paid，一分权益都不发。
+  let expiredPaymentOrders = 0;
+  try {
+    expiredPaymentOrders = await expireStalePaymentOrders({ now });
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'stale payment order expiry failed'
     );
     // 不 rethrow —— 其他维护任务结果仍要返回
   }

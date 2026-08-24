@@ -90,6 +90,44 @@ function evictLRU(): void {
   }
 }
 
+/**
+ * M18：同一 cache key 的重建去重。
+ *
+ * 两个并发请求同时判定 needsRebuild 时，旧实现会各自把整份 transcript 全量 embed 一遍
+ * （last-write-wins），扇出与成本直接翻倍。这里对「同一 key + 同一内容指纹」的在途重建
+ * 做合流：后到者直接 await 前者的 promise。
+ *
+ * 指纹不同（内容真的变了）时**不合流** —— 那是两份不同的内容，合流会让后者拿到过期索引。
+ */
+const inflightRebuilds = new Map<
+  string,
+  { fingerprint: string; promise: Promise<RagState> }
+>();
+
+function dedupeRebuild(
+  key: string,
+  fingerprint: string,
+  build: () => Promise<RagState>
+): Promise<RagState> {
+  const existing = inflightRebuilds.get(key);
+  if (existing && existing.fingerprint === fingerprint) {
+    return existing.promise;
+  }
+  const entry: { fingerprint: string; promise: Promise<RagState> } = {
+    fingerprint,
+    promise: undefined as unknown as Promise<RagState>,
+  };
+  entry.promise = (async () => {
+    try {
+      return await build();
+    } finally {
+      if (inflightRebuilds.get(key) === entry) inflightRebuilds.delete(key);
+    }
+  })();
+  inflightRebuilds.set(key, entry);
+  return entry.promise;
+}
+
 function cacheRagState(key: string, state: RagState): void {
   if (estimateRagStateBytes(state) > MAX_RAG_CACHE_ENTRY_BYTES) {
     sessionCache.delete(key);
@@ -318,52 +356,52 @@ export async function retrieveTranscriptByEmbedding(args: {
     state.contentSignature !== contentSignature;
 
   if (needsRebuild) {
-    const newChunks = chunkSegments(transcript);
+    const prev = state;
+    // M18：并发同内容重建合流，避免两个请求各自把整份 transcript embed 一遍。
+    state = await dedupeRebuild(sessionId, contentSignature, async () => {
+      const newChunks = chunkSegments(transcript);
 
-    // 复用已 embed 的部分：用 (startMs, text) 做 key 匹配
-    let existingVectors: number[][] = [];
-    if (state) {
-      const oldByKey = new Map(
-        state.chunks.map((c, i) => [`${c.startMs}|${c.text}`, state!.vectors[i]])
-      );
-      existingVectors = newChunks.map(
-        (c) => oldByKey.get(`${c.startMs}|${c.text}`) ?? ([] as number[])
-      );
-    } else {
-      existingVectors = newChunks.map(() => [] as number[]);
-    }
+      // 复用已 embed 的部分：用 (startMs, text) 做 key 匹配
+      let existingVectors: number[][] = [];
+      if (prev) {
+        const oldByKey = new Map(
+          prev.chunks.map((c, i) => [`${c.startMs}|${c.text}`, prev.vectors[i]])
+        );
+        existingVectors = newChunks.map(
+          (c) => oldByKey.get(`${c.startMs}|${c.text}`) ?? ([] as number[])
+        );
+      } else {
+        existingVectors = newChunks.map(() => [] as number[]);
+      }
 
-    // 哪些 chunk 还没 embed
-    const missingIndices = existingVectors
-      .map((v, i) => (v.length === 0 ? i : -1))
-      .filter((i) => i >= 0);
+      // 哪些 chunk 还没 embed
+      const missingIndices = existingVectors
+        .map((v, i) => (v.length === 0 ? i : -1))
+        .filter((i) => i >= 0);
 
-    if (missingIndices.length > 0) {
-      const missingTexts = missingIndices.map((i) => newChunks[i].text);
-      const newVectors = await callEmbedding(missingTexts, {
-        userId,
-        sessionId,
-      });
-      missingIndices.forEach((idx, i) => {
-        existingVectors[idx] = newVectors[i];
-      });
-    }
+      if (missingIndices.length > 0) {
+        const missingTexts = missingIndices.map((i) => newChunks[i].text);
+        const newVectors = await callEmbedding(missingTexts, {
+          userId,
+          sessionId,
+        });
+        missingIndices.forEach((idx, i) => {
+          existingVectors[idx] = newVectors[i];
+        });
+      }
 
-    state = {
-      lastSegmentCount: transcript.length,
-      contentSignature,
-      chunks: newChunks,
-      vectors: existingVectors,
-      lastUsedAt: Date.now(),
-    };
+      return {
+        lastSegmentCount: transcript.length,
+        contentSignature,
+        chunks: newChunks,
+        vectors: existingVectors,
+        lastUsedAt: Date.now(),
+      };
+    });
     cacheRagState(sessionId, state);
 
     ragLogger.debug(
-      {
-        sessionId,
-        totalChunks: newChunks.length,
-        newlyEmbedded: missingIndices.length,
-      },
+      { sessionId, totalChunks: state.chunks.length },
       'RAG cache 已更新'
     );
   } else if (state) {
@@ -577,78 +615,85 @@ export function makeRagRetrieverForRecordings(
       const needsRebuild = !state || state.contentSignature !== contentSignature;
 
       if (needsRebuild) {
-        // 各 recording 的 transcript 互相独立，并行拉取避免串行 N-1 个 RTT
-        const transcripts = await Promise.all(
-          sortedIds.map((id) => loadTranscript(id))
-        );
+        const prev = state;
+        // M18：并发同内容重建合流，避免两个请求各自把整组录音 embed 一遍。
+        state = await dedupeRebuild(
+          cacheKey,
+          String(contentSignature ?? 'none'),
+          async () => {
+            // 各 recording 的 transcript 互相独立，并行拉取避免串行 N-1 个 RTT
+            const transcripts = await Promise.all(
+              sortedIds.map((id) => loadTranscript(id))
+            );
 
-        const allChunks: SegmentChunk[] = [];
-        for (let i = 0; i < sortedIds.length; i++) {
-          const recordingId = sortedIds[i];
-          const prefix = `[${recordingId}] `;
-          // prefix 写进 chunk text 是为了让 embedding 向量本身带来源信号，
-          // 同时上层渲染时可直接 split 出 recordingId
-          const prefixTokens = estimateTokens(prefix);
-          for (const chunk of chunkSegments(
-            transcripts[i],
-            EMBEDDING_MAX_INPUTS - allChunks.length
-          )) {
-            allChunks.push({
-              text: `${prefix}${chunk.text}`,
-              startMs: chunk.startMs,
-              endMs: chunk.endMs,
-              tokens: chunk.tokens + prefixTokens,
-              recordingId,
-            });
+            const allChunks: SegmentChunk[] = [];
+            for (let i = 0; i < sortedIds.length; i++) {
+              const recordingId = sortedIds[i];
+              const prefix = `[${recordingId}] `;
+              // prefix 写进 chunk text 是为了让 embedding 向量本身带来源信号，
+              // 同时上层渲染时可直接 split 出 recordingId
+              const prefixTokens = estimateTokens(prefix);
+              for (const chunk of chunkSegments(
+                transcripts[i],
+                EMBEDDING_MAX_INPUTS - allChunks.length
+              )) {
+                allChunks.push({
+                  text: `${prefix}${chunk.text}`,
+                  startMs: chunk.startMs,
+                  endMs: chunk.endMs,
+                  tokens: chunk.tokens + prefixTokens,
+                  recordingId,
+                });
+              }
+            }
+
+            // 复用已 embed 的 chunk 向量（key=recordingId|startMs|text），只 embed 新增/变动的，
+            // 避免每次增长都整批重 embed（与单录音 retrieveTranscriptByEmbedding 增量逻辑一致）。
+            const oldByKey =
+              prev && prev.chunks.length > 0
+                ? new Map(
+                    prev.chunks.map((c, i) => [
+                      `${c.recordingId}|${c.startMs}|${c.text}`,
+                      prev.vectors[i],
+                    ])
+                  )
+                : null;
+            const vectors: number[][] = allChunks.map(
+              (c) =>
+                oldByKey?.get(`${c.recordingId}|${c.startMs}|${c.text}`) ??
+                ([] as number[])
+            );
+            const missingIndices = vectors
+              .map((v, i) => (v.length === 0 ? i : -1))
+              .filter((i) => i >= 0);
+            if (missingIndices.length > 0) {
+              const newVectors = await callEmbedding(
+                missingIndices.map((i) => allChunks[i].text),
+                { userId, sessionId: sortedIds[0] }
+              );
+              missingIndices.forEach((idx, i) => {
+                vectors[idx] = newVectors[i];
+              });
+            }
+
+            return {
+              // recordingIds 集合变了 cacheKey 就会变 → 走另一个 entry，
+              // 所以 state 里不需要单独再记一份 ids
+              contentSignature,
+              lastSegmentCount: allChunks.length,
+              chunks: allChunks,
+              vectors,
+              lastUsedAt: Date.now(),
+            };
           }
-        }
-
-        // 复用已 embed 的 chunk 向量（key=recordingId|startMs|text），只 embed 新增/变动的，
-        // 避免每次增长都整批重 embed（与单录音 retrieveTranscriptByEmbedding 增量逻辑一致）。
-        const oldByKey =
-          state && state.chunks.length > 0
-            ? new Map(
-                state.chunks.map((c, i) => [
-                  `${c.recordingId}|${c.startMs}|${c.text}`,
-                  state!.vectors[i],
-                ])
-              )
-            : null;
-        const vectors: number[][] = allChunks.map(
-          (c) =>
-            oldByKey?.get(`${c.recordingId}|${c.startMs}|${c.text}`) ??
-            ([] as number[])
         );
-        const missingIndices = vectors
-          .map((v, i) => (v.length === 0 ? i : -1))
-          .filter((i) => i >= 0);
-        if (missingIndices.length > 0) {
-          const newVectors = await callEmbedding(
-            missingIndices.map((i) => allChunks[i].text),
-            { userId, sessionId: sortedIds[0] }
-          );
-          missingIndices.forEach((idx, i) => {
-            vectors[idx] = newVectors[i];
-          });
-        }
-
-        state = {
-          // recordingIds 集合变了 cacheKey 就会变 → 走另一个 entry，
-          // 所以 state 里不需要单独再记一份 ids
-          contentSignature,
-          lastSegmentCount: allChunks.length,
-          chunks: allChunks,
-          vectors,
-          lastUsedAt: Date.now(),
-        };
         cacheRagState(cacheKey, state);
 
         ragLogger.debug(
           {
             cacheKey,
             recordingCount: sortedIds.length,
-            totalChunks: allChunks.length,
-            newlyEmbedded: missingIndices.length,
+            totalChunks: state.chunks.length,
           },
           'multi-recording RAG cache 已建立/增量更新'
         );

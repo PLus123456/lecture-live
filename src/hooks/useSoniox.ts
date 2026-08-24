@@ -47,6 +47,28 @@ const CHUNK_BACKOFF_BASE_MS = 3000;
 // 转录静默丢），改为重建连接。取 15s 留余量。
 const PAUSE_HANDLE_STALE_MS = 15_000;
 
+/**
+ * H2：判定「用户手动暂停意图」当前是否已生效。
+ *
+ * `pause()` 同步做三件事：清 reconnectTimer、置 `shouldReconnectRef=false`、把 recordingState
+ * 迁到 'paused'。而**自动**暂停（`pauseForInterruption`）与断网续采都把 `shouldReconnectRef`
+ * 置 true —— 它们的 paused/recording 是「等重连自动恢复」的中间态，必须允许重连成功后 resume。
+ * 两者唯一的区别就是 `shouldReconnectRef`，故用它做判别式（与 `attemptReconnect` 定时器触发时
+ * 那道守卫 `!shouldReconnectRef.current && state !== 'recording'` 完全同一口径）。
+ *
+ * **新增不变式（配合既有 P0-2 / U57 / U58 / C12 代次不变式）**：
+ *   `pause()` 刻意**不** bump `runId`。短暂停复用句柄那条路径（`startImpl` 的
+ *   `recordingRef.current && recordingState === 'paused'` 分支）依赖旧句柄的
+ *   `onPartialResult` / `onConnectionChange` 回调代次仍然有效 —— 一旦 pause 把 runId 推进，
+ *   resume 后这些回调会全部命中 `runId !== runIdRef.current` 早退，转录静默丢字（假录音）。
+ *   因此手动暂停**不能**靠代次守卫拦下在途的重连，必须由本判别式在每个 await 之后复查。
+ *   凡是「await 之后要把会话推回 recording」的分支，都必须先过这一关。
+ */
+function hasManualPauseIntent(shouldReconnect: boolean): boolean {
+  const state = useTranscriptStore.getState().recordingState;
+  return !shouldReconnect && state !== 'recording';
+}
+
 interface UseSonioxOptions {
   idleTimeoutMs?: number;
   audioActivityThreshold?: number;
@@ -81,6 +103,12 @@ export function useSoniox(
   // 引用，而轮换本身要走 attemptReconnect —— 经 ref 解开 useCallback 循环依赖）。
   const rotationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rotateConnectionRef = useRef<() => void>(() => {});
+  // L24：当前连接被 Soniox 服务端硬断的时刻（epoch ms）= 建连时刻 + key 的
+  // max_session_duration_seconds。**服务端倒计时在暂停期间照走**（它按墙钟算，不管我们有没有
+  // 在发音频），所以短暂停复用句柄时必须拿它复核剩余寿命：剩得太少就别复用（改重建、重新
+  // mint），剩得够就按**剩余量**重排轮换定时器 —— 否则 pause() 撤销的轮换永远不会被排回来，
+  // 恢复后只能等硬断（丢最后 ~5s 未 final 的字 + 一次闪断）。
+  const grantHardCutAtRef = useRef<number | null>(null);
   const remoteDraftSeqsRef = useRef<Set<number>>(new Set());
   // 分片上传的 429 退避截止时刻(epoch ms)。窗口内一律短路不再撞限流。
   const chunkBackoffUntilRef = useRef(0);
@@ -857,6 +885,11 @@ export function useSoniox(
       clearTimeout(rotationTimerRef.current);
       rotationTimerRef.current = null;
     }
+    // L24：先记下硬断时刻（无论下面排不排轮换）。暂停/恢复要靠它复核剩余寿命。
+    grantHardCutAtRef.current =
+      maxSessionSeconds && maxSessionSeconds > 0
+        ? Date.now() + maxSessionSeconds * 1000
+        : null;
     // 太短的窗口（收缩到只剩 1 分钟的额度尾巴）不轮换：让 Soniox 硬断 + 既有断线重连兜底，
     // 重连时若额度真耗尽会被 mint 403 拒绝并走重连失败提示。
     if (!maxSessionSeconds || maxSessionSeconds <= ROTATION_LEAD_S * 2) {
@@ -998,7 +1031,12 @@ export function useSoniox(
           if (
             latestState === 'idle' ||
             latestState === 'stopped' ||
-            latestState === 'finalizing'
+            latestState === 'finalizing' ||
+            // H2：**手动暂停**同样要在这里拦下。pause() 不 bump runId（见 hasManualPauseIntent
+            // 的不变式说明），代次守卫接不住它；漏查会让下面的建连照常跑完并把会话强制推回
+            // recording —— 用户以为已暂停，麦克风仍在采、Soniox 仍在计费（幽灵录音）。
+            // 口径与定时器触发时的第一道守卫一致：只认「非自动重连语义下的非 recording 态」。
+            hasManualPauseIntent(shouldReconnectRef.current)
           ) {
             shouldReconnectRef.current = false;
             reconnectAttemptsRef.current = 0;
@@ -1047,6 +1085,16 @@ export function useSoniox(
                   sessionStartWallClockRef.current = Date.now();
                   latencyEmaRef.current = null;
                   setConnectionMeta({ latencyMs, connectedAt: Date.now(), transcriptionLatencyMs: null });
+                  // H2：这个回调在 `await startSonioxRecording` **期间**触发（mint key + WS 握手
+                  // 约 0.5-3s），是手动暂停最容易落进的窗口。上面那道守卫查在建连之前，管不到
+                  // 这里；漏查就会 archiveManager.resume() + setRecordingState('recording') +
+                  // onAutoResume 三连，把用户刚点下的暂停整个抹掉（幽灵录音持续计费）。
+                  // 只跳过「恢复录音」这一组副作用；连接本身是真连上了，meta/稳定计数照记，
+                  // 刚建好的句柄由 await 之后的暂停对齐收尾（与 startNewRecording 的
+                  // 「晚到 start 对齐暂停意图」P0-2 #1 同款）。
+                  if (hasManualPauseIntent(shouldReconnectRef.current)) {
+                    return;
+                  }
                   void archiveManagerRef.current?.resume().catch((error) => {
                     console.error('Failed to resume archive after reconnect:', error);
                   });
@@ -1082,11 +1130,22 @@ export function useSoniox(
             return;
           }
 
+          // H2：晚到的**重连**结果同样要对齐用户最新意图（与 startNewRecording 的 P0-2 #1
+          // 守卫同款）。建连 await 期间点的暂停不会 bump runId，上面的代次检查放行它。
+          const pausedDuringReconnect = hasManualPauseIntent(
+            shouldReconnectRef.current
+          );
+
           if (result.temporaryKey) {
             setConnectionMeta({
               region: result.temporaryKey.region,
               wsUrl: result.temporaryKey.ws_base_url,
             });
+            // 无论如何都要走一遍 scheduleRotation —— 它同时**记录本次 grant 的硬断时刻**
+            // （L24 的 grantHardCutAtRef，恢复时据此复核剩余寿命）。暂停意图下随后再把定时器
+            // 撤掉，与 pause() 的「暂停即撤销寿命轮换」完全同款；恢复时由 startImpl 的复用
+            // 分支按剩余寿命重排。若这里图省事直接跳过 scheduleRotation，grantHardCutAtRef 会
+            // 停留在**断线前那条旧连接**的过期时刻，恢复时被误判为「额度将尽」而白白重建。
             scheduleRotation(result.temporaryKey.max_session_duration_seconds);
           }
 
@@ -1094,6 +1153,28 @@ export function useSoniox(
             recording: RecordingHandle;
             client: unknown;
           };
+
+          if (pausedDuringReconnect) {
+            // 句柄默认处于录音态：立刻暂停它与归档，否则 UI 显示暂停却仍在采集/出字/计费。
+            // 保留句柄（不 stop）是刻意的：用户随即点「继续」时走 startImpl 的短暂停复用分支，
+            // 与手动 pause 后的行为完全一致。
+            try {
+              result.recording.pause?.();
+            } catch (error) {
+              console.error('Failed to pause late reconnect handle:', error);
+            }
+            void archiveManagerRef.current?.pause().catch((error) => {
+              console.error('Failed to pause archive after late reconnect:', error);
+            });
+            // 与 pause() 对齐：撤销刚排上的寿命轮换（硬断时刻已由 scheduleRotation 记下，
+            // 恢复时按剩余寿命重排）。
+            if (rotationTimerRef.current) {
+              clearTimeout(rotationTimerRef.current);
+              rotationTimerRef.current = null;
+            }
+            shouldReconnectRef.current = false;
+            reconnectAttemptsRef.current = 0;
+          }
         } catch (error) {
           if (
             ownerSignal.aborted ||
@@ -1103,6 +1184,13 @@ export function useSoniox(
             return;
           }
           console.error('Reconnect attempt failed:', error);
+          // H2：建连途中用户已手动暂停时不要再排下一轮重连 —— 否则 connectionState 会被反复
+          // 推回 'reconnecting'（暂停中显示"重连中"），要等下一个退避 tick 的守卫才自愈。
+          if (hasManualPauseIntent(shouldReconnectRef.current)) {
+            shouldReconnectRef.current = false;
+            reconnectAttemptsRef.current = 0;
+            return;
+          }
           // 继续尝试
           attemptReconnect();
         }
@@ -1248,7 +1336,13 @@ export function useSoniox(
       if (sessionId) {
         setActiveSessionId(sessionId);
       }
-      setRecordingState(keepPausedUntilConnected ? 'paused' : 'recording');
+      // L47：**不在这里**把 recordingState 翻成 'recording'。
+      // 这一句原先跑在 getUserMedia 之前，而 session 页有个订阅 recordingState 的回写 effect，
+      // 状态一翻转就 `PATCH RECORDING`。于是「点开始 → 麦克风授权被拒 / 取流失败」时后端仍然
+      // 停在 RECORDING：下次进这个会话命中 resume-cold 变成幽灵录制中，还白占并发在途额度。
+      // 真正的翻转点挪到下面「本地采集确认拿到流之后」（见 flipToRecordingIfCurrent）。
+      // 刻意只推迟到「拿到流」而不是「Soniox 连上」—— 断网续采/离线归档的设计前提正是
+      // 「没连上也算 recording」（pauseForInterruption 在 hasLiveCapture 时保持 recording）。
       setCurrentMicDeviceId(sourceType === 'mic' ? selectedMicDeviceId ?? null : null);
       reconnectAttemptsRef.current = 0;
       if (!keepPausedUntilConnected) {
@@ -1332,6 +1426,13 @@ export function useSoniox(
         });
         const managedStream = await archiveManager.getSenderStream();
         if (!startOwnerIsCurrent()) return;
+
+        // L47：到这里本地采集才真正活着（getUserMedia/getDisplayMedia 已成功、MediaRecorder
+        // 已在写块），现在才是能对外宣称 recording 的时刻。授权被拒/取流失败会在上面抛出，
+        // 直接落到 catch 的 hasLive=false 分支 → 'idle'，后端永远不会被 PATCH 成 RECORDING。
+        // 代次守卫由上一行的 startOwnerIsCurrent() 承担（它本身就含 runId 比较）。
+        setRecordingState(keepPausedUntilConnected ? 'paused' : 'recording');
+
         if (startOptions?.preserveStartTime || localChunkCount > 0) {
           void syncRemoteDraft();
         }
@@ -1450,6 +1551,14 @@ export function useSoniox(
             console.error('Failed to pause late start handle:', error);
           }
           void archiveManagerRef.current?.pause();
+          // M20 残留：pause() 在 scheduleRotation **之前**跑完时，它清掉的是上一条连接的轮换
+          // 定时器，而上面刚为这条新连接排了一个新的 —— 暂停中却挂着轮换定时器，与 pause()
+          // 的「暂停即撤销寿命轮换」不一致。这里补齐（硬断时刻已被 scheduleRotation 记下，
+          // 恢复时 startImpl 的复用分支按剩余寿命重排）。
+          if (rotationTimerRef.current) {
+            clearTimeout(rotationTimerRef.current);
+            rotationTimerRef.current = null;
+          }
         }
       } catch (error) {
         if (!startOwnerIsCurrent()) {
@@ -1776,7 +1885,16 @@ export function useSoniox(
     // （审计 high）。清掉旧句柄，落到下面重建一条新连接。
     const pausedAtSnapshot = useTranscriptStore.getState().pausedAt;
     const pausedForMs = pausedAtSnapshot ? Date.now() - pausedAtSnapshot : 0;
-    const handleLikelyStale = pausedForMs > PAUSE_HANDLE_STALE_MS;
+    // L24：Soniox 的 max_session_duration_seconds 倒计时按**墙钟**走，暂停期间照样在烧。
+    // 剩余寿命不足一个轮换提前量的两倍（<60s）时复用句柄没有意义：刚恢复就会被硬断，丢掉
+    // 最后 ~5s 未 final 的字并闪断一次。此时按「句柄已过期」处理 → 走下面的重建分支重新
+    // mint（新预扣、新 grant、新的完整寿命）。
+    const hardCutAt = grantHardCutAtRef.current;
+    const grantRemainingMs = hardCutAt != null ? hardCutAt - Date.now() : null;
+    const grantNearlyExhausted =
+      grantRemainingMs != null && grantRemainingMs <= ROTATION_LEAD_S * 2 * 1000;
+    const handleLikelyStale =
+      pausedForMs > PAUSE_HANDLE_STALE_MS || grantNearlyExhausted;
 
     if (recordingRef.current && recordingState === 'paused' && handleLikelyStale) {
       try {
@@ -1805,6 +1923,12 @@ export function useSoniox(
       setRecordingState('recording');
       setConnectionState('connected');
       markAudioActivity();
+      // L24：pause() 撤销了寿命轮换，而这条复用分支不会经过 onConnectionChange('connected')，
+      // 此前也就没有任何人把它排回来 —— 复用的连接只能等 Soniox 硬断。这里按**剩余**寿命
+      // 重排（上面已保证剩余 > 60s，否则不会走到复用分支）。
+      if (grantRemainingMs != null && grantRemainingMs > 0) {
+        scheduleRotation(Math.floor(grantRemainingMs / 1000));
+      }
       return;
     }
 
@@ -1838,6 +1962,7 @@ export function useSoniox(
     computeResumeOffset,
     markAudioActivity,
     recordingState,
+    scheduleRotation,
     setConnectionState,
     setRecordingState,
     startNewRecording,
@@ -1871,6 +1996,9 @@ export function useSoniox(
     shouldReconnectRef.current = false;
     autoPauseReasonRef.current = null;
     lastAudioActivityAtRef.current = null;
+    // L24：本场结束，grant 硬断时刻作废（下一场 mint 会重新写入）。
+    // 注意 pause() 刻意**不**清它 —— 服务端倒计时在暂停期间照走，恢复时正要靠它复核剩余寿命。
+    grantHardCutAtRef.current = null;
 
     // 递增 runId 使所有在途的录音回调全部失效
     runIdRef.current += 1;
@@ -1923,6 +2051,10 @@ export function useSoniox(
     setRecordingState('stopped');
   }, [cancelStableConn, sessionId, setConnectionState, setRecordingStartTime, setRecordingState]);
 
+  // H2 不变式：pause() 刻意**不** bump runIdRef —— 短暂停复用句柄（startImpl 的 paused 分支）
+  // 依赖保留句柄的回调代次仍然有效，bump 会让 resume 后所有 token 被静默丢弃。代价是「在途的
+  // 重连」拦不住它，故 attemptReconnect 的每个 await 之后都用 hasManualPauseIntent() 复查
+  // （见该函数注释）。改动本函数时务必同步检查那三处复查点。
   const pause = useCallback(() => {
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current);

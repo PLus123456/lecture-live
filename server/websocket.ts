@@ -29,6 +29,11 @@ import { logger, serializeError } from '../src/lib/logger';
 
 const PORT = parseInt(process.env.WS_PORT || '3001', 10);
 const MAX_CONNECTIONS_PER_IP = 50;
+// H1：这个值被 engine.io 原样传给 ws 的 maxPayload —— 超限的入站帧会被 receiver 以
+// close **1009** 直接销毁连接，**消息根本到不了业务 handler**（server.ts 里的
+// MAX_SNAPSHOT_* 截断因此永远执行不到）。客户端必须在发送前自己守住这条线：
+// 见 src/lib/liveShare/snapshotChunking.ts 的 MAX_LIVE_MESSAGE_BYTES（90KB，留足
+// socket.io 帧头余量）。**改这里必须同步改那里**，两边脱钩就会重演直播死循环。
 const MAX_MESSAGE_SIZE_BYTES = 100 * 1024;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
@@ -40,6 +45,9 @@ const trustedProxyConfig = validateTrustedProxyConfiguration();
 // 防止被盗号/异常客户端用 broadcast / sync_snapshot 等消息洪泛打爆独立 WS 进程。
 // 稳态上限 ~20 msg/s，桶容量给突发留出余量；持续超限则断连（onAny 无法真正“丢弃”
 // 已派发给业务 handler 的事件，断连是可靠且对滥用者合适的处置）。
+// H1：桶容量还额外承担一个不变式 —— 主播（重）连时会把全量快照按块**连发**
+// （snapshotChunking.ts 的 MAX_SYNC_SNAPSHOT_CHUNKS = 24），容量必须留在它之上，
+// 否则每次重连补发都会自己把自己限流断连，等于换一种方式复现直播死循环。
 const RATE_LIMIT_REFILL_PER_SEC = 20;
 const RATE_LIMIT_BUCKET_CAPACITY = 40;
 

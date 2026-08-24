@@ -60,7 +60,9 @@ const TOKEN_BLACKLIST_STORE_KEY = '__lectureLiveTokenBlacklistStore';
 // 内存黑名单现在是无条件双写的（见 revokeToken），故必须有上界，否则高频登出的站点
 // 会在进程里堆积最长 30 天的条目。超限时优先丢「最快过期」的那些——它们离自然失效最近，
 // 且 Redis 里仍有同一份记录。
-const TOKEN_BLACKLIST_MAX_ENTRIES = 20_000;
+// L8：从 20k 抬到 100k（每条 ≈ 50B → 约 5MB 上界），并在真的驱逐未过期条目时告警，
+// 见 pruneExpiredBlacklistedTokens。
+const TOKEN_BLACKLIST_MAX_ENTRIES = 100_000;
 
 type TokenBlacklistGlobal = typeof globalThis & {
   [TOKEN_BLACKLIST_STORE_KEY]?: Map<string, TokenBlacklistEntry>;
@@ -155,6 +157,23 @@ function getTokenBlacklistStore(): Map<string, TokenBlacklistEntry> {
   return globalState[TOKEN_BLACKLIST_STORE_KEY] as Map<string, TokenBlacklistEntry>;
 }
 
+/**
+ * L8：超限驱逐会丢掉**尚未过期**的吊销记录 —— Redis 不可用期间，高频登出/刷新
+ * 累计超过上限后，部分「已登出」的 token 会在内存黑名单里复活（上限 = 该 JWT 的
+ * 剩余寿命，最长 7 天）。
+ *
+ * 这里做两件事，不改 fail-open 的总体姿态（内存兜底本就是降级态，改成 fail-closed
+ * 会让 Redis 抖动直接把全站登出，代价更大 —— 那属于 C4 的范畴，需要单独决策）：
+ *  1. 上限抬高一个数量级（条目 ≈ 40B jti + 8B 时间戳，10 万条也就几 MB），
+ *     让「撑爆」变成需要真正异常的流量才会发生；
+ *  2. **一旦真的驱逐了未过期条目就告警**。原实现是静默的，吊销保护静悄悄失效、
+ *     运维完全无从察觉；有这条日志才能被发现并去修 Redis。
+ */
+const blacklistEvictionLogger = {
+  lastWarnAt: 0,
+};
+const BLACKLIST_EVICTION_WARN_INTERVAL_MS = 60_000;
+
 function pruneExpiredBlacklistedTokens(store: Map<string, TokenBlacklistEntry>) {
   const now = Date.now();
   store.forEach((entry, jti) => {
@@ -169,8 +188,24 @@ function pruneExpiredBlacklistedTokens(store: Map<string, TokenBlacklistEntry>) 
   const byExpiry = Array.from(store.entries()).sort(
     (a, b) => a[1].expiresAt - b[1].expiresAt
   );
-  for (let i = 0; i < byExpiry.length - TOKEN_BLACKLIST_MAX_ENTRIES; i += 1) {
+  const evictCount = byExpiry.length - TOKEN_BLACKLIST_MAX_ENTRIES;
+  let evictedUnexpired = 0;
+  for (let i = 0; i < evictCount; i += 1) {
+    // 上面已经清掉所有过期条目，所以这里驱逐的**全部是未过期的**
+    if (byExpiry[i][1].expiresAt > now) evictedUnexpired += 1;
     store.delete(byExpiry[i][0]);
+  }
+
+  if (
+    evictedUnexpired > 0 &&
+    now - blacklistEvictionLogger.lastWarnAt >= BLACKLIST_EVICTION_WARN_INTERVAL_MS
+  ) {
+    blacklistEvictionLogger.lastWarnAt = now;
+    console.error(
+      `[auth] 内存令牌黑名单超限，已驱逐 ${evictedUnexpired} 条**未过期**的吊销记录 ` +
+        `(cap=${TOKEN_BLACKLIST_MAX_ENTRIES})：这些 token 会在剩余寿命内复活。` +
+        '请检查 Redis —— 内存黑名单只是 Redis 不可用时的降级兜底。'
+    );
   }
 }
 

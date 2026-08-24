@@ -40,6 +40,7 @@ import {
 } from 'lucide-react';
 import type { TranscriptSegment } from '@/types/transcript';
 import type { SummaryBlock } from '@/types/summary';
+import type { ViewerConnectionState } from '@/lib/liveShare/viewer';
 
 // ─── 工具函数 ───
 
@@ -450,6 +451,63 @@ function PlaybackStyleRightPanel({ summaries, sessionInfo }: {
   );
 }
 
+// ─── 连接/完整性提示条 ───
+
+/**
+ * M2 + H1 的可见化出口：
+ * - reconnecting：观众端此前对断连零反馈（viewer.ts 没有 connect_error/disconnect
+ *   监听），画面会静止在最后一帧却看不出任何异常；
+ * - truncated：主播端因传输体积上限丢过最早的一段 backlog，历史不完整。
+ *
+ * 注：这里的文案没有走 i18n 字典，而是就地按 locale 分支——本批只允许改直播分享
+ * 相关文件，不动共享的 locales/*.ts（并行批次同时在编辑）。合并后建议提取为
+ * viewer.reconnecting / viewer.backlogTruncated 两个键。
+ */
+function ViewerNotice({
+  connectionState,
+  backlogTruncated,
+  theme,
+  locale,
+}: {
+  connectionState: ViewerConnectionState;
+  backlogTruncated: boolean;
+  theme: 'light' | 'dark';
+  locale: string;
+}) {
+  const reconnecting = connectionState === 'reconnecting';
+  if (!reconnecting && !backlogTruncated) return null;
+
+  const message = reconnecting
+    ? locale === 'zh'
+      ? '连接已断开，正在自动重连…'
+      : 'Connection lost — reconnecting…'
+    : locale === 'zh'
+      ? '较早的内容因体量过大已省略，仅显示最近部分。'
+      : 'Earlier content was omitted because the backlog was too large; showing the most recent part.';
+
+  return (
+    <div
+      role="status"
+      className={`flex items-center gap-2 px-4 py-1.5 text-[11px] border-b ${
+        reconnecting
+          ? theme === 'dark'
+            ? 'border-charcoal-600 bg-charcoal-700 text-cream-300'
+            : 'border-cream-200 bg-cream-100 text-charcoal-600'
+          : theme === 'dark'
+            ? 'border-charcoal-600 bg-charcoal-800 text-cream-500'
+            : 'border-cream-200 bg-white text-charcoal-500'
+      }`}
+    >
+      {reconnecting ? (
+        <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
+      ) : (
+        <AlertCircle className="w-3 h-3 flex-shrink-0" />
+      )}
+      <span className="truncate">{message}</span>
+    </div>
+  );
+}
+
 // ─── 主页面 ───
 
 export default function ViewerPage() {
@@ -494,6 +552,18 @@ export default function ViewerPage() {
 
   // 是否为已完成会话的静态查看模式
   const [isCompleted, setIsCompleted] = useState(false);
+  // 供 socket 回调读取最新完成态（回调闭包捕获的是首帧 state，会读到陈旧值）
+  const isCompletedRef = useRef(false);
+
+  /**
+   * M2：观众端连接态。此前 viewer.ts 只注册业务事件，没有任何 connect_error /
+   * disconnect 监听 —— WS 不可达、Origin 被拒（server/websocket.ts 的 io.use）、
+   * 每 IP 连接数超限时，loading spinner 会永久悬挂，用户完全不知道发生了什么。
+   */
+  const [connectionState, setConnectionState] =
+    useState<ViewerConnectionState>('connecting');
+  /** H1：主播端因传输体积上限截断过 backlog，本次拿到的历史不是完整的。 */
+  const [backlogTruncated, setBacklogTruncated] = useState(false);
 
   useEffect(() => {
     if (!shareToken) {
@@ -547,16 +617,24 @@ export default function ViewerPage() {
           durationMs: data.session?.durationMs,
         });
 
-        rememberViewedLink({
-          token: shareToken,
-          url: window.location.href,
-          sessionId: data.sessionId,
-          title,
-          sourceLang: data.session?.sourceLang || '',
-          targetLang: data.session?.targetLang || '',
-          status,
-          viewedAt: new Date().toISOString(),
-        });
+        // 「最近看过的分享」落 localStorage（sharedLinksStore 走 zustand persist）。
+        // 存储不可用时（Safari 无痕、企业策略禁用、配额耗尽）写入会抛，而这里身处
+        // .then() 内部，抛出去就被下面的 .catch() 吞成「加载会话失败」——一个纯锦上添花
+        // 的历史记录把整个观看功能拖挂。就地兜住：记不住不影响看直播。
+        try {
+          rememberViewedLink({
+            token: shareToken,
+            url: window.location.href,
+            sessionId: data.sessionId,
+            title,
+            sourceLang: data.session?.sourceLang || '',
+            targetLang: data.session?.targetLang || '',
+            status,
+            viewedAt: new Date().toISOString(),
+          });
+        } catch {
+          // 忽略：仅影响「最近看过」列表
+        }
 
         // 已完成/已归档的会话：重定向到 playback 页面（完整回放体验）
         if (status === 'COMPLETED' || status === 'ARCHIVED') {
@@ -568,6 +646,25 @@ export default function ViewerPage() {
 
         // 进行中的会话：连接 WebSocket 实时接收数据
         joinAsViewer(shareToken, {
+          // M2：连接态 → UI。'reconnecting' 只挂一条提示条，不清内容——主播瞬断
+          // （Wi-Fi 切换）在服务端有 15s 宽限，重连后 'connect' 会重新 join 并拿到
+          // 全量 initial_state（C6），把内容清掉纯属自找闪烁。
+          onConnectionChange: (state, info) => {
+            // 归属闸门与其余回调一致：本页已卸载 / 账号边界已变时一律不落状态。
+            void commitViewerUpdate(() => {
+              setConnectionState(state);
+              if (state !== 'closed') return;
+
+              // 终态：服务端主动踢（撤销/过期驱逐、优雅关停强断）或握手被拒。
+              setLoading(false);
+              // 录制正常结束（SHARE_OFFLINE 已把页面切成静态完成态）后的静默断开
+              // 不是错误，别把已经好好的完成视图盖成错误页（transition 模式就是静默断）。
+              if (isCompletedRef.current) return;
+              setError(
+                (prev) => prev ?? (info?.message || t('viewer.loadSessionFailed'))
+              );
+            });
+          },
           onInitialState: (snapshot) => {
             void commitViewerUpdate(() => {
               // C6：每次 socket.io 自动重连都会重新 emit join → 服务端重发全量快照，
@@ -592,6 +689,8 @@ export default function ViewerPage() {
               if (snapshot.previewTranslation) {
                 updatePreviewTranslation(snapshot.previewTranslation);
               }
+              // H1：主播端/服务端截断过 backlog 时明确告知观众，别让残缺历史冒充完整。
+              setBacklogTruncated(snapshot.truncated === true);
               setLoading(false);
             });
           },
@@ -616,6 +715,13 @@ export default function ViewerPage() {
           },
           onStatusUpdate: ({ status: newStatus }) => {
             void commitViewerUpdate(() => {
+              if (newStatus === 'SERVER_SHUTDOWN') {
+                // M2：WS 进程优雅关停会向所有 socket 广播这条（server/websocket.ts）。
+                // 它不代表直播结束，只代表「本次连接即将中断」——进程重启后 socket.io
+                // 会自动重连，所以只提示、不切静态完成态。
+                setConnectionState('reconnecting');
+                return;
+              }
               if (newStatus === 'SHARE_OFFLINE' || newStatus === 'COMPLETED') {
                 // 录制结束：清空预览，切换到静态模式
                 updatePreview({ finalText: '', nonFinalText: '' });
@@ -625,10 +731,14 @@ export default function ViewerPage() {
                   state: 'idle',
                   sourceLanguage: null,
                 });
+                isCompletedRef.current = true;
                 setIsCompleted(true);
                 setSessionInfo((prev) => prev ? { ...prev, status: newStatus } : prev);
               } else if (newStatus === 'SHARE_LIVE') {
-                // C3：主播瞬断后重连成功，解除静态完成态。
+                // C3：主播瞬断（Wi-Fi 切换 / ping 超时）后重连成功，服务端广播 SHARE_LIVE。
+                // 观众自身 socket 通常并未断开、内存快照仍在，只是此前可能因误报的
+                // SHARE_OFFLINE 被单向锁成静态完成态——这里解锁回实时视图。
+                isCompletedRef.current = false;
                 setIsCompleted(false);
                 setSessionInfo((prev) => prev ? { ...prev, status: 'LIVE' } : prev);
               }
@@ -944,6 +1054,13 @@ export default function ViewerPage() {
           </div>
         </header>
 
+        <ViewerNotice
+          connectionState={connectionState}
+          backlogTruncated={backlogTruncated}
+          theme={theme}
+          locale={locale}
+        />
+
         <div className="border-b border-cream-200 bg-white/95 px-2 backdrop-blur-md">
           <div className="flex">
             {[
@@ -1052,6 +1169,13 @@ export default function ViewerPage() {
           <SettingsToggle />
         </div>
       </header>
+
+      <ViewerNotice
+        connectionState={connectionState}
+        backlogTruncated={backlogTruncated}
+        theme={theme}
+        locale={locale}
+      />
 
       {/* 内容区域：两栏布局（转录+翻译 | 摘要），与录音界面一致 */}
       <div className="flex-1 flex gap-4 p-4 min-h-0 overflow-hidden">

@@ -997,6 +997,80 @@ describe('applyGrantTx：发放段防线', () => {
     );
   });
 
+  // M7：发放侧从前只挡「买家已经是 ADMIN」，完全不看 spec.grantRole；而档位管理口的
+  // `['ADMIN','PRO','FREE'].includes(role)` 明确放行 ADMIN —— 只要有一个 grantRole='ADMIN'
+  // 的会员档存在（误操作 / 被接管的管理员账号 / 直接改库），任何 FREE 用户花钱即得管理员：
+  // 终身计费豁免 + 全部 admin API。P6-15 自认「只靠事后审计流水」不是防线。
+  it('▶ M7 grantRole=ADMIN 的会员档：余额购买硬拒（不扣款、不改角色、不记台账）', async () => {
+    rechargeTierFindUniqueMock.mockResolvedValueOnce({
+      ...membershipTier,
+      id: 't-admin',
+      name: '至尊档',
+      grantRole: 'ADMIN',
+    });
+
+    await expect(spendFromBalance('u1', 't-admin')).rejects.toMatchObject({
+      code: 'tier_unavailable',
+    });
+    // 硬拒必须排在扣款之前：一分钱都不许动。
+    expect(userUpdateManyMock).not.toHaveBeenCalled();
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(walletTxCreateMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ M7 支付渠道回调按**冻结快照**发放同样硬拒（快照可能来自收紧之前的存量档位）', async () => {
+    paymentOrderUpdateManyMock.mockResolvedValue({ count: 1 });
+    paymentOrderFindUniqueMock.mockResolvedValueOnce({
+      id: 'o-adm',
+      userId: 'u1',
+      kind: 'purchase',
+      tierId: 't-admin',
+      outTradeNo: 'LLADM',
+      amountCents: 3000,
+      // 认领改成「行锁 SELECT + 条件 UPDATE」之后，锁读到的必须还是未认领态；
+      // 直接喂 'paid' 会走到「非可认领状态」的早退分支，测不到发放段的硬拒。
+      status: 'pending',
+      metadataJson: JSON.stringify({
+        creditCents: 3000,
+        grant: {
+          kind: 'membership',
+          priceCents: 3000,
+          tierId: 't-admin',
+          tierName: '至尊档',
+          grantRole: 'ADMIN',
+          durationDays: 30,
+        },
+      }),
+    });
+    userUpdateMock.mockResolvedValueOnce({ walletBalanceCents: 3000 }); // tx1 到账
+    // 关键：给足「本该发放成功」的条件（锁读到真实用户行 + 余额够扣），否则这条用例会因为
+    // 用户行读不到而假绿 —— 拆掉 M7 硬拒它照样过，等于没测。
+    // 注意不能用 mockResolvedValueOnce：认领改成行锁 SELECT 之后，**第一条** $queryRaw
+    // 是 PaymentOrder 的 FOR UPDATE，一次性替身会把用户行喂给订单锁读。
+    userFindUniqueMock.mockResolvedValue({
+      walletBalanceCents: 3000,
+      role: 'FREE',
+      originalRole: null,
+      roleExpiresAt: null,
+      transcriptionMinutesLimit: 600,
+    });
+
+    const res = await creditPaidOrder('LLADM', 'ref', 'sandbox');
+
+    // 到账与发放是同一个事务（SEC-027）：发放段硬拒 → 整笔回滚，订单进人工复核队列
+    // （不是静默吞钱，也绝不写 role）。
+    expect(res).toMatchObject({ ok: false, status: 'review' });
+    const roleWrite = userUpdateMock.mock.calls.find(
+      (c) => (c[0] as { data?: { role?: unknown } })?.data?.role !== undefined
+    );
+    expect(roleWrite).toBeUndefined();
+    expect(
+      walletTxCreateMock.mock.calls.some(
+        (c) => (c[0] as { data: { type: string } }).data.type === 'purchase_membership'
+      )
+    ).toBe(false);
+  });
+
   // P3-7：扣款守卫是 `walletBalanceCents >= price`，price=0 时恒真恒 count=1 —— 一个「0 元
   // 体验档」建完即提款机。档位管理口挡了一道，这里是快照发放路径上的第二道。
   it('▶ P3-7 0 元的会员/时长档拒绝发放（不加池、不记台账）', async () => {

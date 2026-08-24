@@ -100,11 +100,13 @@ export async function POST(
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
-  // P0-6：async 上传管线的产物写盘会**覆盖** session.recordingPath（asyncUploadProcessor 第 4 步
-  // persistSessionAudioArtifact → setStatus 落 recordingPath），故绝不能跑在已收尾的会话上——否则
-  // 会把已 COMPLETED/ARCHIVED 会话的最终录音覆盖/删除（固定 key 写盘直接冲掉原文件）。入口即拒终态
-  // 会话，机器可读 code 便于前端分支。（更深的加固——asyncUploadProcessor 侧 staging+CAS 写产物——
-  // 见 handoffs 延后；此状态门禁已堵住主要的录音损坏路径。）
+  // P0-6：async 上传管线会写 session.recordingPath，绝不能跑在已收尾的会话上——否则会动到
+  // 已 COMPLETED/ARCHIVED 会话的最终录音。入口即拒终态会话，机器可读 code 便于前端分支。
+  //
+  // 注意这已经是**纵深防御**而非唯一防线：P0-6r 之后 asyncUploadProcessor 第 4 步改成了
+  // 「stage 版本化对象 → setStatus(requireActiveSession) CAS → publish/rollback」，权威守卫
+  // 是那道 CAS（它能挡住入口放行之后、转码期间才被 /finalize 收尾的窄窗口，这道门禁挡不住）。
+  // 保留本门禁的价值是：不让注定要 halt 的管线白跑一遍转码，并给前端一个明确的 409。
   if (session.status === 'COMPLETED' || session.status === 'ARCHIVED') {
     return NextResponse.json(
       {

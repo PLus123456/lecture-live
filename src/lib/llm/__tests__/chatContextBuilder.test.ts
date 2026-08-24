@@ -372,3 +372,91 @@ describe('chatContextBuilder', () => {
     });
   });
 });
+
+/**
+ * L33：L4 的压缩结果被缓存后，L5/L6/L7 会原样复用。
+ *
+ * 但设计文档写明 L4 保留 5 轮、L5+ 只保留 3 轮（LLM_CONTEXT_DESIGN.md 的降级表）——
+ * 复用 5 轮的结果意味着 L5 在"历史"这一维上根本没有比 L4 更收紧，token 占用偏大、
+ * 更容易被推到 L6/L7（RAG + 截 summary，代价更大）。
+ */
+describe('L33：L4/L5 各自按设计的 keepTurns 压缩历史', () => {
+  function makeCase() {
+    const history: ConversationTurn[] = [];
+    for (let i = 0; i < 6; i++) {
+      history.push({
+        role: 'user',
+        content: `U${i}-${'u'.repeat(60)}`,
+        transcriptOffsetMs: i * 1000,
+      });
+      history.push({
+        role: 'assistant',
+        content: `A${i}-${'a'.repeat(60)}`,
+        transcriptOffsetMs: i * 1000,
+      });
+    }
+    const transcript: TranscriptSegment[] = Array.from(
+      { length: 6 },
+      (_, i) => ({ text: `SEG${i}-${'t'.repeat(120)}`, startMs: i * 1000 })
+    );
+    return {
+      history,
+      transcript,
+      userInput: '当前这一问',
+      summary: 'S'.repeat(200),
+      totalTranscriptMs: 6000,
+      language: 'zh' as const,
+      buildSystemPrompt: (t: string, s: string) => `<t>${t}</t><s>${s}</s>`,
+    };
+  }
+
+  it('降到 L5 时按 3 轮重压，而不是复用 L4 的 5 轮结果', async () => {
+    const base = makeCase();
+
+    // 先量出 L5 的真实占用（forceMinLevel=5 时新旧实现都用 keepTurns=3）
+    const probe = await buildChatContext({
+      ...base,
+      minLevel: 1,
+      forceMinLevel: 5,
+      inputBudget: 1_000_000,
+      callLLM: vi.fn(async () => 'COMPRESSED'),
+    });
+    expect(probe.level).toBe(5);
+
+    // 预算恰好等于 L5 的占用 → L1..L4 必然超，最终落在 L5
+    const callLLM = vi.fn(async () => 'COMPRESSED');
+    const ctx = await buildChatContext({
+      ...base,
+      minLevel: 1,
+      inputBudget: probe.breakdown.total,
+      callLLM,
+    });
+
+    expect(ctx.level).toBe(5);
+    // 压缩调用两次：L4 用 keepTurns=5，L5 用 keepTurns=3。
+    // 旧实现只压一次（L4 的 5 轮结果被 L5 直接复用）。
+    expect(callLLM).toHaveBeenCalledTimes(2);
+    // keepTurns=3 → 保留最近 3 轮 = 6 条消息，加当前 user 共 7 条。
+    // 旧实现复用 5 轮 → 11 条。
+    expect(ctx.messages).toHaveLength(7);
+    expect(ctx.messages[0].content).toContain('U3-');
+  });
+
+  it('L4 本身仍用 5 轮（没有把 L4 一起改严）', async () => {
+    const base = makeCase();
+    const callLLM = vi.fn(async () => 'COMPRESSED');
+    const ctx = await buildChatContext({
+      ...base,
+      minLevel: 4,
+      forceMinLevel: 4,
+      inputBudget: 1_000_000,
+      callLLM,
+    });
+
+    expect(ctx.level).toBe(4);
+    expect(callLLM).toHaveBeenCalledTimes(1);
+    // keepTurns=5 → 保留最近 5 轮 = 10 条消息 + 当前 user
+    expect(ctx.messages).toHaveLength(11);
+    expect(ctx.messages[0].content).toContain('U1-');
+  });
+});

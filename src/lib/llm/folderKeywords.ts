@@ -46,36 +46,6 @@ function boundedPromptKeywords(
   return selected;
 }
 
-function parseExtractedKeywords(raw: string): ExtractedKeyword[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw.replace(/```json|```/giu, '').trim());
-  } catch {
-    throw new Error('Folder keyword provider returned invalid JSON');
-  }
-  if (!Array.isArray(parsed)) {
-    throw new Error('Folder keyword provider returned a non-array result');
-  }
-
-  const result: ExtractedKeyword[] = [];
-  for (const value of parsed.slice(0, 20)) {
-    if (
-      !value ||
-      typeof value !== 'object' ||
-      typeof (value as { keyword?: unknown }).keyword !== 'string' ||
-      typeof (value as { confidence?: unknown }).confidence !== 'number' ||
-      !Number.isFinite((value as { confidence: number }).confidence)
-    ) {
-      continue;
-    }
-    result.push({
-      keyword: (value as { keyword: string }).keyword,
-      confidence: (value as { confidence: number }).confidence,
-    });
-  }
-  return result;
-}
-
 function folderKeywordSourceHash(options: {
   sessionId: string;
   folderId: string;
@@ -449,4 +419,42 @@ export async function removeKeyword(folderId: string, keyword: string) {
 
 function normalizeKeyword(value: string): string {
   return Array.from(value.trim().replace(/\s+/gu, ' ')).slice(0, 120).join('');
+}
+
+/** 单次提取最多接受多少个关键词（防模型吐出超长数组打爆写库循环） */
+const MAX_EXTRACTED_KEYWORDS = 200;
+
+/**
+ * L35：把 LLM 的原始响应解析成**保证形状正确**的关键词数组。
+ * 任何解析/类型问题都降级成"这次不加关键词"，而不是抛错炸掉调用它的收尾流程。
+ *
+ * 导出仅供单测；生产只走 extractAndAccumulateKeywords。
+ */
+export function parseExtractedKeywords(raw: string): ExtractedKeyword[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
+  } catch {
+    console.error('Failed to parse keyword extraction result:', raw);
+    return [];
+  }
+
+  if (!Array.isArray(parsed)) {
+    console.error('Keyword extraction result is not an array:', raw);
+    return [];
+  }
+
+  const out: ExtractedKeyword[] = [];
+  for (const entry of parsed.slice(0, MAX_EXTRACTED_KEYWORDS)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const { keyword, confidence } = entry as Record<string, unknown>;
+    if (typeof keyword !== 'string' || !keyword.trim()) continue;
+    // 非数值 confidence（含 "0.9" 字符串、null、NaN）一律按 0 处理，绝不让 NaN 进 Prisma。
+    const numeric = typeof confidence === 'number' ? confidence : Number.NaN;
+    const bounded = Number.isFinite(numeric)
+      ? Math.max(0, Math.min(1, numeric))
+      : 0;
+    out.push({ keyword, confidence: bounded });
+  }
+  return out;
 }

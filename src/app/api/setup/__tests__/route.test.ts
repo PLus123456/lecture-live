@@ -331,7 +331,7 @@ describe('POST /api/setup —— 未认证引导窗口 (C02 / P6-4)', () => {
 });
 
 describe('GET /api/setup —— 只读状态', () => {
-  it('即使 admin/LLM/Soniox 都就绪也不隐式写 setup_complete', async () => {
+  it('四项就绪时报告 setupComplete=true，但**绝不落库**（M24：GET 不得有写副作用）', async () => {
     userCountMock.mockResolvedValue(1);
     llmProviderCountMock.mockResolvedValue(1);
     siteSettingFindUniqueMock.mockImplementation(
@@ -343,10 +343,10 @@ describe('GET /api/setup —— 只读状态', () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(body).toMatchObject({
-      setupComplete: false,
-      steps: { admin: true, llm: true, soniox: true },
-    });
+    // 兼容判定保留（存量部署升级后不会被丢回 /setup），但只体现在返回值里；
+    // 已完成时路由提前返回，不再暴露各步骤明细（那属于内部拓扑信息）。
+    expect(body).toEqual({ setupComplete: true });
+    // 关键：这条 GET 一个字都不写。置位只发生在 step=complete。
     expect(siteSettingUpsertMock).not.toHaveBeenCalled();
   });
 });

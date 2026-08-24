@@ -32,7 +32,17 @@ export async function GET(
   { params }: { params: Promise<{ fileName: string }> }
 ) {
   const { fileName } = await params;
-  const safeFileName = sanitizePath(path.basename(fileName));
+
+  // L64：sanitizePath 对「清洗后为空」的输入是 **throw**，不是返回空串
+  //（fileNames.ts:16-21：`..` 去掉 `..` 后成空 → Invalid path after sanitization）。
+  // 这一句原本在 try 之外，`GET /api/assets/icons/%2e%2e` 于是直接冒泡成 500 而非 400。
+  // 路径穿越本身一直被挡住（无越权读），坏的只是状态码与噪音日志。
+  let safeFileName: string;
+  try {
+    safeFileName = sanitizePath(path.basename(fileName));
+  } catch {
+    return NextResponse.json({ error: 'Invalid icon path' }, { status: 400 });
+  }
   if (!safeFileName || safeFileName !== fileName) {
     return NextResponse.json({ error: 'Invalid icon path' }, { status: 400 });
   }

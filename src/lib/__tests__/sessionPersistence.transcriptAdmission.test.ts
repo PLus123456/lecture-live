@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  persistSessionTranscriptArtifacts,
   stageSessionTranscriptArtifacts,
 } from '@/lib/sessionPersistence';
 
@@ -29,7 +28,6 @@ const maliciousBundle = {
 
 describe('session transcript persistence boundary (SEC-009)', () => {
   it.each([
-    ['direct persistence', persistSessionTranscriptArtifacts],
     ['staged persistence', stageSessionTranscriptArtifacts],
   ])('rejects unknown nested data before %s allocates an artifact', async (_name, persist) => {
     await expect(persist(session, maliciousBundle)).rejects.toMatchObject({

@@ -202,6 +202,10 @@ export async function POST(req: Request) {
       sessionId: kind === 'realtime' ? sessionId : null,
       interpretSessionId,
       region: sonioxConfig.region,
+      // L19：上面那道 countActiveStreamGrants 预检是「读完再建行」的 check-then-act 近似值，
+      // 并发脚本可以让 N 个请求全部读到同一个旧计数、集体越闸。把同一个上限也传进预扣事务里
+      // （那里已对用户行 FOR UPDATE，数与建原子），预检只留作快速失败 + 429 文案。
+      maxActiveGrants: grantCap,
     });
   } catch (error) {
     console.error('Stream grant reservation error:', error);
@@ -217,6 +221,15 @@ export async function POST(req: Request) {
     }
     if (grant.reason === 'quota_exhausted') {
       return NextResponse.json({ error: 'Quota exceeded' }, { status: 403 });
+    }
+    if (grant.reason === 'too_many_streams') {
+      // L19：事务内的权威流数闸命中（并发请求越过了上面那道近似预检）。与预检同文案同状态码。
+      return NextResponse.json(
+        {
+          error: `Too many concurrent transcription streams (max ${grantCap}). Close an existing stream first.`,
+        },
+        { status: 429 }
+      );
     }
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }

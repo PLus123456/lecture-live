@@ -56,13 +56,43 @@ export function outputReference(
   return `translations/${taskId}/outputs/${generation}/${variant}.pdf`;
 }
 
+/**
+ * L29：临时文件名必须每次唯一。
+ *
+ * 原来固定叫 `source.pdf.tmp`：同一个 taskId 只要有两个写入者并存（跨代重派、双进程 tick
+ * 同时收割、用户重传撞上在途收割），两条 writeFile 会交错写同一个 tmp 句柄，随后各自
+ * rename —— 落地的是一个「前半段来自 A、后半段来自 B」的撕裂 PDF；rename 的原子性只保证
+ * 「读者看到的要么是旧文件要么是新文件」，挡不住 tmp 自身被写花。
+ * 加 pid + 随机后缀后，每个写入者独占自己的 tmp，rename 谁最后谁赢（内容都是完整的）。
+ */
+function tmpPathFor(dir: string, fileName: string): string {
+  return path.join(
+    dir,
+    `${fileName}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
+  );
+}
+
+/** 写 tmp → rename 的原子落盘；写坏时不留半截 tmp。 */
+async function writeFileAtomic(
+  dir: string,
+  fileName: string,
+  data: Buffer
+): Promise<void> {
+  const tmp = tmpPathFor(dir, fileName);
+  try {
+    await fs.writeFile(tmp, data);
+    await fs.rename(tmp, path.join(dir, fileName));
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function saveSourceFile(taskId: string, data: Buffer): Promise<string> {
   const dir = taskDir(taskId);
   await fs.mkdir(dir, { recursive: true });
   // tmp+rename 原子落盘（与 manifest 持久化同惯例，防写一半的撕裂文件被后续读走）
-  const tmp = path.join(dir, 'source.pdf.tmp');
-  await fs.writeFile(tmp, data);
-  await fs.rename(tmp, path.join(dir, 'source.pdf'));
+  await writeFileAtomic(dir, 'source.pdf', data);
   return sourceReference(taskId);
 }
 
@@ -90,8 +120,14 @@ export async function saveOutputFile(
     dir,
     `.${variant}.${process.pid}.${crypto.randomUUID()}.tmp`
   );
-  await fs.writeFile(tmp, data);
-  await fs.rename(tmp, path.join(dir, `${variant}.pdf`));
+  // L29：写坏时立刻清掉半截 tmp（rm -rf 兜底之外的即时清理）。
+  try {
+    await fs.writeFile(tmp, data);
+    await fs.rename(tmp, path.join(dir, `${variant}.pdf`));
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    throw error;
+  }
   return outputReference(taskId, variant, generation);
 }
 

@@ -123,6 +123,20 @@ async function getSetupStatus(): Promise<SetupStatusPayload> {
 
   if (schemaReady) {
     setupComplete = await isSetupComplete();
+
+    // M24（本轮降级为 low）：这里原本会在「db+admin+llm+soniox 全就绪」时顺手
+    // upsert setup_complete='true'。报告说的「匿名者抢先锁死向导」不成立
+    // （hasAdmin 是硬前提，没有管理员根本不写），但残留一个真实的观感问题：
+    // 管理员刚建好、向导还没点「完成」时，任意一次并发 GET 都可能抢先置位，
+    // 于是 step=complete 拿到 403「初始设置已完成，无法重复执行」。
+    //
+    // GET 是**读**接口，不该有写副作用。置位只保留在 step=complete
+    // （handleCompleteSetup，要求已有管理员且通过 requireSetupAuthorization）。
+    // 「已有部署升级后首次访问」的兼容路径由 src/app/page.tsx 的 SSR 检查承担。
+    if (!setupComplete && dbConnected && hasAdmin && hasLlmProvider && hasSoniox) {
+      // 只在返回值里体现，不落库
+      setupComplete = true;
+    }
   }
 
   return {
@@ -135,6 +149,20 @@ async function getSetupStatus(): Promise<SetupStatusPayload> {
     },
     error: errorMessage,
   };
+}
+
+/**
+ * L7：显示名归一化 —— trim + 截断。schema 里 `displayName String` 映射成 TEXT，
+ * 没有任何长度约束，未截断就落库意味着管理后台/审计日志/会话列表都会被超大字符串放大。
+ * 64 字符对真实姓名/昵称绰绰有余。
+ */
+// 注：route.ts 只允许导出 Next 认识的路由符号，故这里不 export；
+// auth/register/route.ts 里有一份同口径的实现。
+const MAX_DISPLAY_NAME_LENGTH = 64;
+
+function normalizeDisplayName(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return value.trim().slice(0, MAX_DISPLAY_NAME_LENGTH);
 }
 
 /** 恒定时间比较（长度不同直接判否，避免长度侧信道之外的逐字节短路）。 */
@@ -253,6 +281,32 @@ export async function GET(req: Request) {
 
   try {
     const status = await getSetupStatus();
+
+    // L55：四个部署状态布尔（数据库/管理员/LLM/Soniox 是否就绪）属于内部信息，
+    // 不该对任意匿名者公开 —— 它能告诉攻击者「现在是不是无管理员的首次部署窗口」。
+    // 已完成设置后更是纯泄露（向导再也用不到它）。
+    // 只在以下两种情况给明细：① 通过门禁（引导密钥 / 已登录 ADMIN）；
+    // ② 真正的首次部署窗口（库里零管理员且没配引导密钥）—— 此时向导本来就是匿名的。
+    if (status.setupComplete) {
+      return NextResponse.json({ setupComplete: true });
+    }
+
+    let detailed = false;
+    try {
+      // 只读状态查询复用同一套门禁：通过（引导密钥 / 已登录 ADMIN）才给明细。
+      const outcome = await requireSetupAuthorization(req);
+      detailed = outcome.response === null;
+    } catch {
+      detailed = false;
+    }
+
+    if (!detailed) {
+      return NextResponse.json({
+        setupComplete: false,
+        error: '实例已有管理员，请以管理员身份登录后再查看设置状态',
+      });
+    }
+
     return NextResponse.json(status);
   } catch (error) {
     console.error('Setup check failed:', error);
@@ -288,6 +342,21 @@ export async function POST(req: Request) {
     );
   }
 
+  // L53：`await req.json()` 原本裸在 try/catch 之外，畸形 JSON 会冒泡成框架默认 500。
+  // 客户端错误就该是 400。解析必须排在门禁之前——门禁要按 step 收窄（见下）。
+  let body: Record<string, unknown>;
+  try {
+    const parsed = await req.json();
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('body must be a JSON object');
+    }
+    body = parsed as Record<string, unknown>;
+  } catch {
+    return NextResponse.json({ error: '请求体不是合法的 JSON 对象' }, { status: 400 });
+  }
+
+  const { step } = body as { step?: unknown };
+
   // 门禁失败 fail-closed：判定不了就别放行（判定本身要查库）。
   let authorization: SetupAuthorization;
   try {
@@ -299,9 +368,6 @@ export async function POST(req: Request) {
   if (authorization.response) {
     return authorization.response;
   }
-
-  const body = await req.json();
-  const { step } = body;
 
   // bootstrap token 的唯一权限是原子认领首个管理员。数据库检查、服务配置与 complete
   // 都必须等管理员登录后执行，避免 token 变成长生命周期的隐形管理凭据。
@@ -317,7 +383,7 @@ export async function POST(req: Request) {
       case 'database':
         return handleDatabaseCheck();
       case 'admin':
-        return handleCreateAdmin(body);
+        return handleCreateAdmin(body as Parameters<typeof handleCreateAdmin>[0]);
       case 'llm':
         // bootstrap 模式只能走 step=admin，已在上方统一拒绝；LLM 创建必须绑定
         // 当前已认证管理员，供 inline password proof 与拒绝审计使用。
@@ -326,7 +392,9 @@ export async function POST(req: Request) {
         }
         return await handleConfigureLlm(req, body, authorization.user);
       case 'soniox':
-        return handleConfigureSoniox(body);
+        return handleConfigureSoniox(
+          body as Parameters<typeof handleConfigureSoniox>[0]
+        );
       case 'complete':
         return handleCompleteSetup();
       default:
@@ -375,7 +443,10 @@ async function handleCreateAdmin(body: {
     CLIENT_SESSION_TOKEN,
     validatePassword,
   } = await import('@/lib/auth');
-  const { email, password, displayName } = body;
+  const { email, password } = body;
+  // L7：displayName 与注册路由同口径 —— 先 trim 再截断，避免超大字符串直接落库
+  // （schema 里 displayName 是 TEXT，没有长度约束）。
+  const displayName = normalizeDisplayName(body.displayName);
 
   if (!email || !password || !displayName) {
     return NextResponse.json(
@@ -554,68 +625,72 @@ async function handleConfigureLlm(req: Request, body: {
 
   // Provider、registry 和用途路由是一份高敏配置的单一逻辑批次。即使 allowlist 与
   // reauth 已全部通过，任一后续数据库写失败也不能留下前半批凭据/端点，因此整批同进同退。
-  const created = await prisma.$transaction(async (tx) => {
-    const staged: Array<{ id: string; name: string }> = [];
-    for (let i = 0; i < validatedProviders.length; i++) {
-      const { provider: p, normalizedApiBase } = validatedProviders[i];
+  const created = await prisma.$transaction(
+    async (tx) => {
+      const staged: Array<{ id: string; name: string }> = [];
+      for (let i = 0; i < validatedProviders.length; i++) {
+        const { provider: p, normalizedApiBase } = validatedProviders[i];
 
-      // 加密 API Key 后存入数据库
-      const encryptedKey = encrypt(p.apiKey);
+        // 加密 API Key 后存入数据库
+        const encryptedKey = encrypt(p.apiKey);
 
-      const provider = await tx.llmProvider.create({
-        data: {
-          name: p.name,
-          apiKey: encryptedKey,
-          apiBase: normalizedApiBase,
-          isAnthropic: p.isAnthropic ?? false,
-          sortOrder: i,
-        },
-      });
+        const provider = await tx.llmProvider.create({
+          data: {
+            name: p.name,
+            apiKey: encryptedKey,
+            apiBase: normalizedApiBase,
+            isAnthropic: p.isAnthropic ?? false,
+            sortOrder: i,
+          },
+        });
 
-      // 创建模型配置：先登记模型库条目（规格真源），再按用途建路由行（同一模型多用途共用条目）
-      if (p.models && p.models.length > 0) {
-        const registryByKey = new Map<string, string>(); // modelId::displayName → registryId
-        for (let j = 0; j < p.models.length; j++) {
-          const m = p.models[j];
-          const purpose =
-            (m.purpose as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING') ||
-            'CHAT';
-          const registryKey = `${m.modelId}::${m.displayName}`;
-          let registryId = registryByKey.get(registryKey);
-          if (!registryId) {
-            const registry = await tx.llmRegistryModel.create({
+        // 创建模型配置：先登记模型库条目（规格真源），再按用途建路由行（同一模型多用途共用条目）
+        if (p.models && p.models.length > 0) {
+          const registryByKey = new Map<string, string>(); // modelId::displayName → registryId
+          for (let j = 0; j < p.models.length; j++) {
+            const m = p.models[j];
+            const purpose =
+              (m.purpose as 'CHAT' | 'REALTIME_SUMMARY' | 'FINAL_SUMMARY' | 'KEYWORD_EXTRACTION' | 'EMBEDDING') ||
+              'CHAT';
+            const registryKey = `${m.modelId}::${m.displayName}`;
+            let registryId = registryByKey.get(registryKey);
+            if (!registryId) {
+              const registry = await tx.llmRegistryModel.create({
+                data: {
+                  providerId: provider.id,
+                  modelId: m.modelId,
+                  displayName: m.displayName,
+                  kind: purpose === 'EMBEDDING' ? 'EMBEDDING' : 'TEXT',
+                  maxTokens: m.maxTokens ?? 4096,
+                  sortOrder: j,
+                },
+              });
+              registryId = registry.id;
+              registryByKey.set(registryKey, registryId);
+            }
+            await tx.llmModel.create({
               data: {
                 providerId: provider.id,
+                registryId,
                 modelId: m.modelId,
                 displayName: m.displayName,
-                kind: purpose === 'EMBEDDING' ? 'EMBEDDING' : 'TEXT',
+                purpose,
+                isDefault: m.isDefault ?? (j === 0),
                 maxTokens: m.maxTokens ?? 4096,
+                temperature: m.temperature ?? 0.3,
                 sortOrder: j,
               },
             });
-            registryId = registry.id;
-            registryByKey.set(registryKey, registryId);
           }
-          await tx.llmModel.create({
-            data: {
-              providerId: provider.id,
-              registryId,
-              modelId: m.modelId,
-              displayName: m.displayName,
-              purpose,
-              isDefault: m.isDefault ?? (j === 0),
-              maxTokens: m.maxTokens ?? 4096,
-              temperature: m.temperature ?? 0.3,
-              sortOrder: j,
-            },
-          });
         }
-      }
 
-      staged.push({ id: provider.id, name: provider.name });
-    }
-    return staged;
-  });
+        staged.push({ id: provider.id, name: provider.name });
+      }
+      return staged;
+    },
+    // L54：供应商 × 模型可能有十几行写入，默认 5s 事务超时偏紧。
+    { timeout: 20_000 }
+  );
 
   return NextResponse.json({
     success: true,

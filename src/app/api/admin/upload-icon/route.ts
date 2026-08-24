@@ -5,6 +5,7 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { sanitizeSvgContent } from '@/lib/svgSanitizer';
 import { JOB_STATUS, JOB_TYPE, trackJob } from '@/lib/jobQueue';
 import { writeSecurityAudit } from '@/lib/securityAudit';
+import { parseFormDataWithLimit, isUploadedFile } from '@/lib/requestBodyLimit';
 
 // 所有允许的图标扩展名（用于重传换格式时清理旧扩展名的残留文件）
 const ALL_ICON_EXTENSIONS = ['.png', '.jpg', '.svg', '.ico', '.webp', '.gif'];
@@ -67,20 +68,24 @@ export async function POST(req: Request) {
   });
   if (response || !user) return response!;
 
-  // Content-Length 预检：读 body 前先按声明长度挡掉明显超限的请求，避免把超大 body
-  // 整个缓冲进内存才发现超限（OOM 面）。multipart 有额外开销，给 1MB 余量避免误杀；
-  // 精确的 file.size 校验仍在下方兜底。
-  const declaredLength = Number(req.headers.get('content-length') ?? '');
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_FILE_SIZE + 1024 * 1024) {
-    return NextResponse.json(
-      { error: '文件大小超过限制 (最大 2MB)' },
-      { status: 413 }
-    );
+  // L59：body 上限靠**流式累计字节**，不靠对端声明的 content-length。
+  // 旧写法 `Number(req.headers.get('content-length') ?? '')` 在 chunked 请求下得 0
+  // （不是 NaN）→ `Number.isFinite(0)` 真而 `0 > 3MB` 假 → 预检被跳过，
+  // `req.formData()` 随后把整个 body 缓冲进内存。multipart 开销给 1MB 余量避免误杀。
+  const parsedForm = await parseFormDataWithLimit(req, MAX_FILE_SIZE + 1024 * 1024);
+  if (!parsedForm.ok) {
+    return parsedForm.reason === 'too-large'
+      ? NextResponse.json({ error: '文件大小超过限制 (最大 2MB)' }, { status: 413 })
+      : NextResponse.json({ error: '无效的表单数据' }, { status: 400 });
   }
 
   try {
-    const formData = await req.formData();
-    const file = formData.get('file') as File | null;
+    const formData = parsedForm.value;
+    const fileRaw = formData.get('file');
+    // L60（同 chat-uploads）：`as File` 只是类型断言。`file` 字段发成普通字符串时
+    // `.type` / `.size` / `.arrayBuffer` 全不存在，会一路走到 `file.type.split` 抛
+    // TypeError，被外层 catch 吞成含糊的 500「上传失败」。这里显式判成 400。
+    const file = isUploadedFile(fileRaw) ? fileRaw : null;
     const { searchParams } = new URL(req.url);
     const type =
       (typeof formData.get('type') === 'string'

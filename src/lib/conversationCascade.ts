@@ -155,6 +155,7 @@ export async function completePreparedConversationCascade(
  *   3. 事务外 best-effort 删本地 data/chatimages/<id>/ 目录
  *   4. 单事务内：FOR UPDATE 锁住附件行 → 按 owner 释放配额 → 按 FK 顺序删子表 + 对话本体
  *      （不依赖级联触发时序）
+ *   5. 提交后补删「步骤 1 快照里没有、但步骤 4 真的删掉了」的那些行的物理文件（M28 窗口 1）
  *
  * 注：不需要 invalidate RAG 缓存——删对话不改动任何 transcript，缓存的 transcript embedding
  * 仍然有效（RAG 缓存键是 sessionId 而非 conversationId，见 transcriptRag ADR-009）。

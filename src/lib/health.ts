@@ -1,5 +1,6 @@
 import 'server-only';
 
+import { timingSafeEqual } from 'node:crypto';
 import { connect as netConnect } from 'node:net';
 
 import { logger, serializeError } from '@/lib/logger';
@@ -252,6 +253,86 @@ async function checkWebsocket(): Promise<DependencyHealth> {
       detail: DEPENDENCY_DOWN_DETAIL,
     };
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  M23：去抖缓存 + 公开视图裁剪                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * M23：`/api/health` 被 middleware 显式放行、无鉴权，而每次调用要做
+ * 1 次 DB `SELECT 1` + 1 次 Redis PING + **1 次对 Cloudreve 的出站 HTTP HEAD**
+ * + 1 次到 WS 端口的 TCP 连接 —— 脚本化高频打它就是一台放大器（尤其那次出站请求）。
+ *
+ * 这里加一层「短 TTL + singleflight」：无论并发多高，每 {@link HEALTH_CACHE_TTL_MS}
+ * 只真正体检一次，其余全部读缓存。放大倍数从 O(请求数) 变成 O(时间)。
+ *
+ * TTL 必须**小于** Dockerfile 里 HEALTHCHECK 的 interval（30s），否则容器探活会读到
+ * 过期结论、故障发现被拖慢。默认 10s，可用 HEALTH_CACHE_TTL_MS 调整。
+ *
+ * 刻意**不**在路由上挂 enforceRateLimit：限流一旦触发就是 429，
+ * 而 Dockerfile 的 `wget ... || exit 1` 会把 429 当成不健康 → HEALTHCHECK 转红 →
+ * 重启策略拉起整个容器。等于给攻击者一个「打 /api/health 就能重启你的容器」的开关，
+ * 比原问题更糟。请求**量**的兜底交给反代（deploy/nginx-lecturelive.conf 的 limit_req）。
+ */
+function healthCacheTtlMs(): number {
+  const raw = Number(process.env.HEALTH_CACHE_TTL_MS);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 10_000;
+}
+
+let cachedReport: { report: HealthReport; at: number } | null = null;
+let inFlight: Promise<HealthReport> | null = null;
+
+/** 仅供测试：清空去抖缓存。 */
+export function __resetHealthCache(): void {
+  cachedReport = null;
+  inFlight = null;
+}
+
+export async function getCachedHealthReport(): Promise<HealthReport> {
+  const ttl = healthCacheTtlMs();
+  const now = Date.now();
+
+  if (cachedReport && now - cachedReport.at < ttl) {
+    return cachedReport.report;
+  }
+
+  // singleflight：并发 miss 只跑一次真实体检
+  if (inFlight) {
+    return inFlight;
+  }
+
+  inFlight = getHealthReport()
+    .then((report) => {
+      cachedReport = { report, at: Date.now() };
+      return report;
+    })
+    .finally(() => {
+      inFlight = null;
+    });
+
+  return inFlight;
+}
+
+/**
+ * M23：公开视图只回「整体健康与否」。
+ *
+ * 原实现对匿名调用方直接吐出依赖拓扑（哪些依赖启用/禁用、各依赖延迟 ms、
+ * `Cloudreve not configured` 这类指纹），足够画出内部架构并按延迟推断负载。
+ * 明细只给带内部凭据（HEALTH_DETAIL_TOKEN + x-health-token 头）的调用方。
+ */
+export function redactHealthReport(report: HealthReport): Pick<HealthReport, 'status' | 'checkedAt'> {
+  return { status: report.status, checkedAt: report.checkedAt };
+}
+
+/** 请求是否有权看依赖明细：需配置 HEALTH_DETAIL_TOKEN 且请求头匹配。 */
+export function isHealthDetailAuthorized(req: Request): boolean {
+  const expected = process.env.HEALTH_DETAIL_TOKEN?.trim();
+  if (!expected) return false;
+  const provided = req.headers.get('x-health-token')?.trim();
+  if (!provided || provided.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
 }
 
 export async function getHealthReport(): Promise<HealthReport> {

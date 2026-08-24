@@ -172,16 +172,14 @@ test('群发面板：可先给自己发测试信（不触碰收件人列表）',
   await fillBroadcast(page);
 
   await page.getByRole('button', { name: /Send test to myself|发测试信给自己/i }).click();
-
-  // 必须等的是**发送成功提示**，不能只等页面上出现管理员邮箱 —— 侧边栏本来就一直显示
-  // 登录用户的邮箱，光匹配邮箱会在请求发出之前就命中，断言随即跑在拦截之前（实测
-  // 断言先打印 len=0、拦截日志后到）。等这条带邮箱的成功文案才是真的等到了回包。
+  // 断言必须钉住**成功提示**本身，而不是「页面上任何地方出现了管理员邮箱」——
+  // 侧边栏账号区一直显示同一个邮箱（`text-[10px] text-charcoal-400 truncate`），
+  // 旧写法 `getByText(/admin@lecturelive.com/i)` 会先匹配到它：发测试信功能整个坏掉
+  // 也照样绿（假测试），而成功提示一旦渲染出来又变成 strict mode 两元素冲突而偶发失败。
+  // 这里改用 i18n 里 broadcastTestSent 的两种语言形态（en/zh，e2e 跑在 en）+ 邮箱一起匹配。
   await expect(
     page.getByText(
-      new RegExp(
-        `(Test email sent to|测试邮件已发送至)\\s*${adminUser.email}`,
-        'i'
-      )
+      new RegExp(`(Test email sent to|测试邮件已发送至)\\s*${adminUser.email}`, 'i')
     )
   ).toBeVisible({ timeout: 15_000 });
 

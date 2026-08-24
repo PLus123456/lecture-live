@@ -28,6 +28,19 @@ const DEFAULT_SOFT_CAP_PERCENT = 90;
  */
 const SOFT_CAP_TARGET_DROP = 10;
 
+/** L57：软上限 LRU 清理的分页大小（每轮只把这么多行载进内存）。 */
+const SOFT_CAP_PAGE_SIZE = 200;
+
+/**
+ * L52：孤儿图片目录的「新生保护期」。
+ *
+ * `readdir` 与 `findMany` 之间新建会话的图片目录不在 existingSet 里，随后会被
+ * `rm -rf` 误删（毫秒-秒级窗口，但删的是用户刚上传的图，不可逆）。
+ * 目录 mtime 比本轮开始时间还新（或在保护期内）的一律跳过 —— 真孤儿目录不会自己变新，
+ * 下一轮 cron 照样收走它。
+ */
+const ORPHAN_DIR_GRACE_MS = 60 * 60 * 1000; // 1h
+
 export interface ChatFilesCleanupResult {
   agingDeleted: number;
   softCapDeleted: number;
@@ -131,32 +144,58 @@ export async function runChatFilesCleanup(): Promise<ChatFilesCleanupResult> {
 
       if (used <= target) continue;
 
-      const attachments = await prisma.chatAttachment.findMany({
-        where: { userId: u.id, source: 'UPLOAD' } as never,
-        orderBy: { lastAccessedAt: 'asc' },
-        select: {
-          id: true,
-          userId: true,
-          bytes: true,
-          cloudrevePath: true,
-          extractedTextPath: true,
-        },
-      });
+      // L57：原来是不带 take 的全量 findMany —— 重度用户（数万附件）每轮 cron 都会
+      // 把整张表属于他的那一片全载进内存，而实际要删的往往只是最旧的几十条。
+      // 改成按 lastAccessedAt 升序**分页**拉：删够就停，任一时刻只驻留一批。
+      //
+      // 不用 cursor 分页：本循环会把刚取到的行删掉，cursor 指向的行随即不存在。
+      // 直接反复取「最旧的一页」即可自然前进；删失败的行记进 skipIds 排除，
+      // 避免同一批反复撞上同一个失败行导致死循环。
+      const skipIds: string[] = [];
 
-      for (const att of attachments) {
-        if (used <= target) break;
-        try {
-          await deleteAttachment(att, cloudreveContext);
-          result.softCapDeleted += 1;
-          result.bytesReleased += att.bytes;
-          used -= att.bytes;
-        } catch (err) {
-          result.errors += 1;
-          jobLogger.error(
-            { attachmentId: att.id, err: serializeError(err) },
-            'soft-cap cleanup failed for attachment'
-          );
+      while (used > target) {
+        const attachments: AttachmentRow[] =
+          await prisma.chatAttachment.findMany({
+            where: {
+              userId: u.id,
+              // 只清用户上传的附件；内嵌图片等其它来源由各自的清理路径负责。
+              source: 'UPLOAD',
+              ...(skipIds.length > 0 ? { id: { notIn: skipIds } } : {}),
+            } as never,
+            orderBy: [{ lastAccessedAt: 'asc' }, { id: 'asc' }],
+            take: SOFT_CAP_PAGE_SIZE,
+            select: {
+              id: true,
+              userId: true,
+              bytes: true,
+              cloudrevePath: true,
+              extractedTextPath: true,
+            },
+          });
+
+        if (attachments.length === 0) break;
+
+        let deletedThisPage = 0;
+        for (const att of attachments) {
+          if (used <= target) break;
+          try {
+            await deleteAttachment(att, cloudreveContext);
+            result.softCapDeleted += 1;
+            result.bytesReleased += att.bytes;
+            used -= att.bytes;
+            deletedThisPage += 1;
+          } catch (err) {
+            result.errors += 1;
+            skipIds.push(att.id);
+            jobLogger.error(
+              { attachmentId: att.id, err: serializeError(err) },
+              'soft-cap cleanup failed for attachment'
+            );
+          }
         }
+
+        // 整页一条都没删掉（全失败）→ 再循环也只会重复失败，退出
+        if (deletedThisPage === 0) break;
       }
     }
   }
@@ -216,11 +255,27 @@ export async function cleanupOrphanChatImageDirs(): Promise<number> {
     );
   }
 
+  const graceCutoff = Date.now() - ORPHAN_DIR_GRACE_MS;
+
   let removed = 0;
   for (const name of entries) {
     if (existingSet.has(name)) continue;
+
+    const dirPath = path.join(CHAT_IMAGE_ROOT, name);
+
+    // L52：TOCTOU 保护。readdir 之后、findMany 之前（甚至之后）新建的会话，其图片目录
+    // 不在 existingSet 里，直接 rm -rf 就把用户刚上传的图删了。真正的孤儿目录 mtime
+    // 只会越来越旧，所以「太新就跳过」不会漏收，只会晚一轮 cron。
     try {
-      await fs.rm(path.join(CHAT_IMAGE_ROOT, name), {
+      const stat = await fs.stat(dirPath);
+      if (stat.mtimeMs > graceCutoff) continue;
+    } catch {
+      // stat 不到（已被别处删掉/竞态）：跳过，交给下一轮
+      continue;
+    }
+
+    try {
+      await fs.rm(dirPath, {
         recursive: true,
         force: true,
       });

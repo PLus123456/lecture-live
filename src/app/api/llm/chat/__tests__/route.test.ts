@@ -1522,4 +1522,85 @@ describe('POST /api/llm/chat (mode routing)', () => {
       expect(buildChatContextMock.mock.calls[1][0]).toMatchObject({ minLevel: 2 });
     });
   });
+  /**
+   * M16：chat 主链路精心做了 resolveAuthorizedLlmSelection → buildLlmRoutingOptions
+   * （受限用户 allowedModels、组绑定 chatModelId 生效），主流式调用也确实展开了
+   * routingOptions —— 但传给 buildChatContext 的**历史压缩回调**曾硬编码
+   * `{ purpose: 'CHAT' }`：受限组用户的对话原文被发往全局默认 CHAT 模型，
+   * 组绑定模型被绕过，成本也记错账。
+   */
+  describe('M16：历史压缩必须走用户已授权的模型路由', () => {
+    it('压缩回调透传 routingOptions，而不是硬编码 purpose:CHAT', async () => {
+      buildLlmRoutingOptionsMock.mockReturnValue({ modelId: 'model-allowed-only' });
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-legacy',
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        endedAt: null,
+        degradationLevel: 1,
+        session: { id: 'sess-1', userId: 'user-1', targetLang: 'zh' },
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-legacy',
+          question: 'hello',
+          transcript: [{ text: 'live segment', startMs: 0 }],
+        },
+      });
+      const res = await POST(req, {} as never);
+      await consumeSseEvents(res);
+
+      // buildChatContext 拿到的压缩回调就是降级链 L4+ 真正会调用的那个
+      const builderArg = buildChatContextMock.mock.calls[0][0] as {
+        callLLM: (s: string, u: string) => Promise<string>;
+      };
+      await builderArg.callLLM('COMPRESS_SYS', 'COMPRESS_USER');
+
+      expect(callLLMMock).toHaveBeenCalledWith('COMPRESS_SYS', 'COMPRESS_USER', {
+        modelId: 'model-allowed-only',
+      });
+      expect(callLLMMock).not.toHaveBeenCalledWith(
+        'COMPRESS_SYS',
+        'COMPRESS_USER',
+        { purpose: 'CHAT' }
+      );
+    });
+
+    it('global 路径同样透传（两条 chat 路径口径一致）', async () => {
+      buildLlmRoutingOptionsMock.mockReturnValue({
+        providerOverride: 'group-bound-provider',
+      });
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-global',
+        userId: 'user-1',
+        sessionId: null,
+        endedAt: null,
+        degradationLevel: 1,
+        session: null,
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: { conversationId: 'conv-global', question: 'hello' },
+      });
+      const res = await POST(req, {} as never);
+      await consumeSseEvents(res);
+
+      const builderArg = buildChatContextMock.mock.calls[0][0] as {
+        callLLM: (s: string, u: string) => Promise<string>;
+      };
+      await builderArg.callLLM('S', 'U');
+      expect(callLLMMock).toHaveBeenCalledWith('S', 'U', {
+        providerOverride: 'group-bound-provider',
+      });
+    });
+  });
 });

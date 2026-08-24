@@ -235,6 +235,7 @@ vi.mock('fs/promises', () => {
 });
 
 import {
+  TranscriptDraftRejectedError,
   persistTranscriptDraft,
   loadTranscriptDraft,
   loadTranscriptDraftManifest,
@@ -335,5 +336,53 @@ describe('persistTranscriptDraft 单调守卫（转录 draft 防覆盖）', () =
     // 主草稿仍是更完整的那份，清理不得伤及正稿。
     expect((await loadTranscriptDraft(session))?.segments.length).toBe(10);
     nowSpy.mockRestore();
+  });
+});
+
+describe('L17① 并发 PUT 的 lost update（读 manifest→比较→写 三步非原子）', () => {
+  it('两个并发写入必须串行化：先写者的 9 段绝不被后写者的 7 段整份覆盖', async () => {
+    await persistTranscriptDraft(session, mkPayload(5));
+
+    // 同时发起两次写入（客户端每数秒冲刷一次快照，unload keepalive 还会再来一发）。
+    // 无锁时二者都读到「盘上 5 段」这份陈旧 manifest，都判定「不缩水、放行」，随后**后**
+    // 写者（7 段）整份覆盖先写者（9 段）—— 单调守卫形同虚设，9 段那一批直接丢。
+    // 串行化之后：9 段先落盘，7 段再读到的是 9，命中缩水分支、只留 .conflict 备份。
+    await Promise.all([
+      persistTranscriptDraft(session, mkPayload(9)),
+      persistTranscriptDraft(session, mkPayload(7)),
+    ]);
+
+    expect((await loadTranscriptDraftManifest(session))?.segmentCount).toBe(9);
+    expect((await loadTranscriptDraft(session))?.segments).toHaveLength(9);
+  });
+});
+
+describe('L17② 终态守卫在临界区内复核（seal/finalize 竞态）', () => {
+  it('写前守卫拒绝 → 抛 TranscriptDraftRejectedError 且一个字节都不落盘', async () => {
+    await expect(
+      persistTranscriptDraft(session, mkPayload(3), { guard: async () => false })
+    ).rejects.toBeInstanceOf(TranscriptDraftRejectedError);
+
+    expect(await loadTranscriptDraftManifest(session)).toBeNull();
+    expect(await loadTranscriptDraft(session)).toBeNull();
+  });
+
+  it('写后才发现已 finalize → 补偿删除刚被重建的草稿目录，不留孤儿', async () => {
+    // 守卫第一次放行（PUT 入口检查时会话还没收尾），写盘之后第二次拒绝（finalize 在
+    // req.text()/parse 这段时间里跑完了：读快照 → 删草稿目录 → 而我们刚把目录建了回来）。
+    let calls = 0;
+    const guard = async () => {
+      calls += 1;
+      return calls === 1;
+    };
+
+    await expect(
+      persistTranscriptDraft(session, mkPayload(4), { guard })
+    ).rejects.toBeInstanceOf(TranscriptDraftRejectedError);
+
+    expect(calls).toBe(2);
+    // 旧行为：草稿目录被重建后永远没人清理（DELETE 已经过去了），冷恢复还会读到它。
+    expect(await loadTranscriptDraftManifest(session)).toBeNull();
+    expect(await loadTranscriptDraft(session)).toBeNull();
   });
 });

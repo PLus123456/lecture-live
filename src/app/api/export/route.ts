@@ -11,6 +11,7 @@ import {
   sanitizeHeaderFilename,
   sanitizeTextInput,
 } from '@/lib/security';
+import { parseJsonWithLimit } from '@/lib/requestBodyLimit';
 
 const MAX_SEGMENTS = 50_000;
 // 导出请求体是纯文本 JSON（segments + translations + summaries）。MAX_SEGMENTS=50k
@@ -52,18 +53,22 @@ export async function POST(req: Request) {
     return rateLimited;
   }
 
-  // Content-Length 预检：在读 body 前按声明长度挡掉明显超限的请求，避免超大 JSON
-  // 整个缓冲进内存（OOM 面）。精确的 MAX_SEGMENTS 校验仍在下方兜底。
-  const declaredLength = Number(req.headers.get('content-length') ?? '');
-  if (Number.isFinite(declaredLength) && declaredLength > ABSOLUTE_MAX_BODY_BYTES) {
-    return NextResponse.json(
-      { error: 'Request body too large' },
-      { status: 413 },
-    );
+  // L58：body 上限必须靠**流式累计字节**，不能只看声明长度。
+  // 旧写法 `Number(req.headers.get('content-length') ?? '')` 在 chunked 请求（无该头）
+  // 下得 0 —— `Number.isFinite(0)` 为真、`0 > 64MB` 为假 → 预检整段被跳过，随后
+  // `req.json()` 把任意大的 body 缓冲进内存。这里改为读一块记一块，越线立刻断流。
+  const parsedBody = await parseJsonWithLimit<ExportRequestBody>(
+    req,
+    ABSOLUTE_MAX_BODY_BYTES,
+  );
+  if (!parsedBody.ok) {
+    return parsedBody.reason === 'too-large'
+      ? NextResponse.json({ error: 'Request body too large' }, { status: 413 })
+      : NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
   }
 
   try {
-    const body: ExportRequestBody = await req.json();
+    const body: ExportRequestBody = parsedBody.value;
     if (Array.isArray(body.segments) && body.segments.length > MAX_SEGMENTS) {
       return NextResponse.json(
         { error: `Too many segments (max ${MAX_SEGMENTS})` },

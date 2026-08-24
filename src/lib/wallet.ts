@@ -81,6 +81,17 @@ function generateOutTradeNo(): string {
 export const ORDER_TTL_MS = 60 * 60_000;
 const MAX_PROVIDER_CLOCK_SKEW_MS = 5 * 60_000;
 
+/**
+ * 未支付订单**状态清扫**的宽限期：从 expiresAt 再往后推这么久才置 expired。
+ *
+ * 网关侧已经按 expiresAt 拒收超时支付，我方 creditPaidOrder 又在订单行锁内用
+ * provider-signed paidAt 与 expiresAt 比对（晚付隔离成 late_paid、不发任何权益），
+ * 所以这条清扫只是让列表状态好看，不是资金闸。留 72h 覆盖最长的一家重投窗口
+ * （Stripe 约 3 天；支付宝/微信各约 24h），免得状态先于回调翻脸。
+ * 兜底不变：认领 SQL 的 `status IN ('pending','expired','failed')` 收得住被扫早的行。
+ */
+export const PAYMENT_ORDER_EXPIRE_GRACE_MS = 72 * 60 * 60_000;
+
 /** 归一化 ISO-4217 币种码（大写、去空白）；非法/空值回 ''，由调用方决定回落。 */
 function normalizeCurrency(v: string | null | undefined): string {
   const s = (v ?? '').trim().toUpperCase();
@@ -197,6 +208,45 @@ export async function createPaymentOrder(input: {
     `;
     return order;
   });
+}
+
+/**
+ * 未支付订单清扫：把过了 expiresAt + 宽限期仍是 pending 的订单置为 expired。
+ *
+ * 在此之前 `PaymentOrder.expiresAt` 与 `@@index([status, expiresAt])` 是一对**死列** ——
+ * 建单时写入、全仓无人读，`expired` 这个状态从来没在生产里存在过，pending 订单无限堆积。
+ *
+ * **落地顺序有硬依赖**：本函数必须晚于 creditPaidOrder 的认领 CAS 放宽（CLAIMABLE_ORDER_STATUSES
+ * 收 expired）才允许启用，否则被扫过的订单遇到晚到的真实回调将永远无法入账。
+ *
+ * 只动 pending：failed/canceled/paid/refunded 都是已决终态，清扫器绝不覆写。
+ */
+export async function expireStalePaymentOrders(options?: {
+  graceMs?: number;
+  now?: Date;
+}): Promise<number> {
+  const now = options?.now ?? new Date();
+  const graceMs = Math.max(0, options?.graceMs ?? PAYMENT_ORDER_EXPIRE_GRACE_MS);
+  const cutoff = new Date(now.getTime() - graceMs);
+  const result = await prisma.paymentOrder.updateMany({
+    // expiresAt 为 NULL 的历史行不参与（SQL 三值逻辑下 NULL < cutoff 本就不成立，
+    // 这里显式写出来是给读代码的人看的）。命中 @@index([status, expiresAt])。
+    // fulfillmentStatus 必须仍是 pending：已进入 review/processing 的行由结算侧的状态机负责，
+    // 状态清扫不该在人工复核队列里制造噪音。
+    where: {
+      status: 'pending',
+      fulfillmentStatus: 'pending',
+      expiresAt: { not: null, lt: cutoff },
+    },
+    data: { status: 'expired' },
+  });
+  if (result.count > 0) {
+    logSystemEvent(
+      'recharge.order.expired_sweep',
+      `count=${result.count} cutoff=${cutoff.toISOString()} graceMs=${graceMs}`
+    );
+  }
+  return result.count;
 }
 
 export interface CreditResult {
@@ -721,8 +771,10 @@ async function applyGrantTx(
   if (priceCents <= 0) {
     throw new WalletError('档位价格无效（必须大于 0）', 'tier_unavailable');
   }
-  // 最终发放闸：订单 metadata 是下单时冻结的历史快照，可能来自本修复之前的
-  // ADMIN 档位，不能只依赖当前档位或管理 API。必须在任何扣款、锁读、配额修改前拒绝。
+  // M7 / 最终发放闸：**绝不**通过购买发放 ADMIN。订单 metadata 是下单时冻结的历史快照，
+  // 可能来自收紧之前的 ADMIN 档位，而回调结算按快照发放、根本不读 live 档位——所以档位管理口
+  // （tiers 路由）拒绝写入之外，这里必须再挡一道。用 isPurchasableMembershipRole 而不是
+  // `=== 'ADMIN'`：它同时拒掉任何非 PRO/FREE 的脏值。必须在任何扣款、锁读、配额修改前拒绝。
   let purchasableRole: PurchasableMembershipRole | null = null;
   if (spec.kind === 'membership') {
     const requestedRole = spec.grantRole ?? 'PRO';

@@ -162,6 +162,34 @@ sudo ln -sf /etc/nginx/sites-available/lecturelive /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
+模板里这两行**不能删也不能改成 `proxy_add_header`**：
+
+```nginx
+proxy_set_header X-Real-IP        $remote_addr;
+proxy_set_header X-Forwarded-For  $proxy_add_x_forwarded_for;
+```
+
+`proxy_set_header` 是**覆盖**语义——客户端自己带的同名头会被丢掉。漏配任意一个，
+该头就完全由客户端控制：每次请求换一个值即可换出一个全新的限流桶，
+`auth:login:ip`、`share:view` 等 IP 维度的限流全部失效，审计日志与登录提醒里的 IP 也不可信。
+只设置了其中一个头时，请在 `.env.local` 里用 `TRUSTED_PROXY_IP_HEADER` 钉死只信任那一个。
+
+### 9.1 打开 TRUSTED_PROXY（**必做**）
+
+Nginx 就位后，在 `/opt/lecturelive/.env.local` 里确认：
+
+```bash
+TRUSTED_PROXY=true
+```
+
+不打开的后果：应用拿不到真实客户端 IP，登录/注册的 IP 维度限流会整段跳过
+（只剩「每邮箱 N 次」，拦不住「一个弱口令遍历海量邮箱」的横向密码喷洒），
+通用限流也只能退到「登录用户 / 请求路径」维度。服务端日志会打一条
+`请求带有 X-Forwarded-For / X-Real-IP 但 TRUSTED_PROXY 未开启` 提醒。
+
+前提是应用端口不对公网开放（见下方「端口暴露面」一节：3000/3001 只监听回环）。
+若你把 3000 直接暴露给公网，**不要**打开这个开关——攻击者直连并伪造该头即可逃逸限流。
+
 ### 10. 验证
 
 浏览器访问 `http://your-domain.com`，看到登录页面即部署成功。

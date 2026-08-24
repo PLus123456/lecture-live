@@ -23,9 +23,10 @@ import {
 } from './security';
 import {
   estimateTokens,
+  truncateToTokensFromEnd,
   truncateToTokensFromEndUtf8ByteUpperBound,
 } from './tokenizer';
-import { chunkText } from './chunking';
+import { chunkText, chunkTextWithMeta } from './chunking';
 import { logger, serializeError } from '@/lib/logger';
 
 const reportLogger = logger.child({ component: 'report-manager' });
@@ -39,6 +40,10 @@ const MAP_REDUCE_CONCURRENCY = 3;
  */
 const DEFAULT_CONTEXT_WINDOW = 16384;
 
+/** 各项预留的绝对上限（大窗口下就是它们本身） */
+const SYSTEM_PROMPT_RESERVE_TOKENS = 1500;
+const SUMMARY_CONTEXT_RESERVE_TOKENS = 9000;
+const OUTPUT_RESERVE_TOKENS = 4000;
 /**
  * 单份报告允许的最坏供应商工作量。合法的数小时课程通常远低于 128 次调用；
  * 该硬顶主要阻断超大持久化 transcript 被放大成默认 500 次 map 调用。
@@ -56,16 +61,47 @@ function positiveIntegerOrDefault(value: number | undefined, fallback: number): 
 /**
  * 计算 final summary 阶段的"transcript 输入预算"。
  *
- * 思路：contextWindow × 0.8（安全冗余）减去 system prompt（~1500）、
- * summary context（最多 12000 字符 ≈ 9000 token）、输出预留（~4000）。
+ * 思路：contextWindow × 0.8（安全冗余）减去 system prompt、summary context、输出预留，
  * 剩下的 token 是 transcript 能塞进去的最大量。
  *
- * 当 contextWindow=200K 时预算 ~143K（基本随便塞）；
- * 当 contextWindow=16K 时预算 ~700（必走 map-reduce）。
+ * L39：三项预留此前写死（1500 / 9000 / 4000），contextWindow=8192 时
+ * `6553 - 14500` 为负、却被 `Math.max(2000, …)` 钳回 2000 —— 于是给出一个**根本塞不下**
+ * 的预算，叠加 system + summary + output 必然超窗，上游 400，报告永远生成失败且用户只看到
+ * "无报告"。改成按 usable 的比例封顶：小窗口下三项预留一起收缩，保证
+ * `system + summary + transcript + output ≤ usable` 恒成立。
+ *
+ * summaryBudget 同时是 summaryContext 的**实际截断长度**（调用方必须照此截断），
+ * 否则收缩了预留却照塞 12000 字符的 summary，等于没修。
+ *
+ * 不变量（本函数的全部意义）：
+ *   systemReserve + summaryBudget + transcriptBudget + outputReserve === usable
+ * 三项预留各自不超过 usable 的比例份额，所以 transcriptBudget ≥ 0.35 × usable 恒正，
+ * 不再需要（也绝不能有）一个会把预算重新撑破窗口的人工下限。
+ *
+ * 当 contextWindow=200K 时 transcript 预算 ~145K（基本随便塞）；
+ * 当 contextWindow=16K 时约 5K（必走 map-reduce）；8K 时约 2.3K 且确实塞得下。
+ *
+ * 导出仅供单测直接锁住上面那条不变量。
  */
-function computeTranscriptInputBudget(contextWindow: number): number {
-  const usable = Math.floor(contextWindow * 0.8) - 1500 - 9000 - 4000;
-  return Math.max(2000, usable);
+export function computeReportBudgets(contextWindow: number): {
+  usable: number;
+  systemReserve: number;
+  outputReserve: number;
+  summaryBudget: number;
+  transcriptBudget: number;
+} {
+  const usable = Math.max(0, Math.floor(contextWindow * 0.8));
+  const systemReserve = Math.min(
+    SYSTEM_PROMPT_RESERVE_TOKENS,
+    Math.floor(usable * 0.15)
+  );
+  const outputReserve = Math.min(OUTPUT_RESERVE_TOKENS, Math.floor(usable * 0.25));
+  const summaryBudget = Math.min(
+    SUMMARY_CONTEXT_RESERVE_TOKENS,
+    Math.floor(usable * 0.25)
+  );
+  const transcriptBudget = usable - systemReserve - outputReserve - summaryBudget;
+  return { usable, systemReserve, outputReserve, summaryBudget, transcriptBudget };
 }
 
 /** 意义评估阈值 — 低于此分数的录音不生成报告 */
@@ -169,7 +205,7 @@ export function planSessionReportWork(
     promptTokenUpperBound(significancePrompt.system, significancePrompt.user) +
     maxOutputTokens;
 
-  const inputBudget = computeTranscriptInputBudget(contextWindow);
+  const { transcriptBudget: inputBudget } = computeReportBudgets(contextWindow);
   const transcriptTokens = estimateTokens(options.transcript);
   const summaryContext = buildSummaryContext(options.summaryBlocks);
   let chunkCount = 0;
@@ -245,6 +281,22 @@ export function assertSessionReportWorkWithinBudget(
   ) {
     throw new SessionReportBudgetExceededError(plan);
   }
+}
+
+/** M17：转录被截断时写进报告 overview 的声明（中英双语按 language 选） */
+function buildTruncationNotice(
+  coveredPct: number | null,
+  language: string
+): string {
+  const isZh = language.toLowerCase().slice(0, 2) === 'zh';
+  if (coveredPct === null) {
+    return isZh
+      ? '[⚠️ 本次转录过长，报告仅基于其中一部分内容生成，尾段未被覆盖。]'
+      : '[⚠️ The transcript was too long; this report covers only part of it and omits the tail.]';
+  }
+  return isZh
+    ? `[⚠️ 本次转录过长，报告仅覆盖约前 ${coveredPct}% 的内容，其余部分未参与生成。]`
+    : `[⚠️ The transcript was too long; this report covers only about the first ${coveredPct}% of it.]`;
 }
 
 interface GenerateReportOptions {
@@ -444,14 +496,29 @@ async function generateReport(
   contextWindow: number
 ): Promise<SessionReport | null> {
   try {
-    const inputBudget = computeTranscriptInputBudget(contextWindow);
+    const { transcriptBudget: inputBudget, summaryBudget } =
+      computeReportBudgets(contextWindow);
     const transcriptTokens = estimateTokens(transcript);
+    // L39：summaryContext 也必须按预算截断 —— 小窗口下预留被按比例收缩，
+    // 若照塞 12000 字符的摘要，收缩预留就等于白做。
+    const boundedSummaryContext = truncateToTokensFromEnd(
+      summaryContext,
+      summaryBudget
+    );
 
     let finalTranscript = transcript;
+    // M17：切块触顶会**静默丢弃尾段**，用它带到日志与报告产物里。
+    let transcriptTruncated = false;
+    let truncationNotice = '';
 
     if (transcriptTokens > inputBudget) {
       // 走 map-reduce：先按句子 + 800 token 目标切块，map 抽取事实，reduce 拼回
-      const chunks = chunkText(transcript, { chunkTargetTokens: 800 });
+      const {
+        chunks,
+        truncated,
+        consumedChars,
+        totalChars,
+      } = chunkTextWithMeta(transcript, { chunkTargetTokens: 800 });
       reportLogger.info(
         {
           transcriptTokens,
@@ -461,6 +528,25 @@ async function generateReport(
         },
         'transcript 超出输入预算，启动 map-reduce 报告生成'
       );
+
+      if (truncated) {
+        transcriptTruncated = true;
+        const coveredPct =
+          totalChars > 0 ? Math.round((consumedChars / totalChars) * 100) : 0;
+        truncationNotice = buildTruncationNotice(coveredPct, language);
+        // M17：此前触顶完全静默 —— 日志里只有 chunkCount，没有任何"被截断"的信号，
+        // 用户只会拿到一份莫名少了尾段的报告。
+        reportLogger.warn(
+          {
+            chunkCount: chunks.length,
+            consumedChars,
+            totalChars,
+            coveredPct,
+            transcriptTokens,
+          },
+          '转录切块触顶 maxChunks，尾段已被丢弃；报告只覆盖前半部分'
+        );
+      }
 
       const startedAt = Date.now();
       const chunkSummaries = await runMapStage(
@@ -483,8 +569,11 @@ async function generateReport(
       // 按 token 从尾部截断，保留最近的段。
       const reducedTokens = estimateTokens(finalTranscript);
       if (reducedTokens > inputBudget) {
-        const { truncateToTokensFromEnd } = await import('./tokenizer');
         finalTranscript = truncateToTokensFromEnd(finalTranscript, inputBudget);
+        transcriptTruncated = true;
+        if (!truncationNotice) {
+          truncationNotice = buildTruncationNotice(null, language);
+        }
         reportLogger.warn(
           {
             reducedTokens,
@@ -494,6 +583,11 @@ async function generateReport(
           'reduce 输入仍超预算，按 token 截尾'
         );
       }
+
+      if (truncationNotice) {
+        // 也告诉模型它拿到的不是全文，避免它按"全场纪要"的口吻下结论。
+        finalTranscript = `${truncationNotice}\n\n${finalTranscript}`;
+      }
     }
 
     const { system, user } = buildSessionReportPrompt(
@@ -502,7 +596,7 @@ async function generateReport(
       courseName,
       durationMs,
       date,
-      summaryContext,
+      boundedSummaryContext,
       language
     );
     const result = await callLLM(system, user);
@@ -511,11 +605,22 @@ async function generateReport(
     const mins = durationMinutes % 60;
     const durationStr = formatReportDuration(hours, mins, language);
 
-    return parseSessionReportResult(result, {
+    const report = parseSessionReportResult(result, {
       sessionTitle,
       date,
       duration: durationStr,
     });
+
+    // M17：截断必须在**产物里**可见，光有日志用户看不到。
+    if (transcriptTruncated) {
+      return {
+        ...report,
+        overview: report.overview
+          ? `${truncationNotice}\n\n${report.overview}`
+          : truncationNotice,
+      };
+    }
+    return report;
   } catch (error) {
     reportLogger.error(
       { err: serializeError(error) },

@@ -35,8 +35,22 @@ export async function generateMetadata(): Promise<Metadata> {
 }
 
 /**
- * 只读取初始设置完成标记。该标记只能由已认证 ADMIN 明确提交 setup step=complete；
- * 首页是匿名可达的，绝不能仅因管理员已经存在就替用户写入并提前封闭后续配置向导。
+ * 检查初始设置是否完成。
+ * 如果 setup_complete 标记不存在，但核心配置（admin）已就绪，
+ * 视为完成（兼容已有部署）——**只判定，不落库**。
+ *
+ * M24（修正版）：这里原来会 `upsert setup_complete='true'`。那是一个由**任意匿名访客
+ * 访问 `/`** 触发的 SSR 写副作用，且前置条件只有 `adminCount > 0`（不要求 llm/soniox
+ * 就绪）——比 `api/setup` GET 那处（要求 db+admin+llm+soniox 四者全齐）宽得多。
+ *
+ * 而向导自身的步骤顺序是 database → admin → llm → soniox，`POST /api/setup` 又在入口
+ * 对 `setup_complete===true` 一律 403，全仓**没有任何代码把该键写回 false**。于是：
+ *   step=admin 成功 → 任何人（运维自己开首页 / 爬虫 / 链接预取）访问一次 `/`
+ *   → setup_complete 被置位 → 后续 step=llm / step=soniox 永久 403
+ *   → LLM 一次都没配上，向导就锁死了，只能连数据库改。
+ *
+ * 修法与 api/setup 的 GET 同口径：去掉写副作用，置位只保留在 `step=complete`
+ * （以及管理员显式完成向导的路径）。判定本身保留，存量部署照旧不会被丢回 /setup。
  */
 async function isSetupComplete(): Promise<boolean> {
   // E2E 种子：e2e harness 的 DATABASE_URL 指向不可达端口（全靠 page.route 拦
@@ -47,7 +61,11 @@ async function isSetupComplete(): Promise<boolean> {
     const setting = await prisma.siteSetting.findUnique({
       where: { key: 'setup_complete' },
     });
-    return setting?.value === 'true';
+    if (setting?.value === 'true') return true;
+
+    const adminCount = await prisma.user.count({ where: { role: 'ADMIN' } });
+    // 只读判定：不写库（见上方 M24 说明）。
+    return adminCount > 0;
   } catch {
     // 数据库不可用时跳过检查，让用户进入 setup
     return false;

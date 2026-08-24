@@ -14,6 +14,7 @@ import {
   readPublicAuthJson,
 } from '@/lib/publicAuth';
 import { enforceRateLimit } from '@/lib/rateLimit';
+import { resolveRequestClientIp } from '@/lib/clientIp';
 import { logAction } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
 import { getSiteSettings } from '@/lib/siteSettings';
@@ -24,6 +25,17 @@ import {
   normalizeEmail,
 } from '@/lib/email/domains';
 import { isEmailEnabled, sendVerificationEmail } from '@/lib/email';
+
+/**
+ * L7：显示名归一化 —— trim + 截断。与 `app/api/setup/route.ts` 里的同名实现同口径
+ * （route.ts 只允许导出 Next 认识的路由符号，故两处各留一份而非跨文件 import）。
+ */
+const MAX_DISPLAY_NAME_LENGTH = 64;
+
+function normalizeDisplayName(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return value.trim().slice(0, MAX_DISPLAY_NAME_LENGTH);
+}
 
 export async function POST(req: Request) {
   const prelude = await enforcePublicAuthPrelude(req, {
@@ -58,6 +70,25 @@ export async function POST(req: Request) {
     return rateLimited;
   }
 
+  // 额外按真实来源 IP 限流（仅当 IP 可确定时；trusted_proxy=false 时为 'unknown' 则跳过，
+  // 避免再退化成全局桶）。用于挡同一来源批量注册不同 email。
+  const clientIp = resolveRequestClientIp(req);
+  if (clientIp !== 'unknown') {
+    const ipLimited = await enforceRateLimit(req, {
+      scope: 'auth:register:ip',
+      limit: authLimit * 5,
+      windowMs: 10 * 60_000,
+      key: `ip:${clientIp}`,
+    });
+    if (ipLimited) {
+      return ipLimited;
+    }
+  }
+
+  // L6：邮箱枚举防护要在 catch 里用到它，故提到 try 之外。
+  let verificationRequired = false;
+  let normalizedEmailForResponse = '';
+
   try {
     if (!siteSettings) {
       throw new Error('Site settings unavailable');
@@ -70,8 +101,13 @@ export async function POST(req: Request) {
       );
     }
 
-    const { password, displayName } = body;
+    const { password } = body;
+    // L7：displayName 原本未 trim 未截断直接落库，而 schema 里 `displayName String`
+    // 映射成 TEXT（无长度约束）—— 一条注册请求就能塞进 64KB 字符串，随后在管理后台、
+    // 审计日志、会话列表等处被反复放大传输。setup/route.ts 里有同口径的一份实现。
+    const displayName = normalizeDisplayName(body.displayName);
     const email = normalizeEmail(body.email ?? '');
+    normalizedEmailForResponse = email;
 
     if (!email || !password || !displayName) {
       return NextResponse.json(
@@ -118,7 +154,7 @@ export async function POST(req: Request) {
     // 开关开了但 SMTP 没配则「fail-open」创建已验证账号，避免把注册/登录彻底锁死
     // （admin 设置页会就此告警）。
     const emailReady = await isEmailEnabled(siteSettings);
-    const verificationRequired = siteSettings.email_verification && emailReady;
+    verificationRequired = siteSettings.email_verification && emailReady;
 
     const jwtConfig = getJwtExpiryConfig(siteSettings.jwt_expiry);
     const { user, token } = await registerWithOptions(email, password, displayName, {
@@ -205,6 +241,30 @@ export async function POST(req: Request) {
       error instanceof Prisma.PrismaClientKnownRequestError &&
       error.code === 'P2002'
     ) {
+      const target = Array.isArray(error.meta?.target)
+        ? (error.meta?.target as string[])
+        : [];
+
+      // L6：邮箱已注册时返回 400、成功时返回 201 —— 单看状态码就能枚举「这个邮箱
+      // 有没有注册过」，与 forgot-password 的「恒定响应」标准不一致。
+      //
+      // 开了邮箱验证时可以做到真正不可区分：成功注册也只回一句「请去邮箱查收」，
+      // 那么邮箱已存在时回**完全相同**的 201（不建账号、不发信）即可，攻击者无从分辨。
+      //
+      // 没开邮箱验证时无法隐藏：成功路径必须下发会话 cookie，注册流程结构上就会
+      // 泄露这一位信息（这是注册接口的固有性质，不是本处的疏漏）。此时维持 400，
+      // 但文案保持中性、不点名邮箱。
+      if (target.includes('email') && verificationRequired) {
+        return NextResponse.json(
+          {
+            verificationRequired: true,
+            email: normalizedEmailForResponse,
+            message: '注册成功，请前往邮箱完成验证后再登录',
+          },
+          { status: 201 }
+        );
+      }
+
       return NextResponse.json(
         { error: 'Registration failed' },
         { status: 400 }

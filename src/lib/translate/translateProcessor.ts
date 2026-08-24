@@ -45,12 +45,60 @@ import { logger, serializeError } from '@/lib/logger';
  *
  * 推进途径：1) ws 进程 startDocTranslateLoop 周期 tick；2) 任务状态路由 fire-and-forget
  * 踢一脚。多进程并发安全靠 claim 的条件 updateMany 抢占。
+ *
+ * ─── 代次不变式（generation invariant，本文件最重要的一条规矩）───
+ *
+ * `TranslationTask.jobQueueId` 是**代次令牌**：它指向"当前这一代"调度行。
+ * 用户 retry 会把任务重置回 PENDING、重新扣一次费、并换一条全新的调度行
+ *（retry 路由事务里先把 jobQueueId 置 null，再由 enqueueDocTranslate 绑到新行）。
+ * 于是同一个 taskId 上可能同时存在**上一代的在途逻辑**和**新一代的任务行**。
+ *
+ * 不变式：**调度器里所有对 TranslationTask 的写、以及所有对任务目录的 rm -rf，
+ * 都必须带 `jobQueueId: <自己这一代的 jobId>` 谓词。**
+ *
+ * 漏一处的后果都是真金白银级的（这一簇 bug 全部出自"漏了谓词"）：
+ *   - harvest 漏 → 旧代产物把新一代标成 COMPLETED，新代收割再 rm -rf 删光整个目录
+ *     = 用户看到"已完成"但文件 404，且新扣的钱不退（H4）；
+ *   - markTaskTranslating 漏 → 旧 worker 的 workerId 被写进新一代，用户取消时停错台（M12）；
+ *   - 进度回写漏 → 旧代低进度反复盖掉新代真实进度，进度条回跳（M13）；
+ *   - issueProxyToken 漏 → 唯一索引互相覆盖，其中一台 worker 的 LLM 调用全 401（M11）；
+ *   - 绑定漏 → 双进程孤儿扫描各建一行都绑定成功，同一份 PDF 翻两遍（M11）。
+ *
+ * 两道防线：① 派发入口先比 `task.jobQueueId / task.proxyGeneration` 早退（省掉无谓的
+ *   worker 往返与副作用，并顺手清掉远端任务、终态化本代调度行）；
+ * ② 每一次写都带 `jobQueueId + proxyGeneration` 谓词（原子、不受 TOCTOU 影响，这才是
+ *   权威防线）。只有 ① 没有 ② 不作数。
  */
 
 const translateLogger = logger.child({ component: 'doc-translate' });
 
-/** 单任务在 worker 侧最长滞留：大文档（数百页 × QPS 限速）给足 3 小时 */
-const MAX_WORKER_RUNTIME_MS = 180 * 60_000;
+/**
+ * 单任务在 worker 侧最长滞留：大文档（数百页 × QPS 限速）给足 3 小时。
+ * H5：导出是为了让单测能钉住「僵尸回收阈值必须严格大于它」这条跨模块不变式 ——
+ * 这两个常量当初就是各改各的漂移开的（jobQueue 的 2h < 这里的 3h），必然误杀。
+ */
+export const MAX_WORKER_RUNTIME_MS = 180 * 60_000;
+/**
+ * 任务级**绝对死线**：一个 TranslationTask 允许停留在非终态（PENDING/TRANSLATING）的总时长。
+ *
+ * 为什么单有 MAX_WORKER_RUNTIME_MS 不够：`job.startedAt` 在**每一次重派时都被清空**
+ *（回炉 SUBMITTED 的五处、以及 retryJob），所以那 3 小时其实是「每一次派发」的预算，
+ * 不是任务总预算。整个 worker 机队长期不可达时，任务就在 SUBMITTED ↔ PROCESSING 之间
+ * 无限弹跳、永不终态：用户侧永远显示「翻译中」，而 chargedCents 一直押着不退。
+ * 机队被整个删掉/停用（getTranslateFleetConfig 返回 null）时更彻底 —— 连 tick 都直接早退。
+ *
+ * 取值 24h 的理由：一次完整的合法重试链最长 ≈ 3 次派发 × 3h + 退避(5+20+45min) ≈ 9.5h，
+ * 24h 留了 2.5 倍余量；同时必须严格大于僵尸回收阈值（4h）与单次运行上限（3h），
+ * 三者的序关系由 translateGeneration.test.ts 的跨模块不变式测试钉死 —— 它们当初就是
+ * 各改各的漂移开的（H5 的成因）。
+ *
+ * **锚点**是 `max(TranslationTask.createdAt, 本代 JobQueue 行的 createdAt)`，不是裸的任务
+ * createdAt：用户 retry 复用同一个 TranslationTask 行（createdAt 不变）但会换一条全新的调度行，
+ * 若只看任务 createdAt，隔天来点一次重试会被本扫描当场打死 —— 钱虽然退了，重试却等于不可用。
+ * 而调度行的 createdAt 在「弹跳」这条真正的病态路径上是稳定的（五处回炉只清 startedAt、
+ * 不新建行），死线照样咬得住。
+ */
+export const MAX_TASK_LIFETIME_MS = 24 * 60 * 60_000;
 /** 自动重试退避（按已消耗 attempt 索引） */
 const RETRY_BACKOFF_MS = [5 * 60_000, 20 * 60_000, 45 * 60_000];
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -66,6 +114,12 @@ const DISPATCH_START_GRACE_MS = 12 * 60_000;
  * 取 2 分钟足以避开正常窗口，又不至于让真正的孤儿等太久。
  */
 const ORPHAN_TASK_GRACE_MS = 2 * 60_000;
+/**
+ * H6：绑定台连续不可达多久之后解绑重派。
+ * 断电/域名失效的 worker 会让对账每轮都在 getTranslateJob 上抛错，任务干等着那台复活。
+ * 取 10 分钟：足够跨过一次重启/短暂网络抖动，又不至于让用户等上小时级。
+ */
+const WORKER_UNREACHABLE_REBIND_MS = 10 * 60_000;
 
 interface TranslateJobParams {
   /** 业务行 id（TranslationTask） */
@@ -79,6 +133,8 @@ interface TranslateJobParams {
   dispatchState?: 'claiming' | 'started';
   nextRetryAt?: string;
   progress?: { stage: string | null; percent: number; at: string };
+  /** H6：绑定台首次不可达的时刻（ISO）；任何一次成功对账即清除 */
+  unreachableSince?: string;
   [key: string]: unknown;
 }
 
@@ -131,7 +187,8 @@ export async function enqueueDocTranslate(taskId: string, userId: string): Promi
       where: { id: taskId },
       select: { jobQueueId: true, updatedAt: true },
     });
-    if (task?.jobQueueId) {
+    if (!task) return null; // 行已被删：别留一条没人认领的调度行占派发槽
+    if (task.jobQueueId) {
       const existing = await prisma.jobQueue.findUnique({
         where: { id: task.jobQueueId },
         select: { id: true, status: true },
@@ -156,6 +213,13 @@ export async function enqueueDocTranslate(taskId: string, userId: string): Promi
     // L23：绑定失败（任务被并发取消/删除、或状态已不是 PENDING）时必须把刚建的调度行
     // 就地终态化。原来用的是会抛的 prisma.update：抛出后外层 catch 只 return null，
     // 那行永远留在 SUBMITTED 里，每轮 tick 都被捞进 take(totalSlots)、白占一个全局派发槽。
+    // M11：绑定必须是对**读到的那个代次令牌**的 CAS，不能只看 status。
+    // tick 同时跑在 ws 进程和每个 API 进程里（runDocTranslateTick 的 globalThis 互斥仅
+    // 进程内），两个进程的孤儿扫描可以同时捞到同一条 jobQueueId=null 的任务、各自 createJob，
+    // 只带 `status: 'PENDING'` 的话两次绑定会**先后都成功**：两条 SUBMITTED 行都被派发，
+    // 同一份 PDF 翻两遍、两笔 worker 费用，且 issueProxyToken 互相覆盖唯一索引，
+    // 其中一台的 LLM 调用当场全 401。
+    // 用读到的旧值做谓词（null 或上一条已终态的行 id）→ 只有第一个写入者能命中。
     const bound = await prisma.translationTask.updateMany({
       where: {
         id: taskId,
@@ -255,6 +319,16 @@ export function runDocTranslateTick(): Promise<void> {
 
 async function executeTick(): Promise<void> {
   const fleet = await getTranslateFleetConfig();
+
+  // 0) 任务级绝对死线。**必须排在下面 `if (!fleet)` 早退之前** —— 机队被停用/删空正是
+  // 任务永久挂起的形态之一（连 tick 都进不来），死线放在早退之后就永远够不着它。
+  await enforceTaskLifetimeDeadlines(fleet).catch((error) =>
+    translateLogger.warn(
+      { err: serializeError(error) },
+      '任务生存期死线扫描异常（下轮重试）'
+    )
+  );
+
   if (!fleet) {
     return; // 文档翻译未启用/无可用 worker：入队任务保留，配置好后自动推进
   }
@@ -281,9 +355,9 @@ async function executeTick(): Promise<void> {
   });
   const now = Date.now();
   for (const job of failed) {
-    if (job.attempt >= job.maxAttempts) continue;
     const params = parseJobParams(job.params);
     if (!params.nextRetryAt) continue;
+    if (job.attempt >= job.maxAttempts) continue;
     if (new Date(params.nextRetryAt).getTime() > now) continue;
     const retried = await retryJob(job.id);
     if (retried) {
@@ -292,6 +366,55 @@ async function executeTick(): Promise<void> {
         '文档翻译任务自动重试回炉'
       );
     }
+  }
+
+  // 2.4) H5：断链任务自愈 —— 调度行已终态，业务行却还停在非终态。
+  //
+  // 通用僵尸回收（jobQueue.reclaimStaleProcessingJobs）是 updateMany 直改 job 行、
+  // **绕过 failJob**：它不回写 TranslationTask、不退 chargedCents、不发通知、
+  // 也不写 params.nextRetryAt（上面那圈自动重试要求该字段存在，没有就直接 continue）。
+  // 结果是任务永久停在 TRANSLATING（前端一直转圈）、钱滞留在系统里，而且行已非 PROCESSING
+  // → 上面第 1 步的对账永远捞不到它，worker 就算翻完也没人收割。
+  // 进程在 failJob 的「先写 job 行、再写 task 行」中间被 kill、以及 admin 手动改状态，
+  // 都会落到同一形态。
+  //
+  // 这里按业务行反查（在途任务数量受机队容量约束，很小）：只要它绑定的调度行已终态
+  // 且没有排定自动重试，就补跑一次 failJob —— 还有 attempt 就排退避重试，
+  // 用光了就终态失败 + 全额退款 + 通知。failJob 自带代次谓词，跨代不会误伤。
+  const strandedTasks = await prisma.translationTask.findMany({
+    where: {
+      status: { in: ['PENDING', 'TRANSLATING'] },
+      jobQueueId: { not: null },
+      updatedAt: { lt: new Date(now - ORPHAN_TASK_GRACE_MS) },
+    },
+    select: { id: true, jobQueueId: true },
+    orderBy: { updatedAt: 'asc' },
+    take: 20,
+  });
+  for (const stranded of strandedTasks) {
+    const jobId = stranded.jobQueueId;
+    if (!jobId) continue;
+    const jobRow = await prisma.jobQueue.findUnique({
+      where: { id: jobId },
+      select: { id: true, type: true, status: true, params: true },
+    });
+    if (!jobRow || jobRow.type !== JOB_TYPE.DOC_TRANSLATE) continue;
+    if (jobRow.status !== JOB_STATUS.FAILED && jobRow.status !== JOB_STATUS.SUCCESS) {
+      continue; // 还在途，正常推进中
+    }
+    if (parseJobParams(jobRow.params).nextRetryAt) continue; // 已排重试，等它自己回炉
+    translateLogger.warn(
+      { jobId, taskId: stranded.id, jobStatus: jobRow.status },
+      '调度链断裂（调度行已终态但任务未结算），补做失败结算'
+    );
+    await failJob(jobId, new Error('调度中断，已自动补做结算'), {
+      retryable: true,
+    }).catch((error) =>
+      translateLogger.warn(
+        { jobId, taskId: stranded.id, err: serializeError(error) },
+        '断链任务补结算失败（下轮重试）'
+      )
+    );
   }
 
   // 2.5) L23：捞回「扣了费但没有调度行」的孤儿任务。
@@ -391,6 +514,74 @@ async function executeTick(): Promise<void> {
       );
       await failJob(job.id, error, { retryable: true }, proxyGeneration);
     });
+  }
+}
+
+/**
+ * 任务级绝对死线扫描：把在非终态停留超过 MAX_TASK_LIFETIME_MS 的任务终态化 + **退款**。
+ *
+ * 必须走 `failJob(..., { retryable: false })`，不能图省事用裸 updateMany —— 只有 failJob 会
+ * 跑 refundTaskCharge（释放押着的 chargedCents，这正是本扫描存在的全部意义）、发失败通知、
+ * 并带上 L24 代次谓词。绕过它就等于没修。
+ *
+ * 与既有机制的关系：
+ *  - retryable:false ⇒ failJob 会 `delete params.nextRetryAt`，第 2 步的到期自动重试因此
+ *    不会把它再捞回炉（那圈明确要求 nextRetryAt 存在）；
+ *  - 任务随即变 FAILED，第 2.4 步 H5 断链自愈的 `status in [PENDING, TRANSLATING]` 不再匹配，
+ *    两者不会互相打架，也没有造出 H5 捞不到的新形态；
+ *  - 退避（RETRY_BACKOFF_MS / params.nextRetryAt）不受影响：它只作用于 retryable 的失败。
+ */
+async function enforceTaskLifetimeDeadlines(
+  fleet: TranslateFleetConfig | null,
+  now: number = Date.now()
+): Promise<void> {
+  const cutoff = new Date(now - MAX_TASK_LIFETIME_MS);
+  // 命中 @@index([status, createdAt])。jobQueueId 非空是硬前提：failJob 的入参就是代次令牌，
+  // 没有调度行的孤儿由第 2.5 步补入队，下一轮再落到这里。
+  const candidates = await prisma.translationTask.findMany({
+    where: {
+      status: { in: ['PENDING', 'TRANSLATING'] },
+      createdAt: { lt: cutoff },
+      jobQueueId: { not: null },
+    },
+    select: { id: true, jobQueueId: true, createdAt: true },
+    orderBy: { createdAt: 'asc' },
+    take: 20,
+  });
+
+  for (const task of candidates) {
+    const jobId = task.jobQueueId;
+    if (!jobId) continue;
+    const job = await prisma.jobQueue.findUnique({
+      where: { id: jobId },
+      select: { id: true, type: true, status: true, params: true, createdAt: true },
+    });
+    if (!job || job.type !== JOB_TYPE.DOC_TRANSLATE) continue;
+    // 锚点取较晚者（见 MAX_TASK_LIFETIME_MS 注释）：本代调度行还年轻 = 用户刚重试过，放行。
+    if (job.createdAt.getTime() >= cutoff.getTime()) continue;
+
+    // best-effort 收掉 worker 侧可能还在的那份任务（机队不可达时必然失败，无所谓）。
+    const bound = fleet ? workerById(fleet, parseJobParams(job.params).workerId) : null;
+    if (bound) await deleteTranslateJob(bound, job.id).catch(() => undefined);
+
+    translateLogger.warn(
+      {
+        jobId,
+        taskId: task.id,
+        taskCreatedAt: task.createdAt.toISOString(),
+        jobCreatedAt: job.createdAt.toISOString(),
+        jobStatus: job.status,
+      },
+      '文档翻译任务超过最长生存期，终止并退款'
+    );
+    await failJob(jobId, new Error('文档翻译超时未完成，已终止并退款'), {
+      retryable: false,
+    }).catch((error) =>
+      translateLogger.warn(
+        { jobId, taskId: task.id, err: serializeError(error) },
+        '死线终止失败（下轮重试）'
+      )
+    );
   }
 }
 
@@ -583,6 +774,34 @@ async function writeJobParamsForGeneration(
   });
   if (updated.count !== 1) {
     throw new Error('翻译调度代次已变更');
+  }
+}
+
+/**
+ * 写回 JobQueue.params 的统一入口：
+ *  - 有 proxyGeneration → 代次谓词 CAS（`writeJobParamsForGeneration`）；
+ *  - legacy 行（无代次）→ 退回「完整 params 快照」CAS，语义等价。
+ * 两者都保证「代次/快照已变更」时写不进去，不会把新一代的绑定改回旧 worker。
+ */
+async function writeJobParamsSnapshot(
+  job: JobRow,
+  proxyGeneration: string | null,
+  params: TranslateJobParams
+): Promise<void> {
+  if (proxyGeneration) {
+    await writeJobParamsForGeneration(job.id, proxyGeneration, params);
+    return;
+  }
+  const updated = await prisma.jobQueue.updateMany({
+    where: {
+      id: job.id,
+      status: JOB_STATUS.PROCESSING,
+      params: job.params,
+    },
+    data: { params: JSON.stringify(params) },
+  });
+  if (updated.count !== 1) {
+    throw new Error('翻译调度 legacy 快照已变更');
   }
 }
 
@@ -1149,7 +1368,46 @@ async function reconcileProcessingJob(
       );
       return;
     }
+    // H6 下半段：绑定台连不上（断电 / 域名失效 / 持续 5xx）。原来一路 throw 上去，
+    // 由 executeTick 吞成「下轮重试」，任务就干等着那台自己复活 —— 可能永远不会。
+    // 连续不可达超过阈值就解绑回炉，让 pickWorker（带健康探测）把它挪到活着的台上。
+    const firstFailureMs = Number.isFinite(
+      new Date(params.unreachableSince ?? '').getTime()
+    )
+      ? new Date(params.unreachableSince as string).getTime()
+      : Date.now();
+    if (Date.now() - firstFailureMs >= WORKER_UNREACHABLE_REBIND_MS) {
+      await writeJobParamsSnapshot(
+        job,
+        proxyGeneration,
+        { ...params, workerId: undefined, unreachableSince: undefined }
+      );
+      await prisma.jobQueue.updateMany({
+        where: { id: job.id, status: JOB_STATUS.PROCESSING },
+        data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
+      });
+      translateLogger.warn(
+        { jobId: job.id, taskId: task.id, worker: bound.name },
+        'worker 持续不可达，解绑重派'
+      );
+      return;
+    }
+    if (!params.unreachableSince) {
+      await writeJobParamsSnapshot(job, proxyGeneration, {
+        ...params,
+        unreachableSince: new Date(firstFailureMs).toISOString(),
+      });
+    }
     throw error;
+  }
+
+  // 拿到状态了 = 那台还活着，清掉不可达计时（否则一次抖动会永久拉高后续判定的基线）
+  if (params.unreachableSince) {
+    params.unreachableSince = undefined;
+    await writeJobParamsSnapshot(job, proxyGeneration, {
+      ...params,
+      unreachableSince: undefined,
+    });
   }
 
   switch (remote.status) {

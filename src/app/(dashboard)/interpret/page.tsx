@@ -351,8 +351,11 @@ export default function InterpretPage() {
           )}
 
         <div className="flex-1 flex flex-col items-center justify-center gap-8 px-4 animate-fade-in-up">
-          {/* 大麦克风按钮 */}
+          {/* 大麦克风按钮 —— 页面的主操作，但内部只有一个 SVG 图标，此前**没有任何可
+              访问名称**（a11y 树里就是一个裸 button，屏幕阅读器读不出它是干什么的）。
+              补 aria-label 既是无障碍修复，也让 e2e 能按角色+名称稳定定位它。 */}
           <button
+            aria-label={t('interpret.start')}
             onClick={() => void handleStart()}
             disabled={!canStart}
             className="group relative w-28 h-28 rounded-full text-white flex items-center justify-center

@@ -74,6 +74,14 @@ export function useInterpret() {
   const [elapsedMs, setElapsedMs] = useState(0);
 
   const recordingRef = useRef<{ recording: RecordingHandle; client: unknown } | null>(null);
+  // H3：同传的运行代次。start() 有两个 await 窗口（建锚点的 fetch、startSonioxRecording 的
+  // mint key + WS 握手，合计可达数秒），窗口里点「停止」或导航离开时 stop()/卸载读到的
+  // recordingRef 还是 null → 句柄相关全部 no-op，但照常结算扣费并置 isRunning(false)；随后
+  // start 的后半段无条件把句柄/计时器/轮换定时器装回去，于是麦克风常亮、转录持续、**永不
+  // 再计费**，而 scheduleRotation 建的轮换定时器每 ~15 分钟自我重建一条 Soniox 连接，孤儿
+  // 自我续命。isStartingRef 那把重入锁只挡并发 start，挡不住 stop。
+  // 不变式：stop() 与卸载清理在**任何 await 之前**同步 bump 本代次；start/rotate 的每个
+  // await 之后都必须复查代次，过期即就地拆掉已经建起来的资源（停 WS、清定时器），绝不发布。
   const processorRef = useRef<TokenProcessor | null>(null);
   const startTimeRef = useRef<number | null>(null);
   const anchorIdRef = useRef<string | null>(null);
@@ -369,6 +377,13 @@ export function useInterpret() {
         if (processorRef.current === processor) processorRef.current = null;
         if (activeOwnerRef.current === owner) activeOwnerRef.current = null;
         isStartingRef.current = false;
+        // H3 窗口①：stop()/卸载落在建锚点的 fetch 期间。此时 stop 读到的 startTimeRef 与
+        // recordingRef 都还是 null（duration=0、无句柄），扣费与句柄清理全是 no-op。
+        // 这里把刚建好的服务端锚点顺手结算掉（durationMs=0 + anchorId → 服务端按墙钟
+        // ≈0 结算并消费 Redis 锚点），免得它悬挂到 cron 7h 兜底。
+        if (anchorId) {
+          void deductQuota(0, anchorId, owner.boundary);
+        }
         return;
       }
       anchorIdRef.current = anchorId;
@@ -389,6 +404,9 @@ export function useInterpret() {
 
       // 回调与配置存 ref：寿命轮换（rotateConnection）重建连接时原样复用——processor 延续、
       // 段落不断，锚点/计时器不动，仍是同一场同传。
+      // H3：回调全部带代次门闩。孤儿连接（stop 之后才 open 的 WS、或拆连接期间迟到的帧）
+      // 不得再回写 UI —— 否则「已停止」的界面会被重新点亮成 connected/出字。轮换重建连接时
+      // 复用同一套回调，而轮换不 bump 代次，故门闩对同一场同传恒成立。
       const callbacks: Parameters<typeof startSonioxRecording>[2] = {
         onPartialResult: (tokens) => {
           if (!ownerIsCurrent(owner)) return;
@@ -465,7 +483,7 @@ export function useInterpret() {
         }
       }
     },
-    [token, ownerIsCurrent, scheduleRotation]
+    [token, ownerIsCurrent, scheduleRotation, deductQuota]
   );
 
   const stop = useCallback(async () => {
@@ -535,6 +553,13 @@ export function useInterpret() {
   // 用 ref 持有最新 stop，effect 依赖为空只在卸载时执行一次。
   useEffect(() => {
     const invalidateAndTeardown = (updateState: boolean) => {
+      // C7：拆场前先取结算所需的三样东西（下面会把它们全清掉）。
+      const settleBoundary =
+        activeOwnerRef.current?.boundary ?? getAuthBoundarySnapshot();
+      const settleAnchorId = anchorIdRef.current;
+      const settleDurationMs = startTimeRef.current
+        ? Date.now() - startTimeRef.current
+        : 0;
       lifecycleGenerationRef.current += 1;
       activeOwnerRef.current = null;
       isStartingRef.current = false;
@@ -565,6 +590,12 @@ export function useInterpret() {
         setPreviewLang(null);
         previewLangRef.current = null;
       }
+      // C7：注释一直承诺「卸载时触发扣费」，但重写后这条路径不再结算 —— 锚点会一直
+      // 悬挂到 cron 7h 兜底。这里补回：账号已切走时 deductQuota 内部的边界校验会自行
+      // 早退，不会把上一位用户的时长记到新主体头上。
+      if (settleAnchorId || settleDurationMs > 0) {
+        void deductQuota(settleDurationMs, settleAnchorId, settleBoundary);
+      }
     };
     const clearForBoundary = () => invalidateAndTeardown(true);
     window.addEventListener(
@@ -578,7 +609,7 @@ export function useInterpret() {
       );
       invalidateAndTeardown(false);
     };
-  }, []);
+  }, [deductQuota]);
 
   return {
     isRunning,

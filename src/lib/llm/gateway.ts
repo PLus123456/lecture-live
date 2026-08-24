@@ -282,9 +282,18 @@ export async function getProviderForPurpose(
     if (model) {
       return dbModelToConfig(model);
     }
-  } catch {
+    // L34：DB 里该用途一个模型都没有 —— 此前这条路径连日志都没有，
+    // 直接静默换成 env active provider。
+    llmLogger.warn(
+      { purpose, reason: 'no_model_for_purpose' },
+      'DB 中该用途没有任何模型，回退到 env LLM_ACTIVE_PROVIDER'
+    );
+  } catch (err) {
     // 数据库不可用，回退到环境变量
-    console.warn(`[LLM Gateway] 数据库查询失败，回退到环境变量配置 (purpose=${purpose})`);
+    llmLogger.warn(
+      { purpose, reason: 'db_error', err: serializeError(err) },
+      'DB 查询失败，回退到 env LLM_ACTIVE_PROVIDER'
+    );
   }
 
   // Fallback: 环境变量
@@ -307,8 +316,19 @@ export async function getModelById(
     if (model) {
       return dbModelToConfig(model);
     }
-  } catch {
-    console.warn(`[LLM Gateway] 数据库查询失败，回退到环境变量配置 (modelId=${modelId})`);
+    // L34：调用方**明确点名了一个 modelId**，这里却查不到（行被删 / id 陈旧）。
+    // 静默回退 env active provider = 用户所选模型被无感替换成另一个模型
+    // （授权校验通过之后、真正调用之前的 TOCTOU）。行为保持"回退"不变（DB-only 部署
+    // 里改抛错会把整条链路打死），但必须留下告警，否则运维完全看不见换模型这件事。
+    llmLogger.warn(
+      { modelId, reason: 'model_not_found' },
+      'DB 中找不到指定模型，已回退到 env LLM_ACTIVE_PROVIDER —— 用户所选模型被替换'
+    );
+  } catch (err) {
+    llmLogger.warn(
+      { modelId, reason: 'db_error', err: serializeError(err) },
+      'DB 查询失败，已回退到 env LLM_ACTIVE_PROVIDER —— 用户所选模型被替换'
+    );
   }
 
   // Fallback
@@ -779,6 +799,8 @@ async function readSseLines(
   let buffer = '';
   let receivedBytes = 0;
 
+  // L37：异常路径（abort / onData 抛错 / 上游中途断流）必须显式 cancel reader，
+  // 否则上游连接体只能等 GC finalizer 回收，高并发断连下连接与 FD 会滞留。
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -811,10 +833,15 @@ async function readSseLines(
       onData(tail.slice(5).trim());
     }
   } catch (error) {
+    // cancel 自身也可能抛（流已被 abort），吞掉即可 —— 真正要上抛的是原始错误。
     await reader.cancel('LLM SSE processing failed').catch(() => undefined);
     throw error;
   } finally {
-    reader.releaseLock();
+    try {
+      reader.releaseLock();
+    } catch {
+      // 已释放 / 已锁死，忽略。
+    }
   }
 }
 

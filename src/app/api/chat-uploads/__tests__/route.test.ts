@@ -237,9 +237,12 @@ describe('POST /api/chat-uploads', () => {
 
     // 上传两次：原文件 + 抽出的 .txt
     expect(uploadMock).toHaveBeenCalledTimes(2);
-    // 第一次上传 fileName 应该是 ${conversationId}_${safeFileName}
-    expect(uploadMock.mock.calls[0]?.[2]).toBe('conv-1_notes.txt');
-    expect(uploadMock.mock.calls[1]?.[2]).toBe('conv-1_notes.txt.extracted.txt');
+    // 远端名形如 ${conversationId}_${唯一段}_${safeFileName}：唯一段是必须的，
+    // 否则同一对话里两次上传同名文件会在 Cloudreve 上互相覆盖。
+    expect(uploadMock.mock.calls[0]?.[2]).toMatch(/^conv-1_[0-9a-f]{12}_notes\.txt$/);
+    expect(uploadMock.mock.calls[1]?.[2]).toBe(
+      `${uploadMock.mock.calls[0]?.[2]}.extracted.txt`
+    );
 
     // ChatAttachment.create 调用参数
     expect(chatAttachmentCreateMock).toHaveBeenCalledTimes(1);
@@ -484,9 +487,9 @@ describe('POST /api/chat-uploads', () => {
     expect(chatAttachmentDeleteManyMock).not.toHaveBeenCalled();
     expect(deleteCloudreveAttachmentFilesMock).toHaveBeenCalledWith([
       expect.objectContaining({
-        cloudrevePath: expect.stringContaining('/conv-1_notes.txt'),
-        extractedTextPath: expect.stringContaining(
-          '/conv-1_notes.txt.extracted.txt'
+        cloudrevePath: expect.stringMatching(/\/conv-1_[0-9a-f]{12}_notes\.txt$/),
+        extractedTextPath: expect.stringMatching(
+          /\/conv-1_[0-9a-f]{12}_notes\.txt\.extracted\.txt$/
         ),
       }),
     ]);

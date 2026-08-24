@@ -152,8 +152,37 @@ export async function migrateLocalToCloudreve(): Promise<MigrationResult> {
 }
 
 /**
+ * 远端可读性校验（L63）：unlink 本地最后一份副本之前，必须确认云端那份**真的取得到**。
+ *
+ * 只要 1 个字节：走 openDownloadStream + `Range: bytes=0-0`，拿到响应立刻 cancel body，
+ * 不把文件读进内存。存储节点忽略 Range 回 200 也算存在（同样立刻 cancel）。
+ *
+ * 任何异常（路径非法 / 文件已被云端删除 / 签名接口报错 / 网络不通）一律返回 false ——
+ * 宁可留下本地副本占磁盘，也不能把「云端已经没了」的文件在本地也删掉：这一步是不可逆的。
+ */
+async function remoteCopyIsReadable(
+  storage: CloudreveStorage,
+  remotePath: string
+): Promise<boolean> {
+  try {
+    const response = await storage.openDownloadStream(remotePath, {
+      range: 'bytes=0-0',
+    });
+    await response.body?.cancel().catch(() => undefined);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 清理超过保留天数的本地文件（仅在 Cloudreve 模式下执行）
  * 只清理已经成功上传到 Cloudreve 的文件（引用以 / 开头）
+ *
+ * L63：「引用以 / 开头」只说明**当初**上传成功过，不说明此刻云端还在。云端侧的删除
+ * （手滑清空回收站 / 配额回收 / 存储节点故障）不会回写 DB，本函数照旧把本地最后一份
+ * 副本 unlink 掉 —— 一次定时任务就能把用户的录音彻底抹掉，且无法恢复。
+ * 现在每个待删文件在 unlink 前都要通过 remoteCopyIsReadable；校验不过就跳过并记错。
  */
 export async function cleanupExpiredLocalFiles(
   retentionDays: number
@@ -162,6 +191,25 @@ export async function cleanupExpiredLocalFiles(
 
   if (retentionDays <= 0) {
     return result; // 0 = 永久保留，不清理
+  }
+
+  // L63：没有可用的 Cloudreve 就压根没法校验远端 —— 此时删本地等于纯粹的数据销毁。
+  // （调用方 admin/storage/cleanup 也只在 storage_mode=cloudreve 时才放行。）
+  if (!(await isCloudreveConfiguredAsync())) {
+    result.errorCount++;
+    result.errors.push('Cloudreve 未配置，无法校验远端副本，已跳过全部本地清理');
+    return result;
+  }
+
+  let storage: CloudreveStorage;
+  try {
+    storage = await CloudreveStorage.create();
+  } catch (err) {
+    result.errorCount++;
+    result.errors.push(
+      `Cloudreve 初始化失败，已跳过全部本地清理：${err instanceof Error ? err.message : String(err)}`
+    );
+    return result;
   }
 
   const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
@@ -214,6 +262,15 @@ export async function cleanupExpiredLocalFiles(
         continue;
       }
       if (!(await fileExists(localPath))) continue;
+
+      // L63：unlink 之前先确认云端那一份现在**确实取得到**。取不到就保留本地副本。
+      if (!(await remoteCopyIsReadable(storage, ref))) {
+        result.errorCount++;
+        result.errors.push(
+          `${ref}: 远端副本不可读，已保留本地文件（未 unlink）`
+        );
+        continue;
+      }
 
       try {
         await fs.unlink(localPath);

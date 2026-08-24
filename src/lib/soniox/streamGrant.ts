@@ -47,6 +47,12 @@ export interface CreateStreamGrantInput {
   interpretSessionId?: string | null;
   /** 实际签发使用的 Soniox 区域（usage-logs 按区归属）。 */
   region: string;
+  /**
+   * L19：并发在途 grant 数上限（= maxConcurrentSessions*2+1，由调用方按用户组解析）。
+   * 传入即在**预扣同一事务内**复核，`countActiveStreamGrants` 那种「读完再建行」的
+   * check-then-act 近似检查挡不住并发脚本瞬时越闸。不传则不做流数限制（保持旧行为）。
+   */
+  maxActiveGrants?: number;
 }
 
 export type CreateStreamGrantResult =
@@ -58,7 +64,25 @@ export type CreateStreamGrantResult =
       /** 下发给 Soniox 的单连接时长上限（秒）＝可串流量上限。 */
       maxSessionSeconds: number;
     }
-  | { ok: false; reason: 'quota_exhausted' | 'user_not_found' };
+  | {
+      ok: false;
+      reason: 'quota_exhausted' | 'user_not_found' | 'too_many_streams';
+    };
+
+/**
+ * L19：并发流数闸命中时用来**回滚已做的预扣**的哨兵异常。
+ * 关键点：Prisma 的 `$transaction(cb)` 只有在 cb **抛出**时才回滚；正常 return 一律提交。
+ * 而这一步的预扣（reserveTranscriptionMinutesUpTo）已经写进了 used，直接 return 会留下一笔
+ * 谁也不会释放的悬挂预留（比它要修的 bug 更糟）。故必须抛出、在事务外翻译成返回值。
+ * 对照：`user_not_found` / `quota_exhausted` 两条 return 是安全的 —— 那两种情形下预扣本来
+ * 就没发生（返回 null / 预扣 0）。
+ */
+class TooManyStreamGrantsError extends Error {
+  constructor() {
+    super('too many concurrent stream grants');
+    this.name = 'TooManyStreamGrantsError';
+  }
+}
 
 /**
  * 原子「预扣 + 建 grant」。同一事务：收缩式预扣（reserveTranscriptionMinutesUpTo，FOR UPDATE）
@@ -68,45 +92,73 @@ export type CreateStreamGrantResult =
 export async function createStreamGrantWithReservation(
   input: CreateStreamGrantInput
 ): Promise<CreateStreamGrantResult> {
-  return prisma.$transaction(async (tx) => {
-    const reservation = await reserveTranscriptionMinutesUpTo(
-      input.userId,
-      STREAM_GRANT_MAX_MINUTES,
-      tx
-    );
-    if (!reservation) {
-      return { ok: false as const, reason: 'user_not_found' as const };
-    }
-    if (reservation.reservedMinutes <= 0) {
-      return { ok: false as const, reason: 'quota_exhausted' as const };
-    }
+  const activeSince = new Date(Date.now() - STREAM_GRANT_ACTIVE_WINDOW_MS);
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const reservation = await reserveTranscriptionMinutesUpTo(
+        input.userId,
+        STREAM_GRANT_MAX_MINUTES,
+        tx
+      );
+      if (!reservation) {
+        return { ok: false as const, reason: 'user_not_found' as const };
+      }
+      if (reservation.reservedMinutes <= 0) {
+        return { ok: false as const, reason: 'quota_exhausted' as const };
+      }
 
-    const isAdmin = reservation.role === 'ADMIN';
-    // ADMIN 不写 used（reserveUpTo 短路未扣），reservedMinutes 记 0 保证结算释放 0、对账不虚；
-    // 连接上限仍按请求值全额（无限额用户没有收缩语义）。
-    const reservedMinutes = isAdmin ? 0 : reservation.reservedMinutes;
-    const maxSessionSeconds = reservation.reservedMinutes * 60;
+      // L19：并发流数闸放进**同一事务**。reserveTranscriptionMinutesUpTo 上面已经对该用户行
+      // 做了 `SELECT ... FOR UPDATE`，同一用户的并发 mint 到这里已被串行化，因此「数一遍 +
+      // 建行」是原子的。路由里那道 countActiveStreamGrants 预检仍保留（快速失败 + 429 文案），
+      // 但它是读完再建行的 check-then-act 近似值：脚本并发发 N 个请求可以全部读到同一个旧
+      // 计数、集体越过 maxConcurrent*2+1。这里才是真正生效的闸。
+      if (input.maxActiveGrants != null && input.maxActiveGrants > 0) {
+        const activeCount = await tx.sonioxStreamGrant.count({
+          where: {
+            userId: input.userId,
+            settledAt: null,
+            mintedAt: { gte: activeSince },
+          },
+        });
+        if (activeCount >= input.maxActiveGrants) {
+          throw new TooManyStreamGrantsError();
+        }
+      }
 
-    const grant = await tx.sonioxStreamGrant.create({
-      data: {
-        userId: input.userId,
-        kind: input.kind,
-        sessionId: input.sessionId ?? null,
-        interpretSessionId: input.interpretSessionId ?? null,
-        region: input.region,
+      const isAdmin = reservation.role === 'ADMIN';
+      // ADMIN 不写 used（reserveUpTo 短路未扣），reservedMinutes 记 0 保证结算释放 0、对账不虚；
+      // 连接上限仍按请求值全额（无限额用户没有收缩语义）。
+      const reservedMinutes = isAdmin ? 0 : reservation.reservedMinutes;
+      const maxSessionSeconds = reservation.reservedMinutes * 60;
+
+      const grant = await tx.sonioxStreamGrant.create({
+        data: {
+          userId: input.userId,
+          kind: input.kind,
+          sessionId: input.sessionId ?? null,
+          interpretSessionId: input.interpretSessionId ?? null,
+          region: input.region,
+          reservedMinutes,
+          maxSessionSeconds,
+        },
+        select: { id: true },
+      });
+
+      return {
+        ok: true as const,
+        grantId: grant.id,
         reservedMinutes,
         maxSessionSeconds,
-      },
-      select: { id: true },
+      };
     });
-
-    return {
-      ok: true as const,
-      grantId: grant.id,
-      reservedMinutes,
-      maxSessionSeconds,
-    };
-  });
+  } catch (err) {
+    // L19：闸命中 —— 事务已回滚（预扣未提交），翻译成正常返回值交给调用方回 429。
+    // 其它异常原样上抛（调用方的 catch 会 500 并作废 interpret 锚点）。
+    if (err instanceof TooManyStreamGrantsError) {
+      return { ok: false as const, reason: 'too_many_streams' as const };
+    }
+    throw err;
+  }
 }
 
 /** 结算键：按 grant 自身 / 所属 Session / 所属 InterpretSession 圈定未结 grants。 */

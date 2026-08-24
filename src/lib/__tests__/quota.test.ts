@@ -1601,6 +1601,108 @@ describe('购买时长池 Model A（gross 池）', () => {
     });
   });
 
+  describe('L15 ensureQuotaWindow：请求路径的池结算也要同龄读', () => {
+    /** 窗口已到期 + 持池用户 → 走 ensureQuotaWindow 里的 poolOwed 分支。 */
+    const expiredPoolUser = (used: number) => ({
+      ...freeUser({
+        transcriptionMinutesUsed: used,
+        transcriptionMinutesLimit: 60,
+        purchasedMinutesBalance: 100,
+      }),
+      quotaResetAt: new Date('2020-01-01T00:00:00.000Z'), // 早已过期
+    });
+
+    it('▶ owed 取事务内重读的 used，而不是函数开头那份陈旧快照', async () => {
+      // 开头快照 used=150（陈旧）；事务内重读 used=200（期间又落了 50 分钟消费）。
+      userFindUniqueMock
+        .mockResolvedValueOnce(expiredPoolUser(150)) // ensureQuotaWindow 开头的窗口检查读
+        .mockResolvedValueOnce({
+          transcriptionMinutesUsed: 200,
+          transcriptionMinutesLimit: 60,
+        }) // 事务内同龄重读
+        .mockResolvedValueOnce(expiredPoolUser(0)); // 重置后回读
+      sessionAggregateMock.mockResolvedValueOnce({
+        _sum: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+      });
+      streamGrantAggregateMock.mockResolvedValueOnce({ _sum: { reservedMinutes: 0 } });
+      sessionUpdateManyMock.mockResolvedValue({ count: 0 });
+      streamGrantUpdateManyMock.mockResolvedValue({ count: 0 });
+      executeRawMock.mockResolvedValueOnce(1);
+
+      await getQuotaSnapshot('user-free');
+
+      // ▶ 旧实现用开头快照的 150 → owed=90（少扣 50，池结算口径漂移）。
+      expect(executeRawMock).toHaveBeenCalledTimes(1);
+      expect(executeRawMock.mock.calls[0][1]).toBe(140); // max(0, 200 - 0 - 60)
+    });
+
+    it('▶ used 与在途预留必须落在同一个事务快照内（对齐 cron 路径的 P5-11）', async () => {
+      const readOrder: string[] = [];
+      let insideTx = false;
+      transactionMock.mockImplementationOnce(async (fn: (tx: unknown) => unknown) => {
+        insideTx = true;
+        try {
+          return await fn(mockDb);
+        } finally {
+          insideTx = false;
+        }
+      });
+
+      userFindUniqueMock
+        .mockResolvedValueOnce(expiredPoolUser(150))
+        .mockImplementationOnce(async () => {
+          readOrder.push(`used:${insideTx ? 'in-tx' : 'out-of-tx'}`);
+          return { transcriptionMinutesUsed: 150, transcriptionMinutesLimit: 60 };
+        })
+        .mockResolvedValueOnce(expiredPoolUser(0));
+      sessionAggregateMock.mockImplementationOnce(async () => {
+        readOrder.push(`inflight:${insideTx ? 'in-tx' : 'out-of-tx'}`);
+        return { _sum: { asyncReservedMinutes: 0, fullReservedMinutes: 0 } };
+      });
+      streamGrantAggregateMock.mockResolvedValueOnce({ _sum: { reservedMinutes: 0 } });
+      sessionUpdateManyMock.mockResolvedValue({ count: 0 });
+      streamGrantUpdateManyMock.mockResolvedValue({ count: 0 });
+      executeRawMock.mockResolvedValueOnce(1);
+
+      await getQuotaSnapshot('user-free');
+
+      expect(readOrder).toEqual(['used:in-tx', 'inflight:in-tx']);
+    });
+
+    it('▶ 调用方已在事务内（db=tx）时不再自开事务，直接沿用外层快照', async () => {
+      // deductTranscriptionMinutes(tx) 这类调用：外层事务本就保证一致性读同快照，
+      // 再套一层交互式事务在真实 Prisma 上是非法的（TransactionClient 没有 $transaction）。
+      const txCalls = transactionMock.mock.calls.length;
+      userFindUniqueMock
+        .mockResolvedValueOnce(expiredPoolUser(150))
+        .mockResolvedValueOnce({
+          transcriptionMinutesUsed: 150,
+          transcriptionMinutesLimit: 60,
+        })
+        .mockResolvedValueOnce(expiredPoolUser(0))
+        .mockResolvedValueOnce(expiredPoolUser(0));
+      sessionAggregateMock.mockResolvedValueOnce({
+        _sum: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+      });
+      streamGrantAggregateMock.mockResolvedValueOnce({ _sum: { reservedMinutes: 0 } });
+      sessionUpdateManyMock.mockResolvedValue({ count: 0 });
+      streamGrantUpdateManyMock.mockResolvedValue({ count: 0 });
+      executeRawMock.mockResolvedValue(1);
+      userUpdateManyMock.mockResolvedValue({ count: 1 });
+      userUpdateMock.mockResolvedValue(expiredPoolUser(1)); // increment used 后的回读
+
+      await deductTranscriptionMinutes(
+        'user-free',
+        1,
+        mockDb as unknown as Prisma.TransactionClient
+      );
+
+      // mockDb 没有 $transaction → 分支必须走「直接跑」，一次事务都不该新开。
+      expect(transactionMock.mock.calls.length).toBe(txCalls);
+      expect(executeRawMock.mock.calls[0][1]).toBe(90); // 仍然算得出 owed
+    });
+  });
+
   describe('deductTranscriptionMinutes：Model A 下 used 数学不变、不碰池子', () => {
     it('▶ 扣费只 increment used，不触及 purchasedMinutesBalance', async () => {
       userFindUniqueMock.mockResolvedValueOnce(

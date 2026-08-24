@@ -198,6 +198,11 @@ export async function POST(req: Request) {
     // L16：裸 update 会把一笔**可能已在网关侧建单成功**的订单无条件打成终态 failed（歧义失败：
     // 请求超时但网关其实收下了）。加 status:'pending' 谓词——晚到的回调若已把它认领成 paid，
     // 这条就不再落地，钱不会因为一次超时而消失。
+    //
+    // 谓词**刻意只收 pending**，不跟着认领 CAS 一起放宽到 expired：这条路径是「我方主动判定
+    // 建单失败」，而 failed 不在 CLAIMABLE_ORDER_STATUSES 里。若它能把 expired 改写成 failed，
+    // 等于把一笔本还能被晚到回调认领的订单重新焊死 —— 正是放宽认领 CAS 要消除的那种资损。
+    // 实践上也够不着：清扫器有 72h 宽限期，而这里距建单只有几秒。
     await prisma.paymentOrder
       .updateMany({ where: { id: order.id, status: 'pending' }, data: { status: 'failed' } })
       .catch(() => {});

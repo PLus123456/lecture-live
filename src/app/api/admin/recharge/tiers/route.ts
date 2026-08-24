@@ -131,6 +131,9 @@ function normalizeTier(
   if (!kind || !TIER_KINDS.includes(kind as TierKind)) {
     return { error: '档位类型无效（membership | minutes | topup）' };
   }
+  // 换 kind 时 grantRole 等四列是派生的，必须跟着写（见 KIND_DERIVED_KEYS）。提前算出来，
+  // 好让下面的 ADMIN 硬拒判断知道「本次请求到底会不会写 grantRole」。
+  const kindChanged = partial && given('kind') && body.kind !== current?.kind;
   const name = (merged.name ?? '').trim();
   if (!name) return { error: '档位名称不能为空' };
   const priceCents = intOrNull(merged.priceCents);
@@ -186,7 +189,6 @@ function normalizeTier(
 
   if (!partial) return { data };
 
-  const kindChanged = given('kind') && body.kind !== current?.kind;
   const patch: Record<string, unknown> = {};
   for (const k of TIER_KEYS) {
     if (given(k) || (kindChanged && KIND_DERIVED_KEYS.includes(k))) patch[k] = data[k];

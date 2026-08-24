@@ -39,6 +39,21 @@ const DEFAULT_TARGET = 800;
 // 800 token/块 × 500 块 = 40 万 token，任何单次「整篇提取」的合法用法都远在其下。
 const DEFAULT_MAX_CHUNKS = 500;
 
+/**
+ * chunkText 的完整结果。`truncated=true` 表示因 maxChunks 触顶**丢弃了尾部文本**——
+ * 调用方必须据此打日志并在产物里声明截断（M17：此前触顶是完全静默的，用户只会拿到
+ * 一份"莫名少了尾段"的报告）。
+ */
+export interface ChunkResult {
+  chunks: Chunk[];
+  /** 是否因 maxChunks 触顶丢弃了剩余文本 */
+  truncated: boolean;
+  /** 实际进入 chunks 的字符数 */
+  consumedChars: number;
+  /** 原文总字符数 */
+  totalChars: number;
+}
+
 // 句子边界：中英文标点。注意 \n\n（段落）优先级高于句号。
 const SENTENCE_BOUNDARIES = /([。！？!?]+["」』）)]?\s*|\n{2,}|\.\s+(?=[A-Z]))/g;
 
@@ -76,12 +91,25 @@ function splitIntoSentences(text: string): string[] {
  * - 可选重叠：每个新块前置上一块尾部 N token 的文本（RAG 场景用）
  */
 export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
+  return chunkTextWithMeta(text, options).chunks;
+}
+
+/**
+ * 与 `chunkText` 同一实现，额外返回「是否触顶截断」的元信息。
+ * 需要对丢弃尾段负责的调用方（如报告 map-reduce）应该用这个版本。
+ */
+export function chunkTextWithMeta(
+  text: string,
+  options: ChunkOptions = {}
+): ChunkResult {
   const target = options.chunkTargetTokens ?? DEFAULT_TARGET;
   const max = options.chunkMaxTokens ?? Math.round(target * 1.25);
   const overlap = options.overlapTokens ?? 0;
   const maxChunks = Math.max(1, options.maxChunks ?? DEFAULT_MAX_CHUNKS);
 
-  if (!text) return [];
+  if (!text) {
+    return { chunks: [], truncated: false, consumedChars: 0, totalChars: 0 };
+  }
 
   const sentences = splitIntoSentences(text);
   const chunks: Chunk[] = [];
@@ -91,6 +119,10 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
   let bufferStart = 0;
   let cursor = 0;
   let chunkIndex = 0;
+  let truncated = false;
+  /** 上一次 flush 的结束位置；overlap 模式下用来判断"是否真有新内容"，避免把留作引子的
+   *  尾巴在收尾时重复吐成一个内容全重复的块。 */
+  let lastFlushEnd = 0;
 
   const flush = (endPos: number) => {
     if (!buffer) return;
@@ -101,6 +133,7 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
       charEnd: endPos,
       index: chunkIndex++,
     });
+    lastFlushEnd = endPos;
     if (overlap > 0 && buffer) {
       // 从尾部按估算字符数取 overlap token 等价的文本作为下一块的引子
       const tailRatio = overlap / Math.max(bufferTokens, 1);
@@ -120,6 +153,7 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
     // 这道 break 同时是扇出闸与 CPU 闸，务必留在循环最前面。
     if (chunks.length >= maxChunks) {
       buffer = '';
+      truncated = true;
       break;
     }
 
@@ -129,6 +163,13 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
     // 单句超过 max：先 flush 当前缓冲，再把这句按字符比例强切
     if (sentTokens > max) {
       flush(cursor - sentence.length);
+      // L43：强切路径必须显式清空 buffer。overlap>0 时 flush 会把上一块的尾巴留在
+      // buffer 里当"引子"，而这条超长句是被硬切成独立块的 —— 若不清空，那截引子会
+      // 被拼到**超长句之后**的下一块开头，同时 bufferStart 已被下面改成 cursor，
+      // 于是块文本与 charStart/charEnd 映射错位（引子那段字符被算成了句后的位置）。
+      // 跨强切边界不做 overlap 是有意取舍：宁可少一个引子，也不要错的字符映射。
+      buffer = '';
+      bufferTokens = 0;
       const ratio = max / sentTokens;
       const sliceLen = Math.max(1, Math.floor(sentence.length * ratio));
       let pos = 0;
@@ -142,8 +183,11 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
           charEnd: sentenceStart + pos + piece.length,
           index: chunkIndex++,
         });
+        lastFlushEnd = sentenceStart + pos + piece.length;
         pos += sliceLen;
       }
+      // 强切没切完就撞上 maxChunks → 尾段被丢弃
+      if (pos < sentence.length) truncated = true;
       bufferStart = cursor;
       continue;
     }
@@ -158,7 +202,17 @@ export function chunkText(text: string, options: ChunkOptions = {}): Chunk[] {
   }
 
   if (chunks.length < maxChunks) {
-    flush(cursor);
+    // overlap 模式下 buffer 里可能只剩上一块的引子（没有任何新内容），此时再 flush 会
+    // 吐出一个与上一块完全重复的块。cursor > lastFlushEnd 才说明确有新内容。
+    if (cursor > lastFlushEnd) flush(cursor);
+  } else if (buffer) {
+    // 还有攒着的内容却已经没有块位可用 → 这部分被丢弃
+    truncated = true;
   }
-  return chunks;
+
+  const consumedChars = chunks.reduce(
+    (acc, c) => (c.charEnd > acc ? c.charEnd : acc),
+    0
+  );
+  return { chunks, truncated, consumedChars, totalChars: text.length };
 }

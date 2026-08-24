@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import type { LlmPurpose } from '@/types/llm';
 import { verifyAuth } from '@/lib/auth';
 import { isPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
-import { callLLM } from '@/lib/llm/gateway';
+import { callLLM, type LLMProviderConfig } from '@/lib/llm/gateway';
 import { buildIncrementalSummaryPrompt } from '@/lib/llm/prompts';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import {
@@ -12,6 +12,9 @@ import {
 import { buildLlmRoutingOptions } from '@/lib/llm/llmRoutingOptions';
 import { resolveUserSummaryModels } from '@/lib/userRoles';
 import { resolveSummaryModel } from '@/lib/llm/summaryModel';
+import { computeContextBudget } from '@/lib/llm/tokenBudget';
+import { estimateTokens, truncateToTokensFromEnd } from '@/lib/llm/tokenizer';
+import { logger } from '@/lib/logger';
 import {
   LLM_LIMITS,
   LLMResponseError,
@@ -21,6 +24,66 @@ import {
   readOptionalText,
   readRequiredText,
 } from '@/lib/llm/security';
+
+const summarizeLogger = logger.child({ component: 'llm-summarize' });
+
+/** prompt 模板本身 + 输出预留的粗略 token 开销（不含 courseContext） */
+const SUMMARY_PROMPT_OVERHEAD_TOKENS = 800;
+
+/**
+ * L41：按目标模型的 contextWindow 把「新转录 + 累计上下文」压进输入预算。
+ *
+ * 分配策略：累计上下文（runningContext）最多占可用预算的一半 —— 它是滚动状态，
+ * 丢了会让后续摘要失忆；新转录拿剩下的。两者都从**尾部**保留（最近的内容更重要）。
+ * provider 解析不出来时不截断（保持旧行为，交给上游报错）。
+ */
+function fitSummaryInputsToBudget(
+  newTranscript: string,
+  runningContext: string,
+  courseContext: string,
+  provider: LLMProviderConfig | null
+): { transcript: string; context: string } {
+  if (!provider || !provider.contextWindow) {
+    return { transcript: newTranscript, context: runningContext };
+  }
+  const { inputBudget } = computeContextBudget(provider, provider.contextWindow);
+  const overhead =
+    SUMMARY_PROMPT_OVERHEAD_TOKENS + estimateTokens(courseContext);
+  const available = inputBudget - overhead;
+  if (available <= 0) {
+    // 窗口小到连模板都塞不下 —— 尽力给一小段，交给上游决定成败。
+    return {
+      transcript: truncateToTokensFromEnd(newTranscript, 200),
+      context: '',
+    };
+  }
+
+  let context = runningContext;
+  const contextBudget = Math.floor(available * 0.5);
+  if (estimateTokens(context) > contextBudget) {
+    context = truncateToTokensFromEnd(context, contextBudget);
+  }
+  let transcript = newTranscript;
+  const transcriptBudget = Math.max(200, available - estimateTokens(context));
+  if (estimateTokens(transcript) > transcriptBudget) {
+    transcript = truncateToTokensFromEnd(transcript, transcriptBudget);
+  }
+
+  if (transcript !== newTranscript || context !== runningContext) {
+    summarizeLogger.warn(
+      {
+        contextWindow: provider.contextWindow,
+        inputBudget,
+        transcriptChars: newTranscript.length,
+        boundedTranscriptChars: transcript.length,
+        contextChars: runningContext.length,
+        boundedContextChars: context.length,
+      },
+      '实时摘要输入超出该模型上下文预算，已按预算截断（避免必然失败的循环重试）'
+    );
+  }
+  return { transcript, context };
+}
 
 export async function POST(req: Request) {
   const user = await verifyAuth(req);
@@ -69,13 +132,6 @@ export async function POST(req: Request) {
       LLM_LIMITS.providerOverride
     );
 
-    const { system, user: userMsg } = buildIncrementalSummaryPrompt(
-      newTranscript,
-      runningContext,
-      courseContext || 'University lecture',
-      language
-    );
-
     // 先只解析用户组能力 + 用户信息（identifier 传 undefined）：摘要模型由用户组/全局默认决定，
     // 与用户可选的聊天模型无关。此处不带 providerOverride，避免一个失效/越权的 override 在解析
     // 组摘要模型之前就把摘要 403 掉（组绑定模型本该按优先级胜出）；enforceDefaultModelAccess:false
@@ -101,14 +157,45 @@ export async function POST(req: Request) {
       | { modelId: string }
       | { providerOverride: string }
       | { purpose: LlmPurpose };
+    // L41：同时把解析到的 provider 配置留下来 —— 实时摘要此前只有「字符数」上限
+    // （newTranscript 50K / runningContext 50K），完全不看模型的 contextWindow。
+    // 8K 窗口的模型遇上 50K 字符必然 400，而客户端失败后会把原文 unshift 回 buffer
+    // 原样重发 → 每个触发周期循环失败一次。这里按真实窗口预算截断，把"必然失败"
+    // 变成"内容略有截断但成功"。
+    let providerForBudget: LLMProviderConfig | null = null;
     if (realtimeSummaryModelId) {
-      routing = (await resolveSummaryModel(realtimeSummaryModelId, 'REALTIME_SUMMARY')).routing;
+      const resolved = await resolveSummaryModel(
+        realtimeSummaryModelId,
+        'REALTIME_SUMMARY'
+      );
+      routing = resolved.routing;
+      providerForBudget = resolved.provider;
     } else if (providerOverride) {
       const overrideSelection = await resolveAuthorizedLlmSelection(user.id, providerOverride);
       routing = buildLlmRoutingOptions(overrideSelection, 'REALTIME_SUMMARY');
+      providerForBudget = overrideSelection.providerConfig ?? null;
     } else {
-      routing = { purpose: 'REALTIME_SUMMARY' };
+      // resolveSummaryModel(null, …) 等价于 { purpose: 'REALTIME_SUMMARY' }，
+      // 顺带把全局默认模型的 contextWindow 一并解析出来。
+      const resolved = await resolveSummaryModel(null, 'REALTIME_SUMMARY');
+      routing = resolved.routing;
+      providerForBudget = resolved.provider;
     }
+
+    const { transcript: boundedTranscript, context: boundedContext } =
+      fitSummaryInputsToBudget(
+        newTranscript,
+        runningContext,
+        courseContext,
+        providerForBudget
+      );
+
+    const { system, user: userMsg } = buildIncrementalSummaryPrompt(
+      boundedTranscript,
+      boundedContext,
+      courseContext || 'University lecture',
+      language
+    );
 
     const result = await callLLM(system, userMsg, routing);
 

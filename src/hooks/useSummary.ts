@@ -16,6 +16,10 @@ export function useSummary() {
   const setError = useSummaryStore((s) => s.setError);
 
   const init = useCallback(() => {
+    // M15：重复 init（换录音/重新开始）时，先让上一个 manager 失效并 abort 在途请求，
+    // 否则旧 manager 的 in-flight summarize resolve 后仍会通过构造时捕获的闭包写 store。
+    managerRef.current?.reset();
+
     const settings = useSettingsStore.getState();
     const token = useAuthStore.getState().token;
 
@@ -63,7 +67,11 @@ export function useSummary() {
   const reset = useCallback(() => {
     managerRef.current?.reset();
     managerRef.current = null;
-  }, []);
+    // reset 会 abort 在途 summarize，那次请求不再回调 onSummaryError/onStateUpdate，
+    // 若不在这里收尾，store 的 isLoading 会永远停在 true（转圈不停）。
+    setLoading(false);
+    setBatchSentences(0);
+  }, [setLoading, setBatchSentences]);
 
   return { init, onNewSentence, triggerManual, reset };
 }

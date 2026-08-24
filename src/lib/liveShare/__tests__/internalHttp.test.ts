@@ -9,20 +9,16 @@ import { Server as SocketIOServer } from 'socket.io';
 import { io as createClient, Socket } from 'socket.io-client';
 import { onceSocketEvent } from '../../../../tests/utils/socket';
 
-const {
-  shareLinkFindUniqueMock,
-  shareLinkFindManyMock,
-  verifyAuthTokenMock,
-  diagnoseEstablishedAuthFamilyTokenMock,
-} = vi.hoisted(() => ({
+const { shareLinkFindUniqueMock, shareLinkFindManyMock } = vi.hoisted(() => ({
   shareLinkFindUniqueMock: vi.fn(),
   shareLinkFindManyMock: vi.fn(),
-  verifyAuthTokenMock: vi.fn(),
-  diagnoseEstablishedAuthFamilyTokenMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
+    // 产物账本（StoredArtifact）走 $queryRaw：不桩它的话草稿/产物解析会抛，
+    // 快照回填被整段吞成空盘态。返回空数组 = 没有账本行 → 回退 legacy 路径。
+    $queryRaw: vi.fn(async () => []),
     shareLink: {
       findUnique: shareLinkFindUniqueMock,
       findMany: shareLinkFindManyMock,
@@ -32,9 +28,8 @@ vi.mock('@/lib/prisma', () => ({
 
 vi.mock('@/lib/auth', () => ({
   CLIENT_SESSION_TOKEN: '__cookie_session__',
-  diagnoseEstablishedAuthFamilyToken: diagnoseEstablishedAuthFamilyTokenMock,
   extractTokenFromCookieHeader: vi.fn(() => null),
-  verifyAuthToken: verifyAuthTokenMock,
+  verifyAuthToken: vi.fn(),
 }));
 
 vi.mock('@/lib/logger', () => {
@@ -69,16 +64,6 @@ describe('handleLiveShareInternalRequest', () => {
   const clients: Socket[] = [];
 
   beforeEach(async () => {
-    const authenticatedSession = {
-      user: { id: 'user-1', email: 'alice@example.com', role: 'ADMIN' },
-      token: { jti: 'jti-1', tokenVersion: 1 },
-      rawToken: 'server-jwt',
-    };
-    verifyAuthTokenMock.mockResolvedValue(authenticatedSession);
-    diagnoseEstablishedAuthFamilyTokenMock.mockResolvedValue({
-      status: 'valid',
-      session: authenticatedSession,
-    });
     shareLinkFindUniqueMock.mockImplementation(
       async ({ where: { token } }: { where: { token: string } }) => {
         if (token !== 'share-token') {
@@ -196,39 +181,6 @@ describe('handleLiveShareInternalRequest', () => {
     await expect(errorPromise).resolves.toEqual({
       message: 'Share link revoked',
       code: 'SHARE_REVOKED',
-    });
-    await expect(disconnectPromise).resolves.toBe('io server disconnect');
-  });
-
-  it('合法通知也即时复核并断开已撤权主持人，不进入网络 grace', async () => {
-    const broadcaster = createClient(baseUrl, {
-      transports: ['websocket'],
-      reconnection: false,
-      auth: {
-        token: 'server-jwt',
-        sessionId: 'session-1',
-        shareToken: 'share-token',
-      },
-    });
-    clients.push(broadcaster);
-    await onceSocketEvent(broadcaster, 'connect');
-    await onceSocketEvent(broadcaster, 'initial_state');
-
-    shareLinkFindUniqueMock.mockResolvedValue(null);
-    const errorPromise = onceSocketEvent<{ code: string }>(
-      broadcaster,
-      'share_error'
-    );
-    const disconnectPromise = onceSocketEvent<string>(
-      broadcaster,
-      'disconnect'
-    );
-    const response = await postRevalidate(signedBody());
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ evicted: 0 });
-    await expect(errorPromise).resolves.toMatchObject({
-      code: 'BROADCASTER_AUTH_REVOKED',
     });
     await expect(disconnectPromise).resolves.toBe('io server disconnect');
   });

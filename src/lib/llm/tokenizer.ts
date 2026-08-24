@@ -94,10 +94,35 @@ export function truncateToTokensFromEnd(text: string, maxTokens: number): string
   const tokens = encode(source);
   if (tokens.length <= maxTokens) return source;
 
-  // 简单近似：按 token 比例反推字符位置，从尾部取
+  // 先按 token 比例反推字符位置，从尾部取
   const ratio = maxTokens / tokens.length;
   const charStart = Math.max(0, Math.floor(source.length * (1 - ratio)));
-  return source.slice(charStart);
+  let result = source.slice(charStart);
+
+  // L38①：比例反推是**近似** —— 它假设 token 密度均匀，而尾部若比全文更密
+  // （CJK/拉丁混排、代码块），保留下来的尾巴 token 数会**超过** maxTokens。
+  // 这个函数是各处预算裁剪的最后一道闸，超一点就可能让整段上下文越过上游窗口 → 400。
+  // 这里再用真编码校正几轮收紧，保证返回值确实 ≤ maxTokens。
+  // result 本就只有 ~maxTokens 量级，重编码成本与上面那次同级。
+  //
+  // 每轮至少多切 5%：纯按比例切在「被切掉的头部比整体更稀疏」时收敛极慢
+  // （比例算出来的量总是不够），5% 下限保证有限轮内一定收敛；代价是可能略微
+  // 少于 maxTokens —— 对预算裁剪来说，少一点是安全方向，多一点会直接 400。
+  let resultTokens = encode(result).length;
+  for (
+    let guard = 0;
+    guard < 16 && resultTokens > maxTokens && result.length > 0;
+    guard++
+  ) {
+    const overshootRatio = (resultTokens - maxTokens) / resultTokens;
+    const cut = Math.max(
+      1,
+      Math.ceil(Math.max(overshootRatio, 0.05) * result.length)
+    );
+    result = result.slice(cut);
+    resultTokens = encode(result).length;
+  }
+  return result;
 }
 
 /**

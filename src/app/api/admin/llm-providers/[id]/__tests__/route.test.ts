@@ -97,14 +97,6 @@ describe('PATCH /api/admin/llm-providers/[id] — SEC-034 凭据换靶闸', () =
       { address: '93.184.216.34', family: 4 },
     ]);
 
-    vi.stubEnv(
-      'LLM_PROVIDER_ALLOWED_ORIGINS',
-      [
-        'https://api.vendor.example',
-        'https://llm2.corp.example',
-        'https://api.newvendor.example',
-      ].join(',')
-    );
 
     requireAdminAccessMock.mockResolvedValue({
       user: { id: 'admin-1', email: 'admin@example.com', role: 'ADMIN' },
@@ -285,10 +277,18 @@ describe('PATCH /api/admin/llm-providers/[id] — SEC-034 凭据换靶闸', () =
     expect(reauthMock).not.toHaveBeenCalled();
   });
 
-  it('fresh key 也不能把端点改到 allowlist 之外', async () => {
+  // 已去掉 origin 白名单：自托管场景下管理员和能改 .env 的是同一个人，那道闸挡不住任何人，
+  // 只是每加一个网关都要登机器重启。指向哪个**公网**厂商是管理员的决定。
+  // 但与配置无关的那半边仍然强制：指向内网 / 回环 / 云元数据地址一律拒绝，
+  // 哪怕重填了密钥、也过了重认证 —— 那是 SSRF，不是选型。
+  it.each([
+    ['内网地址', 'https://10.0.0.7/v1'],
+    ['云元数据地址', 'https://169.254.169.254/v1'],
+    ['回环地址', 'https://127.0.0.1:8080/v1'],
+  ])('fresh key 也不能把端点改到%s', async (_label, apiBase) => {
     const res = await PATCH(
       makeRequest({
-        apiBase: 'https://attacker.example/v1',
+        apiBase,
         apiKey: 'brand-new-key',
         currentPassword: 'admin-password',
       }),
@@ -298,6 +298,22 @@ describe('PATCH /api/admin/llm-providers/[id] — SEC-034 凭据换靶闸', () =
     expect(reauthMock).not.toHaveBeenCalled();
     expect(providerUpdateMock).not.toHaveBeenCalled();
     expect(securityAuditMock).toHaveBeenCalled();
+  });
+
+  it('公网厂商端点在重填密钥并通过重认证后放行（不再有 origin 白名单）', async () => {
+    const res = await PATCH(
+      makeRequest({
+        apiBase: 'https://api.some-other-vendor.example/v1',
+        apiKey: 'brand-new-key',
+        currentPassword: 'admin-password',
+      }),
+      { params }
+    );
+    expect(res.status).toBe(200);
+    expect(providerUpdateMock.mock.calls[0][0].data).toMatchObject({
+      apiBase: 'https://api.some-other-vendor.example/v1',
+      apiKey: 'enc:brand-new-key',
+    });
   });
 
   it('query secret 拒绝审计只记录计数/哈希，不记录 key 或值；审计失败时关闭失败', async () => {

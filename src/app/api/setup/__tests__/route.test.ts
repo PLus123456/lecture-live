@@ -8,7 +8,7 @@ import { Prisma } from '@prisma/client';
  * + 10 次/10 分钟限流，而完整接管只需要 3-4 个请求：建隐藏管理员 / 把 LLM 端点指向
  * 攻击者 / 把 Soniox 端点指向攻击者 / 抢先置位 setup_complete 把实例锁死。
  *
- * 这里 LLM exact-origin policy 保持真实，验证 setup 不会成为 allowlist 旁路。
+ * 这里 LLM 出站策略保持真实，验证 setup 不会成为 SSRF 旁路。
  */
 
 const {
@@ -108,12 +108,10 @@ function makeRequest(body: unknown, headers: Record<string, string> = {}): Reque
 
 const BOOTSTRAP_TOKEN = 'test-bootstrap-token-32-bytes-minimum-value';
 const ORIGINAL_BOOTSTRAP_TOKEN = process.env.SETUP_BOOTSTRAP_TOKEN;
-const ORIGINAL_LLM_ALLOWED_ORIGINS = process.env.LLM_PROVIDER_ALLOWED_ORIGINS;
 
 beforeEach(() => {
   vi.clearAllMocks();
   process.env.SETUP_BOOTSTRAP_TOKEN = BOOTSTRAP_TOKEN;
-  process.env.LLM_PROVIDER_ALLOWED_ORIGINS = 'https://api.openai.com';
   dnsLookupMock.mockResolvedValue([{ address: '93.184.216.34', family: 4 }]);
   llmReauthMock.mockResolvedValue({ ok: true });
   llmSecurityAuditMock.mockResolvedValue(undefined);
@@ -142,11 +140,6 @@ beforeEach(() => {
 afterEach(() => {
   if (ORIGINAL_BOOTSTRAP_TOKEN === undefined) delete process.env.SETUP_BOOTSTRAP_TOKEN;
   else process.env.SETUP_BOOTSTRAP_TOKEN = ORIGINAL_BOOTSTRAP_TOKEN;
-  if (ORIGINAL_LLM_ALLOWED_ORIGINS === undefined) {
-    delete process.env.LLM_PROVIDER_ALLOWED_ORIGINS;
-  } else {
-    process.env.LLM_PROVIDER_ALLOWED_ORIGINS = ORIGINAL_LLM_ALLOWED_ORIGINS;
-  }
 });
 
 describe('POST /api/setup —— 未认证引导窗口 (C02 / P6-4)', () => {
@@ -423,7 +416,7 @@ describe('POST /api/setup step=admin —— 首个管理员的并发抢占 (C02 
   });
 });
 
-describe('POST /api/setup —— LLM exact-origin policy (SEC-034)', () => {
+describe('POST /api/setup —— LLM 出站策略 (SEC-034)', () => {
   beforeEach(() => {
     userCountMock.mockResolvedValue(1);
     verifyAuthMock.mockResolvedValue({
@@ -439,8 +432,7 @@ describe('POST /api/setup —— LLM exact-origin policy (SEC-034)', () => {
     'http://169.254.169.254/latest/meta-data',
     'http://[::1]:3000',
     'not-a-url',
-    'https://attacker.example/v1',
-  ])('step=llm 拒绝非 allowlist/非法 apiBase: %s', async (apiBase) => {
+  ])('step=llm 拒绝内网/回环/元数据/非法 apiBase: %s', async (apiBase) => {
     const res = await POST(
       makeRequest({
         step: 'llm',
@@ -510,6 +502,27 @@ describe('POST /api/setup —— LLM exact-origin policy (SEC-034)', () => {
     );
   });
 
+  it('任意公网厂商 origin 都放行（已去掉 origin 白名单）', async () => {
+    const res = await POST(
+      makeRequest({
+        step: 'llm',
+        currentPassword: 'admin-password',
+        providers: [
+          {
+            name: 'other-vendor',
+            apiKey: 'k',
+            apiBase: 'https://api.some-other-vendor.example/v1',
+          },
+        ],
+      })
+    );
+
+    expect(res.status).toBe(200);
+    expect(llmProviderCreateMock.mock.calls[0][0].data.apiBase).toBe(
+      'https://api.some-other-vendor.example/v1'
+    );
+  });
+
   it('整批先验证：后一个 origin 被拒时前一个也不得落库', async () => {
     const res = await POST(
       makeRequest({
@@ -517,7 +530,12 @@ describe('POST /api/setup —— LLM exact-origin policy (SEC-034)', () => {
         currentPassword: 'admin-password',
         providers: [
           { name: 'openai', apiKey: 'k1', apiBase: 'https://api.openai.com/v1' },
-          { name: 'evil', apiKey: 'k2', apiBase: 'https://attacker.example/v1' },
+          // 换靶到内网仍然被拒；公网厂商已不再需要白名单。
+          {
+            name: 'evil',
+            apiKey: 'k2',
+            apiBase: 'http://169.254.169.254/latest/meta-data',
+          },
         ],
       })
     );
@@ -593,14 +611,18 @@ describe('POST /api/setup —— LLM exact-origin policy (SEC-034)', () => {
     expect(llmProviderCreateMock).not.toHaveBeenCalled();
   });
 
-  it('allowlist 拒绝审计写失败时返回 500 且关闭失败', async () => {
+  it('SSRF 拒绝的审计写失败时返回 500 且关闭失败', async () => {
     llmSecurityAuditMock.mockRejectedValue(new Error('audit unavailable'));
     const res = await POST(
       makeRequest({
         step: 'llm',
         currentPassword: 'admin-password',
         providers: [
-          { name: 'evil', apiKey: 'k', apiBase: 'https://attacker.example/v1' },
+          {
+            name: 'evil',
+            apiKey: 'k',
+            apiBase: 'http://169.254.169.254/latest/meta-data',
+          },
         ],
       })
     );

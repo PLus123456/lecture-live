@@ -43,7 +43,6 @@ function redirectResponse(): Response {
 
 describe('LLM network sinks reject provider redirects', () => {
   beforeEach(() => {
-    vi.stubEnv('LLM_PROVIDER_ALLOWED_ORIGINS', 'https://8.8.8.8');
     claimLlmTokenBudgetMock.mockReset().mockResolvedValue('job-1');
     completeActiveJobMock.mockReset().mockResolvedValue(undefined);
     failActiveJobMock.mockReset().mockResolvedValue(undefined);

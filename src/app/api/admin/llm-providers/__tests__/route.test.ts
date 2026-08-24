@@ -102,7 +102,6 @@ describe('POST /api/admin/llm-providers', () => {
     dnsLookupMock.mockReset().mockResolvedValue([
       { address: '93.184.216.34', family: 4 },
     ]);
-    vi.stubEnv('LLM_PROVIDER_ALLOWED_ORIGINS', 'https://api.example.com');
 
     // 默认：鉴权通过
     requireAdminAccessMock.mockResolvedValue({

@@ -110,7 +110,6 @@ ENCRYPTION_KEY=<生成的另一个随机字符串>
 
 # 首次进入 LLM 配置步骤前必填：逐个填写实际 provider 的精确 origin，逗号分隔
 # 只写协议 + 主机 + 非默认端口，不写路径、查询串、通配符，也不会自动放行子域
-LLM_PROVIDER_ALLOWED_ORIGINS=https://你的-llm-provider-origin.example
 
 # 可信代理拓扑（标准部署：公网 -> 本机 Nginx -> 回环 Web/WS）
 TRUSTED_PROXY_HOPS=1
@@ -127,24 +126,9 @@ SETUP_BOOTSTRAP_TOKEN=<openssl rand -hex 32>
 
 > **注意：** `.env` 文件中值可以用引号包裹（`KEY="value"`），`node --env-file` 会正确解析。
 >
-> **LLM 出站边界：** `LLM_PROVIDER_ALLOWED_ORIGINS` 缺失或为空时，setup、管理后台保存和运行时
-> LLM 请求都会关闭失败。只加入你实际使用的 provider 精确 origin；私网、本机以及 DNS 解析到
-> 任一私网地址的主机仍会拒绝。生产环境强制 HTTPS。仅 `NODE_ENV=development` 的本地开发
-> 确需 HTTP 时才可另设 `LLM_PROVIDER_ALLOW_INSECURE_HTTP=true`。修改后需重启 Web 服务。
->
-> **重要：** `DATABASE_URL` 和 `REDIS_URL` 是标准 URL 格式，如果密码中包含 `@`、`#`、`/`、`:` 等特殊字符，**必须进行 URL 编码**，否则 Prisma 会解析失败。常见编码：
->
-> | 字符 | 编码 |
-> |------|------|
-> | `@` | `%40` |
-> | `#` | `%23` |
-> | `/` | `%2F` |
-> | `:` | `%3A` |
->
-> 例如密码为 `Pass@2026`，`DATABASE_URL` 应写为：
-> ```ini
-> DATABASE_URL="mysql://lecturelive:Pass%402026@localhost:3306/lecturelive"
-> ```
+> **LLM 出站边界：** 不设 origin 白名单（自托管场景下管理员与能改 .env 的是同一个人，
+> 白名单只增加运维成本、挡不住任何人）。仍然强制的是与配置无关的那部分：只走 HTTPS、
+> 不跟任何 3xx 重定向、DNS 结果钉住后再连（防重绑定）、私网/回环/链路本地地址一律拒绝。
 
 ### 7. 编译
 
@@ -211,7 +195,7 @@ unset TOKEN
 在浏览器正常登录这个管理员账号，再完成数据库检查、LLM、Soniox 和完成标记。浏览器里的
 `/setup` 在尚无管理员时返回 401 是预期行为；它绝不会读取部署引导密钥。
 
-`step=llm` 填写的地址必须命中 `LLM_PROVIDER_ALLOWED_ORIGINS` 的精确 origin，并通过 DNS/私网校验；
+`step=llm` 填写的地址必须是 HTTPS、不带 query，并通过 DNS/私网校验；
 `step=soniox` 也会做私网黑名单校验，
 `step=complete` 要求管理员已存在——避免匿名者抢先把实例标记为「已完成设置」而锁死。
 

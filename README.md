@@ -249,19 +249,23 @@ See [`.env.example`](.env.example) for the full environment variable list. The m
 | `NEXT_PUBLIC_APP_URL` | Public web URL, default `http://localhost:3000` |
 | `NEXT_PUBLIC_WS_URL` | Public WebSocket URL, default `http://localhost:3001` |
 | `SETUP_BOOTSTRAP_TOKEN` | Required 32+ byte secret used only to claim the first admin |
-| `LLM_PROVIDER_ALLOWED_ORIGINS` | Required comma-separated exact origins for configured LLM providers |
 | `TRUSTED_PROXY_HOPS` | Explicit trusted proxy hop count (`1` for shipped Nginx, `0` for direct local dev) |
 | `TRUSTED_PROXY_CIDRS` | Controlled intermediary proxy networks required for multi-hop deployments |
 
 > LLM provider keys and Soniox credentials are best managed from the admin dashboard, where they can be stored encrypted in the database. Environment variables are mainly a fallback path.
 
-Before the LLM setup step, replace the `LLM_PROVIDER_ALLOWED_ORIGINS` placeholder with the
-exact origin of each provider you actually use (scheme, hostname, and non-default port), for
-example the origin portion of its documented API URL. Missing or empty configuration fails
-closed, paths and wildcards are invalid, subdomains are not inherited, and private/local or
-privately resolving hosts are rejected. HTTPS is required in production. Plain HTTP can only be
-enabled explicitly in `NODE_ENV=development` with `LLM_PROVIDER_ALLOW_INSECURE_HTTP=true`.
-Restart the web process after changing these server environment variables.
+LLM provider endpoints are configured entirely from the admin dashboard — there is no
+environment allowlist to maintain. On a self-hosted deployment the administrator and whoever
+can edit the deployment env are the same person, so such a list adds no boundary while costing
+a shell session and a restart per provider.
+
+The outbound rules that remain need no configuration and cannot be relaxed from the dashboard:
+HTTPS only, no query string or userinfo in the base URL, no redirect is ever followed (Node
+strips `Authorization` across origins but keeps headers such as Anthropic's `x-api-key`), DNS
+answers are pinned for the actual connection so a rebinding host cannot answer public for
+validation and private for the socket, and private, loopback or link-local addresses are
+rejected. Plain HTTP can only be enabled explicitly in `NODE_ENV=development` with
+`LLM_PROVIDER_ALLOW_INSECURE_HTTP=true`.
 
 ### Cloudreve OAuth (v4)
 

@@ -6,11 +6,8 @@ import { BlockList, isIP } from 'node:net';
 import { domainToASCII } from 'node:url';
 import { Agent, type Dispatcher } from 'undici';
 
-export const LLM_ALLOWED_ORIGINS_ENV = 'LLM_PROVIDER_ALLOWED_ORIGINS';
 export const LLM_ALLOW_INSECURE_HTTP_ENV = 'LLM_PROVIDER_ALLOW_INSECURE_HTTP';
 
-const MAX_ALLOWLIST_BYTES = 16 * 1024;
-const MAX_ALLOWLIST_ENTRIES = 64;
 const MAX_PROVIDER_URL_BYTES = 8 * 1024;
 const MAX_DNS_ADDRESSES = 32;
 const DNS_LOOKUP_TIMEOUT_MS = 3_000;
@@ -106,7 +103,7 @@ function canonicalHostname(hostname: string): string {
 
 function parseHttpUrl(
   value: string,
-  options?: { originEntry?: boolean }
+
 ): { url: URL; origin: string; hostname: string } {
   if (Buffer.byteLength(value, 'utf8') > MAX_PROVIDER_URL_BYTES) {
     throw new LlmOutboundPolicyError('LLM provider URL is too large');
@@ -144,11 +141,6 @@ function parseHttpUrl(
   url.hostname = hostname;
   const origin = url.origin;
 
-  if (options?.originEntry && url.pathname !== '/') {
-    throw new LlmOutboundPolicyError(
-      `${LLM_ALLOWED_ORIGINS_ENV} entries must be origins without a path`
-    );
-  }
 
   return { url, origin, hostname };
 }
@@ -235,15 +227,9 @@ type ResolvedLlmTarget = {
 
 async function resolveLlmProviderTarget(
   value: string,
-  rawAllowlist: string | undefined,
   dependencies: Pick<LlmOutboundDependencies, 'lookupAddresses'>
 ): Promise<ResolvedLlmTarget> {
   const { url, origin, hostname } = parseHttpUrl(value);
-  const allowed = parseLlmAllowedOrigins(rawAllowlist);
-  if (!allowed.has(origin)) {
-    throw new LlmOutboundPolicyError('LLM provider origin is not allowlisted');
-  }
-
   const addresses = await resolvePublicAddresses(
     hostname,
     dependencies.lookupAddresses ?? defaultLookupAddresses
@@ -295,50 +281,25 @@ function createPinnedDispatcher(addresses: readonly string[]): Dispatcher {
   });
 }
 
-export function parseLlmAllowedOrigins(
-  raw = process.env[LLM_ALLOWED_ORIGINS_ENV]
-): ReadonlySet<string> {
-  const configured = raw?.trim() ?? '';
-  if (!configured) {
-    // Empty must never mean "all public hosts". That would silently remove the
-    // trust boundary whenever an operator forgot to deploy the new setting.
-    throw new LlmOutboundPolicyError(
-      `${LLM_ALLOWED_ORIGINS_ENV} must contain at least one trusted origin`
-    );
-  }
-  if (Buffer.byteLength(configured, 'utf8') > MAX_ALLOWLIST_BYTES) {
-    throw new LlmOutboundPolicyError(`${LLM_ALLOWED_ORIGINS_ENV} is too large`);
-  }
-
-  const entries = configured.split(/[\s,;]+/).filter(Boolean);
-  if (entries.length === 0 || entries.length > MAX_ALLOWLIST_ENTRIES) {
-    throw new LlmOutboundPolicyError(
-      `${LLM_ALLOWED_ORIGINS_ENV} must contain 1-${MAX_ALLOWLIST_ENTRIES} origins`
-    );
-  }
-
-  const origins = new Set<string>();
-  for (const entry of entries) {
-    origins.add(parseHttpUrl(entry, { originEntry: true }).origin);
-  }
-  return origins;
-}
-
 /**
  * Validate and canonicalize a persisted provider base URL.
  *
- * The allowlist binds scheme + ASCII hostname + effective port. It deliberately
- * does not inherit the registration-email allowlist's implicit subdomain match:
- * an allowed vendor apex must not authorize an attacker-controlled child host.
- * Literal and resolved addresses are also checked against non-public ranges, so
- * an allowlist entry cannot turn into a private-network SSRF exception.
+ * There is no origin allowlist: on a self-hosted single-operator deployment the
+ * administrator and the person who can edit the deployment env are the same
+ * person, so an env-var allowlist adds no boundary against the only party it
+ * could restrict — it only costs an SSH round trip and a restart per provider.
+ *
+ * What remains is the part that protects against the host itself misbehaving,
+ * and costs the operator nothing: literal and DNS-resolved addresses are checked
+ * against non-public ranges, the resolved answer set is pinned for the actual
+ * connection (so a rebinding server cannot answer public for validation and
+ * private for the socket), and redirects are never followed.
  */
 export async function validateLlmProviderBaseUrl(
   value: string,
-  rawAllowlist = process.env[LLM_ALLOWED_ORIGINS_ENV],
   dependencies: Pick<LlmOutboundDependencies, 'lookupAddresses'> = {}
 ): Promise<string> {
-  return (await resolveLlmProviderTarget(value, rawAllowlist, dependencies)).url;
+  return (await resolveLlmProviderTarget(value, dependencies)).url;
 }
 
 /** Validate at the actual network sink, refuse redirects, and never forward secrets to a new origin. */
@@ -347,7 +308,7 @@ export async function fetchLlmOutbound(
   init: RequestInit = {},
   dependencies: LlmOutboundDependencies = {}
 ): Promise<Response> {
-  const target = await resolveLlmProviderTarget(value, undefined, dependencies);
+  const target = await resolveLlmProviderTarget(value, dependencies);
   // SEC-034: DNS validation and connection establishment must use the same answer set. A normal
   // fetch would resolve the hostname again, allowing a rebinding server to return a public IP for
   // policy validation and a private IP for the socket. The pinned lookup preserves the original

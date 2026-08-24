@@ -68,21 +68,4 @@ elif [[ -z "$(read_env_value TRUSTED_PROXY_CIDRS)" ]]; then
 fi
 unset PROXY_HOPS
 
-# LLM 出站白名单是**必填**：parseLlmAllowedOrigins 在为空时抛异常，而它挂在每一次
-# 出站调用上 —— 聊天、摘要、关键词、报告、embedding、翻译会全部 500。这个失败发生在
-# 运行时、没有任何启动期提示，所以在升级闸这里就拦下来，比上线后再一条条排查便宜得多。
-# 只做「配了没有」的形状检查；具体 origin 是否可达由应用侧校验。
-LLM_ALLOWED_ORIGINS=$(read_env_value LLM_PROVIDER_ALLOWED_ORIGINS)
-if [[ -z "$LLM_ALLOWED_ORIGINS" ]]; then
-    echo "[ERROR] 缺少 LLM_PROVIDER_ALLOWED_ORIGINS：服务端只允许访问这里逐个列出的精确 origin。" >&2
-    echo "        未配置时全部 LLM 调用（聊天/摘要/关键词/报告/翻译）都会失败。" >&2
-    echo "        例：LLM_PROVIDER_ALLOWED_ORIGINS=https://api.your-llm-vendor.example" >&2
-    exit 1
-fi
-if [[ "$LLM_ALLOWED_ORIGINS" == *replace-with-your-llm-provider* ]]; then
-    echo "[ERROR] LLM_PROVIDER_ALLOWED_ORIGINS 仍是 .env.example 里的占位值，请替换为真实 origin。" >&2
-    exit 1
-fi
-unset LLM_ALLOWED_ORIGINS
-
 chmod 600 "$ENV_FILE"

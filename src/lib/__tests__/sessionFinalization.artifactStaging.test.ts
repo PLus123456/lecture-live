@@ -65,6 +65,11 @@ vi.mock('@/lib/prisma', () => ({
       update: vi.fn().mockResolvedValue(undefined),
     },
     user: { findUnique: vi.fn().mockResolvedValue(null) },
+    // 收尾会 fire-and-forget 地跑 runBackgroundLLMTasks → isPaymentBenefitAvailable，
+    // 后者走 $queryRaw 查支付冻结。不桩它的话 rejection 逃出用例、变成 vitest 的
+    // unhandled error：**用例全绿但进程非零退出**（CI run 32793691955 就是这样）。
+    // 返回空数组 = 账户没有支付争议冻结。
+    $queryRaw: vi.fn(async () => []),
     $transaction: (...a: unknown[]) => transactionMock(...a),
   },
 }));

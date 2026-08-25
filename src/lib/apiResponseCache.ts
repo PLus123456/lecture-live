@@ -99,6 +99,11 @@ export async function getOrSetApiCache<T>(
   ttlSeconds: number,
   loader: () => Promise<T>
 ): Promise<{ hit: boolean; value: T }> {
+  // 失效窗口必须从**进入本函数**就开始算，不能等到 loader 之前才取。
+  // 下面的 `await redis.get(...)` 是一个真实的挂起点：在它挂起期间发生的失效，
+  // 若用挂起之后取的时刻做基准，就会被判成「早于本次加载」，于是陈旧值照常写回
+  // Redis 并带上完整 TTL —— 正是 L51 要防的那件事（删/改之后 30 秒内仍读到旧列表）。
+  const startedAt = Date.now();
   const redis = getRedisClient();
   const namespacedKey = buildNamespacedKey(key);
 
@@ -122,11 +127,10 @@ export async function getOrSetApiCache<T>(
     return { hit: false, value: (await existing) as T };
   }
 
-  const startedAt = Date.now();
   const load = (async () => {
     const value = await loader();
 
-    // L51 时序保护：loader 期间该前缀被失效过 → 这份值可能已经过时，只返回不写回。
+    // L51 时序保护：本次调用开始之后该前缀被失效过 → 这份值可能已经过时，只返回不写回。
     const invalidatedDuringLoad = latestInvalidationFor(key) >= startedAt;
 
     if (!invalidatedDuringLoad) {

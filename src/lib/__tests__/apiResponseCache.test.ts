@@ -205,6 +205,45 @@ describe('L51 getOrSetApiCache —— 并发 miss 不再击穿', () => {
     expect(redisSetMock).not.toHaveBeenCalled();
   });
 
+  it('★ 失效发生在**读缓存**挂起期间（不是 loader 期间）→ 同样不得写回', async () => {
+    // 全量套件跑起来时真的挂过这条形态：`await redis.get(...)` 是一个真实挂起点，
+    // 失效若落在这个窗口里，而基准时刻取在挂起之后，陈旧值就会被判成「本次加载之后
+    // 才产生的新值」照常写回，并带上完整 TTL（删/改之后 30 秒内仍读到旧列表）。
+    //
+    // 必须显式推进系统时钟：两个时刻落在同一毫秒时 `>=` 会恰好兜住，用例就失去分辨力
+    // （第一版正是这样写的，把 startedAt 挪回错误位置也照样绿）。
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000);
+
+      const { getOrSetApiCache: get, invalidateFoldersApiCache: invalidate } =
+        await import('@/lib/apiResponseCache');
+
+      let releaseGet: (() => void) | null = null;
+      const getGate = new Promise<void>((resolve) => {
+        releaseGet = resolve;
+      });
+      redisGetMock.mockImplementationOnce(async () => {
+        await getGate;
+        return null; // miss，随后走 loader
+      });
+
+      const pending = get('folders:user:u2:list', 30, async () => ({ stale: true }));
+
+      // 读缓存还挂着的时候，另一路提交了写入并失效了这个前缀
+      await invalidate('u2');
+      // 失效之后时钟继续走：基准时刻若取在这之后，就会漏判
+      vi.setSystemTime(1_005);
+      releaseGet!();
+
+      const result = await pending;
+      expect(result.value).toEqual({ stale: true });
+      expect(redisSetMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('没有并发失效时照常写回缓存', async () => {
     const { getOrSetApiCache: get } = await import('@/lib/apiResponseCache');
     await get('folders:user:u9:list', 30, async () => ({ ok: 1 }));

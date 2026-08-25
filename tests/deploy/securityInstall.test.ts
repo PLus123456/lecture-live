@@ -192,3 +192,40 @@ describe('all systemd deployment entrypoints share the security and DB gates', (
     expect(webStart).toBeGreaterThan(databaseGate);
   });
 });
+
+/**
+ * artifact 账本回填是 ensure-database 的第 ⑦ 步，而 ensure-database 在三条部署路径上
+ * 都排在服务启动之前、且都是 fail-fast（upgrade.sh `set -e` + 此前已 systemctl stop；
+ * docker-entrypoint.sh `set -eu`）。所以这个脚本本身跑不起来 = 部署阻断，不是"某个功能没生效"。
+ *
+ * 下面两条钉住它跑起来的两个前提，各自都真实挂过一次。
+ */
+describe('artifact 回填脚本的运行前提（部署阻断级）', () => {
+  const launcher = readFileSync(
+    path.join(ROOT, 'scripts/backfill-stored-artifacts.mjs'),
+    'utf8'
+  );
+
+  it('产物必须落在项目内，否则 --external 的 @prisma/client 解析不到', () => {
+    // ESM 裸说明符是从**导入文件所在目录**逐级向上找 node_modules 的，与 cwd 无关。
+    // 曾经写成 os.tmpdir()：/tmp 之上没有 node_modules → ERR_MODULE_NOT_FOUND，
+    // 空库也必挂（CI run 32791891307 就是这条）。
+    expect(launcher).toContain("'--external:@prisma/client'");
+    expect(launcher).not.toMatch(/mkdtempSync\(\s*path\.join\(\s*tmpdir\(\)/);
+    expect(launcher).toMatch(/mkdtempSync\(\s*\n?\s*path\.join\(root, 'node_modules'/);
+  });
+
+  it('Docker runner 镜像必须自带 esbuild（回填要现编 TS）', () => {
+    const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+    const runnerStage = dockerfile.slice(dockerfile.indexOf('AS runner'));
+
+    // 脚本硬依赖 node_modules/.bin/esbuild，缺了直接 exit 1。
+    expect(launcher).toContain("'.bin'");
+    expect(launcher).toContain('esbuild');
+
+    expect(runnerStage).toContain('/app/node_modules/esbuild ./node_modules/esbuild');
+    // 平台二进制在 @esbuild/<platform> 下，只带 JS 壳跑不起来。
+    expect(runnerStage).toContain('/app/node_modules/@esbuild ./node_modules/@esbuild');
+    expect(runnerStage).toContain('/app/node_modules/.bin/esbuild');
+  });
+});

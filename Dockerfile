@@ -49,12 +49,19 @@ COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/docker-entrypoint.sh ./docker-entrypoint.sh
 COPY --from=builder /app/deploy/shims ./deploy/shims
+# ensure-database 的第 ⑦ 步（artifact 账本回填）会用 esbuild 现编 scripts/*.ts。
+# runner 里缺它 → 回填脚本 exit 1 → entrypoint 的 `set -e` 在 Web/WS 启动前打死容器，
+# 也就是每次启动都失败。只带 esbuild 自身与它的平台二进制包。
+COPY --from=deps /app/node_modules/esbuild ./node_modules/esbuild
+COPY --from=deps /app/node_modules/@esbuild ./node_modules/@esbuild
 
 # 重建 prisma CLI 的 .bin 软链（npm 原本创建的 node_modules/.bin/prisma → ../prisma/build/index.js，
 # 该文件带 `#!/usr/bin/env node` shebang，ensure-database.mjs 直接 spawn 它）
 RUN mkdir -p /app/node_modules/.bin \
  && ln -sf ../prisma/build/index.js /app/node_modules/.bin/prisma \
  && chmod +x /app/node_modules/prisma/build/index.js \
+ && ln -sf ../esbuild/bin/esbuild /app/node_modules/.bin/esbuild \
+ && chmod +x /app/node_modules/esbuild/bin/esbuild \
  && chown -R nextjs:nodejs /app && chmod 755 /app/docker-entrypoint.sh
 
 USER nextjs

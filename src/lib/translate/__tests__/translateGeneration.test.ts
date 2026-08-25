@@ -1,4 +1,6 @@
 // L23 / L24：翻译调度的「代次绑定」与「孤儿任务补入队」。
+// 另含 #236 的任务级绝对死线、H5 断链任务自愈、以及生存期常量的跨模块不变量
+//（这三块在 824e27f 合并 main 时曾被整段丢弃，此处按当前 harness 口径补回）。
 //
 // L24：用户 retry 会把任务重置回 PENDING + 重新扣一次费 + 换一条新调度行。若上一代的
 //      失败/对账才姗姗来迟，它会打死新一代的任务、退掉新一代的钱、甚至 rm -rf 掉源文件。
@@ -28,6 +30,7 @@ const {
   saveOutputFileMock,
   deleteOutputGenerationMock,
   deleteTranslateJobMock,
+  refundWalletCentsMock,
 } = vi.hoisted(() => ({
   taskUpdateManyMock: vi.fn(),
   taskFindUniqueMock: vi.fn(),
@@ -51,6 +54,7 @@ const {
   saveOutputFileMock: vi.fn(),
   deleteOutputGenerationMock: vi.fn(),
   deleteTranslateJobMock: vi.fn(),
+  refundWalletCentsMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -70,7 +74,11 @@ vi.mock('@/lib/prisma', () => ({
     $transaction: transactionMock,
   },
 }));
-vi.mock('@/lib/wallet', () => ({ refundWalletCents: vi.fn() }));
+vi.mock('@/lib/wallet', () => ({ refundWalletCents: refundWalletCentsMock }));
+// failJob 终态路径的 fire-and-forget 通知：mock 掉避免动态 import 真模块产生杂散 IO。
+vi.mock('@/lib/translate/notify', () => ({
+  sendDocTranslateNotification: vi.fn(async () => undefined),
+}));
 vi.mock('@/lib/jobQueue', () => ({
   JOB_TYPE: { DOC_TRANSLATE: 'doc_translate' },
   JOB_STATUS: {
@@ -170,9 +178,12 @@ beforeEach(() => {
   jobFindManyMock.mockResolvedValue([]);
   jobUpdateManyMock.mockResolvedValue({ count: 1 });
   jobUpdateMock.mockResolvedValue({});
+  jobFindUniqueMock.mockResolvedValue(null);
   taskFindManyMock.mockResolvedValue([]);
   taskUpdateManyMock.mockResolvedValue({ count: 1 });
+  taskFindUniqueMock.mockResolvedValue(null);
   createJobMock.mockResolvedValue('job-new');
+  refundWalletCentsMock.mockResolvedValue(undefined);
   // 被 `.catch(...)` 链式调用的 mock 必须返回 Promise，否则 undefined.catch 抛 TypeError
   // 并被对账的外层 catch 吞掉，测试会静默通过（假绿）。
   deleteTranslateJobMock.mockResolvedValue(undefined);
@@ -1190,5 +1201,303 @@ describe('translation proxy credential generation lifecycle (SEC-021)', () => {
         data: expect.objectContaining({ status: 'SUCCESS' }),
       })
     );
+  });
+});
+
+/**
+ * executeTick 里有三条 translationTask.findMany，必须按 where 精确区分，否则一条 mock 会
+ * 同时喂给三个扫描（死线扫描尤其会拿到没有 createdAt 的替身行而在内部抛错，
+ * 被外层 catch 吞掉 → 用例照样绿，等于把新逻辑测没了）。
+ *   死线扫描：where.createdAt 存在
+ *   H5 断链：where.updatedAt 存在（且无 createdAt；本树的断链扫描带 ORPHAN_TASK_GRACE_MS 宽限）
+ *   L23 孤儿：where.jobQueueId === null
+ */
+type TaskFindManyArgs = {
+  where?: { jobQueueId?: unknown; createdAt?: unknown; updatedAt?: unknown };
+};
+const isDeadlineScan = (args: TaskFindManyArgs) => Boolean(args?.where?.createdAt);
+const isStrandedScan = (args: TaskFindManyArgs) =>
+  Boolean(args?.where?.updatedAt) && !args?.where?.createdAt;
+
+/** 从 taskUpdateMany 的全部调用里挑出满足条件的那一次 */
+function findTaskUpdate(
+  predicate: (call: { where: Record<string, unknown>; data: Record<string, unknown> }) => boolean
+) {
+  return taskUpdateManyMock.mock.calls
+    .map(([args]) => args as { where: Record<string, unknown>; data: Record<string, unknown> })
+    .find(predicate);
+}
+
+/** 从 jobQueue.updateMany 的全部调用里挑出终态 FAILED 那一次（failJob 的 job 行写走 updateMany） */
+function findJobFailedWrite() {
+  return jobUpdateManyMock.mock.calls
+    .map(([args]) => args as { where: Record<string, unknown>; data: { status?: string; params?: string } })
+    .find((a) => a.data?.status === 'FAILED');
+}
+
+/**
+ * 给 refundTaskCharge 一个**能真正跑完**的事务替身。
+ *
+ * 全局 beforeEach 的替身没有 translationTask.findUnique —— 退款体第二步就 TypeError，
+ * 被 refundTaskCharge 自己的 try/catch 吞掉。于是「断言 transactionMock 被调用过」这种写法
+ * 看起来在测退款，其实退款一步都没执行。这里换成有内容的替身，让 refundWalletCents 真的
+ * 被调到，并把认领谓词捞出来核对 L24 代次令牌。
+ */
+function arrangeRefundTx() {
+  const claims: { where: Record<string, unknown> }[] = [];
+  transactionMock.mockImplementation(async (cb: (tx: unknown) => unknown) =>
+    cb({
+      translationTask: {
+        updateMany: async (args: { where: Record<string, unknown> }) => {
+          claims.push(args);
+          return { count: 1 };
+        },
+        findUnique: async () => ({ userId: 'u1', chargedCents: 500 }),
+      },
+    })
+  );
+  return claims;
+}
+
+// H5 的跨模块不变式：僵尸回收阈值必须严格大于本模块承诺的最大运行时。
+// 这两个常量当初就是各改各的漂移开的（jobQueue 2h < translateProcessor 3h）。
+describe('僵尸回收阈值 vs 合法最大运行时 (H5)', () => {
+  it('doc_translate 的回收阈值必须严格大于 MAX_WORKER_RUNTIME_MS', async () => {
+    const jobQueue = await vi.importActual<typeof import('@/lib/jobQueue')>('@/lib/jobQueue');
+    const processor = await import('@/lib/translate/translateProcessor');
+    expect(
+      jobQueue.STALE_PROCESSING_THRESHOLD_BY_TYPE[jobQueue.JOB_TYPE.DOC_TRANSLATE]
+    ).toBeGreaterThan(processor.MAX_WORKER_RUNTIME_MS);
+  });
+
+  // 任务级死线同理：它必须是三者里最外层的那一圈，否则会在任务还合法在跑时
+  // 把它打成终态 + 退款（比 H5 的误杀更糟 —— 那至少不退钱）。
+  it('MAX_TASK_LIFETIME_MS > 僵尸回收阈值 > MAX_WORKER_RUNTIME_MS', async () => {
+    const jobQueue = await vi.importActual<typeof import('@/lib/jobQueue')>('@/lib/jobQueue');
+    const processor = await import('@/lib/translate/translateProcessor');
+    const reclaim =
+      jobQueue.STALE_PROCESSING_THRESHOLD_BY_TYPE[jobQueue.JOB_TYPE.DOC_TRANSLATE];
+
+    expect(processor.MAX_TASK_LIFETIME_MS).toBeGreaterThan(reclaim);
+    expect(reclaim).toBeGreaterThan(processor.MAX_WORKER_RUNTIME_MS);
+    // 还要盖得住一条完整的合法重试链：3 次派发 × 3h + 退避 (5+20+45min)。
+    const legalWorstCase = 3 * processor.MAX_WORKER_RUNTIME_MS + (5 + 20 + 45) * 60_000;
+    expect(processor.MAX_TASK_LIFETIME_MS).toBeGreaterThan(legalWorstCase);
+  });
+});
+
+// ─── 任务级绝对死线（#236） ──────────────────────────────────────────────────
+// MAX_WORKER_RUNTIME_MS 是「每一次派发」的预算而非任务总预算：job.startedAt 在每次回炉
+// SUBMITTED 时都被清空。整个机队长期不可达时任务就在 SUBMITTED ↔ PROCESSING 之间
+// 无限弹跳、永不终态 —— 用户永远看到「翻译中」，chargedCents 一直押着不退。
+describe('executeTick — 任务级绝对死线', () => {
+  const DAY = 24 * 60 * 60_000;
+  /** 让死线扫描（且只让它）拿到一行任务 */
+  function arrangeDeadlineCandidate(row: Record<string, unknown>) {
+    taskFindManyMock.mockImplementation(async (args: TaskFindManyArgs) =>
+      isDeadlineScan(args) ? [row] : []
+    );
+  }
+
+  it('★ 超过死线：走 failJob(retryable:false) → 任务终态 FAILED + 退款 + 不排自动重试', async () => {
+    const old = new Date(Date.now() - 3 * DAY);
+    arrangeDeadlineCandidate({ id: 't1', jobQueueId: 'job-stuck', createdAt: old });
+    jobFindUniqueMock.mockResolvedValue({
+      id: 'job-stuck',
+      type: 'doc_translate',
+      status: 'SUBMITTED', // 弹跳态：既不是 PROCESSING 也没排重试
+      params: JSON.stringify({ taskId: 't1', workerId: 'w1' }),
+      attempt: 1,
+      maxAttempts: 3,
+      createdAt: old,
+    });
+    const refundClaims = arrangeRefundTx();
+
+    await runDocTranslateTick();
+
+    // 任务被打成终态，且带 L24 代次谓词
+    const failWrite = findTaskUpdate((c) => c.data?.status === 'FAILED');
+    expect(failWrite).toBeDefined();
+    expect(failWrite!.where).toEqual(
+      expect.objectContaining({ id: 't1', jobQueueId: 'job-stuck' })
+    );
+    // ★ 退款 —— 释放押着的钱正是这条死线的全部意义
+    expect(refundWalletCentsMock).toHaveBeenCalledTimes(1);
+    expect(refundWalletCentsMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'u1',
+        amountCents: 500,
+        type: 'translation_refund',
+      }),
+      expect.anything()
+    );
+    // 退款认领同样带 L24 代次谓词（幂等闸 refundedAt: null 也要在）
+    expect(refundClaims[0]?.where).toEqual(
+      expect.objectContaining({ id: 't1', jobQueueId: 'job-stuck', refundedAt: null })
+    );
+    // retryable:false ⇒ params 不写 nextRetryAt，到期重试那一圈捞不回它
+    const jobWrite = findJobFailedWrite();
+    expect(jobWrite).toBeDefined();
+    expect(JSON.parse(jobWrite!.data.params ?? '{}')).not.toHaveProperty('nextRetryAt');
+  });
+
+  it('未到死线：一律不动（合法长跑任务绝不能被误杀退款）', async () => {
+    const recent = new Date(Date.now() - 60 * 60_000); // 1h
+    arrangeDeadlineCandidate({ id: 't1', jobQueueId: 'job-live', createdAt: recent });
+    jobFindUniqueMock.mockResolvedValue({
+      id: 'job-live',
+      type: 'doc_translate',
+      status: 'PROCESSING',
+      params: JSON.stringify({ taskId: 't1', workerId: 'w1' }),
+      attempt: 1,
+      maxAttempts: 3,
+      createdAt: recent,
+    });
+
+    await runDocTranslateTick();
+
+    expect(findTaskUpdate((c) => c.data?.status === 'FAILED')).toBeUndefined();
+    expect(refundWalletCentsMock).not.toHaveBeenCalled();
+  });
+
+  it('★ 用户刚重试过（任务行老、本代调度行新）：放行，不当场打死', async () => {
+    // retry 复用同一个 TranslationTask（createdAt 不变）但换一条全新调度行。
+    // 若锚点只看任务 createdAt，隔天来点一次重试会被当场终止 —— 钱虽退了，重试等于不可用。
+    arrangeDeadlineCandidate({
+      id: 't1',
+      jobQueueId: 'job-fresh',
+      createdAt: new Date(Date.now() - 3 * DAY),
+    });
+    jobFindUniqueMock.mockResolvedValue({
+      id: 'job-fresh',
+      type: 'doc_translate',
+      status: 'SUBMITTED',
+      params: JSON.stringify({ taskId: 't1' }),
+      attempt: 1,
+      maxAttempts: 3,
+      createdAt: new Date(Date.now() - 60_000), // 一分钟前刚重试
+    });
+
+    await runDocTranslateTick();
+
+    expect(findTaskUpdate((c) => c.data?.status === 'FAILED')).toBeUndefined();
+    expect(refundWalletCentsMock).not.toHaveBeenCalled();
+  });
+
+  it('★ 机队被停用（getTranslateFleetConfig → null）时死线仍然生效', async () => {
+    // 这是任务永久挂起最彻底的一种形态：executeTick 在 `if (!fleet)` 处直接早退。
+    // 死线判定若排在早退之后就永远够不着它。
+    getTranslateFleetConfigMock.mockResolvedValue(null);
+    const old = new Date(Date.now() - 3 * DAY);
+    arrangeDeadlineCandidate({ id: 't1', jobQueueId: 'job-stuck', createdAt: old });
+    jobFindUniqueMock.mockResolvedValue({
+      id: 'job-stuck',
+      type: 'doc_translate',
+      status: 'SUBMITTED',
+      params: JSON.stringify({ taskId: 't1', workerId: 'w1' }),
+      attempt: 1,
+      maxAttempts: 3,
+      createdAt: old,
+    });
+    arrangeRefundTx();
+
+    await runDocTranslateTick();
+
+    expect(findTaskUpdate((c) => c.data?.status === 'FAILED')).toBeDefined();
+    expect(refundWalletCentsMock).toHaveBeenCalledTimes(1);
+    // 机队没了自然连不上 worker，但不能因此卡住结算
+    expect(deleteTranslateJobMock).not.toHaveBeenCalled();
+  });
+
+  it('扫描 where 必须同时带三个条件（非终态 + 过期 + 有代次令牌）', async () => {
+    arrangeDeadlineCandidate({ id: 't1', jobQueueId: 'j', createdAt: new Date(0) });
+    jobFindUniqueMock.mockResolvedValue(null);
+
+    await runDocTranslateTick();
+
+    const call = taskFindManyMock.mock.calls
+      .map(([a]) => a as { where: Record<string, unknown> })
+      .find((a) => isDeadlineScan(a));
+    expect(call!.where).toEqual(
+      expect.objectContaining({
+        status: { in: ['PENDING', 'TRANSLATING'] },
+        jobQueueId: { not: null },
+        createdAt: { lt: expect.any(Date) },
+      })
+    );
+  });
+});
+
+describe('executeTick — 断链任务自愈 (H5)', () => {
+  /** 让断链扫描（且只让它）拿到一行任务 */
+  function arrangeStrandedCandidate(row: Record<string, unknown>) {
+    taskFindManyMock.mockImplementation(async (args: TaskFindManyArgs) =>
+      isStrandedScan(args) ? [row] : []
+    );
+  }
+
+  it('调度行被僵尸回收直改成 FAILED（绕过 failJob）→ 补做结算：任务终态 + 退款', async () => {
+    arrangeStrandedCandidate({ id: 't1', jobQueueId: 'job-zombie' });
+    jobFindUniqueMock.mockResolvedValue({
+      id: 'job-zombie',
+      type: 'doc_translate',
+      status: 'FAILED',
+      // 僵尸回收不写 nextRetryAt —— 这正是任务永久卡死的原因
+      params: JSON.stringify({ taskId: 't1', workerId: 'w1' }),
+      attempt: 3,
+      maxAttempts: 3,
+    });
+    arrangeRefundTx();
+
+    await runDocTranslateTick();
+
+    const failWrite = findTaskUpdate((c) => c.data?.status === 'FAILED');
+    expect(failWrite).toBeDefined();
+    expect(failWrite!.where).toEqual(
+      expect.objectContaining({ id: 't1', jobQueueId: 'job-zombie' })
+    );
+    // 退款必须真的跑到钱包入账，不能只看事务被调过
+    expect(refundWalletCentsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('调度行还在途（SUBMITTED/PROCESSING）→ 不动它', async () => {
+    arrangeStrandedCandidate({ id: 't1', jobQueueId: 'job-live' });
+    jobFindUniqueMock.mockResolvedValue({
+      id: 'job-live',
+      type: 'doc_translate',
+      status: 'SUBMITTED',
+      params: JSON.stringify({ taskId: 't1' }),
+      attempt: 1,
+      maxAttempts: 3,
+    });
+
+    await runDocTranslateTick();
+
+    expect(findTaskUpdate((c) => c.data?.status === 'FAILED')).toBeUndefined();
+    // 在途的 job 行一个字也不许动（重复 failJob 会顺延退避、白烧 attempt）
+    expect(findJobFailedWrite()).toBeUndefined();
+  });
+
+  it('已排定自动重试（nextRetryAt 在）→ 交给退避回炉，不重复结算', async () => {
+    arrangeStrandedCandidate({ id: 't1', jobQueueId: 'job-retry' });
+    jobFindUniqueMock.mockResolvedValue({
+      id: 'job-retry',
+      type: 'doc_translate',
+      status: 'FAILED',
+      params: JSON.stringify({
+        taskId: 't1',
+        nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+      attempt: 1,
+      maxAttempts: 3,
+    });
+
+    await runDocTranslateTick();
+
+    expect(findTaskUpdate((c) => c.data?.status === 'FAILED')).toBeUndefined();
+    // 仅断言「task 没被打 FAILED」杀不死这条保护：attempt 未用光时重复 failJob 走的是
+    // canRetry 分支，task 本来就不写 FAILED，但 job 行会被重写、nextRetryAt 被一 tick
+    // 一次地顺延 —— 排定的重试永远到不了期。必须钉住 job 行零重写。
+    expect(findJobFailedWrite()).toBeUndefined();
   });
 });

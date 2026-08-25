@@ -25,7 +25,6 @@ vi.mock('@/lib/sessionPersistence', () => ({
   stageSessionAudioArtifact: vi.fn(),
   finalizeStagedArtifactPublish: vi.fn(),
   rollbackStagedArtifact: vi.fn(),
-  persistSessionTranscriptArtifacts: vi.fn(),
   loadSessionTranscriptBundle: mocks.loadBundle,
   extractTranscriptText: mocks.extractTranscriptText,
 }));

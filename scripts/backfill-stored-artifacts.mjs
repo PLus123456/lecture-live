@@ -42,6 +42,9 @@ try {
       '--target=node24',
       `--outfile=${output}`,
       '--external:@prisma/client',
+      // 打成 ESM 时 esbuild 会给 CJS 依赖塞一个会抛错的 __require 垫片；pino 之类
+      // 在模块求值阶段 `require('node:os')` 的包会当场炸。补一个真的 require。
+      '--banner:js=import { createRequire as __nodeCreateRequire } from "node:module"; const require = __nodeCreateRequire(import.meta.url);',
       `--alias:server-only=${path.join(root, 'deploy', 'shims', 'server-only.js')}`,
     ],
     { cwd: root, env: process.env, stdio: 'inherit' }

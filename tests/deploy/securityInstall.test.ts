@@ -215,6 +215,15 @@ describe('artifact 回填脚本的运行前提（部署阻断级）', () => {
     expect(launcher).toMatch(/mkdtempSync\(\s*\n?\s*path\.join\(root, 'node_modules'/);
   });
 
+  it('ESM 产物必须带真 require，否则 CJS 依赖在模块求值阶段就炸', () => {
+    // esbuild 打 ESM 时会给 CJS 依赖塞一个「Dynamic require of X is not supported」的
+    // 垫片。pino 在模块求值阶段就 `require('node:os')` —— 没有真 require 时空库也必挂
+    // （CI run 32793267387）。createRequire banner 是这条路径能启动的前提。
+    expect(launcher).toContain("'--format=esm'");
+    expect(launcher).toContain('createRequire');
+    expect(launcher).toMatch(/--banner:js=.*const require = /);
+  });
+
   it('Docker runner 镜像必须自带 esbuild（回填要现编 TS）', () => {
     const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
     const runnerStage = dockerfile.slice(dockerfile.indexOf('AS runner'));

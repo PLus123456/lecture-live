@@ -31,6 +31,7 @@ function instantiate(name: PaymentProviderName, s: RechargeSettings): PaymentPro
  * 【下单方向】按渠道名装配一个支付 provider。仅当总开关开、该渠道已在 admin 启用、
  * 且**收款与验签凭据都齐**才返回实例，否则 null（checkout 路由据此回 400「渠道不可用」）。
  * 验签凭据一并算进就绪度（P3-5）：只看收款凭据会放行「能付款但回调必被拒」的半配置渠道。
+ * Stripe 就绪度还包含 SEC-024 的环境门禁：生产环境只装配明确的 live key。
  */
 export async function getPaymentProvider(
   name: PaymentProviderName,
@@ -60,6 +61,7 @@ export async function getPaymentProvider(
  * 在途订单的回调不该因为管理员在用户付款后停用了渠道就被打成 400：网关会重试到耗尽然后放弃，
  * 钱收了、订单永久 pending。验签仍是唯一信任源，验不过照样拒——所以忽略开关不放大攻击面。
  * 沙箱仍受 NODE_ENV 硬拒（生产绝不接受无验签渠道的到账）。
+ * Stripe 虽忽略开关，但仍复用同一环境门禁，生产 test/未知 key 不能装配 callback provider。
  */
 export async function getCallbackPaymentProvider(
   name: PaymentProviderName,

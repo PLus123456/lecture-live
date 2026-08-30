@@ -13,7 +13,6 @@ import { enforceRateLimit } from '@/lib/rateLimit';
 import {
   reserveTranscriptionMinutes,
   releaseTranscriptionMinutes,
-  settleAsyncReservation,
   reserveStorageMinutes,
 } from '@/lib/quota';
 import { getBillableMinutes } from '@/lib/billing';
@@ -38,6 +37,9 @@ const COMPRESSED_AUDIO_MAX_BYTES_PER_MIN = Math.round(2.5 * 1024 * 1024); // 320
 // 无损/未压缩音频容器（其余 audio/* 一律按有损上限算）。
 const LOSSLESS_AUDIO_RE =
   /^audio\/(wav|wave|x-wav|x-pn-wav|vnd\.wave|aiff|x-aiff|flac|x-flac|l16|l24|basic|alac)$/i;
+
+/** 事务内额度替换失败；抛出才能让“先释放旧预留”随整笔事务一起回滚。 */
+class AsyncUploadQuotaExceededError extends Error {}
 
 function maxBytesPerMinute(originalMimeType: string): number {
   if (/^video\//i.test(originalMimeType)) return VIDEO_MAX_BYTES_PER_MIN;
@@ -214,31 +216,35 @@ export async function POST(
     );
   }
 
-  const reserved = await reserveTranscriptionMinutes(user.id, estimatedMinutes);
-  if (!reserved) {
-    return NextResponse.json({ error: 'Quota exceeded' }, { status: 403 });
-  }
-
-  // ── 原子 claim（U42 状态机守卫 + B1 预留登记）──
+  // ── 原子 claim（U42 状态机守卫 + B1/SEC-030 预留登记）──
   // 在一个事务里 FOR UPDATE 锁住会话行 → 校验状态 ∈ {null,uploading_chunks,failed,canceled} →
-  // 置 uploading_chunks 并把本次预留额写入 asyncReservedMinutes；若行上已有旧预留（re-init 重来、
-  // 或并发的另一 init 顶替），在同一事务内 releaseTranscriptionMinutes 释放它。
+  // 释放该行旧预留 → 预留本次额度 → 把本次额度登记到 asyncReservedMinutes。User 上的额度
+  // 变更与 Session 上的归属登记必须同进同退：旧实现先在独立事务 reserve User，再进入 claim
+  // 事务写 Session，中间的已提交缝隙会让管理员对账看到“used 增了但没有在途归属”，把预留
+  // 当 drift 抹掉；随后 Session 才登记预留，结算时再释放一次，最终净扣为零。
   //
   // 为何用 FOR UPDATE 事务而非裸 updateMany：'uploading_chunks' 在允许集内 → 同会话两个并发 init
   // 都能匹配 updateMany 而各自 count===1（都"赢"claim），各留一份预留、只有后写者进 col → 另一份
   // 预留永久泄漏；且各自按请求开头快照裸减旧预留会双释放。FOR UPDATE 串行化并发 init：后到者读到
   // 前者刚写入的预留并原子释放，净预留恒 = 本次 estimatedMinutes，杜绝泄漏与双释放（审查 R3/R4/R5/R8/R9）。
-  let claimOutcome: 'claimed' | 'conflict' | 'notfound';
+  type ClaimOutcome =
+    | { status: 'claimed'; startedAt: Date }
+    | { status: 'conflict' | 'notfound' };
+  let claimOutcome: ClaimOutcome;
   try {
     claimOutcome = await prisma.$transaction(async (tx) => {
       const rows = await tx.$queryRaw<
-        Array<{ asyncTranscribeStatus: string | null; asyncReservedMinutes: number }>
+        Array<{
+          asyncTranscribeStatus: string | null;
+          asyncTranscribeStartedAt: Date | null;
+          asyncReservedMinutes: number;
+        }>
       >(
-        Prisma.sql`SELECT asyncTranscribeStatus, asyncReservedMinutes FROM Session WHERE id = ${id} FOR UPDATE`
+        Prisma.sql`SELECT asyncTranscribeStatus, asyncTranscribeStartedAt, asyncReservedMinutes FROM Session WHERE id = ${id} FOR UPDATE`
       );
       const row = rows[0];
       if (!row) {
-        return 'notfound' as const;
+        return { status: 'notfound' } as const;
       }
       const status = row.asyncTranscribeStatus;
       const allowed =
@@ -247,27 +253,44 @@ export async function POST(
         status === 'failed' ||
         status === 'canceled';
       if (!allowed) {
-        return 'conflict' as const;
+        return { status: 'conflict' } as const;
       }
       const prior = row.asyncReservedMinutes ?? 0;
+      if (prior > 0) {
+        // 先释放被本次顶替掉的旧预留，再申请新额；若新额不足，下面抛错使事务整体
+        // 回滚，旧预留和旧 Session 状态均原样保留，不会出现 re-init 失败却白送额度。
+        await releaseTranscriptionMinutes(user.id, prior, tx);
+      }
+      const reserved = await reserveTranscriptionMinutes(
+        user.id,
+        estimatedMinutes,
+        tx
+      );
+      if (!reserved) {
+        throw new AsyncUploadQuotaExceededError();
+      }
+      // `asyncTranscribeStartedAt` doubles as a lock-protected attempt generation.  It must be
+      // strictly newer than the previous value even when two claims occur in the same millisecond;
+      // otherwise a failed, superseded init could mistake the replacement attempt for itself and
+      // release the replacement's reservation.
+      const previousStartedAt = row.asyncTranscribeStartedAt?.getTime() ?? 0;
+      const claimStartedAt = new Date(Math.max(Date.now(), previousStartedAt + 1));
       await tx.session.update({
         where: { id },
         data: {
           asyncTranscribeStatus: 'uploading_chunks',
           asyncTranscribeError: null,
-          asyncTranscribeStartedAt: new Date(),
+          asyncTranscribeStartedAt: claimStartedAt,
           asyncReservedMinutes: estimatedMinutes,
         },
       });
-      if (prior > 0) {
-        // 释放被本次顶替掉的旧预留（re-init / 并发 init）——在锁内读到的精确旧值，恰好一次。
-        await releaseTranscriptionMinutes(user.id, prior, tx);
-      }
-      return 'claimed' as const;
+      return { status: 'claimed', startedAt: claimStartedAt } as const;
     });
   } catch (txErr) {
-    // claim 事务本身失败（DB 故障）：撤销本次预留，返回 500。
-    await releaseTranscriptionMinutes(user.id, estimatedMinutes).catch(() => undefined);
+    if (txErr instanceof AsyncUploadQuotaExceededError) {
+      return NextResponse.json({ error: 'Quota exceeded' }, { status: 403 });
+    }
+    // claim 事务本身失败（DB 故障）：User 预留与 Session 登记均由事务自动回滚。
     console.error('Async upload init claim tx error:', txErr);
     return NextResponse.json(
       { error: 'Failed to initialize async upload' },
@@ -275,10 +298,9 @@ export async function POST(
     );
   }
 
-  if (claimOutcome !== 'claimed') {
-    // 抢不到（会话正在跑/已完成）或会话不存在：撤销本次预留，不动会话已有的预留。
-    await releaseTranscriptionMinutes(user.id, estimatedMinutes).catch(() => undefined);
-    if (claimOutcome === 'notfound') {
+  if (claimOutcome.status !== 'claimed') {
+    // 抢不到（会话正在跑/已完成）或会话不存在：事务尚未触碰任何额度或已有预留。
+    if (claimOutcome.status === 'notfound') {
       return NextResponse.json({ error: 'Session not found' }, { status: 404 });
     }
     return NextResponse.json(
@@ -311,19 +333,48 @@ export async function POST(
       },
     });
   } catch (error) {
-    // initAsyncUpload 失败：把会话退回 failed，并用 settleAsyncReservation 原子结算本次预留
-    // （读当前列并释放，恰好一次；若并发 cancel/cron 已释放则读到 0、不重复释放）。
+    // initAsyncUpload 失败：只允许本 attempt 清理自己的预留。状态、attempt generation、
+    // 清列和 User 释放都在同一个 Session FOR UPDATE 事务内校验/提交。若新的 re-init 已经
+    // 顶替本 attempt，旧请求只返回自己的 500，绝不能释放新请求刚登记的预留。
     console.error('Async upload init error:', error);
-    await prisma.session
-      .updateMany({
-        where: { id, asyncTranscribeStatus: 'uploading_chunks' },
-        data: {
-          asyncTranscribeStatus: 'failed',
-          asyncTranscribeError: 'init failed',
-        },
+    await prisma
+      .$transaction(async (tx) => {
+        const rows = await tx.$queryRaw<
+          Array<{
+            userId: string;
+            asyncTranscribeStatus: string | null;
+            asyncTranscribeStartedAt: Date | null;
+            asyncReservedMinutes: number;
+          }>
+        >(
+          Prisma.sql`SELECT userId, asyncTranscribeStatus, asyncTranscribeStartedAt, asyncReservedMinutes FROM Session WHERE id = ${id} FOR UPDATE`
+        );
+        const row = rows[0];
+        if (
+          !row ||
+          row.asyncTranscribeStatus !== 'uploading_chunks' ||
+          row.asyncTranscribeStartedAt?.getTime() !== claimOutcome.startedAt.getTime()
+        ) {
+          return false;
+        }
+
+        const reserved = Number(row.asyncReservedMinutes ?? 0);
+        await tx.session.update({
+          where: { id },
+          data: {
+            asyncTranscribeStatus: 'failed',
+            asyncTranscribeError: 'init failed',
+            asyncReservedMinutes: 0,
+          },
+        });
+        if (Number.isFinite(reserved) && reserved > 0) {
+          await releaseTranscriptionMinutes(row.userId, reserved, tx);
+        }
+        return true;
       })
-      .catch(() => undefined);
-    await settleAsyncReservation(id).catch(() => undefined);
+      .catch((cleanupError) => {
+        console.error('Async upload init cleanup error:', cleanupError);
+      });
     return NextResponse.json(
       { error: 'Failed to initialize async upload' },
       { status: 500 }

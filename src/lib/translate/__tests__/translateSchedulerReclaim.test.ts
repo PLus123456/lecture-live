@@ -7,11 +7,20 @@
 //     attempt 一次跳 2、白烧一格退避档位。
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { updateManyMock, findUniqueMock, updateMock, createMock } = vi.hoisted(() => ({
+const {
+  updateManyMock,
+  findUniqueMock,
+  updateMock,
+  createMock,
+  rootExecuteRawMock,
+  rootQueryRawMock,
+} = vi.hoisted(() => ({
   updateManyMock: vi.fn(),
   findUniqueMock: vi.fn(),
   updateMock: vi.fn(),
   createMock: vi.fn(),
+  rootExecuteRawMock: vi.fn(),
+  rootQueryRawMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -22,6 +31,10 @@ vi.mock('@/lib/prisma', () => ({
       update: updateMock,
       create: createMock,
     },
+    // 回收走原始 SQL（DB UTC 时钟 + 与 claim 共用的 resourceScope X lock），不是 updateMany。
+    $executeRaw: rootExecuteRawMock,
+    $queryRaw: rootQueryRawMock,
+    $transaction: vi.fn(),
   },
 }));
 
@@ -35,13 +48,23 @@ import {
   STALE_PROCESSING_THRESHOLD_BY_TYPE,
 } from '@/lib/jobQueue';
 
-const NOW = new Date('2026-08-22T12:00:00.000Z');
-
 beforeEach(() => {
   vi.clearAllMocks();
   updateManyMock.mockResolvedValue({ count: 0 });
   updateMock.mockResolvedValue({});
+  // 没有带 resourceScope 的僵尸行 → 只会走「非资源任务」那一条 UPDATE。
+  rootQueryRawMock.mockResolvedValue([]);
+  rootExecuteRawMock.mockResolvedValue(0);
 });
+
+/** 取第 n 条根级 $executeRaw 的 Prisma.sql（拼好的 SQL 文本 + 参数值）。 */
+function reclaimSql(index: number) {
+  const call = rootExecuteRawMock.mock.calls[index]?.[0] as {
+    strings?: string[];
+    values?: unknown[];
+  };
+  return { text: call?.strings?.join('?') ?? '', values: call?.values ?? [] };
+}
 
 describe('僵尸回收阈值按 job type 分档 (H5)', () => {
   it('doc_translate 的阈值必须严格大于通用阈值（否则长任务必被误杀）', () => {
@@ -52,45 +75,44 @@ describe('僵尸回收阈值按 job type 分档 (H5)', () => {
   });
 
   it('通用扫描必须排除长跑类型，长跑类型各走自己的阈值', async () => {
-    await reclaimAllStaleProcessingJobs(NOW);
+    await reclaimAllStaleProcessingJobs();
 
-    const calls = updateManyMock.mock.calls.map(([args]) => args as {
-      where: { type?: unknown; startedAt?: { lte: Date } };
-    });
-    expect(calls).toHaveLength(1 + LONG_RUNNING_JOB_TYPES.length);
+    // 每一档一条根级 UPDATE（本用例没有带 resourceScope 的僵尸行）。
+    expect(rootExecuteRawMock).toHaveBeenCalledTimes(1 + LONG_RUNNING_JOB_TYPES.length);
 
-    const generic = calls.find((c) => (c.where.type as { notIn?: string[] })?.notIn);
-    expect(generic).toBeDefined();
-    expect((generic!.where.type as { notIn: string[] }).notIn).toContain(
-      JOB_TYPE.DOC_TRANSLATE
-    );
-    expect(generic!.where.startedAt!.lte).toEqual(
-      new Date(NOW.getTime() - STALE_PROCESSING_JOB_THRESHOLD_MS)
+    const generic = reclaimSql(0);
+    expect(generic.text).toContain('type NOT IN');
+    expect(generic.values).toEqual(
+      expect.arrayContaining([
+        JOB_TYPE.DOC_TRANSLATE,
+        STALE_PROCESSING_JOB_THRESHOLD_MS * 1000,
+      ])
     );
 
-    const docTranslate = calls.find((c) =>
-      (c.where.type as { in?: string[] })?.in?.includes(JOB_TYPE.DOC_TRANSLATE)
-    );
-    expect(docTranslate).toBeDefined();
-    expect(docTranslate!.where.startedAt!.lte).toEqual(
-      new Date(
-        NOW.getTime() - STALE_PROCESSING_THRESHOLD_BY_TYPE[JOB_TYPE.DOC_TRANSLATE]
-      )
+    const docTranslate = reclaimSql(1);
+    expect(docTranslate.text).toContain('type IN');
+    expect(docTranslate.values).toEqual(
+      expect.arrayContaining([
+        JOB_TYPE.DOC_TRANSLATE,
+        STALE_PROCESSING_THRESHOLD_BY_TYPE[JOB_TYPE.DOC_TRANSLATE] * 1000,
+      ])
     );
   });
 
   it('回收数量是各档之和', async () => {
-    updateManyMock.mockResolvedValueOnce({ count: 2 }).mockResolvedValueOnce({ count: 3 });
-    await expect(reclaimAllStaleProcessingJobs(NOW)).resolves.toBe(5);
+    rootExecuteRawMock.mockResolvedValueOnce(2).mockResolvedValueOnce(3);
+    await expect(reclaimAllStaleProcessingJobs()).resolves.toBe(5);
   });
 
   it('不传 options 时保持历史语义：单条不分类型的扫描', async () => {
-    await reclaimStaleProcessingJobs(NOW);
-    expect(updateManyMock).toHaveBeenCalledTimes(1);
-    expect(updateManyMock.mock.calls[0][0].where).toEqual({
-      status: 'PROCESSING',
-      startedAt: { lte: new Date(NOW.getTime() - STALE_PROCESSING_JOB_THRESHOLD_MS) },
-    });
+    await reclaimStaleProcessingJobs();
+    expect(rootExecuteRawMock).toHaveBeenCalledTimes(1);
+    const sql = reclaimSql(0);
+    expect(sql.text).not.toContain('type IN');
+    expect(sql.text).not.toContain('type NOT IN');
+    expect(sql.values).toEqual(
+      expect.arrayContaining([STALE_PROCESSING_JOB_THRESHOLD_MS * 1000])
+    );
   });
 });
 
@@ -108,22 +130,36 @@ describe('retryJob 回炉必须是条件更新 (L25)', () => {
     };
   }
 
-  it('UPDATE 的 where 必须带 status=FAILED（谓词压进语句，不是只靠预检）', async () => {
+  it('UPDATE 的 where 必须带 status=FAILED 与 attempt 快照（谓词压进语句，不是只靠预检）', async () => {
     findUniqueMock.mockResolvedValue(failedJob());
+    updateManyMock.mockResolvedValue({ count: 1 });
 
     await expect(retryJob('job-1')).resolves.toBe(true);
 
-    expect(updateMock).toHaveBeenCalledWith(
+    // attempt 一并入 where：两个 tick 读到同一份 FAILED 快照时只有一个能递增，
+    // 否则 attempt 一次跳 2、白烧掉一格退避档位。
+    expect(updateManyMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 'job-1', status: 'FAILED' },
+        where: expect.objectContaining({
+          id: 'job-1',
+          status: 'FAILED',
+          attempt: 1,
+        }),
         data: expect.objectContaining({ attempt: { increment: 1 } }),
       })
     );
   });
 
-  it('条件没命中（P2025：别的进程同一轮已回炉过）→ 返回 false，不抛', async () => {
+  it('条件没命中（别的进程同一轮已回炉过）→ 返回 false，不抛', async () => {
     findUniqueMock.mockResolvedValue(failedJob());
-    updateMock.mockRejectedValue(
+    updateManyMock.mockResolvedValue({ count: 0 });
+
+    await expect(retryJob('job-1')).resolves.toBe(false);
+  });
+
+  it('P2025（条件更新的竞态输家）同样收敛成 false', async () => {
+    findUniqueMock.mockResolvedValue(failedJob());
+    updateManyMock.mockRejectedValue(
       Object.assign(new Error('Record to update not found'), { code: 'P2025' })
     );
 

@@ -12,11 +12,12 @@ const {
   unsealRecordingDraftMock,
   deleteRecordingDraftMock,
   stageSessionAudioArtifactMock,
+  settleStagedArtifactsInTransactionMock,
   finalizeStagedArtifactPublishMock,
+  readbackStagedArtifactPublicationMock,
   rollbackStagedArtifactMock,
   normalizeRecordedAudioDurationMock,
-  resolveExpectedRecordingDurationMsMock,
-  probeAudioDurationMsFromBufferMock,
+  measureAuthoritativeRecordingDurationMsFromBufferMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
@@ -27,11 +28,12 @@ const {
   unsealRecordingDraftMock: vi.fn(),
   deleteRecordingDraftMock: vi.fn(),
   stageSessionAudioArtifactMock: vi.fn(),
+  settleStagedArtifactsInTransactionMock: vi.fn(),
   finalizeStagedArtifactPublishMock: vi.fn(),
+  readbackStagedArtifactPublicationMock: vi.fn(),
   rollbackStagedArtifactMock: vi.fn(),
   normalizeRecordedAudioDurationMock: vi.fn(),
-  resolveExpectedRecordingDurationMsMock: vi.fn(),
-  probeAudioDurationMsFromBufferMock: vi.fn(),
+  measureAuthoritativeRecordingDurationMsFromBufferMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
@@ -41,6 +43,9 @@ vi.mock('@/lib/prisma', () => ({
       findUnique: sessionFindUniqueMock,
       updateMany: sessionUpdateManyMock,
     },
+    $transaction: vi.fn(async (callback) =>
+      callback({ session: { updateMany: sessionUpdateManyMock } })
+    ),
   },
 }));
 vi.mock('@/lib/security', () => ({ assertOwnership: vi.fn() }));
@@ -57,20 +62,25 @@ vi.mock('@/lib/recordingDraftPersistence', () => ({
 }));
 vi.mock('@/lib/sessionPersistence', () => ({
   stageSessionAudioArtifact: stageSessionAudioArtifactMock,
-  finalizeStagedArtifactPublish: finalizeStagedArtifactPublishMock,
+  settleStagedArtifactsInTransaction: settleStagedArtifactsInTransactionMock,
+  completeStagedArtifactPublishes: finalizeStagedArtifactPublishMock,
+  readbackStagedArtifactPublication: readbackStagedArtifactPublicationMock,
   rollbackStagedArtifact: rollbackStagedArtifactMock,
 }));
 vi.mock('@/lib/audio/recordingDuration', () => ({
   MAX_DURATION_FIX_BYTES: 128 * 1024 * 1024,
   normalizeRecordedAudioDuration: normalizeRecordedAudioDurationMock,
-  probeAudioDurationMsFromBuffer: probeAudioDurationMsFromBufferMock,
-  resolveExpectedRecordingDurationMs: resolveExpectedRecordingDurationMsMock,
+  measureAuthoritativeRecordingDurationMsFromBuffer:
+    measureAuthoritativeRecordingDurationMsFromBufferMock,
+  RECORDING_DURATION_LIMIT_GRACE_MS: 60_000,
+  RecordingDurationMeasurementError: class RecordingDurationMeasurementError extends Error {},
 }));
 vi.mock('@/lib/billing', () => ({
-  clampSessionDurationMs: (ms: number) => ms,
+  getMaxSessionDurationMs: () => 4 * 60 * 60_000,
 }));
 
 import { POST } from '@/app/api/sessions/[id]/audio/draft/finalize/route';
+import { RecordingDurationMeasurementError } from '@/lib/audio/recordingDuration';
 
 const params = Promise.resolve({ id: 'session-1' });
 const req = (url = 'http://localhost:3000/api/sessions/session-1/audio/draft/finalize') =>
@@ -95,13 +105,20 @@ describe('audio/draft/finalize route (P0-5 / P1-7)', () => {
     stageSessionAudioArtifactMock
       .mockReset()
       .mockResolvedValue({ reference: 'local:recordings/sess-1-x.webm', localReference: 'local:recordings/sess-1-x.webm', storage: 'local', category: 'recordings' });
+    settleStagedArtifactsInTransactionMock
+      .mockReset()
+      .mockResolvedValue([{ staged: {}, settled: {} }]);
     finalizeStagedArtifactPublishMock
       .mockReset()
-      .mockResolvedValue({ path: 'local:recordings/sess-1-x.webm', storage: 'local' });
+      .mockResolvedValue([{ path: 'local:recordings/sess-1-x.webm', storage: 'local' }]);
+    readbackStagedArtifactPublicationMock
+      .mockReset()
+      .mockResolvedValue({ outcome: 'not_committed', publications: [] });
     rollbackStagedArtifactMock.mockReset().mockResolvedValue(undefined);
     normalizeRecordedAudioDurationMock.mockReset().mockImplementation(async ({ buffer }) => buffer);
-    resolveExpectedRecordingDurationMsMock.mockReset().mockResolvedValue(120_000);
-    probeAudioDurationMsFromBufferMock.mockReset().mockResolvedValue(0);
+    measureAuthoritativeRecordingDurationMsFromBufferMock
+      .mockReset()
+      .mockResolvedValue(120_000);
     mergeRecordingDraftChunksMock.mockReset();
   });
 
@@ -192,20 +209,27 @@ describe('audio/draft/finalize route (P0-5 / P1-7)', () => {
    * 事后也没有任何兜底会补收：Soniox usage-logs 对账只覆盖 mint 过 grant 的直连串流
    *（client_reference_id = 'rt|it:userId:grantId'），异步文件转录不在其中。
    */
-  it('session-persist#143：三源时长皆为 0 → ffprobe 兜底，真实时长落库', async () => {
+  it('SEC-018：小正时长不能跳过媒体实测，真实时长落库', async () => {
     mergeRecordingDraftChunksMock.mockResolvedValue({
       buffer: Buffer.from('a-very-long-recording'),
       manifest: { mimeType: 'audio/webm', receivedSeqs: [0, 1, 2] },
       hasGap: false,
     });
-    // CREATED→RECORDING→FINALIZING 一气呵成：session.durationMs / transcript / serverStartedAt 皆 0
-    resolveExpectedRecordingDurationMsMock.mockResolvedValue(0);
-    probeAudioDurationMsFromBufferMock.mockResolvedValue(95 * 60_000);
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 'session-1',
+      userId: 'user-1',
+      status: 'FINALIZING',
+      recordingPath: null,
+      durationMs: 1,
+    });
+    measureAuthoritativeRecordingDurationMsFromBufferMock.mockResolvedValue(
+      95 * 60_000
+    );
 
     const response = await POST(req(), { params });
 
     expect(response.status).toBe(200);
-    expect(probeAudioDurationMsFromBufferMock).toHaveBeenCalledTimes(1);
+    expect(measureAuthoritativeRecordingDurationMsFromBufferMock).toHaveBeenCalledTimes(1);
     expect(sessionUpdateManyMock).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ durationMs: 95 * 60_000 }),
@@ -213,33 +237,35 @@ describe('audio/draft/finalize route (P0-5 / P1-7)', () => {
     );
   });
 
-  it('session-persist#143：探测不到时长（无 ffprobe/坏文件）→ 不写 durationMs，但录音照常发布', async () => {
+  it('SEC-018：权威测量失败 → 不发布、不删草稿并解除 seal 供重试', async () => {
     mergeRecordingDraftChunksMock.mockResolvedValue({
       buffer: Buffer.from('unreadable'),
       manifest: { mimeType: 'audio/webm', receivedSeqs: [0] },
       hasGap: false,
     });
-    resolveExpectedRecordingDurationMsMock.mockResolvedValue(0);
-    probeAudioDurationMsFromBufferMock.mockResolvedValue(0);
+    measureAuthoritativeRecordingDurationMsFromBufferMock.mockRejectedValue(
+      new RecordingDurationMeasurementError()
+    );
 
     const response = await POST(req(), { params });
 
-    expect(response.status).toBe(200);
-    // 探测失败一律返回 0、绝不抛 —— 保持既有语义（不写 0，交给 /full-transcribe 入口再探一次）。
-    expect(sessionUpdateManyMock.mock.calls[0][0].data).not.toHaveProperty('durationMs');
-    expect(finalizeStagedArtifactPublishMock).toHaveBeenCalledTimes(1);
+    expect(response.status).toBe(422);
+    expect(stageSessionAudioArtifactMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+    expect(finalizeStagedArtifactPublishMock).not.toHaveBeenCalled();
+    expect(deleteRecordingDraftMock).not.toHaveBeenCalled();
+    expect(unsealRecordingDraftMock).toHaveBeenCalledTimes(1);
   });
 
-  it('三源已有可信时长 → 不多跑一次 ffprobe（草稿最大 512MiB，探测要落临时文件）', async () => {
+  it('已有正时长仍必须重新测量将发布的媒体', async () => {
     mergeRecordingDraftChunksMock.mockResolvedValue({
       buffer: Buffer.from('complete'),
       manifest: { mimeType: 'audio/webm', receivedSeqs: [0, 1, 2] },
       hasGap: false,
     });
-    resolveExpectedRecordingDurationMsMock.mockResolvedValue(120_000);
 
     await POST(req(), { params });
 
-    expect(probeAudioDurationMsFromBufferMock).not.toHaveBeenCalled();
+    expect(measureAuthoritativeRecordingDurationMsFromBufferMock).toHaveBeenCalledTimes(1);
   });
 });

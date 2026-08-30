@@ -3,7 +3,7 @@
 //
 // 挂在 WS 进程的 http server 上（socket.io 只接管 /socket.io/ 路径，其余请求
 // 会回落到 createServer 的原始 listener）。收到带合法 HMAC 签名的通知后，对
-// 目标 session 房间执行一次观众复核驱逐。判定完全以 DB 为准（fail-safe），
+// 目标 session 房间执行一次观众与已建立主持人的复核驱逐。判定完全以 DB 为准（fail-safe），
 // 通知本身只是触发器，被重放最多多跑一次只读复核。
 
 import type { IncomingMessage, ServerResponse } from 'http';
@@ -14,7 +14,10 @@ import {
   isLiveShareRevalidateMode,
   verifyLiveShareRevalidateSignature,
 } from './internalApi';
-import { revalidateSessionViewers } from './server';
+import {
+  revalidateSessionBroadcasters,
+  revalidateSessionViewers,
+} from './server';
 
 const MAX_BODY_BYTES = 16 * 1024;
 
@@ -188,11 +191,18 @@ export function handleLiveShareInternalRequest(
       return;
     }
 
-    const evicted = await revalidateSessionViewers(io, payload.sessionId, {
-      silent: payload.mode === 'transition',
-    });
+    const silent = payload.mode === 'transition';
+    const [evicted, revokedBroadcasters] = await Promise.all([
+      revalidateSessionViewers(io, payload.sessionId, { silent }),
+      revalidateSessionBroadcasters(io, payload.sessionId, { silent }),
+    ]);
     internalHttpLogger.info(
-      { sessionId: payload.sessionId, mode: payload.mode, evicted },
+      {
+        sessionId: payload.sessionId,
+        mode: payload.mode,
+        evicted,
+        revokedBroadcasters,
+      },
       'Processed live share revalidate notification'
     );
     sendJson(res, 200, { evicted });

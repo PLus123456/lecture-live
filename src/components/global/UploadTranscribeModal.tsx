@@ -27,6 +27,13 @@ import ModalPortal from '@/components/ModalPortal';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import LanguageSelect from '@/components/LanguageSelect';
 import { useAuth } from '@/hooks/useAuth';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+  type AuthBoundarySnapshot,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
+import { ACCOUNT_BOUNDARY_CLEAR_EVENT } from '@/lib/clientAccountCleanup';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useI18n } from '@/lib/i18n';
 import { toast } from '@/stores/toastStore';
@@ -60,6 +67,40 @@ const formatDurationCompact = (ms: number) => {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 };
 
+type UploadOwnerCommitResult<T> =
+  | { committed: true; value: T }
+  | { committed: false };
+
+/**
+ * Upload jobs live in a global persisted store, so checking an epoch before a
+ * write is not enough: a cross-tab cookie mutation can commit a new owner in
+ * between the check and the sink. Keep the final synchronous sink under the
+ * auth protocol's shared lock and fail closed if that original owner is gone.
+ */
+async function commitForUploadOwner<T>(
+  expected: AuthBoundarySnapshot,
+  ownerSignal: AbortSignal,
+  commit: () => T,
+): Promise<UploadOwnerCommitResult<T>> {
+  if (ownerSignal.aborted) return { committed: false };
+  try {
+    const result = await runAuthBoundaryCommit(expected, () => {
+      if (ownerSignal.aborted) {
+        return { owned: false } as const;
+      }
+      return { owned: true, value: commit() } as const;
+    });
+    if (!result.committed || !result.value.owned) {
+      return { committed: false };
+    }
+    return { committed: true, value: result.value.value };
+  } catch {
+    // If the shared owner boundary cannot be checked, persisting account data
+    // would be unsafe. The caller treats this exactly like a boundary change.
+    return { committed: false };
+  }
+}
+
 export default function UploadTranscribeModal({ file, onClose, onNavigate }: Props) {
   const { t, locale } = useI18n();
   const { token } = useAuth();
@@ -75,11 +116,22 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
   const [audioDurationMs, setAudioDurationMs] = useState<number>(0);
   const [phase, setPhase] = useState<'configuring' | 'running'>('configuring');
   const [jobId, setJobId] = useState<string | null>(null);
+  const startInFlightRef = useRef(false);
   const cancelRef = useRef<(() => void) | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [cancelDialogOpen, setCancelDialogOpen] = useState(false);
 
   const job = useUploadJobsStore((s) => (jobId ? s.jobs[jobId] : undefined));
+
+  // The File prop and loaded folder names are account-private capabilities too.
+  // Closing on the synchronous boundary event prevents A's modal/filename from
+  // disappearing during cleanup and reappearing when B becomes authenticated.
+  useEffect(() => {
+    window.addEventListener(ACCOUNT_BOUNDARY_CLEAR_EVENT, onClose);
+    return () => {
+      window.removeEventListener(ACCOUNT_BOUNDARY_CLEAR_EVENT, onClose);
+    };
+  }, [onClose]);
 
   // ── 文件元数据（视频文件浏览器可能拿不到时长，忽略即可，后端 ffprobe 是真相） ──
   useEffect(() => {
@@ -125,26 +177,50 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
 
   // ── 启动转录 ──
   const handleStart = useCallback(async () => {
-    if (phase === 'running' || !token) return;
+    if (phase === 'running' || startInFlightRef.current || !token) return;
+    // The first owner commit is asynchronous; close the double-click window
+    // synchronously before waiting for the shared lock.
+    startInFlightRef.current = true;
+    // Capture intent before the first write/await. A later B login must abort
+    // this A operation rather than reinterpret its File/session as B's work.
+    const expected = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
+    if (ownerSignal.aborted) {
+      startInFlightRef.current = false;
+      return;
+    }
     setErrorMsg(null);
 
-    // 1. 创建本地 job
-    const id = uploadJobs.create({
-      fileName: file.name,
-      fileSize: file.size,
-      durationMs: audioDurationMs,
-      estimatedDurationMs: estimateMs,
-      startedAt: Date.now(),
-      sourceLang,
-      targetLang,
-      folderId: folderId || null,
+    // 1. 创建本地 job。create + 初始 update 是同一个 owner-bound 持久提交。
+    const created = await commitForUploadOwner(expected, ownerSignal, () => {
+      const id = uploadJobs.create({
+        fileName: file.name,
+        fileSize: file.size,
+        durationMs: audioDurationMs,
+        estimatedDurationMs: estimateMs,
+        startedAt: Date.now(),
+        sourceLang,
+        targetLang,
+        folderId: folderId || null,
+      });
+      uploadJobs.update(id, { status: 'creating' });
+      return id;
     });
+    if (!created.committed) {
+      startInFlightRef.current = false;
+      return;
+    }
+    const id = created.value;
     setJobId(id);
     setPhase('running');
 
+    const updateOwnedJob = (patch: Parameters<typeof uploadJobs.update>[1]) =>
+      commitForUploadOwner(expected, ownerSignal, () => {
+        uploadJobs.update(id, patch);
+      });
+
     try {
       // 2. 创建 session
-      uploadJobs.update(id, { status: 'creating' });
       const now = new Date();
       const autoTitle = now.toLocaleDateString(locale === 'zh' ? 'zh-CN' : 'en-US', {
         month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -160,60 +236,89 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
           sonioxRegion: sonioxRegionPreference,
           folderId: folderId || undefined,
         }),
+        signal: ownerSignal,
       });
       if (!sessionRes.ok) throw new Error(t('upload.failedCreateSession'));
       const session = (await sessionRes.json()) as { id: string };
-      uploadJobs.update(id, { sessionId: session.id });
+      if (!session || typeof session.id !== 'string' || !session.id) {
+        throw new Error(t('upload.failedCreateSession'));
+      }
 
-      // 3. 启动 async upload pipeline（分片上传 + finalize + poll）
-      const handle = startAsyncUpload({
-        file,
-        sessionId: session.id,
-        authToken: token,
-        // U22/P5-19：把浏览器实测时长交给 init 的配额门禁（探测失败为 0 → 不传，服务端回落大小下界）。
-        // 注意别传 effectiveDurationMs：那是按文件大小的粗估，与服务端下界同源，传了等于没传。
-        estimatedDurationMs: audioDurationMs > 0 ? audioDurationMs : undefined,
-        onUploadProgress: (p) => uploadJobs.update(id, { uploadProgress: p }),
-        onProcessingProgress: (p) =>
-          uploadJobs.update(id, { processingProgress: p }),
-        onStatusChange: (status) => {
-          uploadJobs.update(id, { status: status as UploadJobStatus });
-        },
-      });
-      cancelRef.current = handle.cancel;
-      uploadJobs.registerCancel(id, async () => {
-        handle.cancel();
-        // 同时请求服务端取消（后端会清理 chunks + Soniox 文件）
-        await fetch(`/api/sessions/${session.id}/async-upload`, {
-          method: 'DELETE',
-          headers: { Authorization: `Bearer ${token}` },
-        }).catch(() => undefined);
-      });
+      // 3. sessionId、pipeline start、cancel handle 注册必须是一个不可插入的
+      // owner commit。若 B 已完成 cleanup，callback 根本不会运行；若 B 紧随其后，
+      // cleanup 一定能看到并中止已经注册的 A handle。
+      const started = await commitForUploadOwner(expected, ownerSignal, () => {
+        const current = uploadJobs.get(id);
+        if (!current || current.status === 'canceled' || ownerSignal.aborted) {
+          return null;
+        }
+        uploadJobs.update(id, { sessionId: session.id });
+        if (ownerSignal.aborted) return null;
 
-      const result = await handle.promise;
-      cancelRef.current = null;
-      uploadJobs.unregisterCancel(id);
-
-      if (result.finalStatus === 'completed') {
-        uploadJobs.update(id, { status: 'completed' });
-        toast.show({
-          type: 'success',
-          message: `${t('upload.uploadDone')} · ${file.name}`,
-          description: t('upload.uploadDoneDesc'),
-          duration: 0,
-          action: {
-            label: t('upload.openPlayback'),
-            onClick: () => onNavigate(session.id),
+        const handle = startAsyncUpload({
+          file,
+          sessionId: session.id,
+          authToken: token,
+          // U22/P5-19：把浏览器实测时长交给 init 的配额门禁（探测失败为 0 → 不传，服务端回落大小下界）。
+          // 注意别传 effectiveDurationMs：那是按文件大小的粗估，与服务端下界同源，传了等于没传。
+          estimatedDurationMs: audioDurationMs > 0 ? audioDurationMs : undefined,
+          signal: ownerSignal,
+          onUploadProgress: (p) => {
+            void updateOwnedJob({ uploadProgress: p });
+          },
+          onProcessingProgress: (p) => {
+            void updateOwnedJob({ processingProgress: p });
+          },
+          onStatusChange: (status) => {
+            void updateOwnedJob({ status: status as UploadJobStatus });
           },
         });
-      } else if (result.finalStatus === 'failed') {
-        const msg = result.error || t('upload.failed');
-        uploadJobs.update(id, { status: 'failed', errorMessage: msg });
-        setErrorMsg(msg);
-        toast.error(t('upload.failed'), msg);
-      } else if (result.finalStatus === 'canceled') {
-        uploadJobs.update(id, { status: 'canceled' });
-      }
+        if (ownerSignal.aborted) {
+          handle.cancel();
+          return null;
+        }
+        cancelRef.current = handle.cancel;
+        uploadJobs.registerCancel(id, async () => {
+          handle.cancel();
+          // 同时请求服务端取消（后端会清理 chunks + Soniox 文件）。账号边界
+          // 已变化时 signal 会阻止旧 A 闭包拿新 B cookie 发取消请求。
+          await fetch(`/api/sessions/${session.id}/async-upload`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${token}` },
+            signal: ownerSignal,
+          }).catch(() => undefined);
+        });
+        return handle;
+      });
+      if (!started.committed || !started.value) return;
+      const handle = started.value;
+
+      const result = await handle.promise;
+      await commitForUploadOwner(expected, ownerSignal, () => {
+        cancelRef.current = null;
+        uploadJobs.unregisterCancel(id);
+
+        if (result.finalStatus === 'completed') {
+          uploadJobs.update(id, { status: 'completed' });
+          toast.show({
+            type: 'success',
+            message: `${t('upload.uploadDone')} · ${file.name}`,
+            description: t('upload.uploadDoneDesc'),
+            duration: 0,
+            action: {
+              label: t('upload.openPlayback'),
+              onClick: () => onNavigate(session.id),
+            },
+          });
+        } else if (result.finalStatus === 'failed') {
+          const msg = result.error || t('upload.failed');
+          uploadJobs.update(id, { status: 'failed', errorMessage: msg });
+          setErrorMsg(msg);
+          toast.error(t('upload.failed'), msg);
+        } else if (result.finalStatus === 'canceled') {
+          uploadJobs.update(id, { status: 'canceled' });
+        }
+      });
     } catch (err) {
       // 用户点取消时 abort signal 会让 fetch/sleep 抛 AbortError。
       // asyncUploadClient 顶层 catch 一般会转成 finalStatus='canceled'，但保险起见
@@ -221,16 +326,16 @@ export default function UploadTranscribeModal({ file, onClose, onNavigate }: Pro
       const isAbort =
         (err instanceof DOMException && err.name === 'AbortError') ||
         (err instanceof Error && err.name === 'AbortError');
-      if (isAbort) {
-        uploadJobs.update(id, { status: 'canceled' });
-        uploadJobs.unregisterCancel(id);
+      if (isAbort || ownerSignal.aborted) {
         return;
       }
       const msg = err instanceof Error ? err.message : t('upload.failed');
-      uploadJobs.update(id, { status: 'failed', errorMessage: msg });
-      uploadJobs.unregisterCancel(id);
-      setErrorMsg(msg);
-      toast.error(t('upload.failed'), msg);
+      await commitForUploadOwner(expected, ownerSignal, () => {
+        uploadJobs.update(id, { status: 'failed', errorMessage: msg });
+        uploadJobs.unregisterCancel(id);
+        setErrorMsg(msg);
+        toast.error(t('upload.failed'), msg);
+      });
     }
   }, [
     phase, token, file, audioDurationMs, estimateMs, sourceLang, targetLang,

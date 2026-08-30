@@ -16,6 +16,8 @@ import type {
  */
 export class SandboxProvider implements PaymentProvider {
   readonly name = 'sandbox' as const;
+  readonly mode = 'sandbox' as const;
+  readonly account = 'default';
 
   async createCharge(params: CreateChargeParams): Promise<CreateChargeResult> {
     // 从 notifyUrl 推导本站 origin，拼出沙箱确认页地址。
@@ -23,7 +25,12 @@ export class SandboxProvider implements PaymentProvider {
     const payUrl = `${origin}/api/wallet/sandbox/pay?out_trade_no=${encodeURIComponent(
       params.outTradeNo
     )}`;
-    return { payUrl, providerRef: `sandbox_${params.outTradeNo}` };
+    const ref = `sandbox_${params.outTradeNo}`;
+    return {
+      payUrl,
+      providerRef: ref,
+      objectRefs: [{ objectType: 'sandbox_payment', objectId: ref }],
+    };
   }
 
   async verifyCallback(req: Request, rawBody: string): Promise<CallbackResult | null> {
@@ -35,11 +42,19 @@ export class SandboxProvider implements PaymentProvider {
     const action =
       url.searchParams.get('action') ?? bodyParams.get('action') ?? 'pay';
     // 沙箱不回报金额，也不回报币种 → 上层跳过 (amount, currency) 对账（同 amountCents 的口径）。
+    const paid = action !== 'cancel';
     return {
       outTradeNo,
-      paid: action !== 'cancel',
+      paid,
+      ...(!paid ? { acknowledged: true } : {}),
       providerRef: `sandbox_${outTradeNo}`,
       rawStatus: action,
+      eventType: `sandbox.${action}`,
+      providerMode: this.mode,
+      providerAccount: this.account,
+      objectRefs: [
+        { objectType: 'sandbox_payment', objectId: `sandbox_${outTradeNo}` },
+      ],
     };
   }
 }

@@ -1,16 +1,15 @@
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 // 管理员统计数据 API
 export async function GET(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user, response } = await requireAdminAccess(req, {
     scope: 'admin:stats:get',
     limit: 30,
   });
-  if (response) {
-    return response;
-  }
+  if (response || !user) return response!;
 
   try {
     // 获取最近30天的每日统计
@@ -46,6 +45,26 @@ export async function GET(req: Request) {
 
     // 按天聚合
     const dailyStats = buildDailyStats(thirtyDaysAgo, now, users, sessions, shares);
+
+    // Sensitive aggregate reads are not returned unless their audit row is durable.
+    await writeSecurityAudit(req, {
+      event: 'stats.read',
+      operator: user,
+      target: { type: 'admin_statistics', id: 'rolling-30-days' },
+      before: null,
+      after: null,
+      reason: 'admin-dashboard-statistics-read',
+      outcome: 'SUCCESS',
+      metadata: {
+        rangeDays: 30,
+        totals: {
+          users: totalUsers,
+          sessions: totalSessions,
+          shares: totalShares,
+          folders: totalFolders,
+        },
+      },
+    });
 
     return NextResponse.json({
       totals: {

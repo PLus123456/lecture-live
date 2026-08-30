@@ -679,6 +679,9 @@ async function authenticateBroadcaster(socket: Socket) {
   socket.data.isHost = true;
   socket.data.sessionId = sessionId;
   socket.data.userId = session.user.id;
+  // 记下主播握手所用的 token：撤销通知与周期兜底要按它复核归属
+  // （见 revalidateSessionBroadcasters），否则主播这一侧永远踢不掉。
+  socket.data.shareToken = shareToken;
   socket.join(getRoomId(sessionId));
 
   return { sessionId };
@@ -780,6 +783,71 @@ export async function revalidateSessionViewers(
   return evicted;
 }
 
+/**
+ * 主播侧复核：按 DB 当前状态重新校验某 session 房间里的主播 socket，驱逐已失去
+ * 归属或链接已撤销/过期的连接。与观众复核同一条 fail-safe 原则 —— 判定只看 DB，
+ * 与触发来源无关，被恶意/重复触发时合法主播原样保留。返回驱逐数。
+ *
+ * 存在的理由：撤销通知（internalHttp）与周期兜底都要能把「已经不该再推流的主播」
+ * 断掉；只清观众的话，主播仍会持续把增量推给一个已撤销的房间。
+ */
+export async function revalidateSessionBroadcasters(
+  io: SocketIO,
+  sessionId: string,
+  options: RevalidateViewersOptions = {}
+): Promise<number> {
+  const roomSockets = await io.in(getRoomId(sessionId)).fetchSockets();
+  const hosts = roomSockets.filter((roomSocket) => roomSocket.data.isHost);
+  if (hosts.length === 0) return 0;
+
+  const tokens = [
+    ...new Set(
+      hosts
+        .map((host) =>
+          typeof host.data.shareToken === 'string' ? host.data.shareToken : null
+        )
+        .filter((token): token is string => Boolean(token))
+    ),
+  ];
+
+  const validLinks = tokens.length
+    ? await prisma.shareLink.findMany({
+        where: {
+          token: { in: tokens },
+          sessionId,
+          isLive: true,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+        },
+        select: { token: true },
+      })
+    : [];
+  const validTokens = new Set(validLinks.map((link) => link.token));
+
+  let revoked = 0;
+  for (const host of hosts) {
+    const token = host.data.shareToken;
+    if (typeof token === 'string' && validTokens.has(token)) continue;
+
+    if (!options.silent) {
+      host.emit('share_error', {
+        message: 'Share link revoked',
+        code: 'SHARE_REVOKED',
+      });
+    }
+    host.disconnect(true);
+    revoked += 1;
+  }
+
+  if (revoked > 0) {
+    liveShareLogger.info(
+      { sessionId, revoked, silent: Boolean(options.silent) },
+      'Disconnected live share broadcasters with revoked or expired links'
+    );
+  }
+
+  return revoked;
+}
+
 /** 对所有 live 房间跑一遍观众复核（周期兜底用），串行避免 DB 并发尖峰。 */
 export async function revalidateAllLiveRooms(io: SocketIO): Promise<void> {
   const sessionIds: string[] = [];
@@ -796,6 +864,14 @@ export async function revalidateAllLiveRooms(io: SocketIO): Promise<void> {
       liveShareLogger.warn(
         { sessionId, err: serializeError(error) },
         'Periodic live share viewer revalidation failed'
+      );
+    }
+    try {
+      await revalidateSessionBroadcasters(io, sessionId);
+    } catch (error) {
+      liveShareLogger.warn(
+        { sessionId, err: serializeError(error) },
+        'Periodic live share broadcaster revalidation failed'
       );
     }
   }

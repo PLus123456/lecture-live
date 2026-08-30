@@ -27,6 +27,15 @@ import { invalidateRagCache } from '@/lib/llm/embedding/transcriptRag';
 import { logger, serializeError } from '@/lib/logger';
 import { collectSessionIds } from '@/lib/conversations';
 import { deleteConversationsCascade } from '@/lib/conversationCascade';
+import {
+  CONVERSATION_RECORDING_LIMITS,
+  ConversationRecordingBodyError,
+  ConversationRecordingLimitError,
+  conversationRecordingErrorBody,
+  loadConversationRecordingUsage,
+  normalizeConversationRecordingIds,
+  readConversationRecordingJson,
+} from '@/lib/conversationRecordingPolicy';
 
 const apiLogger = logger.child({ component: 'conversations-api' });
 
@@ -204,12 +213,16 @@ export async function POST(req: Request) {
   });
   if (rateLimited) return rateLimited;
 
-  let body: { sessionId?: unknown; recordingIds?: unknown };
+  let body: Record<string, unknown>;
   try {
-    body = await req.json();
-  } catch {
-    // 空 body 视作 `{}`：创建零录音全局对话
-    body = {};
+    body = await readConversationRecordingJson(req);
+  } catch (error) {
+    if (error instanceof ConversationRecordingBodyError) {
+      return NextResponse.json(conversationRecordingErrorBody(error), {
+        status: error.status,
+      });
+    }
+    throw error;
   }
 
   const legacySessionId =
@@ -220,16 +233,16 @@ export async function POST(req: Request) {
   // recordingIds：若提供必须是 string[]（允许空数组 = 创建零录音全局对话）
   let recordingIds: string[] | null = null;
   if (body.recordingIds !== undefined) {
-    if (
-      !Array.isArray(body.recordingIds) ||
-      !body.recordingIds.every((v) => typeof v === 'string' && v.length > 0)
-    ) {
-      return NextResponse.json(
-        { error: 'recordingIds must be string[]' },
-        { status: 400 }
-      );
+    try {
+      recordingIds = normalizeConversationRecordingIds(body.recordingIds);
+    } catch (error) {
+      if (error instanceof ConversationRecordingBodyError) {
+        return NextResponse.json(conversationRecordingErrorBody(error), {
+          status: error.status,
+        });
+      }
+      throw error;
     }
-    recordingIds = Array.from(new Set(body.recordingIds as string[]));
   }
 
   if (legacySessionId && recordingIds) {
@@ -293,15 +306,18 @@ export async function POST(req: Request) {
   const finalRecordingIds = recordingIds ?? [];
 
   if (finalRecordingIds.length > 0) {
-    // 全部录音必须归属当前用户
-    const ownedCount = await prisma.session.count({
-      where: { id: { in: finalRecordingIds }, userId: user.id },
-    });
-    if (ownedCount !== finalRecordingIds.length) {
-      return NextResponse.json(
-        { error: 'one or more recordingIds not owned by current user' },
-        { status: 403 }
-      );
+    try {
+      await loadConversationRecordingUsage(prisma, user.id, finalRecordingIds);
+    } catch (error) {
+      if (error instanceof ConversationRecordingLimitError) {
+        return NextResponse.json(conversationRecordingErrorBody(error), {
+          status: error.status,
+          ...(error.status === 503
+            ? { headers: { 'Retry-After': '30' } }
+            : {}),
+        });
+      }
+      throw error;
     }
   }
 
@@ -320,12 +336,22 @@ export async function POST(req: Request) {
         },
       });
       if (finalRecordingIds.length > 0) {
-        await tx.conversationSession.createMany({
-          data: finalRecordingIds.map((sid) => ({
-            conversationId: created.id,
-            sessionId: sid,
-          })),
-        });
+        for (
+          let offset = 0;
+          offset < finalRecordingIds.length;
+          offset += CONVERSATION_RECORDING_LIMITS.dbBatchSize
+        ) {
+          const batch = finalRecordingIds.slice(
+            offset,
+            offset + CONVERSATION_RECORDING_LIMITS.dbBatchSize
+          );
+          await tx.conversationSession.createMany({
+            data: batch.map((sid) => ({
+              conversationId: created.id,
+              sessionId: sid,
+            })),
+          });
+        }
       }
       return created;
     });

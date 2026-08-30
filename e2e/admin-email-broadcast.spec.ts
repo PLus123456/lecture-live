@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, installBrowserStubs } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs } from './helpers';
 
 /**
  * 管理员群发邮件面板（审计 #14）。
@@ -42,10 +42,10 @@ test.beforeEach(async ({ page }) => {
       });
     }
     if (p === '/api/auth/login' && method === 'POST') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
-    if (p === '/api/auth/refresh' && method === 'GET') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
 
     if (p === '/api/admin/settings' && method === 'GET') {

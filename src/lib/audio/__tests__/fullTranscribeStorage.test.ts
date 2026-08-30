@@ -60,6 +60,31 @@ vi.mock('@/lib/storage/cloudreveFileDelete', () => ({
   deleteCloudreveFile: deleteCloudreveFileMock,
 }));
 
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_TYPE: {
+    RECORDING: 'recording',
+    ENHANCED_AUDIO: 'enhanced_audio',
+    TRANSCRIPT: 'transcript',
+    SUMMARY: 'summary',
+    REPORT: 'report',
+    FULL_TRANSCRIPT: 'full_transcript',
+  },
+  reserveStoredArtifact: vi.fn(async () => ({
+    id: 'artifact-test',
+    userId: 'user-1',
+    logicalKey: 'logical-test',
+    expectedBytes: BigInt(0),
+    state: 'RESERVED',
+    reservationKey: 'reservation-test',
+  })),
+  settleStoredArtifact: vi.fn(async () => ({ artifact: {}, previous: null })),
+  recordReservedStoredArtifactLocation: vi.fn(async () => undefined),
+  rollbackStoredArtifact: vi.fn(async () => true),
+  markStoredArtifactOrphan: vi.fn(async () => undefined),
+  releaseStoredArtifact: vi.fn(async () => true),
+  findBillableStoredArtifactsByOwner: vi.fn(async () => []),
+}));
+
 import {
   persistArtifact,
   readArtifactFromReference,

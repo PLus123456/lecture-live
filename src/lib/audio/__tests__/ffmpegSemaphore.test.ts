@@ -24,6 +24,7 @@ vi.mock('@/lib/logger', () => ({ logger: { error: vi.fn(), warn: vi.fn(), info: 
 
 import {
   transcodeToMp3,
+  measureDecodedAudioDurationSec,
   getActiveFfmpegCount,
   getMaxConcurrentFfmpeg,
 } from '@/lib/audio/ffmpegTranscode';
@@ -97,5 +98,39 @@ describe('transcodeToMp3 统一并发信号量 (P1-20)', () => {
     await Promise.all([t2, t3]);
 
     expect(getActiveFfmpegCount()).toBe(0); // 全部释放
+  });
+
+  it('duration decode 与转码共享同一并发上限', async () => {
+    const p1 = makeFakeProc();
+    const p2 = makeFakeProc();
+    const p3 = makeFakeProc();
+
+    const t1 = transcodeToMp3({
+      inputPath: '/in1',
+      outputPath: '/out1',
+      durationSec: 10,
+    });
+    const t2 = measureDecodedAudioDurationSec('/in2');
+    const t3 = transcodeToMp3({
+      inputPath: '/in3',
+      outputPath: '/out3',
+      durationSec: 10,
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(getActiveFfmpegCount()).toBe(2);
+
+    p1.triggerClose(0);
+    await t1;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(spawnMock).toHaveBeenCalledTimes(3);
+
+    p2.triggerClose(0);
+    p3.triggerClose(0);
+    await Promise.all([t2, t3]);
+    expect(getActiveFfmpegCount()).toBe(0);
   });
 });

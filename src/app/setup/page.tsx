@@ -2,7 +2,17 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundarySnapshot,
+  isPersistedAuthBoundaryCurrent,
+  useAuthStore,
+} from '@/stores/authStore';
+import {
+  consumeAuthMutationJson,
+  parseAuthMutationSession,
+  revokeUncommittedAuthSession,
+  runAuthCookieMutation,
+} from '@/lib/clientAuthCookieMutation';
 import {
   Database, UserCog, Brain, Radio,
   CheckCircle2, ChevronRight, ChevronLeft,
@@ -47,6 +57,14 @@ interface SonioxRegionForm {
   apiKey: string;
   wsUrl: string;
   restUrl: string;
+}
+
+interface SetupMutationResponse {
+  error?: string;
+  user?: unknown;
+  token?: string;
+  sessionBinding?: unknown;
+  [key: string]: unknown;
 }
 
 const STEPS = [
@@ -115,6 +133,7 @@ export default function SetupPage() {
   const [showPassword, setShowPassword] = useState(false);
 
   // LLM 表单
+  const [llmCurrentPassword, setLlmCurrentPassword] = useState('');
   const [llmProviders, setLlmProviders] = useState<LlmProviderForm[]>([{
     name: '',
     apiKey: '',
@@ -181,40 +200,54 @@ export default function SetupPage() {
 
   // 执行步骤
   const executeStep = async (stepData: Record<string, unknown>) => {
+    const expected = getAuthBoundarySnapshot();
     setError('');
     setStepLoading(true);
     try {
-      const res = await fetch('/api/setup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify(stepData),
+      const completed = await runAuthCookieMutation(async () => {
+        if (!isPersistedAuthBoundaryCurrent(expected)) {
+          throw new DOMException('Stale auth request', 'AbortError');
+        }
+        const res = await fetch('/api/setup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify(stepData),
+        });
+        const { data, sessionBinding } =
+          await consumeAuthMutationJson<SetupMutationResponse>(res, {
+            expected,
+          });
+        if (!res.ok) {
+          setError(data.error || '操作失败');
+          return false;
+        }
+        if (
+          stepData.step === 'admin'
+        ) {
+          const session = parseAuthMutationSession(data);
+          if (!sessionBinding || !session) {
+            await revokeUncommittedAuthSession(sessionBinding, expected);
+            setError('管理员会话响应无效，请重新登录');
+            return false;
+          }
+          if (!isPersistedAuthBoundaryCurrent(expected)) {
+            await revokeUncommittedAuthSession(sessionBinding, expected);
+            return false;
+          }
+          const committed = await setAuth(
+            session.user,
+            session.token,
+            { expected, sessionBinding }
+          );
+          if (!committed) {
+            await revokeUncommittedAuthSession(sessionBinding, expected);
+            return false;
+          }
+        }
+        return true;
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || '操作失败');
-        return false;
-      }
-      if (
-        stepData.step === 'admin' &&
-        data.user &&
-        typeof data.user === 'object' &&
-        typeof data.token === 'string'
-      ) {
-        const user = data.user as {
-          id: string;
-          email: string;
-          displayName: string;
-          role: 'ADMIN' | 'PRO' | 'FREE';
-        };
-        setAuth(
-          {
-            ...user,
-            createdAt: new Date().toISOString(),
-          },
-          data.token
-        );
-      }
+      if (!completed) return false;
       // 刷新状态
       await fetchStatus();
       return true;
@@ -241,7 +274,11 @@ export default function SetupPage() {
       password: adminPassword,
       displayName: adminDisplayName,
     });
-    if (success) setCurrentStep(2);
+    if (success) {
+      // 管理员创建密码不跨步骤复用；LLM 创建必须由独立 current-password 输入再次证明。
+      setAdminPassword('');
+      setCurrentStep(2);
+    }
   };
 
   // Step 3: LLM 配置
@@ -252,11 +289,21 @@ export default function SetupPage() {
       setError('请至少配置一个 LLM 供应商');
       return;
     }
-    const success = await executeStep({
-      step: 'llm',
-      providers: validProviders,
-    });
-    if (success) setCurrentStep(3);
+    if (!llmCurrentPassword) {
+      setError('请输入当前管理员密码以重新验证身份');
+      return;
+    }
+    try {
+      const success = await executeStep({
+        step: 'llm',
+        providers: validProviders,
+        currentPassword: llmCurrentPassword,
+      });
+      if (success) setCurrentStep(3);
+    } finally {
+      // 不在页面状态中保留可复用的密码证明，无论成功、拒绝还是网络失败都清空。
+      setLlmCurrentPassword('');
+    }
   };
 
   // Step 4: Soniox 配置
@@ -786,6 +833,29 @@ export default function SetupPage() {
                   >
                     <Plus className="w-4 h-4" /> 添加更多供应商
                   </button>
+
+                  <div>
+                    <label
+                      htmlFor="setup-llm-current-password"
+                      className="block text-xs font-medium text-charcoal-600 mb-1"
+                    >
+                      当前管理员密码
+                    </label>
+                    <input
+                      id="setup-llm-current-password"
+                      name="currentPassword"
+                      type="password"
+                      autoComplete="current-password"
+                      value={llmCurrentPassword}
+                      onChange={e => setLlmCurrentPassword(e.target.value)}
+                      placeholder="用于本次高风险配置的身份验证"
+                      className="w-full px-3 py-2 rounded-lg border border-cream-300 text-sm
+                                 focus:outline-none focus:ring-2 focus:ring-rust-400 focus:border-transparent"
+                    />
+                    <p className="mt-1 text-xs text-charcoal-400">
+                      此密码仅用于本次重新验证，不会复用创建管理员步骤中输入的密码。
+                    </p>
+                  </div>
 
                   <div className="flex gap-3 pt-2">
                     <button

@@ -143,6 +143,12 @@ const PDFJS_RUNTIME_ASSETS = [
   ])
 );
 
+const DOCUMENT_PARSER_RUNTIME_ASSETS = [
+  './scripts/document-parser-worker.mjs',
+  './scripts/document-parser-network-deny.cjs',
+  './scripts/document-archive-preflight.mjs',
+];
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'standalone',
@@ -165,7 +171,15 @@ const nextConfig = {
   // Prevent server-side bundling of browser-only ML packages
   // pdf-parse 内嵌 pdfjs-dist + @napi-rs/canvas（原生模块）：被 webpack 打进 server bundle
   // 会在 import 时抛 "Object.defineProperty called on non-object"，必须交给 node 原生 require。
-  serverExternalPackages: ['@huggingface/transformers', 'onnxruntime-web', 'pdf-parse'],
+  serverExternalPackages: [
+    '@huggingface/transformers',
+    'onnxruntime-web',
+    'pdf-parse',
+    'jszip',
+    'mammoth',
+    'exceljs',
+    'officeparser',
+  ],
   // pdfjs 的 worker / CMap / 字体是运行时按路径加载的，nft 静态追踪不到，standalone 产物里会缺
   // （install.sh 与 Dockerfile 都只拷 .next/standalone，缺了就在生产抛
   // "Setting up fake worker failed: Cannot find module …/pdf.worker.mjs"）。
@@ -174,9 +188,18 @@ const nextConfig = {
   // 路径写死到两份 pdfjs-dist（package-lock 锁定的安装结构）：前缀带 ** 的 glob 会让 nft
   // 对每条路由整树遍历 node_modules，直接把 build 打成 V8 OOM。
   outputFileTracingIncludes: {
-    '/api/translate/documents': PDFJS_RUNTIME_ASSETS,
-    '/api/chat-uploads': PDFJS_RUNTIME_ASSETS,
-    '/api/llm/extract-keywords': PDFJS_RUNTIME_ASSETS,
+    '/api/translate/documents': [
+      ...PDFJS_RUNTIME_ASSETS,
+      ...DOCUMENT_PARSER_RUNTIME_ASSETS,
+    ],
+    '/api/chat-uploads': [
+      ...PDFJS_RUNTIME_ASSETS,
+      ...DOCUMENT_PARSER_RUNTIME_ASSETS,
+    ],
+    '/api/llm/extract-keywords': [
+      ...PDFJS_RUNTIME_ASSETS,
+      ...DOCUMENT_PARSER_RUNTIME_ASSETS,
+    ],
   },
   webpack: (config, { dev, isServer }) => {
     config.resolve.alias = {

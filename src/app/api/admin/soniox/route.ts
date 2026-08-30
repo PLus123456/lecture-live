@@ -13,6 +13,7 @@ import {
   validateSonioxRestUrl,
   validateSonioxWsUrl,
 } from '@/lib/sonioxUrlValidation';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 const VALID_REGIONS = ['us', 'eu', 'jp'] as const;
 
@@ -22,11 +23,11 @@ const VALID_REGIONS = ['us', 'eu', 'jp'] as const;
  * 获取 Soniox 配置状态（不返回完整 API Key，仅返回是否已配置）
  */
 export async function GET(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user, response } = await requireAdminAccess(req, {
     scope: 'admin:soniox:get',
     limit: 60,
   });
-  if (response) return response;
+  if (response || !user) return response!;
 
   try {
     const rows = await prisma.siteSetting.findMany({
@@ -77,11 +78,28 @@ export async function GET(req: Request) {
       };
     }
 
-    return NextResponse.json({
+    const responseBody = {
       configured: settings.soniox_configured === 'true',
       defaultRegion: settings.soniox_default_region || 'us',
       regions,
+    };
+
+    await writeSecurityAudit(req, {
+      event: 'soniox.read',
+      operator: user,
+      target: { type: 'soniox_configuration', id: 'global' },
+      before: null,
+      after: null,
+      reason: 'admin-soniox-configuration-read',
+      outcome: 'SUCCESS',
+      metadata: {
+        configured: responseBody.configured,
+        defaultRegion: responseBody.defaultRegion,
+        configuredRegions: VALID_REGIONS.filter((region) => regions[region].hasApiKey),
+      },
     });
+
+    return NextResponse.json(responseBody);
   } catch (err) {
     console.error('获取 Soniox 配置失败:', err);
     return NextResponse.json({ error: '获取配置失败' }, { status: 500 });
@@ -93,12 +111,12 @@ export async function GET(req: Request) {
  * 更新 Soniox 配置（API Key 加密存储）
  */
 export async function PUT(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user, response } = await requireAdminAccess(req, {
     scope: 'admin:soniox:update',
     limit: 20,
     windowMs: 10 * 60_000,
   });
-  if (response) return response;
+  if (response || !user) return response!;
 
   try {
     const body = await req.json();
@@ -126,22 +144,14 @@ export async function PUT(req: Request) {
 
     // 已存值（密钥 + 两个自定义地址），供「改端点必须重填密钥」判定与下面的 configured 计算共用。
     const apiKeyKeys = VALID_REGIONS.map((r) => `soniox_${r.toUpperCase()}_api_key`);
-    const existingRows = await prisma.siteSetting.findMany({
-      where: {
-        key: {
-          in: VALID_REGIONS.flatMap((r) => {
-            const u = r.toUpperCase();
-            return [
-              `soniox_${u}_api_key`,
-              `soniox_${u}_ws_url`,
-              `soniox_${u}_rest_url`,
-            ];
-          }),
-        },
-      },
-      select: { key: true, value: true },
+    const regionSettingKeys = VALID_REGIONS.flatMap((r) => {
+      const u = r.toUpperCase();
+      return [
+        `soniox_${u}_api_key`,
+        `soniox_${u}_ws_url`,
+        `soniox_${u}_rest_url`,
+      ];
     });
-    const existingByKey = new Map(existingRows.map((row) => [row.key, row.value]));
 
     for (const [region, config] of Object.entries(regions)) {
       if (!VALID_REGIONS.includes(region as typeof VALID_REGIONS[number])) continue;
@@ -204,32 +214,79 @@ export async function PUT(req: Request) {
       ops.push({ kind: 'upsert', key: 'soniox_default_region', value: defaultRegion });
     }
 
-    // 计算提交后是否仍存在任何 API Key（含本次未触及的区域），据此定 soniox_configured。
-    const remainingKeys = new Set(apiKeyKeys.filter((key) => existingByKey.has(key)));
-    for (const op of ops) {
-      if (!apiKeyKeys.includes(op.key)) continue;
-      if (op.kind === 'upsert') remainingKeys.add(op.key);
-      else remainingKeys.delete(op.key);
-    }
-    const configuredValue = remainingKeys.size > 0 ? 'true' : 'false';
+    // 原子提交：当前值、全部区域写入、配置标记与 SUCCESS 审计共用一个事务。
+    await prisma.$transaction(async (tx) => {
+      const existingRows = await tx.siteSetting.findMany({
+        where: {
+          key: {
+            in: [...regionSettingKeys, 'soniox_default_region', 'soniox_configured'],
+          },
+        },
+        select: { key: true, value: true },
+      });
+      const existingByKey = new Map(existingRows.map((row) => [row.key, row.value]));
+      const remainingKeys = new Set(apiKeyKeys.filter((key) => existingByKey.has(key)));
+      for (const op of ops) {
+        if (!apiKeyKeys.includes(op.key)) continue;
+        if (op.kind === 'upsert') remainingKeys.add(op.key);
+        else remainingKeys.delete(op.key);
+      }
+      const configuredValue = remainingKeys.size > 0 ? 'true' : 'false';
 
-    // 原子提交：全部区域写入 + 配置标记同进一个事务
-    await prisma.$transaction([
-      ...ops.map((op) =>
-        op.kind === 'upsert'
-          ? prisma.siteSetting.upsert({
-              where: { key: op.key },
-              update: { value: op.value },
-              create: { key: op.key, value: op.value },
-            })
-          : prisma.siteSetting.deleteMany({ where: { key: op.key } })
-      ),
-      prisma.siteSetting.upsert({
+      for (const op of ops) {
+        if (op.kind === 'upsert') {
+          await tx.siteSetting.upsert({
+            where: { key: op.key },
+            update: { value: op.value },
+            create: { key: op.key, value: op.value },
+          });
+        } else {
+          await tx.siteSetting.deleteMany({ where: { key: op.key } });
+        }
+      }
+      await tx.siteSetting.upsert({
         where: { key: 'soniox_configured' },
         update: { value: configuredValue },
         create: { key: 'soniox_configured', value: configuredValue },
-      }),
-    ]);
+      });
+
+      const touchedRegions = VALID_REGIONS.filter((region) =>
+        ops.some((op) => op.key.startsWith(`soniox_${region.toUpperCase()}_`))
+      );
+      const apiKeyChanges = Object.fromEntries(
+        touchedRegions.map((region) => [
+          region,
+          ops.some((op) => op.key === `soniox_${region.toUpperCase()}_api_key`),
+        ])
+      );
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'soniox.update',
+          operator: user,
+          target: { type: 'soniox_configuration', id: 'global' },
+          before: {
+            configured: existingByKey.get('soniox_configured') === 'true',
+            defaultRegion: existingByKey.get('soniox_default_region') ?? 'us',
+          },
+          after: {
+            configured: configuredValue === 'true',
+            defaultRegion:
+              defaultRegion && VALID_REGIONS.includes(defaultRegion as typeof VALID_REGIONS[number])
+                ? defaultRegion
+                : existingByKey.get('soniox_default_region') ?? 'us',
+            touchedRegions,
+            apiKeyChanges,
+            endpointChanged: ops.some(
+              (op) => op.key.endsWith('_ws_url') || op.key.endsWith('_rest_url')
+            ),
+          },
+          reason: 'admin-soniox-configuration-update',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
+    });
 
     // 只有提交成功后才失效缓存
     invalidateSiteSettingsCache();

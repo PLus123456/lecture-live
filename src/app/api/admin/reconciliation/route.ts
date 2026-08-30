@@ -1,19 +1,19 @@
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
-import { logAction } from '@/lib/auditLog';
 import { runTranscriptionUsageReconciliation } from '@/lib/reconciliation';
 import { withRequestLogging } from '@/lib/requestLogger';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 // 获取对账历史（分页）
 export const GET = withRequestLogging(
   'admin:reconciliation:list',
   async (req: Request) => {
-    const { response } = await requireAdminAccess(req, {
+    const { user, response } = await requireAdminAccess(req, {
       scope: 'admin:reconciliation:list',
       limit: 60,
     });
-    if (response) return response;
+    if (response || !user) return response!;
 
     const { searchParams } = new URL(req.url);
     const page = Math.max(1, parseInt(searchParams.get('page') || '1', 10));
@@ -31,6 +31,17 @@ export const GET = withRequestLogging(
         }),
         prisma.reconciliationRun.count(),
       ]);
+
+      await writeSecurityAudit(req, {
+        event: 'reconciliation.read',
+        operator: user,
+        target: { type: 'reconciliation_run_collection' },
+        before: null,
+        after: null,
+        reason: 'admin-reconciliation-history-read',
+        outcome: 'SUCCESS',
+        metadata: { page, pageSize, resultCount: runs.length, total },
+      });
 
       return NextResponse.json({
         runs,
@@ -63,15 +74,42 @@ export const POST = withRequestLogging(
         triggeredBy: user.id,
         triggeredByName: user.email,
         source: 'admin',
-      });
-
-      logAction(req, 'admin.reconciliation.run', {
-        user,
-        detail: JSON.stringify({
-          runId: completedRun.id,
-          totalUsers: completedRun.totalUsers,
-          mismatchCount: completedRun.mismatchCount,
-        }),
+        completionMutation: async (tx, run) => {
+          await writeSecurityAudit(
+            req,
+            {
+              event: 'reconciliation.run',
+              operator: user,
+              target: { type: 'reconciliation_run', id: run.id },
+              before: { status: 'running' },
+              after: {
+                status: 'completed',
+                totalUsers: run.totalUsers,
+                mismatchCount: run.mismatchCount,
+              },
+              reason: 'admin-requested-transcription-reconciliation',
+              outcome: 'SUCCESS',
+              metadata: { durableRun: true },
+            },
+            tx
+          );
+        },
+        failureMutation: async (tx, failure) => {
+          await writeSecurityAudit(
+            req,
+            {
+              event: 'reconciliation.run',
+              operator: user,
+              target: { type: 'reconciliation_run', id: failure.runId },
+              before: { status: 'running' },
+              after: { status: 'failed' },
+              reason: 'admin-requested-transcription-reconciliation',
+              outcome: 'FAILED',
+              metadata: { durableRun: true },
+            },
+            tx
+          );
+        },
       });
 
       return NextResponse.json(completedRun);

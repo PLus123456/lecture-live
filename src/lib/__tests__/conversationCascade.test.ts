@@ -11,6 +11,10 @@ const {
   deleteCloudreveAttachmentFilesMock,
   deleteConversationImagesMock,
   releaseUserStorageBytesRawMock,
+  findBillableStoredArtifactsByConversationsMock,
+  markStoredArtifactOrphanMock,
+  releaseStoredArtifactMock,
+  markStoredArtifactsDeletePendingInTransactionMock,
 } = vi.hoisted(() => ({
   findManyMock: vi.fn(),
   transactionMock: vi.fn(),
@@ -22,6 +26,10 @@ const {
   deleteCloudreveAttachmentFilesMock: vi.fn(),
   deleteConversationImagesMock: vi.fn(),
   releaseUserStorageBytesRawMock: vi.fn(),
+  findBillableStoredArtifactsByConversationsMock: vi.fn(),
+  markStoredArtifactOrphanMock: vi.fn(),
+  releaseStoredArtifactMock: vi.fn(),
+  markStoredArtifactsDeletePendingInTransactionMock: vi.fn(),
 }));
 
 /** 事务替身：把 callback 交给一个带 $queryRaw / deleteMany 的 tx client。 */
@@ -52,6 +60,16 @@ vi.mock('@/lib/chatFileCleanup', () => ({
   releaseUserStorageBytesRaw: releaseUserStorageBytesRawMock,
 }));
 
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_TYPE: { INLINE_IMAGE: 'inline_image' },
+  findBillableStoredArtifactsByConversations:
+    findBillableStoredArtifactsByConversationsMock,
+  markStoredArtifactsDeletePendingInTransaction:
+    markStoredArtifactsDeletePendingInTransactionMock,
+  markStoredArtifactOrphan: markStoredArtifactOrphanMock,
+  releaseStoredArtifact: releaseStoredArtifactMock,
+}));
+
 import { deleteConversationsCascade } from '@/lib/conversationCascade';
 
 describe('deleteConversationsCascade', () => {
@@ -65,8 +83,12 @@ describe('deleteConversationsCascade', () => {
     deleteManySessionMock.mockResolvedValue({ count: 0 });
     deleteManyConversationMock.mockResolvedValue({ count: 1 });
     deleteCloudreveAttachmentFilesMock.mockResolvedValue(true);
-    deleteConversationImagesMock.mockResolvedValue(undefined);
+    deleteConversationImagesMock.mockResolvedValue(true);
     releaseUserStorageBytesRawMock.mockResolvedValue(undefined);
+    findBillableStoredArtifactsByConversationsMock.mockResolvedValue([]);
+    markStoredArtifactOrphanMock.mockResolvedValue(undefined);
+    releaseStoredArtifactMock.mockResolvedValue(true);
+    markStoredArtifactsDeletePendingInTransactionMock.mockResolvedValue([]);
   });
 
   it('空数组 → 返回 0，不碰 DB / 文件 / 配额', async () => {
@@ -86,24 +108,21 @@ describe('deleteConversationsCascade', () => {
     );
   });
 
-  it('先删物理文件 + 本地图片，再事务内锁行释放配额 + 删 DB', async () => {
+  it('先事务内脱钩 owner + 标 DELETE_PENDING，再删物理文件并退账', async () => {
     findManyMock.mockResolvedValueOnce([
       {
-        id: 'a1',
         userId: 'u1',
         bytes: BigInt(100),
         cloudrevePath: '/u1/chat-uploads/c1_a.pdf',
         extractedTextPath: '/u1/chat-uploads/c1_a.pdf.txt',
       },
       {
-        id: 'a2',
         userId: 'u1',
         bytes: BigInt(50),
         cloudrevePath: '/u1/chat-uploads/c1_b.png',
         extractedTextPath: null,
       },
       {
-        id: 'a3',
         userId: 'u2',
         bytes: BigInt(200),
         cloudrevePath: '/u2/chat-uploads/c1_c.docx',
@@ -111,27 +130,9 @@ describe('deleteConversationsCascade', () => {
       },
     ]);
     queryRawMock.mockResolvedValueOnce([
-      {
-        id: 'a1',
-        userId: 'u1',
-        bytes: BigInt(100),
-        cloudrevePath: '/u1/chat-uploads/c1_a.pdf',
-        extractedTextPath: '/u1/chat-uploads/c1_a.pdf.txt',
-      },
-      {
-        id: 'a2',
-        userId: 'u1',
-        bytes: BigInt(50),
-        cloudrevePath: '/u1/chat-uploads/c1_b.png',
-        extractedTextPath: null,
-      },
-      {
-        id: 'a3',
-        userId: 'u2',
-        bytes: BigInt(200),
-        cloudrevePath: '/u2/chat-uploads/c1_c.docx',
-        extractedTextPath: null,
-      },
+      { id: 'a1', userId: 'u1', bytes: BigInt(100) },
+      { id: 'a2', userId: 'u1', bytes: BigInt(50) },
+      { id: 'a3', userId: 'u2', bytes: BigInt(200) },
     ]);
 
     const n = await deleteConversationsCascade(['c1']);
@@ -163,7 +164,6 @@ describe('deleteConversationsCascade', () => {
     // 但事务内 FOR UPDATE 重读为空 —— 说明另一路已提交并退过款，本路不得再退。
     findManyMock.mockResolvedValueOnce([
       {
-        id: 'a1',
         userId: 'u1',
         bytes: BigInt(100),
         cloudrevePath: '/u1/chat-uploads/c1_a.pdf',
@@ -184,134 +184,57 @@ describe('deleteConversationsCascade', () => {
     expect(releaseUserStorageBytesRawMock).not.toHaveBeenCalled();
     expect(transactionMock).toHaveBeenCalledTimes(1);
   });
-});
 
-/**
- * M28 窗口 1：事务外快照之后、事务之前插入同一对话的新附件。
- *
- * 步骤 4 删的是 `deleteMany({ conversationId })` —— 范围谓词，会把这些新行一并删掉，
- * 而步骤 2 的物理删除只拿到了快照，从没见过它们的 cloudrevePath。行一删路径永久丢失，
- * 兜底 cron 也再扫不到 → Cloudreve 上的原文件 + .extracted.txt 成永久孤儿。
- *
- * 这一组测试刻意用**能区分"提交前/提交后"的事务替身**：$transaction 替身在 await 完
- * callback 之后才往事件流里写 'tx:commit'，物理删除替身写 'delete:<paths>'。
- * 只断言"补删被调用过"是抓不住把补删写进事务里的错误实现的 —— 必须断言顺序。
- */
-describe('deleteConversationsCascade —— M28 窗口 1（快照外新增行）', () => {
-  let events: string[];
-
-  const SNAPSHOT_ROW = {
-    id: 'a1',
-    userId: 'u1',
-    bytes: BigInt(100),
-    cloudrevePath: '/u1/chat-uploads/c1_old.pdf',
-    extractedTextPath: '/u1/chat-uploads/c1_old.pdf.extracted.txt',
-  };
-  /** 快照之后才插入的新附件：文件已经传完 Cloudreve，行马上会被 deleteMany 带走。 */
-  const RACE_ROW = {
-    id: 'a2',
-    userId: 'u1',
-    bytes: BigInt(70),
-    cloudrevePath: '/u1/chat-uploads/c1_raced.png',
-    extractedTextPath: null,
-  };
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    events = [];
-
-    findManyMock.mockResolvedValue([SNAPSHOT_ROW]);
-    // 事务内 FOR UPDATE 看到的是"真正会被删掉的那批行" = 快照行 + 竞态新增行
-    queryRawMock.mockResolvedValue([SNAPSHOT_ROW, RACE_ROW]);
-
-    deleteManyAttachmentMock.mockResolvedValue({ count: 2 });
-    deleteManyMessageMock.mockResolvedValue({ count: 0 });
-    deleteManySessionMock.mockResolvedValue({ count: 0 });
-    deleteManyConversationMock.mockResolvedValue({ count: 1 });
-    deleteConversationImagesMock.mockResolvedValue(undefined);
-    releaseUserStorageBytesRawMock.mockResolvedValue(undefined);
-
-    deleteCloudreveAttachmentFilesMock.mockImplementation(
-      async (rows: Array<{ cloudrevePath: string }>) => {
-        events.push(`delete:${rows.map((r) => r.cloudrevePath).join('|')}`);
-        return true;
-      }
-    );
-
-    // 关键：'tx:commit' 只在 callback 成功 await 完之后才写入。
-    transactionMock.mockImplementation(async (cb: (tx: unknown) => unknown) => {
-      events.push('tx:begin');
-      const result = await cb(txClient);
-      events.push('tx:commit');
-      return result;
-    });
-  });
-
-  it('竞态新增行的物理文件会被补删，且补删发生在事务提交之后', async () => {
-    await deleteConversationsCascade(['c1']);
-
-    // 两次物理删除：步骤 2 按快照，步骤 5 按"锁到但不在快照里"的差集。
-    expect(deleteCloudreveAttachmentFilesMock).toHaveBeenCalledTimes(2);
-
-    const supplemental = deleteCloudreveAttachmentFilesMock.mock
-      .calls[1][0] as Array<{ cloudrevePath: string; extractedTextPath: string | null }>;
-    // 只补删差集，不重复删已经删过的快照行。
-    expect(supplemental).toEqual([
+  it('owner/DELETE_PENDING 事务失败时绝不先删物理对象', async () => {
+    findManyMock.mockResolvedValueOnce([
       {
-        cloudrevePath: RACE_ROW.cloudrevePath,
+        id: 'a1',
+        conversationId: 'c1',
+        userId: 'u1',
+        bytes: BigInt(10),
+        cloudrevePath: '/u1/chat-uploads/a.txt',
         extractedTextPath: null,
       },
     ]);
+    transactionMock.mockRejectedValueOnce(new Error('database unavailable'));
 
-    // 顺序：快照删 → 开事务 → 提交 → 补删。补删若写在事务里，这个断言会挂。
-    expect(events).toEqual([
-      `delete:${SNAPSHOT_ROW.cloudrevePath}`,
-      'tx:begin',
-      'tx:commit',
-      `delete:${RACE_ROW.cloudrevePath}`,
-    ]);
+    await expect(deleteConversationsCascade(['c1'])).rejects.toThrow(
+      'database unavailable'
+    );
+    expect(deleteCloudreveAttachmentFilesMock).not.toHaveBeenCalled();
+    expect(deleteConversationImagesMock).not.toHaveBeenCalled();
   });
 
-  it('事务回滚 → 一个字节都不补删（行还在，文件就必须还在）', async () => {
-    transactionMock.mockImplementation(async (cb: (tx: unknown) => unknown) => {
-      events.push('tx:begin');
-      await cb(txClient);
-      // 走到提交这一步才失败：callback 里的差集已经算出来了，
-      // 但事务没提交 → 那些行根本没被删掉，补删就是在制造悬垂引用。
-      events.push('tx:rollback');
-      throw new Error('deadlock; transaction rolled back');
-    });
-
-    await expect(deleteConversationsCascade(['c1'])).rejects.toThrow(/rolled back/);
-
-    // 只有步骤 2 的快照删除发生过，补删一次都没有。
-    expect(deleteCloudreveAttachmentFilesMock).toHaveBeenCalledTimes(1);
-    expect(events).toEqual([
-      `delete:${SNAPSHOT_ROW.cloudrevePath}`,
-      'tx:begin',
-      'tx:rollback',
+  it('提交后物理删除失败时保持 DELETE_PENDING，cleanup 可安全重试', async () => {
+    findManyMock.mockResolvedValueOnce([
+      {
+        id: 'a1',
+        conversationId: 'c1',
+        userId: 'u1',
+        bytes: BigInt(10),
+        cloudrevePath: '/u1/chat-uploads/a.txt',
+        extractedTextPath: null,
+      },
     ]);
-  });
-
-  it('没有竞态新增行时不额外发起物理删除（不做无谓的第二次调用）', async () => {
-    queryRawMock.mockResolvedValue([SNAPSHOT_ROW]);
-
-    await deleteConversationsCascade(['c1']);
-
-    expect(deleteCloudreveAttachmentFilesMock).toHaveBeenCalledTimes(1);
-    expect(events).toEqual([
-      `delete:${SNAPSHOT_ROW.cloudrevePath}`,
-      'tx:begin',
-      'tx:commit',
+    findBillableStoredArtifactsByConversationsMock.mockResolvedValueOnce([
+      {
+        id: 'artifact-1',
+        ownerId: 'a1',
+        conversationId: 'c1',
+        artifactType: 'chat_raw',
+      },
     ]);
-  });
+    queryRawMock.mockResolvedValueOnce([
+      { id: 'a1', userId: 'u1', bytes: BigInt(10) },
+    ]);
+    deleteCloudreveAttachmentFilesMock.mockResolvedValueOnce(false);
 
-  it('锁定行的路径来自事务内重查，而非事务外快照（钉住 SELECT 必须带上两列路径）', async () => {
-    await deleteConversationsCascade(['c1']);
+    await expect(deleteConversationsCascade(['c1'])).resolves.toBe(1);
 
-    const sql = String(queryRawMock.mock.calls[0][0]?.strings ?? queryRawMock.mock.calls[0][0]);
-    expect(sql).toContain('cloudrevePath');
-    expect(sql).toContain('extractedTextPath');
-    expect(sql).toContain('FOR UPDATE');
+    expect(markStoredArtifactsDeletePendingInTransactionMock).toHaveBeenCalledWith(
+      txClient,
+      ['artifact-1']
+    );
+    expect(releaseStoredArtifactMock).not.toHaveBeenCalled();
   });
 });

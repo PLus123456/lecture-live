@@ -6,7 +6,15 @@ import {
   EMPTY_STREAMING_PREVIEW_TRANSLATION,
 } from '@/lib/transcriptPreview';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+  isAuthBoundaryCurrent,
+  isPersistedAuthBoundaryCurrent,
+  type AuthBoundarySnapshot,
+  useAuthStore,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
 import { TokenProcessor } from '@/lib/soniox/tokenProcessor';
 import { buildSonioxConfig, startSonioxRecording } from '@/lib/soniox/client';
 import type { RealtimeToken } from '@/types/soniox';
@@ -43,6 +51,12 @@ type RecordingHandle = {
   stop?: () => Promise<void> | void;
 };
 
+interface InterpretOwner {
+  generation: number;
+  boundary: AuthBoundarySnapshot;
+  signal: AbortSignal;
+}
+
 // R1-L1：key 的 max_session_duration_seconds 到点 Soniox 硬断连接；提前这么多秒主动平滑轮换。
 const ROTATION_LEAD_S = 30;
 
@@ -68,7 +82,6 @@ export function useInterpret() {
   // 自我续命。isStartingRef 那把重入锁只挡并发 start，挡不住 stop。
   // 不变式：stop() 与卸载清理在**任何 await 之前**同步 bump 本代次；start/rotate 的每个
   // await 之后都必须复查代次，过期即就地拆掉已经建起来的资源（停 WS、清定时器），绝不发布。
-  const runIdRef = useRef(0);
   const processorRef = useRef<TokenProcessor | null>(null);
   const startTimeRef = useRef<number | null>(null);
   const anchorIdRef = useRef<string | null>(null);
@@ -87,11 +100,31 @@ export function useInterpret() {
   const sonioxConfigRef = useRef<ReturnType<typeof buildSonioxConfig> | null>(null);
   const callbacksRef = useRef<Parameters<typeof startSonioxRecording>[2] | null>(null);
   const deviceIdRef = useRef<string | undefined>(undefined);
+  const lifecycleGenerationRef = useRef(0);
+  const activeOwnerRef = useRef<InterpretOwner | null>(null);
+
+  const ownerIsCurrent = useCallback((owner: InterpretOwner) => (
+    lifecycleGenerationRef.current === owner.generation &&
+    activeOwnerRef.current === owner &&
+    !owner.signal.aborted &&
+    isAuthBoundaryCurrent(owner.boundary) &&
+    isPersistedAuthBoundaryCurrent(owner.boundary)
+  ), []);
 
   const token = useAuthStore((s) => s.token);
 
   const deductQuota = useCallback(
-    async (durationMs: number, anchorId: string | null) => {
+    async (
+      durationMs: number,
+      anchorId: string | null,
+      expected: AuthBoundarySnapshot
+    ) => {
+      if (
+        !isAuthBoundaryCurrent(expected) ||
+        !isPersistedAuthBoundaryCurrent(expected)
+      ) {
+        return;
+      }
       const authToken = useAuthStore.getState().token;
       // 有服务端锚点时即使前端时长为 0 也要让服务端按墙钟结算；无锚点才依赖 durationMs
       if (!authToken || (durationMs <= 0 && !anchorId)) return;
@@ -107,7 +140,11 @@ export function useInterpret() {
         if (res.ok) {
           const data = (await res.json()) as { quotas?: Record<string, unknown> };
           if (data.quotas) {
-            useAuthStore.getState().setQuotas(data.quotas as never);
+            await runAuthBoundaryCommit(expected, () => {
+              useAuthStore
+                .getState()
+                .setQuotas(data.quotas as never, { expected });
+            });
           }
         }
       } catch (e) {
@@ -141,15 +178,19 @@ export function useInterpret() {
   // 关联本场锚点）。失败置 error（与断线同表现，用户可停止结算或重开）。
   const rotateConnection = useCallback(() => {
     void (async () => {
-      // H3：捕获本次轮换的代次。停旧连接与建新连接之间的 await 里若发生 stop/卸载（bump 代次），
-      // 这条轮换整体作废——否则「停止 → 立刻开新一场」的窗口里，上一场的在途轮换会把一条属于
-      // 旧场的连接挂到新场上。isStoppingRef 只在 stop() 执行期间为 true，覆盖不到这个窗口。
-      const genAtStart = runIdRef.current;
+      const owner = activeOwnerRef.current;
       const current = recordingRef.current;
       const callbacks = callbacksRef.current;
       const sonioxConfig = sonioxConfigRef.current;
       const authToken = useAuthStore.getState().token;
-      if (!current || !callbacks || !sonioxConfig || !authToken) {
+      if (
+        !owner ||
+        !ownerIsCurrent(owner) ||
+        !current ||
+        !callbacks ||
+        !sonioxConfig ||
+        !authToken
+      ) {
         return;
       }
       recordingRef.current = null;
@@ -160,7 +201,7 @@ export function useInterpret() {
       }
       // stop 之后用户可能已同时点了停止（isStoppingRef/句柄已清）——不再重建
       if (
-        runIdRef.current !== genAtStart ||
+        !ownerIsCurrent(owner) ||
         isStoppingRef.current ||
         !startTimeRef.current
       ) {
@@ -173,9 +214,10 @@ export function useInterpret() {
           deviceId: deviceIdRef.current,
           regionPreference: settings.sonioxRegionPreference,
           attribution: { kind: 'interpret', anchorId: anchorIdRef.current },
+          signal: owner.signal,
         });
         if (
-          runIdRef.current !== genAtStart ||
+          !ownerIsCurrent(owner) ||
           isStoppingRef.current ||
           !startTimeRef.current
         ) {
@@ -189,12 +231,10 @@ export function useInterpret() {
         scheduleRotation(result.temporaryKey?.max_session_duration_seconds);
       } catch (error) {
         console.error('Interpret rotation failed:', error);
-        if (runIdRef.current === genAtStart) {
-          setConnectionState('error');
-        }
+        if (ownerIsCurrent(owner)) setConnectionState('error');
       }
     })();
-  }, [scheduleRotation]);
+  }, [ownerIsCurrent, scheduleRotation]);
 
   useEffect(() => {
     rotateConnectionRef.current = rotateConnection;
@@ -204,11 +244,15 @@ export function useInterpret() {
     async (langA: string, langB: string, deviceId?: string) => {
       if (!token) return;
       // U27：同步重入保护，快速双击不会派生两条 Soniox WS / 两路麦克风
-      if (isStartingRef.current || recordingRef.current) return;
+      if (isStartingRef.current || isStoppingRef.current || recordingRef.current) return;
       isStartingRef.current = true;
-      // H3：本次启动的代次。stop()/卸载会 bump 它；下面每个 await 之后据此判断这条启动
-      // 是否已被作废。注意不能在这里 bump —— 那会让「start 之前已排队的 stop」失效。
-      const runId = runIdRef.current;
+      const owner: InterpretOwner = {
+        generation: lifecycleGenerationRef.current + 1,
+        boundary: getAuthBoundarySnapshot(),
+        signal: getAuthBoundaryAbortSignal(),
+      };
+      lifecycleGenerationRef.current = owner.generation;
+      activeOwnerRef.current = owner;
 
       langARef.current = langA;
       langBRef.current = langB;
@@ -238,6 +282,7 @@ export function useInterpret() {
       // 创建 TokenProcessor
       const processor = new TokenProcessor({
         onSegmentFinalized: (segment: TranscriptSegment) => {
+          if (!ownerIsCurrent(owner)) return;
           const line: InterpretLine = {
             id: segment.id,
             language: segment.language,
@@ -259,9 +304,11 @@ export function useInterpret() {
           previewLangRef.current = null;
         },
         onPreviewUpdate: (preview) => {
+          if (!ownerIsCurrent(owner)) return;
           setPreviewText(preview);
         },
         onTranslationToken: (text: string, segmentId: string, meta) => {
+          if (!ownerIsCurrent(owner)) return;
           const sourceLanguage = meta?.sourceLanguage ?? previewLangRef.current;
           const isLangA = sourceLanguage === langARef.current;
           const translatedLineId = `${segmentId}-tr`;
@@ -295,6 +342,7 @@ export function useInterpret() {
           }
         },
         onPreviewTranslationUpdate: (preview) => {
+          if (!ownerIsCurrent(owner)) return;
           setPreviewTranslation(preview);
         },
       });
@@ -307,7 +355,7 @@ export function useInterpret() {
       // 建立服务端时长锚点（反作弊：deduct 以服务端墙钟为计费权威）。
       // 失败不阻塞 interpret 启动，deduct 会降级信任前端时长。
       anchorIdRef.current = null;
-      let pendingAnchorId: string | null = null;
+      let anchorId: string | null = null;
       try {
         const anchorRes = await fetch('/api/interpret/start', {
           method: 'POST',
@@ -319,26 +367,26 @@ export function useInterpret() {
         });
         if (anchorRes.ok) {
           const anchorData = (await anchorRes.json()) as { anchorId?: string | null };
-          pendingAnchorId = anchorData.anchorId ?? null;
+          anchorId = anchorData.anchorId ?? null;
         }
       } catch {
         // 锚点是计费增强项，建立失败时静默降级
       }
 
-      // H3 窗口①：stop()/卸载落在建锚点的 fetch 期间。此时 stop 读到的 startTimeRef 与
-      // recordingRef 都还是 null（duration=0、无句柄），扣费与句柄清理全是 no-op；若照常往下
-      // 走，setInterval 会永久泄漏、setIsRunning(true) 还会在 stop 之后把 UI 假复活。
-      // 就地中止，并把刚建好的服务端锚点顺手结算掉（durationMs=0 + anchorId → 服务端按墙钟
-      // ≈0 结算并消费 Redis 锚点），免得它悬挂到 cron 7h 兜底。
-      if (runIdRef.current !== runId) {
-        processorRef.current = null;
-        if (pendingAnchorId) {
-          void deductQuota(0, pendingAnchorId);
-        }
+      if (!ownerIsCurrent(owner)) {
+        if (processorRef.current === processor) processorRef.current = null;
+        if (activeOwnerRef.current === owner) activeOwnerRef.current = null;
         isStartingRef.current = false;
+        // H3 窗口①：stop()/卸载落在建锚点的 fetch 期间。此时 stop 读到的 startTimeRef 与
+        // recordingRef 都还是 null（duration=0、无句柄），扣费与句柄清理全是 no-op。
+        // 这里把刚建好的服务端锚点顺手结算掉（durationMs=0 + anchorId → 服务端按墙钟
+        // ≈0 结算并消费 Redis 锚点），免得它悬挂到 cron 7h 兜底。
+        if (anchorId) {
+          void deductQuota(0, anchorId, owner.boundary);
+        }
         return;
       }
-      anchorIdRef.current = pendingAnchorId;
+      anchorIdRef.current = anchorId;
 
       // 计时器
       startTimeRef.current = Date.now();
@@ -361,7 +409,7 @@ export function useInterpret() {
       // 复用同一套回调，而轮换不 bump 代次，故门闩对同一场同传恒成立。
       const callbacks: Parameters<typeof startSonioxRecording>[2] = {
         onPartialResult: (tokens) => {
-          if (runIdRef.current !== runId) return;
+          if (!ownerIsCurrent(owner)) return;
           const rtTokens = tokens as RealtimeToken[];
           // 原文 preview 侧仍基于当前转录 token 的 language 判断
           for (const t of rtTokens) {
@@ -370,19 +418,19 @@ export function useInterpret() {
               previewLangRef.current = t.language;
             }
           }
-          processorRef.current?.processTokens(rtTokens);
+          processor.processTokens(rtTokens);
         },
         onEndpoint: () => {
-          if (runIdRef.current !== runId) return;
-          processorRef.current?.onEndpoint();
+          if (!ownerIsCurrent(owner)) return;
+          processor.onEndpoint();
         },
         onError: (error) => {
-          if (runIdRef.current !== runId) return;
+          if (!ownerIsCurrent(owner)) return;
           console.error('Interpret Soniox error:', error);
           setConnectionState('error');
         },
         onConnectionChange: (state) => {
-          if (runIdRef.current !== runId) return;
+          if (!ownerIsCurrent(owner)) return;
           setConnectionState(state);
         },
       };
@@ -402,42 +450,40 @@ export function useInterpret() {
             deviceId: deviceId || undefined,
             regionPreference: settings.sonioxRegionPreference,
             attribution: { kind: 'interpret', anchorId: anchorIdRef.current },
+            signal: owner.signal,
           }
         );
 
-        // H3 窗口②（主窗口）：stop()/卸载落在 startSonioxRecording 的 mint key + WS 握手期间。
-        // stop 先于此处执行，读到 recordingRef=null 而全部 no-op（却照常结算扣费、置
-        // isRunning(false)）；若照常发布，麦克风与 Soniox WS 就成了永不计费的孤儿，更糟的是
-        // scheduleRotation 会在 stop 清空 rotationTimerRef **之后**重新排上定时器，此后每
-        // ~15 分钟自动重建一条连接 —— 孤儿自我续命。代次过期就地拆连接，绝不发布。
-        if (runIdRef.current !== runId) {
+        if (!ownerIsCurrent(owner) || isStoppingRef.current) {
           try {
             await (result as { recording: RecordingHandle }).recording.stop?.();
-          } catch { /* silent */ }
+          } catch { /* stale capability teardown is best effort */ }
           return;
         }
         recordingRef.current = result as { recording: RecordingHandle; client: unknown };
         scheduleRotation(result.temporaryKey?.max_session_duration_seconds);
       } catch (error) {
-        console.error('Failed to start interpret:', error);
-        // 代次已过期（stop/卸载已经把 UI 与计费收拾干净）：不要再回写 isRunning/连接状态，
-        // 否则会覆盖 stop 刚设好的终态。
-        if (runIdRef.current !== runId) {
-          return;
+        if (ownerIsCurrent(owner)) {
+          console.error('Failed to start interpret:', error);
+          setIsRunning(false);
+          setConnectionState('error');
+          if (timerRef.current) {
+            clearInterval(timerRef.current);
+            timerRef.current = null;
+          }
+          // 启动失败：清空计时基准，避免残留的 startTimeRef 让后续 stop 误计费
+          startTimeRef.current = null;
         }
-        setIsRunning(false);
-        setConnectionState('error');
-        if (timerRef.current) {
-          clearInterval(timerRef.current);
-          timerRef.current = null;
-        }
-        // 启动失败：清空计时基准，避免残留的 startTimeRef 让后续 stop 误计费
-        startTimeRef.current = null;
       } finally {
-        isStartingRef.current = false;
+        if (
+          activeOwnerRef.current === owner ||
+          activeOwnerRef.current === null
+        ) {
+          isStartingRef.current = false;
+        }
       }
     },
-    [token, scheduleRotation, deductQuota]
+    [token, ownerIsCurrent, scheduleRotation, deductQuota]
   );
 
   const stop = useCallback(async () => {
@@ -446,9 +492,10 @@ export function useInterpret() {
     // 保证 deductQuota 对同一场同传至多以同一口径调用一次。
     if (isStoppingRef.current) return;
     isStoppingRef.current = true;
-    // H3：在任何 await 之前同步作废当前代次。在途的 start()/rotateConnection() 由此得知
-    // 「这一场已经结束」，会就地拆掉刚建的连接、不发布句柄、不排轮换定时器。
-    runIdRef.current += 1;
+    const owner = activeOwnerRef.current;
+    const expected = owner?.boundary ?? getAuthBoundarySnapshot();
+    lifecycleGenerationRef.current += 1;
+    activeOwnerRef.current = null;
 
     if (timerRef.current) {
       clearInterval(timerRef.current);
@@ -478,18 +525,23 @@ export function useInterpret() {
     processorRef.current?.onEndpoint();
     processorRef.current = null;
 
-    setIsRunning(false);
-    setConnectionState('disconnected');
-    setPreviewText(EMPTY_STREAMING_PREVIEW_TEXT);
-    setPreviewTranslation(EMPTY_STREAMING_PREVIEW_TRANSLATION);
-    setPreviewLang(null);
-    previewLangRef.current = null;
+    const boundaryStillCurrent =
+      isAuthBoundaryCurrent(expected) &&
+      isPersistedAuthBoundaryCurrent(expected);
+    if (boundaryStillCurrent) {
+      setIsRunning(false);
+      setConnectionState('disconnected');
+      setPreviewText(EMPTY_STREAMING_PREVIEW_TEXT);
+      setPreviewTranslation(EMPTY_STREAMING_PREVIEW_TRANSLATION);
+      setPreviewLang(null);
+      previewLangRef.current = null;
+    }
 
     // 扣除配额：带上服务端锚点 id，由服务端以墙钟为权威结算
     const anchorId = anchorIdRef.current;
     anchorIdRef.current = null;
-    if (duration > 0 || anchorId) {
-      void deductQuota(duration, anchorId);
+    if (boundaryStillCurrent && (duration > 0 || anchorId)) {
+      void deductQuota(duration, anchorId, expected);
     }
 
     // 释放重入锁，允许下一场同传重新开始/停止
@@ -499,20 +551,65 @@ export function useInterpret() {
   // C7：组件卸载（如 SPA 导航离开 /interpret）时拆掉进行中的录音并触发扣费，
   // 否则孤儿 Soniox WS + 麦克风会一直运行且整场同传不计费。
   // 用 ref 持有最新 stop，effect 依赖为空只在卸载时执行一次。
-  const stopRef = useRef(stop);
-  stopRef.current = stop;
   useEffect(() => {
-    return () => {
-      // H3：先同步作废代次，再决定要不要 stop。旧代码只在 `recordingRef.current` 非空时才
-      // stop —— 启动中卸载（句柄还没赋值）时整条清理被跳过，而 start 的后半段随后照常把
-      // 麦克风、WS、计时器、轮换定时器装起来，孤儿彻底脱离组件生命周期。bump 之后 start
-      // 会自行拆掉刚建的资源；已经跑起来的一场仍走正常 stop（结算扣费 + 停流）。
-      runIdRef.current += 1;
-      if (recordingRef.current || isStartingRef.current || startTimeRef.current) {
-        void stopRef.current();
+    const invalidateAndTeardown = (updateState: boolean) => {
+      // C7：拆场前先取结算所需的三样东西（下面会把它们全清掉）。
+      const settleBoundary =
+        activeOwnerRef.current?.boundary ?? getAuthBoundarySnapshot();
+      const settleAnchorId = anchorIdRef.current;
+      const settleDurationMs = startTimeRef.current
+        ? Date.now() - startTimeRef.current
+        : 0;
+      lifecycleGenerationRef.current += 1;
+      activeOwnerRef.current = null;
+      isStartingRef.current = false;
+      isStoppingRef.current = false;
+      callbacksRef.current = null;
+      sonioxConfigRef.current = null;
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      if (rotationTimerRef.current) {
+        clearTimeout(rotationTimerRef.current);
+        rotationTimerRef.current = null;
+      }
+      const current = recordingRef.current;
+      recordingRef.current = null;
+      processorRef.current = null;
+      startTimeRef.current = null;
+      anchorIdRef.current = null;
+      try {
+        void Promise.resolve(current?.recording.stop?.()).catch(() => undefined);
+      } catch { /* teardown must remain synchronous at the boundary */ }
+      if (updateState) {
+        setIsRunning(false);
+        setConnectionState('disconnected');
+        setPreviewText(EMPTY_STREAMING_PREVIEW_TEXT);
+        setPreviewTranslation(EMPTY_STREAMING_PREVIEW_TRANSLATION);
+        setPreviewLang(null);
+        previewLangRef.current = null;
+      }
+      // C7：注释一直承诺「卸载时触发扣费」，但重写后这条路径不再结算 —— 锚点会一直
+      // 悬挂到 cron 7h 兜底。这里补回：账号已切走时 deductQuota 内部的边界校验会自行
+      // 早退，不会把上一位用户的时长记到新主体头上。
+      if (settleAnchorId || settleDurationMs > 0) {
+        void deductQuota(settleDurationMs, settleAnchorId, settleBoundary);
       }
     };
-  }, []);
+    const clearForBoundary = () => invalidateAndTeardown(true);
+    window.addEventListener(
+      'lecture-live:account-boundary-clear',
+      clearForBoundary
+    );
+    return () => {
+      window.removeEventListener(
+        'lecture-live:account-boundary-clear',
+        clearForBoundary
+      );
+      invalidateAndTeardown(false);
+    };
+  }, [deductQuota]);
 
   return {
     isRunning,

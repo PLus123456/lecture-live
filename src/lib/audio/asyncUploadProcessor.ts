@@ -28,9 +28,14 @@ import {
 import { probeDurationSec, transcodeToMp3, validateMediaContainer } from '@/lib/audio/ffmpegTranscode';
 import {
   stageSessionAudioArtifact,
-  finalizeStagedArtifactPublish,
+  completeStagedArtifactPublishes,
   rollbackStagedArtifact,
+  settleStagedArtifactsInTransaction,
 } from '@/lib/sessionPersistence';
+import {
+  getStoredArtifactById,
+  STORED_ARTIFACT_STATE,
+} from '@/lib/storage/storedArtifactLedger';
 import {
   resolveAndPersistTaskRegion,
   resolveSonioxConfigForSessionRegion,
@@ -265,24 +270,91 @@ export async function processAsyncUpload(opts: ProcessOptions): Promise<void> {
     const staged = await stageSessionAudioArtifact(session, mp3Buffer, 'audio/mpeg');
 
     const durationMs = Math.round(durationSec * 1000);
-    if (
-      !(await setStatus(
-        session.id,
-        'uploading_to_soniox',
-        {
-          recordingPath: staged.reference,
-          durationMs,
-        },
-        { requireActiveSession: true }
-      ))
-    ) {
+    let publication: Awaited<
+      ReturnType<typeof settleStagedArtifactsInTransaction>
+    > = [];
+    let committedAfterReadback = false;
+    try {
+      const committed = await prisma.$transaction(async (tx) => {
+        const updated = await tx.session.updateMany({
+          where: {
+            id: session.id,
+            asyncTranscribeStatus: {
+              notIn: ['canceled', 'failed', 'completed'],
+            },
+            status: { notIn: ['COMPLETED', 'ARCHIVED'] },
+          },
+          data: {
+            asyncTranscribeStatus: 'uploading_to_soniox',
+            recordingPath: staged.reference,
+            durationMs,
+          },
+        });
+        if (updated.count !== 1) return null;
+        return settleStagedArtifactsInTransaction(tx, [staged]);
+      });
+      if (!committed) {
+        await rollbackStagedArtifact(session, staged).catch(() => undefined);
+        throw new PipelineHaltError();
+      }
+      publication = committed;
+    } catch (publishError) {
+      if (publishError instanceof PipelineHaltError) throw publishError;
+      // COMMIT ACK may be lost. Only delete this generation after a successful
+      // readback proves that neither owner nor ledger was published.
+      try {
+        const [owner, artifact] = await Promise.all([
+          prisma.session.findUnique({
+            where: { id: session.id },
+            select: { recordingPath: true },
+          }),
+          getStoredArtifactById(staged.storedArtifactId),
+        ]);
+        if (
+          owner?.recordingPath === staged.reference &&
+          artifact?.state === STORED_ARTIFACT_STATE.ACTIVE &&
+          artifact.reference === staged.reference
+        ) {
+          committedAfterReadback = true;
+        } else if (
+          owner?.recordingPath !== staged.reference &&
+          artifact?.state === STORED_ARTIFACT_STATE.RESERVED
+        ) {
+          await rollbackStagedArtifact(session, staged).catch(() => undefined);
+          throw publishError;
+        } else {
+          logger.error(
+            { sessionId: session.id, err: publishError },
+            'async audio publication outcome is unknown; preserving staged object'
+          );
+          return;
+        }
+      } catch (readbackError) {
+        if (readbackError === publishError) {
+          throw readbackError;
+        }
+        logger.error(
+          { sessionId: session.id, err: readbackError },
+          'async audio publication readback failed; preserving staged object'
+        );
+        return;
+      }
+    }
+    if (!committedAfterReadback) {
+      await completeStagedArtifactPublishes(session, publication).catch(
+        (cleanupError) => {
+          logger.warn(
+            { sessionId: session.id, err: cleanupError },
+            'async audio published but replaced object cleanup failed'
+          );
+        }
+      );
+    }
+    if (publication.length === 0 && !committedAfterReadback) {
       // CAS 未通过（会话已被并发 /finalize 收尾 / 取消 / 失败）——只删刚 stage 的版本化临时对象，
       // 绝不触碰已定稿的 recordingPath；随后抛 PipelineHaltError 由外层按「非错误提前退出」处理。
-      await rollbackStagedArtifact(session, staged).catch(() => undefined);
       throw new PipelineHaltError();
     }
-    // CAS 通过：recordingPath 已原子指向 staged.reference；发布（best-effort 删旧 previousReference）。
-    await finalizeStagedArtifactPublish(session, staged).catch(() => undefined);
     await invalidateSessionsApiCache(session.userId);
 
     // ── 4b. 按实测时长回补入口预留（P1-3）──

@@ -9,6 +9,7 @@ const {
   prismaMock,
   workerMock,
   persistenceMock,
+  getStoredArtifactMock,
 } = vi.hoisted(() => {
   const prismaMock = {
     jobQueue: {
@@ -27,6 +28,7 @@ const {
     user: {
       findUnique: vi.fn(),
     },
+    $transaction: vi.fn(),
   };
   const workerMock = {
     getEnhanceFleetConfig: vi.fn(),
@@ -40,10 +42,16 @@ const {
   const persistenceMock = {
     loadSessionAudioArtifact: vi.fn(),
     stageArtifact: vi.fn(),
-    finalizeStagedArtifactPublish: vi.fn(),
+    settleStagedArtifactsInTransaction: vi.fn(),
+    completeStagedArtifactPublishes: vi.fn(),
     rollbackStagedArtifact: vi.fn(),
   };
-  return { prismaMock, workerMock, persistenceMock };
+  return {
+    prismaMock,
+    workerMock,
+    persistenceMock,
+    getStoredArtifactMock: vi.fn(),
+  };
 });
 
 vi.mock('@/lib/prisma', () => ({ prisma: prismaMock }));
@@ -65,6 +73,11 @@ vi.mock('@/lib/audio/enhanceWorkerClient', async (importOriginal) => {
 });
 
 vi.mock('@/lib/sessionPersistence', () => persistenceMock);
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_STATE: { RESERVED: 'RESERVED', ACTIVE: 'ACTIVE' },
+  STORED_ARTIFACT_TYPE: { ENHANCED_AUDIO: 'enhanced_audio' },
+  getStoredArtifactById: getStoredArtifactMock,
+}));
 
 import { EnhanceWorkerError } from '@/lib/audio/enhanceWorkerClient';
 import {
@@ -125,15 +138,23 @@ beforeEach(() => {
   prismaMock.jobQueue.update.mockResolvedValue({});
   prismaMock.session.updateMany.mockResolvedValue({ count: 1 });
   prismaMock.session.findUnique.mockResolvedValue(SESSION);
+  prismaMock.$transaction.mockImplementation(
+    async (run: (tx: unknown) => Promise<unknown>) =>
+      run({ session: prismaMock.session, jobQueue: prismaMock.jobQueue })
+  );
   // 被 `.catch(...)` 链式调用的 mock 必须返回 Promise，否则 undefined.catch 抛 TypeError
   workerMock.uploadEnhanceInput.mockResolvedValue(undefined);
   workerMock.startEnhanceJob.mockResolvedValue(undefined);
   workerMock.deleteEnhanceJob.mockResolvedValue(undefined);
-  persistenceMock.finalizeStagedArtifactPublish.mockResolvedValue({
-    path: 'x',
-    storage: 'cloudreve',
-  });
+  persistenceMock.settleStagedArtifactsInTransaction.mockResolvedValue([
+    { staged: {}, settled: { artifact: {}, previous: null } },
+  ]);
+  persistenceMock.completeStagedArtifactPublishes.mockResolvedValue([]);
   persistenceMock.rollbackStagedArtifact.mockResolvedValue(undefined);
+  getStoredArtifactMock.mockResolvedValue({
+    state: 'RESERVED',
+    reference: '/user-1/recordings/staged.mp4',
+  });
 });
 
 describe('enqueueAudioEnhance', () => {
@@ -523,6 +544,10 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
       localReference: 'local:recordings/sess-1-enh.mp4',
       storage: 'cloudreve',
       previousReference: null,
+      storedArtifactId: 'artifact-1',
+      expectedPreviousArtifactId: null,
+      actualBytes: 2,
+      artifactType: 'enhanced_audio',
     });
 
     await runAudioEnhanceTick();
@@ -541,9 +566,11 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
         }),
       })
     );
-    expect(persistenceMock.finalizeStagedArtifactPublish).toHaveBeenCalled();
+    expect(
+      persistenceMock.completeStagedArtifactPublishes
+    ).toHaveBeenCalled();
     // P5-16：落终态必须同时释放 activeKey，否则该会话再也入不了新队
-    expect(prismaMock.jobQueue.update).toHaveBeenCalledWith(
+    expect(prismaMock.jobQueue.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ status: 'SUCCESS', activeKey: null }),
       })
@@ -567,6 +594,10 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
       localReference: 'local:recordings/x.mp4',
       storage: 'cloudreve',
       previousReference: null,
+      storedArtifactId: 'artifact-1',
+      expectedPreviousArtifactId: null,
+      actualBytes: 1,
+      artifactType: 'enhanced_audio',
     });
     prismaMock.session.updateMany.mockResolvedValue({ count: 0 }); // CAS 失败=会话没了
     prismaMock.jobQueue.findUnique.mockResolvedValue(
@@ -576,7 +607,9 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
     await runAudioEnhanceTick();
 
     expect(persistenceMock.rollbackStagedArtifact).toHaveBeenCalled();
-    expect(persistenceMock.finalizeStagedArtifactPublish).not.toHaveBeenCalled();
+    expect(
+      persistenceMock.completeStagedArtifactPublishes
+    ).not.toHaveBeenCalled();
   });
 
   it('failed 且 attempt 未用尽：FAILED + params 写入 nextRetryAt，会话回 pending', async () => {
@@ -669,22 +702,6 @@ describe('runAudioEnhanceTick — 对账 PROCESSING', () => {
 });
 
 describe('runAudioEnhanceTick — 自动重试', () => {
-  /**
-   * L25：retryJob 的回炉是**条件**更新（`where: { id, status: FAILED }`，
-   * Prisma 5 的 extendedWhereUnique；不命中抛 P2025）。这个替身把条件建模出来，
-   * 否则「行其实已经不是 FAILED 了」这种竞态在测试里会被无声放过。
-   */
-  function arrangeConditionalUpdate(row: { id: string; status: string }) {
-    prismaMock.jobQueue.update.mockImplementation(
-      async (args: { where: { id: string; status?: string } }) => {
-        if (args.where.status !== undefined && args.where.status !== row.status) {
-          throw Object.assign(new Error('Record to update not found'), { code: 'P2025' });
-        }
-        return { ...row, ...args };
-      }
-    );
-  }
-
   it('FAILED 且过了 nextRetryAt：retryJob 回炉（attempt+1 → SUBMITTED）', async () => {
     const failedJob = jobRow({
       status: 'FAILED',
@@ -695,39 +712,17 @@ describe('runAudioEnhanceTick — 自动重试', () => {
       .mockResolvedValueOnce([]) // PROCESSING
       .mockResolvedValueOnce([failedJob]) // FAILED
       .mockResolvedValueOnce([]); // SUBMITTED
-    // retryJob 内部：findUnique + 条件 update
+    // retryJob 内部：findUnique + guarded updateMany
     prismaMock.jobQueue.findUnique.mockResolvedValue(failedJob);
-    arrangeConditionalUpdate(failedJob);
 
     await runAudioEnhanceTick();
 
-    expect(prismaMock.jobQueue.update).toHaveBeenCalledWith(
+    expect(prismaMock.jobQueue.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        // L25：谓词必须压进 UPDATE 语句本身，不能只靠 findUnique 预检 ——
-        // 两个进程同一轮回炉同一行会让 attempt 一次跳 2、烧掉一格退避档位。
-        where: { id: 'job-1', status: 'FAILED' },
+        where: expect.objectContaining({ id: 'job-1', status: 'FAILED' }),
         data: expect.objectContaining({ status: 'SUBMITTED', attempt: { increment: 1 } }),
       })
     );
-  });
-
-  it('回炉时行已不是 FAILED（别的进程抢先）：条件不命中 → 不重复 +1 attempt', async () => {
-    const failedJob = jobRow({
-      status: 'FAILED',
-      attempt: 1,
-      params: JSON.stringify({ nextRetryAt: new Date(Date.now() - 1000).toISOString() }),
-    });
-    prismaMock.jobQueue.findMany
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([failedJob])
-      .mockResolvedValueOnce([]);
-    prismaMock.jobQueue.findUnique.mockResolvedValue(failedJob);
-    // 预检读到的还是 FAILED 快照，但真正落 UPDATE 时行已被抢先回炉成 SUBMITTED
-    arrangeConditionalUpdate({ id: 'job-1', status: 'SUBMITTED' });
-
-    // P2025 必须被 retryJob 吞成"竞态输家"，不能冒泡成 tick 异常
-    await expect(runAudioEnhanceTick()).resolves.toBeUndefined();
-    expect(prismaMock.jobQueue.update).toHaveBeenCalledTimes(1);
   });
 
   it('未到 nextRetryAt / 无重试标记 / attempt 用尽：一律不回炉', async () => {

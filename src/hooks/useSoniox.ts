@@ -5,7 +5,11 @@ import { combinePreviewText } from '@/lib/transcriptPreview';
 import { useTranscriptStore, type BackupMeta } from '@/stores/transcriptStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundaryAbortSignal,
+  useAuthStore,
+} from '@/stores/authStore';
+import { ACCOUNT_BOUNDARY_CLEAR_EVENT } from '@/lib/clientAccountCleanup';
 import { TokenProcessor } from '@/lib/soniox/tokenProcessor';
 import { buildSonioxConfig, startSonioxRecording } from '@/lib/soniox/client';
 import {
@@ -89,6 +93,7 @@ export function useSoniox(
   const archiveManagerRef = useRef<RecordingArchiveManager | null>(null);
   const processorRef = useRef<TokenProcessor | null>(null);
   const runIdRef = useRef(0);
+  const accountBoundaryInvalidatedRef = useRef(false);
   const overallStartTimeRef = useRef<number | null>(null);
   const lastAudioBlobRef = useRef<Blob | null>(null);
   const reconnectAttemptsRef = useRef(0);
@@ -161,6 +166,9 @@ export function useSoniox(
       syncState?: BackupMeta['syncState'];
       lastError?: string | null;
     }) => {
+      if (accountBoundaryInvalidatedRef.current) {
+        return;
+      }
       const syncState =
         meta.syncState ??
         (meta.localChunkCount === 0
@@ -182,7 +190,7 @@ export function useSoniox(
 
   const uploadDraftChunk = useCallback(
     async (seq: number, blob: Blob, mimeType: string) => {
-      if (!sessionId || !token) {
+      if (accountBoundaryInvalidatedRef.current || !sessionId || !token) {
         return false;
       }
 
@@ -239,6 +247,10 @@ export function useSoniox(
             body: formData,
           }
         );
+
+        if (accountBoundaryInvalidatedRef.current) {
+          return false;
+        }
 
         if (!response.ok) {
           if (response.status === 429) {
@@ -298,6 +310,9 @@ export function useSoniox(
   );
 
   const syncRemoteDraft = useCallback(async () => {
+    if (accountBoundaryInvalidatedRef.current) {
+      return false;
+    }
     if (syncDraftPromiseRef.current) {
       return syncDraftPromiseRef.current;
     }
@@ -310,6 +325,9 @@ export function useSoniox(
       let localChunkCount = 0;
       try {
         const localEntries = await getAudioChunkEntries(sessionId);
+        if (accountBoundaryInvalidatedRef.current) {
+          return false;
+        }
         localChunkCount = localEntries.length;
         if (localEntries.length === 0) {
           remoteDraftSeqsRef.current = new Set();
@@ -335,6 +353,9 @@ export function useSoniox(
           const response = await fetch(`/api/sessions/${sessionId}/audio/draft`, {
             headers: { Authorization: `Bearer ${token}` },
           });
+          if (accountBoundaryInvalidatedRef.current) {
+            return false;
+          }
           if (response.ok) {
             const data = (await response.json()) as { seqs?: number[] };
             // GET 成功：以服务端为权威（可能比本地记录少 = 确有分片没传上去，需补传）
@@ -886,6 +907,16 @@ export function useSoniox(
   // 内部重连函数 — 断网后自动尝试重新建立 Soniox 连接
   const attemptReconnect = useCallback(
     async () => {
+      if (accountBoundaryInvalidatedRef.current) {
+        return;
+      }
+      // Capture the owner before any timer/await. A stale A reconnect that runs
+      // after logout must keep A's aborted signal instead of adopting B's new
+      // auth boundary when it eventually constructs an archive manager.
+      const ownerSignal = getAuthBoundaryAbortSignal();
+      if (ownerSignal.aborted) {
+        return;
+      }
       // 清掉任何还未触发的上一次重连定时器，避免 onError + catch 同时触发时堆叠多个 WS 尝试
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
@@ -920,6 +951,9 @@ export function useSoniox(
         // 判断期间是否发生了 stop / 卸载（两者都会递增 runId），若是则放弃，避免在已停止/
         // 已卸载的会话上复活一条录音流（审计 high）。
         const genAtStart = runIdRef.current;
+        if (ownerSignal.aborted) {
+          return;
+        }
         const storeState = useTranscriptStore.getState();
         if (
           storeState.recordingState === 'idle' ||
@@ -956,7 +990,7 @@ export function useSoniox(
             archiveManagerRef.current && sessionId
               ? archiveManagerRef.current
               : sessionId
-                ? new RecordingArchiveManager(sessionId)
+                ? new RecordingArchiveManager(sessionId, { ownerSignal })
                 : null;
 
           if (!archiveManager || !sessionId) {
@@ -972,16 +1006,27 @@ export function useSoniox(
             deviceId: sourceType === 'mic' ? selectedMicDeviceId : undefined,
             preserveData: true,
           });
+          if (
+            ownerSignal.aborted ||
+            accountBoundaryInvalidatedRef.current ||
+            runIdRef.current !== genAtStart
+          ) {
+            return;
+          }
           const managedStream = await archiveManager.getSenderStream();
-          void syncRemoteDraft();
 
           // await（ensureArchive / getSenderStream）期间用户可能已 stop 或组件已卸载 ——
           // 建立新 Soniox 连接前再复查一次，否则会白建一条 WS 并把已停止的会话复活成录音态。
-          if (runIdRef.current !== genAtStart) {
+          if (
+            ownerSignal.aborted ||
+            accountBoundaryInvalidatedRef.current ||
+            runIdRef.current !== genAtStart
+          ) {
             shouldReconnectRef.current = false;
             reconnectAttemptsRef.current = 0;
             return;
           }
+          void syncRemoteDraft();
           const latestState = useTranscriptStore.getState().recordingState;
           if (
             latestState === 'idle' ||
@@ -1001,13 +1046,19 @@ export function useSoniox(
           const runId = runIdRef.current + 1;
           runIdRef.current = runId;
           const connectStartMs = performance.now();
+          const reconnectOwnerIsCurrent = () =>
+            !ownerSignal.aborted &&
+            !accountBoundaryInvalidatedRef.current &&
+            runId === runIdRef.current;
+
+          if (!reconnectOwnerIsCurrent()) return;
 
           const result = await startSonioxRecording(
             sonioxConfig,
             currentToken,
             {
               onPartialResult: (tokens) => {
-                if (runId !== runIdRef.current) return;
+                if (!reconnectOwnerIsCurrent()) return;
                 if (tokens.length > 0) {
                   markAudioActivity();
                 }
@@ -1015,18 +1066,18 @@ export function useSoniox(
                 updateTranscriptionLatency(tokens as RealtimeToken[]);
               },
               onEndpoint: () => {
-                if (runId !== runIdRef.current) return;
+                if (!reconnectOwnerIsCurrent()) return;
                 processorRef.current?.onEndpoint();
               },
               onError: (error) => {
-                if (runId !== runIdRef.current) return;
+                if (!reconnectOwnerIsCurrent()) return;
                 console.error('Soniox error (reconnect):', error);
                 void pauseForInterruption('disconnect');
                 // 继续尝试重连
                 attemptReconnect();
               },
               onConnectionChange: (state) => {
-                if (runId !== runIdRef.current) return;
+                if (!reconnectOwnerIsCurrent()) return;
                 setConnectionState(state as 'connecting' | 'connected' | 'error');
                 if (state === 'connected') {
                   markConnectedStable();
@@ -1065,14 +1116,16 @@ export function useSoniox(
               regionPreference: settings.sonioxRegionPreference,
               attribution: { kind: 'realtime', sessionId },
               onAudioLevel: (level) => {
+                if (!reconnectOwnerIsCurrent()) return;
                 if (level >= audioActivityThreshold) {
                   markAudioActivity();
                 }
               },
+              signal: ownerSignal,
             }
           );
 
-          if (runId !== runIdRef.current) {
+          if (!reconnectOwnerIsCurrent()) {
             try { await result.recording.stop?.(); } catch { /* silent */ }
             return;
           }
@@ -1123,6 +1176,13 @@ export function useSoniox(
             reconnectAttemptsRef.current = 0;
           }
         } catch (error) {
+          if (
+            ownerSignal.aborted ||
+            accountBoundaryInvalidatedRef.current ||
+            runIdRef.current !== genAtStart
+          ) {
+            return;
+          }
           console.error('Reconnect attempt failed:', error);
           // H2：建连途中用户已手动暂停时不要再排下一轮重连 —— 否则 connectionState 会被反复
           // 推回 'reconnecting'（暂停中显示"重连中"），要等下一个退避 tick 的守卫才自愈。
@@ -1198,6 +1258,16 @@ export function useSoniox(
       overrideMicDeviceId?: string | null;
       preservePauseStateUntilConnected?: boolean;
     }) => {
+      if (accountBoundaryInvalidatedRef.current) {
+        return;
+      }
+      // Bind every archive created by this async start to the auth/session
+      // boundary that initiated it. Never look up a replacement signal after
+      // an await, otherwise a delayed A start could accidentally adopt B.
+      const ownerSignal = getAuthBoundaryAbortSignal();
+      if (ownerSignal.aborted) {
+        return;
+      }
       if (!token) {
         setConnectionState('error');
         setRecordingState('idle');
@@ -1288,6 +1358,10 @@ export function useSoniox(
 
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
+      const startOwnerIsCurrent = () =>
+        !ownerSignal.aborted &&
+        !accountBoundaryInvalidatedRef.current &&
+        runId === runIdRef.current;
 
       // Consume pre-acquired system audio stream if available
       const preAcquiredStream =
@@ -1301,7 +1375,8 @@ export function useSoniox(
         }
 
         const archiveManager =
-          archiveManagerRef.current ?? new RecordingArchiveManager(sessionId);
+          archiveManagerRef.current ??
+          new RecordingArchiveManager(sessionId, { ownerSignal });
         archiveManagerRef.current = archiveManager;
         archiveManager.setChunkStoredHandler(({ seq, blob, mimeType }) => {
           return uploadDraftChunk(seq, blob, mimeType);
@@ -1309,7 +1384,10 @@ export function useSoniox(
         // P1-10：硬件掉线（麦克风拔出 / 系统共享停止，源 track ended）时，若归档已无实时
         // 采集，UI 不应继续显示 recording。反映为 paused + 断连，让用户看到明确信号。
         archiveManager.setCaptureEndedHandler(() => {
-          if (archiveManagerRef.current !== archiveManager) {
+          if (
+            !startOwnerIsCurrent() ||
+            archiveManagerRef.current !== archiveManager
+          ) {
             return;
           }
           if (archiveManager.hasLiveCapture()) {
@@ -1324,6 +1402,7 @@ export function useSoniox(
         // P0-4：recorder.start() 之前先与服务端协商起始 seq（nextSeq = 服务端 maxSeq+1），
         // 冷启动/续录都据此设定归档起点，杜绝从 0 起覆盖服务端已有录音开头。
         const negotiatedStartSeq = await negotiateStartSeq();
+        if (!startOwnerIsCurrent()) return;
         await archiveManager.ensureArchive({
           sourceType,
           deviceId: sourceType === 'mic' ? selectedMicDeviceId : undefined,
@@ -1332,7 +1411,9 @@ export function useSoniox(
           startedAt,
           initialSeq: negotiatedStartSeq,
         });
+        if (!startOwnerIsCurrent()) return;
         const localChunkCount = (await getAudioChunkEntries(sessionId)).length;
+        if (!startOwnerIsCurrent()) return;
         publishBackupMeta({
           localChunkCount,
           remoteChunkCount: remoteDraftSeqsRef.current.size,
@@ -1344,15 +1425,13 @@ export function useSoniox(
                 : 'pending',
         });
         const managedStream = await archiveManager.getSenderStream();
+        if (!startOwnerIsCurrent()) return;
 
         // L47：到这里本地采集才真正活着（getUserMedia/getDisplayMedia 已成功、MediaRecorder
         // 已在写块），现在才是能对外宣称 recording 的时刻。授权被拒/取流失败会在上面抛出，
         // 直接落到 catch 的 hasLive=false 分支 → 'idle'，后端永远不会被 PATCH 成 RECORDING。
-        // 代次守卫：这几步 await 期间用户可能已 stop（stop() 会 bump runId 并迁 finalizing/
-        // stopped），此时绝不能把状态又翻回 recording。
-        if (runId === runIdRef.current) {
-          setRecordingState(keepPausedUntilConnected ? 'paused' : 'recording');
-        }
+        // 代次守卫由上一行的 startOwnerIsCurrent() 承担（它本身就含 runId 比较）。
+        setRecordingState(keepPausedUntilConnected ? 'paused' : 'recording');
 
         if (startOptions?.preserveStartTime || localChunkCount > 0) {
           void syncRemoteDraft();
@@ -1360,12 +1439,13 @@ export function useSoniox(
 
         const connectStartMs = performance.now();
 
+        if (!startOwnerIsCurrent()) return;
         const result = await startSonioxRecording(
           sonioxConfig,
           token,
           {
             onPartialResult: (tokens) => {
-              if (runId !== runIdRef.current) {
+              if (!startOwnerIsCurrent()) {
                 return;
               }
               if (tokens.length > 0) {
@@ -1375,13 +1455,13 @@ export function useSoniox(
               updateTranscriptionLatency(tokens as RealtimeToken[]);
             },
             onEndpoint: () => {
-              if (runId !== runIdRef.current) {
+              if (!startOwnerIsCurrent()) {
                 return;
               }
               processor.onEndpoint();
             },
             onError: (error) => {
-              if (runId !== runIdRef.current) {
+              if (!startOwnerIsCurrent()) {
                 return;
               }
               console.error('Soniox error:', error);
@@ -1389,7 +1469,7 @@ export function useSoniox(
               attemptReconnect();
             },
             onConnectionChange: (state) => {
-              if (runId !== runIdRef.current) {
+              if (!startOwnerIsCurrent()) {
                 return;
               }
               setConnectionState(state as 'connecting' | 'connected' | 'error');
@@ -1427,29 +1507,31 @@ export function useSoniox(
             regionPreference: settings.sonioxRegionPreference,
             attribution: { kind: 'realtime', sessionId },
             onAudioLevel: (level) => {
+              if (!startOwnerIsCurrent()) return;
               if (level >= audioActivityThreshold) {
                 markAudioActivity();
               }
             },
+            signal: ownerSignal,
           }
         );
 
-        // Store region and wsUrl from the temporary key response
-        if (result.temporaryKey) {
-          setConnectionMeta({
-            region: result.temporaryKey.region,
-            wsUrl: result.temporaryKey.ws_base_url,
-          });
-          scheduleRotation(result.temporaryKey.max_session_duration_seconds);
-        }
-
-        if (runId !== runIdRef.current) {
+        if (!startOwnerIsCurrent()) {
           try {
             await result.recording.stop?.();
           } catch (error) {
             console.error('Error stopping stale recording:', error);
           }
           return;
+        }
+
+        // Store region and wsUrl only after the owner is still proven current.
+        if (result.temporaryKey) {
+          setConnectionMeta({
+            region: result.temporaryKey.region,
+            wsUrl: result.temporaryKey.ws_base_url,
+          });
+          scheduleRotation(result.temporaryKey.max_session_duration_seconds);
         }
 
         recordingRef.current = result as { recording: RecordingHandle; client: unknown };
@@ -1479,7 +1561,7 @@ export function useSoniox(
           }
         }
       } catch (error) {
-        if (runId !== runIdRef.current) {
+        if (!startOwnerIsCurrent()) {
           return;
         }
 
@@ -1637,6 +1719,54 @@ export function useSoniox(
       finalizeOnUnloadSentRef.current = false;
     }
   }, [recordingState]);
+
+  useEffect(() => {
+    const handleAccountBoundaryClear = () => {
+      // Invalidate every delayed Soniox callback before the synchronous store
+      // reset begins. The central recording registry owns/awaits archive
+      // teardown; clearing this ref prevents this old hook from touching it.
+      accountBoundaryInvalidatedRef.current = true;
+      runIdRef.current += 1;
+      shouldReconnectRef.current = false;
+      reconnectAttemptsRef.current = 0;
+      autoPauseReasonRef.current = null;
+
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (stableConnTimerRef.current) {
+        clearTimeout(stableConnTimerRef.current);
+        stableConnTimerRef.current = null;
+      }
+      if (rotationTimerRef.current) {
+        clearTimeout(rotationTimerRef.current);
+        rotationTimerRef.current = null;
+      }
+
+      const oldRecording = recordingRef.current;
+      recordingRef.current = null;
+      archiveManagerRef.current = null;
+      if (oldRecording) {
+        try {
+          void Promise.resolve(oldRecording.recording.stop?.()).catch(() => {});
+        } catch {
+          // Boundary cleanup still continues; callbacks are already stale.
+        }
+      }
+    };
+
+    window.addEventListener(
+      ACCOUNT_BOUNDARY_CLEAR_EVENT,
+      handleAccountBoundaryClear
+    );
+    return () => {
+      window.removeEventListener(
+        ACCOUNT_BOUNDARY_CLEAR_EVENT,
+        handleAccountBoundaryClear
+      );
+    };
+  }, []);
 
   // 组件卸载时清掉 pending 重连定时器，避免在已卸载后仍尝试新建 WS，
   // 并兜底停止仍在运行的麦克风 / Soniox WS / 归档 MediaRecorder。

@@ -18,6 +18,7 @@ import {
 } from '@/lib/recordingDraftPersistence';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { checkQuota } from '@/lib/quota';
+import { StoredArtifactQuotaExceededError } from '@/lib/storage/storedArtifactLedger';
 
 const MAX_CHUNK_BYTES = 2 * 1024 * 1024;
 // 单会话草稿分片 seq 上界。分片按 seq append-only 命名，seq 上界即文件数上界。
@@ -166,6 +167,15 @@ export async function POST(
       chunkCount,
     });
   } catch (error) {
+    if (error instanceof StoredArtifactQuotaExceededError) {
+      return NextResponse.json(
+        {
+          error: 'Storage quota exceeded; cannot save recording draft',
+          quota: 'storage_bytes',
+        },
+        { status: 402 }
+      );
+    }
     // P1-7：草稿已 seal（收尾封存），拒绝迟到分片写入。
     if (error instanceof RecordingDraftSealedError) {
       return NextResponse.json(

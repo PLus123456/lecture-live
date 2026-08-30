@@ -35,9 +35,10 @@ import {
 } from '@/lib/soniox/asyncTranscriptConverter';
 import {
   stageSessionTranscriptArtifacts,
-  finalizeStagedArtifactPublish,
+  settleStagedArtifactsInTransaction,
+  completeStagedArtifactPublishes,
+  readbackStagedArtifactPublication,
   rollbackStagedArtifact,
-  type StagedArtifact,
 } from '@/lib/sessionPersistence';
 import { runBackgroundLLMTasks } from '@/lib/sessionFinalization';
 import {
@@ -140,22 +141,7 @@ export async function finalizeAsyncTranscription(
     summaries: [],
     translations,
   };
-  // ── M5：转录/摘要走两阶段写盘（stage → CAS → publish/rollback）──────────────────
-  // 旧实现是 persistSessionTranscriptArtifacts：写**固定 key** `{sessionId}.json`，且写在下面
-  // 那个终态 CAS 事务**之前**。拉 transcript / 写盘期间用户仍可能取消（cancelAsyncUpload 允许
-  // finalizing→canceled），CAS 于是 count===0 —— 但文件已经落在固定 key 上了。若该会话此前已有
-  // 实时转录定稿在同一个固定 key，这一路就是**直接覆盖掉终态转录**；否则至少留一份没有任何 DB 行
-  // 引用的孤儿。与 sessionFinalization 里修掉的 M5 是同一形态，只是换了个文件。
-  //
-  // 版本化对象天然不同名（`{id}-{stamp}.json`），谁都碰不到谁；CAS 输了就整组删掉。
   const staged = await stageSessionTranscriptArtifacts(session, bundle);
-  const stagedArtifacts: StagedArtifact[] = [staged.transcript, staged.summary];
-  const rollbackStagedArtifacts = async () => {
-    for (const artifact of stagedArtifacts) {
-      await rollbackStagedArtifact(session, artifact).catch(() => undefined);
-    }
-    stagedArtifacts.length = 0;
-  };
 
   // ── 终态 CAS + 计费：同一事务（P5-7）──
   // 完成写入必须带状态守卫（原 route U60 注释）：上面的 claim 把状态置 'finalizing'，但拉
@@ -172,12 +158,15 @@ export async function finalizeAsyncTranscription(
   // 合并后本事务的第一条语句就是按主键 X 锁本 Session 行的 CAS，之后才动 User → 与 init 同为
   // Session→User，环被打断。
   let canceledDuringFinalize = false;
+  let stagedPublications: Awaited<
+    ReturnType<typeof settleStagedArtifactsInTransaction>
+  > = [];
   try {
     const { async_upload_billing_multiplier } = await getSiteSettings();
     const billableMinutes = Math.ceil(
       getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
     );
-    canceledDuringFinalize = await prisma.$transaction(async (tx) => {
+    const commit = await prisma.$transaction(async (tx) => {
       const finalized = await tx.session.updateMany({
         where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
         data: {
@@ -193,7 +182,7 @@ export async function finalizeAsyncTranscription(
       });
       if (finalized.count !== 1) {
         // 守卫抢不到：不扣费、不结算预留，事务空提交，交下方 canceled 分支处理。
-        return true;
+        return { canceled: true as const, stagedPublications: [] };
       }
 
       // 异步上传转录计费（批2 + B1）：claim + 此处 CAS 共同保证每个 session 仅有一个路径进到这里且
@@ -206,14 +195,22 @@ export async function finalizeAsyncTranscription(
         // P5-5：带 sessionId → 同事务写 Session.billedMinutes 台账，对账据此算 expected。
         await deductTranscriptionMinutes(session.userId, billableMinutes, tx, {
           sessionId: session.id,
+          source: 'async_upload_finalize',
+          referenceId: session.id,
         });
       }
       // settleAsyncReservation 用 FOR UPDATE 读**当前**列并原子释放。deduct 内部 ensureQuotaWindow 若
       // 刚触发月度重置会顺带清列 → 此时 settle 读到 0、不重复释放，杜绝跨周期把已被重置隐式清除的预留
       // 再减一次（审查 R1）。并发多路径经 settle 也仅释放一次。
       await settleAsyncReservation(session.id, tx);
-      return false;
+      const publications = await settleStagedArtifactsInTransaction(tx, [
+        staged.transcript,
+        staged.summary,
+      ]);
+      return { canceled: false as const, stagedPublications: publications };
     });
+    canceledDuringFinalize = commit.canceled;
+    stagedPublications = commit.stagedPublications;
   } catch (billingErr) {
     // P5-7：CAS+计费整体回滚（最现实的是死锁 / 事务超时）。此刻会话仍是 'finalizing'——退回
     // transcribing，让下一次前端 poll（allowClaimFrom=['transcribing']）或 cron 回收重新收尾。
@@ -223,33 +220,63 @@ export async function finalizeAsyncTranscription(
       { err: billingErr, sessionId: session.id },
       'async upload finalize+billing tx failed; rolled back to transcribing for retry'
     );
-    const reverted = await prisma.session
-      .updateMany({
-        where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
-        data: { asyncTranscribeStatus: 'transcribing' },
-      })
-      .catch(() => ({ count: 0 }));
-    // M5：临时对象的回滚闸就是上面这条 CAS 的 count —— 这里**刻意不用** casCommitted 布尔。
-    // 本 try 里除了那个事务再无别的语句，「抛错」⇒「未提交」在此几乎恒成立，加个布尔只会得到一个
-    // 永远为 false 的死条件（sessionFinalization 里那段注释警告的正是这个）。而 count 能真正分辨
-    // 那个唯一的例外：
-    //   count===1 → 行仍是 finalizing ⇒ 终态 CAS 必未生效 ⇒ 这两个版本化对象无人引用，删。
-    //   count===0 → 行已不是 finalizing。最要命的一种是「事务其实已提交、只是响应丢失」
-    //     （上面的注释早就点明这种可能）——此时 DB 的 transcriptPath 正指着它们，删了就是把
-    //     刚定稿的转录删掉。保守放过：多留两个小 JSON 远好过删掉被引用的终态产物。
-    if (reverted.count === 1) {
-      await rollbackStagedArtifacts();
+    try {
+      const owner = await prisma.session.findUnique({
+        where: { id: session.id },
+        select: {
+          asyncTranscribeStatus: true,
+          transcriptPath: true,
+          summaryPath: true,
+        },
+      });
+      const readback = await readbackStagedArtifactPublication(
+        [staged.transcript, staged.summary],
+        [owner?.transcriptPath, owner?.summaryPath]
+      );
+      if (
+        owner?.asyncTranscribeStatus === 'completed' &&
+        readback.outcome === 'committed'
+      ) {
+        // COMMIT succeeded and only its ACK was lost. Continue the normal
+        // post-commit cleanup path; rolling back here would delete live data.
+        stagedPublications = readback.publications;
+      } else if (readback.outcome === 'not_committed') {
+        await prisma.session
+          .updateMany({
+            where: { id: session.id, asyncTranscribeStatus: 'finalizing' },
+            data: { asyncTranscribeStatus: 'transcribing' },
+          })
+          .catch(() => undefined);
+        await Promise.all([
+          rollbackStagedArtifact(session, staged.transcript).catch(
+            () => undefined
+          ),
+          rollbackStagedArtifact(session, staged.summary).catch(
+            () => undefined
+          ),
+        ]);
+        return { outcome: 'claim_lost' };
+      } else {
+        logger.error(
+          { sessionId: session.id },
+          'async finalize publication outcome unknown; preserving staged artifacts'
+        );
+        return { outcome: 'claim_lost' };
+      }
+    } catch (readbackError) {
+      logger.error(
+        { err: readbackError, sessionId: session.id },
+        'async finalize publication readback failed; preserving staged artifacts'
+      );
+      return { outcome: 'claim_lost' };
     }
-    // 与「对方已抢先」同一语义：调用方读最新状态返回，交由下一轮重试（绝不删 Soniox 资源）。
-    return { outcome: 'claim_lost' };
   }
 
   if (canceledDuringFinalize) {
-    // M5：终态 CAS 抢不到 ⇒ DB 的 transcriptPath/summaryPath 绝不指向本次 stage 的版本化对象，
-    // 删掉它们。旧实现在这条路径上什么都不做，固定 key 的转录/摘要就那么留在盘上（甚至覆盖了
-    // 已有的实时转录定稿）。
-    await rollbackStagedArtifacts();
-
+    await Promise.all([
+      rollbackStagedArtifact(session, staged.transcript).catch(() => undefined),
+      rollbackStagedArtifact(session, staged.summary).catch(() => undefined),
+    ]);
     // 收尾守卫抢不到（finalizing 期间状态已变）。P1-19：**只有确认会话确实被取消（canceled）**才删
     // Soniox 资源——否则可能是并发 finalizer 的失败回退把状态改回 transcribing（转录仍需要），此时删
     // 外部资源会让后续 salvage getSoniox 404、会话永久卡死（回归红线）。非 canceled → 保留资源交对方/重试。
@@ -280,11 +307,11 @@ export async function finalizeAsyncTranscription(
     return { outcome: 'canceled_during_finalize' };
   }
 
-  // M5：CAS 已提交，DB 的 transcriptPath/summaryPath 已原子指向这两个版本化对象 —— 从此
-  // **不可回滚**。发布（转录/摘要不追踪 previousReference，故 publish 无旧文件可删、纯粹是把
-  // 引用交回；保留调用是为了与录音走同一套 stage→CAS→publish 语义）。
-  await finalizeStagedArtifactPublish(session, staged.transcript).catch(() => undefined);
-  await finalizeStagedArtifactPublish(session, staged.summary).catch(() => undefined);
+  const [transcriptResult, summaryResult] =
+    await completeStagedArtifactPublishes(session, stagedPublications);
+  if (!transcriptResult || !summaryResult) {
+    throw new Error('async transcript artifact publication was incomplete');
+  }
 
   // 终态 + 计费已一并提交之后的副作用（route：失效 sessions API 缓存）。P5-7 之前它排在计费之前，
   // 现在计费与终态同事务提交，缓存失效必须等提交成功——否则事务回滚后缓存却已按「已完成」失效。

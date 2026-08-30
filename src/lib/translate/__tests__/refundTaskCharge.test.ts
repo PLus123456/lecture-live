@@ -52,6 +52,7 @@ vi.mock('@/lib/translate/workerClient', () => ({
 vi.mock('@/lib/translate/taskStorage', () => ({
   readSourceFile: vi.fn(),
   saveOutputFile: vi.fn(),
+  deleteOutputGeneration: vi.fn(),
   deleteTaskFiles: vi.fn(),
 }));
 vi.mock('@/lib/logger', () => ({
@@ -80,7 +81,7 @@ describe('refundTaskCharge', () => {
     // CAS 形态：refundedAt=null 且 chargedCents>0 才置位
     expect(taskUpdateManyMock).toHaveBeenCalledWith({
       where: { id: 't1', refundedAt: null, chargedCents: { gt: 0 } },
-      data: { refundedAt: expect.any(Date) },
+      data: { refundedAt: expect.any(Date), updatedAt: expect.any(Date) },
     });
     // L22：入账必须走同一个事务客户端（第二个参数），否则「闸已置位、钱没到账」会永久卡死
     expect(refundWalletCentsMock).toHaveBeenCalledWith(
@@ -106,7 +107,9 @@ describe('refundTaskCharge', () => {
     taskFindUniqueMock.mockResolvedValue({ userId: 'u1', chargedCents: 120 });
     refundWalletCentsMock.mockRejectedValue(new Error('db down'));
 
-    await expect(refundTaskCharge('t1', '翻译失败自动退款')).resolves.toBeUndefined();
+    await expect(refundTaskCharge('t1', '翻译失败自动退款')).resolves.toEqual({
+      claimed: false,
+    });
 
     // 抢闸与入账在同一事务里，失败即回滚 —— 不该再有「补偿性地把 refundedAt 写回 null」
     // 这一条独立语句（它自己也可能挂，挂了这笔钱就永久消失）
@@ -128,9 +131,36 @@ describe('refundTaskCharge', () => {
         chargedCents: { gt: 0 },
         jobQueueId: 'job-1',
       },
-      data: { refundedAt: expect.any(Date) },
+      data: { refundedAt: expect.any(Date), updatedAt: expect.any(Date) },
     });
     // 任务已换代（谓词不命中）→ 不得退掉新一代刚扣的钱
+    expect(refundWalletCentsMock).not.toHaveBeenCalled();
+  });
+
+  it('重试补退款用终态完整快照，迟到请求不得认领新代费用', async () => {
+    taskUpdateManyMock.mockResolvedValue({ count: 0 });
+    const updatedAt = new Date('2026-08-20T12:00:00.000Z');
+
+    await refundTaskCharge('t1', '重试前补退款', {
+      status: 'CANCELED',
+      jobQueueId: null,
+      proxyGeneration: null,
+      chargedCents: 120,
+      updatedAt,
+    });
+
+    expect(taskUpdateManyMock).toHaveBeenCalledWith({
+      where: {
+        id: 't1',
+        refundedAt: null,
+        chargedCents: { equals: 120, gt: 0 },
+        status: 'CANCELED',
+        jobQueueId: null,
+        proxyGeneration: null,
+        updatedAt,
+      },
+      data: { refundedAt: expect.any(Date), updatedAt: expect.any(Date) },
+    });
     expect(refundWalletCentsMock).not.toHaveBeenCalled();
   });
 });

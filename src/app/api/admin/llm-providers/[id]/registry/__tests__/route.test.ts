@@ -13,6 +13,7 @@ const {
   routeAggregateMock,
   routeCreateMock,
   routeUpdateManyMock,
+  securityAuditMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   providerFindUniqueMock: vi.fn(),
@@ -24,6 +25,7 @@ const {
   routeAggregateMock: vi.fn(),
   routeCreateMock: vi.fn(),
   routeUpdateManyMock: vi.fn(),
+  securityAuditMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({
@@ -55,6 +57,9 @@ vi.mock('@/lib/prisma', () => {
 });
 
 vi.mock('@/lib/auditLog', () => ({ logAction: vi.fn() }));
+vi.mock('@/lib/securityAudit', () => ({
+  writeSecurityAudit: securityAuditMock,
+}));
 
 import { POST } from '@/app/api/admin/llm-providers/[id]/registry/route';
 
@@ -87,6 +92,7 @@ beforeEach(() => {
   routeAggregateMock.mockResolvedValue({ _max: { sortOrder: null } });
   routeCreateMock.mockImplementation(async ({ data }) => ({ id: 'route-new', ...data }));
   routeUpdateManyMock.mockResolvedValue({ count: 0 });
+  securityAuditMock.mockResolvedValue(undefined);
 });
 
 describe('POST /api/admin/llm-providers/[id]/registry', () => {
@@ -97,6 +103,14 @@ describe('POST /api/admin/llm-providers/[id]/registry', () => {
       contextWindow: 262144,
       maxTokens: 8192,
     });
+    expect(securityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'llm-registry.create',
+        outcome: 'SUCCESS',
+      }),
+      expect.any(Object)
+    );
   });
 
   it('purposes 一步挂载：按用途各建一条路由行，该用途首个模型自动成为默认', async () => {
@@ -159,5 +173,12 @@ describe('POST /api/admin/llm-providers/[id]/registry', () => {
     registryFindFirstMock.mockResolvedValue({ id: 'reg-dup' });
     const res = await POST(post({ modelId: 'm', displayName: 'M' }), params);
     expect(res.status).toBe(400);
+  });
+
+  it('审计不可用时事务关闭失败，不向客户端确认登记成功', async () => {
+    securityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+    const res = await POST(post({ modelId: 'm', displayName: 'M' }), params);
+    expect(res.status).toBe(500);
+    expect(securityAuditMock).toHaveBeenCalledTimes(1);
   });
 });

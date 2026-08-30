@@ -33,6 +33,7 @@ const {
   makeRagRetrieverForSessionMock,
   makeRagRetrieverForRecordingsMock,
   loadAttachmentsAsSystemBlocksMock,
+  attachmentReleaseMock,
   loadSessionTranscriptBundleMock,
   loadSessionReportMock,
   buildLlmRoutingOptionsMock,
@@ -40,6 +41,8 @@ const {
   findCompressionBoundaryMock,
   persistChatImageMock,
   estimateRawContextTokensMock,
+  sessionFindManyMock,
+  prismaQueryRawMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   enforceApiRateLimitMock: vi.fn(),
@@ -59,6 +62,7 @@ const {
   makeRagRetrieverForSessionMock: vi.fn(),
   makeRagRetrieverForRecordingsMock: vi.fn(),
   loadAttachmentsAsSystemBlocksMock: vi.fn(),
+  attachmentReleaseMock: vi.fn(),
   loadSessionTranscriptBundleMock: vi.fn(),
   loadSessionReportMock: vi.fn(),
   buildLlmRoutingOptionsMock: vi.fn(),
@@ -66,6 +70,8 @@ const {
   findCompressionBoundaryMock: vi.fn(),
   persistChatImageMock: vi.fn(),
   estimateRawContextTokensMock: vi.fn(),
+  sessionFindManyMock: vi.fn(),
+  prismaQueryRawMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
@@ -87,6 +93,8 @@ vi.mock('@/lib/prisma', () => ({
     conversationMessage: {
       create: conversationMessageCreateMock,
     },
+    session: { findMany: sessionFindManyMock },
+    $queryRaw: prismaQueryRawMock,
     $transaction: prismaTransactionMock,
   },
 }));
@@ -131,11 +139,18 @@ vi.mock('@/lib/llm/chatContextBuilder', async () => {
 });
 
 vi.mock('@/lib/llm/embedding/transcriptRag', () => ({
+  computeTranscriptContentSignature: vi.fn(() => 'test-signature'),
   makeRagRetrieverForSession: makeRagRetrieverForSessionMock,
   makeRagRetrieverForRecordings: makeRagRetrieverForRecordingsMock,
 }));
 
 vi.mock('@/lib/llm/chatAttachments', () => ({
+  ChatAttachmentCapacityError: class ChatAttachmentCapacityError extends Error {
+    constructor() {
+      super('Attachment processing capacity is busy; retry later');
+      this.name = 'ChatAttachmentCapacityError';
+    }
+  },
   loadAttachmentsAsSystemBlocks: loadAttachmentsAsSystemBlocksMock,
   // 实现保持简单 — 这些纯函数在隔离单测里覆盖了
   renderReportAsText: (data: { report?: { topic?: string } } | null) =>
@@ -197,6 +212,7 @@ vi.mock('@/lib/llm/chatImageStorage', async () => {
   };
 });
 
+import { ChatAttachmentCapacityError } from '@/lib/llm/chatAttachments';
 import { POST } from '@/app/api/llm/chat/route';
 import { ChatContextEOLError } from '@/lib/llm/chatContextBuilder';
 import { __resetConversationTurnLocks } from '@/lib/llm/conversationTurnLock';
@@ -264,7 +280,11 @@ describe('POST /api/llm/chat (mode routing)', () => {
 
     resolveAuthorizedLlmSelectionMock.mockResolvedValue({
       user: { role: 'PRO' },
-      providerConfig: { contextWindow: 200_000, displayName: 'mock' },
+      providerConfig: {
+        contextWindow: 200_000,
+        displayName: 'mock',
+        supportsImage: true,
+      },
       providerName: 'mock',
       featureFlags: {
         maxThinkingDepth: 'high',
@@ -286,6 +306,17 @@ describe('POST /api/llm/chat (mode routing)', () => {
 
     buildChatContextMock.mockResolvedValue(makeDefaultBuildChatContextResult());
     estimateRawContextTokensMock.mockReturnValue(100); // 远小于 budget*0.8
+    sessionFindManyMock.mockImplementation(
+      ({ where }: { where: { id: { in: string[] } } }) =>
+        Promise.resolve(
+          where.id.in.map((id) => ({ id, durationMs: 60_000 }))
+        )
+    );
+    prismaQueryRawMock.mockImplementation((query: { strings?: string[] }) =>
+      query.strings?.join('').includes('SiteSetting')
+        ? Promise.resolve([{ value: 'complete' }])
+        : Promise.resolve([])
+    );
 
     // 立即给出一个 text + 立即结束的 streaming 模拟
     callLLMWithHistoryStreamMock.mockImplementation(
@@ -308,7 +339,10 @@ describe('POST /api/llm/chat (mode routing)', () => {
     buildLlmRoutingOptionsMock.mockReturnValue({});
     makeRagRetrieverForSessionMock.mockReturnValue(async () => '');
     makeRagRetrieverForRecordingsMock.mockReturnValue(async () => '');
-    loadAttachmentsAsSystemBlocksMock.mockResolvedValue([]);
+    loadAttachmentsAsSystemBlocksMock.mockResolvedValue({
+      blocks: [],
+      release: attachmentReleaseMock,
+    });
     loadSessionTranscriptBundleMock.mockResolvedValue({
       segments: [],
       summaries: [],
@@ -352,7 +386,10 @@ describe('POST /api/llm/chat (mode routing)', () => {
       expect(done?.level).toBe(1);
 
       // 关键断言：legacy 实时路径必须用 single-session retriever
-      expect(makeRagRetrieverForSessionMock).toHaveBeenCalledWith('sess-1');
+      expect(makeRagRetrieverForSessionMock).toHaveBeenCalledWith(
+        'sess-1',
+        'user-1'
+      );
       // 不能走多录音 retriever
       expect(makeRagRetrieverForRecordingsMock).not.toHaveBeenCalled();
       // 不能调附件 loader（legacy 路径不读附件）
@@ -413,8 +450,9 @@ describe('POST /api/llm/chat (mode routing)', () => {
       // 走多录音 retriever（recordingIds = ['sess-1']），不走单录音 retriever
       expect(makeRagRetrieverForRecordingsMock).toHaveBeenCalledWith(
         ['sess-1'],
+        'user-1',
         expect.any(Function),
-        expect.any(Number)
+        expect.any(String)
       );
       expect(makeRagRetrieverForSessionMock).not.toHaveBeenCalled();
     });
@@ -447,7 +485,10 @@ describe('POST /api/llm/chat (mode routing)', () => {
       await consumeSseEvents(res);
 
       // legacy 仍走单录音 retriever
-      expect(makeRagRetrieverForSessionMock).toHaveBeenCalledWith('sess-long');
+      expect(makeRagRetrieverForSessionMock).toHaveBeenCalledWith(
+        'sess-long',
+        'user-1'
+      );
       // buildChatContext 收到 forceMinLevel=6
       const builderArg = buildChatContextMock.mock.calls[0][0];
       expect(builderArg.forceMinLevel).toBe(6);
@@ -520,14 +561,17 @@ describe('POST /api/llm/chat (mode routing)', () => {
         attachments: [{ id: 'att-1', userId: 'user-1' }],
       });
 
-      loadAttachmentsAsSystemBlocksMock.mockResolvedValue([
-        {
-          attachmentId: 'att-1',
-          kind: 'document',
-          fileName: 'spec.pdf',
-          text: 'SPEC_CONTENT',
-        },
-      ]);
+      loadAttachmentsAsSystemBlocksMock.mockResolvedValue({
+        blocks: [
+          {
+            attachmentId: 'att-1',
+            kind: 'document',
+            fileName: 'spec.pdf',
+            text: 'SPEC_CONTENT',
+          },
+        ],
+        release: attachmentReleaseMock,
+      });
       loadSessionTranscriptBundleMock.mockResolvedValue({
         segments: [
           { text: 'segment 1', startMs: 0 },
@@ -542,6 +586,7 @@ describe('POST /api/llm/chat (mode routing)', () => {
         body: {
           conversationId: 'conv-global',
           question: 'hello',
+          attachmentIds: ['att-1'],
         },
       });
       const res = await POST(req, {} as never);
@@ -558,7 +603,9 @@ describe('POST /api/llm/chat (mode routing)', () => {
       // 附件 loader 被调
       expect(loadAttachmentsAsSystemBlocksMock).toHaveBeenCalledWith({
         conversationId: 'conv-global',
-        attachmentIds: undefined,
+        userId: 'user-1',
+        attachmentIds: ['att-1'],
+        allowImages: true,
       });
 
       // 不能走 single-session retriever
@@ -707,11 +754,27 @@ describe('POST /api/llm/chat (mode routing)', () => {
       // attachments 调一次但结果空
       expect(loadAttachmentsAsSystemBlocksMock).toHaveBeenCalledWith({
         conversationId: 'conv-empty',
+        userId: 'user-1',
         attachmentIds: undefined,
+        allowImages: true,
       });
     });
 
-    it('attachmentIds 参数透传给 loader', async () => {
+    it('attachmentIds 与模型图片能力参数透传给 loader', async () => {
+      resolveAuthorizedLlmSelectionMock.mockResolvedValueOnce({
+        user: { role: 'PRO' },
+        providerConfig: {
+          contextWindow: 200_000,
+          displayName: 'text-only',
+          supportsImage: false,
+        },
+        providerName: 'mock',
+        featureFlags: {
+          maxThinkingDepth: 'high',
+          allowRealtimeSummary: true,
+          allowFinalSummary: true,
+        },
+      });
       conversationFindUniqueMock.mockResolvedValue({
         id: 'conv-with-att',
         userId: 'user-1',
@@ -738,12 +801,396 @@ describe('POST /api/llm/chat (mode routing)', () => {
 
       expect(loadAttachmentsAsSystemBlocksMock).toHaveBeenCalledWith({
         conversationId: 'conv-with-att',
+        userId: 'user-1',
         attachmentIds: ['att-1'],
+        allowImages: false,
       });
+    });
+
+    it('附件进程容量已满 → 立即 429 且带 Retry-After', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-busy',
+        userId: 'user-1',
+        sessionId: null,
+        endedAt: null,
+        degradationLevel: 1,
+        session: null,
+        messages: [],
+        sessions: [],
+        attachments: [{ id: 'att-1', userId: 'user-1' }],
+      });
+      loadAttachmentsAsSystemBlocksMock.mockRejectedValueOnce(
+        new ChatAttachmentCapacityError()
+      );
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-busy',
+          question: 'q',
+          attachmentIds: ['att-1'],
+        },
+      });
+      const res = await POST(req, {} as never);
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get('retry-after')).toBe('1');
+    });
+
+    it('附件加载后若流开始前失败，会立即释放附件 lease', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-prestream-error',
+        userId: 'user-1',
+        sessionId: null,
+        endedAt: null,
+        degradationLevel: 1,
+        session: null,
+        messages: [],
+        sessions: [],
+        attachments: [{ id: 'att-1', userId: 'user-1' }],
+      });
+      estimateRawContextTokensMock.mockImplementationOnce(() => {
+        throw new Error('pre-stream context assembly failed');
+      });
+
+      const response = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body: {
+            conversationId: 'conv-prestream-error',
+            question: 'q',
+            attachmentIds: ['att-1'],
+          },
+        }),
+        {} as never
+      );
+
+      expect(response.status).toBe(500);
+      expect(attachmentReleaseMock).toHaveBeenCalledTimes(1);
+      expect(callLLMWithHistoryStreamMock).not.toHaveBeenCalled();
+    });
+
+    it('Promise.all 的 sibling 先失败时，迟到的附件 lease 仍会被释放', async () => {
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-late-lease',
+        userId: 'user-1',
+        sessionId: null,
+        endedAt: null,
+        degradationLevel: 1,
+        session: null,
+        messages: [],
+        sessions: [
+          {
+            conversationId: 'conv-late-lease',
+            sessionId: 'sess-broken',
+            addedAt: new Date(),
+            session: {
+              id: 'sess-broken',
+              userId: 'user-1',
+              targetLang: 'zh',
+              title: 'Broken',
+              recordingPath: null,
+              transcriptPath: '/broken.json',
+              summaryPath: null,
+              reportPath: null,
+            },
+          },
+        ],
+        attachments: [{ id: 'att-1', userId: 'user-1' }],
+      });
+      loadSessionTranscriptBundleMock.mockResolvedValueOnce({
+        get segments() {
+          throw new Error('broken transcript shape');
+        },
+        summaries: [],
+        translations: {},
+      });
+      let finishAttachmentLoad!: (loaded: {
+        blocks: unknown[];
+        release: () => void;
+      }) => void;
+      loadAttachmentsAsSystemBlocksMock.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishAttachmentLoad = resolve;
+          })
+      );
+
+      const response = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body: {
+            conversationId: 'conv-late-lease',
+            question: 'q',
+            attachmentIds: ['att-1'],
+          },
+        }),
+        {} as never
+      );
+      expect(response.status).toBe(500);
+      expect(attachmentReleaseMock).not.toHaveBeenCalled();
+
+      finishAttachmentLoad({ blocks: [], release: attachmentReleaseMock });
+      await vi.waitFor(() => {
+        expect(attachmentReleaseMock).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it('下载完成后仍持有附件 lease，直到慢上游流真正结束', async () => {
+      conversationFindUniqueMock.mockImplementation(
+        async ({ where }: { where: { id: string } }) => ({
+          id: where.id,
+          userId: 'user-1',
+          sessionId: null,
+          endedAt: null,
+          degradationLevel: 1,
+          session: null,
+          messages: [],
+          sessions: [],
+          attachments: [{ id: 'att-1', userId: 'user-1' }],
+        })
+      );
+
+      let attachmentLeaseHeld = false;
+      let firstReleaseCount = 0;
+      loadAttachmentsAsSystemBlocksMock.mockImplementation(async () => {
+        if (attachmentLeaseHeld) throw new ChatAttachmentCapacityError();
+        attachmentLeaseHeld = true;
+        let released = false;
+        return {
+          blocks: [
+            {
+              attachmentId: 'att-1',
+              kind: 'document',
+              fileName: 'held.txt',
+              text: 'already downloaded',
+            },
+          ],
+          release: () => {
+            if (released) return;
+            released = true;
+            firstReleaseCount += 1;
+            attachmentLeaseHeld = false;
+          },
+        };
+      });
+
+      let finishFirstUpstream!: () => void;
+      const firstUpstreamGate = new Promise<void>((resolve) => {
+        finishFirstUpstream = resolve;
+      });
+      let markFirstUpstreamStarted!: () => void;
+      const firstUpstreamStarted = new Promise<void>((resolve) => {
+        markFirstUpstreamStarted = resolve;
+      });
+      let upstreamCall = 0;
+      callLLMWithHistoryStreamMock.mockImplementation(
+        async (
+          _sys: string,
+          _msgs: unknown,
+          _opts: unknown,
+          onEvent: (ev: { type: string; delta?: string }) => void
+        ) => {
+          upstreamCall += 1;
+          onEvent({ type: 'text', delta: 'hello' });
+          if (upstreamCall === 1) {
+            markFirstUpstreamStarted();
+            await firstUpstreamGate;
+          }
+          return {
+            text: 'hello',
+            usage: { inputTokens: 1, outputTokens: 1 },
+          };
+        }
+      );
+
+      const first = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body: {
+            conversationId: 'conv-slow-1',
+            question: 'q',
+            attachmentIds: ['att-1'],
+          },
+        }),
+        {} as never
+      );
+      await firstUpstreamStarted;
+      expect(firstReleaseCount).toBe(0);
+
+      const whileHeld = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body: {
+            conversationId: 'conv-slow-2',
+            question: 'q',
+            attachmentIds: ['att-1'],
+          },
+        }),
+        {} as never
+      );
+      expect(whileHeld.status).toBe(429);
+      expect(firstReleaseCount).toBe(0);
+
+      finishFirstUpstream();
+      await consumeSseEvents(first);
+      expect(firstReleaseCount).toBe(1);
+
+      const afterRelease = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body: {
+            conversationId: 'conv-slow-3',
+            question: 'q',
+            attachmentIds: ['att-1'],
+          },
+        }),
+        {} as never
+      );
+      expect(afterRelease.status).toBe(200);
+      await consumeSseEvents(afterRelease);
+    });
+
+    it('客户端取消只 abort，上游延迟退出期间仍保留附件 lease', async () => {
+      conversationFindUniqueMock.mockImplementation(
+        async ({ where }: { where: { id: string } }) => ({
+          id: where.id,
+          userId: 'user-1',
+          sessionId: null,
+          endedAt: null,
+          degradationLevel: 1,
+          session: null,
+          messages: [],
+          sessions: [],
+          attachments: [{ id: 'att-1', userId: 'user-1' }],
+        })
+      );
+
+      let attachmentLeaseHeld = false;
+      let notifyLeaseReleased!: () => void;
+      const leaseReleased = new Promise<void>((resolve) => {
+        notifyLeaseReleased = resolve;
+      });
+      loadAttachmentsAsSystemBlocksMock.mockImplementation(async () => {
+        if (attachmentLeaseHeld) throw new ChatAttachmentCapacityError();
+        attachmentLeaseHeld = true;
+        let released = false;
+        return {
+          blocks: [
+            {
+              attachmentId: 'att-1',
+              kind: 'document',
+              fileName: 'held.txt',
+              text: 'already downloaded',
+            },
+          ],
+          release: () => {
+            if (released) return;
+            released = true;
+            attachmentLeaseHeld = false;
+            notifyLeaseReleased();
+          },
+        };
+      });
+
+      let allowAbortExit!: () => void;
+      const abortExitGate = new Promise<void>((resolve) => {
+        allowAbortExit = resolve;
+      });
+      let notifyAbortObserved!: () => void;
+      const abortObserved = new Promise<void>((resolve) => {
+        notifyAbortObserved = resolve;
+      });
+      callLLMWithHistoryStreamMock.mockImplementationOnce(
+        async (
+          _sys: string,
+          _msgs: unknown,
+          opts: { signal: AbortSignal },
+          onEvent: (ev: { type: string; delta?: string }) => void
+        ) => {
+          onEvent({ type: 'text', delta: 'partial' });
+          if (opts.signal.aborted) {
+            notifyAbortObserved();
+          } else {
+            opts.signal.addEventListener('abort', notifyAbortObserved, {
+              once: true,
+            });
+          }
+          await abortObserved;
+          await abortExitGate;
+          throw new Error('aborted after provider cleanup');
+        }
+      );
+
+      const first = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body: {
+            conversationId: 'conv-abort-1',
+            question: 'q',
+            attachmentIds: ['att-1'],
+          },
+        }),
+        {} as never
+      );
+      expect(first.status).toBe(200);
+      await first.body!.cancel();
+      await abortObserved;
+
+      const whileProviderExits = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body: {
+            conversationId: 'conv-abort-2',
+            question: 'q',
+            attachmentIds: ['att-1'],
+          },
+        }),
+        {} as never
+      );
+      expect(whileProviderExits.status).toBe(429);
+      expect(attachmentLeaseHeld).toBe(true);
+
+      allowAbortExit();
+      await leaseReleased;
+      expect(attachmentLeaseHeld).toBe(false);
+
+      const afterProviderExit = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body: {
+            conversationId: 'conv-abort-3',
+            question: 'q',
+            attachmentIds: ['att-1'],
+          },
+        }),
+        {} as never
+      );
+      expect(afterProviderExit.status).toBe(200);
+      await consumeSseEvents(afterProviderExit);
     });
   });
 
   describe('common error paths', () => {
+    it('首个超长 transcript 段直接413，不查库也不调 provider', async () => {
+      const response = await POST(
+        createJsonRequest('http://localhost:3000/api/llm/chat', {
+          method: 'POST',
+          body: {
+            conversationId: 'conv-legacy',
+            question: 'hello',
+            transcript: [{ text: 'x'.repeat(64 * 1024 + 1), startMs: 0 }],
+          },
+        }),
+        {} as never
+      );
+
+      expect(response.status).toBe(413);
+      expect(conversationFindUniqueMock).not.toHaveBeenCalled();
+      expect(callLLMWithHistoryStreamMock).not.toHaveBeenCalled();
+      expect(callEmbeddingMock).not.toHaveBeenCalled();
+    });
+
     it('未登录 → 401', async () => {
       verifyAuthMock.mockResolvedValue(null);
       const req = createJsonRequest('http://localhost:3000/api/llm/chat', {

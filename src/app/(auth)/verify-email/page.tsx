@@ -7,7 +7,17 @@ import { Loader2, CheckCircle2, XCircle } from 'lucide-react';
 import SiteLogo from '@/components/SiteLogo';
 import ThemeSwitcher from '@/components/ThemeSwitcher';
 import { useI18n } from '@/lib/i18n';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundarySnapshot,
+  isPersistedAuthBoundaryCurrent,
+  useAuthStore,
+} from '@/stores/authStore';
+import {
+  consumeAuthMutationJson,
+  parseAuthMutationSession,
+  revokeUncommittedAuthSession,
+  runAuthCookieMutation,
+} from '@/lib/clientAuthCookieMutation';
 
 type Status = 'verifying' | 'success' | 'error';
 
@@ -29,23 +39,60 @@ export default function VerifyEmailPage() {
       setErrorMsg(t('auth.verifyMissingToken'));
       return;
     }
+    const expected = getAuthBoundarySnapshot();
 
     (async () => {
       try {
-        const res = await fetch('/api/auth/verify-email', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token }),
+        const verified = await runAuthCookieMutation(async () => {
+          if (!isPersistedAuthBoundaryCurrent(expected)) {
+            throw new DOMException('Stale auth request', 'AbortError');
+          }
+          const res = await fetch('/api/auth/verify-email', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token }),
+          });
+          const { data, sessionBinding } =
+            await consumeAuthMutationJson<{
+              sessionBinding?: unknown;
+              verified?: boolean;
+              user?: unknown;
+              token?: unknown;
+            }>(res, {
+              expected,
+            });
+          const session = parseAuthMutationSession(data);
+          if (
+            !res.ok ||
+            !data?.verified ||
+            !sessionBinding ||
+            !session
+          ) {
+            if (res.ok) {
+              await revokeUncommittedAuthSession(sessionBinding, expected);
+            }
+            setStatus('error');
+            setErrorMsg(
+              res.status === 429
+                ? t('auth.rateLimited')
+                : t('auth.verifyFailed')
+            );
+            return false;
+          }
+          if (!isPersistedAuthBoundaryCurrent(expected)) {
+            await revokeUncommittedAuthSession(sessionBinding, expected);
+            return false;
+          }
+          const committed = await setAuth(session.user, session.token, {
+            expected,
+            sessionBinding,
+          });
+          if (!committed) {
+            await revokeUncommittedAuthSession(sessionBinding, expected);
+          }
+          return committed;
         });
-        const data = await res.json().catch(() => null);
-        // 文案走 i18n 键，不采用服务端 error（服务端永远是硬编码中文，英文键因此成了死代码）。
-        if (!res.ok || !data?.verified) {
-          setStatus('error');
-          setErrorMsg(res.status === 429 ? t('auth.rateLimited') : t('auth.verifyFailed'));
-          return;
-        }
-        // 验证成功：后端已下发会话 cookie，同步客户端 store 后进入应用。
-        setAuth(data.user, data.token);
+        if (!verified) return;
         setStatus('success');
         // replace 而非 push：验证令牌是一次性的，把本页留在历史里意味着用户按一下后退
         // 就会重放已消费的链接，然后对着一个刚验证成功的账号弹「链接无效或已过期」。

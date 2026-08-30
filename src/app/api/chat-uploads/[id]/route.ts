@@ -12,12 +12,20 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
-import { releaseStorageBytes } from '@/lib/quota';
 import {
   loadCloudreveContext,
   deleteCloudreveFile,
 } from '@/lib/storage/cloudreveFileDelete';
 import { logger, serializeError } from '@/lib/logger';
+import {
+  STORED_ARTIFACT_TYPE,
+  areStoredArtifactDeleteIntentsDurable,
+  assertStoredArtifactBackfillComplete,
+  assertStoredArtifactReferencesCovered,
+  findBillableStoredArtifactsByOwner,
+  markStoredArtifactsDeletePendingInTransaction,
+  releaseStoredArtifact,
+} from '@/lib/storage/storedArtifactLedger';
 
 const routeLogger = logger.child({ component: 'chat-uploads-delete' });
 
@@ -64,58 +72,116 @@ export async function DELETE(
     );
   }
 
-  // 物理文件 best-effort 删除（失败不阻塞 DB 清理）
-  const cloudreveCtx = await loadCloudreveContext();
-  if (cloudreveCtx) {
-    await deleteCloudreveFile(attachment.cloudrevePath, cloudreveCtx);
-    if (attachment.extractedTextPath) {
-      await deleteCloudreveFile(attachment.extractedTextPath, cloudreveCtx);
-    }
-  }
-
-  // DB 删除 + 配额释放（按附件 owner 释放，admin 跨用户删也要还给原用户）
-  //
-  // L62：这里刻意用 deleteMany + count 而不是 delete。两个并发 DELETE 打同一个 id 时，
-  // 双方都能通过上面的 findUnique 检查、都会走到这一步；`prisma.delete` 对已被对方删掉的
-  // 行抛 P2025，旧代码把它当 DB 故障回 500 —— 用户看到「删除失败」而文件其实已经删干净了
-  // （前端 removeAttachment 还会因此回滚 chip 并 toast 报错）。
-  //
-  // 更要紧的是配额：count 是「本请求真的删掉了几行」的权威口径。只有 count===1 才释放字节，
-  // 与 chatFileCleanup 的 B8 / conversationCascade 的 P5-13 同一条不变量 ——
-  // 任一行的字节至多被释放一次，杜绝并发双删各退一份的凭空配额。
-  let deletedCount: number;
+  let ledgerRows: Awaited<
+    ReturnType<typeof findBillableStoredArtifactsByOwner>
+  >;
   try {
-    const result = await prisma.chatAttachment.deleteMany({ where: { id } });
-    deletedCount = result.count;
+    await assertStoredArtifactBackfillComplete();
+    ledgerRows = await findBillableStoredArtifactsByOwner(
+      'chat_attachment',
+      attachment.id
+    );
+    assertStoredArtifactReferencesCovered(ledgerRows, [
+      attachment.cloudrevePath,
+      attachment.extractedTextPath,
+    ]);
   } catch (err) {
     routeLogger.error(
       { id, err: serializeError(err) },
-      'chat-uploads-delete: DB delete failed'
+      'chat attachment inventory is incomplete; delete refused'
     );
-    return NextResponse.json({ error: 'Delete failed' }, { status: 500 });
+    return NextResponse.json(
+      { error: 'Attachment storage inventory is not ready' },
+      { status: 503, headers: { 'Retry-After': '30' } }
+    );
   }
 
-  if (deletedCount === 0) {
-    // 并发的另一路已经删掉了这一行（并已释放过它的字节）。删除语义上已达成，
-    // 回 200 保持幂等；**绝不能**在这里 releaseStorageBytes，那就是重复退额度。
-    routeLogger.info(
-      { id },
-      'chat-uploads-delete: 行已被并发请求删除；跳过配额释放（幂等返回）'
-    );
-    return NextResponse.json({ ok: true, alreadyDeleted: true });
-  }
-
+  // 先在同一 DB 事务中删 owner 并把 ledger 变成持久 DELETE_PENDING。
+  // 物理删除放在提交后：崩溃只会留下可重试的 ownerless 对象，
+  // 绝不会把仍可见的附件先删成断链。
   try {
-    await releaseStorageBytes(attachment.userId, Number(attachment.bytes));
+    await prisma.$transaction(async (tx) => {
+      await markStoredArtifactsDeletePendingInTransaction(
+        tx,
+        ledgerRows.map((row) => row.id)
+      );
+      await tx.chatAttachment.delete({ where: { id } });
+      if (ledgerRows.length === 0) {
+        await tx.$executeRaw`
+          UPDATE User
+          SET storageBytesUsed = GREATEST(0, storageBytesUsed - ${attachment.bytes})
+          WHERE id = ${attachment.userId}
+        `;
+      }
+    });
   } catch (err) {
-    routeLogger.warn(
-      {
-        userId: attachment.userId,
-        bytes: attachment.bytes.toString(),
-        err: serializeError(err),
-      },
-      'chat-uploads-delete: releaseStorageBytes failed; admin reconcile 会兜底'
+    try {
+      const owner = await prisma.chatAttachment.findUnique({
+        where: { id },
+        select: { id: true },
+      });
+      if (owner) {
+        routeLogger.error(
+          { id, err: serializeError(err) },
+          'chat-uploads-delete: DB delete failed'
+        );
+        return NextResponse.json({ error: 'Delete failed' }, { status: 500 });
+      }
+      const deleteIntentDurable = await areStoredArtifactDeleteIntentsDurable(
+        ledgerRows.map((row) => row.id)
+      );
+      if (!deleteIntentDurable) {
+        routeLogger.error(
+          { id },
+          'chat attachment owner detached without a provable ledger delete intent'
+        );
+        return NextResponse.json(
+          { error: 'Delete status is being reconciled' },
+          { status: 503, headers: { 'Retry-After': '30' } }
+        );
+      }
+      routeLogger.warn(
+        { id },
+        'chat attachment delete returned failure but owner+ledger readback confirmed commit'
+      );
+    } catch (readbackError) {
+      routeLogger.error(
+        { id, err: serializeError(readbackError) },
+        'chat attachment delete outcome unknown; physical files preserved'
+      );
+      return NextResponse.json(
+        { error: 'Delete status is being reconciled' },
+        { status: 503, headers: { 'Retry-After': '30' } }
+      );
+    }
+  }
+
+  const cloudreveCtx = await loadCloudreveContext();
+  let rawDeleted = false;
+  let extractedDeleted = attachment.extractedTextPath === null;
+  if (cloudreveCtx) {
+    rawDeleted = await deleteCloudreveFile(
+      attachment.cloudrevePath,
+      cloudreveCtx
     );
+    if (attachment.extractedTextPath) {
+      extractedDeleted = await deleteCloudreveFile(
+        attachment.extractedTextPath,
+        cloudreveCtx
+      );
+    }
+  }
+
+  if (ledgerRows.length > 0) {
+    for (const artifact of ledgerRows) {
+      const deleted =
+        artifact.artifactType === STORED_ARTIFACT_TYPE.CHAT_EXTRACTED
+          ? extractedDeleted
+          : rawDeleted;
+      if (deleted) {
+        await releaseStoredArtifact(artifact.id).catch(() => undefined);
+      }
+    }
   }
 
   return NextResponse.json({ ok: true });

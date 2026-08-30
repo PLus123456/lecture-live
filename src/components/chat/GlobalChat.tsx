@@ -21,7 +21,11 @@ import {
   X,
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundarySnapshot,
+  isAuthBoundaryCurrent,
+  useAuthStore,
+} from '@/stores/authStore';
 import { useConversationListStore } from '@/stores/conversationListStore';
 import {
   useChatStore,
@@ -29,6 +33,10 @@ import {
   EMPTY_CONVERSATION_RUNTIME,
 } from '@/stores/chatStore';
 import { findCompressionBoundary } from '@/lib/llm/chatCompression';
+import {
+  CHAT_ATTACHMENT_SELECTION_MAX_COUNT,
+} from '@/lib/llm/chatAttachmentPolicy';
+import { selectChatAttachmentsForLlm } from '@/lib/llm/chatAttachmentSelection';
 import { toast } from '@/stores/toastStore';
 import type {
   ChatMessage,
@@ -346,6 +354,7 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
 
 async function consumeSse(
   body: ReadableStream<Uint8Array>,
+  isCurrent: () => boolean,
   onEvent: (event: string, payload: Record<string, unknown>) => void
 ): Promise<void> {
   const reader = body.getReader();
@@ -353,6 +362,7 @@ async function consumeSse(
   let buffer = '';
 
   const flushFrame = (frame: string) => {
+    if (!isCurrent()) throw new DOMException('Auth boundary changed', 'AbortError');
     let event = 'message';
     let dataLine = '';
     for (const rawLine of frame.split('\n')) {
@@ -372,7 +382,9 @@ async function consumeSse(
   };
 
   for (;;) {
+    if (!isCurrent()) throw new DOMException('Auth boundary changed', 'AbortError');
     const { done, value } = await reader.read();
+    if (!isCurrent()) throw new DOMException('Auth boundary changed', 'AbortError');
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     let sep: number;
@@ -686,6 +698,8 @@ export default function GlobalChat({
               fileName?: string;
               bytes?: number | string;
               kind?: 'image' | 'document' | 'text';
+              llmUsable?: boolean;
+              llmUnavailableReason?: string | null;
             }>;
           };
           if (controller.signal.aborted) return;
@@ -699,6 +713,8 @@ export default function GlobalChat({
                   ? parseInt(a.bytes, 10) || 0
                   : a.bytes ?? 0,
               kind: a.kind ?? 'document',
+              llmUsable: a.llmUsable,
+              llmUnavailableReason: a.llmUnavailableReason,
             }));
           setAttachments(chips);
         } catch (err) {
@@ -821,6 +837,8 @@ export default function GlobalChat({
         fileName?: string;
         bytes?: number | string;
         kind?: 'image' | 'document' | 'text';
+        llmUsable?: boolean;
+        llmUnavailableReason?: string | null;
       };
       if (!data.attachmentId) {
         toast.error(t('chat.uploadFailed'));
@@ -834,6 +852,8 @@ export default function GlobalChat({
             ? parseInt(data.bytes, 10) || 0
             : data.bytes ?? file.size,
         kind: data.kind ?? 'document',
+        llmUsable: data.llmUsable,
+        llmUnavailableReason: data.llmUnavailableReason,
       };
       // 上传返回时用户可能已切到别的对话（组件实例常驻，仅 prop 变化）——
       // 迟到的旧对话上传结果不允许写进新对话的 attachments（否则 chip 串台）。
@@ -841,6 +861,9 @@ export default function GlobalChat({
         return;
       }
       setAttachments((prev) => [...prev, newChip]);
+      if (newChip.llmUsable === false) {
+        toast.error(t('chat.attachmentLlmUnavailable'), newChip.fileName);
+      }
     } catch {
       toast.error(t('chat.uploadFailed'));
     } finally {
@@ -1097,6 +1120,8 @@ export default function GlobalChat({
       uploadingFile
     )
       return;
+    const authBoundary = getAuthBoundarySnapshot();
+    const authCurrent = () => isAuthBoundaryCurrent(authBoundary);
 
     // 本对话是否还没有任何 assistant 回复（用于完成后触发标题自动生成）。
     // 不用 messages.length === 0：首轮失败/被停止时服务端已持久化 user 消息，
@@ -1170,10 +1195,38 @@ export default function GlobalChat({
       const recordingIds = recordings.map((r) => r.sessionId);
       // 首页起聊时预上传的附件经 pendingFirstMessage 显式带入（此刻 attachments 状态可能还没
       // 拉回来，不能只依赖它，否则首条自动发送会漏掉刚传的文档）。
-      const attachmentIds =
-        extra?.attachmentIds && extra.attachmentIds.length > 0
-          ? extra.attachmentIds
-          : attachments.map((a) => a.id);
+      let attachmentIds: string[];
+      let omittedByLimits = 0;
+      if (extra?.attachmentIds && extra.attachmentIds.length > 0) {
+        const explicitIds = [...new Set(extra.attachmentIds)];
+        const explicitSet = new Set(explicitIds);
+        const knownAttachments = attachments.filter((a) => explicitSet.has(a.id));
+        if (knownAttachments.length === explicitIds.length) {
+          const selection = selectChatAttachmentsForLlm(knownAttachments);
+          attachmentIds = selection.attachmentIds;
+          omittedByLimits = selection.omittedByLimits;
+        } else {
+          // 首页自动发送可能早于附件 GET 回填；其上传侧已按同一预算选过。
+          // 对历史 pending 数据仍至少收紧数量，服务端继续做权威总字节复核。
+          attachmentIds = explicitIds.slice(
+            0,
+            CHAT_ATTACHMENT_SELECTION_MAX_COUNT
+          );
+          omittedByLimits = Math.max(
+            0,
+            explicitIds.length - CHAT_ATTACHMENT_SELECTION_MAX_COUNT
+          );
+        }
+      } else {
+        const selection = selectChatAttachmentsForLlm(attachments);
+        attachmentIds = selection.attachmentIds;
+        omittedByLimits = selection.omittedByLimits;
+      }
+      if (omittedByLimits > 0) {
+        toast.info(
+          t('chat.attachmentSelectionLimited', { n: omittedByLimits })
+        );
+      }
 
       const res = await fetch('/api/llm/chat', {
         method: 'POST',
@@ -1202,6 +1255,7 @@ export default function GlobalChat({
             : {}),
         }),
       });
+      if (!authCurrent()) throw new DOMException('Auth boundary changed', 'AbortError');
 
       if (
         !res.ok ||
@@ -1224,7 +1278,8 @@ export default function GlobalChat({
       let accumulatedThinking = '';
       let sawError = false;
 
-      await consumeSse(res.body, (event, payload) => {
+      await consumeSse(res.body, authCurrent, (event, payload) => {
+        if (!authCurrent()) return;
         if (event === 'thinking') {
           const now = Date.now();
           if (!thinkingFirstAt) thinkingFirstAt = now;
@@ -1284,6 +1339,8 @@ export default function GlobalChat({
         }
       });
 
+      if (!authCurrent()) return;
+
       if (!sawError) {
         updateMessage(conversationId, assistantId, { streaming: false });
         // 首轮对话完成 → 异步生成标题；完成后强刷共享会话列表，
@@ -1306,15 +1363,18 @@ export default function GlobalChat({
       // U18：必须先清掉占位消息的 streaming 标志再 return，否则该气泡的旋转 loader 与
       // 「思考中…」占位会永久卡住（直到刷新/切换对话）。
       if ((error as { name?: string })?.name === 'AbortError') {
-        updateMessage(conversationId, assistantId, { streaming: false });
+        if (authCurrent()) {
+          updateMessage(conversationId, assistantId, { streaming: false });
+        }
         return;
       }
+      if (!authCurrent()) return;
       updateMessage(conversationId, assistantId, {
         content: `Error: ${error instanceof Error ? error.message : 'Chat failed'}`,
         streaming: false,
       });
     } finally {
-      setLoading(conversationId, false);
+      if (authCurrent()) setLoading(conversationId, false);
     }
   };
 

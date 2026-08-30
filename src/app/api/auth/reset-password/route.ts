@@ -2,8 +2,10 @@ import { NextResponse } from 'next/server';
 import bcrypt from 'bcryptjs';
 import { prisma } from '@/lib/prisma';
 import { validatePassword } from '@/lib/auth';
-import { enforceRateLimit } from '@/lib/rateLimit';
-import { resolveRequestClientIp } from '@/lib/clientIp';
+import {
+  enforcePublicAuthPrelude,
+  readPublicAuthJson,
+} from '@/lib/publicAuth';
 import { logAction } from '@/lib/auditLog';
 import { getSiteSettings } from '@/lib/siteSettings';
 import {
@@ -23,25 +25,17 @@ const ACCOUNT_UNAVAILABLE = 'reset-password:account-unavailable';
  * 不自动登录：重置成功后要求用新密码重新登录（更保守，且重置常发生在异设备）。
  */
 export async function POST(req: Request) {
+  const prelude = await enforcePublicAuthPrelude(req, {
+    scope: 'reset-password',
+    endpointIpLimit: 20,
+    endpointWindowMs: 15 * 60_000,
+  });
+  if (prelude.response) return prelude.response;
+
+  const parsed = await readPublicAuthJson<{ token?: string; password?: string }>(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   const siteSettings = await getSiteSettings().catch(() => null);
-
-  const clientIp = resolveRequestClientIp(req);
-  if (clientIp !== 'unknown') {
-    const limited = await enforceRateLimit(req, {
-      scope: 'auth:reset-password:ip',
-      limit: 20,
-      windowMs: 15 * 60_000,
-      key: `ip:${clientIp}`,
-    });
-    if (limited) return limited;
-  }
-
-  let body: { token?: string; password?: string };
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
-  }
 
   const token = typeof body.token === 'string' ? body.token.trim() : '';
   const password = typeof body.password === 'string' ? body.password : '';
@@ -124,7 +118,11 @@ export async function POST(req: Request) {
   const when = new Date().toLocaleString('zh-CN', { hour12: false });
   void sendSecurityAlertEmail(
     { id: user.id, email: user.email, displayName: user.displayName },
-    { kind: 'password_changed', ip: clientIp === 'unknown' ? null : clientIp, when },
+    {
+      kind: 'password_changed',
+      ip: prelude.clientIp === 'unknown' ? null : prelude.clientIp,
+      when,
+    },
     { settings: siteSettings ?? undefined }
   );
 

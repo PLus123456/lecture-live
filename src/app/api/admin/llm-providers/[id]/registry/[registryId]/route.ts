@@ -1,12 +1,12 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import {
   coerceRegistryKind,
   syncRegistrySpecToRoutes,
   type RegistrySpec,
 } from '@/lib/llm/registry';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 /**
  * PATCH /api/admin/llm-providers/[id]/registry/[registryId]
@@ -21,8 +21,8 @@ export async function PATCH(
     limit: 30,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -120,12 +120,38 @@ export async function PATCH(
       });
       // 规格写穿到所有路由行
       await syncRegistrySpecToRoutes(registryId, spec, tx);
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-registry.update',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'llm_registry_model', id: registryId, providerId },
+          before: {
+            modelId: existing.modelId,
+            displayName: existing.displayName,
+            kind: existing.kind,
+            supportsImage: existing.supportsImage,
+            maxTokens: existing.maxTokens,
+            contextWindow: existing.contextWindow,
+            embeddingDimensions: existing.embeddingDimensions,
+            sortOrder: existing.sortOrder,
+          },
+          after: {
+            modelId: updated.modelId,
+            displayName: updated.displayName,
+            kind: updated.kind,
+            supportsImage: updated.supportsImage,
+            maxTokens: updated.maxTokens,
+            contextWindow: updated.contextWindow,
+            embeddingDimensions: updated.embeddingDimensions,
+            sortOrder: updated.sortOrder,
+          },
+          reason: 'admin_update',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
       return updated;
-    });
-
-    logAction(req, 'admin.llm.registry.update', {
-      user: admin,
-      detail: `更新模型: ${displayName} (${modelId})`,
     });
 
     return NextResponse.json({ registryModel: registry });
@@ -149,8 +175,8 @@ export async function DELETE(
     limit: 30,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -162,11 +188,26 @@ export async function DELETE(
       return NextResponse.json({ error: '模型不存在' }, { status: 404 });
     }
 
-    await prisma.llmRegistryModel.delete({ where: { id: registryId } });
-
-    logAction(req, 'admin.llm.registry.delete', {
-      user: admin,
-      detail: `移除模型: ${existing.displayName} (${existing.modelId})`,
+    await prisma.$transaction(async (tx) => {
+      await tx.llmRegistryModel.delete({ where: { id: registryId } });
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-registry.delete',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'llm_registry_model', id: registryId, providerId },
+          before: {
+            modelId: existing.modelId,
+            displayName: existing.displayName,
+            kind: existing.kind,
+            status: existing.status,
+          },
+          after: { deleted: true },
+          reason: 'admin_delete',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
     });
 
     return NextResponse.json({ message: '模型已移除' });

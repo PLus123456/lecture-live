@@ -3,6 +3,7 @@
 
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
+import { isPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
 import { prisma } from '@/lib/prisma';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
@@ -11,27 +12,35 @@ import { resolveUserFeatureFlags, resolveUserSummaryModels } from '@/lib/userRol
 import { callLLM } from '@/lib/llm/gateway';
 import { resolveSummaryModel } from '@/lib/llm/summaryModel';
 import { enforceRateLimit } from '@/lib/rateLimit';
-import { generateSessionReport } from '@/lib/llm/reportManager';
+import { SessionReportBudgetExceededError } from '@/lib/llm/reportManager';
+import { generateOrReuseSessionReport } from '@/lib/llm/reportGenerationService';
+import { ActiveJobBudgetExceededError } from '@/lib/jobQueue';
 import {
   extractTranscriptText,
   loadSessionTranscriptBundle,
-  persistSessionReport,
   loadSessionReport,
 } from '@/lib/sessionPersistence';
 import type { SummaryBlock } from '@/types/summary';
 
 export async function POST(req: Request) {
-  const rateLimited = await enforceRateLimit(req, {
-    scope: 'llm:report',
-    limit: 10,
-    windowMs: 60_000,
-  });
-  if (rateLimited) return rateLimited;
-
   const user = await verifyAuth(req);
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
+  if (!(await isPaymentBenefitAvailable(user.id))) {
+    return NextResponse.json(
+      { error: '账户存在未处理的支付争议', code: 'payment_account_frozen' },
+      { status: 403 }
+    );
+  }
+
+  const rateLimited = await enforceRateLimit(req, {
+    scope: 'llm:report',
+    limit: 10,
+    windowMs: 60_000,
+    key: `user:${user.id}`,
+  });
+  if (rateLimited) return rateLimited;
 
   try {
     const { sessionId } = await req.json();
@@ -89,9 +98,15 @@ export async function POST(req: Request) {
     const { routing: finalRouting, provider: finalSummaryProvider } =
       await resolveSummaryModel(finalSummaryModelId, 'FINAL_SUMMARY');
 
-    // 生成报告（包含意义评估）
-    const reportData = await generateSessionReport({
-      sessionId,
+    const modelKey =
+      finalSummaryProvider?.dbModelId ??
+      ('modelId' in finalRouting
+        ? `model:${finalRouting.modelId}`
+        : `purpose:${finalRouting.purpose}`);
+
+    // 手动与 finalize 后台统一经过同一个 sourceHash 单飞、复用和整次预算边界。
+    const result = await generateOrReuseSessionReport({
+      session,
       transcript: fullTranscript,
       sessionTitle: session.title,
       courseName: session.courseName ?? '',
@@ -99,26 +114,70 @@ export async function POST(req: Request) {
       date: session.createdAt.toISOString().split('T')[0],
       summaryBlocks,
       language: session.targetLang || 'zh',
-      callLLM: (system: string, userMsg: string) =>
-        callLLM(system, userMsg, finalRouting),
+      callLLM: (system: string, userMsg: string, execution) =>
+        callLLM(system, userMsg, {
+          ...finalRouting,
+          maxOutputTokens: execution.maxOutputTokens,
+          onUsage: execution.onUsage,
+        }),
       contextWindow: finalSummaryProvider?.contextWindow,
+      maxOutputTokens: finalSummaryProvider?.maxTokens,
+      modelKey,
+      triggeredBy: `user:${user.id}`,
     });
 
-    // 持久化报告
-    const stored = await persistSessionReport(session, reportData);
-    await prisma.session.update({
-      where: { id: sessionId },
-      data: { reportPath: stored.path },
-    });
-    await invalidateSessionsApiCache(user.id);
+    if (result.status === 'in_progress') {
+      return NextResponse.json(
+        {
+          success: false,
+          inProgress: true,
+          sourceHash: result.sourceHash,
+        },
+        { status: 202, headers: { 'Retry-After': '5' } }
+      );
+    }
+
+    if (result.status === 'generated') {
+      await invalidateSessionsApiCache(user.id);
+    }
 
     return NextResponse.json({
       success: true,
-      reportPath: stored.path,
-      significance: reportData.significance,
-      hasReport: reportData.report !== null,
+      reused: result.status === 'reused',
+      reportPath: result.reportPath,
+      significance: result.reportData.significance,
+      hasReport: result.reportData.report !== null,
     });
   } catch (error) {
+    if (error instanceof ActiveJobBudgetExceededError) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil(
+          ((error.resetAt?.getTime() ?? Date.now() + 60_000) - Date.now()) /
+            1000
+        )
+      );
+      return NextResponse.json(
+        {
+          error: 'Report generation token budget exhausted',
+          dimension: error.dimension,
+        },
+        {
+          status: 429,
+          headers: { 'Retry-After': String(retryAfterSeconds) },
+        }
+      );
+    }
+    if (error instanceof SessionReportBudgetExceededError) {
+      return NextResponse.json(
+        {
+          error: 'Report exceeds generation budget',
+          providerCalls: error.plan.providerCalls,
+          reservedTokens: error.plan.reservedTokens,
+        },
+        { status: 413 }
+      );
+    }
     console.error('Report generation error:', error);
     return NextResponse.json(
       { error: 'Failed to generate report' },

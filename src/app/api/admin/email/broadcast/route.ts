@@ -1,7 +1,6 @@
+import { createHash } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
-import { logger, serializeError } from '@/lib/logger';
 import { getSiteSettings } from '@/lib/siteSettings';
 import {
   findBroadcastRecipients,
@@ -12,6 +11,11 @@ import {
   type BroadcastContent,
 } from '@/lib/email/broadcast';
 import { sendGenericNotificationEmail } from '@/lib/email';
+import { JOB_STATUS, JOB_TYPE, trackJob } from '@/lib/jobQueue';
+import {
+  getSecurityAuditRequestId,
+  writeSecurityAudit,
+} from '@/lib/securityAudit';
 
 /**
  * POST /api/admin/email/broadcast
@@ -20,7 +24,7 @@ import { sendGenericNotificationEmail } from '@/lib/email';
  * mode:
  *   'preview'（缺省）— 只统计收件人数，不发任何信
  *   'test'          — 只发给当前管理员自己，用于确认排版
- *   'send'          — 真正群发（后台派发，立即返回）
+ *   'send'          — 真正群发；请求内等待有界派发并可靠提交 journal 终态
  *
  * 群发不可撤回，故 mode 必须显式传 'send'：请求体畸形/字段缺失一律退化成 preview，
  * 绝不会"意外发出去"。
@@ -32,6 +36,46 @@ const AUDIENCES: BroadcastAudience[] = ['all', 'FREE', 'PRO', 'ADMIN'];
 const MAX_SUBJECT = 200;
 const MAX_HEADING = 200;
 const MAX_BODY = 20_000;
+
+class EmailOperationRejectedError extends Error {
+  constructor(readonly status = 400) {
+    super('email operation rejected');
+    this.name = 'EmailOperationRejectedError';
+  }
+}
+
+function contentAuditSummary(content: BroadcastContent) {
+  const canonical = JSON.stringify({
+    category: content.category,
+    subject: content.subject,
+    heading: content.heading,
+    bodyText: content.bodyText,
+    cta: content.cta ?? null,
+  });
+  return {
+    contentHash: createHash('sha256').update(canonical, 'utf8').digest('hex'),
+    subjectLength: content.subject.length,
+    headingLength: content.heading.length,
+    bodyLength: content.bodyText.length,
+    hasCta: Boolean(content.cta),
+  };
+}
+
+function operatorFromAdmin(admin: {
+  id: string;
+  email?: string | null;
+  role?: string | null;
+}) {
+  return {
+    id: admin.id,
+    email: admin.email ?? null,
+    role: admin.role ?? null,
+  };
+}
+
+function auditFailureResponse() {
+  return NextResponse.json({ error: '安全审计服务不可用' }, { status: 500 });
+}
 
 export async function POST(req: Request) {
   const { user: admin, response } = await requireAdminAccess(req, {
@@ -114,34 +158,115 @@ export async function POST(req: Request) {
   }
 
   const content: BroadcastContent = { category, subject, heading, bodyText, cta };
+  const requestId = getSecurityAuditRequestId(req);
+  const contentSummary = contentAuditSummary(content);
 
   // 测试发送：只发给管理员本人，不查收件人、不过用户偏好（管理员可能自己关了促销）。
   if (mode === 'test') {
-    const result = await sendGenericNotificationEmail(
-      {
-        id: admin.id,
-        email: admin.email,
-        displayName: admin.email,
-        // 测试信要绕过偏好过滤，否则管理员自己退订过就永远收不到预览
-        emailPreferences: null,
-      },
-      content,
-      { settings }
-    );
-    logAction(req, 'admin.email.broadcast.test', {
-      user: admin,
-      detail: `测试发送 ${category} 至 ${admin.email}: ${result.ok ? '成功' : result.error}`,
-    });
-    return NextResponse.json(
-      result.ok ? { ok: true, sentTo: admin.email } : { ok: false, error: result.error },
-      { status: result.ok ? 200 : 400 }
-    );
+    try {
+      await trackJob(
+        {
+          type: JOB_TYPE.ADMIN_INTEGRATION,
+          userId: admin.id,
+          triggeredBy: `admin:${admin.id}`,
+          params: {
+            operation: 'email_broadcast_test',
+            category,
+            contentHash: contentSummary.contentHash,
+            requestId,
+          },
+          resultSummary: () => ({ delivered: true }),
+          errorSummary: () => 'EmailBroadcastTestError',
+          terminalMutation: async (tx, terminal) => {
+            const succeeded = terminal.status === JOB_STATUS.SUCCESS;
+            await writeSecurityAudit(
+              req,
+              {
+                event: 'email.broadcast_test',
+                operator: operatorFromAdmin(admin),
+                target: { type: 'email_broadcast_test', ownerId: admin.id },
+                before: { category, content: contentSummary },
+                after: { delivered: succeeded },
+                reason: 'admin_test_delivery',
+                outcome: succeeded ? 'SUCCESS' : 'FAILED',
+                metadata: succeeded
+                  ? undefined
+                  : {
+                      errorClass:
+                        terminal.status === JOB_STATUS.FAILED &&
+                        terminal.error instanceof Error
+                          ? terminal.error.name
+                          : 'UnknownError',
+                    },
+                requestId,
+              },
+              tx
+            );
+          },
+        },
+        async () => {
+          try {
+            const result = await sendGenericNotificationEmail(
+              {
+                id: admin.id,
+                email: admin.email,
+                displayName: admin.email,
+                // 测试信要绕过偏好过滤，否则管理员自己退订过就永远收不到预览
+                emailPreferences: null,
+              },
+              content,
+              { settings }
+            );
+            if (!result.ok) throw new EmailOperationRejectedError();
+            return { delivered: true };
+          } catch (error) {
+            if (error instanceof EmailOperationRejectedError) throw error;
+            // JobQueue.error 也是管理员可读数据，不能把 SMTP/URL/凭据错误原文写进去。
+            throw new EmailOperationRejectedError(500);
+          }
+        }
+      );
+    } catch (error) {
+      return NextResponse.json(
+        { ok: false, error: '测试邮件发送失败' },
+        {
+          status:
+            error instanceof EmailOperationRejectedError ? error.status : 500,
+        }
+      );
+    }
+    return NextResponse.json({ ok: true, sentTo: admin.email });
   }
 
-  const { users, truncated } = await findBroadcastRecipients(audience, category, settings);
+  let recipients: Awaited<ReturnType<typeof findBroadcastRecipients>>;
+  try {
+    recipients = await findBroadcastRecipients(audience, category, settings);
+  } catch (error) {
+    console.error('查询邮件群发收件人失败:', error);
+    return NextResponse.json({ error: '查询收件人失败' }, { status: 500 });
+  }
+  const { users, truncated } = recipients;
 
   // 预览：只报人数。marketing 总开关关着时这里会是 0——正好让管理员当场看出来。
   if (mode === 'preview') {
+    try {
+      await writeSecurityAudit(req, {
+        event: 'email.broadcast_preview',
+        operator: operatorFromAdmin(admin),
+        target: { type: 'email_broadcast_audience', id: audience },
+        before: { category, audience, content: contentSummary },
+        after: {
+          recipientCount: users.length,
+          truncated,
+          marketingEnabled: settings.marketing_emails_enabled,
+        },
+        reason: 'admin_preview',
+        outcome: 'SUCCESS',
+        requestId,
+      });
+    } catch {
+      return auditFailureResponse();
+    }
     return NextResponse.json({
       ok: true,
       mode: 'preview',
@@ -153,6 +278,20 @@ export async function POST(req: Request) {
   }
 
   if (users.length === 0) {
+    try {
+      await writeSecurityAudit(req, {
+        event: 'email.broadcast',
+        operator: operatorFromAdmin(admin),
+        target: { type: 'email_broadcast_audience', id: audience },
+        before: { category, audience, content: contentSummary },
+        after: { recipientCount: 0 },
+        reason: 'no_eligible_recipients',
+        outcome: 'DENIED',
+        requestId,
+      });
+    } catch {
+      return auditFailureResponse();
+    }
     return NextResponse.json(
       {
         error: settings.marketing_emails_enabled
@@ -163,21 +302,93 @@ export async function POST(req: Request) {
     );
   }
 
-  // 审计先落，再派发：派发是 fire-and-forget，失败也要留下"谁在什么时候发了什么"。
-  logAction(req, 'admin.email.broadcast.send', {
-    user: admin,
-    detail: `群发 ${category} 给 ${audience}（${users.length} 人）: ${subject}`,
-  });
-
-  // 不 await：SMTP 往返 × N 人会把请求线程挂死（审计 #5 的原样重演）。
-  void runBroadcast(users, content, settings).catch((err) =>
-    logger.error({ err: serializeError(err) }, '[broadcast] 群发任务异常')
-  );
+  let result: Awaited<ReturnType<typeof runBroadcast>>;
+  try {
+    result = await trackJob(
+      {
+        type: JOB_TYPE.ADMIN_INTEGRATION,
+        userId: admin.id,
+        triggeredBy: `admin:${admin.id}`,
+        params: {
+          operation: 'email_broadcast',
+          category,
+          audience,
+          recipientCount: users.length,
+          contentHash: contentSummary.contentHash,
+          requestId,
+        },
+        resultSummary: (value) => ({ ...value, recipientCount: users.length }),
+        errorSummary: () => 'EmailBroadcastError',
+        terminalMutation: async (tx, terminal) => {
+          if (terminal.status === JOB_STATUS.SUCCESS) {
+            const completed = terminal.result;
+            const partial =
+              completed.failed > 0 ||
+              completed.budgetExhausted ||
+              truncated;
+            await writeSecurityAudit(
+              req,
+              {
+                event: 'email.broadcast',
+                operator: operatorFromAdmin(admin),
+                target: { type: 'email_broadcast_audience', id: audience },
+                before: { category, audience, content: contentSummary },
+                after: {
+                  recipientCount: users.length,
+                  sent: completed.sent,
+                  skipped: completed.skipped,
+                  failed: completed.failed,
+                  budgetExhausted: completed.budgetExhausted,
+                  truncated,
+                },
+                reason: 'admin_broadcast',
+                outcome: partial ? 'PARTIAL' : 'SUCCESS',
+                requestId,
+              },
+              tx
+            );
+            return;
+          }
+          await writeSecurityAudit(
+            req,
+            {
+              event: 'email.broadcast',
+              operator: operatorFromAdmin(admin),
+              target: { type: 'email_broadcast_audience', id: audience },
+              before: { category, audience, content: contentSummary },
+              after: { recipientCount: users.length, completed: false },
+              reason: 'admin_broadcast',
+              outcome: 'FAILED',
+              metadata: {
+                errorClass:
+                  terminal.error instanceof Error
+                    ? terminal.error.name
+                    : 'UnknownError',
+              },
+              requestId,
+            },
+            tx
+          );
+        },
+      },
+      async () => {
+        try {
+          return await runBroadcast(users, content, settings);
+        } catch {
+          throw new EmailOperationRejectedError(500);
+        }
+      }
+    );
+  } catch (error) {
+    console.error('邮件群发任务失败:', error);
+    return NextResponse.json({ error: '群发任务失败' }, { status: 500 });
+  }
 
   return NextResponse.json({
     ok: true,
     mode: 'send',
     dispatched: users.length,
     truncated,
+    ...result,
   });
 }

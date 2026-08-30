@@ -1,6 +1,6 @@
 import type { Page, Route } from '@playwright/test';
 import { devices, expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 完整版补全转录·移动端（阶段C）端到端：mobile 回放页（MobilePlaybackLayout）transcript tab
@@ -105,13 +105,13 @@ function installFullTranscribeMocks(page: Page, opts: FullMockOptions = {}) {
     if (p === '/api/auth/login' && method === 'POST') {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
-    if (p === '/api/auth/refresh' && method === 'GET') {
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
       return fulfillJson(route, {
         user: { id: 'user-1', email: 'alice@example.com', displayName: 'Alice', role: 'ADMIN' },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
 

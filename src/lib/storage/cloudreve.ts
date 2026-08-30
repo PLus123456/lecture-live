@@ -4,6 +4,7 @@
 import 'server-only';
 
 import path from 'path';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { sanitizePath } from '@/lib/security';
@@ -813,10 +814,12 @@ export function clearCachedTokens() {
  * 清除内存缓存 + 数据库中持久化的所有 token 记录。
  * 用于：refresh_token 失效、配置变更、管理员主动撤销授权。
  */
-export async function clearPersistedTokens(): Promise<void> {
+export async function clearPersistedTokens(
+  db: Pick<Prisma.TransactionClient, 'siteSetting'> = prisma
+): Promise<void> {
   tokenCache = null;
   try {
-    await prisma.siteSetting.deleteMany({
+    await db.siteSetting.deleteMany({
       where: { key: { in: [...TOKEN_DB_KEYS] } },
     });
   } catch (err) {

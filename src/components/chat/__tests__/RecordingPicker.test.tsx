@@ -171,7 +171,7 @@ describe('RecordingPicker (component)', () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        '/api/sessions?limit=100',
+        '/api/sessions?limit=50',
         expect.objectContaining({
           headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
         }),

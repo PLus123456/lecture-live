@@ -51,4 +51,11 @@ export interface SessionReportData {
   report: SessionReport | null;
   /** 报告生成时间 */
   generatedAt: string;
+  /**
+   * 服务端幂等元数据。可选是为了兼容修复前的存量报告；客户端无需解释该字段。
+   */
+  _generation?: {
+    schemaVersion: number;
+    sourceHash: string;
+  };
 }

@@ -22,7 +22,12 @@ import {
   deleteSessionArtifacts,
 } from '@/lib/sessionPersistence';
 import { deleteRecordingDraft } from '@/lib/recordingDraftPersistence';
-import { deleteConversationsCascade } from '@/lib/conversationCascade';
+import { deleteTranscriptDraft } from '@/lib/transcriptDraftPersistence';
+import {
+  completePreparedConversationCascade,
+  deletePreparedConversationsInTransaction,
+  prepareConversationsCascade,
+} from '@/lib/conversationCascade';
 import { settleAsyncReservation, settleFullReservation } from '@/lib/quota';
 import { resolveUserMaxConcurrentSessions } from '@/lib/userRoles';
 import { cancelAsyncUpload } from '@/lib/audio/asyncUploadProcessor';
@@ -31,6 +36,10 @@ import {
   deleteSonioxFile,
   deleteSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
+import {
+  findBillableStoredArtifactsByOwner,
+  markStoredArtifactsDeletePendingInTransaction,
+} from '@/lib/storage/storedArtifactLedger';
 
 // B4：单用户并发在途录音（RECORDING/PAUSED）上限。实时录音事后扣费，无法在入口精确预留，
 // 用并发上限把「多标签并发开录叠加超额」的溢出封在 N×角色上限内（留足余量容忍崩溃残留的僵尸会话，
@@ -338,19 +347,6 @@ export async function DELETE(
     return NextResponse.json({ error: 'Access denied' }, { status: 403 });
   }
 
-  // 删行前先取消进行中的异步上传转录：否则本地分片/合并/mp3（可达 ~5GB）+ Soniox 上的
-  // 文件会随 session 行消失而失去关联、永久泄漏。cancelAsyncUpload 会清本地盘 + 删 Soniox
-  // 文件 + 把状态置 canceled。终态语义对齐 async-upload DELETE：completed/failed/canceled/null
-  // 视为已收尾、无需取消。
-  if (
-    session.asyncTranscribeStatus !== 'completed' &&
-    session.asyncTranscribeStatus !== 'failed' &&
-    session.asyncTranscribeStatus !== 'canceled' &&
-    session.asyncTranscribeStatus != null
-  ) {
-    await cancelAsyncUpload(session).catch(() => undefined);
-  }
-
   // B1/R4：删会话前原子结算该会话遗留的在途预留（异步上传 asyncReservedMinutes + 完整版补全
   // fullReservedMinutes）。行一删，cron 兜底扫描便再也找不到这行 → 预留永久占着
   // transcriptionMinutesUsed 泄漏，故必须 inline 释放。用 settle*（FOR UPDATE 读当前列并释放）而非
@@ -371,20 +367,62 @@ export async function DELETE(
     );
   }
 
-  // 完整版补全转录进行中时删会话：与异步上传同理，Soniox 上的 file + transcription 会随行消失而
-  // 永久泄漏（行一删便无 id→owner 关联，reclaim cron 也无从查起）。best-effort 清 Soniox 资源
-  // （本地/Cloudreve 转录产物由下方 deleteSessionArtifacts 的 'full-transcripts' 分支清）。
-  // 仅进行中态才可能持有未清的 Soniox 资源：finalize 成功会 null 掉这两个字段、失败/回收也会清；
-  // 故用「任一字段非空」精确判定，避免对终态多余请求。
+  // U8：先把 legacy 单录音对话（Conversation.sessionId = 本 session）经
+  // deleteConversationsCascade 删干净 —— 它会 best-effort 删 Cloudreve 附件物理文件
+  // （原文件 + 抽取的 .txt）+ 本地内嵌图片 + 释放字节配额 + 删 DB 行。若只靠下面
+  // session.delete 的 onDelete: Cascade 裸删 ChatAttachment 行，Cloudreve 物理文件会成
+  // 永久孤儿（行一删连 cloudrevePath 都拿不到，cron 也无法回收）。
+  // 注：全局多录音对话经 ConversationSession 联表挂载，删 session 只级联联表行、对话与
+  // 附件保留，故这里只处理 sessionId 直挂的 legacy 对话。
+  const legacyConversations = await prisma.conversation.findMany({
+    where: { sessionId: id },
+    select: { id: true },
+  });
+  const preparedLegacyConversations = await prepareConversationsCascade(
+    legacyConversations.map((conversation) => conversation.id)
+  );
+
+  const sessionLedgerRows = await findBillableStoredArtifactsByOwner(
+    'session',
+    session.id
+  );
+  // Owner 删除与 ledger DELETE_PENDING 在同一事务。提交后才碰物理对象；
+  // 如果进程在两者之间崩溃，统一 artifact cleanup 仍持有 reference 可重试。
+  await prisma.$transaction(async (tx) => {
+    await markStoredArtifactsDeletePendingInTransaction(
+      tx,
+      sessionLedgerRows.map((row) => row.id)
+    );
+    await deletePreparedConversationsInTransaction(
+      tx,
+      preparedLegacyConversations
+    );
+    await tx.folderSession.deleteMany({ where: { sessionId: id } });
+    await tx.shareLink.deleteMany({ where: { sessionId: id } });
+    await tx.session.delete({ where: { id } });
+  });
+
+  await completePreparedConversationCascade(preparedLegacyConversations).catch(
+    () => false
+  );
+  await deleteSessionArtifacts(session, sessionLedgerRows).catch(() => undefined);
+  await deleteRecordingDraft(session).catch(() => undefined);
+  await deleteTranscriptDraft(session).catch(() => undefined);
+
+  if (
+    session.asyncTranscribeStatus !== 'completed' &&
+    session.asyncTranscribeStatus !== 'failed' &&
+    session.asyncTranscribeStatus !== 'canceled' &&
+    session.asyncTranscribeStatus != null
+  ) {
+    await cancelAsyncUpload(session).catch(() => undefined);
+  }
+
   if (session.fullSonioxFileId || session.fullSonioxTranscriptionId) {
-    // P1-16：按任务开始时固定的 region 解析配置（session.sonioxRegion），绝不落回可变默认
-    // region —— 否则跨 region 任务会向错误区的 API 删不存在的资源、真正的资源仍泄漏。
     const sonioxConfig = await resolveSonioxConfigForSessionRegion(
       session.sonioxRegion
     ).catch(() => null);
     if (sonioxConfig) {
-      // 删 transcription 再删 file（与 fullTranscribeFinalize / cancelAsyncUpload 同口径）：
-      // transcription 引用 file，先删 job 释放更紧的历史/pending 配额，再删底层文件。
       if (session.fullSonioxTranscriptionId) {
         await deleteSonioxTranscription(
           sonioxConfig,
@@ -398,36 +436,6 @@ export async function DELETE(
       }
     }
   }
-
-  // U8：先把 legacy 单录音对话（Conversation.sessionId = 本 session）经
-  // deleteConversationsCascade 删干净 —— 它会 best-effort 删 Cloudreve 附件物理文件
-  // （原文件 + 抽取的 .txt）+ 本地内嵌图片 + 释放字节配额 + 删 DB 行。若只靠下面
-  // session.delete 的 onDelete: Cascade 裸删 ChatAttachment 行，Cloudreve 物理文件会成
-  // 永久孤儿（行一删连 cloudrevePath 都拿不到，cron 也无法回收）。
-  // 注：全局多录音对话经 ConversationSession 联表挂载，删 session 只级联联表行、对话与
-  // 附件保留，故这里只处理 sessionId 直挂的 legacy 对话。
-  const legacyConversations = await prisma.conversation.findMany({
-    where: { sessionId: id },
-    select: { id: true },
-  });
-  if (legacyConversations.length > 0) {
-    await deleteConversationsCascade(
-      legacyConversations.map((c) => c.id)
-    ).catch(() => undefined);
-  }
-
-  // U4：删行前 best-effort 物理删除会话全部产物（本地 data/ + Cloudreve 录音/转录/
-  // 摘要/报告）+ 录音草稿分片目录。行一删便再无 path→owner 关联，无 cron 可回收，
-  // 故必须在删行前清理。全部 best-effort，失败不阻塞 DB 删除。
-  await deleteSessionArtifacts(session).catch(() => undefined);
-  await deleteRecordingDraft(session).catch(() => undefined);
-
-  // 先删除关联表记录（FolderSession / ShareLink），再删除 session
-  await prisma.$transaction([
-    prisma.folderSession.deleteMany({ where: { sessionId: id } }),
-    prisma.shareLink.deleteMany({ where: { sessionId: id } }),
-    prisma.session.delete({ where: { id: id } }),
-  ]);
 
   await Promise.all([
     invalidateSessionsApiCache(user.id),

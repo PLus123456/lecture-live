@@ -38,6 +38,18 @@ NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])')"
 [[ "$NODE_MAJOR" -ge 20 ]] || error "Node 版本过低（当前 $(node -v)），需要 ≥ 20"
 info "Node: $(node -v) ($NODE_BIN)"
 
+# 单元使用 ProtectProc/ProcSubset/ProtectKernelLogs 等 systemd 249+ 沙箱指令。
+# 旧版若静默忽略，运维会误以为解析器已受约束，因此安装阶段 fail closed。
+command -v systemd-analyze &>/dev/null || error "未找到 systemd-analyze，无法验证 worker 沙箱"
+SYSTEMD_VERSION="$(systemd-analyze --version | awk 'NR==1 {print $2}')"
+[[ "$SYSTEMD_VERSION" =~ ^[0-9]+$ ]] || error "无法识别 systemd 版本"
+# 门槛按**实际用到的最严指令**定：ProtectProc= / ProcSubset= 是 systemd 247 引入的。
+# 卡 249 会把 Debian 11(247) 连同存量 worker 一起挡在升级之外，而 247 上沙箱是完整生效的。
+# Ubuntu 20.04(245) / RHEL 8(239) 仍然拒绝——那里这些指令会被静默忽略，
+# 运维会误以为解析器已受约束。
+[[ "$SYSTEMD_VERSION" -ge 247 ]] || error "systemd 版本过低（当前 ${SYSTEMD_VERSION}），需要 ≥ 247 才能完整执行安全沙箱（ProtectProc/ProcSubset 自 247 起支持）"
+info "systemd: ${SYSTEMD_VERSION}"
+
 # ── 2. 依赖：ffmpeg（缺失且有 apt 时自动安装） ──
 if ! command -v ffmpeg &>/dev/null; then
     if command -v apt-get &>/dev/null; then
@@ -167,20 +179,46 @@ Environment=AUDIO_WORKER_PORT=${WORKER_PORT}
 Environment=AUDIO_WORKER_HOST=127.0.0.1
 Environment=AUDIO_WORKER_DATA_DIR=${APP_DIR}/data
 Environment=AUDIO_WORKER_CONCURRENCY=1
+Environment=AUDIO_WORKER_PROBE_TIMEOUT_MS=60000
 
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=${APP_DIR}/data
 ProtectKernelTunables=true
 ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
 RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+UMask=0077
+MemoryMax=4G
+CPUQuota=200%
+TasksMax=64
+LimitNOFILE=1024
+LimitFSIZE=8G
+LimitCORE=0
+OOMPolicy=stop
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 chmod 600 "$UNIT_FILE"
+
+systemd-analyze verify "$UNIT_FILE" || error "systemd 单元验证失败，拒绝启动未完整加固的 worker"
 
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || systemctl restart "$SERVICE_NAME"

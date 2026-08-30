@@ -11,10 +11,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Server as SocketIOServer } from 'socket.io';
 import { io as createClient, Socket } from 'socket.io-client';
 import { onceSocketEvent } from '../../../../tests/utils/socket';
+import {
+  makeSummaryBlock,
+  makeTranscriptSegment,
+} from './fixtures';
 
-const { shareLinkFindUniqueMock, verifyAuthTokenMock } = vi.hoisted(() => ({
+const {
+  shareLinkFindUniqueMock,
+  verifyAuthTokenMock,
+  diagnoseEstablishedAuthFamilyTokenMock,
+} = vi.hoisted(() => ({
   shareLinkFindUniqueMock: vi.fn(),
   verifyAuthTokenMock: vi.fn(),
+  diagnoseEstablishedAuthFamilyTokenMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -27,6 +36,7 @@ vi.mock('@/lib/prisma', () => ({
 
 vi.mock('@/lib/auth', () => ({
   CLIENT_SESSION_TOKEN: '__cookie_session__',
+  diagnoseEstablishedAuthFamilyToken: diagnoseEstablishedAuthFamilyTokenMock,
   extractTokenFromCookieHeader: vi.fn(() => null),
   verifyAuthToken: verifyAuthTokenMock,
 }));
@@ -59,10 +69,15 @@ describe('LiveBroadcaster 连接/重连补发快照（C16/U11）', () => {
   const clients: Socket[] = [];
 
   beforeEach(async () => {
-    verifyAuthTokenMock.mockResolvedValue({
+    const authenticatedSession = {
       user: { id: 'user-1', email: 'alice@example.com', role: 'ADMIN' },
       token: { jti: 'jti-1', tokenVersion: 1 },
       rawToken: 'server-jwt',
+    };
+    verifyAuthTokenMock.mockResolvedValue(authenticatedSession);
+    diagnoseEstablishedAuthFamilyTokenMock.mockResolvedValue({
+      status: 'valid',
+      session: authenticatedSession,
     });
 
     shareLinkFindUniqueMock.mockImplementation(
@@ -124,9 +139,9 @@ describe('LiveBroadcaster 连接/重连补发快照（C16/U11）', () => {
   });
 
   const snapshot = {
-    segments: [{ id: 'seg-1', text: 'Hello', start: 0, end: 1 }],
+    segments: [makeTranscriptSegment()],
     translations: { 'seg-1': '你好' },
-    summaryBlocks: [{ id: 'sum-1', blockIndex: 0, summary: 'Summary' }],
+    summaryBlocks: [makeSummaryBlock()],
     status: 'RECORDING',
     previewText: { finalText: '', nonFinalText: '' },
     previewTranslation: {
@@ -135,13 +150,34 @@ describe('LiveBroadcaster 连接/重连补发快照（C16/U11）', () => {
       state: 'idle' as const,
       sourceLanguage: null,
     },
-  } as unknown as Parameters<LiveBroadcaster['syncSnapshot']>[0];
+  };
 
   // 获取 broadcaster 底层 socket 并等其（首次）建连。initial_state / viewer_count 会
   // 紧随 connect 到达，故不在此单独 await，避免与 connect 竞争（先 await connect 再
   // await initial_state 会漏掉已到达的 initial_state 导致挂起）。
   function rawSocketOf(broadcaster: LiveBroadcaster): Socket {
     return (broadcaster as unknown as { socket: Socket }).socket;
+  }
+
+  async function joinOnFreshSocketUntil<T extends { segments: unknown[] }>(
+    predicate: (state: T) => boolean
+  ): Promise<T> {
+    let lastState = { segments: [] } as unknown as T;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const viewer = createClient(baseUrl, {
+        transports: ['websocket'],
+        reconnection: false,
+      });
+      clients.push(viewer);
+      await onceSocketEvent(viewer, 'connect');
+      const statePromise = onceSocketEvent<T>(viewer, 'initial_state');
+      viewer.emit('join', { shareToken: 'share-token' });
+      lastState = await statePromise;
+      if (predicate(lastState)) return lastState;
+      viewer.disconnect();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return lastState;
   }
 
   it('首连后 syncSnapshot 的快照可被晚加入 viewer 取到', async () => {
@@ -158,22 +194,11 @@ describe('LiveBroadcaster 连接/重连补发快照（C16/U11）', () => {
     // 主播同步快照（正常路径）
     broadcaster.syncSnapshot(snapshot);
 
-    const viewer = createClient(baseUrl, {
-      transports: ['websocket'],
-      reconnection: false,
-    });
-    clients.push(viewer);
-    await onceSocketEvent(viewer, 'connect');
-    const viewerStatePromise = onceSocketEvent<{
+    const state = await joinOnFreshSocketUntil<{
       segments: Array<{ id: string }>;
       translations: Record<string, string>;
-    }>(viewer, 'initial_state');
-    viewer.emit('join', { shareToken: 'share-token' });
-
-    const state = await viewerStatePromise;
-    expect(state.segments).toEqual([
-      { id: 'seg-1', text: 'Hello', start: 0, end: 1 },
-    ]);
+    }>((candidate) => candidate.segments.length === 1);
+    expect(state.segments).toMatchObject([{ id: 'seg-1', text: 'Hello' }]);
     expect(state.translations).toEqual({ 'seg-1': '你好' });
   });
 
@@ -190,25 +215,12 @@ describe('LiveBroadcaster 连接/重连补发快照（C16/U11）', () => {
 
     broadcaster.syncSnapshot(snapshot);
 
-    // 让服务端确实吃到首帧快照（避免与后续断连竞争）
-    const settleViewer = createClient(baseUrl, {
-      transports: ['websocket'],
-      reconnection: false,
-    });
-    clients.push(settleViewer);
-    await onceSocketEvent(settleViewer, 'connect');
-    // 轮询直到服务端确实吃到 broadcaster 的 sync_snapshot —— broadcaster 的 sync_snapshot
-    // 与 settleViewer 的 join 分属两个 socket，到达服务端的先后不确定；单发一次 join 若
-    // 抢在 sync_snapshot 之前会拿到空历史（CI 高负载下偶发）。join 处理器每次都回 initial_state
-    // (server.ts)，故可安全重发直到快照就位，消除跨 socket 竞争的 flaky。
-    let settled: { segments: unknown[] } = { segments: [] };
-    for (let attempt = 0; attempt < 40; attempt++) {
-      const p = onceSocketEvent<{ segments: unknown[] }>(settleViewer, 'initial_state');
-      settleViewer.emit('join', { shareToken: 'share-token' });
-      settled = await p;
-      if (settled.segments.length === 1) break;
-      await new Promise((r) => setTimeout(r, 25));
-    }
+    // 让服务端确实吃到首帧快照（避免与后续断连竞争）。
+    // 跨 socket 到达顺序不确定；SEC-003 后同 socket 重复 join 是幂等 no-op，故每次
+    // 轮询都使用一个新 viewer（等价于真实断线重连），不会依赖重复全快照响应。
+    const settled = await joinOnFreshSocketUntil<{ segments: unknown[] }>(
+      (candidate) => candidate.segments.length === 1
+    );
     expect(settled.segments).toHaveLength(1);
 
     // 触发一次底层断连——socket.io-client 默认 reconnection:true，会自动重连并再次
@@ -243,9 +255,7 @@ describe('LiveBroadcaster 连接/重连补发快照（C16/U11）', () => {
     viewer.emit('join', { shareToken: 'share-token' });
 
     const state = await viewerStatePromise;
-    expect(state.segments).toEqual([
-      { id: 'seg-1', text: 'Hello', start: 0, end: 1 },
-    ]);
+    expect(state.segments).toMatchObject([{ id: 'seg-1', text: 'Hello' }]);
   });
 
   it('从未 syncSnapshot 时连接不会误发快照（viewer 拿到空历史）', async () => {

@@ -8,22 +8,51 @@ import {
 } from '@/lib/llm/defaults';
 import { serializeProviderForAdmin } from '@/lib/llm/providerAdmin';
 import { ensureLlmRegistry } from '@/lib/llm/registry';
-import { logAction } from '@/lib/auditLog';
-import { validateCloudreveBaseUrl } from '@/lib/storage/cloudreve';
+import {
+  describeLlmEndpointForAudit,
+  validateLlmProviderBaseUrl,
+} from '@/lib/llm/outboundPolicy';
+import { requireLlmAdminCurrentPassword } from '@/lib/llm/adminReauth';
+import { writeLlmSecurityAudit } from '@/lib/llm/securityAudit';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 // 获取所有 LLM 供应商及其模型（模型库条目 + 用途路由行）
 export async function GET(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user: admin, response } = await requireAdminAccess(req, {
     scope: 'admin:llm-providers:list',
     limit: 60,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
     // 惰性迁移：把历史「无 registry」的路由行归并出模型库条目（幂等，无待迁移行时只花一次 count）
-    await ensureLlmRegistry();
+    await ensureLlmRegistry({
+      onMigrated: async (tx, migration) => {
+        await writeSecurityAudit(
+          req,
+          {
+            event: 'llm-registry.migrate',
+            operator: { id: admin.id, email: admin.email, role: admin.role },
+            target: {
+              type: 'llm_registry_model',
+              id: migration.registryId,
+              ids: migration.routeIds,
+            },
+            before: { linked: false },
+            after: {
+              linked: true,
+              createdRegistry: migration.createdRegistry,
+              routeCount: migration.routeIds.length,
+            },
+            reason: 'legacy_registry_backfill',
+            outcome: 'SUCCESS',
+          },
+          tx
+        );
+      },
+    });
 
     const providers = await prisma.llmProvider.findMany({
       include: {
@@ -42,6 +71,28 @@ export async function GET(req: Request) {
       orderBy: { sortOrder: 'asc' },
     });
 
+    await writeSecurityAudit(req, {
+      event: 'llm-providers.read',
+      operator: { id: admin.id, email: admin.email, role: admin.role },
+      target: {
+        type: 'llm_provider_collection',
+        ids: providers.map((provider) => provider.id),
+      },
+      after: {
+        providerCount: providers.length,
+        modelCount: providers.reduce(
+          (total, provider) => total + provider.models.length,
+          0
+        ),
+        registryCount: providers.reduce(
+          (total, provider) => total + provider.registryModels.length,
+          0
+        ),
+      },
+      reason: 'admin_list',
+      outcome: 'SUCCESS',
+    });
+
     return NextResponse.json({
       providers: providers.map((provider) => serializeProviderForAdmin(provider)),
     });
@@ -58,8 +109,8 @@ export async function POST(req: Request) {
     limit: 20,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -76,14 +127,20 @@ export async function POST(req: Request) {
       );
     }
 
-    // 校验 apiBase：格式合法 + 私网过滤（防 SSRF，服务端每次请求都会打这个地址）
-    // 复用 Cloudreve 的 validateCloudreveBaseUrl（http/https + 私网黑名单），返回规范化后的 URL
+    // SEC-034：LLM 使用独立、精确 origin allowlist；不得继承 Cloudreve 的私网豁免。
     let normalizedApiBase: string;
     try {
-      normalizedApiBase = validateCloudreveBaseUrl(apiBase);
+      normalizedApiBase = await validateLlmProviderBaseUrl(apiBase);
     } catch {
+      await writeLlmSecurityAudit(req, 'llm-provider.create-rejected', {
+        user: admin,
+        detail: {
+          reason: 'outbound_origin_policy',
+          endpoint: describeLlmEndpointForAudit(apiBase),
+        },
+      });
       return NextResponse.json(
-        { error: 'apiBase 必须是合法的 http(s) 地址，且不能指向内网/本地地址' },
+        { error: 'apiBase 必须是已加入服务端允许列表的安全 http(s) origin' },
         { status: 400 }
       );
     }
@@ -148,39 +205,75 @@ export async function POST(req: Request) {
       });
     }
 
-    const createdProvider = await prisma.llmProvider.create({
-      data: {
-        name,
-        apiKey: encrypt(apiKey),
-        apiBase: normalizedApiBase,
-        isAnthropic: isAnthropic ?? false,
-        sortOrder: sortOrder ?? 0,
-        ...(modelsData.length > 0 ? { models: { create: modelsData } } : {}),
-      },
-      include: {
-        models: { orderBy: { sortOrder: 'asc' } },
-      },
-    });
-
-    const defaultModelIds = pickDefaultModelIdsByPurpose(createdProvider.models);
-    if (Object.keys(defaultModelIds).length > 0) {
-      await normalizeDefaultModelsByPurpose(defaultModelIds);
+    // 创建 provider 会立即把一份新凭据绑定到可出站的主机；即使已有 ADMIN
+    // cookie，也必须在本次高风险写入中证明当前密码，阻断被盗会话持久化恶意端点。
+    const reauth = await requireLlmAdminCurrentPassword(
+      req,
+      admin.id,
+      body.currentPassword
+    );
+    if (!reauth.ok) {
+      await writeLlmSecurityAudit(req, 'llm-provider.create-rejected', {
+        user: admin,
+        detail: {
+          reason: `reauth_${reauth.reason}`,
+          endpoint: describeLlmEndpointForAudit(normalizedApiBase),
+        },
+      });
+      return reauth.response;
     }
 
-    const provider = await prisma.llmProvider.findUnique({
-      where: { id: createdProvider.id },
-      include: {
-        models: { orderBy: { sortOrder: 'asc' } },
-      },
-    });
+    const provider = await prisma.$transaction(async (tx) => {
+      const createdProvider = await tx.llmProvider.create({
+        data: {
+          name,
+          apiKey: encrypt(apiKey),
+          apiBase: normalizedApiBase,
+          isAnthropic: isAnthropic ?? false,
+          sortOrder: sortOrder ?? 0,
+          ...(modelsData.length > 0 ? { models: { create: modelsData } } : {}),
+        },
+        include: {
+          models: { orderBy: { sortOrder: 'asc' } },
+        },
+      });
 
-    if (!provider) {
-      throw new Error('创建后的供应商不存在');
-    }
+      const defaultModelIds = pickDefaultModelIdsByPurpose(createdProvider.models);
+      if (Object.keys(defaultModelIds).length > 0) {
+        await normalizeDefaultModelsByPurpose(defaultModelIds, tx);
+      }
 
-    logAction(req, 'admin.llm.provider.create', {
-      user: admin,
-      detail: `创建 LLM 供应商: ${name}`,
+      const fullProvider = await tx.llmProvider.findUnique({
+        where: { id: createdProvider.id },
+        include: {
+          models: { orderBy: { sortOrder: 'asc' } },
+        },
+      });
+      if (!fullProvider) {
+        throw new Error('创建后的供应商不存在');
+      }
+
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-providers.create',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'llm_provider', id: fullProvider.id },
+          after: {
+            id: fullProvider.id,
+            name: fullProvider.name,
+            endpoint: describeLlmEndpointForAudit(fullProvider.apiBase),
+            isAnthropic: fullProvider.isAnthropic,
+            hasApiKey: Boolean(fullProvider.apiKey),
+            modelCount: fullProvider.models.length,
+          },
+          reason: 'admin_create',
+          outcome: 'SUCCESS',
+          metadata: { normalizedDefaultPurposes: Object.keys(defaultModelIds) },
+        },
+        tx
+      );
+      return fullProvider;
     });
 
     return NextResponse.json(

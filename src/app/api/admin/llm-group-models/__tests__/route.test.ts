@@ -8,20 +8,22 @@ const {
   siteSettingUpsertMock,
   siteSettingUpdateMock,
   routeFindUniqueMock,
+  securityAuditMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   siteSettingFindUniqueMock: vi.fn(),
   siteSettingUpsertMock: vi.fn(),
   siteSettingUpdateMock: vi.fn(),
   routeFindUniqueMock: vi.fn(),
+  securityAuditMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({
   requireAdminAccess: requireAdminAccessMock,
 }));
 
-vi.mock('@/lib/prisma', () => ({
-  prisma: {
+vi.mock('@/lib/prisma', () => {
+  const tx = {
     siteSetting: {
       findUnique: siteSettingFindUniqueMock,
       upsert: siteSettingUpsertMock,
@@ -30,10 +32,19 @@ vi.mock('@/lib/prisma', () => ({
     llmModel: {
       findUnique: routeFindUniqueMock,
     },
-  },
-}));
+  };
+  return {
+    prisma: {
+      ...tx,
+      $transaction: async (fn: (value: typeof tx) => Promise<unknown>) => fn(tx),
+    },
+  };
+});
 
 vi.mock('@/lib/auditLog', () => ({ logAction: vi.fn() }));
+vi.mock('@/lib/securityAudit', () => ({
+  writeSecurityAudit: securityAuditMock,
+}));
 
 import { GET, PUT } from '@/app/api/admin/llm-group-models/route';
 
@@ -50,6 +61,7 @@ beforeEach(() => {
   requireAdminAccessMock.mockResolvedValue({ user: { id: 'admin-1' }, response: null });
   siteSettingFindUniqueMock.mockResolvedValue(null);
   routeFindUniqueMock.mockResolvedValue({ id: 'model-1', purpose: 'CHAT' });
+  securityAuditMock.mockResolvedValue(undefined);
 });
 
 describe('GET /api/admin/llm-group-models', () => {
@@ -82,6 +94,13 @@ describe('GET /api/admin/llm-group-models', () => {
     expect(data.groups[0].chatModelId).toBe('model-1');
     expect(data.groups[2].finalSummaryModelId).toBe('model-9');
     expect(keys).not.toContain('ADMIN');
+    expect(securityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'llm-group-models.read',
+        outcome: 'SUCCESS',
+      })
+    );
   });
 
   it('走运行时解析器：附带可用模型 + 能力开关（与用户组面板/access 同一口径）', async () => {
@@ -153,6 +172,14 @@ describe('PUT /api/admin/llm-group-models', () => {
     expect(res.status).toBe(200);
     const written = JSON.parse(siteSettingUpsertMock.mock.calls[0][0].update.value);
     expect(written).toEqual({ transcriptionMinutesLimit: 60, chatModelId: 'model-1' });
+    expect(securityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'llm-group-models.update',
+        outcome: 'SUCCESS',
+      }),
+      expect.any(Object)
+    );
   });
 
   it('自定义组：改 custom_groups 里对应条目的 permissions 字段', async () => {
@@ -209,5 +236,19 @@ describe('PUT /api/admin/llm-group-models', () => {
       put({ groupKey: 'custom:ghost', purpose: 'CHAT', modelId: '' })
     );
     expect(missing.status).toBe(404);
+  });
+
+  it('敏感列表审计失败时不返回组配置', async () => {
+    securityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+    const res = await GET(new Request('http://localhost/api/admin/llm-group-models'));
+    expect(res.status).toBe(500);
+  });
+
+  it('写入审计失败时不返回绑定成功', async () => {
+    securityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+    const res = await PUT(
+      put({ groupKey: 'FREE', purpose: 'CHAT', modelId: 'model-1' })
+    );
+    expect(res.status).toBe(500);
   });
 });

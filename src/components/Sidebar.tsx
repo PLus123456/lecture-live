@@ -23,6 +23,7 @@ import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
 import { formatBytes } from '@/lib/format';
 import ThemeSwitcher from '@/components/ThemeSwitcher';
+import { toast } from '@/stores/toastStore';
 
 /**
  * slideOut：dashboard layout 在进入对话区（/chat、/conversations）时传 true，
@@ -113,7 +114,14 @@ export default function Sidebar({ slideOut = false }: { slideOut?: boolean }) {
     : 0;
 
   const handleLogout = async () => {
-    await logout();
+    const result = await logout();
+    if (!result.durableRevocation) {
+      toast.error(
+        t('auth.logoutIncomplete'),
+        t('auth.logoutIncompleteDescription')
+      );
+      return;
+    }
     router.replace('/login');
   };
 

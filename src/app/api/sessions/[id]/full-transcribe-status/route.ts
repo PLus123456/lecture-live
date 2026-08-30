@@ -10,7 +10,7 @@ import {
   deleteSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
-import { settleFullReservation } from '@/lib/quota';
+import { failFullTranscribeAttempt } from '@/lib/audio/fullTranscribeAdmission';
 
 // 完整版补全转录状态轮询（前端 poll 驱动收尾，同 async-transcribe-status 模式）：
 //   - 终态(completed/failed/null) 直接返回
@@ -78,23 +78,18 @@ export async function GET(
   }
 
   if (job.status === 'error') {
-    const failed = await prisma.session.updateMany({
-      where: { id, fullTranscribeStatus: 'transcribing' },
-      data: {
-        fullTranscribeStatus: 'failed',
-        fullTranscribeError: 'Soniox transcription failed',
-      },
-    });
-    // R4：任务失败 → 释放入口持有的转录分钟预留（fullReservedMinutes）。抢到 failed 才释放。
-    // settleFullReservation 用 FOR UPDATE 读当前列并原子释放，与 finalize 结算 / 删会话 / cron
-    // releaseOrphanFullReservations 互斥，恰好释放一次。
-    if (failed.count === 1) {
-      await settleFullReservation(id).catch(() => undefined);
-    }
+    // claim-bound failed transition and quota release are one Session→User transaction. Splitting
+    // them would let a retrigger reserve claim B between A's failure and A's late settlement.
+    const failed = await failFullTranscribeAttempt({
+      sessionId: id,
+      claimId: session.fullTranscribeClaimId,
+      allowedStatuses: ['transcribing'],
+      error: 'Soniox transcription failed',
+    }).catch(() => false);
     // 抢到才清 Soniox 残留（file + errored transcription）：不让 error 态会话把 Soniox 侧配额
     // 泄漏到「删会话/重触发」才回收（与 cron mark-failed 同口径）。best-effort、幂等、失败不抛。
     // 此处 fullSonioxTranscriptionId 必非空（上方 status!=='transcribing' || 无 id 已提前返回）。
-    if (failed.count === 1) {
+    if (failed) {
       if (session.fullSonioxFileId) {
         await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(() => undefined);
       }
@@ -102,6 +97,21 @@ export async function GET(
         sonioxConfig,
         session.fullSonioxTranscriptionId
       ).catch(() => undefined);
+    }
+    if (!failed) {
+      const latest = await prisma.session.findUnique({
+        where: { id },
+        select: {
+          fullTranscribeStatus: true,
+          fullTranscribeError: true,
+          fullTranscriptPath: true,
+        },
+      });
+      return NextResponse.json({
+        status: latest?.fullTranscribeStatus ?? 'transcribing',
+        error: latest?.fullTranscribeError ?? null,
+        hasFullTranscript: Boolean(latest?.fullTranscriptPath),
+      });
     }
     return NextResponse.json({
       status: 'failed',
@@ -135,7 +145,11 @@ export async function GET(
     // 拉 transcript / 落盘失败：回退 transcribing 让下次 poll 重试（claim 已置 finalizing）。
     logger.error({ err, sessionId: id }, 'full transcribe finalize failed, reverting');
     await prisma.session.updateMany({
-      where: { id, fullTranscribeStatus: 'finalizing' },
+      where: {
+        id,
+        fullTranscribeClaimId: session.fullTranscribeClaimId,
+        fullTranscribeStatus: 'finalizing',
+      },
       data: { fullTranscribeStatus: 'transcribing' },
     });
     return NextResponse.json({ status: 'transcribing', error: null, hasFullTranscript: false });

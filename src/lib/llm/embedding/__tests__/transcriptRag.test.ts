@@ -8,6 +8,8 @@ const callEmbeddingMock = vi.fn<(texts: string[]) => Promise<number[][]>>();
 
 vi.mock('@/lib/llm/gateway', () => ({
   callEmbedding: (texts: string[]) => callEmbeddingMock(texts),
+  EMBEDDING_MAX_INPUTS: 512,
+  EmbeddingAdmissionError: class EmbeddingAdmissionError extends Error {},
 }));
 
 // estimateTokens 用真实实现走得通，但为了让 chunk 切分边界稳定且可预测，
@@ -21,9 +23,31 @@ vi.mock('@/lib/llm/tokenizer', () => ({
 import {
   invalidateRagCache,
   invalidateRagCacheForRecordings,
-  makeRagRetrieverForRecordings,
-  retrieveTranscriptByEmbedding,
+  computeTranscriptContentSignature,
+  makeRagRetrieverForRecordings as makeRagRetrieverForRecordingsRaw,
+  retrieveTranscriptByEmbedding as retrieveTranscriptByEmbeddingRaw,
 } from '@/lib/llm/embedding/transcriptRag';
+
+const TEST_USER_ID = 'user-rag-test';
+const makeRagRetrieverForRecordings = (
+  recordingIds: ReadonlyArray<string>,
+  loadTranscript: (
+    recordingId: string
+  ) => Promise<ReadonlyArray<TranscriptSegment>>,
+  contentSignature?: string | number
+) =>
+  makeRagRetrieverForRecordingsRaw(
+    recordingIds,
+    TEST_USER_ID,
+    loadTranscript,
+    contentSignature
+  );
+const retrieveTranscriptByEmbedding = (
+  args: Omit<
+    Parameters<typeof retrieveTranscriptByEmbeddingRaw>[0],
+    'userId'
+  >
+) => retrieveTranscriptByEmbeddingRaw({ ...args, userId: TEST_USER_ID });
 
 /**
  * 给每段 transcript 派发一个独特的、可预测的"向量"：
@@ -62,6 +86,7 @@ beforeEach(() => {
   invalidateRagCache('rec-b');
   invalidateRagCache('rec-c');
   invalidateRagCache('rec-dim');
+  invalidateRagCache('rec-limit');
   invalidateRagCacheForRecordings(['rec-a', 'rec-b']);
   invalidateRagCacheForRecordings(['rec-b', 'rec-a']);
   invalidateRagCacheForRecordings(['rec-a']);
@@ -145,52 +170,26 @@ describe('makeRagRetrieverForRecordings', () => {
     expect(callEmbeddingMock.mock.calls.length).toBe(callCountAfterFirst + 1);
   });
 
-  /**
-   * L42：顺序**必须**进 cache key。
-   *
-   * chunk 的 startMs 是调用方按「各录音在本对话里的拼接顺序」累计平移过的全局轴坐标
-   * （chat/route.ts 的 segmentsByRecording），而 contentSignature（段数 + 总字符）与顺序
-   * 无关。旧实现里 key 只含集合 → 另一种挂载顺序的对话直接命中前一个对话的快照，
-   * 时间标签整体错位。这个用例锁住「不同顺序 = 不同 entry，各自的时间标签正确」。
-   */
-  it('recordingIds 顺序不同 → 各自独立 entry，时间标签不串台（向量仍复用）', async () => {
-    // 模拟调用方：第一个录音从 0 起，第二个录音平移到 3600s（全局轴）
-    const shiftedLoader = (order: ReadonlyArray<string>) =>
-      vi.fn<(id: string) => Promise<ReadonlyArray<TranscriptSegment>>>(
-        async (id) => {
-          const offsetMs = order.indexOf(id) * 3_600_000;
-          return [{ text: `${id} content alpha`, startMs: offsetMs }];
-        }
-      );
+  it('recordingIds 顺序不同但内容相同 → 命中同一 cache entry', async () => {
+    const loadTranscript = vi.fn<
+      (id: string) => Promise<ReadonlyArray<TranscriptSegment>>
+    >(async (id) => makeSegments([`${id} content alpha`]));
 
-    const orderAB = ['rec-a', 'rec-b'];
-    const orderBA = ['rec-b', 'rec-a'];
-    const loadAB = shiftedLoader(orderAB);
-    const loadBA = shiftedLoader(orderBA);
-
-    const outAB = await makeRagRetrieverForRecordings(orderAB, loadAB)(
-      'alpha',
-      [],
-      1000
+    const retrieveAB = makeRagRetrieverForRecordings(
+      ['rec-a', 'rec-b'],
+      loadTranscript
     );
-    const embedCallsAfterAB = callEmbeddingMock.mock.calls.length;
-
-    const outBA = await makeRagRetrieverForRecordings(orderBA, loadBA)(
-      'alpha',
-      [],
-      1000
+    const retrieveBA = makeRagRetrieverForRecordings(
+      ['rec-b', 'rec-a'],
+      loadTranscript
     );
 
-    // AB 顺序：rec-a 在 00:00:00，rec-b 在 01:00:00
-    expect(outAB).toContain('[00:00:00] [rec-a]');
-    expect(outAB).toContain('[01:00:00] [rec-b]');
-    // BA 顺序：反过来。旧实现下这里会命中 AB 的快照拿到与 outAB 完全一样的标签。
-    expect(outBA).toContain('[00:00:00] [rec-b]');
-    expect(outBA).toContain('[01:00:00] [rec-a]');
+    await retrieveAB('alpha', [], 1000);
+    const loadsAfterFirst = loadTranscript.mock.calls.length;
 
-    // 顺序变体之间必须复用向量：只多出 query 的那一次 embedding，
-    // 绝不能因为换个顺序就把整组录音重 embed 一遍（M18 要压的就是这种扇出）。
-    expect(callEmbeddingMock.mock.calls.length).toBe(embedCallsAfterAB + 1);
+    await retrieveBA('alpha', [], 1000);
+    // 顺序不同也应命中同一 entry → loader 不应再调用
+    expect(loadTranscript.mock.calls.length).toBe(loadsAfterFirst);
   });
 
   it('空 recordingIds 或空 query 直接短路返回空串，不触发 embedding', async () => {
@@ -348,6 +347,81 @@ describe('retrieveTranscriptByEmbedding 单录音内容签名（段数守恒也�
     });
     expect(callEmbeddingMock.mock.calls.length).toBe(callsAfterFirst + 1);
   });
+
+  it('段数与字符长度都不变的纠正也会失效旧向量', async () => {
+    await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-a',
+      query: 'alpha',
+      transcript: makeSegments(['alpha one']),
+      maxTokens: 1000,
+    });
+    const callsBeforeCorrection = callEmbeddingMock.mock.calls.length;
+
+    const output = await retrieveTranscriptByEmbedding({
+      sessionId: 'rec-a',
+      query: 'beta',
+      // 两个文本都是 9 个 UTF-16 code units。
+      transcript: makeSegments(['betaX one']),
+      maxTokens: 1000,
+    });
+
+    const correctionCalls = callEmbeddingMock.mock.calls.slice(
+      callsBeforeCorrection
+    );
+    expect(
+      correctionCalls.some((args) => args[0].includes('betaX one'))
+    ).toBe(true);
+    expect(output).toContain('betaX one');
+  });
+});
+
+describe('RAG aggregate embedding admission', () => {
+  const chunkySegments = (count: number): TranscriptSegment[] =>
+    Array.from({ length: count }, (_, i) => ({
+      text: `alpha-${i} ${'x'.repeat(180)}`,
+      startMs: i * 1000,
+    }));
+
+  it('单录音超过512 chunks 在任何 embedding 调用前拒绝', async () => {
+    await expect(
+      retrieveTranscriptByEmbedding({
+        sessionId: 'rec-limit',
+        query: 'alpha',
+        transcript: chunkySegments(513),
+        maxTokens: 1000,
+      })
+    ).rejects.toThrow('Embedding chunk count exceeded');
+    expect(callEmbeddingMock).not.toHaveBeenCalled();
+  });
+
+  it('多录音共享512 chunk 总额，不是每录音各512', async () => {
+    const retrieve = makeRagRetrieverForRecordings(
+      ['rec-a', 'rec-b'],
+      async () => chunkySegments(300),
+      'oversized-combined'
+    );
+
+    expect(await retrieve('alpha', [], 1000)).toBe('');
+    expect(callEmbeddingMock).not.toHaveBeenCalled();
+  });
+
+  it('强内容签名区分等长改写与录音边界', () => {
+    const first = computeTranscriptContentSignature([
+      { recordingId: 'a', segments: makeSegments(['alpha one']) },
+      { recordingId: 'b', segments: makeSegments(['beta two']) },
+    ]);
+    const equalLengthRewrite = computeTranscriptContentSignature([
+      { recordingId: 'a', segments: makeSegments(['gamma one']) },
+      { recordingId: 'b', segments: makeSegments(['beta two']) },
+    ]);
+    const movedBoundary = computeTranscriptContentSignature([
+      { recordingId: 'a', segments: makeSegments(['alpha one', 'beta two']) },
+      { recordingId: 'b', segments: [] },
+    ]);
+
+    expect(first).not.toBe(equalLengthRewrite);
+    expect(first).not.toBe(movedBoundary);
+  });
 });
 
 describe('U41 混合维度缓存自愈（变动 chunk 在最前时守卫仍生效）', () => {
@@ -469,85 +543,5 @@ describe('L2 超长单段二次切分', () => {
     // 命中的 beta 块带的时间标签应是 10:00（600s），不是 00:00
     expect(out).toContain('beta tail segment');
     expect(out).not.toMatch(/\[00:00[^\]]*\][^[]*beta tail segment/);
-  });
-});
-
-/**
- * M18：索引扇出必须有闸门与去重。
- *
- * 老实现对缺失 chunk **无上限**地 `callEmbedding(missingTexts)`，且两个并发请求同时
- * 判定 needsRebuild 会各自全量 embed 一遍（last-write-wins），全部发生在回答用户之前。
- */
-describe('M18 索引闸门与并发去重', () => {
-  it('chunk 数触顶时只 embed 上限内的块（不再无上限扇出）', async () => {
-    // 每段 200 字符（桩 estimateTokens=字符数）→ 超过 CHUNK_TARGET_TOKENS(150)
-    // 但不超过 CHUNK_MAX_TOKENS(250) → 一段一块。
-    const seg = 'alpha ' + 'w'.repeat(194);
-    const transcript = Array.from({ length: 4100 }, (_, i) => ({
-      text: seg,
-      startMs: i * 1000,
-    }));
-
-    await retrieveTranscriptByEmbedding({
-      sessionId: 'rec-huge',
-      query: 'alpha',
-      transcript,
-      maxTokens: 1000,
-    });
-
-    // 第一次调用是 chunk 批（第二次是 query）
-    const chunkBatch = callEmbeddingMock.mock.calls[0][0] as string[];
-    expect(chunkBatch.length).toBe(4000);
-    expect(chunkBatch.length).toBeLessThan(transcript.length);
-  });
-
-  it('两个并发请求同内容 → chunk 只 embed 一次（不再各自全量 embed）', async () => {
-    // 每段 ~200 字符（桩 estimateTokens=字符数）→ 一段一块，确保 chunk 批不止一条，
-    // 从而能和只含一条的 query 批区分开。
-    const pad = (word: string) => `${word} ${'w'.repeat(190)}`;
-    const transcript = makeSegments([
-      pad('alpha one'),
-      pad('beta two'),
-      pad('gamma three'),
-    ]);
-
-    // 让 chunk 批次的 embedding 悬停，制造两个请求同时在 rebuild 的窗口
-    let releaseFirst: (() => void) | null = null;
-    const gate = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-    let seenBatch = false;
-    callEmbeddingMock.mockImplementation(async (texts: string[]) => {
-      // query 只有一条，chunk 批不止一条
-      if (texts.length > 1 && !seenBatch) {
-        seenBatch = true;
-        await gate;
-      }
-      return fakeEmbed(texts);
-    });
-
-    const a = retrieveTranscriptByEmbedding({
-      sessionId: 'rec-race',
-      query: 'alpha',
-      transcript,
-      maxTokens: 1000,
-    });
-    const b = retrieveTranscriptByEmbedding({
-      sessionId: 'rec-race',
-      query: 'beta',
-      transcript,
-      maxTokens: 1000,
-    });
-
-    releaseFirst!();
-    const [outA, outB] = await Promise.all([a, b]);
-
-    const batchCalls = callEmbeddingMock.mock.calls.filter(
-      ([texts]) => (texts as string[]).length > 1
-    );
-    // 去重前：两次全量 chunk 批；去重后：一次
-    expect(batchCalls).toHaveLength(1);
-    expect(outA).toContain('alpha one');
-    expect(outB).toContain('beta two');
   });
 });

@@ -2,12 +2,15 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import {
   CLIENT_SESSION_TOKEN,
+  getAuthTokenSessionBinding,
   getJwtExpiryConfig,
+  issueAuthToken,
   setAuthCookie,
-  signToken,
 } from '@/lib/auth';
-import { enforceRateLimit } from '@/lib/rateLimit';
-import { resolveRequestClientIp } from '@/lib/clientIp';
+import {
+  enforcePublicAuthPrelude,
+  readPublicAuthJson,
+} from '@/lib/publicAuth';
 import { logAction } from '@/lib/auditLog';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { consumeEmailToken } from '@/lib/email/tokens';
@@ -23,23 +26,16 @@ const ACCOUNT_UNAVAILABLE = 'verify-email:account-unavailable';
  * 令牌为 256bit 随机、单次、24h 过期；轻度 IP 限流兜底防刷（穷举本不可行）。
  */
 export async function POST(req: Request) {
-  const clientIp = resolveRequestClientIp(req);
-  if (clientIp !== 'unknown') {
-    const limited = await enforceRateLimit(req, {
-      scope: 'auth:verify-email:ip',
-      limit: 30,
-      windowMs: 10 * 60_000,
-      key: `ip:${clientIp}`,
-    });
-    if (limited) return limited;
-  }
+  const prelude = await enforcePublicAuthPrelude(req, {
+    scope: 'verify-email',
+    endpointIpLimit: 30,
+    endpointWindowMs: 10 * 60_000,
+  });
+  if (prelude.response) return prelude.response;
 
-  let body: { token?: string };
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
-  }
+  const parsed = await readPublicAuthJson<{ token?: string }>(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
 
   const token = typeof body.token === 'string' ? body.token.trim() : '';
   if (!token) {
@@ -99,7 +95,7 @@ export async function POST(req: Request) {
 
   // 自动登录：签发会话 cookie。
   const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry);
-  const sessionToken = signToken(
+  const sessionToken = await issueAuthToken(
     { id: user.id, email: user.email, role: user.role, tokenVersion: user.tokenVersion },
     { expiresInDays: jwtConfig.expiresInDays }
   );
@@ -112,8 +108,10 @@ export async function POST(req: Request) {
       role: user.role,
     },
     token: CLIENT_SESSION_TOKEN,
+    sessionBinding: getAuthTokenSessionBinding(sessionToken),
     verified: true,
   });
   setAuthCookie(response, sessionToken, { maxAge: jwtConfig.cookieMaxAge });
+  response.headers.set('Clear-Site-Data', '"cache"');
   return response;
 }

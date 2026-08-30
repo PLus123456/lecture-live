@@ -12,6 +12,10 @@ import { exportToSrt } from './srt';
 import { exportJson } from './json';
 import { generateDocx } from './docx';
 import { exportPdf } from './pdf';
+import {
+  createAccountObjectUrl,
+  revokeAccountObjectUrl,
+} from '@/lib/accountObjectUrls';
 
 /** 用户可选择的内容类型 */
 export type ContentType = 'transcript' | 'summary' | 'timedSummary' | 'recording';
@@ -668,7 +672,7 @@ async function generateSeparateFiles(
 // ─── 触发文件下载 ───
 
 function triggerDownload(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
+  const url = createAccountObjectUrl(blob);
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
@@ -676,7 +680,7 @@ function triggerDownload(blob: Blob, filename: string): void {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  setTimeout(() => revokeAccountObjectUrl(url), 60_000);
 }
 
 async function bundleAsZip(files: GeneratedFile[], zipName: string): Promise<void> {

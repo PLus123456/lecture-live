@@ -2,13 +2,21 @@
 // PDF / DOCX / PPTX / TXT 文件内容提取
 
 import type JSZipType from 'jszip';
+import {
+  extractKeywordDocumentText,
+  type DocumentParserError,
+} from '@/lib/documentParserProcess';
+import {
+  inspectDocumentArchive,
+  ZIP_LIMITS,
+} from '../../scripts/document-archive-preflight.mjs';
 
 /**
  * 解压炸弹（zip bomb）防护上限：OOXML（docx/pptx/xlsx）本质是 ZIP 容器，
  * 一个 ~100KB 的恶意文件可声明解压出数 GB 内容，任意登录用户上传即可 OOM。
  * 在交给真正的解析器解压前，先累加 ZIP 内各 entry 的"未压缩大小"，超阈值直接拒绝。
  */
-export const MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024; // 200MB
+export const MAX_UNCOMPRESSED_BYTES = ZIP_LIMITS.maxUncompressedBytes;
 
 /**
  * 解析超时上限（ms）。DOCX/PPTX/XLSX 有 ZIP 解压炸弹防护，但 PDF 经底层 pdfjs 解析，
@@ -177,6 +185,11 @@ export async function loadZipGuarded(
   buffer: Buffer,
   maxBytes = MAX_UNCOMPRESSED_BYTES
 ): Promise<JSZipType> {
+  // 关键顺序：先扫描原始中央目录，再让 JSZip 建立 entry 对象。旧实现反过来，
+  // entry 爆炸会在守卫运行前就耗尽共享 Web 进程。
+  inspectDocumentArchive(buffer, {
+    limits: { maxUncompressedBytes: maxBytes },
+  });
   const JSZip = (await import('jszip')).default;
   const zip = await JSZip.loadAsync(buffer);
   assertZipNotBomb(zip, maxBytes);
@@ -184,38 +197,21 @@ export async function loadZipGuarded(
   return zip;
 }
 
-export async function extractTextFromFile(file: File): Promise<string> {
+export interface FileParserOptions {
+  signal?: AbortSignal;
+}
+
+export async function extractTextFromFile(
+  file: File,
+  options: FileParserOptions = {}
+): Promise<string> {
   const buffer = Buffer.from(await file.arrayBuffer());
 
   switch (file.type) {
-    case 'application/pdf': {
-      // pdf-parse v2：具名导出 PDFParse 类（无 default 导出）；
-      // getText({ pageJoiner: '' }) 抽全文，pageJoiner 置空避免注入 "-- N of M --" 页码标记。
-      const { PDFParse } = await import('pdf-parse');
-      const parser = new PDFParse({ data: buffer });
-      try {
-        // 安全：对解析时长封顶，防恶意 PDF 占满 CPU/内存致 DoS。
-        const result = (await withParseTimeout(
-          parser.getText({ pageJoiner: '' }),
-          'PDF'
-        )) as { text?: string };
-        return result.text ?? '';
-      } finally {
-        await parser.destroy();
-      }
-    }
-
-    case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
-      // DOCX 是 ZIP 容器：先做解压炸弹防护再交给 mammoth。
-      await loadZipGuarded(buffer);
-      const mammoth = await import('mammoth');
-      const result = await mammoth.extractRawText({ buffer });
-      return result.value;
-    }
-
-    case 'application/vnd.openxmlformats-officedocument.presentationml.presentation': {
-      return await extractPptxText(buffer);
-    }
+    case 'application/pdf':
+    case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+    case 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+      return extractKeywordDocumentText(buffer, file.type, options);
 
     case 'text/plain': {
       return buffer.toString('utf-8');
@@ -232,46 +228,4 @@ export async function extractTextFromFile(file: File): Promise<string> {
  */
 export const MAX_PPTX_TEXT_CHARS = 4_000_000;
 
-async function extractPptxText(buffer: Buffer): Promise<string> {
-  // storage-parser#71：给整个 PPTX 提取套解析超时（此前只有 PDF 分支有）。正则改成线性之后
-  // 这条是兜底 —— 幻灯片之间有 await 让出点，超时能真正生效。
-  return withParseTimeout(extractPptxTextUnbounded(buffer), 'PPTX');
-}
-
-async function extractPptxTextUnbounded(buffer: Buffer): Promise<string> {
-  // PPTX 是 ZIP 文件，解包后读取 ppt/slides/slide*.xml 中的文本。
-  // loadZipGuarded 在解压前累加未压缩大小做防护（zip bomb）。
-  const zip = await loadZipGuarded(buffer);
-  const texts: string[] = [];
-  let totalChars = 0;
-
-  for (const [name, entry] of Object.entries(zip.files)) {
-    if (name.match(/ppt\/slides\/slide\d+\.xml$/)) {
-      const xml = await entry.async('text');
-      // 提取 <a:t> 标签内文本。
-      //
-      // storage-parser#71：原来的 `(.*?)` 对**未闭合**的 <a:t> 呈二次复杂度 —— exec 对每个能
-      // 匹配 '<a:t>' 的起点都要向后扫描整个后缀去找 '</a:t>'，全部失败才返回 null，且 `.` 默认
-      // 不匹配换行，攻击者只要不放换行就能让每次扫描跑满整串。实测 '<a:t>' 重复填充：
-      // 100KB→480ms、200KB→1.9s、400KB→7.7s、800KB→31.6s（长度翻倍耗时翻四倍）。而
-      // loadZipGuarded 允许 200MiB 声明未压缩量、这种高度重复的内容压缩比极高，几百 KB 的上传
-      // 就能解出数十 MB 的 slide XML —— 一个请求把一个 CPU 核钉死数小时。
-      // 换成 `[^<]*`：字符类在遇到第一个 '<' 即停，跨所有起点的总扫描量退化为 O(L)（同一载荷
-      // 800KB 只要 0.6ms）。合法 OOXML 的文本内容里 '<' 必须转义成 '&lt;'，语义不变。
-      const pattern = /<a:t>([^<]*)<\/a:t>/g;
-      let match: RegExpExecArray | null;
-      do {
-        match = pattern.exec(xml);
-        if (match?.[1]) {
-          texts.push(match[1]);
-          totalChars += match[1].length;
-          if (totalChars >= MAX_PPTX_TEXT_CHARS) {
-            return texts.join('\n').slice(0, MAX_PPTX_TEXT_CHARS);
-          }
-        }
-      } while (match);
-    }
-  }
-
-  return texts.join('\n');
-}
+export type { DocumentParserError };

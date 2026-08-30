@@ -70,7 +70,10 @@ export async function POST(
     return NextResponse.json({ title: null });
   }
 
-  const title = await generateConversationTitle({ firstUserMessage: firstUser });
+  const title = await generateConversationTitle({
+    userId: user.id,
+    firstUserMessage: firstUser,
+  });
   if (!title) {
     return NextResponse.json({ title: null });
   }

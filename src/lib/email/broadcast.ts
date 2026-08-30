@@ -4,9 +4,9 @@
 // 管理员「关闭营销邮件」实际什么也没关。这里补上唯一的调用方。
 //
 // 两条硬约束：
-//  1. **绝不在请求线程里串行发完**。审计里的 #5 就是这么把维护循环拖成小时级停摆的：
+//  1. **绝不串行发完**。审计里的 #5 就是这么把维护循环拖成小时级停摆的：
 //     500 人 × SMTP 10~20s = 单轮 1.4h。这里用与 sendExpiryReminders 同款的
-//     worker pool（有界并发 + 总时间预算），并由路由 fire-and-forget 调度。
+//     worker pool（有界并发 + 总时间预算）；路由在 durable JobQueue journal 内 await 终态。
 //  2. **逐人过偏好**。sendGenericNotificationEmail 内部已做权威判定，这里额外过一遍只为
 //     让预览人数与实际发送量一致（否则管理员看到的数字是假的）。
 
@@ -83,7 +83,7 @@ export interface BroadcastResult {
 
 /**
  * 实际派发。有界并发 + 总预算，任何单封失败都不中断整批。
- * 调用方应 fire-and-forget（不要 await 在请求线程里）。
+ * 调用方必须 await，并在调用前持久化 operation journal；否则进程退出会丢失终态。
  */
 export async function runBroadcast(
   recipients: EmailUser[],

@@ -2,12 +2,17 @@ import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
 import { withRequestLogging } from '@/lib/requestLogger';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 import type { Prisma } from '@prisma/client';
 
 // 进账台账：支付订单列表（分页 + 按状态/渠道筛选，附用户邮箱）
 export const GET = withRequestLogging('admin:recharge:orders:list', async (req: Request) => {
-  const { response } = await requireAdminAccess(req, { scope: 'admin:recharge:orders:list', limit: 60 });
+  const { user: admin, response } = await requireAdminAccess(req, {
+    scope: 'admin:recharge:orders:list',
+    limit: 60,
+  });
   if (response) return response;
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
 
   const sp = new URL(req.url).searchParams;
   const page = Math.max(1, parseInt(sp.get('page') || '1', 10));
@@ -36,12 +41,34 @@ export const GET = withRequestLogging('admin:recharge:orders:list', async (req: 
   });
   const byId = new Map(users.map((u) => [u.id, u]));
 
-  return NextResponse.json({
+  const payload = {
     orders: orders.map((o) => ({
       ...o,
       userEmail: byId.get(o.userId)?.email ?? null,
       userName: byId.get(o.userId)?.displayName ?? null,
     })),
     pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
-  });
+  };
+
+  try {
+    await writeSecurityAudit(req, {
+      event: 'recharge.orders.read',
+      operator: { id: admin.id, email: admin.email, role: admin.role },
+      target: { type: 'recharge_order_collection' },
+      reason: 'admin_list',
+      outcome: 'SUCCESS',
+      metadata: {
+        filters: { status: status ?? null, provider: provider ?? null },
+        page,
+        pageSize,
+        count: payload.orders.length,
+        total,
+      },
+    });
+  } catch (err) {
+    console.error('充值订单读取安全审计失败:', err);
+    return NextResponse.json({ error: '安全审计服务暂时不可用' }, { status: 503 });
+  }
+
+  return NextResponse.json(payload);
 });

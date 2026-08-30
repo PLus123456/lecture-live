@@ -13,6 +13,7 @@ const {
   routeUpdateMock,
   routeUpdateManyMock,
   routeDeleteMock,
+  securityAuditMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   registryFindUniqueMock: vi.fn(),
@@ -24,6 +25,7 @@ const {
   routeUpdateMock: vi.fn(),
   routeUpdateManyMock: vi.fn(),
   routeDeleteMock: vi.fn(),
+  securityAuditMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({
@@ -55,6 +57,9 @@ vi.mock('@/lib/prisma', () => {
 });
 
 vi.mock('@/lib/auditLog', () => ({ logAction: vi.fn() }));
+vi.mock('@/lib/securityAudit', () => ({
+  writeSecurityAudit: securityAuditMock,
+}));
 
 import { POST } from '@/app/api/admin/llm-routes/route';
 import { PATCH, DELETE } from '@/app/api/admin/llm-routes/[id]/route';
@@ -98,6 +103,7 @@ beforeEach(() => {
   routeCreateMock.mockImplementation(async ({ data }) => ({ id: 'route-new', ...data }));
   routeUpdateMock.mockImplementation(async ({ data }) => ({ id: 'route-1', ...data }));
   routeUpdateManyMock.mockResolvedValue({ count: 0 });
+  securityAuditMock.mockResolvedValue(undefined);
 });
 
 describe('POST /api/admin/llm-routes（挂载）', () => {
@@ -114,6 +120,11 @@ describe('POST /api/admin/llm-routes（挂载）', () => {
       purpose: 'CHAT',
       isDefault: true, // 首个 → 自动默认
     });
+    expect(securityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({ event: 'llm-routes.create', outcome: 'SUCCESS' }),
+      expect.any(Object)
+    );
   });
 
   it('该用途已有模型时不抢默认', async () => {
@@ -189,6 +200,25 @@ describe('PATCH /api/admin/llm-routes/[id]（调参 + 默认互斥）', () => {
     routeFindUniqueMock.mockResolvedValue(null);
     const res = await PATCH(patch({ isDefault: true }), params('missing'));
     expect(res.status).toBe(404);
+  });
+
+  it('审计写入失败时不返回更新成功', async () => {
+    routeFindUniqueMock.mockResolvedValue({
+      id: 'route-1',
+      providerId: 'prov-1',
+      registryId: 'reg-1',
+      purpose: 'CHAT',
+      modelId: 'gpt-4o',
+      displayName: 'GPT-4o',
+      isDefault: false,
+      thinkingMode: 'NONE',
+      thinkingDepth: 'medium',
+      temperature: 0.6,
+      sortOrder: 0,
+    });
+    securityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+    const res = await PATCH(patch({ isDefault: true }), params('route-1'));
+    expect(res.status).toBe(500);
   });
 });
 

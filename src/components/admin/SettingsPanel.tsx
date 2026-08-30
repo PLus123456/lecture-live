@@ -2348,17 +2348,17 @@ function TranslationPanel({
 function SecurityPanel({
   settings,
   onChange,
-  onToggle,
 }: {
   settings: SiteSettingsData;
   onChange: (key: string, value: string) => void;
-  onToggle: (key: string, value: boolean) => void;
 }) {
   const { t } = useI18n();
   return (
     <div>
       <SettingField label={t('adminSettings.trustedProxy')} description={t('adminSettings.trustedProxyDesc')}>
-        <ToggleSwitch checked={settings.trusted_proxy as boolean} onChange={(v) => onToggle('trusted_proxy', v)} />
+        <div className="rounded-lg border border-cream-200 bg-cream-50 px-3 py-2 text-sm text-charcoal-600 dark:border-charcoal-600 dark:bg-charcoal-700 dark:text-cream-300">
+          <code>TRUSTED_PROXY_HOPS</code> / <code>TRUSTED_PROXY_CIDRS</code>
+        </div>
       </SettingField>
       <SettingField label={t('adminSettings.loginRateLimit')} description={t('adminSettings.loginRateLimitDesc')}>
         <TextInput value={settings.rate_limit_auth} onChange={(v) => onChange('rate_limit_auth', v)} type="number" />
@@ -2502,7 +2502,13 @@ export default function SettingsPanel() {
       return;
     }
 
-    const payload = { ...settings, site_url_backups: cleanedBackups };
+    const payload: SiteSettingsData = {
+      ...settings,
+      site_url_backups: cleanedBackups,
+    };
+    // 旧 API 响应里仍可能有 trusted_proxy（兼容存量数据库），但它不再是可写配置。
+    // 从整包保存中显式剔除，避免管理员产生“切换后立即生效”的错误预期。
+    delete payload.trusted_proxy;
 
     setSaving(true);
     try {
@@ -2577,7 +2583,7 @@ export default function SettingsPanel() {
       case 'llm':
         return <LlmSettingsPanel />;
       case 'security':
-        return <SecurityPanel settings={settings} onChange={handleChange} onToggle={handleToggle} />;
+        return <SecurityPanel settings={settings} onChange={handleChange} />;
     }
   };
 

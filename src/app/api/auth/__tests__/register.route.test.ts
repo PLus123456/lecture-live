@@ -44,6 +44,7 @@ vi.mock('@/lib/logger', () => ({
 }));
 vi.mock('@/lib/auth', () => ({
   CLIENT_SESSION_TOKEN: 'client-session',
+  getAuthTokenSessionBinding: () => 'binding-register',
   getJwtExpiryConfig: () => ({ expiresInDays: 7, cookieMaxAge: 604800 }),
   registerWithOptions: registerWithOptionsMock,
   setAuthCookie: vi.fn(),

@@ -98,6 +98,8 @@ NEXT_PUBLIC_WS_URL=https://your-domain.com
 
 # 数据库（密码与第 4 步一致，特殊字符需 URL 编码，见下方说明）
 DATABASE_URL="mysql://lecturelive:你的数据库密码@localhost:3306/lecturelive"
+# 正式安装会在服务启动前同步 schema 并安装数据库安全 CHECK，不允许关闭
+AUTO_DB_PUSH=true
 
 # Redis（密码与第 5 步一致）
 REDIS_URL=redis://:你的Redis密码@localhost:6379
@@ -106,29 +108,27 @@ REDIS_URL=redis://:你的Redis密码@localhost:6379
 JWT_SECRET=<生成的随机字符串>
 ENCRYPTION_KEY=<生成的另一个随机字符串>
 
+# 首次进入 LLM 配置步骤前必填：逐个填写实际 provider 的精确 origin，逗号分隔
+# 只写协议 + 主机 + 非默认端口，不写路径、查询串、通配符，也不会自动放行子域
+
+# 可信代理拓扑（标准部署：公网 -> 本机 Nginx -> 回环 Web/WS）
+TRUSTED_PROXY_HOPS=1
+TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
+
 # 生产环境
 NODE_ENV=production
 
-# 可选：部署引导密钥。配了它，/api/setup 的匿名首次部署窗口就彻底关闭
-# （详见下方「首次部署窗口的安全性」）。不配也可以，见那一节的默认行为。
-# SETUP_BOOTSTRAP_TOKEN=<openssl rand -hex 32>
+# 首次管理员引导密钥（至少 32 字节）
+# install.sh 在缺失或过短时会自动生成，并只保存到 /opt/lecturelive/.env。
+# 也可在安装前手工生成：openssl rand -hex 32
+SETUP_BOOTSTRAP_TOKEN=<openssl rand -hex 32>
 ```
 
 > **注意：** `.env` 文件中值可以用引号包裹（`KEY="value"`），`node --env-file` 会正确解析。
 >
-> **重要：** `DATABASE_URL` 和 `REDIS_URL` 是标准 URL 格式，如果密码中包含 `@`、`#`、`/`、`:` 等特殊字符，**必须进行 URL 编码**，否则 Prisma 会解析失败。常见编码：
->
-> | 字符 | 编码 |
-> |------|------|
-> | `@` | `%40` |
-> | `#` | `%23` |
-> | `/` | `%2F` |
-> | `:` | `%3A` |
->
-> 例如密码为 `Pass@2026`，`DATABASE_URL` 应写为：
-> ```ini
-> DATABASE_URL="mysql://lecturelive:Pass%402026@localhost:3306/lecturelive"
-> ```
+> **LLM 出站边界：** 不设 origin 白名单（自托管场景下管理员与能改 .env 的是同一个人，
+> 白名单只增加运维成本、挡不住任何人）。仍然强制的是与配置无关的那部分：只走 HTTPS、
+> 不跟任何 3xx 重定向、DNS 结果钉住后再连（防重绑定）、私网/回环/链路本地地址一律拒绝。
 
 ### 7. 编译
 
@@ -148,6 +148,8 @@ sudo bash deploy/install.sh
 这会：
 - 将 Next.js standalone 产物复制到 `/opt/lecturelive`
 - 将编译好的 `websocket.js` + 精简依赖部署到 `/opt/lecturelive/ws-server`
+- 在引导密钥缺失或过短时生成强随机 `SETUP_BOOTSTRAP_TOKEN`，只写入权限为 600 的部署 `.env`
+- 加载部署 `.env` 运行统一数据库编排并安装安全约束；缺连接串、禁用同步或迁移失败时停止启动
 - 配置 systemd 服务并启动
 
 ### 9. 配置 Nginx 反代
@@ -196,37 +198,70 @@ TRUSTED_PROXY=true
 
 ## 首次部署窗口的安全性
 
-`/api/setup` 是**公开**端点（中间件不对它鉴权）——服务一起来到你建出第一个管理员之间，
-这条路径对全网开放。默认行为：
+`/api/setup` 是中间件放行的引导端点，但写操作在路由内按实例状态**关闭失败**：
 
 | 状态 | 谁能调 `/api/setup` |
 |------|---------------------|
-| 库里还没有管理员 | 任何人（只能走 `step=admin`，且首个管理员的创建有唯一键 CAS，抢不出第二个） |
-| 已有管理员 | 必须是**已登录的 ADMIN**（向导在 `step=admin` 之后自动带上该 cookie） |
-| 设了 `SETUP_BOOTSTRAP_TOKEN` | 带 `x-setup-token: <该值>` 的请求，**或**已登录的 ADMIN |
+| 库里还没有管理员 | 必须提供至少 32 字节的服务端 `SETUP_BOOTSTRAP_TOKEN`，且该令牌**只能**调用 `step=admin` |
+| 引导密钥缺失或过短 | 所有首次管理员认领请求返回 503，不会回退到匿名模式 |
+| 已有管理员 | 只接受**已登录的 ADMIN**；引导令牌立即且永久失去授权能力 |
 
-结论：**先建管理员，再对外放开 80/443**。做不到的话，就在 `.env` 里设
-`SETUP_BOOTSTRAP_TOKEN`，把匿名窗口彻底关掉，然后用 curl 走完向导：
+安装脚本不会把密钥打印进日志或交给浏览器。请在服务器本机读取部署 `.env`，用 curl
+原子认领首位管理员；不要把密钥放进 URL、浏览器本地存储、截图或聊天记录：
 
 ```bash
-TOKEN=$(grep '^SETUP_BOOTSTRAP_TOKEN=' /opt/lecturelive/.env | cut -d= -f2-)
+TOKEN=$(sudo sed -n 's/^SETUP_BOOTSTRAP_TOKEN=//p' /opt/lecturelive/.env | tail -n 1)
+TOKEN=${TOKEN#\"}; TOKEN=${TOKEN%\"}
+TOKEN=${TOKEN#\'}; TOKEN=${TOKEN%\'}
 curl -sS -X POST http://127.0.0.1:3000/api/setup \
   -H 'Content-Type: application/json' -H "x-setup-token: $TOKEN" \
-  -d '{"step":"admin","email":"admin@example.com","password":"你的密码","displayName":"Admin"}'
+  -d '{"step":"admin","email":"admin@example.com","password":"replace-with-a-unique-strong-password-2026","displayName":"Admin"}'
+unset TOKEN
 ```
 
-> 注意：设了 `SETUP_BOOTSTRAP_TOKEN` 之后，浏览器里的 `/setup` 向导在**还没有管理员**时
-> 会一直 401（页面不会带这个 header）。建好管理员并登录后，向导的后续步骤照常可用。
+成功响应会设置管理员会话 cookie。由于命令行 curl 不会自动把 cookie 交给浏览器，请随后
+在浏览器正常登录这个管理员账号，再完成数据库检查、LLM、Soniox 和完成标记。浏览器里的
+`/setup` 在尚无管理员时返回 401 是预期行为；它绝不会读取部署引导密钥。
 
-`step=llm` / `step=soniox` 填写的地址会做私网黑名单校验（与管理后台同一套），
+`step=llm` 填写的地址必须是 HTTPS、不带 query，并通过 DNS/私网校验；
+`step=soniox` 也会做私网黑名单校验，
 `step=complete` 要求管理员已存在——避免匿名者抢先把实例标记为「已完成设置」而锁死。
 
-`setup_complete` 全仓只写 `true`、从不写回 `false`，误置位只能连数据库改回来：
+`setup_complete` 只会由**已认证 ADMIN 明确提交 `step=complete`**写成 `true`；首页和
+公开状态接口都只读、不会自动封门。该标记从不自动写回 `false`，误置位只能连数据库改回来：
 
 ```sql
 -- sudo mysql lecturelive
 DELETE FROM SiteSetting WHERE `key` IN ('setup_complete', 'setup_admin_claimed');
 ```
+
+---
+
+## 可信代理与真实客户端 IP
+
+标准部署的安全边界是“公网客户端 → 本机 Nginx → 回环 Web/WS”。模板同时保证：
+
+- Web 与 WS 端口只绑定宿主回环，公网不能绕过 Nginx；
+- Nginx 用 `$remote_addr` **覆盖**客户端提交的 `X-Forwarded-For` / `X-Real-IP`；
+- 应用固定从右侧剥离 `TRUSTED_PROXY_HOPS=1` 跳，并让两个头不一致时关闭失败；
+- Nginx 同时执行每 IP 和站点全局的请求/连接预算。
+
+不要把 3000/3001 直接暴露到公网。仅在完全不使用反向代理的本地开发模式把
+`TRUSTED_PROXY_HOPS=0`；此时 HTTP 请求没有可信的 socket peer，IP 型限流会退化为
+`unknown`，不适合作为生产拓扑。
+
+如果 Nginx 前还有 CDN/LB，必须在部署前显式描述链路，例如两跳：
+
+```ini
+TRUSTED_PROXY_HOPS=2
+TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128,203.0.113.0/24
+```
+
+其中 CIDR 只能填写实际受控代理网段，并同步调整 Nginx，让它在校验上游来源后传递完整、
+可预测的链；`X-Real-IP` 必须等于 XFF 最右侧的直接外部代理。跳数超过 1 但没有显式
+CIDR、CIDR 非法、两个头不一致或跳数超过 8 时，WS 会拒绝连接或进程拒绝启动；
+HTTP 端则把无法验证的链解析为 `unknown`。拓扑变更后必须重启 Web 和 WS。管理后台旧版
+`trusted_proxy` 开关不再改变安全边界，实际配置只认上述环境变量。
 
 ---
 
@@ -268,6 +303,10 @@ ls -lh /opt/lecturelive/backups/
 
 备份自动保留最近 5 个版本。
 
+回滚只允许恢复带 `health-ready-v1` 运行时标记的安全版本。早于受保护深度就绪端点的
+旧备份会被拒绝并保持 Web/WS 停止，避免重新上线匿名依赖探测；此时应修复当前版本，
+或先把旧代码移植安全补丁后重新构建，不能手工伪造标记强行启动。
+
 ---
 
 ## 常用运维命令
@@ -304,6 +343,38 @@ journalctl -u lecturelive-web --since today
 ```
 
 ### 数据库
+
+首次从旧版升级且数据库已有 Stripe 成功订单时，生产启动闸会保持服务停止，直到历史退款/拒付完成一次性审计。脚本只调用 Stripe 官方 REST API，不保存 API key、签名或原始响应；默认是只读 dry-run：
+
+```bash
+# 对账 CLI 与受限复核服务统一从 /opt/lecturelive-maintenance 的自包含
+# standalone runtime 运行，不依赖此时可能尚未替换的 /opt/lecturelive/node_modules。
+
+# 1. 从最早本地 Stripe 订单前一天扫到命令启动时刻；完整分页，任何中断都不会发布完成 marker
+sudo lecturelive-payment-maintenance reconcile
+
+# 2. 人工核对 dry-run 的 account id、覆盖时间、Refund/Dispute 与对象映射后再导入
+sudo lecturelive-payment-maintenance reconcile \
+  --apply \
+  --confirm=IMPORT_HISTORICAL_STRIPE_REVERSALS \
+  --reason="首次安全升级：已核对 Stripe Dashboard 与覆盖起点"
+
+# 3. 导入只进入 durable inbox/review；部分退款、非 lost dispute、冲突/未映射项不会被猜测处理。
+#    正式 web/ws 仍保持停止。启动受限维护服务（前台运行；另开一个 SSH 会话操作 API）：
+sudo lecturelive-payment-maintenance
+
+#    维护模式只允许登录/刷新/登出和 ADMIN 支付复核 API；普通用户、钱包、支付回调、
+#    setup/share/translation 等全部 503，Stripe 会在恢复正式服务后重投。
+#    通过 /api/admin/recharge/reviews 逐项 map/retry、退款或理由化处置，并解除相应 hold。
+#    处置完按 Ctrl-C 退出维护服务。
+#    所有 history:* inbox=processed、case 已关闭且历史 hold 已解除后，显式发布完成 marker：
+sudo lecturelive-payment-maintenance reconcile \
+  --finalize \
+  --confirm=FINALIZE_REVIEWED_STRIPE_HISTORY \
+  --reason="历史 Stripe 复核队列与冻结均已处置完毕"
+```
+
+脚本把 marker 绑定到 `/v1/account` 返回的 `acct_*`、live/default 命名空间、扫描起止时间和当前 key 指纹。更换 key、扫描被截断、仍有 review/hold、历史 test 或 Connect 订单时启动继续失败；不得用手工伪造 SiteSetting 绕过。
 
 ```bash
 # 进入 MySQL

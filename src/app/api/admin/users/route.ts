@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import bcrypt from 'bcryptjs';
 import { requireAdminAccess } from '@/lib/adminApi';
@@ -17,6 +18,12 @@ import {
 } from '@/lib/quota';
 import { deleteCloudreveAttachmentFiles } from '@/lib/storage/cloudreveFileDelete';
 import { invalidateUserEmailTokens } from '@/lib/email/tokens';
+import {
+  getSecurityAuditRequestId,
+  writeSecurityAudit,
+} from '@/lib/securityAudit';
+import { JOB_STATUS, JOB_TYPE, trackJob } from '@/lib/jobQueue';
+import { deleteTaskFiles } from '@/lib/translate/taskStorage';
 
 // 共享的用户查询 select 字段
 const USER_SELECT = {
@@ -40,6 +47,85 @@ const USER_SELECT = {
   allowedModels: true,
   customGroupId: true,
 } as const;
+
+const MAX_DELETE_USER_IDS = 50;
+const USER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+type SecurityAuditEvent = Parameters<typeof writeSecurityAudit>[1];
+type SecurityAuditDb = Parameters<typeof writeSecurityAudit>[2];
+
+class SecurityAuditUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super('required security audit write failed', { cause });
+    this.name = 'SecurityAuditUnavailableError';
+  }
+}
+
+async function requireSecurityAudit(
+  req: Request,
+  event: SecurityAuditEvent,
+  db?: SecurityAuditDb
+) {
+  try {
+    return await writeSecurityAudit(req, event, db);
+  } catch (cause) {
+    throw new SecurityAuditUnavailableError(cause);
+  }
+}
+
+function securityAuditUnavailableResponse() {
+  return NextResponse.json(
+    { error: '审计服务暂不可用，请稍后重试' },
+    { status: 503 }
+  );
+}
+
+function auditOperator(user: {
+  id: string;
+  email?: string | null;
+  role?: string | null;
+}) {
+  return {
+    id: user.id,
+    email: user.email ?? null,
+    role: user.role ?? null,
+  };
+}
+
+/**
+ * Security audit snapshots are an explicit allowlist. In particular, never pass a
+ * Prisma User row through wholesale: it also contains passwordHash/tokenVersion and
+ * may gain more credential fields in future migrations.
+ */
+function toSafeUserAudit(user: Record<string, unknown>) {
+  return {
+    id: user.id,
+    email: user.email,
+    displayName: user.displayName,
+    role: user.role,
+    status: user.status,
+    points: user.points,
+    originalRole: user.originalRole,
+    roleExpiresAt: user.roleExpiresAt,
+    avatarPath: user.avatarPath,
+    createdAt: user.createdAt,
+    emailVerifiedAt: user.emailVerifiedAt,
+    transcriptionMinutesUsed: user.transcriptionMinutesUsed,
+    transcriptionMinutesLimit: user.transcriptionMinutesLimit,
+    storageHoursUsed: user.storageHoursUsed,
+    storageHoursLimit: user.storageHoursLimit,
+    allowedModels: user.allowedModels,
+    customGroupId: user.customGroupId,
+  };
+}
+
+function safeChangedFields(data: Record<string, unknown>): string[] {
+  const fields = Object.keys(data).filter(
+    (field) => field !== 'passwordHash' && field !== 'tokenVersion'
+  );
+  if (data.passwordHash !== undefined) fields.push('passwordChanged');
+  return fields;
+}
 
 // 管理员用户列表 API
 export async function GET(req: Request) {
@@ -115,8 +201,32 @@ export async function GET(req: Request) {
       return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
     });
 
+    // This response contains every user's email, role and quota state. Do not
+    // release it unless the required security audit has durably succeeded.
+    await requireSecurityAudit(req, {
+      event: 'users.read',
+      operator: auditOperator(admin),
+      target: { type: 'user_collection' },
+      reason: 'admin_list',
+      outcome: 'SUCCESS',
+      metadata: {
+        filterApplied: Boolean(filter),
+        groupApplied: Boolean(groupFilter),
+        roleFilter: ['ADMIN', 'PRO', 'FREE'].includes(groupFilter)
+          ? groupFilter
+          : null,
+        customGroupFilterApplied: Boolean(
+          groupFilter && !['ADMIN', 'PRO', 'FREE'].includes(groupFilter)
+        ),
+        count: sortedUsers.length,
+      },
+    });
+
     return NextResponse.json({ users: sortedUsers });
   } catch (err) {
+    if (err instanceof SecurityAuditUnavailableError) {
+      return securityAuditUnavailableResponse();
+    }
     console.error('用户列表查询失败:', err);
     return NextResponse.json({ error: '查询失败' }, { status: 500 });
   }
@@ -166,21 +276,43 @@ export async function POST(req: Request) {
       resolveRoleStorageBytesLimit(normalizedRole),
     ]);
 
-    const user = await prisma.user.create({
-      data: {
-        email,
-        displayName,
-        passwordHash,
-        role: normalizedRole,
-        // 管理员手工建号即视为已验证：邮箱和初始密码都是管理员亲自填的，等于线下背书。
-        // 此前这里不写该字段 → email_verification 开启时，管理员建的账号一律 403 登不上，
-        // 而后台也看不到这个字段，谁都诊断不出来。
-        // 让用户去验证一个管理员替他填的地址也没有意义：地址填错了，验证信照样收不到。
-        emailVerifiedAt: new Date(),
-        ...quotas,
-        storageBytesLimit,
-      },
-      select: USER_SELECT,
+    const requestId = getSecurityAuditRequestId(req);
+    const user = await prisma.$transaction(async (tx) => {
+      const created = await tx.user.create({
+        data: {
+          email,
+          displayName,
+          passwordHash,
+          role: normalizedRole,
+          // 管理员手工建号即视为已验证：邮箱和初始密码都是管理员亲自填的，等于线下背书。
+          // 此前这里不写该字段 → email_verification 开启时，管理员建的账号一律 403 登不上，
+          // 而后台也看不到这个字段，谁都诊断不出来。
+          // 让用户去验证一个管理员替他填的地址也没有意义：地址填错了，验证信照样收不到。
+          emailVerifiedAt: new Date(),
+          ...quotas,
+          storageBytesLimit,
+        },
+        select: USER_SELECT,
+      });
+
+      // User creation is DB-only, so the state change and its SUCCESS record
+      // share one transaction. An unavailable audit store rolls the account back.
+      await requireSecurityAudit(
+        req,
+        {
+          event: 'users.create',
+          operator: auditOperator(admin),
+          target: { type: 'user', id: created.id, ownerId: created.id },
+          before: null,
+          after: toSafeUserAudit(created as Record<string, unknown>),
+          reason: 'admin_create',
+          outcome: 'SUCCESS',
+          requestId,
+        },
+        tx
+      );
+
+      return created;
     });
 
     logAction(req, 'admin.user.create', {
@@ -190,6 +322,9 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ user }, { status: 201 });
   } catch (err) {
+    if (err instanceof SecurityAuditUnavailableError) {
+      return securityAuditUnavailableResponse();
+    }
     console.error('创建用户失败:', err);
     return NextResponse.json({ error: '创建失败' }, { status: 500 });
   }
@@ -206,13 +341,29 @@ export async function DELETE(req: Request) {
     return response!;
   }
 
-  try {
-    const body = await req.json();
-    const { userIds } = body as { userIds: string[] };
+  let auditContext: {
+    requestId: string;
+    target: { type: string; ids: string[] };
+    before: Array<Record<string, unknown>>;
+    metadata: { requestedCount: number; foundCount: number };
+  } | null = null;
+  let trackedTerminalAuditWritten = false;
 
-    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+  try {
+    const body = (await req.json()) as { userIds?: unknown };
+    const rawUserIds = body.userIds;
+
+    if (
+      !Array.isArray(rawUserIds) ||
+      rawUserIds.length === 0 ||
+      rawUserIds.length > MAX_DELETE_USER_IDS ||
+      rawUserIds.some(
+        (id) => typeof id !== 'string' || !USER_ID_PATTERN.test(id)
+      )
+    ) {
       return NextResponse.json({ error: '请提供要删除的用户 ID' }, { status: 400 });
     }
+    const userIds = rawUserIds as string[];
 
     const protectedAdmins = await prisma.user.findMany({
       where: {
@@ -222,9 +373,11 @@ export async function DELETE(req: Request) {
       select: { id: true },
     });
     const protectedAdminIds = new Set(protectedAdmins.map((entry) => entry.id));
-    const safeIds = userIds.filter(
-      (id) => id !== admin.id && !protectedAdminIds.has(id)
-    );
+    const safeIds = [
+      ...new Set(
+        userIds.filter((id) => id !== admin.id && !protectedAdminIds.has(id))
+      ),
+    ];
 
     if (safeIds.length === 0) {
       return NextResponse.json({
@@ -236,21 +389,199 @@ export async function DELETE(req: Request) {
       });
     }
 
-    const deleted = await cascadeDeleteUsers(safeIds);
+    const usersBeforeDelete = await prisma.user.findMany({
+      where: { id: { in: safeIds } },
+      select: USER_SELECT,
+    });
+    const requestId = getSecurityAuditRequestId(req);
+    const target = { type: 'user', ids: safeIds };
+    const before = usersBeforeDelete.map((user) =>
+      toSafeUserAudit(user as Record<string, unknown>)
+    );
+    const metadata = {
+      requestedCount: safeIds.length,
+      foundCount: usersBeforeDelete.length,
+    };
 
+    // The cascade starts with an external Cloudreve deletion, so a durable attempt
+    // must exist before any irreversible side effect is allowed to run.
+    await requireSecurityAudit(req, {
+      event: 'users.delete',
+      operator: auditOperator(admin),
+      target,
+      before,
+      reason: 'admin_delete',
+      outcome: 'ATTEMPTED',
+      metadata,
+      requestId,
+    });
+    auditContext = { requestId, target, before, metadata };
+
+    const result = await trackJob(
+      {
+        type: JOB_TYPE.ADMIN_MUTATION,
+        userId: admin.id,
+        triggeredBy: `admin:${admin.id}`,
+        params: {
+          operation: 'admin_users_delete',
+          requestedCount: safeIds.length,
+          requestId,
+        },
+        resultSummary: (value) => ({
+          deleted: value.deleted,
+          remoteFilesComplete: value.remoteFilesComplete,
+          localTranslationFilesComplete: value.localTranslationFilesComplete,
+          quotaReleaseComplete: value.quotaReleaseComplete,
+        }),
+        errorSummary: (error) =>
+          error instanceof CascadeDeleteUsersError && error.partial
+            ? 'UserCascadePartialError'
+            : error instanceof Error
+              ? error.name
+              : 'UserCascadeError',
+        terminalMutation: async (tx, terminal) => {
+          if (terminal.status === JOB_STATUS.SUCCESS) {
+            const completed = terminal.result;
+            const missing = Math.max(0, safeIds.length - completed.deleted);
+            const outcome =
+              completed.remoteFilesComplete &&
+              completed.localTranslationFilesComplete &&
+              completed.quotaReleaseComplete &&
+              completed.deleted === safeIds.length
+                ? 'SUCCESS'
+                : 'PARTIAL';
+            await requireSecurityAudit(
+              req,
+              {
+                event: 'users.delete',
+                operator: auditOperator(admin),
+                target,
+                before,
+                after: { deleted: completed.deleted, missing },
+                reason: 'admin_delete',
+                outcome,
+                metadata: {
+                  ...metadata,
+                  deleted: completed.deleted,
+                  missing,
+                  remoteFilesComplete: completed.remoteFilesComplete,
+                  localTranslationFilesComplete:
+                    completed.localTranslationFilesComplete,
+                  quotaReleaseComplete: completed.quotaReleaseComplete,
+                  journaled: true,
+                },
+                requestId,
+              },
+              tx
+            );
+          } else {
+            await requireSecurityAudit(
+              req,
+              {
+                event: 'users.delete',
+                operator: auditOperator(admin),
+                target,
+                before,
+                reason: 'admin_delete',
+                outcome:
+                  terminal.error instanceof CascadeDeleteUsersError &&
+                  terminal.error.partial
+                    ? 'PARTIAL'
+                    : 'FAILED',
+                metadata: {
+                  ...metadata,
+                  failureStage: 'cascade_delete',
+                  errorClass:
+                    terminal.error instanceof Error
+                      ? terminal.error.name
+                      : 'UnknownError',
+                  journaled: true,
+                },
+                requestId,
+              },
+              tx
+            );
+          }
+          trackedTerminalAuditWritten = true;
+        },
+      },
+      () =>
+        cascadeDeleteUsers(safeIds, {
+          databaseMutation: async (tx, deleted) => {
+            // The Cloudreve cleanup is necessarily outside MySQL, but the authoritative
+            // user/cascade deletion and its database-phase outcome commit together.
+            await requireSecurityAudit(
+              req,
+              {
+                event: 'users.delete',
+                operator: auditOperator(admin),
+                target,
+                before,
+                after: { deleted },
+                reason: 'admin_delete',
+                outcome: 'SUCCESS',
+                metadata: { ...metadata, deleted, phase: 'database' },
+                requestId,
+              },
+              tx
+            );
+          },
+        })
+    );
     logAction(req, 'admin.user.delete', {
       user: admin,
-      detail: `删除 ${deleted} 个用户`,
+      detail: `删除 ${result.deleted} 个用户`,
     });
 
     return NextResponse.json({
-      deleted,
+      deleted: result.deleted,
       skipped: {
         self: userIds.includes(admin.id),
         admins: protectedAdmins.map((entry) => entry.id),
       },
     });
   } catch (err) {
+    const containsSecurityAuditFailure = (value: unknown): boolean => {
+      if (value instanceof SecurityAuditUnavailableError) return true;
+      if (value instanceof AggregateError) {
+        return value.errors.some(containsSecurityAuditFailure);
+      }
+      return (
+        value instanceof Error &&
+        value.cause !== undefined &&
+        containsSecurityAuditFailure(value.cause)
+      );
+    };
+    if (containsSecurityAuditFailure(err)) {
+      return securityAuditUnavailableResponse();
+    }
+
+    if (auditContext && !trackedTerminalAuditWritten) {
+      try {
+        await requireSecurityAudit(req, {
+          event: 'users.delete',
+          operator: auditOperator(admin),
+          target: auditContext.target,
+          before: auditContext.before,
+          reason: 'admin_delete',
+          outcome:
+            err instanceof CascadeDeleteUsersError && err.partial
+              ? 'PARTIAL'
+              : 'FAILED',
+          metadata: {
+            ...auditContext.metadata,
+            failureStage: 'cascade_delete',
+          },
+          requestId: auditContext.requestId,
+        });
+      } catch (auditErr) {
+        if (auditErr instanceof SecurityAuditUnavailableError) {
+          return securityAuditUnavailableResponse();
+        }
+        throw auditErr;
+      }
+    }
+
     console.error('删除用户失败:', err);
     return NextResponse.json({ error: '删除失败' }, { status: 500 });
   }
@@ -277,11 +608,33 @@ export async function DELETE(req: Request) {
  *
  * 注：AuditLog.userId / ReconciliationMismatch.userId 为无 FK 的留痕列，故意保留以便审计。
  *
- * @returns 实际删除的用户数
+ * @returns 实际删除的用户数及事务外清理的完整性
  */
-async function cascadeDeleteUsers(userIds: string[]): Promise<number> {
+interface CascadeDeleteResult {
+  deleted: number;
+  remoteFilesComplete: boolean;
+  localTranslationFilesComplete: boolean;
+  quotaReleaseComplete: boolean;
+}
+
+class CascadeDeleteUsersError extends Error {
+  constructor(cause: unknown, readonly partial: boolean) {
+    super('user cascade delete failed', { cause });
+    this.name = 'CascadeDeleteUsersError';
+  }
+}
+
+async function cascadeDeleteUsers(
+  userIds: string[],
+  options: {
+    databaseMutation?: (
+      tx: Prisma.TransactionClient,
+      deleted: number
+    ) => Promise<void>;
+  } = {}
+): Promise<CascadeDeleteResult> {
   // 收集待删用户的 session / folder / conversation id 集合
-  const [sessions, folders, ownedConversations] = await Promise.all([
+  const [sessions, folders, ownedConversations, translationTasks] = await Promise.all([
     prisma.session.findMany({
       where: { userId: { in: userIds } },
       select: { id: true },
@@ -291,6 +644,10 @@ async function cascadeDeleteUsers(userIds: string[]): Promise<number> {
       select: { id: true },
     }),
     prisma.conversation.findMany({
+      where: { userId: { in: userIds } },
+      select: { id: true },
+    }),
+    prisma.translationTask.findMany({
       where: { userId: { in: userIds } },
       select: { id: true },
     }),
@@ -333,8 +690,18 @@ async function cascadeDeleteUsers(userIds: string[]): Promise<number> {
     },
   });
 
-  // 物理删除 Cloudreve 文件（best-effort，事务外，失败不阻塞）
-  await deleteCloudreveAttachmentFiles(attachments);
+  // 物理删除 Cloudreve 文件（best-effort，事务外，失败不阻塞）。
+  // false 表示可能已删掉一部分，必须在安全审计里如实标记 PARTIAL。
+  let remoteFilesComplete = true;
+  if (attachments.length > 0) {
+    try {
+      remoteFilesComplete = await deleteCloudreveAttachmentFiles(attachments);
+    } catch (cause) {
+      // The shared helper promises not to throw, but fail safely if that contract
+      // regresses: an earlier remote file may already have been removed.
+      throw new CascadeDeleteUsersError(cause, true);
+    }
+  }
 
   const attachmentIds = attachments.map((a) => a.id);
   const deletedUserSet = new Set(userIds);
@@ -343,47 +710,88 @@ async function cascadeDeleteUsers(userIds: string[]): Promise<number> {
   // 数组顺序即执行顺序）。空 `in: []` 的 deleteMany 是安全 no-op，故无需逐项判空。
   // ConversationMessage / ConversationSession 对 Conversation 虽是 onDelete: Cascade，
   // 仍显式先删，不依赖级联在同一事务内的触发时序。
-  const txResults = await prisma.$transaction([
-    // ShareLink：既指向 User(createdBy) 又指向 Session，最先清
-    prisma.shareLink.deleteMany({
-      where: {
-        OR: [
-          { createdBy: { in: userIds } },
-          { sessionId: { in: sessionIds } },
-        ],
-      },
-    }),
-    prisma.chatAttachment.deleteMany({ where: { id: { in: attachmentIds } } }),
-    prisma.conversationMessage.deleteMany({
-      where: { conversationId: { in: conversationIds } },
-    }),
-    prisma.conversationSession.deleteMany({
-      where: {
-        OR: [
-          { conversationId: { in: conversationIds } },
-          { sessionId: { in: sessionIds } },
-        ],
-      },
-    }),
-    prisma.conversation.deleteMany({ where: { id: { in: conversationIds } } }),
-    // Folder/Session 联表 + Folder 关键词池，再删 Folder 本体
-    prisma.folderSession.deleteMany({
-      where: {
-        OR: [
-          { sessionId: { in: sessionIds } },
-          { folderId: { in: folderIds } },
-        ],
-      },
-    }),
-    prisma.folderKeyword.deleteMany({ where: { folderId: { in: folderIds } } }),
-    prisma.folder.deleteMany({ where: { id: { in: folderIds } } }),
-    prisma.session.deleteMany({ where: { id: { in: sessionIds } } }),
-    // 冗余 userId 列（无 FK，不阻塞删除，但清掉运行态任务避免悬挂引用）
-    prisma.jobQueue.deleteMany({ where: { userId: { in: userIds } } }),
-    prisma.user.deleteMany({ where: { id: { in: userIds } } }),
-  ]);
-  const userResult = txResults[txResults.length - 1];
-
+  let userResult: { count: number };
+  try {
+    userResult = await prisma.$transaction(async (tx) => {
+      // ShareLink：既指向 User(createdBy) 又指向 Session，最先清
+      await tx.shareLink.deleteMany({
+        where: {
+          OR: [
+            { createdBy: { in: userIds } },
+            { sessionId: { in: sessionIds } },
+          ],
+        },
+      });
+      await tx.chatAttachment.deleteMany({ where: { id: { in: attachmentIds } } });
+      await tx.conversationMessage.deleteMany({
+        where: { conversationId: { in: conversationIds } },
+      });
+      await tx.conversationSession.deleteMany({
+        where: {
+          OR: [
+            { conversationId: { in: conversationIds } },
+            { sessionId: { in: sessionIds } },
+          ],
+        },
+      });
+      await tx.conversation.deleteMany({ where: { id: { in: conversationIds } } });
+      // Folder/Session 联表 + Folder 关键词池，再删 Folder 本体
+      await tx.folderSession.deleteMany({
+        where: {
+          OR: [
+            { sessionId: { in: sessionIds } },
+            { folderId: { in: folderIds } },
+          ],
+        },
+      });
+      await tx.folderKeyword.deleteMany({ where: { folderId: { in: folderIds } } });
+      await tx.folder.deleteMany({ where: { id: { in: folderIds } } });
+      await tx.session.deleteMany({ where: { id: { in: sessionIds } } });
+      // 资源任务是全局/用户预算的持久账本。删用户时若物理删除当日
+      // actualUnits（尤其 actual=NULL 的未知用量），会立即把全局额度重新发出。
+      // userId 无 FK：先匿名化但保留资源行，只清理非账本的普通任务。账本数值之外
+      // 的 params/result/error 可能含报告或翻译正文，删号时必须一并抹除。
+      await tx.jobQueue.updateMany({
+        where: {
+          userId: { in: userIds },
+          resourceScope: { not: null },
+        },
+        data: {
+          userId: null,
+          sessionId: null,
+          triggeredBy: 'deleted-user',
+          params: null,
+          result: null,
+          error: null,
+          activeKey: null,
+        },
+      });
+      await tx.jobQueue.deleteMany({
+        where: {
+          userId: { in: userIds },
+          resourceScope: null,
+        },
+      });
+      const deleted = await tx.user.deleteMany({ where: { id: { in: userIds } } });
+      await options.databaseMutation?.(tx, deleted.count);
+      return deleted;
+    });
+  } catch (cause) {
+    if (cause instanceof SecurityAuditUnavailableError) throw cause;
+    // If remote deletion was attempted, a DB rollback cannot restore files that
+    // were already removed. Surface that distinction to the completion audit.
+    throw new CascadeDeleteUsersError(cause, attachments.length > 0);
+  }
+  // TranslationTask 行由 User FK cascade 删除；本地 source/output 无 FK，必须在
+  // DB 提交后逐目录清理。失败不可回滚数据库，只能如实标 PARTIAL 供运维补偿。
+  let localTranslationFilesComplete = true;
+  for (const task of translationTasks) {
+    try {
+      await deleteTaskFiles(task.id);
+    } catch {
+      localTranslationFilesComplete = false;
+    }
+  }
   // 释放被删数据占用的字节配额（仅对仍存在的 owner 有意义：被删用户自身的行已随删除消失）。
   // 复用 releaseStorageBytes，best-effort；失败留给字节对账兜底。
   const bytesByOwner = new Map<string, bigint>();
@@ -394,13 +802,23 @@ async function cascadeDeleteUsers(userIds: string[]): Promise<number> {
       (bytesByOwner.get(att.userId) ?? BigInt(0)) + att.bytes
     );
   }
+  let quotaReleaseComplete = true;
   for (const [ownerId, bytes] of bytesByOwner) {
     if (bytes > BigInt(0)) {
-      await releaseStorageBytes(ownerId, Number(bytes)).catch(() => undefined);
+      try {
+        await releaseStorageBytes(ownerId, Number(bytes));
+      } catch {
+        quotaReleaseComplete = false;
+      }
     }
   }
 
-  return userResult.count;
+  return {
+    deleted: userResult.count,
+    remoteFilesComplete,
+    localTranslationFilesComplete,
+    quotaReleaseComplete,
+  };
 }
 
 // 编辑用户
@@ -413,6 +831,14 @@ export async function PATCH(req: Request) {
   if (response || !admin) {
     return response!;
   }
+
+  let auditContext: {
+    requestId: string;
+    target: { type: string; id: string; ownerId: string };
+    before: Record<string, unknown>;
+    metadata: { changedFields: string[]; passwordChanged: boolean };
+  } | null = null;
+  let settlementCompleted = false;
 
   try {
     const siteSettings = await getSiteSettings();
@@ -636,6 +1062,32 @@ export async function PATCH(req: Request) {
       data.transcriptionUsageReconcileFrom = new Date();
     }
 
+    if (Object.keys(data).length === 0) {
+      return NextResponse.json({ error: '没有需要更新的字段' }, { status: 400 });
+    }
+
+    const requestId = getSecurityAuditRequestId(req);
+    const target = { type: 'user', id: userId, ownerId: userId };
+    const before = toSafeUserAudit(existing as Record<string, unknown>);
+    const metadata = {
+      changedFields: safeChangedFields(data),
+      passwordChanged: data.passwordHash !== undefined,
+    };
+
+    // Persist the attempt before quota settlement (which may commit independently)
+    // or the user update. Password/hash/token-version values never enter the event.
+    await requireSecurityAudit(req, {
+      event: 'users.update',
+      operator: auditOperator(admin),
+      target,
+      before,
+      reason: 'admin_update',
+      outcome: 'ATTEMPTED',
+      metadata,
+      requestId,
+    });
+    auditContext = { requestId, target, before, metadata };
+
     // 充值系统（Model A）：若本次下调了转录分钟上限（角色/组/显式覆盖任一路径已写入 data），
     // 先按旧上限结算持池用户的时长池并整周期重置，避免下次月度重置误扣/清零池子、或对账虚报 drift。
     if (
@@ -648,6 +1100,7 @@ export async function PATCH(req: Request) {
         existing.transcriptionMinutesLimit,
         data.transcriptionMinutesLimit
       );
+      settlementCompleted = true;
     }
 
     // P5-2：清零 used 之前，持池用户必须先按**当前**上限结算池子——否则本周期已动用的池分钟
@@ -660,10 +1113,7 @@ export async function PATCH(req: Request) {
       // 按**本周期实际生效的旧上限**结算（不是本次 PATCH 写入的新上限）：上限调高时用新上限
       // 会把 owed 算小、少扣池；调低那条路已在上面用旧上限结清过。
       await settlePoolOnUsageReset(userId, existing.transcriptionMinutesLimit);
-    }
-
-    if (Object.keys(data).length === 0) {
-      return NextResponse.json({ error: '没有需要更新的字段' }, { status: 400 });
+      settlementCompleted = true;
     }
 
     const user = await prisma.$transaction(async (tx) => {
@@ -672,20 +1122,76 @@ export async function PATCH(req: Request) {
       if (data.passwordHash !== undefined) {
         await invalidateUserEmailTokens(userId, { db: tx });
       }
-      return tx.user.update({
+      const updated = await tx.user.update({
         where: { id: userId },
         data,
         select: USER_SELECT,
       });
+
+      await requireSecurityAudit(
+        req,
+        {
+          event: 'users.update',
+          operator: auditOperator(admin),
+          target,
+          before,
+          after: {
+            ...toSafeUserAudit(updated as Record<string, unknown>),
+            ...(data.passwordHash !== undefined
+              ? { passwordChanged: true }
+              : {}),
+          },
+          reason: 'admin_update',
+          outcome: 'SUCCESS',
+          metadata,
+          requestId,
+        },
+        tx
+      );
+
+      return updated;
     });
 
     logAction(req, 'admin.user.update', {
       user: admin,
-      detail: `编辑用户: ${user.email} (${Object.keys(data).join(', ')})`,
+      detail: `编辑用户: ${user.email} (${safeChangedFields(data).join(', ')})`,
     });
 
     return NextResponse.json({ user });
   } catch (err) {
+    const auditUnavailable = err instanceof SecurityAuditUnavailableError;
+
+    // If an independent quota settlement committed before the user transaction
+    // failed/rolled back, the operation is PARTIAL even when the failing step was
+    // the transactional SUCCESS audit itself.
+    if (auditContext && (!auditUnavailable || settlementCompleted)) {
+      try {
+        await requireSecurityAudit(req, {
+          event: 'users.update',
+          operator: auditOperator(admin),
+          target: auditContext.target,
+          before: auditContext.before,
+          reason: 'admin_update',
+          outcome: settlementCompleted ? 'PARTIAL' : 'FAILED',
+          metadata: {
+            ...auditContext.metadata,
+            failureStage: 'settlement_or_update',
+            settlementCompleted,
+          },
+          requestId: auditContext.requestId,
+        });
+      } catch (auditErr) {
+        if (auditErr instanceof SecurityAuditUnavailableError) {
+          return securityAuditUnavailableResponse();
+        }
+        throw auditErr;
+      }
+    }
+
+    if (auditUnavailable) {
+      return securityAuditUnavailableResponse();
+    }
+
     console.error('编辑用户失败:', err);
     return NextResponse.json({ error: '编辑失败' }, { status: 500 });
   }

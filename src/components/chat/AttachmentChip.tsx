@@ -20,6 +20,9 @@ export interface AttachmentChipData {
   kind: 'image' | 'document' | 'text';
   /** 可选预览链接；没有则点击无效果。 */
   previewUrl?: string;
+  /** false 表示文件仍已保存，但不会被加入 LLM 请求。 */
+  llmUsable?: boolean;
+  llmUnavailableReason?: string | null;
 }
 
 function truncate(name: string, max = 20): string {
@@ -44,6 +47,7 @@ export default function AttachmentChip({
   const Icon = attachment.kind === 'image' ? ImageIcon : FileText;
   const displayName = truncate(attachment.fileName, 20);
   const sizeLabel = formatBytes(attachment.bytes);
+  const llmUnavailable = attachment.llmUsable === false;
 
   // 文件名按钮：有预览 URL → 新页打开 Cloudreve；否则禁用，单击无响应
   const NameNode = attachment.previewUrl ? (
@@ -64,12 +68,24 @@ export default function AttachmentChip({
 
   return (
     <div
-      className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-cream-300
-                 bg-cream-50 text-[11px] text-charcoal-600 max-w-[220px] animate-tag-pop"
+      className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border
+                 text-[11px] max-w-[280px] animate-tag-pop ${
+                   llmUnavailable
+                     ? 'border-amber-300 bg-amber-50 text-amber-800'
+                     : 'border-cream-300 bg-cream-50 text-charcoal-600'
+                 }`}
     >
       <Icon className="w-3.5 h-3.5 text-charcoal-400 flex-shrink-0" />
       {NameNode}
       <span className="text-charcoal-400 flex-shrink-0">· {sizeLabel}</span>
+      {llmUnavailable && (
+        <span
+          className="text-amber-700 flex-shrink-0"
+          title={attachment.llmUnavailableReason ?? undefined}
+        >
+          · {t('chat.attachmentLlmUnavailable')}
+        </span>
+      )}
       {onRemove && (
         <button
           type="button"

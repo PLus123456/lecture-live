@@ -7,9 +7,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * 页面写的是 `data?.error ?? t('auth.verifyFailed')`，于是英文用户读到中文。
  */
 
-const pushMock = vi.fn();
-const replaceMock = vi.fn();
-const setAuthMock = vi.fn();
+const {
+  pushMock,
+  replaceMock,
+  setAuthMock,
+  revokeUncommittedMock,
+} = vi.hoisted(() => ({
+  pushMock: vi.fn(),
+  replaceMock: vi.fn(),
+  setAuthMock: vi.fn(),
+  revokeUncommittedMock: vi.fn(async () => true),
+}));
 
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: pushMock, replace: replaceMock }),
@@ -26,9 +34,25 @@ vi.mock('next/link', () => ({
   ),
 }));
 vi.mock('@/stores/authStore', () => ({
+  getAuthBoundarySnapshot: () => ({
+    epoch: 0,
+    userId: null,
+    sessionBinding: null,
+  }),
+  isPersistedAuthBoundaryCurrent: () => true,
   useAuthStore: (selector: (s: { setAuth: typeof setAuthMock }) => unknown) =>
     selector({ setAuth: setAuthMock }),
 }));
+vi.mock('@/lib/clientAuthCookieMutation', async () => {
+  const actual = await vi.importActual<
+    typeof import('@/lib/clientAuthCookieMutation')
+  >('@/lib/clientAuthCookieMutation');
+  return {
+    ...actual,
+    runAuthCookieMutation: (operation: () => Promise<unknown>) => operation(),
+    revokeUncommittedAuthSession: revokeUncommittedMock,
+  };
+});
 vi.mock('@/lib/i18n', async () => {
   const actual = await vi.importActual<typeof import('@/lib/i18n')>('@/lib/i18n');
   return {
@@ -55,6 +79,11 @@ function mockFetch(response: { ok: boolean; status: number; body: unknown }) {
     vi.fn().mockResolvedValue({
       ok: response.ok,
       status: response.status,
+      headers: new Headers(
+        response.ok
+          ? { 'X-Lecture-Live-Auth-Session': 'binding-1' }
+          : undefined
+      ),
       json: async () => response.body,
     })
   );
@@ -63,6 +92,7 @@ function mockFetch(response: { ok: boolean; status: number; body: unknown }) {
 describe('VerifyEmailPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    setAuthMock.mockResolvedValue(true);
     setToken('raw-token');
   });
 
@@ -97,7 +127,8 @@ describe('VerifyEmailPage', () => {
       body: {
         verified: true,
         user: { id: 'u1', email: 'a@b.com', displayName: 'A', role: 'FREE' },
-        token: 'client-session',
+        token: '__cookie_session__',
+        sessionBinding: 'binding-1',
       },
     });
     render(<VerifyEmailPage />);
@@ -106,6 +137,26 @@ describe('VerifyEmailPage', () => {
       expect(setAuthMock).toHaveBeenCalledTimes(1);
     });
     expect(screen.getByText(/email verified/i)).toBeInTheDocument();
+  });
+
+  it('2xx 缺少 user/token 时撤销未提交 family，绝不写入坏主体', async () => {
+    mockFetch({
+      ok: true,
+      status: 200,
+      body: { verified: true, sessionBinding: 'binding-1' },
+    });
+    render(<VerifyEmailPage />);
+
+    await waitFor(() => {
+      expect(revokeUncommittedMock).toHaveBeenCalledWith(
+        'binding-1',
+        expect.objectContaining({ epoch: 0 })
+      );
+    });
+    expect(setAuthMock).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/this verification link is invalid or expired/i)
+    ).toBeInTheDocument();
   });
 
   // #19：验证令牌一次性，成功后若用 push 留在历史里，后退即重放已消费的链接，
@@ -118,7 +169,8 @@ describe('VerifyEmailPage', () => {
       body: {
         verified: true,
         user: { id: 'u1', email: 'a@b.com', displayName: 'A', role: 'FREE' },
-        token: 'client-session',
+        token: '__cookie_session__',
+        sessionBinding: 'binding-1',
       },
     });
     render(<VerifyEmailPage />);

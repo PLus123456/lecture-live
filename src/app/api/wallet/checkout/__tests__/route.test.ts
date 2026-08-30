@@ -12,6 +12,7 @@ const {
   tierFindUniqueMock,
   orderUpdateManyMock,
   createChargeMock,
+  linkPaymentProviderObjectsMock,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
   enforceRateLimitMock: vi.fn(),
@@ -23,6 +24,7 @@ const {
   tierFindUniqueMock: vi.fn(),
   orderUpdateManyMock: vi.fn(),
   createChargeMock: vi.fn(),
+  linkPaymentProviderObjectsMock: vi.fn(),
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
@@ -40,10 +42,26 @@ vi.mock('@/lib/wallet', () => ({
   createPaymentOrder: createPaymentOrderMock,
   spendFromBalance: spendFromBalanceMock,
   DEFAULT_ORDER_CURRENCY: 'CNY',
-  WalletError: class WalletError extends Error {},
+  ORDER_TTL_MS: 60 * 60_000,
+  WalletError: class WalletError extends Error {
+    constructor(
+      message: string,
+      public readonly code: string
+    ) {
+      super(message);
+    }
+  },
+}));
+vi.mock('@/lib/payment/webhookInbox', () => ({
+  linkPaymentProviderObjects: linkPaymentProviderObjectsMock,
 }));
 
 import { POST } from '@/app/api/wallet/checkout/route';
+import { WalletError } from '@/lib/wallet';
+
+// 网关必须拿到与我方 expiresAt 完全相同的截止时间，否则超时支付仍会被收钱、
+// 而 creditPaidOrder 判 late_paid 不发任何权益。
+const ORDER_EXPIRES_AT = new Date('2026-08-22T13:00:00.000Z');
 
 const TOPUP_TIER = {
   id: 'tier-1',
@@ -67,6 +85,7 @@ beforeEach(() => {
   tierFindUniqueMock.mockReset();
   orderUpdateManyMock.mockReset();
   createChargeMock.mockReset();
+  linkPaymentProviderObjectsMock.mockReset().mockResolvedValue(undefined);
 
   verifyAuthMock.mockResolvedValue({ id: 'u1', email: 'u@x.y', role: 'FREE' });
   enforceRateLimitMock.mockResolvedValue(null);
@@ -81,6 +100,7 @@ beforeEach(() => {
     id: 'o1',
     outTradeNo: 'LLTEST',
     amountCents: 10000,
+    expiresAt: ORDER_EXPIRES_AT,
   });
   createChargeMock.mockResolvedValue({ payUrl: 'https://pay', providerRef: 'pi_123' });
   getPaymentProviderMock.mockResolvedValue({ name: 'stripe', createCharge: createChargeMock });
@@ -115,6 +135,17 @@ describe('checkout：币种端到端绑定（P3-15）', () => {
     );
   });
 
+  it('▶ 把订单失效时刻原样下发给网关（不给网关留开口窗）', async () => {
+    // 网关侧不设截止时间的话，Stripe Checkout 默认 24h、支付宝 15 天、微信 2h：
+    // 用户在我方 expiresAt 之后付款照样被扣钱，而 creditPaidOrder 判 late_paid，
+    // 不加余额、不发权益，也没有任何管理端动作能补发。
+    await pay();
+
+    expect(createChargeMock).toHaveBeenCalledWith(
+      expect.objectContaining({ expiresAt: ORDER_EXPIRES_AT })
+    );
+  });
+
   it('▶ 配置里币种缺失/非法 → 回落 CNY（绝不落成网关默认的 usd）', async () => {
     getRechargeSettingsMock.mockResolvedValue({
       enabled: true,
@@ -138,6 +169,13 @@ describe('checkout：下单落库', () => {
     expect(orderUpdateManyMock).toHaveBeenCalledWith({
       where: { id: 'o1', status: 'pending' },
       data: { providerRef: 'pi_123' },
+    });
+    expect(linkPaymentProviderObjectsMock).toHaveBeenCalledWith({
+      provider: 'stripe',
+      providerMode: 'unknown',
+      providerAccount: 'default',
+      orderId: 'o1',
+      objectRefs: [{ objectType: 'payment_intent', objectId: 'pi_123' }],
     });
   });
 
@@ -196,5 +234,74 @@ describe('checkout：余额结算去抖（L13）', () => {
     );
 
     expect(spendFromBalanceMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ 冻结账户不得余额购买', async () => {
+    tierFindUniqueMock.mockResolvedValue({ ...TOPUP_TIER, kind: 'minutes' });
+    spendFromBalanceMock.mockRejectedValue(
+      new WalletError('账户存在未处理的支付争议', 'account_frozen')
+    );
+
+    const response = await POST(
+      createJsonRequest('http://localhost/api/wallet/checkout', {
+        method: 'POST',
+        body: { tierId: 'tier-1', mode: 'balance' },
+      })
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ code: 'account_frozen' });
+  });
+});
+
+describe('SEC-025：拒付冻结账户禁止新支付单', () => {
+  it('▶ createPaymentOrder 冻结闸拒绝后不调网关', async () => {
+    createPaymentOrderMock.mockRejectedValue(
+      new WalletError('账户存在未处理的支付争议', 'account_frozen')
+    );
+
+    const response = await pay();
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({ code: 'account_frozen' });
+    expect(createChargeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('SEC-023：存量 ADMIN 会员档 fail-closed', () => {
+  const legacyAdminTier = {
+    ...TOPUP_TIER,
+    id: 'tier-admin',
+    kind: 'membership',
+    name: '历史管理员商品',
+    grantRole: 'ADMIN',
+    durationDays: 30,
+    creditCents: null,
+  };
+
+  it('▶ 网关下单在建单和调用 Stripe 前拒绝', async () => {
+    tierFindUniqueMock.mockResolvedValueOnce(legacyAdminTier);
+
+    const res = await pay({ tierId: 'tier-admin' });
+
+    expect(res.status).toBe(400);
+    expect(createPaymentOrderMock).not.toHaveBeenCalled();
+    expect(getPaymentProviderMock).not.toHaveBeenCalled();
+    expect(createChargeMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ 余额购买在限流和扣款事务前拒绝', async () => {
+    tierFindUniqueMock.mockResolvedValueOnce(legacyAdminTier);
+
+    const res = await POST(
+      createJsonRequest('http://localhost/api/wallet/checkout', {
+        method: 'POST',
+        body: { tierId: 'tier-admin', mode: 'balance' },
+      })
+    );
+
+    expect(res.status).toBe(400);
+    expect(spendFromBalanceMock).not.toHaveBeenCalled();
+    expect(enforceRateLimitMock).toHaveBeenCalledTimes(1); // 仅通用入口限流；不进入余额去抖/扣款
   });
 });

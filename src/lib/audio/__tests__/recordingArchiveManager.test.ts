@@ -34,6 +34,20 @@ vi.mock('../audioCapture', () => ({
 }));
 
 import { RecordingArchiveManager } from '../recordingArchiveManager';
+import {
+  appendAudioChunk,
+  getAudioSession,
+  persistAudioArchiveSnapshot,
+  upsertAudioSession,
+} from '../audioChunkStore';
+import { teardownActiveRecordingArchivesForAccountBoundary } from '../recordingArchiveRegistry';
+
+const appendAudioChunkMock = vi.mocked(appendAudioChunk);
+const getAudioSessionMock = vi.mocked(getAudioSession);
+const persistAudioArchiveSnapshotMock = vi.mocked(
+  persistAudioArchiveSnapshot
+);
+const upsertAudioSessionMock = vi.mocked(upsertAudioSession);
 
 // ── 极简 fake 媒体对象 ──
 class FakeTrack {
@@ -78,6 +92,7 @@ class FakeMediaRecorder {
   }
   state: 'inactive' | 'recording' | 'paused' = 'inactive';
   mimeType = 'audio/webm';
+  deferStopEvent = false;
   private listeners: Record<string, Array<(e?: unknown) => void>> = {};
   constructor(public stream: unknown, options?: { mimeType?: string }) {
     if (options?.mimeType) this.mimeType = options.mimeType;
@@ -94,16 +109,27 @@ class FakeMediaRecorder {
   }
   stop() {
     this.state = 'inactive';
-    (this.listeners['stop'] ?? []).forEach((cb) => cb());
+    if (!this.deferStopEvent) {
+      this.emitStop();
+    }
   }
   requestData() {}
   addEventListener(type: string, cb: (e?: unknown) => void) {
     (this.listeners[type] ??= []).push(cb);
   }
   removeEventListener() {}
+  emitStop() {
+    (this.listeners['stop'] ?? []).forEach((cb) => cb());
+  }
+  emitData(data: Blob) {
+    (this.listeners['dataavailable'] ?? []).forEach((cb) =>
+      cb({ data } as BlobEvent)
+    );
+  }
 }
 
 beforeEach(() => {
+  vi.clearAllMocks();
   FakeMediaRecorder.instances = [];
   acquireMicrophoneStream.mockReset();
   acquireSystemAudioStream.mockReset();
@@ -111,7 +137,8 @@ beforeEach(() => {
   vi.stubGlobal('MediaStream', FakeMediaStream);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await teardownActiveRecordingArchivesForAccountBoundary();
   vi.unstubAllGlobals();
 });
 
@@ -213,5 +240,109 @@ describe('RecordingArchiveManager P1-10 硬件掉线', () => {
     // 修复后：readyState 检查使其为 false，并回调上报。
     expect(mgr.hasLiveCapture()).toBe(false);
     expect(endedSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('RecordingArchiveManager account boundary persistence fence', () => {
+  it('abort synchronously invalidates, teardown awaits old writes, and late final data cannot resurrect storage', async () => {
+    const owner = new AbortController();
+    acquireMicrophoneStream.mockResolvedValue(
+      new FakeMediaStream([new FakeTrack()])
+    );
+    const mgr = new RecordingArchiveManager('sess-old-account', {
+      ownerSignal: owner.signal,
+    });
+    await mgr.ensureArchive({ sourceType: 'mic' });
+    const uploadChunk = vi.fn(() => true);
+    mgr.setChunkStoredHandler(uploadChunk);
+
+    const recorder = FakeMediaRecorder.instances.at(-1)!;
+    recorder.deferStopEvent = true;
+    appendAudioChunkMock.mockClear();
+    getAudioSessionMock.mockClear();
+    persistAudioArchiveSnapshotMock.mockClear();
+    upsertAudioSessionMock.mockClear();
+
+    let releaseOldAppend!: () => void;
+    appendAudioChunkMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseOldAppend = resolve;
+        })
+    );
+
+    // A chunk entered IndexedDB just before logout and remains in flight.
+    recorder.emitData(new Blob(['old-account-chunk']));
+    await vi.waitFor(() => expect(releaseOldAppend).toBeTypeOf('function'));
+    expect(appendAudioChunkMock).toHaveBeenCalledTimes(1);
+    expect(uploadChunk).toHaveBeenCalledTimes(1);
+
+    // authStore rotates/aborts synchronously, before the queued account cleanup.
+    owner.abort();
+    recorder.emitData(new Blob(['same-stack-final-after-abort']));
+    expect(appendAudioChunkMock).toHaveBeenCalledTimes(1);
+    expect(uploadChunk).toHaveBeenCalledTimes(1);
+
+    let teardownSettled = false;
+    const teardown = teardownActiveRecordingArchivesForAccountBoundary().then(
+      () => {
+        teardownSettled = true;
+      }
+    );
+    await Promise.resolve();
+    expect(teardownSettled).toBe(false);
+
+    // Even after MediaRecorder reports stop, cleanup still waits for the IDB
+    // transaction that began while A was current.
+    recorder.emitStop();
+    await Promise.resolve();
+    expect(teardownSettled).toBe(false);
+
+    releaseOldAppend();
+    await teardown;
+    expect(getAudioSessionMock).not.toHaveBeenCalled();
+    expect(upsertAudioSessionMock).not.toHaveBeenCalled();
+
+    // Model both account-cleanup passes having cleared IDB/sessionStorage. A
+    // non-conforming recorder delivers one more final event afterwards; its
+    // captured generation is stale and must not recreate either store.
+    appendAudioChunkMock.mockClear();
+    getAudioSessionMock.mockClear();
+    persistAudioArchiveSnapshotMock.mockClear();
+    upsertAudioSessionMock.mockClear();
+    recorder.emitData(new Blob(['very-late-final']));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(appendAudioChunkMock).not.toHaveBeenCalled();
+    expect(getAudioSessionMock).not.toHaveBeenCalled();
+    expect(persistAudioArchiveSnapshotMock).not.toHaveBeenCalled();
+    expect(upsertAudioSessionMock).not.toHaveBeenCalled();
+    expect(uploadChunk).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not hang account cleanup when MediaRecorder never emits stop', async () => {
+    vi.useFakeTimers();
+    try {
+      const owner = new AbortController();
+      const track = new FakeTrack();
+      acquireMicrophoneStream.mockResolvedValue(
+        new FakeMediaStream([track])
+      );
+      const mgr = new RecordingArchiveManager('sess-missing-stop', {
+        ownerSignal: owner.signal,
+      });
+      await mgr.ensureArchive({ sourceType: 'mic' });
+
+      FakeMediaRecorder.instances.at(-1)!.deferStopEvent = true;
+      owner.abort();
+      const teardown = teardownActiveRecordingArchivesForAccountBoundary();
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      await expect(teardown).resolves.toBeUndefined();
+      expect(track.readyState).toBe('ended');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

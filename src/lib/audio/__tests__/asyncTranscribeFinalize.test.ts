@@ -16,9 +16,11 @@ const {
   sessionTxUpdateMock,
   transactionMock,
   getSonioxTranscriptMock,
-  stageMock,
-  publishMock,
-  rollbackMock,
+  persistMock,
+  settleStagedArtifactsMock,
+  completeStagedPublishesMock,
+  readbackStagedArtifactPublicationMock,
+  rollbackStagedArtifactMock,
   runBackgroundLLMTasksMock,
   deductMock,
   settleMock,
@@ -33,9 +35,11 @@ const {
   sessionTxUpdateMock: vi.fn(),
   transactionMock: vi.fn(),
   getSonioxTranscriptMock: vi.fn(),
-  stageMock: vi.fn(),
-  publishMock: vi.fn(),
-  rollbackMock: vi.fn(),
+  persistMock: vi.fn(),
+  settleStagedArtifactsMock: vi.fn(),
+  completeStagedPublishesMock: vi.fn(),
+  readbackStagedArtifactPublicationMock: vi.fn(),
+  rollbackStagedArtifactMock: vi.fn(),
   runBackgroundLLMTasksMock: vi.fn(),
   deductMock: vi.fn(),
   settleMock: vi.fn(),
@@ -67,10 +71,11 @@ vi.mock('@/lib/soniox/asyncTranscriptConverter', () => ({
 }));
 
 vi.mock('@/lib/sessionPersistence', () => ({
-  // M5：改走两阶段（stage → CAS → publish/rollback）。
-  stageSessionTranscriptArtifacts: stageMock,
-  finalizeStagedArtifactPublish: publishMock,
-  rollbackStagedArtifact: rollbackMock,
+  stageSessionTranscriptArtifacts: persistMock,
+  settleStagedArtifactsInTransaction: settleStagedArtifactsMock,
+  completeStagedArtifactPublishes: completeStagedPublishesMock,
+  readbackStagedArtifactPublication: readbackStagedArtifactPublicationMock,
+  rollbackStagedArtifact: rollbackStagedArtifactMock,
 }));
 
 vi.mock('@/lib/sessionFinalization', () => ({
@@ -117,22 +122,23 @@ describe('finalizeAsyncTranscription', () => {
     getSonioxTranscriptMock.mockResolvedValue({ tokens: [{ text: 'a' }] });
     convertMock.mockReturnValue([{ id: 'seg1' }]);
     extractMock.mockReturnValue([]);
-    stageMock.mockResolvedValue({
-      transcript: {
-        category: 'transcripts',
-        reference: '/t/s1',
-        localReference: 'local:transcripts/s1-stamp.json',
-        storage: 'local',
-      },
-      summary: {
-        category: 'summaries',
-        reference: '/s/s1',
-        localReference: 'local:summaries/s1-stamp.json',
-        storage: 'local',
-      },
+    persistMock.mockResolvedValue({
+      transcript: { reference: '/t/s1' },
+      summary: { reference: '/s/s1' },
     });
-    publishMock.mockResolvedValue({ path: '/t/s1', storage: 'local' });
-    rollbackMock.mockResolvedValue(undefined);
+    settleStagedArtifactsMock.mockResolvedValue([
+      { staged: { reference: '/t/s1' }, settled: {} },
+      { staged: { reference: '/s/s1' }, settled: {} },
+    ]);
+    completeStagedPublishesMock.mockResolvedValue([
+      { path: '/t/s1', storage: 'local' },
+      { path: '/s/s1', storage: 'local' },
+    ]);
+    rollbackStagedArtifactMock.mockResolvedValue(undefined);
+    readbackStagedArtifactPublicationMock.mockResolvedValue({
+      outcome: 'not_committed',
+      publications: [],
+    });
     getSiteSettingsMock.mockResolvedValue({ async_upload_billing_multiplier: 0.8 });
     deductMock.mockResolvedValue(undefined);
     settleMock.mockResolvedValue(0);
@@ -190,9 +196,12 @@ describe('finalizeAsyncTranscription', () => {
 
     // 计费恰好一次，口径 = ceil(ceil(600000/60000) × 0.8) = ceil(8) = 8（第三参为事务 tx）
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything(), {
-      sessionId: 's1',
-    });
+    expect(deductMock).toHaveBeenCalledWith(
+      'u1',
+      8,
+      expect.anything(),
+      expect.objectContaining({ sessionId: 's1' })
+    );
 
     expect(runBackgroundLLMTasksMock).toHaveBeenCalledTimes(1);
     // P1-17：先删 transcription 再删 file，确认删除后清对应 DB 外部 ID（第 3 次 updateMany）。
@@ -217,7 +226,7 @@ describe('finalizeAsyncTranscription', () => {
 
     expect(result).toEqual({ outcome: 'claim_lost' });
     expect(getSonioxTranscriptMock).not.toHaveBeenCalled();
-    expect(stageMock).not.toHaveBeenCalled();
+    expect(persistMock).not.toHaveBeenCalled();
     expect(deductMock).not.toHaveBeenCalled();
     expect(runBackgroundLLMTasksMock).not.toHaveBeenCalled();
     expect(deleteSonioxFileMock).not.toHaveBeenCalled();
@@ -316,6 +325,31 @@ describe('finalizeAsyncTranscription', () => {
     expect(runBackgroundLLMTasksMock).not.toHaveBeenCalled();
   });
 
+  it('COMMIT ACK 丢失但 owner+ledger readback 已提交时不回滚 live 产物', async () => {
+    sessionUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    transactionMock.mockRejectedValueOnce(new Error('commit acknowledgement lost'));
+    sessionFindUniqueMock.mockResolvedValue({
+      asyncTranscribeStatus: 'completed',
+      transcriptPath: '/t/s1',
+      summaryPath: '/s/s1',
+    });
+    readbackStagedArtifactPublicationMock.mockResolvedValueOnce({
+      outcome: 'committed',
+      publications: [
+        { staged: { reference: '/t/s1' }, settled: {} },
+        { staged: { reference: '/s/s1' }, settled: {} },
+      ],
+    });
+
+    const result = await finalizeAsyncTranscription(makeSession(), CONFIG, {
+      allowClaimFrom: ['transcribing'],
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(rollbackStagedArtifactMock).not.toHaveBeenCalled();
+    expect(completeStagedPublishesMock).toHaveBeenCalled();
+  });
+
   it('拉 transcript 抛错：不吞异常（交调用方判定瞬时/永久），claim 已抢到但未扣费', async () => {
     sessionUpdateManyMock.mockResolvedValueOnce({ count: 1 }); // claim
     const err = new Error('Soniox get transcript failed: HTTP 503');
@@ -327,7 +361,7 @@ describe('finalizeAsyncTranscription', () => {
       })
     ).rejects.toThrow('HTTP 503');
 
-    expect(stageMock).not.toHaveBeenCalled();
+    expect(persistMock).not.toHaveBeenCalled();
     expect(deductMock).not.toHaveBeenCalled();
   });
 
@@ -357,9 +391,12 @@ describe('finalizeAsyncTranscription', () => {
       })
     );
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything(), {
-      sessionId: 's1',
-    });
+    expect(deductMock).toHaveBeenCalledWith(
+      'u1',
+      8,
+      expect.anything(),
+      expect.objectContaining({ sessionId: 's1' })
+    );
   });
 
   it('B1 结算：同一事务内 deduct 实扣(8) + settleAsyncReservation 原子转/清入口预留', async () => {
@@ -374,9 +411,12 @@ describe('finalizeAsyncTranscription', () => {
     // deduct 实扣 8（ceil(10×0.8)）+ settleAsyncReservation(sessionId, tx)：读当前列并原子释放，
     // 二者同一事务 tx。预留的具体释放/清列逻辑在 settleAsyncReservation 内（其自有单测）。
     expect(deductMock).toHaveBeenCalledTimes(1);
-    expect(deductMock).toHaveBeenCalledWith('u1', 8, expect.anything(), {
-      sessionId: 's1',
-    });
+    expect(deductMock).toHaveBeenCalledWith(
+      'u1',
+      8,
+      expect.anything(),
+      expect.objectContaining({ sessionId: 's1' })
+    );
     expect(settleMock).toHaveBeenCalledTimes(1);
     expect(settleMock).toHaveBeenCalledWith('s1', expect.anything());
   });

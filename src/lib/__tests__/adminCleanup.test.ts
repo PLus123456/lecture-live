@@ -54,6 +54,7 @@ describe('expandCategoriesToActions', () => {
 describe('isNeverDeleteAction', () => {
   it('admin.* 全部禁删', () => {
     expect(isNeverDeleteAction('admin.user.delete')).toBe(true);
+    expect(isNeverDeleteAction('admin.security.users.read')).toBe(true);
     expect(isNeverDeleteAction('admin.session.read')).toBe(true);
     expect(isNeverDeleteAction('admin.job.retry')).toBe(true);
     expect(isNeverDeleteAction('admin.auditlog.cleanup')).toBe(true);

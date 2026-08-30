@@ -1,45 +1,40 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * L36：DOCX / XLSX / PPTX 的解析此前**没有时长封顶**（只有 PDF 有 withParseTimeout）。
- * loadZipGuarded 只挡「解压后总字节」，挡不住「体积合法但 XML 嵌套极深 / 元素数极多」
- * 的病态文档 —— 那种文档能让 mammoth / exceljs / officeparser 长时间占住 CPU。
+ * L36 的继任者。
  *
- * 这里用替身把三条路径的解析器都换成秒回的桩，只断言**接线**：每条路径都必须经过
- * withParseTimeout，且带上正确的标签。
+ * 原始问题：DOCX / XLSX / PPTX 的解析**没有时长封顶**（只有 PDF 有 withParseTimeout），
+ * 体积合法但 XML 嵌套极深的病态文档能长时间占住 CPU。当时的修法是给三条 in-process
+ * 路径都套上 withParseTimeout。
+ *
+ * 现在的修法更强：PDF/Office 一律交给**可强杀的子进程**（documentParserProcess），
+ * 由它负责堆上限、超时强杀、无网络无秘密的运行时（用例见
+ * `src/lib/__tests__/documentParserProcess.test.ts`，其中「kills a child whose event
+ * loop is permanently blocked」就是超时封顶本身）。
+ *
+ * 因此这里要钉住的不变式换成**接线**：这四类文档绝不能退回主进程里解析 ——
+ * 一旦有人把 mammoth / exceljs / officeparser / pdf-parse 重新拉回 in-process，
+ * 上面那些防线一条都用不上。
  */
-const { withParseTimeoutMock, loadZipGuardedMock } = vi.hoisted(() => ({
-  withParseTimeoutMock: vi.fn(),
-  loadZipGuardedMock: vi.fn(),
+const { extractAttachmentDocumentTextMock } = vi.hoisted(() => ({
+  extractAttachmentDocumentTextMock: vi.fn(),
 }));
 
-vi.mock('@/lib/fileParser', () => ({
-  withParseTimeout: withParseTimeoutMock,
-  loadZipGuarded: loadZipGuardedMock,
-  PARSE_TIMEOUT_MS: 30_000,
-}));
-
-vi.mock('mammoth', () => ({
-  extractRawText: vi.fn(async () => ({ value: 'DOCX_TEXT' })),
-}));
-
-vi.mock('exceljs', () => ({
-  default: {
-    Workbook: class {
-      xlsx = { load: async () => undefined };
-      eachSheet() {
-        /* 无 sheet，输出空串即可 */
-      }
-    },
+vi.mock('@/lib/documentParserProcess', () => ({
+  extractAttachmentDocumentText: extractAttachmentDocumentTextMock,
+  DocumentParserError: class DocumentParserError extends Error {
+    constructor(
+      message: string,
+      readonly code: string
+    ) {
+      super(message);
+    }
   },
-}));
-
-vi.mock('officeparser', () => ({
-  parseOffice: vi.fn(async () => ({ toText: () => 'PPTX_TEXT' })),
 }));
 
 import { extractTextFromBuffer } from '@/lib/llm/fileExtractor';
 
+const MIME_PDF = 'application/pdf';
 const MIME_DOCX =
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 const MIME_XLSX =
@@ -47,34 +42,32 @@ const MIME_XLSX =
 const MIME_PPTX =
   'application/vnd.openxmlformats-officedocument.presentationml.presentation';
 
-describe('fileExtractor（L36 Office 解析必须有时长封顶）', () => {
+describe('fileExtractor —— 复杂文档一律走可强杀的子进程', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    loadZipGuardedMock.mockResolvedValue(undefined);
-    // 透传：不改变结果，只记录标签
-    withParseTimeoutMock.mockImplementation(
-      async (task: Promise<unknown>) => task
-    );
+    extractAttachmentDocumentTextMock.mockResolvedValue('TEXT');
   });
 
   it.each([
+    [MIME_PDF, 'PDF'],
     [MIME_DOCX, 'DOCX'],
     [MIME_XLSX, 'XLSX'],
     [MIME_PPTX, 'PPTX'],
-  ])('%s 的解析经过 withParseTimeout(%s)', async (mime, label) => {
-    await extractTextFromBuffer(Buffer.from('fake'), mime);
+  ])('%s（%s）交给 documentParserProcess，而不是在主进程里解析', async (mime) => {
+    const text = await extractTextFromBuffer(Buffer.from('fake'), mime);
 
-    expect(withParseTimeoutMock).toHaveBeenCalledTimes(1);
-    expect(withParseTimeoutMock.mock.calls[0][1]).toBe(label);
+    expect(extractAttachmentDocumentTextMock).toHaveBeenCalledTimes(1);
+    expect(extractAttachmentDocumentTextMock.mock.calls[0][1]).toBe(mime);
+    expect(text).toBe('TEXT');
   });
 
-  it('超时会被如实向上抛（不会被当成"抽到空文本"吞掉）', async () => {
-    withParseTimeoutMock.mockRejectedValue(
-      new Error('DOCX 解析超时（>30s），疑似恶意文档')
+  it('子进程被强杀/超时的错误如实向上抛（不会被当成"抽到空文本"吞掉）', async () => {
+    extractAttachmentDocumentTextMock.mockRejectedValue(
+      new Error('document parser timed out')
     );
 
     await expect(
       extractTextFromBuffer(Buffer.from('fake'), MIME_DOCX)
-    ).rejects.toThrow(/解析超时/);
+    ).rejects.toThrow(/timed out/);
   });
 });

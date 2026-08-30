@@ -29,6 +29,15 @@ type UserRow = {
   emailVerifiedAt: Date | null;
 };
 
+type AuthTokenFamilyRow = {
+  id: string;
+  userId: string;
+  currentJtiHash: string;
+  generation: number;
+  sessionStartedAt: Date;
+  expiresAt: Date;
+};
+
 const {
   fake,
   state,
@@ -44,8 +53,14 @@ const {
   const state: {
     tokens: TokenRow[];
     userRow: UserRow | null;
+    authTokenFamilies: AuthTokenFamilyRow[];
     userUpdateImpl: (args: unknown) => unknown;
-  } = { tokens: [], userRow: null, userUpdateImpl: () => ({}) };
+  } = {
+    tokens: [],
+    userRow: null,
+    authTokenFamilies: [],
+    userUpdateImpl: () => ({}),
+  };
 
   const fake = createFakeTxPrisma({
     emailToken: {
@@ -72,6 +87,12 @@ const {
     user: {
       findUnique: (() => state.userRow) as never,
       update: ((args: unknown) => state.userUpdateImpl(args)) as never,
+    },
+    authTokenFamily: {
+      create: ((args: { data: AuthTokenFamilyRow }) => {
+        state.authTokenFamilies.push(args.data);
+        return args.data;
+      }) as never,
     },
   });
 
@@ -101,6 +122,7 @@ describe('POST /api/auth/verify-email', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     fake.reset();
+    state.authTokenFamilies = [];
 
     state.tokens = [
       {
@@ -145,6 +167,13 @@ describe('POST /api/auth/verify-email', () => {
     expect(res.headers.get('set-cookie')).toContain('lecture-live-token=');
     expect(state.tokens[0].consumedAt).toBeInstanceOf(Date);
     expect(fake.committedOps()).toContain('user.update');
+    expect(fake.committedOps()).toContain('authTokenFamily.create');
+    expect(state.authTokenFamilies).toHaveLength(1);
+    expect(state.authTokenFamilies[0]).toMatchObject({
+      userId: 'u1',
+      generation: 0,
+    });
+    expect(state.authTokenFamilies[0].currentJtiHash).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('已验证过的账号再点链接：不重复写 emailVerifiedAt，仍放行登录', async () => {

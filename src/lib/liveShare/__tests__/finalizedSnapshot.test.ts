@@ -27,6 +27,9 @@ const { shareLinkFindUniqueMock, sessionFindUniqueMock, verifyAuthTokenMock } =
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
+    // 产物账本（StoredArtifact）走 $queryRaw：不桩它的话草稿/产物解析会抛，
+    // 快照回填被整段吞成空盘态。返回空数组 = 没有账本行 → 回退 legacy 路径。
+    $queryRaw: vi.fn(async () => []),
     shareLink: {
       findUnique: shareLinkFindUniqueMock,
       findMany: vi.fn(async () => []),
@@ -67,6 +70,28 @@ const DRAFT_DIR = path.join(
   'transcript-drafts',
   SESSION_ID
 );
+
+/**
+ * SEC-009 之后读侧也要过 admitPersistedTranscriptBundle 的严格 schema：
+ * segment 必须带 speaker / language / 时间字段，只有 {id,text} 会被整份拒收
+ * （→ 观众拿到空快照）。fixture 补齐成写入侧真正会落盘的形状。
+ */
+function seg(id: string, text: string, index = 0) {
+  return {
+    id,
+    sessionIndex: index,
+    speaker: 'Speaker 1',
+    language: 'zh',
+    text,
+    globalStartMs: index * 1000,
+    globalEndMs: index * 1000 + 1000,
+    startMs: index * 1000,
+    endMs: index * 1000 + 1000,
+    isFinal: true,
+    confidence: 1,
+    timestamp: '00:00:00',
+  };
+}
 
 describe('已收尾会话的 initial_state 回填（跨批次集成回归）', () => {
   let httpServer: ReturnType<typeof createServer>;
@@ -156,12 +181,20 @@ describe('已收尾会话的 initial_state 回填（跨批次集成回归）', (
 
   it('DB 有版本化 transcriptPath 时能读到内容（约定式 {id}.json 并不存在）', async () => {
     await writeVersionedTranscript({
-      segments: [
-        { id: 'seg-1', text: '收尾之后的转录第一段' },
-        { id: 'seg-2', text: '第二段' },
-      ],
+      segments: [seg('seg-1', '收尾之后的转录第一段', 0), seg('seg-2', '第二段', 1)],
       translations: { 'seg-1': 'first finalized segment' },
-      summaries: [{ id: 'sum-1', blockIndex: 0, summary: '摘要' }],
+      summaries: [
+        {
+          id: 'sum-1',
+          blockIndex: 0,
+          timeRange: { startMs: 0, endMs: 2000 },
+          keyPoints: ['要点'],
+          definitions: {},
+          summary: '摘要',
+          suggestedQuestions: [],
+          frozen: true,
+        },
+      ],
     });
     // 约定式路径确实不存在——这正是回归的根源
     await expect(
@@ -191,7 +224,7 @@ describe('已收尾会话的 initial_state 回填（跨批次集成回归）', (
     await fs.writeFile(
       path.join(DRAFT_DIR, 'transcript.json'),
       JSON.stringify({
-        segments: [{ id: 'draft-1', text: '直播进行中的草稿' }],
+        segments: [seg('draft-1', '直播进行中的草稿')],
         translations: { 'draft-1': 'live draft' },
         summaries: [],
         updatedAt: Date.now(),
@@ -213,7 +246,7 @@ describe('已收尾会话的 initial_state 回填（跨批次集成回归）', (
 
   it('L3：产物路径同样要过 clamp（单条超长文本被截断，不原样推给观众）', async () => {
     await writeVersionedTranscript({
-      segments: [{ id: 'seg-huge', text: 'x'.repeat(50_000) }],
+      segments: [seg('seg-huge', 'x'.repeat(50_000))],
       translations: {},
       summaries: [],
     });

@@ -1,6 +1,6 @@
 import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 // 回归护栏：账号设置弹窗（侧边栏左下角设置按钮打开的 UserSettingsModal）曾经绝大多数
 // 文案是硬编码英文、且“段落切分说明”一段是硬编码中文——切到任一语言都“中不中英不英”。
@@ -48,7 +48,7 @@ async function mockAppApis(page: Page) {
           displayName: 'Alice',
           role: 'ADMIN',
         },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
 

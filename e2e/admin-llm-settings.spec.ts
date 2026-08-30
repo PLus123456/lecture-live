@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * Admin「设置 > LLM」两段式设置页烟测（用途路由 + 模型库）。
@@ -227,10 +227,10 @@ async function setupRoutes(page: Page, captured: CapturedRequest[]) {
       });
     }
     if (p === '/api/auth/login' && method === 'POST') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
-    if (p === '/api/auth/refresh' && method === 'GET') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
     if (p === '/api/admin/settings' && method === 'GET') {
       return fulfillJson(route, {});
@@ -551,4 +551,60 @@ test('模型库：验证连通性 + 删除网关确认弹窗', async ({ page }) 
       )
     )
     .toBe(true);
+});
+
+/**
+ * 「只改个名字」的保存请求里必须带上 apiBase 与 isAnthropic。
+ *
+ * 这条不是在测 UI 好不好用，而是在钉住一个**单测赖以成立的前提**：
+ * 服务端 PATCH 的并发预检里，`touchesCredentialBinding` 只有在请求带了
+ * apiBase / isAnthropic / 新密钥时才为真。线上那次「改任何字段都 409」之所以
+ * 必然触发，正是因为 GatewayModal 每次保存都会把这两个字段一起回传 ——
+ * 单测按这个形态构造用例，如果哪天 UI 改成只发 diff，那条单测就悄悄测不到东西了。
+ * 所以这里用真实 UI 把这个契约固定下来。
+ */
+test('保存网关（仅改名）仍会回传 apiBase 与 isAnthropic —— 钉住服务端并发预检的触发前提', async ({
+  page,
+}) => {
+  const captured: CapturedRequest[] = [];
+  await setupRoutes(page, captured);
+  await gotoLlmSettings(page);
+
+  await page.getByRole('button', { name: /编辑网关|Edit Gateway/ }).click();
+
+  const nameInput = page.getByRole('textbox').first();
+  await expect(nameInput).toHaveValue('火山方舟');
+  await nameInput.fill('火山方舟（改名）');
+
+  await page
+    .getByRole('button', { name: /^保存$|^Save$/ })
+    .last()
+    .click();
+
+  await expect
+    .poll(() =>
+      captured.find(
+        (r) =>
+          r.method === 'PATCH' && r.path === '/api/admin/llm-providers/prov-ark'
+      )
+    )
+    .toBeTruthy();
+
+  const patch = captured.find(
+    (r) => r.method === 'PATCH' && r.path === '/api/admin/llm-providers/prov-ark'
+  )!;
+  const body = patch.body as Record<string, unknown>;
+
+  expect(body.name).toBe('火山方舟（改名）');
+  // 这两条是重点：没有它们，服务端那条 TINYINT 比较根本不会被走到。
+  expect(body, 'UI 不再回传 apiBase → 单测的用例形态已经失真').toHaveProperty(
+    'apiBase'
+  );
+  expect(body, 'UI 不再回传 isAnthropic → 单测的用例形态已经失真').toHaveProperty(
+    'isAnthropic'
+  );
+  expect(body.apiBase).toBe('https://ark.cn-beijing.volces.com/api/v3');
+  expect(body.isAnthropic).toBe(false);
+  // 没换靶就不该逼用户重填密钥。
+  expect(body).not.toHaveProperty('apiKey');
 });

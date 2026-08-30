@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import crypto from 'crypto';
 import { SandboxProvider } from '@/lib/payment/providers/sandbox';
 import { StripeProvider, verifyStripeSignature } from '@/lib/payment/providers/stripe';
@@ -15,6 +15,15 @@ import {
 
 const settings = (o: Partial<RechargeSettings>) => o as unknown as RechargeSettings;
 
+// 订单失效时刻现在是 createCharge 的必填参数：网关必须与我方 expiresAt 同一时刻关单，
+// 否则超时支付照收、我方却判 late_paid 不发权益。
+const CHARGE_EXPIRES_AT = new Date('2026-08-22T12:00:00.000Z');
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+});
+
 describe('SandboxProvider', () => {
   const provider = new SandboxProvider();
 
@@ -26,6 +35,7 @@ describe('SandboxProvider', () => {
       currency: 'CNY',
       returnUrl: 'https://app.test/home',
       notifyUrl: 'https://app.test/api/wallet/callback/sandbox',
+      expiresAt: CHARGE_EXPIRES_AT,
     });
     expect(res.payUrl).toBe('https://app.test/api/wallet/sandbox/pay?out_trade_no=LL123');
   });
@@ -35,11 +45,13 @@ describe('SandboxProvider', () => {
       new Request('https://app.test/api/wallet/callback/sandbox?out_trade_no=LL1&action=pay'),
       ''
     );
-    expect(pay).toEqual({
+    expect(pay).toMatchObject({
       outTradeNo: 'LL1',
       paid: true,
       providerRef: 'sandbox_LL1',
       rawStatus: 'pay',
+      providerMode: 'sandbox',
+      providerAccount: 'default',
     });
 
     const cancel = await provider.verifyCallback(
@@ -119,6 +131,7 @@ describe('支付宝待签名串：请求方向与通知方向规则不同（P3-1
       currency: 'CNY',
       returnUrl: 'https://app.test/home',
       notifyUrl: 'https://app.test/api/wallet/callback/alipay',
+      expiresAt: CHARGE_EXPIRES_AT,
     });
     const query = new URL(res.payUrl!).searchParams;
     const sign = query.get('sign')!;
@@ -149,6 +162,7 @@ describe('支付宝待签名串：请求方向与通知方向规则不同（P3-1
         currency: 'USD',
         returnUrl: 'https://app.test/home',
         notifyUrl: 'https://app.test/api/wallet/callback/alipay',
+        expiresAt: CHARGE_EXPIRES_AT,
       })
     ).rejects.toThrow(/CNY/);
   });
@@ -376,52 +390,261 @@ describe('Stripe verifyCallback', () => {
     expect(res?.amountCents).toBe(3900);
   });
 
+  it('▶ 延迟支付 async_payment_succeeded 与 PaymentIntent succeeded 均可结算', async () => {
+    const asyncBody = JSON.stringify({
+      type: 'checkout.session.async_payment_succeeded',
+      livemode: false,
+      data: {
+        object: {
+          id: 'cs_async',
+          object: 'checkout.session',
+          client_reference_id: 'LLS-ASYNC',
+          payment_status: 'paid',
+          amount_total: 3900,
+          currency: 'usd',
+          payment_intent: 'pi_async',
+        },
+      },
+    });
+    const asyncResult = await stripeProvider().verifyCallback(
+      stripeReq(asyncBody),
+      asyncBody
+    );
+    expect(asyncResult).toMatchObject({ paid: true, outTradeNo: 'LLS-ASYNC' });
+
+    const intentBody = JSON.stringify({
+      type: 'payment_intent.succeeded',
+      livemode: false,
+      data: {
+        object: {
+          id: 'pi_async',
+          object: 'payment_intent',
+          status: 'succeeded',
+          metadata: { out_trade_no: 'LLS-ASYNC' },
+          amount_received: 3900,
+          currency: 'usd',
+          latest_charge: 'ch_async',
+        },
+      },
+    });
+    const intentResult = await stripeProvider().verifyCallback(
+      stripeReq(intentBody),
+      intentBody
+    );
+    expect(intentResult).toMatchObject({ paid: true, outTradeNo: 'LLS-ASYNC' });
+    expect(intentResult?.objectRefs).toEqual([
+      { objectType: 'payment_intent', objectId: 'pi_async' },
+      { objectType: 'charge', objectId: 'ch_async' },
+    ]);
+  });
+
+  it('▶ 未知已验签事件不会被宽泛标为 acknowledged', async () => {
+    const unknownBody = JSON.stringify({
+      id: 'evt_future',
+      type: 'charge.future_reversal_semantics',
+      livemode: false,
+      data: {
+        object: {
+          id: 'ch_future',
+          object: 'charge',
+          currency: 'usd',
+        },
+      },
+    });
+    const result = await stripeProvider().verifyCallback(
+      stripeReq(unknownBody),
+      unknownBody
+    );
+    expect(result).toMatchObject({ paid: false, eventId: 'evt_future' });
+    expect(result?.acknowledged).toBeUndefined();
+  });
+
   it('▶ ACK：成功 200 / 失败 500（P3-3，Stripe 看状态码判投递）', () => {
     const p = stripeProvider();
     expect(p.callbackAck(true).status).toBe(200);
     expect(p.callbackAck(false).status).toBe(500);
   });
 
-  it('▶ live 密钥下拒绝 livemode!==true 的事件（P3-4）', async () => {
-    const live = stripeProvider({ stripeSecretKey: 'sk_live_abc' });
+  it.each(['sk_live_abc', 'rk_live_abc'])(
+    '▶ 生产 %s 只接受 livemode=true 事件',
+    async (key) => {
+      vi.stubEnv('NODE_ENV', 'production');
+      const live = stripeProvider({ stripeSecretKey: key });
+      const testEvent = session();
+      expect(await live.verifyCallback(stripeReq(testEvent), testEvent)).toBeNull();
+
+      const liveEvent = JSON.stringify({
+        type: 'checkout.session.completed',
+        livemode: true,
+        data: {
+          object: {
+            client_reference_id: 'LLS1',
+            payment_status: 'paid',
+            amount_total: 3900,
+            currency: 'usd',
+          },
+        },
+      });
+      expect((await live.verifyCallback(stripeReq(liveEvent), liveEvent))?.paid).toBe(true);
+    }
+  );
+
+  it('▶ test key 在本地接受 test 事件，但反向拒绝 livemode=true', async () => {
     const testEvent = session();
-    expect(await live.verifyCallback(stripeReq(testEvent), testEvent)).toBeNull();
+    expect((await stripeProvider().verifyCallback(stripeReq(testEvent), testEvent))?.paid).toBe(true);
 
     const liveEvent = JSON.stringify({
       type: 'checkout.session.completed',
       livemode: true,
-      data: { object: { client_reference_id: 'LLS1', payment_status: 'paid', amount_total: 3900, currency: 'usd' } },
+      data: { object: { client_reference_id: 'LLS1', payment_status: 'paid' } },
     });
-    expect((await live.verifyCallback(stripeReq(liveEvent), liveEvent))?.paid).toBe(true);
+    expect(await stripeProvider().verifyCallback(stripeReq(liveEvent), liveEvent)).toBeNull();
   });
 
-  it('▶ test 密钥不受 livemode 限制（本地/测试链路照常）', async () => {
-    const body = session();
-    expect((await stripeProvider().verifyCallback(stripeReq(body), body))?.paid).toBe(true);
+  it.each(['sk_test_abc', 'rk_test_abc', 'proxy_secret'])(
+    '▶ 生产 %s 即使签名合法且声称 livemode=true 也 fail-closed',
+    async (key) => {
+      vi.stubEnv('NODE_ENV', 'production');
+      const liveClaim = JSON.stringify({
+        type: 'checkout.session.completed',
+        livemode: true,
+        data: { object: { client_reference_id: 'LLS1', payment_status: 'paid' } },
+      });
+      expect(
+        await stripeProvider({ stripeSecretKey: key }).verifyCallback(
+          stripeReq(liveClaim),
+          liveClaim
+        )
+      ).toBeNull();
+    }
+  );
+
+  it('▶ 绕过装配直接 createCharge 时，生产 test key 仍在 fetch 前失败', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    await expect(
+      stripeProvider({ stripeSecretKey: 'rk_test_abc' }).createCharge({
+        outTradeNo: 'LLS-PROD',
+        amountCents: 100,
+        subject: 'x',
+        currency: 'CNY',
+        returnUrl: 'https://app.test/home',
+        notifyUrl: 'https://app.test/api/wallet/callback/stripe',
+        expiresAt: CHARGE_EXPIRES_AT,
+      })
+    ).rejects.toThrow(/live mode key/i);
+  });
+
+  it('▶ createCharge 把订单号传播到 PaymentIntent metadata，并返回 typed Session ref', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 'cs_test_1', url: 'https://checkout.test/1' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const created = await stripeProvider().createCharge({
+      outTradeNo: 'LLS-MAP',
+      amountCents: 3900,
+      subject: 'x',
+      currency: 'USD',
+      returnUrl: 'https://app.test/home',
+      notifyUrl: 'https://app.test/api/wallet/callback/stripe',
+      expiresAt: CHARGE_EXPIRES_AT,
+    });
+    const request = fetchMock.mock.calls[0][1] as RequestInit;
+    const form = new URLSearchParams(String(request.body));
+    expect(form.get('payment_intent_data[metadata][out_trade_no]')).toBe('LLS-MAP');
+    expect(created.objectRefs).toEqual([
+      { objectType: 'checkout_session', objectId: 'cs_test_1' },
+    ]);
   });
 
   it('▶ charge.refunded → reversal（P3-16），绝不到账', async () => {
     const body = JSON.stringify({
+      id: 'evt_refund_1',
       type: 'charge.refunded',
       livemode: false,
-      data: { object: { metadata: { out_trade_no: 'LLS1' }, currency: 'cny', amount_total: 3900 } },
+      data: {
+        object: {
+          id: 'ch_1',
+          object: 'charge',
+          payment_intent: 'pi_1',
+          metadata: { out_trade_no: 'LLS1' },
+          currency: 'cny',
+          amount: 3900,
+        },
+      },
     });
     const res = await stripeProvider().verifyCallback(stripeReq(body), body);
     expect(res?.paid).toBe(false);
     expect(res?.reversal).toBe(true);
     expect(res?.outTradeNo).toBe('LLS1');
+    expect(res?.eventId).toBe('evt_refund_1');
+    expect(res?.objectRefs).toEqual([
+      { objectType: 'charge', objectId: 'ch_1' },
+      { objectType: 'payment_intent', objectId: 'pi_1' },
+    ]);
   });
 
   it('▶ charge.dispute.created → reversal（拿不到订单号也不静默吞）', async () => {
     const body = JSON.stringify({
+      id: 'evt_dispute_1',
       type: 'charge.dispute.created',
       livemode: false,
-      data: { object: { currency: 'usd' } },
+      data: { object: { id: 'dp_1', object: 'dispute', charge: 'ch_1', currency: 'usd' } },
     });
     const res = await stripeProvider().verifyCallback(stripeReq(body), body);
     expect(res?.reversal).toBe(true);
     expect(res?.outTradeNo).toBe('');
+    expect(res?.objectRefs).toEqual([
+      { objectType: 'dispute', objectId: 'dp_1' },
+      { objectType: 'charge', objectId: 'ch_1' },
+    ]);
+    expect(res?.reversalState).toBe('pending');
+    expect(res?.fullReversal).toBe(false);
   });
+
+  it.each([
+    ['refund.created', 'pending', 'pending', true, false],
+    ['refund.updated', 'succeeded', 'withdrawn', true, undefined],
+    ['refund.failed', 'failed', 'reinstated', false, undefined],
+    ['charge.dispute.updated', 'under_review', 'pending', true, false],
+    ['charge.dispute.closed', 'lost', 'withdrawn', true, undefined],
+    ['charge.dispute.closed', 'won', 'reinstated', false, undefined],
+    ['charge.dispute.closed', 'warning_closed', 'reinstated', false, undefined],
+  ])(
+    '▶ Stripe lifecycle %s/%s → %s',
+    async (type, status, reversalState, reversal, fullReversal) => {
+      const isRefund = type.startsWith('refund.');
+      const body = JSON.stringify({
+        id: `evt_${status}`,
+        type,
+        livemode: false,
+        created: 1_776_921_000,
+        data: {
+          object: {
+            id: isRefund ? 're_lifecycle' : 'dp_lifecycle',
+            object: isRefund ? 'refund' : 'dispute',
+            status,
+            amount: 3900,
+            currency: 'usd',
+            charge: 'ch_lifecycle',
+          },
+        },
+      });
+      const result = await stripeProvider().verifyCallback(stripeReq(body), body);
+      expect(result).toMatchObject({
+        reversal,
+        reversalState,
+        rawStatus: `${type}:${status}`,
+      });
+      expect(result?.fullReversal).toBe(fullReversal);
+      expect(result?.acknowledged).toBe(
+        reversalState === 'reinstated' ? true : undefined
+      );
+    }
+  );
 
   it('▶ 时间戳非数字 → 直接拒（P6-14 极性）', async () => {
     const body = session();
@@ -439,6 +662,7 @@ describe('Stripe verifyCallback', () => {
         currency: '元',
         returnUrl: 'https://app.test/home',
         notifyUrl: 'https://app.test/api/wallet/callback/stripe',
+        expiresAt: CHARGE_EXPIRES_AT,
       })
     ).rejects.toThrow(/currency/i);
   });
@@ -546,6 +770,13 @@ describe('微信 verifyCallback', () => {
     expect(res?.paid).toBe(false);
   });
 
+  it('▶ 未知非交易事件验签后保留，但不自动 acknowledged', async () => {
+    const body = JSON.stringify({ event_type: 'FUTURE.REVERSAL', summary: '未知事件' });
+    const res = await wechatProvider().verifyCallback(wechatReq(body), body);
+    expect(res).toMatchObject({ paid: false, eventType: 'FUTURE.REVERSAL' });
+    expect(res?.acknowledged).toBeUndefined();
+  });
+
   it('▶ REFUND.SUCCESS → reversal；REFUND.CLOSED（未退成）→ 只 ACK 不冻结', async () => {
     const ok = txBody(
       { out_trade_no: 'LLW1', refund_status: 'SUCCESS', refund_id: 'rf-1', amount: { total: 3900 } },
@@ -602,6 +833,7 @@ describe('微信 verifyCallback', () => {
         currency: 'USD',
         returnUrl: 'https://app.test/home',
         notifyUrl: 'https://app.test/api/wallet/callback/wechat',
+        expiresAt: CHARGE_EXPIRES_AT,
       })
     ).rejects.toThrow(/CNY/);
   });

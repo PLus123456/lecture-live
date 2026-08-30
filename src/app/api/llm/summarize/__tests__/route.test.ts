@@ -24,6 +24,10 @@ const {
 }));
 
 vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
+// 路由新增了「账户有无支付争议冻结」的准入检查（走 $queryRaw）；不桩就会打真库。
+vi.mock('@/lib/payment/entitlementAdmission', () => ({
+  isPaymentBenefitAvailable: vi.fn(async () => true),
+}));
 vi.mock('@/lib/rateLimit', () => ({
   enforceApiRateLimit: enforceApiRateLimitMock,
 }));

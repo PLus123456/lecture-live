@@ -11,12 +11,15 @@ const {
   runFindUniqueMock,
   sessionGroupByMock,
   grantGroupByMock,
+  writeSecurityAuditMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   runFindUniqueMock: vi.fn(),
   sessionGroupByMock: vi.fn(),
   grantGroupByMock: vi.fn(),
+  writeSecurityAuditMock: vi.fn(),
 }));
+vi.mock('@/lib/securityAudit', () => ({ writeSecurityAudit: writeSecurityAuditMock }));
 
 vi.mock('@/lib/adminApi', () => ({ requireAdminAccess: requireAdminAccessMock }));
 vi.mock('@/lib/prisma', () => ({
@@ -40,6 +43,7 @@ describe('GET /api/admin/reconciliation/[runId] — 在途预留提示（P5-1b�
     requireAdminAccessMock.mockResolvedValue({ user: { id: 'a' }, response: null });
     sessionGroupByMock.mockResolvedValue([]);
     grantGroupByMock.mockResolvedValue([]);
+    writeSecurityAuditMock.mockResolvedValue({});
   });
 
   it('▶ 每条差异带上该用户的在途预留分钟（async + full + 未结 grant 求和）', async () => {
@@ -78,5 +82,24 @@ describe('GET /api/admin/reconciliation/[runId] — 在途预留提示（P5-1b�
   it('run 不存在 → 404', async () => {
     runFindUniqueMock.mockResolvedValue(null);
     expect((await get('nope')).status).toBe(404);
+  });
+
+  it('安全审计写失败时不返回敏感差异明细', async () => {
+    runFindUniqueMock.mockResolvedValue({
+      id: 'run-1',
+      mismatches: [{ id: 'mm-1', userId: 'u1', driftMinutes: -30 }],
+    });
+    writeSecurityAuditMock.mockRejectedValueOnce(new Error('audit unavailable'));
+
+    const res = await get('run-1');
+    expect(res.status).toBe(500);
+    expect(writeSecurityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'reconciliation.detail_read',
+        target: { type: 'reconciliation_run', id: 'run-1' },
+        outcome: 'SUCCESS',
+      })
+    );
   });
 });

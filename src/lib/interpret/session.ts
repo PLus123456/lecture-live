@@ -286,7 +286,10 @@ export async function reclaimStaleInterpretSessions(now: Date): Promise<number> 
           tx
         );
         if (billable > 0) {
-          const snap = await deductTranscriptionMinutes(s.userId, billable, tx);
+          const snap = await deductTranscriptionMinutes(s.userId, billable, tx, {
+            source: 'interpret_cron',
+            referenceId: s.id,
+          });
           // ADMIN 恒不扣费（snap.role==='ADMIN' 即 deduct 短路），不记台账。
           if (snap && snap.role !== 'ADMIN') {
             await recordInterpretUsage(s.userId, billable, elapsedMs, tx);

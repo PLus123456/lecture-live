@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * U8 — 侧栏「对话」入口 + 字节配额条的视觉烟测。
@@ -56,7 +56,7 @@ test.beforeEach(async ({ page }) => {
           displayName: 'Admin',
           role: 'ADMIN',
         },
-        token: '__cookie_session__',
+        token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING,
       });
     }
 

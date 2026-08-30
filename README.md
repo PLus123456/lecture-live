@@ -153,7 +153,9 @@ npm install
 
 # 3. Configure environment variables
 cp .env.example .env.local
-# At minimum set DATABASE_URL, REDIS_URL, JWT_SECRET
+# At minimum set DATABASE_URL, REDIS_URL, JWT_SECRET, ENCRYPTION_KEY, and a
+# strong SETUP_BOOTSTRAP_TOKEN (`openssl rand -hex 32`). Because local dev has
+# no reverse proxy, also set TRUSTED_PROXY_HOPS=0.
 
 # 4. Prepare the database
 npm run db:ensure
@@ -164,22 +166,30 @@ npm run dev:ws
 ```
 
 > `npm run dev` serves the Next.js app at `http://localhost:3000`, and `npm run dev:ws` starts the Socket.IO server at `ws://localhost:3001`.
+> The browser intentionally never receives the setup secret. Before using the setup UI, create the first admin with a local `curl` request as documented in [`deploy/INSTALL.md`](deploy/INSTALL.md#首次部署窗口的安全性), then sign in normally.
 
 ### Docker Deployment
 
 ```bash
 # 1. Configure environment variables
 cp .env.example .env.local
-# Set DB_PASSWORD, MYSQL_ROOT_PASSWORD, REDIS_PASSWORD, JWT_SECRET, ENCRYPTION_KEY
+# Set DB_PASSWORD, MYSQL_ROOT_PASSWORD, REDIS_PASSWORD, JWT_SECRET,
+# ENCRYPTION_KEY, and SETUP_BOOTSTRAP_TOKEN (`openssl rand -hex 32`).
 
 # 2. Launch the full stack
 docker-compose up -d
 
-# 3. Verify health
+# 3. Public liveness (does not fan out to dependencies)
 curl http://localhost:3000/api/health
+
+# Deep readiness is authenticated and is run by the container healthcheck:
+docker-compose exec app node scripts/check-readiness.mjs
 ```
 
-The Docker stack includes the app server, WebSocket service, MySQL 8.4, Redis 7, and Cloudreve.
+托管安装、升级、回滚和 systemd 启动均会校验深度就绪端点；检查失败会停止 Web/WS
+并返回非零。为避免恢复匿名依赖探测，安全标记上线前生成的旧备份不能直接启动。
+
+The Docker stack includes the app server, WebSocket service, MySQL 8.4, Redis 7, and Cloudreve. Production access is expected to pass through the shipped Nginx configuration; ports 3000/3001 are published on host loopback only. For a single-machine direct-access development run without Nginx, explicitly set `TRUSTED_PROXY_HOPS=0` (IP identity behind Docker NAT will then be shared and is not a production topology).
 
 ### Optional: Audio Enhancement Worker
 
@@ -238,8 +248,24 @@ See [`.env.example`](.env.example) for the full environment variable list. The m
 | `SONIOX_API_KEY` | Soniox API key fallback |
 | `NEXT_PUBLIC_APP_URL` | Public web URL, default `http://localhost:3000` |
 | `NEXT_PUBLIC_WS_URL` | Public WebSocket URL, default `http://localhost:3001` |
+| `SETUP_BOOTSTRAP_TOKEN` | Required 32+ byte secret used only to claim the first admin |
+| `TRUSTED_PROXY_HOPS` | Explicit trusted proxy hop count (`1` for shipped Nginx, `0` for direct local dev) |
+| `TRUSTED_PROXY_CIDRS` | Controlled intermediary proxy networks required for multi-hop deployments |
 
 > LLM provider keys and Soniox credentials are best managed from the admin dashboard, where they can be stored encrypted in the database. Environment variables are mainly a fallback path.
+
+LLM provider endpoints are configured entirely from the admin dashboard — there is no
+environment allowlist to maintain. On a self-hosted deployment the administrator and whoever
+can edit the deployment env are the same person, so such a list adds no boundary while costing
+a shell session and a restart per provider.
+
+The outbound rules that remain need no configuration and cannot be relaxed from the dashboard:
+HTTPS only, no query string or userinfo in the base URL, no redirect is ever followed (Node
+strips `Authorization` across origins but keeps headers such as Anthropic's `x-api-key`), DNS
+answers are pinned for the actual connection so a rebinding host cannot answer public for
+validation and private for the socket, and private, loopback or link-local addresses are
+rejected. Plain HTTP can only be enabled explicitly in `NODE_ENV=development` with
+`LLM_PROVIDER_ALLOW_INSECURE_HTTP=true`.
 
 ### Cloudreve OAuth (v4)
 

@@ -10,6 +10,13 @@ import {
 } from '@/lib/storage/cloudreveFileDelete';
 import { CHAT_IMAGE_ROOT } from '@/lib/llm/chatImageStorage';
 import { logger, serializeError } from '@/lib/logger';
+import {
+  STORED_ARTIFACT_TYPE,
+  findBillableStoredArtifactsByConversations,
+  findBillableStoredArtifactsByOwner,
+  markStoredArtifactsDeletePendingInTransaction,
+  releaseStoredArtifact,
+} from '@/lib/storage/storedArtifactLedger';
 
 const jobLogger = logger.child({ component: 'chat-files-cleanup-job' });
 
@@ -83,7 +90,8 @@ export async function runChatFilesCleanup(): Promise<ChatFilesCleanupResult> {
       where: {
         createdAt: { lt: cutoff },
         lastAccessedAt: { lt: cutoff },
-      },
+        source: 'UPLOAD',
+      } as never,
       select: {
         id: true,
         userId: true,
@@ -150,8 +158,10 @@ export async function runChatFilesCleanup(): Promise<ChatFilesCleanupResult> {
           await prisma.chatAttachment.findMany({
             where: {
               userId: u.id,
+              // 只清用户上传的附件；内嵌图片等其它来源由各自的清理路径负责。
+              source: 'UPLOAD',
               ...(skipIds.length > 0 ? { id: { notIn: skipIds } } : {}),
-            },
+            } as never,
             orderBy: [{ lastAccessedAt: 'asc' }, { id: 'asc' }],
             take: SOFT_CAP_PAGE_SIZE,
             select: {
@@ -229,6 +239,21 @@ export async function cleanupOrphanChatImageDirs(): Promise<number> {
     select: { id: true },
   });
   const existingSet = new Set(existing.map((c) => c.id));
+  const orphanNames = entries.filter((name) => !existingSet.has(name));
+  const inlineLedgers = await findBillableStoredArtifactsByConversations(
+    orphanNames
+  );
+  const inlineArtifactIds = inlineLedgers
+    .filter(
+      (artifact) =>
+        artifact.artifactType === STORED_ARTIFACT_TYPE.INLINE_IMAGE
+    )
+    .map((artifact) => artifact.id);
+  if (inlineArtifactIds.length > 0) {
+    await prisma.$transaction((tx) =>
+      markStoredArtifactsDeletePendingInTransaction(tx, inlineArtifactIds)
+    );
+  }
 
   const graceCutoff = Date.now() - ORPHAN_DIR_GRACE_MS;
 
@@ -254,6 +279,14 @@ export async function cleanupOrphanChatImageDirs(): Promise<number> {
         recursive: true,
         force: true,
       });
+      for (const artifact of inlineLedgers) {
+        if (
+          artifact.conversationId === name &&
+          artifact.artifactType === STORED_ARTIFACT_TYPE.INLINE_IMAGE
+        ) {
+          await releaseStoredArtifact(artifact.id).catch(() => undefined);
+        }
+      }
       removed += 1;
     } catch (err) {
       jobLogger.warn(
@@ -277,21 +310,46 @@ async function deleteAttachment(
   att: AttachmentRow,
   cloudreve: CloudreveDeleteContext | null
 ): Promise<void> {
+  const ledgerRows = await findBillableStoredArtifactsByOwner(
+    'chat_attachment',
+    att.id
+  );
+  await prisma.$transaction(async (tx) => {
+    await markStoredArtifactsDeletePendingInTransaction(
+      tx,
+      ledgerRows.map((row) => row.id)
+    );
+    await tx.chatAttachment.delete({ where: { id: att.id } });
+    if (ledgerRows.length === 0) {
+      await tx.$executeRaw`
+        UPDATE User
+        SET storageBytesUsed = GREATEST(0, storageBytesUsed - ${att.bytes})
+        WHERE id = ${att.userId}
+      `;
+    }
+  });
+
+  let rawDeleted = false;
+  let extractedDeleted = att.extractedTextPath === null;
   if (cloudreve) {
-    await deleteCloudreveFile(att.cloudrevePath, cloudreve);
+    rawDeleted = await deleteCloudreveFile(att.cloudrevePath, cloudreve);
     if (att.extractedTextPath) {
-      await deleteCloudreveFile(att.extractedTextPath, cloudreve);
+      extractedDeleted = await deleteCloudreveFile(
+        att.extractedTextPath,
+        cloudreve
+      );
     }
   }
 
-  await prisma.$transaction([
-    prisma.chatAttachment.delete({ where: { id: att.id } }),
-    prisma.$executeRaw`
-      UPDATE User
-      SET storageBytesUsed = GREATEST(0, CAST(storageBytesUsed AS SIGNED) - ${att.bytes})
-      WHERE id = ${att.userId}
-    `,
-  ]);
+  for (const artifact of ledgerRows) {
+    const deleted =
+      artifact.artifactType === STORED_ARTIFACT_TYPE.CHAT_EXTRACTED
+        ? extractedDeleted
+        : rawDeleted;
+    if (deleted) {
+      await releaseStoredArtifact(artifact.id);
+    }
+  }
 }
 
 /**

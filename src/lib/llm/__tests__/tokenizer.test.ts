@@ -15,6 +15,7 @@ import {
   estimateTokens,
   isWithinTokens,
   truncateToTokensFromEnd,
+  truncateToTokensFromEndUtf8ByteUpperBound,
 } from '@/lib/llm/tokenizer';
 
 describe('estimateTokens 超长输入短路', () => {
@@ -92,5 +93,18 @@ describe('truncateToTokensFromEnd 不得超出 maxTokens', () => {
     expect(encodeMock(out).length).toBeGreaterThan(700);
     // 必须仍然是原文的尾巴
     expect(text.endsWith(out)).toBe(true);
+  });
+
+  it('高度可压缩的 20 万字符 suffix 也被 UTF-8 预留上界完整覆盖', () => {
+    encodeMock.mockImplementationOnce(() => new Array(1563).fill(0));
+    const compressed = ' '.repeat(200_000);
+    const truncated = truncateToTokensFromEnd(compressed, 2000);
+
+    expect(truncated).toBe(compressed);
+    expect(new TextEncoder().encode(truncated).byteLength).toBeLessThanOrEqual(
+      truncateToTokensFromEndUtf8ByteUpperBound(2000)
+    );
+    // 旧的 inputBudget*32 只预留 64,000，无法覆盖该反例。
+    expect(truncateToTokensFromEndUtf8ByteUpperBound(2000)).toBe(800_000);
   });
 });

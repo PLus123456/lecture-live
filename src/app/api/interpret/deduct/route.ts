@@ -209,7 +209,11 @@ export async function POST(req: Request) {
       const snapshot = await deductTranscriptionMinutes(
         payload.id,
         billableMinutes,
-        tx
+        tx,
+        {
+          source: 'interpret_deduct',
+          referenceId: claim.sessionId ?? anchorIdForClaim ?? undefined,
+        }
       );
       if (!snapshot) {
         // 用户不存在：回滚整个事务（含认领），会话留给 cron。

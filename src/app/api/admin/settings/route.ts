@@ -1,8 +1,11 @@
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
-import { logAction } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
+import {
+  getSecurityAuditRequestId,
+  writeSecurityAudit,
+} from '@/lib/securityAudit';
 import {
   getSiteSettings,
   invalidateSiteSettingsCache,
@@ -13,7 +16,6 @@ import {
 } from '@/lib/siteSettings';
 import { encrypt } from '@/lib/crypto';
 import { invalidateSonioxDbConfigCache } from '@/lib/soniox/env';
-import { invalidateTrustedProxyCache } from '@/lib/clientIp';
 import { migrateLocalToCloudreve } from '@/lib/storage/migration';
 import {
   clearPersistedTokens as clearCloudreveTokens,
@@ -27,20 +29,54 @@ import {
   requiresSecretReentry,
   retargetErrorMessage,
 } from '@/lib/credentialRetarget';
+import { JOB_TYPE, trackJob } from '@/lib/jobQueue';
 
 // 获取所有站点设置
 export async function GET(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user: admin, response } = await requireAdminAccess(req, {
     scope: 'admin:settings:get',
     limit: 60,
   });
   if (response) {
     return response;
   }
+  if (!admin) {
+    return NextResponse.json({ error: '权限不足' }, { status: 403 });
+  }
 
   try {
     const settings = await getSiteSettings({ fresh: true });
-    return NextResponse.json(serializeSiteSettingsForAdmin(settings));
+    const payload = serializeSiteSettingsForAdmin(settings);
+
+    try {
+      await writeSecurityAudit(req, {
+        event: 'settings.read',
+        operator: {
+          id: admin.id,
+          email: admin.email,
+          role: admin.role,
+        },
+        target: { type: 'site_settings', id: 'global' },
+        before: null,
+        after: {
+          keys: Object.keys(payload).sort(),
+          secretValuesMasked: true,
+        },
+        reason: 'admin_read',
+        outcome: 'SUCCESS',
+      });
+    } catch (auditError) {
+      logger.error(
+        { err: serializeError(auditError) },
+        '记录站点设置读取审计失败'
+      );
+      return NextResponse.json(
+        { error: '安全审计服务不可用' },
+        { status: 503 }
+      );
+    }
+
+    return NextResponse.json(payload);
   } catch (err) {
     logger.error({ err: serializeError(err) }, '获取站点设置失败');
     return NextResponse.json({ error: '获取设置失败' }, { status: 500 });
@@ -57,6 +93,24 @@ export async function PUT(req: Request) {
   if (response) {
     return response;
   }
+  if (!admin) {
+    return NextResponse.json({ error: '权限不足' }, { status: 403 });
+  }
+
+  const auditRequestId = getSecurityAuditRequestId(req);
+  let auditAttempted = false;
+  let primarySettingsCommitted = false;
+  let auditContext:
+    | {
+        target: {
+          type: string;
+          id: string;
+          ids: string[];
+        };
+        before: Record<string, unknown>;
+        after: Record<string, unknown>;
+      }
+    | undefined;
 
   try {
     const body = await req.json();
@@ -123,7 +177,8 @@ export async function PUT(req: Request) {
       'rate_limit_api',
       'jwt_expiry',
       'bcrypt_rounds',
-      'trusted_proxy',
+      // trusted_proxy 是旧版数据库 boolean，只保留读取兼容。真实代理拓扑必须由
+      // TRUSTED_PROXY_HOPS/CIDRS 在 Web/WS 启动前确定，禁止通过热更新接口切换。
       // Chat 文件配额 & 清理（U13）
       'chat_files_retention_days',
       'chat_files_soft_cap_percent',
@@ -310,19 +365,20 @@ export async function PUT(req: Request) {
         previousSettings.audio_enhance_worker_url
       ),
     };
-    // 「改端点必须重填凭据」**只对 SMTP 生效**，这是刻意收窄的范围，别再往这张表里加行。
+    // 本 settings 路由里，「改端点必须重填凭据」目前覆盖 SMTP。LLM provider
+    // 不在 SiteSetting 表中，已在 /api/admin/llm-providers/[id] 的写入边界单独强制。
     //
     // 保留 SMTP 的理由：邮件服务商地址几乎不会变（改它基本只有换靶一种解释），而 SMTP 口令
     // 常常就是邮箱账号本身的密码、在别处复用，外带出去的破坏面最大。管理员真要改也一定知道
     // 这个口令，重填成本≈0。
     //
-    // 其余几类（Cloudreve / 音频增强 worker / 翻译 worker / LLM apiBase / Soniox）已放开：
+    // 其余几类（Cloudreve / 音频增强 worker / 翻译 worker / Soniox）仍未在本路由强制：
     // 那些地址通常是自建服务，机器 IP 一变就得改，却要求重填一把可能根本取不回来的密钥
-    //（LLM 厂商的 key 多数只在创建时显示一次），代价明显大于收益。
+    // 代价明显大于收益。
     //
     // 放开后接受的残余风险（明确记录，不要当成没有）：admin 会话一旦失陷（XSS / cookie 泄露 /
     // 内部人），攻击者可以「改地址 + 密钥留空」让服务端把解密后的真实凭据主动投递到新地址
-    //（LLM 的 Authorization: Bearer、worker token 都是一次握手就送出去）。这条通道无法从
+    //（worker token 等都是一次握手就送出去）。这条通道无法从
     // GET 侧堵住——GET 一直是脱敏的，它绕的正是脱敏。真要收口，方向是给这类改动加一次
     // 登录密码二次确认（盗号者不知道登录密码），而不是把重填密钥的负担压回管理员身上。
     const retargetGuards: Array<{
@@ -379,89 +435,227 @@ export async function PUT(req: Request) {
       return mirroredEntries;
     });
 
-    // 使用事务逐个 upsert
-    await prisma.$transaction(
-      normalizedEntries.map(([key, value]) =>
-        prisma.siteSetting.upsert({
+    const normalizedEntryMap = new Map(normalizedEntries);
+    const cloudreveCredentialsChanged =
+      (normalizedEntryMap.has('cloudreve_url') &&
+        normalizedEntryMap.get('cloudreve_url') !==
+          String(previousSettings.cloudreve_url ?? '')) ||
+      (normalizedEntryMap.has('cloudreve_client_id') &&
+        normalizedEntryMap.get('cloudreve_client_id') !==
+          String(previousSettings.cloudreve_client_id ?? '')) ||
+      normalizedEntryMap.has('cloudreve_client_secret');
+    const switchedToCloudreve =
+      previousSettings.storage_mode !== 'cloudreve' &&
+      (normalizedEntryMap.get('storage_mode') ?? previousSettings.storage_mode) ===
+        'cloudreve';
+
+    const auditSensitiveKeys = new Set(sensitiveKeys);
+    const auditValue = (key: string, value: unknown, changed: boolean) =>
+      auditSensitiveKeys.has(key)
+        ? { configured: Boolean(value), changed }
+        : value;
+    const previousSettingsRecord = previousSettings as unknown as Record<
+      string,
+      unknown
+    >;
+    const auditKeys = [...new Set(normalizedEntries.map(([key]) => key))].sort();
+    const settingsAuditContext = {
+      target: {
+        type: 'site_settings',
+        id: 'global',
+        ids: auditKeys,
+      },
+      before: Object.fromEntries(
+        auditKeys.map((key) => [
+          key,
+          auditValue(key, previousSettingsRecord[key], false),
+        ])
+      ),
+      after: Object.fromEntries(
+        normalizedEntries.map(([key, value]) => [
+          key,
+          auditValue(key, value, true),
+        ])
+      ),
+    };
+    auditContext = settingsAuditContext;
+
+    try {
+      await writeSecurityAudit(req, {
+        event: 'settings.update',
+        operator: {
+          id: admin.id,
+          email: admin.email,
+          role: admin.role,
+        },
+        ...settingsAuditContext,
+        reason: 'admin_update',
+        outcome: 'ATTEMPTED',
+        requestId: auditRequestId,
+      });
+      auditAttempted = true;
+    } catch (auditError) {
+      logger.error(
+        { err: serializeError(auditError) },
+        '记录站点设置更新尝试失败'
+      );
+      return NextResponse.json(
+        { error: '安全审计服务不可用' },
+        { status: 503 }
+      );
+    }
+
+    // 设置、由设置派生的用户配额、旧 OAuth token 清理以及 SUCCESS 审计是一个
+    // 数据库事实：任何一步失败都必须整体回滚，不能留下“配置已改但审计/配额未改”的状态。
+    const STORAGE_QUOTA_MB = 1024 * 1024;
+    const parseQuotaMb = (raw: string | undefined, fallback: number) => {
+      const parsed = Number.parseInt(raw ?? '', 10);
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.min(1_048_576, Math.max(0, parsed));
+    };
+    const byteQuotaChanges: Array<{
+      role: 'FREE' | 'PRO' | 'ADMIN';
+      key:
+        | 'chat_files_quota_free_mb'
+        | 'chat_files_quota_pro_mb'
+        | 'chat_files_quota_admin_mb';
+      previous: number;
+    }> = [
+      {
+        role: 'FREE',
+        key: 'chat_files_quota_free_mb',
+        previous: previousSettings.chat_files_quota_free_mb,
+      },
+      {
+        role: 'PRO',
+        key: 'chat_files_quota_pro_mb',
+        previous: previousSettings.chat_files_quota_pro_mb,
+      },
+      {
+        role: 'ADMIN',
+        key: 'chat_files_quota_admin_mb',
+        previous: previousSettings.chat_files_quota_admin_mb,
+      },
+    ];
+
+    await prisma.$transaction(async (tx) => {
+      for (const [key, value] of normalizedEntries) {
+        await tx.siteSetting.upsert({
           where: { key },
           update: { value },
           create: { key, value },
-        })
-      )
-    );
+        });
+      }
+
+      for (const change of byteQuotaChanges) {
+        if (!normalizedEntryMap.has(change.key)) continue;
+        const nextMb = parseQuotaMb(
+          normalizedEntryMap.get(change.key),
+          change.previous
+        );
+        if (nextMb === change.previous) continue;
+        await tx.user.updateMany({
+          where: { role: change.role },
+          data: {
+            storageBytesLimit:
+              BigInt(Math.floor(nextMb)) * BigInt(STORAGE_QUOTA_MB),
+          },
+        });
+      }
+
+      if (cloudreveCredentialsChanged) {
+        await clearCloudreveTokens(tx);
+      }
+
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'settings.update',
+          operator: {
+            id: admin.id,
+            email: admin.email,
+            role: admin.role,
+          },
+          ...settingsAuditContext,
+          reason: 'admin_update',
+          outcome: 'SUCCESS',
+          metadata: {
+            cloudreveCredentialsChanged,
+            migrationRequired: switchedToCloudreve,
+          },
+          requestId: auditRequestId,
+        },
+        tx
+      );
+    });
+    primarySettingsCommitted = true;
 
     invalidateSiteSettingsCache();
     invalidateSonioxDbConfigCache();
-    invalidateTrustedProxyCache();
     invalidateCloudreveConfigCache();
     invalidateMailer(); // SMTP 配置可能已变，丢弃缓存的 transporter
     const settings = await getSiteSettings({ fresh: true });
 
-    // U86：审计日志移到事务提交之后。此前在事务前 fire-and-forget 记录，事务失败会留下
-    // 幽灵「已更新」审计行，重试成功后又写第二行，事后追溯配置变更时间会错位。
-    logAction(req, 'admin.settings.update', {
-      user: admin,
-      detail: `更新设置项: ${entries.map(([k]) => k).join(', ')}`,
-    });
-
-    // Chat 字节配额联动：admin 改了某角色的 chat_files_quota_*_mb 后，把对应角色所有用户的
-    // storageBytesLimit 回填到新值。这是让该设置真正生效的唯一写入点 —— 此前这三个值只存进
-    // SiteSetting、从不推给任何用户，导致所有人（含 PRO）被钉死在 schema 默认 100MB。
-    // 字节配额按角色驱动、自定义组沿用其底层角色配额，故按 role 全量更新（不排除自定义组成员）。
-    const STORAGE_QUOTA_MB = 1024 * 1024;
-    const byteQuotaByRole: Array<{ role: 'FREE' | 'PRO' | 'ADMIN'; mb: number; prevMb: number }> = [
-      { role: 'FREE', mb: settings.chat_files_quota_free_mb, prevMb: previousSettings.chat_files_quota_free_mb },
-      { role: 'PRO', mb: settings.chat_files_quota_pro_mb, prevMb: previousSettings.chat_files_quota_pro_mb },
-      { role: 'ADMIN', mb: settings.chat_files_quota_admin_mb, prevMb: previousSettings.chat_files_quota_admin_mb },
-    ];
-    for (const change of byteQuotaByRole) {
-      if (change.mb !== change.prevMb && Number.isFinite(change.mb) && change.mb >= 0) {
-        await prisma.user.updateMany({
-          where: { role: change.role },
-          data: {
-            storageBytesLimit: BigInt(Math.floor(change.mb)) * BigInt(STORAGE_QUOTA_MB),
-          },
-        });
-      }
-    }
-
-    // Cloudreve URL/Client 任一变更后，旧 token 不再匹配新 server/app —
-    // 用旧 token 调新 client 必然 401，必须清空让管理员重新走 OAuth。
-    const cloudreveCredentialsChanged =
-      previousSettings.cloudreve_url !== settings.cloudreve_url ||
-      previousSettings.cloudreve_client_id !== settings.cloudreve_client_id ||
-      previousSettings.cloudreve_client_secret !== settings.cloudreve_client_secret;
-
-    if (cloudreveCredentialsChanged) {
-      await clearCloudreveTokens().catch((err) =>
-        logger.error(
-          { err: serializeError(err) },
-          '[admin.settings] 清除 Cloudreve token 失败'
-        )
-      );
-    }
-
-    // 如果存储模式从 local 切换到 cloudreve，后台触发迁移
-    const switchedToCloudreve =
-      previousSettings.storage_mode !== 'cloudreve' &&
-      settings.storage_mode === 'cloudreve';
-
+    // 切换存储后，迁移是外部副作用：必须先持久化 PROCESSING journal，且终态与
+    // 结构化审计同事务落库。请求等待终态，禁止 fire-and-forget 丢失结果。
     if (switchedToCloudreve) {
-      // 后台执行，不阻塞响应
-      migrateLocalToCloudreve()
-        .then((r) =>
-          logger.info(
-            {
-              migratedCount: r.migratedCount,
-              skippedCount: r.skippedCount,
-              errorCount: r.errorCount,
-            },
-            '[存储迁移] 完成'
-          )
-        )
-        .catch((err) =>
-          logger.error({ err: serializeError(err) }, '[存储迁移] 失败')
-        );
+      await trackJob(
+        {
+          type: JOB_TYPE.STORAGE_MIGRATION,
+          triggeredBy: `admin:${admin.id}`,
+          params: { direction: 'local_to_cloudreve', source: 'settings' },
+          resultSummary: (result) => ({
+            migratedCount: result.migratedCount,
+            skippedCount: result.skippedCount,
+            errorCount: result.errorCount,
+          }),
+          errorSummary: (error) =>
+            error instanceof Error ? error.name : 'UnknownError',
+          terminalMutation: async (tx, terminal) => {
+            const result =
+              terminal.status === 'SUCCESS' ? terminal.result : undefined;
+            await writeSecurityAudit(
+              req,
+              {
+                event: 'settings.storage_migration',
+                operator: {
+                  id: admin.id,
+                  email: admin.email,
+                  role: admin.role,
+                },
+                target: { type: 'storage_backend', id: 'global' },
+                before: { backend: 'local' },
+                after: result
+                  ? {
+                      backend: 'cloudreve',
+                      migratedCount: result.migratedCount,
+                      skippedCount: result.skippedCount,
+                      errorCount: result.errorCount,
+                    }
+                  : undefined,
+                reason: 'settings_storage_switch',
+                outcome: !result
+                  ? 'FAILED'
+                  : result.errorCount > 0
+                    ? 'PARTIAL'
+                    : 'SUCCESS',
+                metadata: result
+                  ? undefined
+                  : {
+                      errorClass:
+                        terminal.status === 'FAILED' &&
+                        terminal.error instanceof Error
+                          ? terminal.error.name
+                          : 'UnknownError',
+                    },
+                requestId: auditRequestId,
+              },
+              tx
+            );
+          },
+        },
+        () => migrateLocalToCloudreve()
+      );
     }
 
     return NextResponse.json({
@@ -470,6 +664,36 @@ export async function PUT(req: Request) {
     });
   } catch (err) {
     logger.error({ err: serializeError(err) }, '更新站点设置失败');
+
+    if (auditAttempted && auditContext) {
+      try {
+        await writeSecurityAudit(req, {
+          event: 'settings.update',
+          operator: {
+            id: admin.id,
+            email: admin.email,
+            role: admin.role,
+          },
+          ...auditContext,
+          reason: 'admin_update',
+          outcome: primarySettingsCommitted ? 'PARTIAL' : 'FAILED',
+          metadata: {
+            errorType: err instanceof Error ? err.name : 'UnknownError',
+          },
+          requestId: auditRequestId,
+        });
+      } catch (auditError) {
+        logger.error(
+          { err: serializeError(auditError) },
+          '记录站点设置更新失败结果失败'
+        );
+        return NextResponse.json(
+          { error: '安全审计服务不可用' },
+          { status: 503 }
+        );
+      }
+    }
+
     return NextResponse.json({ error: '更新设置失败' }, { status: 500 });
   }
 }

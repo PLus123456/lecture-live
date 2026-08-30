@@ -1,7 +1,15 @@
 import { Prisma } from '@prisma/client';
+import { randomUUID } from 'crypto';
 import { prisma } from '@/lib/prisma';
 import {
-  getBillableMinutes,
+  CHAT_QUOTA_ARTIFACT_TYPE_LIST,
+  isStoredArtifactBackfillComplete,
+} from '@/lib/storage/storedArtifactLedger';
+import {
+  assertPaymentBenefitAvailable,
+  isPaymentBenefitAvailable,
+} from '@/lib/payment/entitlementAdmission';
+import {
   getNextQuotaResetAt,
   getQuotaCycleStartAt,
   getRemainingTranscriptionMinutes,
@@ -12,7 +20,7 @@ import {
  * 的 tx），让配额窗口校验 + 扣减与外层事务在同一事务里原子提交。
  * PrismaClient 是 TransactionClient 的超集，故 `= prisma` 默认值类型相容。
  */
-type QuotaDbClient = Prisma.TransactionClient;
+export type QuotaDbClient = Prisma.TransactionClient;
 
 type QuotaCheckType = 'transcription_minutes' | 'storage_hours' | 'storage_bytes';
 
@@ -327,6 +335,7 @@ export async function checkQuota(
   userId: string,
   type: QuotaCheckType
 ): Promise<boolean> {
+  if (!(await isPaymentBenefitAvailable(userId))) return false;
   const user = await getQuotaSnapshot(userId);
   if (!user) {
     return false;
@@ -364,19 +373,28 @@ export async function checkQuota(
  *
  * @param db 可选事务客户端。实时 finalize 传入 `$transaction` 的 tx，使"扣减 ⟺ session
  *   置 COMPLETED"在同一事务原子提交（失败一起回滚，杜绝并发/重试双扣或漏扣）。
- * @param opts.sessionId 计费台账锚点（P5-5）。传入则在同一 db/tx 内把本次实扣分钟累加到
- *   `Session.billedMinutes`——不可变追加型台账，口径同 InterpretUsage/SonioxStreamGrant。
- *   对账据此求和而非按当前状态 + 当前倍率重算，于是：改 async 倍率不再追溯全站失真；
- *   完整版转录重跑 N 次（N 笔真扣）不再被对账算成一笔而诱导 admin 退掉 N−1 笔。
- *   用 updateMany（非 update）：会话行可能已被删/不存在，缺行只影响台账、绝不能把扣费整体炸掉。
+ * SEC-030：每次真实 increment 都在同一事务写一笔 TranscriptionCharge。Session.billedMinutes
+ * 继续累加仅为兼容展示/审计；它会随 Session 删除而消失，且只有最后 billedAt，绝不能再作为
+ * 周期对账真源。未传 db 时本函数自行开启事务，避免“counter 已扣、ledger 写失败”的裂缝。
  */
 export async function deductTranscriptionMinutes(
   userId: string,
   minutes: number,
-  db: QuotaDbClient = prisma,
-  opts?: { sessionId?: string }
+  db?: QuotaDbClient,
+  opts?: {
+    sessionId?: string;
+    source?: string;
+    referenceId?: string;
+  }
 ): Promise<UserQuotaSnapshot | null> {
-  const user = await ensureQuotaWindow(userId, new Date(), db);
+  if (!db) {
+    return prisma.$transaction((tx) =>
+      deductTranscriptionMinutes(userId, minutes, tx, opts)
+    );
+  }
+
+  const chargedAt = new Date();
+  const user = await ensureQuotaWindow(userId, chargedAt, db);
   if (!user) {
     return null;
   }
@@ -401,7 +419,17 @@ export async function deductTranscriptionMinutes(
     select: QUOTA_USER_SELECT,
   });
 
-  // P5-5 计费台账：与扣费同 db/tx 累加，保证「扣了 ⟺ 台账记了」不可分。
+  const source = (opts?.source?.trim() || 'unspecified').slice(0, 64);
+  const referenceId = opts?.referenceId ?? opts?.sessionId ?? null;
+  await db.$executeRaw`
+    INSERT INTO TranscriptionCharge
+      (id, userId, source, referenceId, minutes, chargedAt, legacyAmbiguous, createdAt)
+    VALUES
+      (${randomUUID()}, ${userId}, ${source}, ${referenceId}, ${normalizedMinutes},
+       ${chargedAt}, FALSE, ${chargedAt})
+  `;
+
+  // 兼容字段：与扣费同 tx 更新，但对账只读独立逐笔台账。
   if (opts?.sessionId) {
     await db.session.updateMany({
       where: { id: opts.sessionId },
@@ -707,11 +735,10 @@ export async function grantPurchasedMinutes(
 }
 
 /**
- * 对账：按已完成 session 的实际时长重算应扣分钟，与 transcriptionMinutesUsed 比对。
+ * 对账：按当前周期不可变逐笔 charge ledger + 在途预留重建应扣分钟。
  *
- * @param asyncMultiplier 异步上传转录的计费倍率（默认 1）。异步路径按倍率计费
- *   （见 async-transcribe-status 扣费），对账侧必须乘同样倍率，否则会把折扣恒报成 drift。
- *   实时转录始终全额（不乘倍率）。
+ * @param asyncMultiplier 为兼容旧调用签名保留。倍率已在扣费发生时固化到逐笔 ledger，
+ *   对账不得用当前配置追溯重算历史。
  *
  * U15（口径修正）：排除 ADMIN 用户。扣费侧对 ADMIN 恒短路不扣（deduct/reserve 见 role==='ADMIN'
  * 分支），故 ADMIN 的 transcriptionMinutesUsed 恒为 0，而本函数会按其 COMPLETED session 重算出
@@ -733,12 +760,100 @@ export async function grantPurchasedMinutes(
  * 口径（与扣费侧一字一致）计入 expected，消除虚报。完整版扣费是确定性的（由 durationMs 唯一决定），
  * 故无须像 interpret 那样引入台账，直接按 completed 状态重算即可。
  *
- * P5-5 计费台账（本轮）：Session 现有不可变累加列 `billedMinutes`（deduct 时同事务累加）。
- * expected 优先对它求和，**只有** billedMinutes=0 的历史行（该列上线前的数据）才走上面那套重算。
- * 重算口径的两个致命面因此关闭：① 改 async_upload_billing_multiplier 会追溯改变全站 expected
- *（0.8→0.5 全站负 drift，一点「修复」白送已收费用）；② 完整版转录终态可反复触发、每次真扣一笔，
- * 而按 fullTranscribeStatus 重算恒只算一笔 → drift=1−N，admin「修复」会退掉 N−1 笔真实扣费。
+ * SEC-030：Session.billedMinutes 是跨周期累计值而 billedAt 只有最后一次时间；把它按 billedAt
+ * 归期会把上周期分钟重复算进本周期。现在只汇总 TranscriptionCharge 的独立 chargedAt 事件。
+ * 升级切换写入的 legacyAmbiguous opening balance 只用于守恒展示；只要仍落在当前周期，管理员
+ * 自动修复必须 fail-closed，因为存量累计数无法可靠拆期。
  */
+export interface TranscriptionReconciliationUser {
+  id: string;
+  email: string;
+  transcriptionMinutesUsed: number;
+  quotaResetAt: Date | null;
+  transcriptionUsageReconcileFrom: Date | null;
+}
+
+export interface TranscriptionUsageReconciliation {
+  id: string;
+  email: string;
+  recordedMinutes: number;
+  transcriptionMinutesUsed: number;
+  driftMinutes: number;
+  hasAmbiguousCharges: boolean;
+}
+
+/**
+ * Rebuild one user's current transcription counter from the surviving charge ledger plus every
+ * still-live reservation. Callers repairing a counter must invoke this with their transaction
+ * client *after* locking the User row: every reservation/settlement also updates that row, so the
+ * lock closes the otherwise exploitable snapshot/repair window without taking Session locks in the
+ * opposite order.
+ *
+ * TranscriptionCharge is independent of user-deletable Session rows, so an exact-window result is
+ * authoritative in both directions. During the legacy cutover window `hasAmbiguousCharges` forces
+ * the admin repair boundary to fail closed instead of guessing how a cumulative Session total
+ * should be split across periods.
+ */
+export async function calculateTranscriptionUsageReconciliation(
+  user: TranscriptionReconciliationUser,
+  _asyncMultiplier = 1,
+  db: QuotaDbClient = prisma
+): Promise<TranscriptionUsageReconciliation> {
+  void _asyncMultiplier;
+  const monthCycleStart = getQuotaCycleStartAt(user.quotaResetAt);
+  const cycleStart =
+    user.transcriptionUsageReconcileFrom &&
+    user.transcriptionUsageReconcileFrom > monthCycleStart
+      ? user.transcriptionUsageReconcileFrom
+      : monthCycleStart;
+
+  type ChargeAggregate = {
+    totalMinutes: bigint | number | string | null;
+    ambiguousCount: bigint | number | string | null;
+  };
+  const chargeRows = await db.$queryRaw<ChargeAggregate[]>`
+    SELECT
+      COALESCE(SUM(minutes), 0) AS totalMinutes,
+      COALESCE(SUM(CASE WHEN legacyAmbiguous THEN 1 ELSE 0 END), 0) AS ambiguousCount
+    FROM TranscriptionCharge
+    WHERE userId = ${user.id} AND chargedAt >= ${cycleStart}
+  `;
+  const chargeMinutes = Number(chargeRows[0]?.totalMinutes ?? 0);
+  const hasAmbiguousCharges = Number(chargeRows[0]?.ambiguousCount ?? 0) > 0;
+
+  // SEC-030: reservations are already reflected in User.transcriptionMinutesUsed.  Omitting them
+  // made a healthy in-flight task look like negative drift and let an administrator erase its
+  // reservation.  Settlement would subsequently release the same amount a second time.
+  const [sessionReservations, grantReservations] = await Promise.all([
+    db.session.aggregate({
+      where: {
+        userId: user.id,
+        OR: [{ asyncReservedMinutes: { gt: 0 } }, { fullReservedMinutes: { gt: 0 } }],
+      },
+      _sum: { asyncReservedMinutes: true, fullReservedMinutes: true },
+    }),
+    db.sonioxStreamGrant.aggregate({
+      where: { userId: user.id, settledAt: null, reservedMinutes: { gt: 0 } },
+      _sum: { reservedMinutes: true },
+    }),
+  ]);
+
+  const recordedMinutes =
+    chargeMinutes +
+    (sessionReservations._sum.asyncReservedMinutes ?? 0) +
+    (sessionReservations._sum.fullReservedMinutes ?? 0) +
+    (grantReservations._sum.reservedMinutes ?? 0);
+
+  return {
+    id: user.id,
+    email: user.email,
+    recordedMinutes,
+    transcriptionMinutesUsed: user.transcriptionMinutesUsed,
+    driftMinutes: recordedMinutes - user.transcriptionMinutesUsed,
+    hasAmbiguousCharges,
+  };
+}
+
 export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
   const users = await prisma.user.findMany({
     where: {
@@ -755,138 +870,69 @@ export async function reconcileTranscriptionUsage(asyncMultiplier = 1) {
   });
 
   const results = await Promise.all(
-    users.map(async (user) => {
-      const monthCycleStart = getQuotaCycleStartAt(user.quotaResetAt);
-      // Q_MED：限额下调结算会在周期中途把 used 归零并记 transcriptionUsageReconcileFrom；用它作为
-      // 对账下界（取较晚者），排除结算前已计费的 session，避免虚报 drift。正常情况下该列为空或早于
-      // 月对齐的 cycleStart，max 使其无影响；月度重置后 cycleStart 自然越过它而失效（无需清列）。
-      const cycleStart =
-        user.transcriptionUsageReconcileFrom &&
-        user.transcriptionUsageReconcileFrom > monthCycleStart
-          ? user.transcriptionUsageReconcileFrom
-          : monthCycleStart;
-
-      const sessions = await prisma.session.findMany({
-        where: {
-          userId: user.id,
-          status: 'COMPLETED',
-          // B7：按扣费时刻(billedAt)归期，而非 createdAt。跨月/延迟收尾/自动回收的会话，扣费落在
-          // finalize 时的配额窗口(ensureQuotaWindow 按 quotaResetAt)，用 createdAt 归期会把它算错周期、
-          // 虚报 drift。billedAt 为空(未扣费/ADMIN/pre-B7 老数据)时回退 createdAt，保持旧行为。
-          OR: [
-            { billedAt: { gte: cycleStart } },
-            { billedAt: null, createdAt: { gte: cycleStart } },
-          ],
-        },
-        select: {
-          durationMs: true,
-          billedMinutes: true,
-          asyncTranscribeStatus: true,
-          fullTranscribeStatus: true,
-        },
-      });
-
-      const sessionMinutes = sessions.reduce((total, session) => {
-        // P5-5：有台账就认台账（不可变、扣多少记多少），只有 billedMinutes=0 的历史行才回退重算。
-        // 重算口径读的是**当前**状态与**当前**倍率，故倍率一改即全站追溯失真、完整版重跑 N 次只算一笔。
-        if (session.billedMinutes > 0) {
-          return total + session.billedMinutes;
-        }
-        if (!session.durationMs || session.durationMs <= 0) {
-          return total;
-        }
-        const billable = getBillableMinutes(session.durationMs);
-        // 异步上传转录（asyncTranscribeStatus 非空）按倍率，实时转录全额。
-        // 与扣费侧 ceil(分钟×倍率) 完全一致，保证折扣不被误报为 drift。
-        const transcribeCharged =
-          session.asyncTranscribeStatus != null
-            ? Math.ceil(billable * asyncMultiplier)
-            : billable;
-        // 完整版补全转录（fullTranscribeStatus==='completed'）是叠加在实时/异步转录之上的
-        // 额外一笔扣费，口径 ceil(分钟×倍率)，与 fullTranscribeFinalize 扣费侧一字一致（B6）。
-        // 未完成态（transcribing/finalizing/pending/failed 等）尚未扣费，计 0。
-        const fullCharged =
-          session.fullTranscribeStatus === 'completed'
-            ? Math.ceil(billable * asyncMultiplier)
-            : 0;
-        return total + transcribeCharged + fullCharged;
-      }, 0);
-
-      // 同传用量：当前对账周期内该用户已扣的 interpret 分钟之和（口径与扣费侧一字一致，
-      // 直接对已落库的 billedMinutes 求和；不做倍率——interpret 恒全额扣，无异步折扣）。
-      // 周期窗口与 Session 侧一致：chargedAt >= cycleStart。
-      const interpretAgg = await prisma.interpretUsage.aggregate({
-        where: {
-          userId: user.id,
-          chargedAt: { gte: cycleStart },
-        },
-        _sum: { billedMinutes: true },
-      });
-      const interpretMinutes = interpretAgg._sum.billedMinutes ?? 0;
-
-      // R1-L2：usage cron 经 grant 直接补扣的分钟（孤儿转扣/迟到补扣）不走 Session 也不走
-      // InterpretUsage，台账就是 grant 行本身（billedMinutes，settledAt=扣费时刻）。不计入则凡被
-      // 兜底扣过的用户恒报负 drift、按报表「修复」会把真实扣费退掉（B6 同款教训）。周期口径一致：
-      // settledAt >= cycleStart。
-      const grantAgg = await prisma.sonioxStreamGrant.aggregate({
-        where: {
-          userId: user.id,
-          settledAt: { gte: cycleStart },
-          billedMinutes: { gt: 0 },
-        },
-        _sum: { billedMinutes: true },
-      });
-      const grantMinutes = grantAgg._sum.billedMinutes ?? 0;
-
-      const expectedMinutes = sessionMinutes + interpretMinutes + grantMinutes;
-
-      return {
-        id: user.id,
-        email: user.email,
-        recordedMinutes: expectedMinutes,
-        transcriptionMinutesUsed: user.transcriptionMinutesUsed,
-        driftMinutes: expectedMinutes - user.transcriptionMinutesUsed,
-      };
-    })
+    users.map((user) => calculateTranscriptionUsageReconciliation(user, asyncMultiplier))
   );
 
-  return results.filter((entry) => entry.driftMinutes !== 0);
+  return results
+    .filter((entry) => entry.driftMinutes !== 0)
+    .map(({ hasAmbiguousCharges, ...entry }) => {
+      void hasAmbiguousCharges;
+      return entry;
+    });
 }
 
 /**
- * 字节配额对账：用 ChatAttachment 的真实 SUM(bytes) 回写每个用户的 storageBytesUsed。
+ * 字节配额对账：只从统一 StoredArtifact 真源重建。
  *
- * 与转录对账（只记录差异、不自动修）不同，字节用量完全由 ChatAttachment 行决定、是确定性的，
- * 因此这里直接回写自愈：删录音漏扣 / 上传中断漏扣 / 并发偏差等都会被校准。无附件的用户若残留
- * 非零计数也会被清零。返回检查与修正的用户数。
+ * 回填 marker 完成前必须拒绝回写：Session/录音/抽取文本/内联图的历史字节并不全在
+ * ChatAttachment.bytes 里，旧实现因此会把已收费录音直接抹为 0。完成回填后，每个用户在
+ * FOR UPDATE 锁下重算 chargedBytes；新预留也必须更新同一 User 行，所以无法在 SUM 与回写之间
+ * 插入一笔看不到的在途预留。
  */
 export async function reconcileStorageBytes(): Promise<{
   checked: number;
   corrected: number;
+  skipped?: boolean;
 }> {
-  const sums = await prisma.chatAttachment.groupBy({
-    by: ['userId'],
-    _sum: { bytes: true },
-  });
-  const sumByUser = new Map<string, bigint>();
-  for (const row of sums) {
-    sumByUser.set(row.userId, row._sum.bytes ?? BigInt(0));
+  if (!(await isStoredArtifactBackfillComplete())) {
+    return { checked: 0, corrected: 0, skipped: true };
   }
 
   const users = await prisma.user.findMany({
-    select: { id: true, storageBytesUsed: true },
+    select: { id: true },
   });
 
   let corrected = 0;
   for (const user of users) {
-    const actual = sumByUser.get(user.id) ?? BigInt(0);
-    if (actual !== user.storageBytesUsed) {
-      await prisma.user.update({
+    corrected += await prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ storageBytesUsed: bigint }>>`
+        SELECT storageBytesUsed
+        FROM User
+        WHERE id = ${user.id}
+        FOR UPDATE
+      `;
+      if (locked.length !== 1) return 0;
+
+      // 只重建「chat 文件」这一维：storageBytesUsed/storageBytesLimit 的口径就是
+      // chat_files_quota_*_mb。录音/转录/草稿虽然同样进账本（对账与孤儿清理需要），
+      // 但归 storageHoursLimit 管；把它们算进来会让 FREE 用户 100MB 的 chat 额度
+      // 被一场讲座直接吃满。见 CHAT_QUOTA_ARTIFACT_TYPES。
+      const sums = await tx.$queryRaw<Array<{ actual: bigint | null }>>`
+        SELECT SUM(chargedBytes) AS actual
+        FROM StoredArtifact
+        WHERE userId = ${user.id}
+          AND chargedBytes > 0
+          AND artifactType IN (${Prisma.join([...CHAT_QUOTA_ARTIFACT_TYPE_LIST])})
+      `;
+      const actual = sums[0]?.actual ?? BigInt(0);
+      if (actual === locked[0].storageBytesUsed) return 0;
+
+      await tx.user.update({
         where: { id: user.id },
         data: { storageBytesUsed: actual },
       });
-      corrected += 1;
-    }
+      return 1;
+    });
   }
   return { checked: users.length, corrected };
 }
@@ -951,6 +997,9 @@ export async function reserveStorageMinutes(
   sessionId: string,
   estimatedMinutes: number
 ): Promise<{ ok: boolean; remaining: number }> {
+  if (!(await isPaymentBenefitAvailable(userId))) {
+    return { ok: false, remaining: 0 };
+  }
   const user = await getQuotaSnapshot(userId);
   if (!user) {
     return { ok: false, remaining: 0 };
@@ -1051,21 +1100,23 @@ export async function reserveStorageBytes(
   userId: string,
   bytes: number
 ): Promise<boolean> {
-  const user = await ensureQuotaWindow(userId);
-  if (!user) return false;
-  if (user.role === 'ADMIN') return true;
+  return prisma.$transaction(async (tx) => {
+    await assertPaymentBenefitAvailable(userId, tx, { lockUser: true });
+    const user = await ensureQuotaWindow(userId, new Date(), tx);
+    if (!user) return false;
+    if (user.role === 'ADMIN') return true;
 
-  const normalized = normalizeNonNegativeAmount(bytes);
-  if (normalized <= 0) return true;
+    const normalized = normalizeNonNegativeAmount(bytes);
+    if (normalized <= 0) return true;
 
-  // 条件原子扣减：仅当扣减后不超过 limit 才更新。affectedRows=1 表示预留成功。
-  const affected = await prisma.$executeRaw`
-    UPDATE User
-    SET storageBytesUsed = storageBytesUsed + ${BigInt(normalized)}
-    WHERE id = ${userId}
-      AND storageBytesUsed + ${BigInt(normalized)} <= storageBytesLimit
-  `;
-  return affected === 1;
+    const affected = await tx.$executeRaw`
+      UPDATE User
+      SET storageBytesUsed = storageBytesUsed + ${BigInt(normalized)}
+      WHERE id = ${userId}
+        AND storageBytesUsed + ${BigInt(normalized)} <= storageBytesLimit
+    `;
+    return affected === 1;
+  });
 }
 
 /**
@@ -1113,6 +1164,12 @@ export async function reserveTranscriptionMinutes(
   minutes: number,
   db: QuotaDbClient = prisma
 ): Promise<boolean> {
+  if (db === prisma) {
+    return prisma.$transaction((tx) =>
+      reserveTranscriptionMinutes(userId, minutes, tx)
+    );
+  }
+  await assertPaymentBenefitAvailable(userId, db, { lockUser: true });
   const user = await ensureQuotaWindow(userId, new Date(), db);
   if (!user) return false;
   if (user.role === 'ADMIN') return true;
@@ -1156,6 +1213,7 @@ export async function reserveTranscriptionMinutesUpTo(
   maxMinutes: number,
   tx: QuotaDbClient
 ): Promise<ShrinkReservationResult | null> {
+  await assertPaymentBenefitAvailable(userId, tx, { lockUser: true });
   const user = await ensureQuotaWindow(userId, new Date(), tx);
   if (!user) return null;
   if (user.role === 'ADMIN') {

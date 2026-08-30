@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * U10 — /chat 路由 + Claude 式起聊首页烟测（对齐 PR#169/#170 重构）。
@@ -60,12 +60,12 @@ test.beforeEach(async ({ page }) => {
     }
 
     if (p === '/api/auth/login' && method === 'POST') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
 
     // 整页导航到 /chat 后 token 不在内存，靠 refresh 从 HttpOnly cookie 恢复会话。
-    if (p === '/api/auth/refresh' && method === 'GET') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
 
     if (p === '/api/users/quota') return fulfillJson(route, quotaPayload);

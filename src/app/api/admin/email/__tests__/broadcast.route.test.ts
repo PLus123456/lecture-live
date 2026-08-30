@@ -8,25 +8,33 @@ import { createJsonRequest, readJson } from '../../../../../../tests/utils/http'
 const {
   requireAdminAccessMock,
   getSiteSettingsMock,
-  logActionMock,
   findBroadcastRecipientsMock,
   runBroadcastMock,
   sendGenericNotificationEmailMock,
+  trackJobMock,
+  writeSecurityAuditMock,
+  getSecurityAuditRequestIdMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
-  logActionMock: vi.fn(),
   findBroadcastRecipientsMock: vi.fn(),
   runBroadcastMock: vi.fn(),
   sendGenericNotificationEmailMock: vi.fn(),
+  trackJobMock: vi.fn(),
+  writeSecurityAuditMock: vi.fn(),
+  getSecurityAuditRequestIdMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({ requireAdminAccess: requireAdminAccessMock }));
 vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: getSiteSettingsMock }));
-vi.mock('@/lib/auditLog', () => ({ logAction: logActionMock }));
-vi.mock('@/lib/logger', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-  serializeError: (e: unknown) => e,
+vi.mock('@/lib/securityAudit', () => ({
+  writeSecurityAudit: writeSecurityAuditMock,
+  getSecurityAuditRequestId: getSecurityAuditRequestIdMock,
+}));
+vi.mock('@/lib/jobQueue', () => ({
+  JOB_TYPE: { ADMIN_INTEGRATION: 'admin_integration' },
+  JOB_STATUS: { SUCCESS: 'SUCCESS', FAILED: 'FAILED' },
+  trackJob: trackJobMock,
 }));
 vi.mock('@/lib/email', () => ({
   sendGenericNotificationEmail: sendGenericNotificationEmailMock,
@@ -76,6 +84,33 @@ describe('POST /api/admin/email/broadcast', () => {
     });
     runBroadcastMock.mockResolvedValue({ sent: 2, skipped: 0, failed: 0 });
     sendGenericNotificationEmailMock.mockResolvedValue({ ok: true });
+    getSecurityAuditRequestIdMock.mockReturnValue('server-request-id');
+    writeSecurityAuditMock.mockResolvedValue({
+      requestId: 'server-request-id',
+      action: 'admin.security.email.test',
+    });
+    trackJobMock.mockImplementation(
+      async (
+        options: {
+          terminalMutation?: (
+            tx: unknown,
+            terminal: { status: string; result?: unknown; error?: unknown }
+          ) => Promise<void>;
+        },
+        operation: () => Promise<unknown>
+      ) => {
+        const tx = { auditLog: {} };
+        let result: unknown;
+        try {
+          result = await operation();
+        } catch (error) {
+          await options.terminalMutation?.(tx, { status: 'FAILED', error });
+          throw error;
+        }
+        await options.terminalMutation?.(tx, { status: 'SUCCESS', result });
+        return result;
+      }
+    );
   });
 
   // 群发不可撤回：请求体没写 mode 就绝不能发出去。
@@ -88,6 +123,14 @@ describe('POST /api/admin/email/broadcast', () => {
     expect(body.recipientCount).toBe(2);
     expect(runBroadcastMock).not.toHaveBeenCalled();
     expect(sendGenericNotificationEmailMock).not.toHaveBeenCalled();
+    expect(writeSecurityAuditMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        event: 'email.broadcast_preview',
+        outcome: 'SUCCESS',
+        requestId: 'server-request-id',
+      })
+    );
   });
 
   it('未知 mode 同样退化成预览而不是发送', async () => {
@@ -97,19 +140,32 @@ describe('POST /api/admin/email/broadcast', () => {
     expect(runBroadcastMock).not.toHaveBeenCalled();
   });
 
-  it('mode=send 才真正派发，且不阻塞响应', async () => {
-    // 派发任务永不 resolve：若路由 await 了它，这里会挂到超时
-    runBroadcastMock.mockReturnValue(new Promise(() => {}));
-
+  it('mode=send 先建立 durable journal，再 await 派发与终态审计', async () => {
     const res = await post({ ...VALID, mode: 'send' });
     const body = await readJson<Record<string, unknown>>(res);
 
     expect(res.status).toBe(200);
     expect(body.dispatched).toBe(2);
     expect(runBroadcastMock).toHaveBeenCalledTimes(1);
-    expect(logActionMock).toHaveBeenCalledWith(
+    expect(trackJobMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'admin_integration',
+        triggeredBy: 'admin:admin-1',
+        params: expect.objectContaining({
+          operation: 'email_broadcast',
+          requestId: 'server-request-id',
+        }),
+        errorSummary: expect.any(Function),
+        terminalMutation: expect.any(Function),
+      }),
+      expect.any(Function)
+    );
+    expect(writeSecurityAuditMock).toHaveBeenCalledWith(
       expect.anything(),
-      'admin.email.broadcast.send',
+      expect.objectContaining({
+        event: 'email.broadcast',
+        outcome: 'SUCCESS',
+      }),
       expect.anything()
     );
   });
@@ -125,6 +181,45 @@ describe('POST /api/admin/email/broadcast', () => {
     });
     expect(findBroadcastRecipientsMock).not.toHaveBeenCalled();
     expect(runBroadcastMock).not.toHaveBeenCalled();
+  });
+
+  it('preview 安全审计失败时返回 500 且不泄露收件人数', async () => {
+    writeSecurityAuditMock.mockRejectedValueOnce(new Error('audit unavailable'));
+
+    const res = await post(VALID);
+
+    expect(res.status).toBe(500);
+  });
+
+  it('durable params 与结构化审计不保存正文、凭据或 CTA query', async () => {
+    const sensitive = {
+      ...VALID,
+      mode: 'send',
+      subject: 'private-subject-value',
+      bodyText: 'private-body-value',
+      cta: {
+        url: 'https://example.com/path?api_key=super-secret-value',
+        label: 'private-label-value',
+      },
+    };
+
+    const res = await post(sensitive);
+
+    expect(res.status).toBe(200);
+    const persisted = JSON.stringify({
+      journal: trackJobMock.mock.calls[0]?.[0],
+      audits: writeSecurityAuditMock.mock.calls.map((call) => call[1]),
+    });
+    expect(persisted).not.toContain('private-subject-value');
+    expect(persisted).not.toContain('private-body-value');
+    expect(persisted).not.toContain('private-label-value');
+    expect(persisted).not.toContain('api_key');
+    expect(persisted).not.toContain('super-secret-value');
+    expect(
+      trackJobMock.mock.calls[0]?.[0].errorSummary(
+        new Error('smtp body api_key=super-secret-value')
+      )
+    ).toBe('EmailBroadcastError');
   });
 
   it('非法分类被拒（不能借此绕开偏好体系发事务类邮件）', async () => {

@@ -14,6 +14,9 @@ const { shareLinkFindUniqueMock, shareLinkFindManyMock, verifyAuthTokenMock } =
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
+    // 产物账本（StoredArtifact）走 $queryRaw：不桩它的话草稿/产物解析会抛，
+    // 快照回填被整段吞成空盘态。返回空数组 = 没有账本行 → 回退 legacy 路径。
+    $queryRaw: vi.fn(async () => []),
     shareLink: {
       findUnique: shareLinkFindUniqueMock,
       findMany: shareLinkFindManyMock,

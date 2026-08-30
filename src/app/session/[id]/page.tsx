@@ -10,6 +10,7 @@ import SettingsDrawer from '@/components/SettingsDrawer';
 import ExportModal from '@/components/ExportModal';
 import MobileSessionLayout from '@/components/mobile/MobileSessionLayout';
 import LiveShareBadge from '@/components/session/LiveShareBadge';
+import SessionAuthRecovery from '@/components/session/SessionAuthRecovery';
 import { useI18n } from '@/lib/i18n';
 import { mergeSessionTerms } from '@/lib/keywords/sessionTerms';
 import {
@@ -23,7 +24,12 @@ import {
 import { summaryBlocksToResponses } from '@/lib/summary';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSettingsStore } from '@/stores/settingsStore';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+  useAuthStore,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
 import { useAuth } from '@/hooks/useAuth';
 import {
   useTranscriptStore,
@@ -375,7 +381,7 @@ export default function ActiveSessionPage() {
   const isMobile = useIsMobile();
   const { t } = useI18n();
 
-  const { restoreSession } = useAuth();
+  const { restoreSession, sessionChecked: authSessionChecked } = useAuth();
   const user = useAuthStore((s) => s.user);
   const token = useAuthStore((s) => s.token);
   const cachedQuotas = useAuthStore((s) => s.quotas);
@@ -453,6 +459,7 @@ export default function ActiveSessionPage() {
     if (!token) {
       return null;
     }
+    const expected = getAuthBoundarySnapshot();
 
     try {
       const response = await fetch('/api/users/quota', {
@@ -468,9 +475,14 @@ export default function ActiveSessionPage() {
         return null;
       }
 
-      setQuotaSnapshot(data.quotas);
-      useAuthStore.getState().setQuotas(data.quotas);
-      return data.quotas;
+      const committed = await runAuthBoundaryCommit(expected, () => {
+        const accepted = useAuthStore
+          .getState()
+          .setQuotas(data.quotas as UserQuotas, { expected });
+        if (accepted) setQuotaSnapshot(data.quotas as UserQuotas);
+        return accepted;
+      });
+      return committed.committed && committed.value ? data.quotas : null;
     } catch {
       return null;
     }
@@ -539,37 +551,10 @@ export default function ActiveSessionPage() {
   const quotaWarningShownRef = useRef(false);
   const quotaLimitReachedRef = useRef(false);
   const maxDurationReachedRef = useRef(false);
-  const restoreAttemptedRef = useRef(false);
-  const restoreInFlightRef = useRef(false);
 
   // v2.1: Route guard — redirect COMPLETED/ARCHIVED sessions to playback view
   const [sessionChecked, setSessionChecked] = useState(false);
   const [backendStatus, setBackendStatus] = useState<string | null>(null);
-  useEffect(() => {
-    if (user && token) return;
-    // restoreSession 正在进行中：StrictMode 双调用或快速重渲染时，不能误跳 /login
-    if (restoreInFlightRef.current) return;
-    if (!restoreAttemptedRef.current) {
-      restoreAttemptedRef.current = true;
-      restoreInFlightRef.current = true;
-      restoreSession().then((ok) => {
-        restoreInFlightRef.current = false;
-        if (!ok) {
-          // zustand persist 可能已经水合了 token，再次检查
-          const { user: u, token: t } = useAuthStore.getState();
-          if (!u || !t) {
-            router.replace('/login');
-          }
-        }
-      });
-      return;
-    }
-    // 同样 double-check，避免水合延迟导致误跳
-    const { user: u, token: t } = useAuthStore.getState();
-    if (!u || !t) {
-      router.replace('/login');
-    }
-  }, [user, token, router, restoreSession]);
 
   // M19：本页面当前绑定的 sessionId 的**最新值**。App Router 下 /session/A → /session/B
   // 属同一动态段，页面组件实例被复用、只重跑 effect，所有异步回调里的 `sessionId` 都是
@@ -946,6 +931,8 @@ export default function ActiveSessionPage() {
     if (recoveryMode !== 'finalizing') return;
     // 如果是当前录制触发的 finalize，不重复处理（handleStopWithFinalization 会自行跳转）
     if (isFinalizingRef.current) return;
+    const ownerBoundary = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
 
     // 说明是刷新后检测到的 FINALIZING — 显示 finalize 遮罩并轮询
     isFinalizingRef.current = true;
@@ -957,6 +944,8 @@ export default function ActiveSessionPage() {
     ]);
 
     let retried = false;
+    let disposed = false;
+    let navigationTimer: ReturnType<typeof setTimeout> | null = null;
     const poll = setInterval(async () => {
       try {
         const res = await fetch(`/api/sessions/${sessionId}`, {
@@ -964,23 +953,37 @@ export default function ActiveSessionPage() {
         });
         if (!res.ok) return;
         const data = await res.json();
+        if (disposed || ownerSignal.aborted) return;
         if (data.status === 'COMPLETED' || data.status === 'ARCHIVED') {
-          clearInterval(poll);
-          setFinalizingSteps([
-            { label: t('session.finalizing.stepStop'), status: 'done' },
-            { label: t('session.finalizing.stepSync'), status: 'done' },
-            { label: t('session.finalizing.stepFinalize'), status: 'done' },
-          ]);
-          // 清除本地缓存
-          try {
-            sessionStorage.removeItem('lecture-live-transcript');
-            sessionStorage.removeItem('lecture-live-translations');
-            sessionStorage.removeItem('lecture-live-summary');
-          } catch { /* silent */ }
-          // finalized=1：告知回放页刚收尾完成，报告/标题正由后台生成，乐观显示「生成中」并轮询刷新
-          setTimeout(() => router.push(`/session/${sessionId}/playback?finalized=1`), 600);
+          await runAuthBoundaryCommit(ownerBoundary, () => {
+            if (disposed || ownerSignal.aborted) return;
+            clearInterval(poll);
+            setFinalizingSteps([
+              { label: t('session.finalizing.stepStop'), status: 'done' },
+              { label: t('session.finalizing.stepSync'), status: 'done' },
+              { label: t('session.finalizing.stepFinalize'), status: 'done' },
+            ]);
+            // 清除本地缓存
+            try {
+              sessionStorage.removeItem('lecture-live-transcript');
+              sessionStorage.removeItem('lecture-live-translations');
+              sessionStorage.removeItem('lecture-live-summary');
+            } catch { /* silent */ }
+            // 导航定时器本身也必须复验 owner；600ms 内切 B 不能再跳 A 回放。
+            navigationTimer = setTimeout(() => {
+              void runAuthBoundaryCommit(ownerBoundary, () => {
+                if (!disposed && !ownerSignal.aborted) {
+                  router.push(`/session/${sessionId}/playback?finalized=1`);
+                }
+              });
+            }, 600);
+          });
         } else if (data.status === 'FINALIZING' && !retried) {
           // 可能 finalize 请求被刷新中断 — 超时后自动重试一次
+          const current = await runAuthBoundaryCommit(ownerBoundary, () =>
+            !disposed && !ownerSignal.aborted
+          );
+          if (!current.committed || !current.value) return;
           retried = true;
           fetch(`/api/sessions/${sessionId}/finalize`, {
             method: 'POST',
@@ -988,10 +991,24 @@ export default function ActiveSessionPage() {
             body: JSON.stringify({}),
           }).catch(() => { /* server-side draft 是主要数据源，空 body 即可 */ });
         }
-      } catch { /* 网络错误 — 继续轮询 */ }
+      } catch (error) {
+        if (
+          error &&
+          typeof error === 'object' &&
+          'name' in error &&
+          error.name === 'AbortError'
+        ) {
+          clearInterval(poll);
+        }
+        // 其他网络错误 — 继续轮询
+      }
     }, 3000);
 
-    return () => clearInterval(poll);
+    return () => {
+      disposed = true;
+      clearInterval(poll);
+      if (navigationTimer) clearTimeout(navigationTimer);
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionChecked, token, sessionId, recoveryMode]);
 
@@ -1348,6 +1365,16 @@ export default function ActiveSessionPage() {
 
   // v2.2: 服务端 finalize — 客户端只负责停止录音 + 发信号，服务端从 draft 完成所有持久化
   const handleStopWithFinalization = useCallback(async () => {
+    const ownerBoundary = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
+    const assertOwner = async () => {
+      const checked = await runAuthBoundaryCommit(ownerBoundary, () =>
+        !ownerSignal.aborted
+      );
+      if (!checked.committed || !checked.value) {
+        throw new DOMException('Auth boundary changed', 'AbortError');
+      }
+    };
     setIsFinalizing(true);
     isFinalizingRef.current = true;
     setFinalizingError(null);
@@ -1374,6 +1401,7 @@ export default function ActiveSessionPage() {
       // ── Step 1: 停止 Soniox 和本地录音 ──
       await syncSessionStatus('FINALIZING');
       await stopRecording();
+      await assertOwner();
       steps[0].status = 'done';
       steps[1].status = 'active';
       setFinalizingSteps([...steps]);
@@ -1408,25 +1436,30 @@ export default function ActiveSessionPage() {
       } catch (err) {
         console.warn('Final transcript draft flush failed before seal:', err);
       }
+      await assertOwner();
 
       // 转录已落库后再密封音频 draft —— 二者不再竞争 sealed 标志。
       // 音频分片是否已完整补传到服务端 —— 决定停止后能否安全清本地 IndexedDB 音频。
       // finalizeRemoteDraft 用「集合包含 [0..maxSeq]」判定完整性；补传不完整（持续 429/断网/
       // leading gap）时返回 false（审计 P0-5）。
       const audioDraftComplete = (await finalizeRemoteDraft().catch(() => false)) === true;
+      await assertOwner();
 
       // P0-5 契约2：音频未完整补传时**绝不**把会话置终态（POST /finalize 会 COMPLETED）——
       // 终态后草稿 finalize 一律被拒，本地虽仍存完整副本却再无入口补传，等同不可恢复。
       // 改为：中止收尾、回到 paused、保留本地 IndexedDB 与 sessionStorage，暴露「重试保存」入口
       // （hasPendingSave 由 finalizingError 驱动），让用户在网络恢复后重新收尾补齐尾部音频。
       if (!audioDraftComplete) {
-        steps[1].status = 'error';
-        setFinalizingSteps([...steps]);
-        const store = useTranscriptStore.getState();
-        store.setRecordingState('paused');
-        isFinalizingRef.current = false;
-        setIsFinalizing(false);
-        setFinalizingError(t('session.finalizing.audioIncomplete'));
+        await runAuthBoundaryCommit(ownerBoundary, () => {
+          if (ownerSignal.aborted) return;
+          steps[1].status = 'error';
+          setFinalizingSteps([...steps]);
+          const store = useTranscriptStore.getState();
+          store.setRecordingState('paused');
+          isFinalizingRef.current = false;
+          setIsFinalizing(false);
+          setFinalizingError(t('session.finalizing.audioIncomplete'));
+        });
         console.warn(
           'Audio draft incomplete at stop; aborting session finalize to avoid ' +
             'terminal lock, keeping local chunks for retry'
@@ -1452,6 +1485,7 @@ export default function ActiveSessionPage() {
         }),
       });
       const finalizeBody = await finalizeRes.json().catch(() => ({}));
+      await assertOwner();
       const outcome = resolveFinalizeOutcome(finalizeRes.ok, finalizeBody);
 
       if (outcome.kind === 'error') {
@@ -1462,16 +1496,19 @@ export default function ActiveSessionPage() {
         // 会话已在本客户端之外被收尾（服务端 reclaimStaleSessions 回收 / 另一标签抢先）。
         // 本次带上的 segments/音频未被服务端采纳 —— 本地缓存可能是唯一完整副本，绝不清空。
         // 给出专门提示、保留 sessionStorage 与 IndexedDB 音频，不跳回放（避免用户以为正常）。
-        steps[2].status = 'done';
-        setFinalizingSteps([...steps]);
-        clearPendingSessionTerms();
-        const store = useTranscriptStore.getState();
-        store.setConnectionState('error');
-        store.setRecordingState('paused');
-        isFinalizingRef.current = false;
-        setIsFinalizing(false); // 收起收尾遮罩，否则会常驻盖住页面
-        setSessionReclaimed(true);
-        setFinalizingError(t('session.finalizing.staleCompleted'));
+        await runAuthBoundaryCommit(ownerBoundary, () => {
+          if (ownerSignal.aborted) return;
+          steps[2].status = 'done';
+          setFinalizingSteps([...steps]);
+          clearPendingSessionTerms();
+          const store = useTranscriptStore.getState();
+          store.setConnectionState('error');
+          store.setRecordingState('paused');
+          isFinalizingRef.current = false;
+          setIsFinalizing(false); // 收起收尾遮罩，否则会常驻盖住页面
+          setSessionReclaimed(true);
+          setFinalizingError(t('session.finalizing.staleCompleted'));
+        });
         return;
       }
 
@@ -1480,19 +1517,10 @@ export default function ActiveSessionPage() {
       if (isSharing) {
         await stopSharing(sessionId, { keepForPlayback: true });
       }
-
-      steps[2].status = 'done';
-      setFinalizingSteps([...steps]);
-      clearPendingSessionTerms();
+      await assertOwner();
 
       // 清除本地缓存（已由服务端持久化）。转录随 session finalize body 完整提交，可清；
       // 音频只有在确认完整补传到服务端后才清 IndexedDB，否则保留本地完整副本防尾部丢失。
-      try {
-        sessionStorage.removeItem('lecture-live-transcript');
-        sessionStorage.removeItem('lecture-live-translations');
-        sessionStorage.removeItem('lecture-live-summary');
-        sessionStorage.removeItem('lecture-live-archive-mime');
-      } catch { /* silent */ }
       if (audioDraftComplete) {
         try {
           const { clearAudioChunks } = await import('@/lib/audio/audioChunkStore');
@@ -1504,23 +1532,44 @@ export default function ActiveSessionPage() {
           'Audio draft incomplete at stop; keeping local audio chunks for recovery'
         );
       }
-
-      setTimeout(() => {
-        // finalized=1：回放页据此乐观显示「报告生成中」并轮询后台任务完成后自动刷新报告/标题
-        router.push(`/session/${sessionId}/playback?finalized=1`);
-      }, 800);
+      await assertOwner();
+      await runAuthBoundaryCommit(ownerBoundary, () => {
+        if (ownerSignal.aborted) return;
+        steps[2].status = 'done';
+        setFinalizingSteps([...steps]);
+        clearPendingSessionTerms();
+        try {
+          sessionStorage.removeItem('lecture-live-transcript');
+          sessionStorage.removeItem('lecture-live-translations');
+          sessionStorage.removeItem('lecture-live-summary');
+          sessionStorage.removeItem('lecture-live-archive-mime');
+        } catch { /* silent */ }
+        setTimeout(() => {
+          void runAuthBoundaryCommit(ownerBoundary, () => {
+            // finalized=1：回放页据此乐观显示「报告生成中」并轮询后台任务完成后自动刷新报告/标题
+            router.push(`/session/${sessionId}/playback?finalized=1`);
+          });
+        }, 800);
+      });
     } catch (error) {
-      failFinalization(
-        steps.findIndex((step) => step.status === 'active'),
-        error instanceof Error ? error.message : t('session.finalizing.failed')
-      );
-      // 先把状态落到 paused、再置 isFinalizingRef=false：否则两者之间若发生卸载
-      // (StrictMode 双挂载 / SPA 导航)，cleanup 会在「recordingState 仍是 stopped、
-      // isFinalizingRef 已 false」的窗口里误清全部转录数据（S1 刷新丢状态）。
-      const store = useTranscriptStore.getState();
-      store.setConnectionState('error');
-      store.setRecordingState('paused');
-      isFinalizingRef.current = false;
+      const committed = await runAuthBoundaryCommit(ownerBoundary, () => {
+        if (ownerSignal.aborted) return false;
+        failFinalization(
+          steps.findIndex((step) => step.status === 'active'),
+          error instanceof Error ? error.message : t('session.finalizing.failed')
+        );
+        // 先把状态落到 paused、再置 isFinalizingRef=false：否则两者之间若发生卸载
+        // (StrictMode 双挂载 / SPA 导航)，cleanup 会在「recordingState 仍是 stopped、
+        // isFinalizingRef 已 false」的窗口里误清全部转录数据（S1 刷新丢状态）。
+        const store = useTranscriptStore.getState();
+        store.setConnectionState('error');
+        store.setRecordingState('paused');
+        isFinalizingRef.current = false;
+        return true;
+      });
+      if (!committed.committed || !committed.value) {
+        isFinalizingRef.current = false;
+      }
     }
   }, [
     stopRecording,
@@ -1786,9 +1835,11 @@ export default function ActiveSessionPage() {
 
   if (!user || !token) {
     return (
-      <div className="min-h-[100dvh] flex items-center justify-center bg-cream-50">
-        <div className="text-charcoal-400 text-sm">{t('session.redirectingToLogin')}</div>
-      </div>
+      <SessionAuthRecovery
+        sessionChecked={authSessionChecked}
+        restoreSession={restoreSession}
+        pendingMessage={t('session.redirectingToLogin')}
+      />
     );
   }
 

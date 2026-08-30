@@ -60,6 +60,12 @@ export default {
   auth: {
     signIn: '登录',
     signOut: '退出登录',
+    logoutIncomplete: '安全退出尚未完成',
+    logoutIncompleteDescription:
+      '本机数据已清理，但服务器未能确认令牌已撤销。请在服务恢复后重试。',
+    sessionServiceUnavailable: '登录服务暂时不可用',
+    sessionServiceUnavailableDescription:
+      '当前会话凭据已保留，请在服务恢复后重试。',
     register: '注册',
     createAccount: '创建账户',
     signInToAccount: '登录账户',
@@ -496,6 +502,9 @@ export default {
     orBrowse: '或浏览',
     noKeywords: '暂无关键词',
     noKeywordsDesc: '手动添加或上传文件以提取',
+    keywordLimitReached:
+      '未添加 {count} 个关键词：列表最多 200 项、单项最多 120 个字符，且受总大小限制。',
+    keywordListInvalid: '当前关键词列表超出安全上限，请先删减后再提取。',
     updatingContext: '正在更新 ASR 上下文...',
     injectKeywords: '注入 {count} 个关键词到 ASR',
   },
@@ -1203,6 +1212,10 @@ export default {
     providerNamePlaceholder: '例如：Anthropic',
     apiUrl: 'API URL',
     apiKey: 'API Key',
+    llmApiKeyRequiredOnEndpointChange: '修改 LLM API 地址或协议时必须重新填写 API Key',
+    llmApiKeyRetargetHint: '为防止已保存的密钥被发往新主机，修改 API 地址或协议时必须重填密钥。',
+    llmCurrentPasswordRequired: '新建或改靶 LLM 网关时请输入当前管理员密码',
+    llmCurrentPasswordHint: '新建网关或修改 API 地址、协议时，需要在本次操作中验证当前密码。',
     isAnthropicApi: 'Anthropic 原生 API',
     modelList: '模型列表',
     addModel: '添加模型',
@@ -1335,8 +1348,8 @@ export default {
     jwtExpiryDesc: '登录令牌有效天数',
     bcryptRounds: 'Bcrypt 轮数',
     bcryptRoundsDesc: '密码哈希迭代轮数，数值越高越安全，但登录响应越慢',
-    trustedProxy: '信任反向代理头',
-    trustedProxyDesc: '启用后从 X-Forwarded-For / X-Real-IP 请求头读取真实客户端 IP，部署于 Nginx 等反向代理后时应开启',
+    trustedProxy: '可信代理拓扑（只读）',
+    trustedProxyDesc: '仅由进程启动时的环境变量决定；修改后必须重启 Web 与 WS，旧数据库开关不再生效',
   },
 
   // 语言选项
@@ -1834,6 +1847,8 @@ export default {
     recordingPickerComingSoon: '敬请期待',
     removeRecording: '移除录音',
     removeAttachment: '移除附件',
+    attachmentLlmUnavailable: '不可用于 AI',
+    attachmentSelectionLimited: '本轮已省略 {n} 个超出 AI 限额的附件',
     uploadFailed: '上传失败',
     fileTooLarge: '文件超出大小限制',
     unsupportedFileType: '不支持的文件类型',

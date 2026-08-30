@@ -1,30 +1,107 @@
 import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
-import type { LlmPurpose } from '@/types/llm';
 import { prisma } from '@/lib/prisma';
+import { isPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
 import { callLLMWithHistoryStream, type LLMStreamEvent } from '@/lib/llm/gateway';
 import { resolveGroupBoundModel } from '@/lib/llm/summaryModel';
-import { resolveUserTranslationModelId } from '@/lib/userRoles';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { logger, serializeError } from '@/lib/logger';
+import {
+  ActiveJobBudgetExceededError,
+  ActiveJobConcurrencyExceededError,
+  ActiveJobConflictError,
+  completeActiveJob,
+  failActiveJob,
+  JOB_STATUS,
+  JOB_TYPE,
+} from '@/lib/jobQueue';
+import {
+  claimLlmTokenBudget,
+  trustedLlmUsageTokens,
+} from '@/lib/llm/resourceBudget';
+import {
+  decodeTranslationProxyCache,
+  encodeTranslationProxyCache,
+  parseTranslationProxyRequest,
+  planTranslationProxyRequest,
+  readTranslationProxyJson,
+  translationProxyTaskBudget,
+  TRANSLATION_PROXY_MAX_OUTPUT_TOKENS,
+  TRANSLATION_PROXY_MAX_RESPONSE_UTF8_BYTES,
+  TranslationProxyRequestError,
+  type TranslationProxyCachedResult,
+} from '@/lib/translate/llmProxyAdmission';
 
 const proxyLogger = logger.child({ component: 'translate-llm-proxy' });
+const PROXY_UPSTREAM_TOTAL_TIMEOUT_MS = 5 * 60_000;
 
-/** 单次请求的 messages 总字符硬上限（pdf2zh 单批很小；防滥用者拿代理当免费 LLM） */
-const MAX_PROMPT_CHARS = 120_000;
+function openAiError(
+  message: string,
+  status: number,
+  type = 'server_error',
+  headers?: HeadersInit
+): Response {
+  return NextResponse.json(
+    { error: { message, type } },
+    { status, headers }
+  );
+}
 
-/**
- * L25：任务级**累计** token 预算（纵深防御，需先攻陷 worker 才够得着）。
- *
- * 代理凭据在任务处于 TRANSLATING 期间一直有效，此前除了 900/min 的限速外没有任何总量约束：
- * 单次请求限 120K 字符 × 900 次/分 = 一台被攻陷的 worker 可以拿它当免费 LLM 无限刷，
- * 账单记在站点头上，而用户只按页数付过一次费。
- *
- * 按页数给宽裕预算：pdf2zh 每页正常消耗在几千 token 量级，这里放到 40k/页 + 100k 起步
- * （约正常用量的一个数量级以上），正常任务永远撞不到，被滥用时能兜住。
- */
-const PROXY_TOKEN_BUDGET_BASE = 100_000;
-const PROXY_TOKEN_BUDGET_PER_PAGE = 40_000;
+function completionResponse(
+  taskId: string,
+  stream: boolean,
+  value: TranslationProxyCachedResult
+): Response {
+  const completion = {
+    id: `chatcmpl-${taskId.slice(0, 8)}${Date.now().toString(36)}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: 'lecture-live-gateway',
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: value.text },
+        finish_reason: 'stop',
+      },
+    ],
+    usage: {
+      prompt_tokens: value.inputTokens,
+      completion_tokens: value.outputTokens,
+      total_tokens: value.actualTokens,
+    },
+  };
+  if (!stream) return NextResponse.json(completion);
+
+  const chunk = {
+    id: completion.id,
+    object: 'chat.completion.chunk',
+    created: completion.created,
+    model: completion.model,
+    choices: [
+      {
+        index: 0,
+        delta: { role: 'assistant', content: value.text },
+        finish_reason: null,
+      },
+    ],
+  };
+  const final = {
+    ...chunk,
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    usage: completion.usage,
+  };
+  return new Response(
+    `data: ${JSON.stringify(chunk)}\n\n` +
+      `data: ${JSON.stringify(final)}\n\n` +
+      'data: [DONE]\n\n',
+    {
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+      },
+    }
+  );
+}
 
 /**
  * POST /api/translate/llm-proxy/v1/chat/completions — 文档翻译 worker 的 LLM 回流代理。
@@ -40,45 +117,34 @@ const PROXY_TOKEN_BUDGET_PER_PAGE = 40_000;
  */
 export async function POST(req: Request) {
   const authHeader = req.headers.get('Authorization') ?? '';
-  const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const rawToken = authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7).trim()
+    : '';
   if (!rawToken || rawToken.length < 32) {
-    return NextResponse.json({ error: { message: 'Unauthorized' } }, { status: 401 });
+    return openAiError('Unauthorized', 401);
   }
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   const task = await prisma.translationTask.findUnique({
     where: { proxyTokenHash: tokenHash },
     select: {
       id: true,
+      userId: true,
       status: true,
       modelId: true,
       pageCount: true,
       llmInputTokens: true,
       llmOutputTokens: true,
+      proxyTokenHash: true,
+      proxyGeneration: true,
+      jobQueueId: true,
       user: { select: { role: true, customGroupId: true } },
     },
   });
   if (!task || task.status !== 'TRANSLATING') {
-    return NextResponse.json({ error: { message: 'Unauthorized' } }, { status: 401 });
+    return openAiError('Unauthorized', 401);
   }
-
-  // L25：累计 token 预算闸。llm*Tokens 本来只是「成本可视」的统计列，这里顺带当额度用。
-  const spentTokens = task.llmInputTokens + task.llmOutputTokens;
-  const tokenBudget =
-    PROXY_TOKEN_BUDGET_BASE + Math.max(0, task.pageCount) * PROXY_TOKEN_BUDGET_PER_PAGE;
-  if (spentTokens >= tokenBudget) {
-    proxyLogger.warn(
-      { taskId: task.id, spentTokens, tokenBudget },
-      '翻译代理累计 token 超出任务预算，拒绝继续调用'
-    );
-    return NextResponse.json(
-      {
-        error: {
-          message: 'translation token budget exceeded',
-          type: 'insufficient_quota',
-        },
-      },
-      { status: 429 }
-    );
+  if (!(await isPaymentBenefitAvailable(task.userId))) {
+    return openAiError('payment account frozen', 403, 'account_frozen');
   }
 
   // 防滥用限速（宽松固定 900/min：pdf2zh 侧已有 --qps 限速，这里只挡异常流量）
@@ -90,142 +156,391 @@ export async function POST(req: Request) {
   });
   if (rateLimited) return rateLimited;
 
+  let parsed: ReturnType<typeof parseTranslationProxyRequest>;
   try {
-    const body = await req.json();
-    const rawMessages = Array.isArray(body?.messages) ? body.messages : [];
-    let system = '';
-    const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
-    let totalChars = 0;
-    for (const m of rawMessages) {
-      if (!m || typeof m !== 'object') continue;
-      const role = (m as { role?: unknown }).role;
-      const content = (m as { content?: unknown }).content;
-      const text =
-        typeof content === 'string'
-          ? content
-          : Array.isArray(content)
-            ? content
-                .map((part) =>
-                  part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string'
-                    ? (part as { text: string }).text
-                    : ''
-                )
-                .join('')
-            : '';
-      totalChars += text.length;
-      if (role === 'system') {
-        system = system ? `${system}\n${text}` : text;
-      } else if (role === 'user' || role === 'assistant') {
-        messages.push({ role, content: text });
+    const body = await readTranslationProxyJson(req);
+    parsed = parseTranslationProxyRequest(body);
+  } catch (error) {
+    const message =
+      error instanceof TranslationProxyRequestError
+        ? error.message
+        : 'invalid request body';
+    return openAiError(
+      message,
+      error instanceof TranslationProxyRequestError ? error.status : 400,
+      'invalid_request_error'
+    );
+  }
+
+  // 派发器在签发 worker token 前已持久化 modelId。代理只能使用这一精确 DB
+  // TRANSLATION 模型；缺失/删除/改用途/查询失败均关闭失败，绝不静默 fallback。
+  const boundId = task.modelId;
+  if (!boundId) {
+    return openAiError('translation model snapshot unavailable', 503);
+  }
+  const resolved = await resolveGroupBoundModel(
+    boundId,
+    'TRANSLATION'
+  ).catch(() => null);
+  if (
+    !resolved?.provider ||
+    resolved.provider.dbModelId !== boundId ||
+    resolved.provider.purpose !== 'TRANSLATION' ||
+    !Number.isSafeInteger(resolved.provider.maxTokens) ||
+    resolved.provider.maxTokens <= 0
+  ) {
+    return openAiError('translation model unavailable', 503);
+  }
+  const maxOutputTokens = Math.min(
+    resolved.provider.maxTokens,
+    TRANSLATION_PROXY_MAX_OUTPUT_TOKENS
+  );
+  const routing = { modelId: boundId };
+  const modelKey = boundId;
+  const { requestHash, reservedTokens } = planTranslationProxyRequest({
+    taskId: task.id,
+    modelKey,
+    system: parsed.system,
+    messages: parsed.messages,
+    maxOutputTokens,
+  });
+  const activeKey = `translation_llm:${task.id}:${requestHash}`;
+
+  const readReplay = async (): Promise<
+    | { kind: 'none' }
+    | { kind: 'pending' }
+    | { kind: 'success'; value: TranslationProxyCachedResult }
+    | { kind: 'corrupt' }
+  > => {
+    const existing = await prisma.jobQueue.findUnique({
+      where: { activeKey },
+      select: { status: true, result: true },
+    });
+    if (!existing) return { kind: 'none' };
+    if (existing.status === JOB_STATUS.SUCCESS) {
+      const value = decodeTranslationProxyCache(existing.result);
+      return value ? { kind: 'success', value } : { kind: 'corrupt' };
+    }
+    if (
+      existing.status === JOB_STATUS.SUBMITTED ||
+      existing.status === JOB_STATUS.PENDING ||
+      existing.status === JOB_STATUS.PROCESSING
+    ) {
+      return { kind: 'pending' };
+    }
+    return { kind: 'none' };
+  };
+
+  const replay = await readReplay();
+  if (replay.kind === 'success') {
+    return completionResponse(task.id, parsed.stream, replay.value);
+  }
+  if (replay.kind === 'pending') {
+    return openAiError('translation request already in progress', 429, 'rate_limit_error', {
+      'Retry-After': '1',
+    });
+  }
+  if (replay.kind === 'corrupt') {
+    return openAiError('translation replay cache unavailable', 503);
+  }
+
+  const spentTokens = task.llmInputTokens + task.llmOutputTokens;
+  const tokenBudget = translationProxyTaskBudget(task.pageCount);
+  let jobId: string;
+  try {
+    jobId = await claimLlmTokenBudget({
+      type: JOB_TYPE.TRANSLATION_LLM_PROXY,
+      sessionId: task.id,
+      userId: task.userId,
+      triggeredBy: 'translation-worker',
+      activeKey,
+      units: reservedTokens,
+      owner: {
+        limit: tokenBudget,
+        settledUnitsFloor: spentTokens,
+        // pdf2zh 的 qps 仍可排队；同一任务只有一个付费请求在途，彻底关闭并发穿透。
+        maxActiveJobs: 1,
+      },
+      params: {
+        requestHash,
+        modelKey,
+        reservedTokens,
+        maxOutputTokens,
+        schedulingJobId: task.jobQueueId,
+      },
+    });
+  } catch (error) {
+    if (error instanceof ActiveJobConflictError) {
+      const winner = await readReplay();
+      if (winner.kind === 'success') {
+        return completionResponse(task.id, parsed.stream, winner.value);
       }
+      return openAiError('translation request already in progress', 429, 'rate_limit_error', {
+        'Retry-After': '1',
+      });
     }
-    if (messages.length === 0) {
-      return NextResponse.json(
-        { error: { message: 'messages 为空' } },
-        { status: 400 }
+    if (error instanceof ActiveJobConcurrencyExceededError) {
+      return openAiError('translation task concurrency exceeded', 429, 'rate_limit_error', {
+        'Retry-After': String(error.retryAfterSeconds),
+      });
+    }
+    if (error instanceof ActiveJobBudgetExceededError) {
+      const headers = error.resetAt
+        ? {
+            'Retry-After': String(
+              Math.max(1, Math.ceil((error.resetAt.getTime() - Date.now()) / 1000))
+            ),
+          }
+        : undefined;
+      return openAiError(
+        'translation token budget exceeded',
+        429,
+        'insufficient_quota',
+        headers
       );
     }
-    if (totalChars > MAX_PROMPT_CHARS) {
-      return NextResponse.json(
-        { error: { message: 'prompt 超出代理上限' } },
-        { status: 400 }
+    proxyLogger.error(
+      { taskId: task.id, err: serializeError(error) },
+      '翻译代理预算预留失败'
+    );
+    return openAiError('translation budget admission failed', 503);
+  }
+
+  // claim 后重新校验任务代次、凭据和调度行。旧 worker 在任务回炉/取消后即使仍持
+  // token，也只能把 0-usage claim 结算掉，绝不能触达 provider。
+  let freshTask: {
+    status: string;
+    proxyTokenHash: string | null;
+    proxyGeneration: string | null;
+    modelId: string | null;
+    jobQueueId: string | null;
+    llmInputTokens: number;
+    llmOutputTokens: number;
+  } | null = null;
+  let schedulingJob: { status: string; type: string } | null = null;
+  let postClaimReadError: unknown;
+  try {
+    [freshTask, schedulingJob] = await Promise.all([
+      prisma.translationTask.findUnique({
+        where: { id: task.id },
+        select: {
+          status: true,
+          proxyTokenHash: true,
+          proxyGeneration: true,
+          modelId: true,
+          jobQueueId: true,
+          llmInputTokens: true,
+          llmOutputTokens: true,
+        },
+      }),
+      task.jobQueueId
+        ? prisma.jobQueue.findUnique({
+            where: { id: task.jobQueueId },
+            select: { status: true, type: true },
+          })
+        : Promise.resolve(null),
+    ]);
+  } catch (error) {
+    postClaimReadError = error;
+  }
+  const stillAuthorized =
+    freshTask?.status === 'TRANSLATING' &&
+    freshTask.proxyTokenHash === tokenHash &&
+    freshTask.proxyGeneration === task.proxyGeneration &&
+    freshTask.modelId === task.modelId &&
+    freshTask.jobQueueId === task.jobQueueId &&
+    schedulingJob?.status === JOB_STATUS.PROCESSING &&
+    schedulingJob.type === JOB_TYPE.DOC_TRANSLATE &&
+    freshTask.llmInputTokens + freshTask.llmOutputTokens + reservedTokens <=
+      tokenBudget;
+  if (!stillAuthorized) {
+    try {
+      await failActiveJob(
+        jobId,
+        postClaimReadError ??
+          new Error('translation proxy task generation is no longer active'),
+        { requestHash, reservedTokens },
+        0
       );
+    } catch (error) {
+      proxyLogger.error(
+        { taskId: task.id, jobId, err: serializeError(error) },
+        '翻译代理 claim 撤销结算失败'
+      );
+      return openAiError('translation claim settlement failed', 503);
     }
+    return openAiError('Unauthorized', 401);
+  }
 
-    // 模型强制路由：任务创建时的模型快照 > 组绑定 > 全局 TRANSLATION 默认；
-    // 请求里的 model/temperature 忽略（温度由 TRANSLATION 路由行统一配置）
-    const boundId =
-      task.modelId || (await resolveUserTranslationModelId(task.user).catch(() => null));
-    const routing: { modelId: string } | { purpose: LlmPurpose } = (
-      await resolveGroupBoundModel(boundId, 'TRANSLATION')
-    ).routing;
-
+  let actualTokens = reservedTokens;
+  let settledInputTokens = reservedTokens;
+  let settledOutputTokens = 0;
+  let successSettlementStarted = false;
+  try {
+    if (req.signal.aborted) {
+      actualTokens = 0;
+      settledInputTokens = 0;
+      throw new Error('translation proxy request was canceled before dispatch');
+    }
     let text = '';
-    let inputTokens = 0;
-    let outputTokens = 0;
+    let responseUtf8Bytes = 0;
+    const responseEncoder = new TextEncoder();
+    let eventInputTokens: number | undefined;
+    let eventOutputTokens: number | undefined;
+    const signal = AbortSignal.any([
+      req.signal,
+      AbortSignal.timeout(PROXY_UPSTREAM_TOTAL_TIMEOUT_MS),
+    ]);
     const result = await callLLMWithHistoryStream(
-      system,
-      messages,
-      routing,
-      (ev: LLMStreamEvent) => {
-        if (ev.type === 'text' && ev.delta) text += ev.delta;
-        else if (ev.type === 'usage') {
-          if (typeof ev.inputTokens === 'number') inputTokens = ev.inputTokens;
-          if (typeof ev.outputTokens === 'number') outputTokens = ev.outputTokens;
+      parsed.system,
+      parsed.messages,
+      {
+        ...routing,
+        // gateway 在它自己的 provider 解析后、实际 fetch 前再次核对；这样即使
+        // 模型在本路由预检后被删除/改用途，也不会 fallback 到错误模型。
+        expectedModel: { dbModelId: boundId, purpose: 'TRANSLATION' },
+        maxOutputTokens,
+        maxResponseUtf8Bytes: TRANSLATION_PROXY_MAX_RESPONSE_UTF8_BYTES,
+        signal,
+      },
+      (event: LLMStreamEvent) => {
+        if (event.type === 'text' && event.delta) {
+          responseUtf8Bytes += responseEncoder.encode(event.delta).byteLength;
+          if (responseUtf8Bytes > TRANSLATION_PROXY_MAX_RESPONSE_UTF8_BYTES) {
+            throw new TranslationProxyRequestError(
+              'upstream response is too large'
+            );
+          }
+          text += event.delta;
+        }
+        else if (event.type === 'usage') {
+          if (typeof event.inputTokens === 'number') {
+            eventInputTokens = event.inputTokens;
+          }
+          if (typeof event.outputTokens === 'number') {
+            eventOutputTokens = event.outputTokens;
+          }
         }
       }
     );
     text = result.text || text;
-    if (typeof result.usage?.inputTokens === 'number') inputTokens = result.usage.inputTokens;
-    if (typeof result.usage?.outputTokens === 'number') outputTokens = result.usage.outputTokens;
-    // provider 不回 usage 时按字符粗估（仅成本可视，不参与定价）
-    if (!inputTokens) inputTokens = Math.ceil((system.length + totalChars) / 4);
-    if (!outputTokens) outputTokens = Math.ceil(text.length / 4);
-
-    await prisma.translationTask
-      .update({
-        where: { id: task.id },
-        data: {
-          llmInputTokens: { increment: inputTokens },
-          llmOutputTokens: { increment: outputTokens },
-        },
-      })
-      .catch(() => undefined);
-
-    const completion = {
-      id: `chatcmpl-${task.id.slice(0, 8)}${Date.now().toString(36)}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: 'lecture-live-gateway',
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: text },
-          finish_reason: 'stop',
-        },
-      ],
-      usage: {
-        prompt_tokens: inputTokens,
-        completion_tokens: outputTokens,
-        total_tokens: inputTokens + outputTokens,
-      },
-    };
-
-    if (body?.stream === true) {
-      // 兼容流式客户端：单块 chunk + [DONE]
-      const chunk = {
-        id: completion.id,
-        object: 'chat.completion.chunk',
-        created: completion.created,
-        model: completion.model,
-        choices: [
-          { index: 0, delta: { role: 'assistant', content: text }, finish_reason: null },
-        ],
-      };
-      const final = {
-        ...chunk,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-        usage: completion.usage,
-      };
-      const payload =
-        `data: ${JSON.stringify(chunk)}\n\n` +
-        `data: ${JSON.stringify(final)}\n\n` +
-        'data: [DONE]\n\n';
-      return new Response(payload, {
-        headers: {
-          'Content-Type': 'text/event-stream; charset=utf-8',
-          'Cache-Control': 'no-cache, no-transform',
-        },
-      });
+    if (
+      responseEncoder.encode(text).byteLength >
+      TRANSLATION_PROXY_MAX_RESPONSE_UTF8_BYTES
+    ) {
+      throw new TranslationProxyRequestError('upstream response is too large');
     }
+    const usage = {
+      inputTokens: result.usage?.inputTokens ?? eventInputTokens,
+      outputTokens: result.usage?.outputTokens ?? eventOutputTokens,
+      totalTokens: result.usage?.totalTokens,
+    };
+    const measured = trustedLlmUsageTokens(usage, reservedTokens);
+    actualTokens = measured ?? reservedTokens;
+    const splitIsTrusted =
+      Number.isSafeInteger(usage.inputTokens) &&
+      (usage.inputTokens ?? -1) >= 0 &&
+      Number.isSafeInteger(usage.outputTokens) &&
+      (usage.outputTokens ?? -1) >= 0 &&
+      (usage.inputTokens as number) + (usage.outputTokens as number) ===
+        actualTokens;
+    settledInputTokens = splitIsTrusted
+      ? (usage.inputTokens as number)
+      : actualTokens;
+    settledOutputTokens = splitIsTrusted
+      ? (usage.outputTokens as number)
+      : 0;
 
-    return NextResponse.json(completion);
-  } catch (error) {
-    proxyLogger.warn({ taskId: task.id, err: serializeError(error) }, '翻译代理调用失败');
-    // OpenAI 风格错误体 + 5xx：pdf2zh 侧会按可重试处理
-    return NextResponse.json(
-      { error: { message: 'upstream LLM call failed', type: 'server_error' } },
-      { status: 502 }
+    const cachedValue: TranslationProxyCachedResult = {
+      text,
+      inputTokens: settledInputTokens,
+      outputTokens: settledOutputTokens,
+      actualTokens,
+    };
+    const translationProxyCache = encodeTranslationProxyCache(cachedValue);
+    successSettlementStarted = true;
+    await completeActiveJob(
+      jobId,
+      {
+        translationProxyCache,
+        requestHash,
+        reservedTokens,
+        actualTokens,
+      },
+      actualTokens,
+      {
+        retainActiveKeyOnSuccess: true,
+        mutation: async (tx) => {
+          const updated = await tx.translationTask.updateMany({
+            where: {
+              id: task.id,
+              status: 'TRANSLATING',
+              proxyTokenHash: tokenHash,
+              proxyGeneration: task.proxyGeneration,
+              modelId: task.modelId,
+              jobQueueId: task.jobQueueId,
+            },
+            data: {
+              llmInputTokens: { increment: settledInputTokens },
+              llmOutputTokens: { increment: settledOutputTokens },
+            },
+          });
+          if (updated.count !== 1) {
+            throw new Error('Translation task usage settlement target is missing');
+          }
+        },
+      }
     );
+    return completionResponse(task.id, parsed.stream, cachedValue);
+  } catch (error) {
+    if (!successSettlementStarted) {
+      try {
+        await failActiveJob(
+          jobId,
+          error,
+          { requestHash, reservedTokens, actualTokens },
+          actualTokens,
+          actualTokens > 0
+            ? {
+                mutation: async (tx) => {
+                  const updated = await tx.translationTask.updateMany({
+                    where: {
+                      id: task.id,
+                      status: 'TRANSLATING',
+                      proxyTokenHash: tokenHash,
+                      proxyGeneration: task.proxyGeneration,
+                      modelId: task.modelId,
+                      jobQueueId: task.jobQueueId,
+                    },
+                    data: {
+                      llmInputTokens: { increment: settledInputTokens },
+                      llmOutputTokens: { increment: settledOutputTokens },
+                    },
+                  });
+                  if (updated.count !== 1) {
+                    throw new Error(
+                      'Translation task failure usage settlement target is missing'
+                    );
+                  }
+                },
+              }
+            : undefined
+        );
+      } catch (settlementError) {
+        proxyLogger.error(
+          {
+            taskId: task.id,
+            jobId,
+            err: serializeError(settlementError),
+          },
+          '翻译代理失败计量结果未知，保留资源 lease'
+        );
+      }
+    }
+    proxyLogger.warn(
+      { taskId: task.id, err: serializeError(error) },
+      '翻译代理调用失败'
+    );
+    return openAiError('upstream LLM call failed', 502);
   }
 }

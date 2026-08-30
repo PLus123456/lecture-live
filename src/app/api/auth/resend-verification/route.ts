@@ -1,7 +1,11 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { enforceRateLimit } from '@/lib/rateLimit';
-import { resolveRequestClientIp } from '@/lib/clientIp';
+import {
+  enforcePublicAuthPrelude,
+  publicAuthAccountKey,
+  readPublicAuthJson,
+} from '@/lib/publicAuth';
 import { logAction } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
 import { getSiteSettings } from '@/lib/siteSettings';
@@ -19,14 +23,16 @@ const GENERIC_OK = {
 };
 
 export async function POST(req: Request) {
-  const siteSettings = await getSiteSettings().catch(() => null);
+  const prelude = await enforcePublicAuthPrelude(req, {
+    scope: 'resend-verification',
+    endpointIpLimit: 10,
+    endpointWindowMs: 10 * 60_000,
+  });
+  if (prelude.response) return prelude.response;
 
-  let body: { email?: string };
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
-  }
+  const parsed = await readPublicAuthJson<{ email?: string }>(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
 
   const email = normalizeEmail(body.email ?? '').slice(0, 255);
 
@@ -36,21 +42,12 @@ export async function POST(req: Request) {
         scope: 'auth:resend-verification',
         limit: 3,
         windowMs: 10 * 60_000,
-        key: `email:${email}`,
+        key: publicAuthAccountKey('email', email),
       })
     : null;
   if (emailLimited) return emailLimited;
 
-  const clientIp = resolveRequestClientIp(req);
-  if (clientIp !== 'unknown') {
-    const ipLimited = await enforceRateLimit(req, {
-      scope: 'auth:resend-verification:ip',
-      limit: 10,
-      windowMs: 10 * 60_000,
-      key: `ip:${clientIp}`,
-    });
-    if (ipLimited) return ipLimited;
-  }
+  const siteSettings = await getSiteSettings().catch(() => null);
 
   // 无效邮箱、邮件系统未启用、或站点根本没开邮箱验证：静默返回通用成功（不泄露差异）。
   //
@@ -78,7 +75,7 @@ export async function POST(req: Request) {
     if (user && user.status === 1 && user.emailVerifiedAt == null) {
       void sendVerificationEmail(user, {
         settings: siteSettings ?? undefined,
-        requestIp: clientIp === 'unknown' ? null : clientIp,
+        requestIp: prelude.clientIp === 'unknown' ? null : prelude.clientIp,
       }).catch((err) =>
         logger.error(
           { err: serializeError(err) },

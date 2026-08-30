@@ -39,6 +39,27 @@ vi.mock('../ViewerTranscriptPanel', () => ({
   ViewerTranscriptPanel: () => null,
 }));
 
+// 观看页的所有状态回写都过账号边界闸门（卸载 / 账号切换后一律丢弃）。
+// 本用例只测 join 时序，边界恒定「仍是同一主体」。
+vi.mock('@/stores/authStore', () => ({
+  useAuthStore: Object.assign(
+    (selector: (state: { token: string | null }) => unknown) =>
+      selector({ token: null }),
+    { getState: () => ({ token: null }) }
+  ),
+  getAuthBoundarySnapshot: () => ({ epoch: 1, userId: null, sessionBinding: null }),
+  getAuthBoundaryAbortSignal: () => ({ aborted: false }),
+  isAuthBoundaryCurrent: () => true,
+  isPersistedAuthBoundaryCurrent: () => true,
+}));
+
+vi.mock('@/lib/clientAuthCookieMutation', () => ({
+  runAuthBoundaryCommit: async (
+    _expected: unknown,
+    commit: () => unknown | Promise<unknown>
+  ) => ({ committed: true, value: await commit() }),
+}));
+
 import ViewerPage from '../page';
 
 const LIVE_SESSION_RESPONSE = {

@@ -2,7 +2,14 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { uploadSonioxFile } from '@/lib/soniox/asyncFile';
+import {
+  SONIOX_TRANSCRIPT_MAX_RESPONSE_BYTES,
+  SONIOX_TRANSCRIPT_MAX_TOKENS,
+  SonioxTranscriptPayloadError,
+  admitSonioxTranscriptResponse,
+  getSonioxTranscript,
+  uploadSonioxFile,
+} from '@/lib/soniox/asyncFile';
 import type { SonioxRuntimeConfig } from '@/lib/soniox/env';
 
 async function readBody(body: unknown): Promise<Buffer> {
@@ -80,5 +87,70 @@ describe('uploadSonioxFile', () => {
       id: 'file-123',
       filename: 'session.mp3',
     });
+  });
+});
+
+describe('Soniox transcript ingress admission', () => {
+  const config: SonioxRuntimeConfig = {
+    region: 'us',
+    apiKey: 'soniox-key',
+    restBaseUrl: 'https://api.soniox.test',
+    wsBaseUrl: 'wss://stt-rt.soniox.test/transcribe-websocket',
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('无 Content-Length 时按实际响应流字节超限即取消，且不 JSON.parse', async () => {
+    const chunk = new Uint8Array(8 * 1024 * 1024 + 1);
+    const cancel = vi.fn();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const chunks =
+          Math.floor(SONIOX_TRANSCRIPT_MAX_RESPONSE_BYTES / chunk.byteLength) + 1;
+        for (let index = 0; index < chunks; index += 1) {
+          controller.enqueue(chunk);
+        }
+      },
+      cancel,
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(stream, { status: 200 }))
+    );
+
+    await expect(getSonioxTranscript(config, 'tr-oversize')).rejects.toThrow(
+      /too large/
+    );
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('在复制 token 前按数组长度拒绝异常 provider 响应', () => {
+    expect(() =>
+      admitSonioxTranscriptResponse({
+        id: 'tr-1',
+        text: '',
+        tokens: new Array(SONIOX_TRANSCRIPT_MAX_TOKENS + 1),
+      })
+    ).toThrow(SonioxTranscriptPayloadError);
+  });
+
+  it('合法小 transcript 被规范化通过', () => {
+    expect(
+      admitSonioxTranscriptResponse({
+        id: 'tr-1',
+        text: 'hello',
+        tokens: [
+          {
+            text: 'hello',
+            start_ms: 0,
+            end_ms: 100,
+            confidence: 0.9,
+            speaker: '1',
+          },
+        ],
+      })
+    ).toMatchObject({ id: 'tr-1', tokens: [{ text: 'hello' }] });
   });
 });

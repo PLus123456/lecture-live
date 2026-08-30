@@ -20,6 +20,8 @@ const {
   stageMock,
   publishMock,
   rollbackMock,
+  settleStagedMock,
+  readbackMock,
   runBackgroundLLMTasksMock,
   deductMock,
   settleMock,
@@ -36,6 +38,8 @@ const {
   stageMock: vi.fn(),
   publishMock: vi.fn(),
   rollbackMock: vi.fn(),
+  settleStagedMock: vi.fn(),
+  readbackMock: vi.fn(),
   runBackgroundLLMTasksMock: vi.fn(),
   deductMock: vi.fn(),
   settleMock: vi.fn(),
@@ -63,7 +67,10 @@ vi.mock('@/lib/soniox/asyncTranscriptConverter', () => ({
 }));
 vi.mock('@/lib/sessionPersistence', () => ({
   stageSessionTranscriptArtifacts: stageMock,
-  finalizeStagedArtifactPublish: publishMock,
+  // 收尾改成 stage → 事务内 settle → 提交后一次性 complete；抛错时 readback 判定是否已提交。
+  settleStagedArtifactsInTransaction: settleStagedMock,
+  completeStagedArtifactPublishes: publishMock,
+  readbackStagedArtifactPublication: readbackMock,
   rollbackStagedArtifact: rollbackMock,
 }));
 vi.mock('@/lib/sessionFinalization', () => ({ runBackgroundLLMTasks: runBackgroundLLMTasksMock }));
@@ -114,8 +121,16 @@ beforeEach(() => {
   convertMock.mockReturnValue([{ id: 'seg1' }]);
   extractMock.mockReturnValue([]);
   stageMock.mockResolvedValue({ transcript: STAGED_TRANSCRIPT, summary: STAGED_SUMMARY });
-  publishMock.mockResolvedValue({ path: STAGED_TRANSCRIPT.reference, storage: 'local' });
+  publishMock.mockResolvedValue([
+    { path: STAGED_TRANSCRIPT.reference, storage: 'local' },
+    { path: STAGED_SUMMARY.reference, storage: 'local' },
+  ]);
   rollbackMock.mockResolvedValue(undefined);
+  settleStagedMock.mockImplementation(async (_tx: unknown, staged: unknown[]) =>
+    staged.map((item) => ({ staged: item, settled: {} }))
+  );
+  // 默认：抛错路径上确证「没提交过」，可以放心回滚临时对象。
+  readbackMock.mockResolvedValue({ outcome: 'not_committed', publications: [] });
   getSiteSettingsMock.mockResolvedValue({ async_upload_billing_multiplier: 0.8 });
   deductMock.mockResolvedValue(undefined);
   settleMock.mockResolvedValue(0);
@@ -152,9 +167,12 @@ describe('M5：转录/摘要两阶段写盘', () => {
     // 固定 key 绝不出现（那才是 M5 的病灶）。
     expect(casCall.data.transcriptPath).not.toBe('local:transcripts/s1.json');
 
-    expect(publishMock).toHaveBeenCalledTimes(2);
-    expect(publishMock).toHaveBeenCalledWith(expect.anything(), STAGED_TRANSCRIPT);
-    expect(publishMock).toHaveBeenCalledWith(expect.anything(), STAGED_SUMMARY);
+    // 两个 artifact 一次性交给 completeStagedArtifactPublishes（提交之后才发生）。
+    expect(publishMock).toHaveBeenCalledTimes(1);
+    const published = (
+      publishMock.mock.calls[0][1] as Array<{ staged: unknown }>
+    ).map((entry) => entry.staged);
+    expect(published).toEqual([STAGED_TRANSCRIPT, STAGED_SUMMARY]);
     expect(rollbackMock).not.toHaveBeenCalled();
   });
 
@@ -210,18 +228,33 @@ describe('M5：转录/摘要两阶段写盘', () => {
   });
 
   it('★ 事务抛错但其实已提交（响应丢失，回退 count===0）：**绝不**回滚 —— DB 正指着这两个文件', async () => {
-    sessionUpdateManyMock
-      .mockResolvedValueOnce({ count: 1 }) // claim
-      .mockResolvedValueOnce({ count: 0 }); // 回退没命中 ⇒ 行已不是 finalizing（多半已 completed）
+    sessionUpdateManyMock.mockResolvedValueOnce({ count: 1 }); // claim
     transactionMock.mockRejectedValueOnce(new Error('Connection lost after COMMIT'));
+    // 判据不是「回退 CAS 的 count」，而是**回读**：DB 行已是 completed 且 path 正指着
+    // 这两个 staged 对象 ⇒ 事务其实提交过，只是响应丢了。
+    sessionFindUniqueMock.mockResolvedValue({
+      asyncTranscribeStatus: 'completed',
+      transcriptPath: STAGED_TRANSCRIPT.reference,
+      summaryPath: STAGED_SUMMARY.reference,
+    });
+    readbackMock.mockResolvedValue({
+      outcome: 'committed',
+      publications: [
+        { staged: STAGED_TRANSCRIPT, settled: {} },
+        { staged: STAGED_SUMMARY, settled: {} },
+      ],
+    });
 
     const result = await finalizeAsyncTranscription(makeSession(), CONFIG, {
       allowClaimFrom: ['transcribing'],
     });
 
-    expect(result).toEqual({ outcome: 'claim_lost' });
     // 这是本条的全部意义：删了就是把刚定稿的转录删掉。
     expect(rollbackMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      transcriptPath: STAGED_TRANSCRIPT.reference,
+      summaryPath: STAGED_SUMMARY.reference,
+    });
   });
 
   it('stage 必须早于终态 CAS（保持「先写版本化对象、再由 CAS 认领」的顺序）', async () => {

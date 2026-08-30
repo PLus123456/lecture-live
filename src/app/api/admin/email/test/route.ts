@@ -1,12 +1,32 @@
+import { createHash } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import { getSiteSettings, SETTING_SECRET_MASK } from '@/lib/siteSettings';
 import type { EmailConfig } from '@/lib/email/mailer';
 import { verifyEmailConnection, sendMailWithConfig } from '@/lib/email/mailer';
 import { getBrandCtx } from '@/lib/email';
 import { testEmail } from '@/lib/email/templates';
 import { isValidEmailAddress, normalizeEmail } from '@/lib/email/domains';
+import { JOB_STATUS, JOB_TYPE, trackJob } from '@/lib/jobQueue';
+import {
+  getSecurityAuditRequestId,
+  writeSecurityAudit,
+} from '@/lib/securityAudit';
+
+class EmailTestRejectedError extends Error {
+  constructor(
+    readonly clientError: string | undefined,
+    readonly status = 400
+  ) {
+    // This message is persisted in JobQueue.error. Keep SMTP endpoints, users and credentials out.
+    super('email test operation rejected');
+    this.name = 'EmailTestRejectedError';
+  }
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
 
 /**
  * POST /api/admin/email/test
@@ -22,6 +42,7 @@ export async function POST(req: Request) {
     windowMs: 60_000,
   });
   if (response) return response;
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
 
   let body: Record<string, unknown> = {};
   try {
@@ -54,15 +75,84 @@ export async function POST(req: Request) {
   if (senderEmail) override.fromEmail = senderEmail;
 
   const sendTo = str(body.sendTo);
+  const requestId = getSecurityAuditRequestId(req);
+  const overrideFields = Object.keys(override)
+    .filter((field) => field !== 'password')
+    .sort();
+  const passwordProvided = override.password !== undefined;
 
   // 仅测试连接
   if (!sendTo) {
-    const result = await verifyEmailConnection(override);
-    logAction(req, 'admin.email.test', {
-      user: admin,
-      detail: result.ok ? '连接成功' : `连接失败: ${result.error ?? ''}`,
-    });
-    return NextResponse.json(result, { status: result.ok ? 200 : 400 });
+    try {
+      const result = await trackJob(
+        {
+          type: JOB_TYPE.ADMIN_INTEGRATION,
+          userId: admin.id,
+          triggeredBy: `admin:${admin.id}`,
+          params: {
+            operation: 'smtp_connection_test',
+            overrideFields,
+            passwordProvided,
+            requestId,
+          },
+          resultSummary: () => ({ connected: true }),
+          errorSummary: () => 'SmtpConnectionTestError',
+          terminalMutation: async (tx, terminal) => {
+            const connected = terminal.status === JOB_STATUS.SUCCESS;
+            await writeSecurityAudit(
+              req,
+              {
+                event: 'email.smtp_test',
+                operator: { id: admin.id, email: admin.email, role: admin.role },
+                target: { type: 'smtp_connection', id: 'configured_or_override' },
+                before: { overrideFields, passwordProvided },
+                after: { connected },
+                reason: 'admin_connection_test',
+                outcome: connected ? 'SUCCESS' : 'FAILED',
+                metadata: connected
+                  ? undefined
+                  : {
+                      errorClass:
+                        terminal.status === JOB_STATUS.FAILED &&
+                        terminal.error instanceof Error
+                          ? terminal.error.name
+                          : 'UnknownError',
+                    },
+                requestId,
+              },
+              tx
+            );
+          },
+        },
+        async () => {
+          try {
+            const verified = await verifyEmailConnection(override);
+            if (!verified.ok) {
+              throw new EmailTestRejectedError(verified.error);
+            }
+            return verified;
+          } catch (error) {
+            if (error instanceof EmailTestRejectedError) throw error;
+            throw new EmailTestRejectedError(undefined, 500);
+          }
+        }
+      );
+      return NextResponse.json(result);
+    } catch (error) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            error instanceof EmailTestRejectedError
+              ? error.clientError ?? '连接测试失败'
+              : '连接测试失败',
+        },
+        {
+          status:
+            error instanceof EmailTestRejectedError ? error.status : 500,
+        }
+      );
+    }
   }
 
   // 发送测试邮件
@@ -75,13 +165,73 @@ export async function POST(req: Request) {
     ? getBrandCtx(settings)
     : { siteName: 'LectureLive', siteUrl: 'http://localhost:3000' };
   const mail = testEmail(ctx);
-  const result = await sendMailWithConfig(override, { to, ...mail });
-  logAction(req, 'admin.email.test.send', {
-    user: admin,
-    detail: result.ok ? `已发送至 ${to}` : `发送失败: ${result.error ?? ''}`,
-  });
-  return NextResponse.json(
-    result.ok ? { ok: true, sent: true } : { ok: false, error: result.error },
-    { status: result.ok ? 200 : 400 }
-  );
+  const recipientHash = sha256(to);
+  try {
+    await trackJob(
+      {
+        type: JOB_TYPE.ADMIN_INTEGRATION,
+        userId: admin.id,
+        triggeredBy: `admin:${admin.id}`,
+        params: {
+          operation: 'smtp_test_delivery',
+          overrideFields,
+          passwordProvided,
+          recipientHash,
+          requestId,
+        },
+        resultSummary: () => ({ delivered: true, recipientHash }),
+        errorSummary: () => 'SmtpTestDeliveryError',
+        terminalMutation: async (tx, terminal) => {
+          const delivered = terminal.status === JOB_STATUS.SUCCESS;
+          await writeSecurityAudit(
+            req,
+            {
+              event: 'email.test_delivery',
+              operator: { id: admin.id, email: admin.email, role: admin.role },
+              target: { type: 'email_recipient_hash', id: recipientHash },
+              before: { overrideFields, passwordProvided },
+              after: { delivered },
+              reason: 'admin_test_delivery',
+              outcome: delivered ? 'SUCCESS' : 'FAILED',
+              metadata: delivered
+                ? undefined
+                : {
+                    errorClass:
+                      terminal.status === JOB_STATUS.FAILED &&
+                      terminal.error instanceof Error
+                        ? terminal.error.name
+                        : 'UnknownError',
+                  },
+              requestId,
+            },
+            tx
+          );
+        },
+      },
+      async () => {
+        try {
+          const result = await sendMailWithConfig(override, { to, ...mail });
+          if (!result.ok) throw new EmailTestRejectedError(result.error);
+          return result;
+        } catch (error) {
+          if (error instanceof EmailTestRejectedError) throw error;
+          throw new EmailTestRejectedError(undefined, 500);
+        }
+      }
+    );
+  } catch (error) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error:
+          error instanceof EmailTestRejectedError
+            ? error.clientError ?? '测试邮件发送失败'
+            : '测试邮件发送失败',
+      },
+      {
+        status: error instanceof EmailTestRejectedError ? error.status : 500,
+      }
+    );
+  }
+  return NextResponse.json({ ok: true, sent: true });
 }

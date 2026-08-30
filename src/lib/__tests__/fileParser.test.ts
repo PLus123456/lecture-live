@@ -26,8 +26,20 @@ async function buildZipBomb(targetUncompressed: number): Promise<Buffer> {
 }
 
 /** Minimal valid PPTX (ZIP) with one slide containing an <a:t> text run. */
+function addPptxScaffold(zip: JSZip): void {
+  zip.file(
+    '[Content_Types].xml',
+    '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'
+  );
+  zip.file(
+    'ppt/presentation.xml',
+    '<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>'
+  );
+}
+
 async function buildPptx(text: string): Promise<Buffer> {
   const zip = new JSZip();
+  addPptxScaffold(zip);
   zip.file(
     'ppt/slides/slide1.xml',
     `<?xml version="1.0"?><p:sld xmlns:p="x" xmlns:a="y"><a:t>${text}</a:t></p:sld>`
@@ -110,6 +122,7 @@ describe('fileParser PPTX 未闭合标签的复杂度 (storage-parser#71)', () =
   /** 只有开标签、没有闭标签、且不含换行 —— 触发回溯扫后缀的最坏形态。 */
   async function buildUnclosedPptx(byteLen: number): Promise<Buffer> {
     const zip = new JSZip();
+    addPptxScaffold(zip);
     zip.file('ppt/slides/slide1.xml', '<a:t>'.repeat(Math.floor(byteLen / 5)));
     return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
   }
@@ -129,6 +142,7 @@ describe('fileParser PPTX 未闭合标签的复杂度 (storage-parser#71)', () =
 
   it('闭合良好的多段文本照常提取（换成 [^<]* 没有改变语义）', async () => {
     const zip = new JSZip();
+    addPptxScaffold(zip);
     zip.file(
       'ppt/slides/slide1.xml',
       '<p:sld><a:t>first</a:t><a:p/><a:t>second</a:t>' +

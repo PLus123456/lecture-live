@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { isPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
 import {
   callLLM,
   callLLMWithHistoryStream,
@@ -39,6 +40,7 @@ import {
 } from '@/lib/llm/chatContextBuilder';
 import { computeContextBudget } from '@/lib/llm/tokenBudget';
 import {
+  computeTranscriptContentSignature,
   makeRagRetrieverForRecordings,
   makeRagRetrieverForSession,
 } from '@/lib/llm/embedding/transcriptRag';
@@ -46,12 +48,27 @@ import { findCompressionBoundary } from '@/lib/llm/chatCompression';
 import { buildLlmRoutingOptions } from '@/lib/llm/llmRoutingOptions';
 import { logger, serializeError } from '@/lib/logger';
 import {
+  createUserMessageWithStagedChatImages,
+  ChatImagePublicationOutcomeUnknownError,
   parseImageDataUrl,
-  persistChatImage,
+  rollbackStagedChatImages,
+  stageChatImage,
   type DecodedChatImage,
+  type StagedChatImage,
 } from '@/lib/llm/chatImageStorage';
 import {
+  StoredArtifactConversationLimitError,
+  StoredArtifactQuotaExceededError,
+} from '@/lib/storage/storedArtifactLedger';
+import {
+  CONVERSATION_RECORDING_LIMITS,
+  ConversationRecordingLimitError,
+  conversationRecordingErrorBody,
+  loadConversationRecordingUsage,
+} from '@/lib/conversationRecordingPolicy';
+import {
   buildAttachmentsSystemMessage,
+  ChatAttachmentCapacityError,
   concatRecordingReports,
   extractAttachmentImages,
   loadAttachmentsAsSystemBlocks,
@@ -61,9 +78,14 @@ import {
   loadSessionReport,
   loadSessionTranscriptBundle,
 } from '@/lib/sessionPersistence';
-import { toExportSegments } from '@/lib/export/types';
 import type { SessionReportData } from '@/types/report';
 import type { SummaryBlock } from '@/types/summary';
+import {
+  admitTranscriptSegments,
+  readBoundedChatRequestJson,
+  TranscriptAdmissionAccumulator,
+  TranscriptAdmissionError,
+} from '@/lib/llm/transcriptAdmission';
 
 const VALID_DEPTHS: ThinkingDepth[] = ['low', 'medium', 'high'];
 
@@ -149,34 +171,6 @@ function isContextLengthError(err: unknown): boolean {
   );
 }
 
-interface TranscriptSegmentInput {
-  text?: unknown;
-  startMs?: unknown;
-}
-
-function parseTranscriptSegments(value: unknown): TranscriptSegment[] {
-  if (!Array.isArray(value)) return [];
-  const out: TranscriptSegment[] = [];
-  let totalChars = 0;
-  for (const raw of value as TranscriptSegmentInput[]) {
-    if (!raw || typeof raw !== 'object') continue;
-    const text = typeof raw.text === 'string' ? raw.text : '';
-    const startMs = typeof raw.startMs === 'number' ? raw.startMs : 0;
-    if (!text) continue;
-    out.push({ text, startMs });
-    totalChars += text.length;
-    // 安全：对客户端提交的 transcript 体量封顶，防超大数组在降级循环里反复 tokenizer
-    // 编码造成 CPU 放大。上限远超真实多小时讲座，超限即截断（保留较早段，时间锚点不乱）。
-    if (
-      out.length >= LLM_LIMITS.transcriptSegments ||
-      totalChars >= LLM_LIMITS.transcriptTotalChars
-    ) {
-      break;
-    }
-  }
-  return out;
-}
-
 /**
  * 解析请求体里的 images 字段（base64 data URL 数组），校验张数与单张大小。
  * 任一张非法 / 超限即抛 LLMValidationError。
@@ -203,6 +197,61 @@ function parseChatImages(value: unknown): DecodedChatImage[] {
     out.push(decoded);
   }
   return out;
+}
+
+async function persistUserQuestion(args: {
+  conversationId: string;
+  userId: string;
+  question: string;
+  transcriptOffsetMs: number;
+  images: ReadonlyArray<DecodedChatImage>;
+}): Promise<void> {
+  if (args.images.length === 0) {
+    await prisma.conversationMessage.create({
+      data: {
+        conversationId: args.conversationId,
+        role: 'user',
+        content: args.question,
+        transcriptOffsetMs: args.transcriptOffsetMs,
+      },
+    });
+    return;
+  }
+
+  const staged: StagedChatImage[] = [];
+  try {
+    // 最多 4 张，顺序 stage 可以在任意一张失败时精确回滚前缀，
+    // 并避免为同一用户并发争用 User 配额行锁。
+    for (const image of args.images) {
+      staged.push(await stageChatImage(args.conversationId, args.userId, image));
+    }
+    const refs = staged.map((image) => `![image](${image.url})`);
+    const content = `${args.question}\n\n${refs.join('\n')}`;
+    await createUserMessageWithStagedChatImages({
+      conversationId: args.conversationId,
+      content,
+      transcriptOffsetMs: args.transcriptOffsetMs,
+      images: staged,
+    });
+  } catch (error) {
+    if (!(error instanceof ChatImagePublicationOutcomeUnknownError)) {
+      await rollbackStagedChatImages(staged).catch((rollbackError) => {
+        chatLogger.error(
+          {
+            conversationId: args.conversationId,
+            err: serializeError(rollbackError),
+          },
+          '内联图片发布失败后回滚不完整'
+        );
+      });
+    } else {
+      chatLogger.error(
+        { conversationId: args.conversationId, err: serializeError(error) },
+        '内联图片发布结果未知，保留文件与预留供对账'
+      );
+    }
+    throw error;
+  }
 }
 
 function parseAttachmentIds(value: unknown): string[] | undefined {
@@ -233,16 +282,13 @@ function sseFrame(event: string, data: unknown): string {
 }
 
 /**
- * 把 transcript bundle 的 segments （unknown[]） 规范成 TranscriptSegment[]。
- * 复用 toExportSegments 的字段宽容解析，再投影到 chatContextBuilder 期望的最小形状。
+ * 把 transcript bundle 的 segments（unknown[]）规范成 TranscriptSegment[]，
+ * 并在进入 RAG/context 数组前执行与请求体相同的单段/聚合硬界。
  */
 function bundleSegmentsToTranscriptSegments(
   segments: unknown[]
 ): TranscriptSegment[] {
-  return toExportSegments(segments).map((s) => ({
-    text: s.text,
-    startMs: s.startMs,
-  }));
+  return admitTranscriptSegments(segments);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -293,6 +339,28 @@ interface StreamChatArgs {
   attachmentsSystemMessage?: string;
   /** 释放「每对话单飞行中回复」锁；流结束/失败/取消时调用（幂等） */
   releaseTurn?: () => void;
+}
+
+/** 把多个资源 lease 合并成一个幂等释放函数，避免 cancel/finally 双重释放。 */
+function combineReleases(
+  ...releases: Array<(() => void) | null | undefined>
+): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const release of releases) {
+      try {
+        release?.();
+      } catch (err) {
+        // 一个释放器异常也不能阻止其余 lease 回收。
+        chatLogger.error(
+          { err: serializeError(err) },
+          'chat resource lease release failed'
+        );
+      }
+    }
+  };
 }
 
 /**
@@ -567,9 +635,9 @@ function streamChatResponse(
       }
     },
     cancel() {
-      // 客户端断开（点「停止」/关闭页面/切走）→ 取消上游 provider 请求，并释放对话锁。
+      // 客户端断开只负责通知上游停止。provider/DB 可能在收到 abort 后延迟退出，
+      // 期间仍引用附件 blocks；资源 lease 必须等 start() 的 finally 确认流水线静默再释放。
       upstreamAbort.abort();
-      args.releaseTurn?.();
     },
   });
 
@@ -599,7 +667,7 @@ interface ParsedChatRequest {
 }
 
 async function parseRequest(req: Request): Promise<ParsedChatRequest> {
-  const body = await req.json();
+  const body = await readBoundedChatRequestJson(req);
 
   const conversationId = readRequiredText(
     body.conversationId,
@@ -616,7 +684,7 @@ async function parseRequest(req: Request): Promise<ParsedChatRequest> {
     'summaryContext',
     LLM_LIMITS.summaryContext
   );
-  const transcript = parseTranscriptSegments(body.transcript);
+  const transcript = admitTranscriptSegments(body.transcript);
   const images = parseChatImages(body.images);
   const attachmentIds = parseAttachmentIds(body.attachmentIds);
   const totalTranscriptMs =
@@ -671,6 +739,12 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
   if (!payload) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
+  if (!(await isPaymentBenefitAvailable(payload.id))) {
+    return NextResponse.json(
+      { error: '账户存在未处理的支付争议，付费功能已冻结', code: 'payment_account_frozen' },
+      { status: 403 }
+    );
+  }
 
   const rateLimited = await enforceApiRateLimit(req, {
     scope: 'llm:chat',
@@ -682,6 +756,20 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
   // 每对话回复锁：正常路径在流结束时由 streamChatResponse 释放；若在流开始前抛错，
   // 由下方 catch 兜底释放（幂等）。
   let releaseTurn: (() => void) | null = null;
+  const attachmentLease: {
+    release: (() => void) | null;
+    registrationClosed: boolean;
+  } = { release: null, registrationClosed: false };
+
+  // Promise.all 的 session 分支可能先失败；附件 loader 即使随后才完成，也必须立刻
+  // 释放刚移交的 lease，不能因主请求已经进入 catch 而泄漏。
+  const registerAttachmentRelease = (release: () => void) => {
+    if (attachmentLease.registrationClosed) {
+      release();
+      return;
+    }
+    attachmentLease.release = release;
+  };
 
   try {
     const parsed = await parseRequest(req);
@@ -704,6 +792,7 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
             transcriptPath: true,
             summaryPath: true,
             reportPath: true,
+            durationMs: true,
           },
         },
         messages: {
@@ -717,6 +806,10 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
           },
         },
         sessions: {
+          // 历史脏数据可能早已超过新硬顶；只多取一条用于稳定拒绝，禁止在
+          // admission 之前把无界关联集合物化进进程。
+          take: CONVERSATION_RECORDING_LIMITS.maxRecordings + 1,
+          orderBy: { addedAt: 'asc' },
           include: {
             session: {
               select: {
@@ -728,6 +821,7 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
                 transcriptPath: true,
                 summaryPath: true,
                 reportPath: true,
+                durationMs: true,
               },
             },
           },
@@ -826,13 +920,54 @@ export const POST = withRequestLogging('llm:chat', async (req: Request) => {
       },
       userId: payload.id,
       releaseTurn,
+      registerAttachmentRelease,
     });
   } catch (error) {
-    // 流开始前抛错 → 释放已获取的对话锁（正常路径由 streamChatResponse 的 finally 释放）。
-    releaseTurn?.();
+    // 流开始前抛错 → 关闭迟到的附件 lease 注册，并释放已获取资源。正常流路径由
+    // streamChatResponse 的 finally/cancel 统一释放。
+    attachmentLease.registrationClosed = true;
+    combineReleases(attachmentLease.release, releaseTurn)();
+
+    if (error instanceof StoredArtifactQuotaExceededError) {
+      return NextResponse.json(
+        { error: 'Storage quota exceeded; image was not persisted' },
+        { status: 403 }
+      );
+    }
+
+    if (error instanceof StoredArtifactConversationLimitError) {
+      return NextResponse.json(
+        {
+          error: 'Conversation inline image limit exceeded',
+          maxBytes: Number(error.maxBytes),
+          maxCount: error.maxCount,
+        },
+        { status: 413 }
+      );
+    }
+
+    if (error instanceof ConversationRecordingLimitError) {
+      return NextResponse.json(conversationRecordingErrorBody(error), {
+        status: error.status,
+        ...(error.status === 503
+          ? { headers: { 'Retry-After': '30' } }
+          : {}),
+      });
+    }
 
     if (error instanceof LLMValidationError) {
       return NextResponse.json({ error: error.message }, { status: 400 });
+    }
+
+    if (error instanceof TranscriptAdmissionError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
+
+    if (error instanceof ChatAttachmentCapacityError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: 429, headers: { 'Retry-After': '1' } }
+      );
     }
 
     if (error instanceof LLMAccessError) {
@@ -907,35 +1042,14 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
 
   // ── 持久化 user 消息 ──
   const userTranscriptOffset = parsed.totalTranscriptMs;
-  let persistedQuestionContent = parsed.question;
-  if (parsed.images.length > 0) {
-    const saved = await Promise.all(
-      parsed.images.map(async (img) => {
-        try {
-          return `![image](${await persistChatImage(conversation.id, img)})`;
-        } catch (err) {
-          chatLogger.warn(
-            { conversationId: conversation.id, err: serializeError(err) },
-            '聊天图片持久化失败，本轮仍会发给模型但刷新后不可见'
-          );
-          return null;
-        }
-      })
-    );
-    const refs = saved.filter((ref): ref is string => ref !== null);
-    if (refs.length > 0) {
-      persistedQuestionContent = `${parsed.question}\n\n${refs.join('\n')}`;
-    }
-  }
   // user 消息在调用 LLM 之前落库，避免请求中断丢失用户输入。代价是本轮若被
   // abort/失败且无 assistant 配对会留下"孤儿 user 消息"，由 dropTrailingOrphanUser 兜底。
-  await prisma.conversationMessage.create({
-    data: {
-      conversationId: conversation.id,
-      role: 'user',
-      content: persistedQuestionContent,
-      transcriptOffsetMs: userTranscriptOffset,
-    },
+  await persistUserQuestion({
+    conversationId: conversation.id,
+    userId,
+    question: parsed.question,
+    transcriptOffsetMs: userTranscriptOffset,
+    images: parsed.images,
   });
 
   const history: ConversationTurn[] = dropTrailingOrphanUser(
@@ -969,7 +1083,7 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
       : chatSystemPrompt;
   };
 
-  const ragRetriever = makeRagRetrieverForSession(sessionId);
+  const ragRetriever = makeRagRetrieverForSession(sessionId, userId);
   const routingOptions = buildLlmRoutingOptions(selection, 'CHAT');
   const modelLabel =
     selection.providerConfig?.displayName ||
@@ -1045,15 +1159,26 @@ interface HandleGlobalChatArgs {
       transcriptPath: string | null;
       summaryPath: string | null;
       reportPath: string | null;
+      durationMs: number;
     }>;
   };
   userId: string;
   /** 每对话回复锁的释放函数（由 POST 获取后透传），流结束时释放 */
   releaseTurn: () => void;
+  /** loader 完成即登记 lease；若 sibling Promise 已失败，POST 会立即释放迟到 lease */
+  registerAttachmentRelease: (release: () => void) => void;
 }
 
 async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
   const { parsed, conversation, userId } = args;
+
+  // 挂载后 transcript / draft 仍可能继续增长，因此不能只在 attach 时检查。
+  // 每轮在任何文件下载或 embedding admission 之前都从完整账本复核。
+  await loadConversationRecordingUsage(
+    prisma,
+    userId,
+    conversation.ownedSessions.map((session) => session.id)
+  );
 
   // 全局 chat 没有"当前 session 的 targetLang"。优先取已挂的第一个录音的 targetLang，
   // 否则默认 zh —— buildTimeAnchor 与 history 压缩 prompt 的措辞会跟着语言变。
@@ -1083,11 +1208,17 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
   const budget = computeContextBudget(provider, provider.contextWindow);
 
   // ── 并行加载附件 + 各 session 的 transcript / summary / report ──
-  const [attachmentBlocks, sessionAssets] = await Promise.all([
-    loadAttachmentsAsSystemBlocks({
-      conversationId: conversation.id,
-      attachmentIds: parsed.attachmentIds,
-    }),
+  const attachmentLoadPromise = loadAttachmentsAsSystemBlocks({
+    conversationId: conversation.id,
+    userId,
+    attachmentIds: parsed.attachmentIds,
+    allowImages: provider.supportsImage,
+  }).then((loaded) => {
+    args.registerAttachmentRelease(loaded.release);
+    return loaded;
+  });
+  const [attachmentLoad, sessionAssets] = await Promise.all([
+    attachmentLoadPromise,
     Promise.all(
       conversation.ownedSessions.map(async (s) => {
         const bundle = await loadSessionTranscriptBundle(s).catch(() => null);
@@ -1103,10 +1234,11 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
       })
     ),
   ]);
+  const attachmentBlocks = attachmentLoad.blocks;
 
   // ── 拼出 combined transcript（按 session 顺序拼接；每条 segment 的 startMs
   // 平移 + 偏移基准），并准备多录音 RAG 闭包 ──
-  const combinedTranscript: TranscriptSegment[] = [];
+  const combinedAdmission = new TranscriptAdmissionAccumulator();
   let cumulativeMs = 0;
   // 各录音喂给 RAG 的 segments 用「已平移到全局轴」的 startMs（= 本录音全局偏移 +
   // 本地 startMs），使 RAG 检索片段打的 [HH:MM:SS] 标签与 totalTranscriptMs / 时间锚点
@@ -1120,29 +1252,32 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
       startMs: recordingOffsetMs + seg.startMs,
     }));
     segmentsByRecording.set(asset.session.id, shiftedSegments);
-    combinedTranscript.push(...shiftedSegments);
+    for (const segment of shiftedSegments) {
+      combinedAdmission.add(segment.text, segment.startMs);
+    }
     // 用最后一段的 endMs 作为该 session 的总长度近似（segments 已按时间序）
     const last = asset.segments[asset.segments.length - 1];
     if (last) {
       cumulativeMs += last.startMs + 1000; // 加 1s buffer 防止两段时间锚重叠
     }
   }
+  const combinedTranscript = combinedAdmission.finish();
   const totalTranscriptMs = cumulativeMs;
 
   const recordingIds = conversation.ownedSessions.map((s) => s.id);
-  // 内容签名 = 段数与全文字符总长的组合。此前仅用 segment 总数，段数守恒但某段被
-  // 重转写/纠正（文本变、段数不变）时签名不变 → 多录音 RAG 命中旧快照、检索到纠正前
-  // 文本（v3 finding U76）。这里叠加全文 char 长度，令同段数文本改写也触发增量重建
-  // （与单录音路径的 lastContentLength 判据一致）。
-  const ragTotalChars = combinedTranscript.reduce(
-    (acc, seg) => acc + seg.text.length,
-    0
+  // 签名包含 recordingId/startMs/text；等段数、等长改写也必然失效旧
+  // 向量，同时保留真正不变内容的 cache 命中。
+  const ragContentSignature = computeTranscriptContentSignature(
+    sessionAssets.map((asset) => ({
+      recordingId: asset.session.id,
+      segments: asset.segments,
+    }))
   );
-  const ragContentSignature = combinedTranscript.length * 1_000_003 + ragTotalChars;
   const ragRetriever =
     recordingIds.length > 0
       ? makeRagRetrieverForRecordings(
           recordingIds,
+          userId,
           async (rid) => segmentsByRecording.get(rid) ?? [],
           ragContentSignature
         )
@@ -1150,35 +1285,14 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
 
   // ── 持久化 user 消息（在 LLM 调用之前）──
   const userTranscriptOffset = parsed.totalTranscriptMs;
-  let persistedQuestionContent = parsed.question;
-  if (parsed.images.length > 0) {
-    const saved = await Promise.all(
-      parsed.images.map(async (img) => {
-        try {
-          return `![image](${await persistChatImage(conversation.id, img)})`;
-        } catch (err) {
-          chatLogger.warn(
-            { conversationId: conversation.id, err: serializeError(err) },
-            '聊天图片持久化失败，本轮仍会发给模型但刷新后不可见'
-          );
-          return null;
-        }
-      })
-    );
-    const refs = saved.filter((ref): ref is string => ref !== null);
-    if (refs.length > 0) {
-      persistedQuestionContent = `${parsed.question}\n\n${refs.join('\n')}`;
-    }
-  }
   // user 消息在调用 LLM 之前落库，避免请求中断丢失用户输入。代价是本轮若被
   // abort/失败且无 assistant 配对会留下"孤儿 user 消息"，由 dropTrailingOrphanUser 兜底。
-  await prisma.conversationMessage.create({
-    data: {
-      conversationId: conversation.id,
-      role: 'user',
-      content: persistedQuestionContent,
-      transcriptOffsetMs: userTranscriptOffset,
-    },
+  await persistUserQuestion({
+    conversationId: conversation.id,
+    userId,
+    question: parsed.question,
+    transcriptOffsetMs: userTranscriptOffset,
+    images: parsed.images,
   });
 
   // 历史消息：与 legacy 一致用 compressionBoundary 截尾
@@ -1341,7 +1455,6 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
     reportText: combinedReportText,
     forceMinLevel,
     attachmentsSystemMessage: attachmentsBlock,
-    releaseTurn: args.releaseTurn,
+    releaseTurn: combineReleases(args.releaseTurn, attachmentLoad.release),
   });
 }
-

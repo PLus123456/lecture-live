@@ -9,7 +9,183 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { mockFiles } = vi.hoisted(() => ({ mockFiles: new Map<string, string>() }));
+const { mockFiles, mockOpen } = vi.hoisted(() => {
+  const files = new Map<string, string>();
+  const open = vi.fn(async (p: string) => {
+    if (!files.has(p)) {
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    }
+    const source = Buffer.from(files.get(p)!, 'utf8');
+    let cursor = 0;
+    return {
+      read: vi.fn(
+        async (
+          target: Buffer,
+          offset: number,
+          length: number,
+          position: number | null
+        ) => {
+          const start = position ?? cursor;
+          const bytesRead = Math.max(
+            0,
+            Math.min(length, source.byteLength - start)
+          );
+          if (bytesRead > 0) {
+            source.copy(target, offset, start, start + bytesRead);
+          }
+          if (position === null) {
+            cursor += bytesRead;
+          }
+          return { bytesRead, buffer: target };
+        }
+      ),
+      close: vi.fn(async () => undefined),
+    };
+  });
+  return { mockFiles: files, mockOpen: open };
+});
+
+const ledgerHarness = vi.hoisted(() => {
+  class OutcomeUnknownError extends Error {}
+  type ArtifactRow = Record<string, unknown> & {
+    id: string;
+    logicalKey: string;
+    state: string;
+    identityKey: string | null;
+    ownerType: string;
+    ownerId: string;
+    chargedBytes: bigint;
+  };
+  const rows = new Map<string, ArtifactRow>();
+  const active = new Map<string, ArtifactRow>();
+  let sequence = 0;
+  return {
+    rows,
+    active,
+    reset() {
+      rows.clear();
+      active.clear();
+      sequence = 0;
+    },
+    nextId() {
+      sequence += 1;
+      return `artifact-${sequence}`;
+    },
+    OutcomeUnknownError,
+  };
+});
+
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_STATE: {
+    RESERVED: 'RESERVED',
+    ACTIVE: 'ACTIVE',
+    DELETE_PENDING: 'DELETE_PENDING',
+  },
+  STORED_ARTIFACT_TYPE: { TRANSCRIPT_DRAFT: 'transcript_draft' },
+  StoredArtifactPublishOutcomeUnknownError: ledgerHarness.OutcomeUnknownError,
+  buildStoredArtifactLogicalKey: vi.fn(
+    (ownerType: string, ownerId: string, artifactType: string) =>
+      `${ownerType}:${ownerId}:${artifactType}`
+  ),
+  reserveStoredArtifact: vi.fn(async (input: Record<string, unknown> & {
+    logicalKey: string;
+    expectedBytes: number;
+    ownerType: string;
+    ownerId: string;
+  }) => {
+    const id = ledgerHarness.nextId();
+    const previous = ledgerHarness.active.get(input.logicalKey) ?? null;
+    const row = {
+      ...input,
+      id,
+      state: 'RESERVED',
+      storage: 'pending',
+      reference: null,
+      bytes: BigInt(input.expectedBytes),
+      chargedBytes: BigInt(input.expectedBytes),
+      identityKey: null,
+      replacesArtifactId: previous?.id ?? null,
+      reservationKey: `reservation-${id}`,
+    };
+    ledgerHarness.rows.set(id, row);
+    return row;
+  }),
+  recordReservedStoredArtifactLocation: vi.fn(
+    async (id: string, publication: Record<string, unknown>) => {
+      Object.assign(ledgerHarness.rows.get(id)!, publication);
+    }
+  ),
+  settleStoredArtifactsAtomically: vi.fn(
+    async (
+      inputs: Array<{
+        artifactId: string;
+        publication: Record<string, unknown>;
+      }>
+    ) => {
+      const planned = inputs.map(({ artifactId, publication }) => {
+        const row = ledgerHarness.rows.get(artifactId)!;
+        const previous = ledgerHarness.active.get(row.logicalKey) ?? null;
+        if (
+          Object.hasOwn(publication, 'expectedPreviousArtifactId') &&
+          (previous?.id ?? null) !== publication.expectedPreviousArtifactId
+        ) {
+          throw new Error('publish conflict');
+        }
+        return { row, previous, publication };
+      });
+      return planned.map(({ row, previous, publication }) => {
+        if (previous) {
+          previous.state = 'ORPHANED';
+          previous.identityKey = null;
+        }
+        Object.assign(row, publication, {
+          state: 'ACTIVE',
+          identityKey: row.logicalKey,
+        });
+        ledgerHarness.active.set(row.logicalKey, row);
+        return { artifact: row, previous };
+      });
+    }
+  ),
+  getActiveStoredArtifactByLogicalKey: vi.fn(
+    async (logicalKey: string) => ledgerHarness.active.get(logicalKey) ?? null
+  ),
+  getStoredArtifactById: vi.fn(
+    async (id: string) => ledgerHarness.rows.get(id) ?? null
+  ),
+  rollbackStoredArtifact: vi.fn(async (id: string) => {
+    const row = ledgerHarness.rows.get(id);
+    if (row) {
+      row.state = 'DELETED';
+      row.chargedBytes = BigInt(0);
+    }
+    return true;
+  }),
+  releaseStoredArtifact: vi.fn(async (id: string) => {
+    const row = ledgerHarness.rows.get(id);
+    if (row) {
+      row.state = 'DELETED';
+      row.chargedBytes = BigInt(0);
+    }
+    return true;
+  }),
+  findBillableStoredArtifactsByOwner: vi.fn(
+    async (ownerType: string, ownerId: string) =>
+      Array.from(ledgerHarness.rows.values()).filter(
+        (row) =>
+          row.ownerType === ownerType &&
+          row.ownerId === ownerId &&
+          row.chargedBytes > BigInt(0)
+      )
+  ),
+  markStoredArtifactsDeletePending: vi.fn(async (ids: string[]) => {
+    for (const id of ids) {
+      const row = ledgerHarness.rows.get(id);
+      if (row) row.state = 'DELETE_PENDING';
+    }
+    return ids.map((id) => ledgerHarness.rows.get(id)).filter(Boolean);
+  }),
+}));
 
 vi.mock('fs/promises', () => {
   const enoent = () => Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
@@ -31,6 +207,14 @@ vi.mock('fs/promises', () => {
       access: vi.fn(async (p: string) => {
         if (!mockFiles.has(p)) throw enoent();
       }),
+      stat: vi.fn(async (p: string) => {
+        if (!mockFiles.has(p)) throw enoent();
+        return {
+          size: Buffer.byteLength(mockFiles.get(p)!, 'utf8'),
+          isFile: () => true,
+        };
+      }),
+      open: mockOpen,
       rm: vi.fn(async (p: string) => {
         for (const k of Array.from(mockFiles.keys())) {
           if (k.startsWith(p)) mockFiles.delete(k);
@@ -57,6 +241,7 @@ import {
   loadTranscriptDraftManifest,
   type TranscriptDraftPayload,
 } from '@/lib/transcriptDraftPersistence';
+import { SESSION_TRANSCRIPT_LIMITS } from '@/lib/sessionApi';
 
 const session = { id: 'sess-1', userId: 'user-1' };
 
@@ -71,6 +256,7 @@ function mkPayload(n: number): TranscriptDraftPayload {
 
 beforeEach(() => {
   mockFiles.clear();
+  ledgerHarness.reset();
   vi.clearAllMocks();
 });
 
@@ -108,6 +294,22 @@ describe('persistTranscriptDraft 单调守卫（转录 draft 防覆盖）', () =
     expect((await loadTranscriptDraft(session))?.segments.length).toBe(2);
   });
 
+  it('历史超大草稿在打开/读取前即拒绝', async () => {
+    await persistTranscriptDraft(session, mkPayload(2));
+    const transcriptPath = Array.from(mockFiles.keys()).find(
+      (key) => key.includes('/transcript-') && key.endsWith('.json')
+    );
+    expect(transcriptPath).toBeDefined();
+    mockFiles.set(
+      transcriptPath!,
+      'x'.repeat(SESSION_TRANSCRIPT_LIMITS.maxPersistedJsonBytes + 1)
+    );
+    mockOpen.mockClear();
+
+    await expect(loadTranscriptDraft(session)).resolves.toBeNull();
+    expect(mockOpen).not.toHaveBeenCalled();
+  });
+
   // P4-5：冲突分支每次都写一份**全量**备份且从不清理。构造：顶满 segmentCount 之后，
   // 之后每次少一段的 PUT 必命中冲突分支 → 备份文件无上限增长，而 CREATED 会话永不回收。
   it('P4-5 冲突备份只保留最近 3 份（不再无上限堆积）', async () => {
@@ -127,7 +329,7 @@ describe('persistTranscriptDraft 单调守卫（转录 draft 防覆盖）', () =
 
     // 保留的必须是最近的三份（时间戳最大）。
     const kept = conflictKeys
-      .map((k) => Number(k.match(/transcript\.conflict-(\d+)\.json$/)?.[1]))
+      .map((k) => Number(k.match(/transcript\.conflict-(\d+)-/)?.[1]))
       .sort((a, b) => a - b);
     expect(kept[0]).toBeGreaterThan(1_700_000_000_000);
 

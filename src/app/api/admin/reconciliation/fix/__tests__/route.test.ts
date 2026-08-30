@@ -1,16 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createJsonRequest } from '../../../../../../../tests/utils/http';
 
-/**
- * P5-1 / P5-10：对账「修复」按钮。
- *  - (a) 写回必须是 CAS + 增量（WHERE used = 快照 storedMinutes，increment driftMinutes），
- *        绝对写会把 run 之后发生的真实扣费一笔抹掉；
- *  - (c) 有效性下界必须取 max(cycleStart, transcriptionUsageReconcileFrom)，否则限额下调结算
- *        （把 quotaResetAt 推到下月 1 日、getQuotaCycleStartAt 返回值不变）后守卫必然放行，
- *        已被池结清的分钟被写回 used → 下次月度重置从 gross 池二次扣；
- *  - P5-10 单条修复的三步必须在一个事务内，且标记带 fixed:false 谓词。
- */
-
 const {
   requireAdminAccessMock,
   runFindUniqueMock,
@@ -18,13 +8,12 @@ const {
   mismatchFindUniqueMock,
   mismatchFindManyMock,
   mismatchUpdateManyMock,
-  userFindUniqueMock,
-  userFindManyMock,
-  userUpdateManyMock,
+  userUpdateMock,
+  queryRawMock,
   transactionMock,
-  logActionMock,
-  legacyUserUpdateMock,
-  legacyMismatchUpdateMock,
+  calculateMock,
+  getSiteSettingsMock,
+  securityAuditMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   runFindUniqueMock: vi.fn(),
@@ -32,24 +21,30 @@ const {
   mismatchFindUniqueMock: vi.fn(),
   mismatchFindManyMock: vi.fn(),
   mismatchUpdateManyMock: vi.fn(),
-  userFindUniqueMock: vi.fn(),
-  userFindManyMock: vi.fn(),
-  userUpdateManyMock: vi.fn(),
+  userUpdateMock: vi.fn(),
+  queryRawMock: vi.fn(),
   transactionMock: vi.fn(),
-  logActionMock: vi.fn(),
-  // 只为「临时还原旧实现验证测试确实会红」而存在的替身：旧实现走的是 update（绝对写），
-  // 不挂上它旧代码会因缺方法而报错，那种红是管道红、不算真红。
-  legacyUserUpdateMock: vi.fn(),
-  legacyMismatchUpdateMock: vi.fn(),
+  calculateMock: vi.fn(),
+  getSiteSettingsMock: vi.fn(),
+  securityAuditMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({ requireAdminAccess: requireAdminAccessMock }));
-vi.mock('@/lib/auditLog', () => ({ logAction: logActionMock }));
+vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: getSiteSettingsMock }));
+vi.mock('@/lib/securityAudit', () => ({ writeSecurityAudit: securityAuditMock }));
 vi.mock('@/lib/billing', () => ({
-  // 周期起点固定为 2026-06-01（本月 1 日），与 settlePoolOnLimitChange 把 quotaResetAt 推到
-  // 下月 1 日后 getQuotaCycleStartAt 的返回值「完全不变」这一事实一致。
   getQuotaCycleStartAt: () => new Date('2026-06-01T00:00:00.000Z'),
 }));
+vi.mock('@/lib/quota', () => ({
+  calculateTranscriptionUsageReconciliation: calculateMock,
+}));
+
+const txClient = {
+  $queryRaw: queryRawMock,
+  reconciliationRun: { update: runUpdateMock },
+  reconciliationMismatch: { updateMany: mismatchUpdateManyMock },
+  user: { update: userUpdateMock },
+};
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
@@ -58,37 +53,13 @@ vi.mock('@/lib/prisma', () => ({
       findUnique: mismatchFindUniqueMock,
       findMany: mismatchFindManyMock,
       updateMany: mismatchUpdateManyMock,
-      update: legacyMismatchUpdateMock,
     },
-    user: {
-      findUnique: userFindUniqueMock,
-      findMany: userFindManyMock,
-      updateMany: userUpdateManyMock,
-      update: legacyUserUpdateMock,
-    },
+    user: { update: userUpdateMock },
     $transaction: transactionMock,
   },
 }));
 
 import { POST } from '@/app/api/admin/reconciliation/fix/route';
-
-/** 事务替身：把回调跑在同一批 spy 上，让「在事务内」与「在事务外」用同一份数据可比。 */
-const txClient = {
-  reconciliationRun: { update: runUpdateMock },
-  reconciliationMismatch: {
-    updateMany: mismatchUpdateManyMock,
-    update: legacyMismatchUpdateMock,
-  },
-  user: { updateMany: userUpdateManyMock, update: legacyUserUpdateMock },
-};
-
-const post = (body: unknown) =>
-  POST(
-    createJsonRequest('http://localhost/api/admin/reconciliation/fix', {
-      method: 'POST',
-      body,
-    })
-  );
 
 const RUN_AT = new Date('2026-06-20T00:00:00.000Z');
 
@@ -98,235 +69,339 @@ function mismatch(over: Partial<Record<string, unknown>> = {}) {
     runId: 'run-1',
     userId: 'u1',
     userEmail: 'u@x.com',
-    recordedMinutes: 100,
+    recordedMinutes: 145,
     storedMinutes: 130,
-    driftMinutes: -30,
+    driftMinutes: 15,
     fixed: false,
     run: { createdAt: RUN_AT },
     ...over,
   };
 }
 
-describe('POST /api/admin/reconciliation/fix — 单条修复', () => {
+function lockedUser(over: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: 'u1',
+    email: 'u@x.com',
+    transcriptionMinutesUsed: 130,
+    quotaResetAt: new Date('2026-07-01T00:00:00.000Z'),
+    transcriptionUsageReconcileFrom: null,
+    ...over,
+  };
+}
+
+function post(body: unknown) {
+  return POST(
+    createJsonRequest('http://localhost/api/admin/reconciliation/fix', {
+      method: 'POST',
+      body,
+    })
+  );
+}
+
+describe('POST /api/admin/reconciliation/fix — SEC-030 locked repair', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     requireAdminAccessMock.mockResolvedValue({
       user: { id: 'admin1', email: 'admin@x.com', role: 'ADMIN' },
       response: null,
     });
-    // 同时支持交互式与数组两种形态：旧实现批量路径走数组形态，替身能跑它才能验出「真红」。
-    transactionMock.mockImplementation(async (arg: unknown) =>
-      typeof arg === 'function'
-        ? (arg as (tx: unknown) => Promise<unknown>)(txClient)
-        : Promise.all(arg as unknown[])
-    );
+    getSiteSettingsMock.mockResolvedValue({ async_upload_billing_multiplier: 0.8 });
+    transactionMock.mockImplementation((fn: (tx: typeof txClient) => unknown) => fn(txClient));
+    queryRawMock.mockResolvedValue([lockedUser()]);
     mismatchUpdateManyMock.mockResolvedValue({ count: 1 });
-    userUpdateManyMock.mockResolvedValue({ count: 1 });
+    userUpdateMock.mockResolvedValue({});
     runUpdateMock.mockResolvedValue({});
-    legacyUserUpdateMock.mockResolvedValue({});
-    legacyMismatchUpdateMock.mockResolvedValue({});
-  });
-
-  it('▶ P5-1(a)：写回是 CAS + 增量，而非按 recordedMinutes 绝对覆写', async () => {
-    mismatchFindUniqueMock.mockResolvedValue(mismatch());
-    userFindUniqueMock.mockResolvedValue({
-      id: 'u1',
-      quotaResetAt: new Date('2026-07-01T00:00:00.000Z'),
-      transcriptionUsageReconcileFrom: null,
+    securityAuditMock.mockResolvedValue({
+      requestId: 'req-1',
+      action: 'admin.security.reconciliation.fix',
     });
-
-    const res = await post({ mismatchId: 'mm-1' });
-
-    expect(res.status).toBe(200);
-    expect(userUpdateManyMock).toHaveBeenCalledWith({
-      where: { id: 'u1', transcriptionMinutesUsed: 130 },
-      data: { transcriptionMinutesUsed: { increment: -30 } },
+    calculateMock.mockResolvedValue({
+      id: 'u1',
+      email: 'u@x.com',
+      transcriptionMinutesUsed: 130,
+      recordedMinutes: 145,
+      driftMinutes: 15,
+      hasAmbiguousCharges: false,
     });
   });
 
-  it('▶ P5-1(a)：用量在 run 之后已变化（CAS 不中）→ 409 且整个事务回滚，不改任何计数', async () => {
+  it('locks User first, then recomputes committed + inflight and writes the fresh target', async () => {
     mismatchFindUniqueMock.mockResolvedValue(mismatch());
-    userFindUniqueMock.mockResolvedValue({
-      id: 'u1',
-      quotaResetAt: new Date('2026-07-01T00:00:00.000Z'),
-      transcriptionUsageReconcileFrom: null,
+    const order: string[] = [];
+    queryRawMock.mockImplementation(async () => {
+      order.push('lock');
+      return [lockedUser()];
     });
-    userUpdateManyMock.mockResolvedValue({ count: 0 }); // 快照失效
-
-    const res = await post({ mismatchId: 'mm-1' });
-
-    expect(res.status).toBe(409);
-    // 事务体抛错 → 真实 Prisma 会整体回滚；这里断言 fixedCount 那一步根本没执行
-    expect(runUpdateMock).not.toHaveBeenCalled();
-  });
-
-  it('▶ P5-1(c)：run 早于 transcriptionUsageReconcileFrom → 409（不把已结清分钟写回 used）', async () => {
-    // 关键：quotaResetAt 已被限额下调结算推到下月 1 日，但 getQuotaCycleStartAt 仍返回本月 1 日，
-    // 只看 cycleStart 的旧守卫必然放行 → 二次扣池。reconcileFrom 是唯一能拦住它的下界。
-    mismatchFindUniqueMock.mockResolvedValue(mismatch());
-    userFindUniqueMock.mockResolvedValue({
-      id: 'u1',
-      quotaResetAt: new Date('2026-07-01T00:00:00.000Z'),
-      transcriptionUsageReconcileFrom: new Date('2026-06-25T00:00:00.000Z'),
-    });
-
-    const res = await post({ mismatchId: 'mm-1' });
-
-    expect(res.status).toBe(409);
-    expect(userUpdateManyMock).not.toHaveBeenCalled();
-  });
-
-  it('reconcileFrom 早于 run → 正常放行', async () => {
-    mismatchFindUniqueMock.mockResolvedValue(mismatch());
-    userFindUniqueMock.mockResolvedValue({
-      id: 'u1',
-      quotaResetAt: new Date('2026-07-01T00:00:00.000Z'),
-      transcriptionUsageReconcileFrom: new Date('2026-06-10T00:00:00.000Z'),
-    });
-
-    const res = await post({ mismatchId: 'mm-1' });
-
-    expect(res.status).toBe(200);
-    expect(userUpdateManyMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('▶ P5-10：三步（改用量 / 标记 / 递增计数）都在同一个事务内', async () => {
-    mismatchFindUniqueMock.mockResolvedValue(mismatch());
-    userFindUniqueMock.mockResolvedValue({
-      id: 'u1',
-      quotaResetAt: new Date('2026-07-01T00:00:00.000Z'),
-      transcriptionUsageReconcileFrom: null,
-    });
-    const inside: string[] = [];
-    let insideTx = false;
-    transactionMock.mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) => {
-      insideTx = true;
-      try {
-        return await fn(txClient);
-      } finally {
-        insideTx = false;
-      }
-    });
-    userUpdateManyMock.mockImplementation(async () => {
-      inside.push(`user:${insideTx ? 'in-tx' : 'out-of-tx'}`);
-      return { count: 1 };
+    calculateMock.mockImplementation(async () => {
+      order.push('recompute');
+      return {
+        id: 'u1',
+        email: 'u@x.com',
+        transcriptionMinutesUsed: 130,
+        recordedMinutes: 145,
+        driftMinutes: 15,
+      };
     });
     mismatchUpdateManyMock.mockImplementation(async () => {
-      inside.push(`mark:${insideTx ? 'in-tx' : 'out-of-tx'}`);
+      order.push('mark');
       return { count: 1 };
     });
-    runUpdateMock.mockImplementation(async () => {
-      inside.push(`count:${insideTx ? 'in-tx' : 'out-of-tx'}`);
+    userUpdateMock.mockImplementation(async () => {
+      order.push('write');
       return {};
     });
 
-    const res = await post({ mismatchId: 'mm-1' });
+    const response = await post({ mismatchId: 'mm-1' });
 
-    expect(res.status).toBe(200);
-    expect(inside).toEqual(['mark:in-tx', 'user:in-tx', 'count:in-tx']);
+    expect(response.status).toBe(200);
+    expect(order).toEqual(['lock', 'recompute', 'mark', 'write']);
+    expect(calculateMock).toHaveBeenCalledWith(lockedUser(), 0.8, txClient);
+    expect(userUpdateMock).toHaveBeenCalledWith({
+      where: { id: 'u1' },
+      data: { transcriptionMinutesUsed: 145 },
+    });
+    expect(mismatchUpdateManyMock).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'mm-1', fixed: false } })
+    );
+    expect(securityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'reconciliation.fix',
+        target: expect.objectContaining({ id: 'u1', ownerId: 'u1' }),
+        before: { minutes: 130 },
+        after: { minutes: 145 },
+        outcome: 'SUCCESS',
+      }),
+      txClient
+    );
   });
 
-  it('▶ P5-10：标记带 fixed:false 谓词；被并发抢先则 409、不重复递增 fixedCount', async () => {
+  it('blocks the ABA case: a reservation already became an equal committed charge', async () => {
     mismatchFindUniqueMock.mockResolvedValue(mismatch());
-    userFindUniqueMock.mockResolvedValue({
+    calculateMock.mockResolvedValue({
       id: 'u1',
-      quotaResetAt: new Date('2026-07-01T00:00:00.000Z'),
-      transcriptionUsageReconcileFrom: null,
+      email: 'u@x.com',
+      transcriptionMinutesUsed: 130,
+      recordedMinutes: 130,
+      driftMinutes: 0,
     });
-    mismatchUpdateManyMock.mockResolvedValue({ count: 0 }); // 已被别人标记
 
-    const res = await post({ mismatchId: 'mm-1' });
+    const response = await post({ mismatchId: 'mm-1' });
 
-    expect(res.status).toBe(409);
-    expect(mismatchUpdateManyMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: 'mm-1', fixed: false },
+    expect(response.status).toBe(409);
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(mismatchUpdateManyMock).not.toHaveBeenCalled();
+    expect(runUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('can safely lower a counter because immutable charge rows survive Session deletion', async () => {
+    mismatchFindUniqueMock.mockResolvedValue(
+      mismatch({
+        recordedMinutes: 100,
+        storedMinutes: 130,
+        driftMinutes: -30,
       })
     );
+    calculateMock.mockResolvedValue({
+      id: 'u1',
+      email: 'u@x.com',
+      transcriptionMinutesUsed: 130,
+      // The missing 30-minute Session row may have been physically deleted. The surviving ledger
+      // is therefore not proof that the user's real charge should be lowered.
+      recordedMinutes: 100,
+      driftMinutes: -30,
+      hasAmbiguousCharges: false,
+    });
+
+    const response = await post({ mismatchId: 'mm-1' });
+
+    expect(response.status).toBe(200);
+    expect(userUpdateMock).toHaveBeenCalledWith({
+      where: { id: 'u1' },
+      data: { transcriptionMinutesUsed: 100 },
+    });
+  });
+
+  it('fixAll fails closed while the current period contains an ambiguous legacy opening balance', async () => {
+    runFindUniqueMock.mockResolvedValue({ id: 'run-1', createdAt: RUN_AT });
+    mismatchFindManyMock.mockResolvedValue([
+      mismatch({ recordedMinutes: 100, storedMinutes: 130, driftMinutes: -30 }),
+    ]);
+    calculateMock.mockResolvedValue({
+      id: 'u1',
+      email: 'u@x.com',
+      transcriptionMinutesUsed: 130,
+      recordedMinutes: 100,
+      driftMinutes: -30,
+      hasAmbiguousCharges: true,
+    });
+
+    const response = await post({ runId: 'run-1', fixAll: true });
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({
+      code: 'AMBIGUOUS_LEGACY_LEDGER',
+      blockedCount: 1,
+    });
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(mismatchUpdateManyMock).not.toHaveBeenCalled();
     expect(runUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a run older than the locked user reconciliation lower bound', async () => {
+    mismatchFindUniqueMock.mockResolvedValue(mismatch());
+    queryRawMock.mockResolvedValue([
+      lockedUser({ transcriptionUsageReconcileFrom: new Date('2026-06-25T00:00:00.000Z') }),
+    ]);
+
+    const response = await post({ mismatchId: 'mm-1' });
+
+    expect(response.status).toBe(409);
+    expect(calculateMock).not.toHaveBeenCalled();
+    expect(userUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('a lost fixed:false claim cannot change the user or inflate fixedCount', async () => {
+    mismatchFindUniqueMock.mockResolvedValue(mismatch());
+    mismatchUpdateManyMock.mockResolvedValue({ count: 0 });
+
+    const response = await post({ mismatchId: 'mm-1' });
+
+    expect(response.status).toBe(409);
+    expect(userUpdateMock).not.toHaveBeenCalled();
+    expect(runUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the in-transaction security audit cannot be persisted', async () => {
+    mismatchFindUniqueMock.mockResolvedValue(mismatch());
+    securityAuditMock.mockRejectedValueOnce(new Error('audit unavailable'));
+
+    const response = await post({ mismatchId: 'mm-1' });
+
+    expect(response.status).toBe(500);
+    expect(securityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({ outcome: 'SUCCESS' }),
+      txClient
+    );
   });
 });
 
-describe('POST /api/admin/reconciliation/fix — 批量修复', () => {
+describe('POST /api/admin/reconciliation/fix — true concurrent requests', () => {
+  let releaseTail: Promise<void> = Promise.resolve();
+  let fixed: Set<string>;
+  let usedByUser: Map<string, number>;
+  let ledgerByUser: Map<string, number>;
+  let fixedCount: number;
+
   beforeEach(() => {
     vi.clearAllMocks();
+    fixed = new Set();
+    usedByUser = new Map([
+      ['u1', 100],
+      ['u2', 50],
+    ]);
+    ledgerByUser = new Map([
+      ['u1', 130],
+      ['u2', 70],
+    ]);
+    fixedCount = 0;
+    releaseTail = Promise.resolve();
     requireAdminAccessMock.mockResolvedValue({
       user: { id: 'admin1', email: 'admin@x.com', role: 'ADMIN' },
       response: null,
     });
-    // 同时支持交互式与数组两种形态：旧实现批量路径走数组形态，替身能跑它才能验出「真红」。
-    transactionMock.mockImplementation(async (arg: unknown) =>
-      typeof arg === 'function'
-        ? (arg as (tx: unknown) => Promise<unknown>)(txClient)
-        : Promise.all(arg as unknown[])
-    );
+    getSiteSettingsMock.mockResolvedValue({ async_upload_billing_multiplier: 0.8 });
     runFindUniqueMock.mockResolvedValue({ id: 'run-1', createdAt: RUN_AT });
-    mismatchUpdateManyMock.mockResolvedValue({ count: 1 });
-    userUpdateManyMock.mockResolvedValue({ count: 1 });
-    runUpdateMock.mockResolvedValue({});
-    legacyUserUpdateMock.mockResolvedValue({});
-    legacyMismatchUpdateMock.mockResolvedValue({});
-  });
+    securityAuditMock.mockResolvedValue({
+      requestId: 'req-1',
+      action: 'admin.security.reconciliation.fix',
+    });
 
-  it('▶ P5-1(a)：批量写回同样是 CAS + 增量', async () => {
-    mismatchFindManyMock.mockResolvedValue([mismatch()]);
-    userFindManyMock.mockResolvedValue([
-      {
-        id: 'u1',
-        quotaResetAt: new Date('2026-07-01T00:00:00.000Z'),
-        transcriptionUsageReconcileFrom: null,
-      },
+    // Actual overlapping route promises share a row-lock harness.  The callback owns the lock until
+    // commit, matching the transaction boundary rather than merely sequencing individual mocks.
+    transactionMock.mockImplementation(async (fn: (tx: typeof txClient) => unknown) => {
+      const previous = releaseTail;
+      let release!: () => void;
+      releaseTail = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      try {
+        return await fn(txClient);
+      } finally {
+        release();
+      }
+    });
+    queryRawMock.mockImplementation(async (_strings: TemplateStringsArray, userId: string) => [
+      lockedUser({ id: userId, email: `${userId}@x.com`, transcriptionMinutesUsed: usedByUser.get(userId) }),
     ]);
-
-    const res = await post({ runId: 'run-1', fixAll: true });
-
-    expect(res.status).toBe(200);
-    expect(userUpdateManyMock).toHaveBeenCalledWith({
-      where: { id: 'u1', transcriptionMinutesUsed: 130 },
-      data: { transcriptionMinutesUsed: { increment: -30 } },
+    calculateMock.mockImplementation(async (user: ReturnType<typeof lockedUser>) => {
+      const target = ledgerByUser.get(String(user.id)) ?? 0;
+      const used = usedByUser.get(String(user.id)) ?? 0;
+      return {
+        id: user.id,
+        email: user.email,
+        transcriptionMinutesUsed: used,
+        recordedMinutes: target,
+        driftMinutes: target - used,
+      };
+    });
+    mismatchUpdateManyMock.mockImplementation(async ({ where }: { where: { id: string } }) => {
+      if (fixed.has(where.id)) return { count: 0 };
+      fixed.add(where.id);
+      return { count: 1 };
+    });
+    userUpdateMock.mockImplementation(
+      async ({ where, data }: { where: { id: string }; data: { transcriptionMinutesUsed: number } }) => {
+        usedByUser.set(where.id, data.transcriptionMinutesUsed);
+        return {};
+      }
+    );
+    runUpdateMock.mockImplementation(async () => {
+      fixedCount += 1;
+      return {};
     });
   });
 
-  it('▶ P5-1(c)：批量侧也读 transcriptionUsageReconcileFrom，早于它的 run 被跳过', async () => {
-    mismatchFindManyMock.mockResolvedValue([mismatch()]);
-    userFindManyMock.mockResolvedValue([
-      {
-        id: 'u1',
-        quotaResetAt: new Date('2026-07-01T00:00:00.000Z'),
-        transcriptionUsageReconcileFrom: new Date('2026-06-25T00:00:00.000Z'),
-      },
+  it('two simultaneous single fixes apply exactly once', async () => {
+    mismatchFindUniqueMock.mockResolvedValue(mismatch());
+
+    const [a, b] = await Promise.all([
+      post({ mismatchId: 'mm-1' }),
+      post({ mismatchId: 'mm-1' }),
     ]);
 
-    const res = await post({ runId: 'run-1', fixAll: true });
-
-    expect(res.status).toBe(409);
-    expect(userUpdateManyMock).not.toHaveBeenCalled();
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    expect(usedByUser.get('u1')).toBe(130);
+    expect(fixedCount).toBe(1);
+    expect(fixed).toEqual(new Set(['mm-1']));
   });
 
-  it('▶ CAS 未命中的条目不计入 fixedCount（计数不虚高）', async () => {
-    mismatchFindManyMock.mockResolvedValue([
-      mismatch({ id: 'mm-1', userId: 'u1' }),
+  it('simultaneous bulk repairs use stable order and count each mismatch once', async () => {
+    const rows = [
       mismatch({ id: 'mm-2', userId: 'u2' }),
-    ]);
-    userFindManyMock.mockResolvedValue([
-      { id: 'u1', quotaResetAt: null, transcriptionUsageReconcileFrom: null },
-      { id: 'u2', quotaResetAt: null, transcriptionUsageReconcileFrom: null },
-    ]);
-    userUpdateManyMock
-      .mockResolvedValueOnce({ count: 1 })
-      .mockResolvedValueOnce({ count: 0 }); // u2 用量已变
-    mismatchUpdateManyMock.mockResolvedValue({ count: 1 });
+      mismatch({ id: 'mm-1', userId: 'u1' }),
+    ];
+    mismatchFindManyMock.mockResolvedValue(rows);
 
-    const res = await post({ runId: 'run-1', fixAll: true });
-    const body = await res.json();
+    const [a, b] = await Promise.all([
+      post({ runId: 'run-1', fixAll: true }),
+      post({ runId: 'run-1', fixAll: true }),
+    ]);
 
-    expect(body.fixedCount).toBe(1);
-    expect(body.skippedStale).toBe(1);
-    expect(mismatchUpdateManyMock).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: { in: ['mm-1'] }, fixed: false } })
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    expect(usedByUser).toEqual(
+      new Map([
+        ['u1', 130],
+        ['u2', 70],
+      ])
     );
-    expect(runUpdateMock).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { fixedCount: { increment: 1 } } })
-    );
+    expect(fixedCount).toBe(2);
+    expect(fixed).toEqual(new Set(['mm-1', 'mm-2']));
+    const lockedOrder = queryRawMock.mock.calls.map((call) => call[1]);
+    expect(lockedOrder).toEqual(['u1', 'u1', 'u2', 'u2']);
+    // One short transaction per user per request: no batch-wide RR snapshot survives from u1 to u2.
+    expect(transactionMock).toHaveBeenCalledTimes(4);
   });
 });

@@ -25,6 +25,8 @@ import { getSiteSettings } from '@/lib/siteSettings';
 const CONTROL_TIMEOUT_MS = 30_000;
 // 论文级 PDF 通常 <50MB，传输给 10 分钟余量
 const TRANSFER_TIMEOUT_MS = 10 * 60_000;
+const CONTROL_RESPONSE_MAX_BYTES = 64 * 1024;
+const OUTPUT_RESPONSE_MAX_BYTES = 128 * 1024 * 1024;
 
 /** 单台 worker 的连接配置（token 已解密） */
 export interface TranslateWorkerConfig {
@@ -177,7 +179,12 @@ function authHeaders(config: Pick<TranslateWorkerConfig, 'token'>): Record<strin
 
 async function readErrorBody(res: Response): Promise<string> {
   try {
-    const text = await res.text();
+    const bytes = await readBoundedResponseBytes(
+      res,
+      CONTROL_RESPONSE_MAX_BYTES,
+      'worker error response'
+    );
+    const text = new TextDecoder().decode(bytes);
     const plain = /<\s*html/i.test(text)
       ? text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
       : text;
@@ -185,6 +192,50 @@ async function readErrorBody(res: Response): Promise<string> {
   } catch {
     return '';
   }
+}
+
+async function readBoundedResponseBytes(
+  res: Response,
+  maxBytes: number,
+  label: string
+): Promise<Uint8Array> {
+  const declared = res.headers.get('content-length');
+  if (declared !== null) {
+    const parsed = Number(declared);
+    if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > maxBytes) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new Error(`${label} exceeded byte limit`);
+    }
+  }
+  if (!res.body) return new Uint8Array();
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`${label} exceeded byte limit`);
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  }
+
+  const merged = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged;
 }
 
 async function requestJson<T>(
@@ -203,7 +254,12 @@ async function requestJson<T>(
       res.status
     );
   }
-  return (await res.json()) as T;
+  const bytes = await readBoundedResponseBytes(
+    res,
+    CONTROL_RESPONSE_MAX_BYTES,
+    'worker control response'
+  );
+  return JSON.parse(new TextDecoder().decode(bytes)) as T;
 }
 
 /** 探活 + 队列详情（admin「测试连接」与派发前选台共用） */
@@ -270,8 +326,24 @@ export async function downloadTranslateOutput(
       res.status
     );
   }
-  const data = Buffer.from(await res.arrayBuffer());
-  return { data, contentType: res.headers.get('content-type') ?? 'application/pdf' };
+  const contentType = res.headers.get('content-type') ?? '';
+  if (
+    !contentType.toLowerCase().includes('application/pdf') &&
+    !contentType.toLowerCase().includes('application/octet-stream')
+  ) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new TranslateWorkerError(
+      `worker 下载 ${variant} 产物 Content-Type 非法`,
+      502
+    );
+  }
+  const bytes = await readBoundedResponseBytes(
+    res,
+    OUTPUT_RESPONSE_MAX_BYTES,
+    `worker ${variant} output`
+  );
+  const data = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return { data, contentType };
 }
 
 /** best-effort 清理 worker 侧任务目录；404 视为已清理 */

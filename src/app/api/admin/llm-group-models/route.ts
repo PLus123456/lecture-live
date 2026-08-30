@@ -1,13 +1,13 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import {
   coerceSummaryModelId,
   resolveRoleQuotas,
   resolveCustomGroupPermissions,
   type GroupPermissions,
 } from '@/lib/userRoles';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 // 支持按组绑定模型的用途（关键词/嵌入全局统一，不按组）
 const GROUP_BINDABLE_PURPOSES = [
@@ -49,6 +49,16 @@ interface GroupModelBinding {
   allowDocTranslation: boolean;
 }
 
+class GroupModelRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+    this.name = 'GroupModelRequestError';
+  }
+}
+
 /** 从运行时解析器的结果抽出按组视图需要的字段（绑定 + 可用模型 + 能力开关） */
 function fromPermissions(perms: GroupPermissions) {
   return {
@@ -74,12 +84,12 @@ function fromPermissions(perms: GroupPermissions) {
  * 不与「用户组」面板产生两套口径。ADMIN 恒跟随全局（解析器对 ADMIN 短路），不出现在列表里。
  */
 export async function GET(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user: admin, response } = await requireAdminAccess(req, {
     scope: 'admin:llm-group-models:list',
     limit: 60,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -135,6 +145,20 @@ export async function GET(req: Request) {
       }
     }
 
+    await writeSecurityAudit(req, {
+      event: 'llm-group-models.read',
+      operator: { id: admin.id, email: admin.email, role: admin.role },
+      target: {
+        type: 'llm_group_model_collection',
+        ids: groups.map((group) => group.key),
+      },
+      after: {
+        groupCount: groups.length,
+        customGroupCount: groups.filter((group) => group.isCustom).length,
+      },
+      reason: 'admin_list',
+      outcome: 'SUCCESS',
+    });
     return NextResponse.json({ groups });
   } catch (err) {
     console.error('获取用户组模型绑定失败:', err);
@@ -154,8 +178,8 @@ export async function PUT(req: Request) {
     limit: 60,
     windowMs: 10 * 60_000,
   });
-  if (response) {
-    return response;
+  if (response || !admin) {
+    return response ?? NextResponse.json({ error: '权限不足' }, { status: 403 });
   }
 
   try {
@@ -171,84 +195,97 @@ export async function PUT(req: Request) {
       );
     }
 
-    // 非空绑定必须指向「该用途下现存的路由行」，防止把别的用途/不存在的 id 绑进组
-    if (modelId) {
-      const route = await prisma.llmModel.findUnique({ where: { id: modelId } });
-      if (!route || route.purpose !== purpose) {
-        return NextResponse.json(
-          { error: '模型不存在或未挂载到该用途' },
-          { status: 400 }
-        );
-      }
-    }
-
     const field = PURPOSE_FIELD[purpose];
-
-    if ((BINDABLE_ROLES as readonly string[]).includes(groupKey)) {
-      // 系统角色：读-改-写 group_config_<role>（缺失字段由 resolveRoleQuotas 字段级回落，
-      // 部分写入是安全的）
-      const key = `group_config_${groupKey}`;
-      const row = await prisma.siteSetting.findUnique({ where: { key } });
-      let cfg: Record<string, unknown> = {};
-      if (row) {
-        try {
-          const parsed = JSON.parse(row.value);
-          if (parsed && typeof parsed === 'object') {
-            cfg = parsed as Record<string, unknown>;
-          }
-        } catch {
-          // 脏配置：重建为仅含绑定字段的对象，其余字段回落默认
-        }
-      }
-      cfg[field] = modelId;
-      await prisma.siteSetting.upsert({
-        where: { key },
-        update: { value: JSON.stringify(cfg) },
-        create: { key, value: JSON.stringify(cfg) },
-      });
-    } else if (groupKey.startsWith('custom:')) {
-      const groupId = groupKey.slice('custom:'.length);
-      const row = await prisma.siteSetting.findUnique({
-        where: { key: 'custom_groups' },
-      });
-      if (!row) {
-        return NextResponse.json({ error: '用户组不存在' }, { status: 404 });
-      }
-      let arr: unknown;
-      try {
-        arr = JSON.parse(row.value);
-      } catch {
-        return NextResponse.json({ error: '用户组配置损坏' }, { status: 500 });
-      }
-      if (!Array.isArray(arr)) {
-        return NextResponse.json({ error: '用户组不存在' }, { status: 404 });
-      }
-      const entry = arr.find(
-        (g): g is { id: string; permissions?: Record<string, unknown> } =>
-          Boolean(g) && typeof g === 'object' && (g as { id?: unknown }).id === groupId
-      );
-      if (!entry) {
-        return NextResponse.json({ error: '用户组不存在' }, { status: 404 });
-      }
-      if (!entry.permissions || typeof entry.permissions !== 'object') {
-        entry.permissions = {};
-      }
-      (entry.permissions as Record<string, unknown>)[field] = modelId;
-      await prisma.siteSetting.update({
-        where: { key: 'custom_groups' },
-        data: { value: JSON.stringify(arr) },
-      });
-    } else {
+    const isSystemGroup = (BINDABLE_ROLES as readonly string[]).includes(groupKey);
+    const isCustomGroup = groupKey.startsWith('custom:');
+    if (!isSystemGroup && !isCustomGroup) {
       return NextResponse.json({ error: 'groupKey 非法' }, { status: 400 });
     }
 
-    logAction(req, 'admin.llm.groupModel.update', {
-      user: admin,
-      detail: `更新组模型绑定: ${groupKey} ${purpose} → ${modelId || '(跟随全局默认)'}`,
+    await prisma.$transaction(async (tx) => {
+      // 非空绑定必须在同一事务内确认用途，避免校验后被并发删除仍写入悬空绑定。
+      if (modelId) {
+        const route = await tx.llmModel.findUnique({ where: { id: modelId } });
+        if (!route || route.purpose !== purpose) {
+          throw new GroupModelRequestError('模型不存在或未挂载到该用途', 400);
+        }
+      }
+
+      let previousModelId = '';
+      if (isSystemGroup) {
+        const key = `group_config_${groupKey}`;
+        const row = await tx.siteSetting.findUnique({ where: { key } });
+        let cfg: Record<string, unknown> = {};
+        if (row) {
+          try {
+            const parsed = JSON.parse(row.value);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              cfg = parsed as Record<string, unknown>;
+            }
+          } catch {
+            // 脏配置：重建为仅含绑定字段的对象，其余字段回落默认。
+          }
+        }
+        previousModelId = coerceSummaryModelId(cfg[field]);
+        cfg[field] = modelId;
+        await tx.siteSetting.upsert({
+          where: { key },
+          update: { value: JSON.stringify(cfg) },
+          create: { key, value: JSON.stringify(cfg) },
+        });
+      } else {
+        const groupId = groupKey.slice('custom:'.length);
+        const row = await tx.siteSetting.findUnique({
+          where: { key: 'custom_groups' },
+        });
+        if (!row) throw new GroupModelRequestError('用户组不存在', 404);
+        let arr: unknown;
+        try {
+          arr = JSON.parse(row.value);
+        } catch {
+          throw new GroupModelRequestError('用户组配置损坏', 500);
+        }
+        if (!Array.isArray(arr)) {
+          throw new GroupModelRequestError('用户组不存在', 404);
+        }
+        const entry = arr.find(
+          (group): group is { id: string; permissions?: Record<string, unknown> } =>
+            Boolean(group) &&
+            typeof group === 'object' &&
+            (group as { id?: unknown }).id === groupId
+        );
+        if (!entry) throw new GroupModelRequestError('用户组不存在', 404);
+        if (!entry.permissions || typeof entry.permissions !== 'object') {
+          entry.permissions = {};
+        }
+        previousModelId = coerceSummaryModelId(entry.permissions[field]);
+        entry.permissions[field] = modelId;
+        await tx.siteSetting.update({
+          where: { key: 'custom_groups' },
+          data: { value: JSON.stringify(arr) },
+        });
+      }
+
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'llm-group-models.update',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'llm_group_model_binding', id: groupKey },
+          before: { purpose, modelId: previousModelId || null },
+          after: { purpose, modelId: modelId || null },
+          reason: 'admin_update_binding',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
     });
 
     return NextResponse.json({ ok: true });
   } catch (err) {
+    if (err instanceof GroupModelRequestError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
     console.error('更新用户组模型绑定失败:', err);
     return NextResponse.json({ error: '更新失败' }, { status: 500 });
   }

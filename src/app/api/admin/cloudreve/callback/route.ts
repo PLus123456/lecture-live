@@ -8,6 +8,15 @@ import {
 import { invalidateSiteSettingsCache } from '@/lib/siteSettings';
 import { resolvePublicAppOrigin } from '@/lib/requestOrigin';
 import { encrypt } from '@/lib/crypto';
+import { JOB_TYPE, trackJob } from '@/lib/jobQueue';
+import { writeSecurityAudit } from '@/lib/securityAudit';
+
+function auditUnavailableResponse() {
+  return NextResponse.json(
+    { error: '审计服务暂不可用，请稍后重试' },
+    { status: 503 }
+  );
+}
 
 function normalizeStoredRedirectUri(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
@@ -78,12 +87,12 @@ function parseStoredVerifier(
 export async function GET(req: Request) {
   // 该回调仅靠 middleware 的 JWT 兜底，普通登录用户也能命中。
   // 这里补一道 requireAdminAccess：非管理员直接 403，避免被用来探测 / 触发 OAuth 交换。
-  const { response: accessResponse } = await requireAdminAccess(req, {
+  const { user: admin, response: accessResponse } = await requireAdminAccess(req, {
     scope: 'admin:cloudreve:callback',
     limit: 20,
     windowMs: 60_000,
   });
-  if (accessResponse) return accessResponse;
+  if (accessResponse || !admin) return accessResponse!;
 
   const url = new URL(req.url);
   const code = url.searchParams.get('code');
@@ -106,13 +115,39 @@ export async function GET(req: Request) {
     : fallbackOrigin;
 
   if (error) {
-    // 授权被拒绝或出错，重定向到管理面板并附带错误信息
+    try {
+      await writeSecurityAudit(req, {
+        event: 'cloudreve.callback',
+        operator: { id: admin.id, email: admin.email, role: admin.role },
+        target: { type: 'cloudreve_oauth', id: 'global' },
+        before: { state: 'authorization_pending' },
+        after: { state: 'authorization_denied' },
+        reason: 'oauth_provider_denied',
+        outcome: 'DENIED',
+        metadata: { providerErrorPresent: true },
+      });
+    } catch {
+      return auditUnavailableResponse();
+    }
+    // 不把 provider 可控的错误文本反射到管理页 URL；结构化审计只记录是否出现。
     return NextResponse.redirect(
-      new URL(`/admin?cloudreve_error=${encodeURIComponent(error)}`, redirectBaseOrigin)
+      new URL('/admin?cloudreve_error=provider_denied', redirectBaseOrigin)
     );
   }
 
   if (!code) {
+    try {
+      await writeSecurityAudit(req, {
+        event: 'cloudreve.callback',
+        operator: { id: admin.id, email: admin.email, role: admin.role },
+        target: { type: 'cloudreve_oauth', id: 'global' },
+        before: { state: 'authorization_pending' },
+        reason: 'oauth_code_missing',
+        outcome: 'DENIED',
+      });
+    } catch {
+      return auditUnavailableResponse();
+    }
     return NextResponse.redirect(
       new URL('/admin?cloudreve_error=missing_code', redirectBaseOrigin)
     );
@@ -125,18 +160,47 @@ export async function GET(req: Request) {
     );
     if (verifierState === 'expired') {
       // 过期 / 损坏的 verifier 一律清掉，避免残留明文被复用。
-      await prisma.siteSetting
-        .deleteMany({
-          where: {
-            key: { in: ['cloudreve_code_verifier', 'cloudreve_redirect_uri'] },
-          },
-        })
-        .catch(() => {});
+      try {
+        await prisma.$transaction(async (tx) => {
+          await tx.siteSetting.deleteMany({
+            where: {
+              key: { in: ['cloudreve_code_verifier', 'cloudreve_redirect_uri'] },
+            },
+          });
+          await writeSecurityAudit(
+            req,
+            {
+              event: 'cloudreve.callback',
+              operator: { id: admin.id, email: admin.email, role: admin.role },
+              target: { type: 'cloudreve_oauth', id: 'global' },
+              before: { state: 'authorization_pending' },
+              after: { state: 'expired_state_removed' },
+              reason: 'oauth_verifier_expired',
+              outcome: 'DENIED',
+            },
+            tx
+          );
+        });
+      } catch {
+        return auditUnavailableResponse();
+      }
       return NextResponse.redirect(
         new URL('/admin?cloudreve_error=expired_verifier', redirectBaseOrigin)
       );
     }
     if (!codeVerifier) {
+      try {
+        await writeSecurityAudit(req, {
+          event: 'cloudreve.callback',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'cloudreve_oauth', id: 'global' },
+          before: { state: 'authorization_pending' },
+          reason: 'oauth_verifier_missing',
+          outcome: 'DENIED',
+        });
+      } catch {
+        return auditUnavailableResponse();
+      }
       return NextResponse.redirect(
         new URL('/admin?cloudreve_error=missing_verifier', redirectBaseOrigin)
       );
@@ -145,37 +209,97 @@ export async function GET(req: Request) {
     const redirectUri =
       storedRedirectUri ?? `${fallbackOrigin}/api/admin/cloudreve/callback`;
 
-    // 用 code 换取 token
-    const tokens = await exchangeAuthorizationCode(code, redirectUri, codeVerifier);
+    // JobQueue 先落 PROCESSING，再做不可回滚的 OAuth code exchange。返回值含 token，
+    // 必须用 resultSummary 保证 durable journal 只保存非敏感摘要。
+    const tokens = await trackJob(
+      {
+        type: JOB_TYPE.ADMIN_INTEGRATION,
+        triggeredBy: `admin:${admin.id}`,
+        params: { operation: 'cloudreve_oauth_callback' },
+        resultSummary: (value) => ({
+          authorized: true,
+          expiresAt: value.expiresAt,
+        }),
+        errorSummary: (error) =>
+          error instanceof Error ? error.name : 'UnknownError',
+        terminalMutation: async (tx, terminal) => {
+          if (terminal.status === 'FAILED') {
+            await writeSecurityAudit(
+              req,
+              {
+                event: 'cloudreve.callback',
+                operator: { id: admin.id, email: admin.email, role: admin.role },
+                target: { type: 'cloudreve_oauth', id: 'global' },
+                before: { state: 'authorization_pending' },
+                after: { state: 'authorization_failed' },
+                reason: 'oauth_code_exchange',
+                outcome: 'FAILED',
+                metadata: {
+                  errorClass:
+                    terminal.error instanceof Error
+                      ? terminal.error.name
+                      : 'UnknownError',
+                },
+              },
+              tx
+            );
+            return;
+          }
 
-    // 持久化 token 到数据库（加密存储，与 LlmProvider.apiKey 同一加密体系）
-    const encryptedAccess = encrypt(tokens.accessToken);
-    const encryptedRefresh = encrypt(tokens.refreshToken);
-    await prisma.$transaction([
-      prisma.siteSetting.upsert({
-        where: { key: 'cloudreve_access_token' },
-        update: { value: encryptedAccess },
-        create: { key: 'cloudreve_access_token', value: encryptedAccess },
-      }),
-      prisma.siteSetting.upsert({
-        where: { key: 'cloudreve_refresh_token' },
-        update: { value: encryptedRefresh },
-        create: { key: 'cloudreve_refresh_token', value: encryptedRefresh },
-      }),
-      prisma.siteSetting.upsert({
-        where: { key: 'cloudreve_token_expires_at' },
-        update: { value: String(tokens.expiresAt) },
-        create: { key: 'cloudreve_token_expires_at', value: String(tokens.expiresAt) },
-      }),
-      // 清理临时 OAuth 状态，避免下次授权复用旧值
-      prisma.siteSetting.deleteMany({
-        where: {
-          key: {
-            in: ['cloudreve_code_verifier', 'cloudreve_redirect_uri'],
-          },
+          const encryptedAccess = encrypt(terminal.result.accessToken);
+          const encryptedRefresh = encrypt(terminal.result.refreshToken);
+          await Promise.all([
+            tx.siteSetting.upsert({
+              where: { key: 'cloudreve_access_token' },
+              update: { value: encryptedAccess },
+              create: { key: 'cloudreve_access_token', value: encryptedAccess },
+            }),
+            tx.siteSetting.upsert({
+              where: { key: 'cloudreve_refresh_token' },
+              update: { value: encryptedRefresh },
+              create: { key: 'cloudreve_refresh_token', value: encryptedRefresh },
+            }),
+            tx.siteSetting.upsert({
+              where: { key: 'cloudreve_token_expires_at' },
+              update: { value: String(terminal.result.expiresAt) },
+              create: {
+                key: 'cloudreve_token_expires_at',
+                value: String(terminal.result.expiresAt),
+              },
+            }),
+            tx.siteSetting.deleteMany({
+              where: {
+                key: {
+                  in: ['cloudreve_code_verifier', 'cloudreve_redirect_uri'],
+                },
+              },
+            }),
+          ]);
+          await writeSecurityAudit(
+            req,
+            {
+              event: 'cloudreve.callback',
+              operator: { id: admin.id, email: admin.email, role: admin.role },
+              target: { type: 'cloudreve_oauth', id: 'global' },
+              before: { state: 'authorization_pending' },
+              after: {
+                state: 'authorized',
+                expiresAt: terminal.result.expiresAt,
+              },
+              reason: 'oauth_code_exchange',
+              outcome: 'SUCCESS',
+            },
+            tx
+          );
         },
-      }),
-    ]);
+      },
+      () =>
+        exchangeAuthorizationCode(
+          code,
+          redirectUri,
+          codeVerifier
+        )
+    );
 
     // 加载到内存缓存
     loadTokensIntoCache(tokens);
@@ -187,9 +311,8 @@ export async function GET(req: Request) {
     );
   } catch (err) {
     console.error('[Cloudreve OAuth] token 交换失败:', err);
-    const errorMsg = err instanceof Error ? err.message : 'token_exchange_failed';
     return NextResponse.redirect(
-      new URL(`/admin?cloudreve_error=${encodeURIComponent(errorMsg)}`, redirectBaseOrigin)
+      new URL('/admin?cloudreve_error=token_exchange_failed', redirectBaseOrigin)
     );
   }
 }

@@ -1,11 +1,9 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import jwt from 'jsonwebtoken';
 import {
   extractTokenFromCookieHeader,
   getJwtExpiryConfig,
-  lookupRefreshGrace,
   peekTokenJti,
-  recordRefreshGrace,
   signToken,
   validatePassword,
 } from '@/lib/auth';
@@ -101,13 +99,7 @@ describe('getJwtExpiryConfig 钳到剩余绝对寿命 (U51 / P6-5)', () => {
   });
 });
 
-describe('刷新幂等辅助 (v3-R7)', () => {
-  beforeEach(() => {
-    // 无 REDIS_URL → getRedisClient 返回 null → 走内存宽限存储；每例前清空。
-    const g = globalThis as Record<string, unknown>;
-    delete g.__lectureLiveTokenRefreshGraceStore;
-  });
-
+describe('JWT 结构与 legacy 兼容', () => {
   it('peekTokenJti：合法签名返回 jti', () => {
     const token = signToken(SAMPLE_USER);
     const jti = peekTokenJti(token);
@@ -131,12 +123,23 @@ describe('刷新幂等辅助 (v3-R7)', () => {
     expect(peekTokenJti(stale)).toBeNull();
   });
 
-  it('recordRefreshGrace / lookupRefreshGrace：记入后可查回同一新 token', async () => {
-    await recordRefreshGrace('old-jti', 'new-token-value');
-    expect(await lookupRefreshGrace('old-jti')).toBe('new-token-value');
-  });
+  it('family token 同时携带 familyId 与 generation，legacy token 两者都不带', () => {
+    const familyToken = signToken(SAMPLE_USER, {
+      familyId: 'family-1',
+      generation: 3,
+      jti: 'leaf-3',
+    });
+    const family = jwt.verify(familyToken, JWT_SECRET) as {
+      familyId?: string;
+      generation?: number;
+    };
+    expect(family).toMatchObject({ familyId: 'family-1', generation: 3 });
 
-  it('lookupRefreshGrace：未记录的 jti 返回 null', async () => {
-    expect(await lookupRefreshGrace('never-recorded')).toBeNull();
+    const legacy = jwt.verify(signToken(SAMPLE_USER), JWT_SECRET) as {
+      familyId?: string;
+      generation?: number;
+    };
+    expect(legacy.familyId).toBeUndefined();
+    expect(legacy.generation).toBeUndefined();
   });
 });

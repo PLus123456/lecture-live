@@ -10,7 +10,14 @@ import {
 import { useInterpret, type InterpretLine } from '@/hooks/useInterpret';
 import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
-import { useAuthStore } from '@/stores/authStore';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+  isAuthBoundaryCurrent,
+  isPersistedAuthBoundaryCurrent,
+  useAuthStore,
+} from '@/stores/authStore';
+import { ACCOUNT_BOUNDARY_CLEAR_EVENT } from '@/lib/clientAccountCleanup';
 import type {
   StreamingPreviewText,
   StreamingPreviewTranslation,
@@ -176,34 +183,38 @@ export default function InterpretPage() {
   const [selectedMic, setSelectedMic] = useState('');
   const [micTesting, setMicTesting] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
-  /**
-   * L48：麦克风测试（3 秒）持有的资源句柄。此前 setInterval / setTimeout / MediaStream /
-   * AudioContext 全是裸创建、不注册卸载清理 —— 测试途中离开页面时定时器还在对已卸载组件
-   * setState，麦克风与 AudioContext 也要等那条 3 秒 timeout 自己跑完才释放（若 timeout
-   * 被浏览器后台节流则更久）。这里统一存 ref，由卸载 effect 一次性收干净。
-   */
-  const micTestIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const micTestTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const micTestStreamRef = useRef<MediaStream | null>(null);
-  const micTestCtxRef = useRef<AudioContext | null>(null);
-  // 只读 ref，不依赖任何 render 值 → 引用恒定，可安全用于卸载 effect。
-  const releaseMicTest = useCallback(() => {
-    if (micTestIntervalRef.current) {
-      clearInterval(micTestIntervalRef.current);
-      micTestIntervalRef.current = null;
+  const micTestGenerationRef = useRef(0);
+  const micTestResourcesRef = useRef<{
+    stream: MediaStream;
+    context: AudioContext;
+    interval: ReturnType<typeof setInterval>;
+    timeout: ReturnType<typeof setTimeout>;
+  } | null>(null);
+
+  const cancelMicTest = useCallback((updateState: boolean) => {
+    micTestGenerationRef.current += 1;
+    const resources = micTestResourcesRef.current;
+    micTestResourcesRef.current = null;
+    if (resources) {
+      clearInterval(resources.interval);
+      clearTimeout(resources.timeout);
+      resources.stream.getTracks().forEach((track) => track.stop());
+      void resources.context.close().catch(() => undefined);
     }
-    if (micTestTimeoutRef.current) {
-      clearTimeout(micTestTimeoutRef.current);
-      micTestTimeoutRef.current = null;
-    }
-    micTestStreamRef.current?.getTracks().forEach((track) => track.stop());
-    micTestStreamRef.current = null;
-    if (micTestCtxRef.current) {
-      void micTestCtxRef.current.close();
-      micTestCtxRef.current = null;
+    if (updateState) {
+      setMicTesting(false);
+      setMicLevel(0);
     }
   }, []);
-  useEffect(() => releaseMicTest, [releaseMicTest]);
+
+  useEffect(() => {
+    const cancelForBoundary = () => cancelMicTest(true);
+    window.addEventListener(ACCOUNT_BOUNDARY_CLEAR_EVENT, cancelForBoundary);
+    return () => {
+      window.removeEventListener(ACCOUNT_BOUNDARY_CLEAR_EVENT, cancelForBoundary);
+      cancelMicTest(false);
+    };
+  }, [cancelMicTest]);
 
   useEffect(() => {
     navigator.mediaDevices?.enumerateDevices().then((devices) => {
@@ -251,38 +262,56 @@ export default function InterpretPage() {
   /** 测试麦克风 — 录 3 秒后自动停止 */
   const testMic = useCallback(async () => {
     if (micTesting) return;
+    const generation = micTestGenerationRef.current + 1;
+    micTestGenerationRef.current = generation;
+    const expected = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
+    const ownerIsCurrent = () =>
+      micTestGenerationRef.current === generation &&
+      !ownerSignal.aborted &&
+      isAuthBoundaryCurrent(expected) &&
+      isPersistedAuthBoundaryCurrent(expected);
     setMicTesting(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: selectedMic ? { deviceId: selectedMic } : true,
       });
+      if (!ownerIsCurrent()) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       const ctx = new AudioContext();
-      micTestStreamRef.current = stream;
-      micTestCtxRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
       source.connect(analyser);
       const data = new Uint8Array(analyser.frequencyBinCount);
 
-      micTestIntervalRef.current = setInterval(() => {
+      const interval = setInterval(() => {
+        if (!ownerIsCurrent()) {
+          cancelMicTest(true);
+          return;
+        }
         analyser.getByteFrequencyData(data);
         const avg = data.reduce((a, b) => a + b, 0) / data.length;
         setMicLevel(avg / 255);
       }, 50);
 
-      micTestTimeoutRef.current = setTimeout(() => {
-        // L48：定时器/流/AudioContext 统一由 releaseMicTest 收（卸载路径复用同一份逻辑）。
-        releaseMicTest();
-        setMicTesting(false);
-        setMicLevel(0);
+      const timeout = setTimeout(() => {
+        if (micTestGenerationRef.current === generation) {
+          cancelMicTest(true);
+        }
       }, 3000);
+      micTestResourcesRef.current = {
+        stream,
+        context: ctx,
+        interval,
+        timeout,
+      };
     } catch {
-      // 取流失败：可能已经拿到过 stream/ctx（后续步骤抛错），一并收干净。
-      releaseMicTest();
-      setMicTesting(false);
+      if (ownerIsCurrent()) setMicTesting(false);
     }
-  }, [micTesting, selectedMic, releaseMicTest]);
+  }, [cancelMicTest, micTesting, selectedMic]);
 
   // 录制中离开页面时提示数据丢失
   useEffect(() => {

@@ -1,12 +1,7 @@
 import { test, expect, type Page, type Route } from '@playwright/test';
 import path from 'path';
 import fs from 'fs';
-import {
-  fulfillJson,
-  fulfillSse,
-  installBrowserStubs,
-  loginViaForm,
-} from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, fulfillSse, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * U15 — 全局对话（/chat）端到端，对齐 PR#169/#170「Claude 式聊天布局重构」。
@@ -149,11 +144,11 @@ function installChatMocks(page: Page, state: ChatMockState) {
       });
     }
     if (p === '/api/auth/login' && method === 'POST') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
-    if (p === '/api/auth/refresh' && method === 'GET') {
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
       // 整页导航 / 刷新后靠 cookie 恢复会话
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
 
     // ── dashboard 外壳杂项 ──

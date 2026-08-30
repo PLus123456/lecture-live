@@ -1,93 +1,324 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/lib/prisma', () => ({ prisma: {} }));
-
-import { parseExtractedKeywords } from '@/lib/llm/folderKeywords';
-
-/**
- * L35：关键词抽取此前只 try/catch 了 JSON.parse，之后完全信任 LLM 返回的形状：
- *  - 返回 JSON 对象（非数组）→ `for...of` 抛未捕获 TypeError；
- *  - 元素不是对象 / keyword 非字符串 → normalizeKeyword 的 .trim() 抛 TypeError；
- *  - confidence 是字符串 → `"high" || 0` 得 "high" → Math.min/max 产出 NaN
- *    → Prisma 写入抛错，而且发生在**循环中途**（前面已写库、后面全丢）。
- * 同目录 security.ts 早有完整的 toStringArray / toBoundedNumber 防御，这里补齐同等口径。
- */
-describe('parseExtractedKeywords（L35 LLM 返回体形状校验）', () => {
-  it('正常数组照常解析', () => {
-    const out = parseExtractedKeywords(
-      JSON.stringify([
-        { keyword: '梯度下降', confidence: 0.9 },
-        { keyword: 'BPE', confidence: 0.4 },
-      ])
-    );
-    expect(out).toEqual([
-      { keyword: '梯度下降', confidence: 0.9 },
-      { keyword: 'BPE', confidence: 0.4 },
-    ]);
-  });
-
-  it('返回 JSON 对象而非数组 → 空数组，不抛错', () => {
-    expect(() =>
-      parseExtractedKeywords('{"keywords":[{"keyword":"x","confidence":1}]}')
-    ).not.toThrow();
-    expect(
-      parseExtractedKeywords('{"keywords":[{"keyword":"x","confidence":1}]}')
-    ).toEqual([]);
-  });
-
-  it('非法 JSON → 空数组，不抛错', () => {
-    expect(parseExtractedKeywords('not json at all')).toEqual([]);
-  });
-
-  it('元素不是对象 / keyword 非字符串 → 跳过而不是抛 TypeError', () => {
-    const out = parseExtractedKeywords(
-      JSON.stringify([
-        'plain string',
-        null,
-        42,
-        ['nested'],
-        { keyword: 123, confidence: 0.5 },
-        { confidence: 0.5 },
-        { keyword: '   ', confidence: 0.5 },
-        { keyword: 'ok', confidence: 0.5 },
-      ])
-    );
-    expect(out).toEqual([{ keyword: 'ok', confidence: 0.5 }]);
-  });
-
-  it('confidence 非数值 → 归零，绝不产出 NaN（NaN 进 Prisma 会中途炸掉写入循环）', () => {
-    const out = parseExtractedKeywords(
-      JSON.stringify([
-        { keyword: 'a', confidence: 'high' },
-        { keyword: 'b', confidence: null },
-        { keyword: 'c' },
-        { keyword: 'd', confidence: '0.9' },
-      ])
-    );
-    expect(out.map((k) => k.confidence)).toEqual([0, 0, 0, 0]);
-    for (const k of out) {
-      expect(Number.isNaN(k.confidence)).toBe(false);
+const mocks = vi.hoisted(() => {
+  class MockActiveJobConflictError extends Error {
+    constructor(readonly activeKey: string) {
+      super(`Active job already exists for ${activeKey}`);
+      this.name = 'ActiveJobConflictError';
     }
+  }
+  class MockWindowExpiredError extends Error {
+    constructor(
+      readonly scope: string,
+      readonly admissionNow: Date,
+      readonly windowStart: Date,
+      readonly windowEnd: Date
+    ) {
+      super(`${scope} window expired`);
+      this.name = 'ActiveJobReservationWindowExpiredError';
+    }
+  }
+  return {
+    MockActiveJobConflictError,
+    MockWindowExpiredError,
+    markerReadRaw: vi.fn(),
+    markerWriteRaw: vi.fn(),
+    keywordCount: vi.fn(),
+    keywordFindMany: vi.fn(),
+    keywordUpdate: vi.fn(),
+    keywordCreate: vi.fn(),
+    keywordUpsert: vi.fn(),
+    keywordDeleteMany: vi.fn(),
+    getProvider: vi.fn(),
+    callLLM: vi.fn(),
+    claimActiveJob: vi.fn(),
+    completeActiveJob: vi.fn(),
+    failActiveJob: vi.fn(),
+  };
+});
+
+vi.mock('@/lib/prisma', () => ({
+  prisma: {
+    $queryRaw: mocks.markerReadRaw,
+    $executeRaw: mocks.markerWriteRaw,
+    folderKeyword: {
+      count: mocks.keywordCount,
+      findMany: mocks.keywordFindMany,
+      update: mocks.keywordUpdate,
+      create: mocks.keywordCreate,
+      upsert: mocks.keywordUpsert,
+      deleteMany: mocks.keywordDeleteMany,
+    },
+  },
+}));
+
+vi.mock('@/lib/llm/gateway', () => ({
+  getProviderForPurpose: mocks.getProvider,
+  callLLM: mocks.callLLM,
+}));
+
+vi.mock('@/lib/jobQueue', () => ({
+  ActiveJobConflictError: mocks.MockActiveJobConflictError,
+  ActiveJobReservationWindowExpiredError: mocks.MockWindowExpiredError,
+  claimActiveJob: mocks.claimActiveJob,
+  completeActiveJob: mocks.completeActiveJob,
+  failActiveJob: mocks.failActiveJob,
+  JOB_TYPE: { KEYWORD_EXTRACTION: 'keyword_extraction' },
+}));
+
+vi.mock('@/lib/payment/entitlementAdmission', () => ({
+  assertPaymentBenefitAvailable: vi.fn().mockResolvedValue(undefined),
+}));
+
+import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
+
+const PROVIDER = {
+  name: 'provider',
+  model: 'keyword-model',
+  dbModelId: 'model-1',
+  maxTokens: 4096,
+};
+
+describe('extractAndAccumulateKeywords SEC-011 admission', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getProvider.mockResolvedValue(PROVIDER);
+    mocks.markerReadRaw.mockResolvedValue([{ sourceHash: null }]);
+    mocks.markerWriteRaw.mockResolvedValue(1);
+    mocks.keywordCount.mockResolvedValue(0);
+    mocks.keywordFindMany.mockResolvedValue([]);
+    mocks.keywordUpdate.mockResolvedValue({});
+    mocks.keywordCreate.mockImplementation(async ({ data }) => ({
+      id: `created-${data.keyword}`,
+      ...data,
+    }));
+    mocks.claimActiveJob.mockResolvedValue('keyword-job-1');
+    mocks.completeActiveJob.mockResolvedValue(undefined);
+    mocks.failActiveJob.mockResolvedValue(undefined);
+    mocks.callLLM.mockResolvedValue('[]');
   });
 
-  it('confidence 超界被夹回 [0,1]', () => {
-    const out = parseExtractedKeywords(
-      JSON.stringify([
-        { keyword: 'a', confidence: 7 },
-        { keyword: 'b', confidence: -3 },
-        { keyword: 'c', confidence: Number.POSITIVE_INFINITY },
+  it('空 transcript 是本地空操作，不解析模型也不 claim', async () => {
+    await expect(
+      extractAndAccumulateKeywords('session-1', 'folder-1', 'user-1', '   ')
+    ).resolves.toEqual([]);
+    expect(mocks.getProvider).not.toHaveBeenCalled();
+    expect(mocks.claimActiveJob).not.toHaveBeenCalled();
+    expect(mocks.callLLM).not.toHaveBeenCalled();
+  });
+
+  it('整次最坏 token 在共享日账原子预留，可信 usage 按实际结算且空数组落有效否定 marker', async () => {
+    mocks.callLLM.mockImplementation(
+      async (
+        _system: string,
+        _user: string,
+        options: { onUsage?: (usage: { totalTokens: number }) => void }
+      ) => {
+        options.onUsage?.({ totalTokens: 19 });
+        return '[]';
+      }
+    );
+
+    const result = await extractAndAccumulateKeywords(
+      'session-1',
+      'folder-1',
+      'user-1',
+      'A lecture about distributed systems.'
+    );
+
+    expect(result).toEqual([]);
+    expect(mocks.claimActiveJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'keyword_extraction',
+        sessionId: 'session-1',
+        userId: 'user-1',
+        activeKey: 'folder_keywords:session-1:folder-1',
+        resourceReservation: expect.objectContaining({
+          scope: 'llm_tokens',
+          units: expect.any(Number),
+        }),
+      })
+    );
+    expect(mocks.claimActiveJob.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.callLLM.mock.invocationCallOrder[0]
+    );
+    expect(mocks.markerWriteRaw).toHaveBeenCalledTimes(1);
+    const markerSql = mocks.markerWriteRaw.mock.calls[0]?.[0] as {
+      strings?: string[];
+      values?: unknown[];
+    };
+    expect(markerSql.strings?.join('')).toContain('UPDATE FolderSession');
+    expect(markerSql.strings?.join('')).toContain(
+      'folderKeywordGeneratedAt = UTC_TIMESTAMP(3)'
+    );
+    expect(markerSql.values).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^[a-f0-9]{64}$/),
+        'folder-1',
+        'session-1',
       ])
     );
-    expect(out.map((k) => k.confidence)).toEqual([1, 0, 0]);
+    expect(mocks.completeActiveJob).toHaveBeenCalledWith(
+      'keyword-job-1',
+      expect.objectContaining({
+        actualTokens: 19,
+        providerMeasuredCalls: 1,
+        conservativeFallbackCalls: 0,
+        keywordCount: 0,
+      }),
+      19
+    );
   });
 
-  it('超长数组被截断（防写库循环被打爆）', () => {
-    const raw = JSON.stringify(
-      Array.from({ length: 500 }, (_, i) => ({
-        keyword: `k${i}`,
-        confidence: 0.5,
+  it('已知词查询和 prompt 都有共享策略边界，不会复制第 201 项', async () => {
+    mocks.keywordFindMany.mockResolvedValue(
+      Array.from({ length: 201 }, (_, index) => ({
+        id: `keyword-${index}`,
+        keyword: index === 200 ? 'CANARY-OVER-LIMIT' : `known-${index}`,
+        confidence: 1,
+        usageCount: 1,
       }))
     );
-    expect(parseExtractedKeywords(raw)).toHaveLength(200);
+
+    await extractAndAccumulateKeywords(
+      'session-1',
+      'folder-1',
+      'user-1',
+      'A normal lecture.'
+    );
+
+    expect(mocks.keywordFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        take: 200,
+        orderBy: [{ confidence: 'desc' }, { createdAt: 'asc' }],
+      })
+    );
+    const system = mocks.callLLM.mock.calls[0]?.[0] as string;
+    expect(system).toContain('known-0');
+    expect(system).not.toContain('CANARY-OVER-LIMIT');
+    expect(new TextEncoder().encode(system).byteLength).toBeLessThan(20 * 1024);
+  });
+
+  it('provider 断连时按单调用上界结算 FAILED，不写 marker', async () => {
+    mocks.callLLM.mockRejectedValue(new Error('provider disconnected'));
+
+    await expect(
+      extractAndAccumulateKeywords(
+        'session-1',
+        'folder-1',
+        'user-1',
+        'A normal lecture.'
+      )
+    ).rejects.toThrow('provider disconnected');
+
+    const reserved = (
+      mocks.claimActiveJob.mock.calls[0]?.[0] as {
+        resourceReservation: { units: number };
+      }
+    ).resourceReservation.units;
+    expect(mocks.failActiveJob).toHaveBeenCalledWith(
+      'keyword-job-1',
+      expect.any(Error),
+      expect.objectContaining({
+        actualTokens: reserved,
+        conservativeFallbackCalls: 1,
+      }),
+      reserved
+    );
+    expect(mocks.markerWriteRaw).not.toHaveBeenCalled();
+  });
+
+  it('同 session-folder 在途冲突直接复用单飞语义，零 provider 调用', async () => {
+    mocks.claimActiveJob.mockRejectedValue(
+      new mocks.MockActiveJobConflictError(
+        'folder_keywords:session-1:folder-1'
+      )
+    );
+
+    await expect(
+      extractAndAccumulateKeywords(
+        'session-1',
+        'folder-1',
+        'user-1',
+        'A normal lecture.'
+      )
+    ).resolves.toEqual([]);
+    expect(mocks.callLLM).not.toHaveBeenCalled();
+    expect(mocks.completeActiveJob).not.toHaveBeenCalled();
+  });
+
+  it('claim 成功后发现 winner 已落 marker 时以 0 usage 完成 loser', async () => {
+    let sourceHash = '';
+    mocks.claimActiveJob.mockImplementation(async (options) => {
+      sourceHash = options.params.sourceHash;
+      return 'keyword-job-loser';
+    });
+    mocks.markerReadRaw
+      .mockResolvedValueOnce([{ sourceHash: null }])
+      .mockImplementation(async () => [{ sourceHash }]);
+
+    await expect(
+      extractAndAccumulateKeywords(
+        'session-1',
+        'folder-1',
+        'user-1',
+        'A normal lecture.'
+      )
+    ).resolves.toEqual([]);
+
+    expect(mocks.callLLM).not.toHaveBeenCalled();
+    expect(mocks.completeActiveJob).toHaveBeenCalledWith(
+      'keyword-job-loser',
+      expect.objectContaining({ reusedAfterClaim: true, actualTokens: 0 }),
+      0
+    );
+  });
+
+  it('不同 sourceHash winner 在等待 claim 期间落 marker 时旧请求 0 usage 失败，不能回退 marker', async () => {
+    mocks.markerReadRaw
+      .mockResolvedValueOnce([{ sourceHash: null }])
+      .mockResolvedValueOnce([{ sourceHash: 'f'.repeat(64) }]);
+
+    await expect(
+      extractAndAccumulateKeywords(
+        'session-1',
+        'folder-1',
+        'user-1',
+        'An older transcript version.'
+      )
+    ).rejects.toThrow(
+      'Folder keyword source changed while waiting for generation claim'
+    );
+
+    expect(mocks.callLLM).not.toHaveBeenCalled();
+    expect(mocks.markerWriteRaw).not.toHaveBeenCalled();
+    expect(mocks.failActiveJob).toHaveBeenCalledWith(
+      'keyword-job-1',
+      expect.any(Error),
+      expect.objectContaining({ actualTokens: 0 }),
+      0
+    );
+  });
+
+  it('旧 source 行会回填 durable marker，不在升级后重复付费', async () => {
+    mocks.keywordCount.mockResolvedValue(2);
+
+    await expect(
+      extractAndAccumulateKeywords(
+        'session-1',
+        'folder-1',
+        'user-1',
+        'A normal lecture.'
+      )
+    ).resolves.toEqual([]);
+
+    expect(mocks.markerWriteRaw).toHaveBeenCalledTimes(1);
+    expect(mocks.claimActiveJob).toHaveBeenCalledTimes(1);
+    expect(mocks.completeActiveJob).toHaveBeenCalledWith(
+      'keyword-job-1',
+      expect.objectContaining({ legacyMarkerBackfill: true, actualTokens: 0 }),
+      0
+    );
+    expect(mocks.callLLM).not.toHaveBeenCalled();
   });
 });

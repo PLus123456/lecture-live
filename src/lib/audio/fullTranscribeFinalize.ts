@@ -28,8 +28,11 @@ import {
   extractTranslationsByTokens,
 } from '@/lib/soniox/asyncTranscriptConverter';
 import {
-  persistArtifact,
+  completeStagedArtifactPublishes,
   readArtifactFromReference,
+  rollbackStagedArtifact,
+  settleStagedArtifactsInTransaction,
+  stageArtifact,
 } from '@/lib/sessionPersistence';
 import {
   deductTranscriptionMinutes,
@@ -37,31 +40,19 @@ import {
 } from '@/lib/quota';
 import { getBillableMinutes } from '@/lib/billing';
 import { getSiteSettings } from '@/lib/siteSettings';
+import {
+  admitPersistedTranscriptBundle,
+  SESSION_TRANSCRIPT_LIMITS,
+} from '@/lib/sessionApi';
+import {
+  getStoredArtifactById,
+  STORED_ARTIFACT_STATE,
+} from '@/lib/storage/storedArtifactLedger';
 
 export interface FullTranscriptBundle {
   segments: unknown[];
   summaries: unknown[];
   translations: Record<string, string>;
-}
-
-/**
- * 落盘完整版补全转录 bundle。
- *
- * 阶段C：走 sessionPersistence 的 persistArtifact（'full-transcripts' category），与实时
- * 转录/摘要/报告同一套 category + Cloudreve 存储系统 —— Cloudreve 已配置则上传远程并返回
- * 远程路径，否则落本地 data/full-transcripts/{id}.json 并返回 `local:` 引用。返回值写回
- * fullTranscriptPath；与实时 transcriptPath 完全分离，绝不互相覆盖。
- */
-export async function persistFullTranscript(
-  session: Pick<Session, 'id' | 'userId'>,
-  bundle: FullTranscriptBundle
-): Promise<string> {
-  const result = await persistArtifact(
-    session,
-    'full-transcripts',
-    JSON.stringify(bundle, null, 2)
-  );
-  return result.path;
 }
 
 /**
@@ -78,7 +69,8 @@ export async function loadFullTranscript(
   const buffer = await readArtifactFromReference(
     session,
     'full-transcripts',
-    session.fullTranscriptPath
+    session.fullTranscriptPath,
+    { maxBytes: SESSION_TRANSCRIPT_LIMITS.maxPersistedJsonBytes }
   );
   if (!buffer) {
     return null;
@@ -93,27 +85,22 @@ export async function loadFullTranscript(
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return null;
   }
-
-  const record = parsed as Partial<FullTranscriptBundle>;
-  const translations =
-    record.translations && typeof record.translations === 'object' && !Array.isArray(record.translations)
-      ? Object.fromEntries(
-          Object.entries(record.translations as Record<string, unknown>).filter(
-            ([, v]) => typeof v === 'string'
-          ) as [string, string][]
-        )
-      : {};
-
-  return {
-    segments: Array.isArray(record.segments) ? record.segments : [],
-    summaries: Array.isArray(record.summaries) ? record.summaries : [],
-    translations,
-  };
+  try {
+    return admitPersistedTranscriptBundle(parsed);
+  } catch {
+    return null;
+  }
 }
 
 export type FinalizableFullSession = Pick<
   Session,
-  'id' | 'userId' | 'fullSonioxFileId' | 'fullSonioxTranscriptionId' | 'targetLang' | 'durationMs'
+  | 'id'
+  | 'userId'
+  | 'fullTranscribeClaimId'
+  | 'fullSonioxFileId'
+  | 'fullSonioxTranscriptionId'
+  | 'targetLang'
+  | 'durationMs'
 >;
 
 export type FinalizeFullResult =
@@ -143,23 +130,53 @@ export async function finalizeFullTranscription(
   // 把它逼进 canceled_during_finalize 误删 Soniox 转录、致会话永久卡死（回归红线）。
   const allowClaimFrom = options?.allowClaimFrom ?? ['transcribing'];
   const claim = await prisma.session.updateMany({
-    where: { id: session.id, fullTranscribeStatus: { in: allowClaimFrom } },
+    where: {
+      id: session.id,
+      fullTranscribeClaimId: session.fullTranscribeClaimId,
+      fullTranscribeStatus: { in: allowClaimFrom },
+    },
     data: { fullTranscribeStatus: 'finalizing', fullTranscribeStartedAt: new Date() },
   });
   if (claim.count !== 1) {
     return { outcome: 'claim_lost' };
   }
 
-  const transcript = await getSonioxTranscript(sonioxConfig, transcriptionId);
-  const segments = convertAsyncTokensToSegments(transcript.tokens, {
-    targetLang: session.targetLang,
-  });
-  const translations = extractTranslationsByTokens(transcript.tokens, segments);
-  const bundle = { segments, summaries: [] as unknown[], translations };
+  let segments: ReturnType<typeof convertAsyncTokensToSegments>;
+  let staged: Awaited<ReturnType<typeof stageArtifact>>;
+  try {
+    const transcript = await getSonioxTranscript(sonioxConfig, transcriptionId);
+    segments = convertAsyncTokensToSegments(transcript.tokens, {
+      targetLang: session.targetLang,
+    });
+    const translations = extractTranslationsByTokens(transcript.tokens, segments);
+    const bundle = admitPersistedTranscriptBundle({
+      segments,
+      summaries: [],
+      translations,
+    });
 
-  // 落盘到独立的 full-transcripts（**不碰** transcriptPath / recordingPath / status）。
-  // session 含 userId，Cloudreve 已配置时按 userId 归属上传远程。
-  const fullPath = await persistFullTranscript(session, bundle);
+    // 只 stage 不 publish：终态 owner 守卫、计费与 ledger ACTIVE 必须同一事务。
+    staged = await stageArtifact(
+      session,
+      'full-transcripts',
+      JSON.stringify(bundle, null, 2)
+    );
+  } catch (admissionOrStageError) {
+    // Provider/schema/byte rejection must not strand an owner mutation. Restore
+    // the claim only if this exact claimant still owns the finalizing state.
+    await prisma.session
+      .updateMany({
+        where: {
+          id: session.id,
+          fullTranscribeClaimId: session.fullTranscribeClaimId,
+          fullTranscribeStatus: 'finalizing',
+        },
+        data: { fullTranscribeStatus: 'transcribing' },
+      })
+      .catch(() => undefined);
+    throw admissionOrStageError;
+  }
+  const fullPath = staged.reference;
 
   // ── finalize 守卫 + 计费：同一事务（P5-7）──
   // 守卫：finalizing → completed，抢不到（收尾期间被取消/重置）则不落地。
@@ -175,15 +192,23 @@ export async function finalizeFullTranscription(
   // Session FOR UPDATE(settleFullReservation)，同一 session 并发即成 InnoDB 死锁环（P5-7 最现实的
   // 失败原因）。合并后本事务第一条语句就是按主键 X 锁本 Session 行的 CAS，之后才动 User，环被打断。
   let canceledDuringFinalize = false;
+  let stagedPublications: Awaited<
+    ReturnType<typeof settleStagedArtifactsInTransaction>
+  > = [];
+  let committedAfterReadback = false;
   try {
     // 计费口径：ceil(getBillableMinutes(durationMs) × 异步倍率)，与异步上传转录同口径。
     const { async_upload_billing_multiplier } = await getSiteSettings();
     const billableMinutes = Math.ceil(
       getBillableMinutes(session.durationMs) * async_upload_billing_multiplier
     );
-    canceledDuringFinalize = await prisma.$transaction(async (tx) => {
+    const commit = await prisma.$transaction(async (tx) => {
       const finalized = await tx.session.updateMany({
-        where: { id: session.id, fullTranscribeStatus: 'finalizing' },
+        where: {
+          id: session.id,
+          fullTranscribeClaimId: session.fullTranscribeClaimId,
+          fullTranscribeStatus: 'finalizing',
+        },
         data: {
           fullTranscribeStatus: 'completed',
           fullTranscriptPath: fullPath,
@@ -193,7 +218,7 @@ export async function finalizeFullTranscription(
       });
       if (finalized.count !== 1) {
         // 守卫抢不到：不扣费、不结算预留，事务空提交，交下方分支处理。
-        return true;
+        return { canceled: true as const, stagedPublications: [] };
       }
 
       // R4：把入口预留（session.fullReservedMinutes，已计入 used）「转」为实扣——deduct 实际 +
@@ -206,30 +231,75 @@ export async function finalizeFullTranscription(
         // 对账据此算 expected，重跑不再对账成「虚高 drift」）。
         await deductTranscriptionMinutes(session.userId, billableMinutes, tx, {
           sessionId: session.id,
+          source: 'full_transcribe_finalize',
+          referenceId: session.id,
         });
       }
       await settleFullReservation(session.id, tx);
-      return false;
+      const publications = await settleStagedArtifactsInTransaction(tx, [
+        staged,
+      ]);
+      return { canceled: false as const, stagedPublications: publications };
     });
+    canceledDuringFinalize = commit.canceled;
+    stagedPublications = commit.stagedPublications;
   } catch (billingErr) {
-    // P5-7：CAS+计费整体回滚（最现实的是死锁 / 事务超时）。此刻会话仍是 'finalizing'——退回
-    // transcribing，让下一次前端 poll 或 cron 回收（allowClaimFrom 含 transcribing）重新收尾。
-    // 带 WHERE 守卫：若事务其实已提交、只是响应丢失，状态已是 completed → 0 行、绝不回退终态。
     logger.error(
       { err: billingErr, sessionId: session.id },
       'full transcribe finalize+billing tx failed; rolled back to transcribing for retry'
     );
-    await prisma.session
-      .updateMany({
-        where: { id: session.id, fullTranscribeStatus: 'finalizing' },
-        data: { fullTranscribeStatus: 'transcribing' },
-      })
-      .catch(() => undefined);
-    // 与「对方已抢先」同一语义：调用方读最新状态、交下一轮重试（绝不删 Soniox 资源）。
-    return { outcome: 'claim_lost' };
+    try {
+      const [owner, artifact] = await Promise.all([
+        prisma.session.findUnique({
+          where: { id: session.id },
+          select: {
+            fullTranscribeStatus: true,
+            fullTranscriptPath: true,
+          },
+        }),
+        getStoredArtifactById(staged.storedArtifactId),
+      ]);
+      if (
+        owner?.fullTranscribeStatus === 'completed' &&
+        owner.fullTranscriptPath === staged.reference &&
+        artifact?.state === STORED_ARTIFACT_STATE.ACTIVE &&
+        artifact.reference === staged.reference
+      ) {
+        committedAfterReadback = true;
+      } else if (
+        owner?.fullTranscriptPath !== staged.reference &&
+        artifact?.state === STORED_ARTIFACT_STATE.RESERVED
+      ) {
+        await rollbackStagedArtifact(session, staged).catch(() => undefined);
+        await prisma.session
+          .updateMany({
+            where: {
+              id: session.id,
+              fullTranscribeClaimId: session.fullTranscribeClaimId,
+              fullTranscribeStatus: 'finalizing',
+            },
+            data: { fullTranscribeStatus: 'transcribing' },
+          })
+          .catch(() => undefined);
+        return { outcome: 'claim_lost' };
+      } else {
+        logger.error(
+          { sessionId: session.id },
+          'full transcript publication outcome unknown; preserving staged object'
+        );
+        return { outcome: 'claim_lost' };
+      }
+    } catch (readbackError) {
+      logger.error(
+        { err: readbackError, sessionId: session.id },
+        'full transcript publication readback failed; preserving staged object'
+      );
+      return { outcome: 'claim_lost' };
+    }
   }
 
   if (canceledDuringFinalize) {
+    await rollbackStagedArtifact(session, staged).catch(() => undefined);
     // 守卫抢不到：收尾期间状态已不是 finalizing。**关键：此处绝不删 Soniox 资源。**
     // 完整版转录没有「用户取消」路径，故 finalizing 被抢走只可能是两种情形，删 Soniox 都是错的：
     //  (1) 另一条 finalize（前端 poll / cron 回收）先赢了守卫 → 它已落盘、会自行清 Soniox，
@@ -239,6 +309,16 @@ export async function finalizeFullTranscription(
     //      会话永久卡在 transcribing 且转录被销毁（回归红线）。保留 Soniox → 交由下一轮 poll/
     //      cron 重新 salvage 收尾。任一路径最终都会清 Soniox（completed）或删会话时清（delete 路由）。
     return { outcome: 'canceled_during_finalize' };
+  }
+
+  if (!committedAfterReadback) {
+    await completeStagedArtifactPublishes(session, stagedPublications).catch(
+      (cleanupError) =>
+        logger.warn(
+          { err: cleanupError, sessionId: session.id },
+          'full transcript published but replaced object cleanup failed'
+        )
+    );
   }
 
   // ── 清 Soniox 资源（P1-17：先删 transcription 再删 file；确认删除成功/404 才清 DB 外部 ID）──
@@ -252,7 +332,10 @@ export async function finalizeFullTranscription(
   if (txDeleted || fileDeleted) {
     await prisma.session
       .updateMany({
-        where: { id: session.id },
+        where: {
+          id: session.id,
+          fullTranscribeClaimId: session.fullTranscribeClaimId,
+        },
         data: {
           ...(txDeleted ? { fullSonioxTranscriptionId: null } : {}),
           ...(fileDeleted ? { fullSonioxFileId: null } : {}),

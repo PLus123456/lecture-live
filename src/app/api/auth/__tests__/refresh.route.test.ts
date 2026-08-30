@@ -1,50 +1,48 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import jwt from 'jsonwebtoken';
 
-/**
- * v3-R7 刷新并发幂等 + 安全属性回归。
- *
- * 用真实 @/lib/auth（不 mock），让 rotation / 黑名单 / 宽限 / 完整校验都在同一条链路上跑，
- * 只 mock prisma / redis / siteSettings / rateLimit。覆盖四组安全属性：
- *   ① 并发/二次刷新（同旧 jti）不再 401、能拿到有效 token；
- *   ② 宽限窗过后旧 jti 彻底失效（被拒）；
- *   ③ 改密(tokenVersion 递增)/封禁(status) 的即时吊销不受宽限影响；
- *   ④ 非法/伪造/过期 token 仍拒。
- */
-
-const { userFindUniqueMock, getRedisClientMock, getSiteSettingsMock, enforceRateLimitMock } =
-  vi.hoisted(() => ({
-    userFindUniqueMock: vi.fn(),
-    getRedisClientMock: vi.fn(),
-    getSiteSettingsMock: vi.fn(),
-    enforceRateLimitMock: vi.fn(),
-  }));
+const mocks = vi.hoisted(() => ({
+  userFindUnique: vi.fn(),
+  familyFindUnique: vi.fn(),
+  familyCreate: vi.fn(),
+  familyUpdateMany: vi.fn(),
+  familyUpsert: vi.fn(),
+  getRedisClient: vi.fn(),
+  getSiteSettings: vi.fn(),
+  enforceRateLimit: vi.fn(),
+}));
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
-    user: {
-      findUnique: userFindUniqueMock,
+    user: { findUnique: mocks.userFindUnique },
+    authTokenFamily: {
+      findUnique: mocks.familyFindUnique,
+      create: mocks.familyCreate,
+      updateMany: mocks.familyUpdateMany,
+      upsert: mocks.familyUpsert,
     },
   },
 }));
+vi.mock('@/lib/redis', () => ({ getRedisClient: mocks.getRedisClient }));
+vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: mocks.getSiteSettings }));
+vi.mock('@/lib/rateLimit', () => ({ enforceRateLimit: mocks.enforceRateLimit }));
+vi.mock('@/lib/auditLog', () => ({ logAction: vi.fn() }));
 
-vi.mock('@/lib/redis', () => ({
-  getRedisClient: getRedisClientMock,
-}));
-
-vi.mock('@/lib/siteSettings', () => ({
-  getSiteSettings: getSiteSettingsMock,
-}));
-
-vi.mock('@/lib/rateLimit', () => ({
-  enforceRateLimit: enforceRateLimitMock,
-}));
-
-import { GET } from '@/app/api/auth/refresh/route';
-import { signToken } from '@/lib/auth';
+import { GET, POST } from '@/app/api/auth/refresh/route';
+import { POST as logout } from '@/app/api/auth/logout/route';
+import {
+  diagnoseEstablishedAuthFamilyToken,
+  getAuthTokenSessionBinding,
+  issueAuthToken,
+  revokeToken,
+  signToken,
+  verifyAuthToken,
+  verifyEstablishedAuthFamilyToken,
+} from '@/lib/auth';
 
 const JWT_SECRET = process.env.JWT_SECRET as string;
 const COOKIE_NAME = 'lecture-live-token';
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const ACTIVE_USER = {
   id: 'user-1',
@@ -55,280 +53,605 @@ const ACTIVE_USER = {
   status: 1,
 };
 
+interface FamilyRow {
+  id: string;
+  userId: string;
+  currentJtiHash: string;
+  legacyJtiHash: string | null;
+  generation: number;
+  sessionStartedAt: Date;
+  expiresAt: Date;
+  revokedAt: Date | null;
+  revokedReason: string | null;
+}
+
+const families = new Map<string, FamilyRow>();
+
+function p2002(): Error & { code: string } {
+  return Object.assign(new Error('unique constraint'), { code: 'P2002' });
+}
+
+function installFamilyDb() {
+  mocks.familyFindUnique.mockImplementation(async ({ where }) => {
+    if (where.id) return families.get(where.id) ?? null;
+    if (where.legacyJtiHash) {
+      return (
+        [...families.values()].find(
+          (row) => row.legacyJtiHash === where.legacyJtiHash
+        ) ?? null
+      );
+    }
+    return null;
+  });
+
+  mocks.familyCreate.mockImplementation(async ({ data }) => {
+    if (
+      families.has(data.id) ||
+      [...families.values()].some(
+        (row) =>
+          row.currentJtiHash === data.currentJtiHash ||
+          (data.legacyJtiHash && row.legacyJtiHash === data.legacyJtiHash)
+      )
+    ) {
+      throw p2002();
+    }
+    const row: FamilyRow = {
+      id: data.id,
+      userId: data.userId,
+      currentJtiHash: data.currentJtiHash,
+      legacyJtiHash: data.legacyJtiHash ?? null,
+      generation: data.generation ?? 0,
+      sessionStartedAt: data.sessionStartedAt,
+      expiresAt: data.expiresAt,
+      revokedAt: data.revokedAt ?? null,
+      revokedReason: data.revokedReason ?? null,
+    };
+    families.set(row.id, row);
+    return row;
+  });
+
+  mocks.familyUpdateMany.mockImplementation(async ({ where, data }) => {
+    let count = 0;
+    for (const row of families.values()) {
+      if (where.id !== undefined && row.id !== where.id) continue;
+      if (where.userId !== undefined && row.userId !== where.userId) continue;
+      if (
+        where.currentJtiHash !== undefined &&
+        row.currentJtiHash !== where.currentJtiHash
+      ) continue;
+      if (
+        where.generation !== undefined &&
+        row.generation !== where.generation
+      ) {
+        continue;
+      }
+      if (where.revokedAt === null && row.revokedAt !== null) continue;
+      if (
+        where.expiresAt?.equals &&
+        row.expiresAt.getTime() !== where.expiresAt.equals.getTime()
+      ) continue;
+      if (where.expiresAt?.gt && row.expiresAt <= where.expiresAt.gt) continue;
+      if (data.currentJtiHash !== undefined) {
+        row.currentJtiHash = data.currentJtiHash;
+      }
+      if (typeof data.generation === 'object') {
+        row.generation += data.generation.increment;
+      } else if (data.generation !== undefined) {
+        row.generation = data.generation;
+      }
+      if (data.revokedAt !== undefined) row.revokedAt = data.revokedAt;
+      if (data.revokedReason !== undefined) row.revokedReason = data.revokedReason;
+      count += 1;
+    }
+    return { count };
+  });
+}
+
 function makeRequest(token: string): Request {
+  const binding = getAuthTokenSessionBinding(token) ?? 'invalid-binding';
   return new Request('http://localhost:3000/api/auth/refresh', {
-    method: 'GET',
-    headers: { Cookie: `${COOKIE_NAME}=${token}` },
+    method: 'POST',
+    headers: {
+      Cookie: `${COOKIE_NAME}=${token}`,
+      'X-Lecture-Live-Auth-Session': binding,
+    },
+  });
+}
+
+function makeLogoutRequest(token: string): Request {
+  const binding = getAuthTokenSessionBinding(token);
+  if (!binding) throw new Error('family binding missing');
+  return new Request('http://localhost:3000/api/auth/logout', {
+    method: 'POST',
+    headers: {
+      Cookie: `${COOKIE_NAME}=${token}`,
+      'X-Lecture-Live-Auth-Session': binding,
+    },
   });
 }
 
 function readSetCookieToken(response: Response): string | null {
   const setCookie = response.headers.get('set-cookie');
-  if (!setCookie) return null;
-  const match = setCookie.match(new RegExp(`${COOKIE_NAME}=([^;]+)`));
+  const match = setCookie?.match(new RegExp(`${COOKIE_NAME}=([^;]+)`));
   return match?.[1] ?? null;
 }
 
-function jtiOf(token: string): string {
-  const decoded = jwt.verify(token, JWT_SECRET) as { jti: string };
-  return decoded.jti;
+function decode(token: string) {
+  return jwt.verify(token, JWT_SECRET) as {
+    id: string;
+    jti: string;
+    exp: number;
+    sessionStartedAt: number;
+    familyId?: string;
+    generation?: number;
+  };
 }
 
-function resetInMemoryStores() {
-  const g = globalThis as Record<string, unknown>;
-  delete g.__lectureLiveTokenBlacklistStore;
-  delete g.__lectureLiveTokenRefreshGraceStore;
-}
+beforeEach(() => {
+  families.clear();
+  vi.clearAllMocks();
+  installFamilyDb();
+  mocks.userFindUnique.mockResolvedValue(ACTIVE_USER);
+  mocks.getRedisClient.mockReturnValue(null);
+  mocks.getSiteSettings.mockResolvedValue({ jwt_expiry: 7 });
+  mocks.enforceRateLimit.mockResolvedValue(null);
+  delete (globalThis as Record<string, unknown>).__lectureLiveTokenBlacklistStore;
+});
 
-describe('GET /api/auth/refresh — 并发幂等与安全属性 (v3-R7)', () => {
-  beforeEach(() => {
-    resetInMemoryStores();
-    // 无 Redis：走进程内存黑名单 + 内存宽限（与生产 Redis 分支同构）。
-    getRedisClientMock.mockReturnValue(null);
-    getSiteSettingsMock.mockResolvedValue({ jwt_expiry: 7 });
-    enforceRateLimitMock.mockResolvedValue(null);
-    // verifyToken / 路由 DB 查询：默认返回活跃用户。
-    userFindUniqueMock.mockResolvedValue(ACTIVE_USER);
+describe('POST /api/auth/refresh — 持久 family / CAS / reuse', () => {
+  it('跨站顶层 GET 即使并发也只返回 405，不轮换、不撤族、不清 cookie', async () => {
+    const token = await issueAuthToken(ACTIVE_USER);
+    const familyId = decode(token).familyId as string;
+
+    const responses = await Promise.all([GET(), GET()]);
+
+    expect(responses.map((response) => response.status)).toEqual([405, 405]);
+    expect(responses.every((response) => !response.headers.has('set-cookie'))).toBe(true);
+    expect(families.get(familyId)).toMatchObject({
+      generation: 0,
+      revokedAt: null,
+    });
+    expect((await verifyAuthToken(token))?.user.id).toBe(ACTIVE_USER.id);
   });
 
-  it('正常刷新：rotate 出新 token，旧 jti 立即入黑名单', async () => {
-    const oldToken = signToken(ACTIVE_USER);
-    const res = await GET(makeRequest(oldToken));
-    expect(res.status).toBe(200);
-
-    const newToken = readSetCookieToken(res);
-    expect(newToken).toBeTruthy();
-    expect(newToken).not.toBe(oldToken);
-    expect(jtiOf(newToken as string)).not.toBe(jtiOf(oldToken));
-
-    // 旧 token 再次直接刷新（模拟重放，且已过宽限前提在下面单测）——这里验证旧 jti 已被吊销：
-    // 旧 token 现在只能走宽限路径；宽限内它能换回同一个新 token（见并发用例）。
-  });
-
-  // ① 并发 / 二次刷新（同旧 jti）不再 401，且拿到有效 token（与首次相同的新 token）
-  it('并发第二个 Tab 带同一旧 token 再刷新：不 401，返回与首次相同的新 token', async () => {
-    const oldToken = signToken(ACTIVE_USER);
-
-    const first = await GET(makeRequest(oldToken));
-    expect(first.status).toBe(200);
-    const firstNewToken = readSetCookieToken(first);
-    expect(firstNewToken).toBeTruthy();
-
-    // 第二个请求仍带「已被 rotate 的旧 token」——旧 jti 已在黑名单，verifyAuthSession 返回 null，
-    // 应走宽限路径，返回同一个新 token（cookie 收敛），而非 401。
-    const second = await GET(makeRequest(oldToken));
-    expect(second.status).toBe(200);
-    const secondNewToken = readSetCookieToken(second);
-    expect(secondNewToken).toBe(firstNewToken);
-  });
-
-  it('宽限返回的新 token 本身有效：可继续正常刷新', async () => {
-    const oldToken = signToken(ACTIVE_USER);
-    const first = await GET(makeRequest(oldToken));
-    const newToken = readSetCookieToken(first) as string;
-
-    // 用宽限拿到的新 token 直接再刷新一次，应正常 rotate（200 且换到又一个新 token）。
-    const next = await GET(makeRequest(newToken));
-    expect(next.status).toBe(200);
-    const nextToken = readSetCookieToken(next);
-    expect(nextToken).toBeTruthy();
-    expect(nextToken).not.toBe(newToken);
-  });
-
-  // ② 宽限窗过后旧 jti 彻底失效
-  it('宽限窗过后：同一旧 token 再刷新被拒（401）', async () => {
-    const oldToken = signToken(ACTIVE_USER);
-    const first = await GET(makeRequest(oldToken));
-    expect(first.status).toBe(200);
-
-    // 手动清空宽限记录，模拟 30s TTL 过后：旧 jti 仍在黑名单，但宽限记录已没。
-    const g = globalThis as Record<string, unknown>;
-    delete g.__lectureLiveTokenRefreshGraceStore;
-
-    const afterGrace = await GET(makeRequest(oldToken));
-    expect(afterGrace.status).toBe(401);
-  });
-
-  // ③ 改密 / tokenVersion 递增：即时吊销不被宽限绕过
-  it('刷新后 tokenVersion 递增（改密）：宽限内旧 token 也被拒（401）', async () => {
-    const oldToken = signToken(ACTIVE_USER);
-    const first = await GET(makeRequest(oldToken));
-    expect(first.status).toBe(200);
-
-    // 改密：DB 里 tokenVersion 递增，宽限 token 携带旧版本，完整校验必然失败。
-    userFindUniqueMock.mockResolvedValue({ ...ACTIVE_USER, tokenVersion: 1 });
-
-    const afterPwChange = await GET(makeRequest(oldToken));
-    expect(afterPwChange.status).toBe(401);
-  });
-
-  // ③ 封禁 status：即时吊销不被宽限绕过
-  it('刷新后用户被封禁（status!=1）：宽限内旧 token 也被拒（401）', async () => {
-    const oldToken = signToken(ACTIVE_USER);
-    const first = await GET(makeRequest(oldToken));
-    expect(first.status).toBe(200);
-
-    userFindUniqueMock.mockResolvedValue({ ...ACTIVE_USER, status: 0 });
-
-    const afterBan = await GET(makeRequest(oldToken));
-    expect(afterBan.status).toBe(401);
-  });
-
-  // ④ 伪造 / 过期 / 非法 token 仍拒
-  it('伪造签名的 token（错误密钥）：401', async () => {
-    const forged = jwt.sign(
+  it('POST 缺失或错配 family binding 时在 DB/CAS 前拒绝且不清 cookie', async () => {
+    const token = await issueAuthToken(ACTIVE_USER);
+    const familyId = decode(token).familyId as string;
+    const withoutBinding = new Request(
+      'http://localhost:3000/api/auth/refresh',
       {
-        id: ACTIVE_USER.id,
-        email: ACTIVE_USER.email,
-        role: ACTIVE_USER.role,
-        tokenVersion: 0,
-        sessionStartedAt: Date.now(),
-        jti: 'forged-jti',
+        method: 'POST',
+        headers: { Cookie: `${COOKIE_NAME}=${token}` },
+      }
+    );
+    const mismatched = new Request(
+      'http://localhost:3000/api/auth/refresh',
+      {
+        method: 'POST',
+        headers: {
+          Cookie: `${COOKIE_NAME}=${token}`,
+          'X-Lecture-Live-Auth-Session': 'binding-for-another-family',
+        },
+      }
+    );
+
+    const missingResponse = await POST(withoutBinding);
+    const mismatchResponse = await POST(mismatched);
+
+    expect(missingResponse.status).toBe(428);
+    expect(mismatchResponse.status).toBe(409);
+    expect(missingResponse.headers.get('set-cookie')).toBeNull();
+    expect(mismatchResponse.headers.get('set-cookie')).toBeNull();
+    expect(families.get(familyId)).toMatchObject({
+      generation: 0,
+      revokedAt: null,
+    });
+  });
+
+  it('跨站 form POST 无 cookie/自定义 binding 时返回 403，响应不得清目标站 cookie/cache', async () => {
+    mocks.familyFindUnique.mockClear();
+    mocks.familyUpdateMany.mockClear();
+    const crossSiteForm = new Request(
+      'http://localhost:3000/api/auth/refresh',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Origin: 'https://evil.example',
+          'Sec-Fetch-Site': 'cross-site',
+        },
+        body: 'rotate=1',
+      }
+    );
+
+    const response = await POST(crossSiteForm);
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get('set-cookie')).toBeNull();
+    expect(response.headers.get('clear-site-data')).toBeNull();
+    expect(mocks.familyFindUnique).not.toHaveBeenCalled();
+    expect(mocks.familyUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it('正常刷新只 CAS 轮换同一 family 的 current leaf', async () => {
+    const oldToken = await issueAuthToken(ACTIVE_USER);
+    const old = decode(oldToken);
+
+    const response = await POST(makeRequest(oldToken));
+    expect(response.status).toBe(200);
+    expect(response.headers.get('clear-site-data')).toBe('"cache"');
+    const nextToken = readSetCookieToken(response) as string;
+    const next = decode(nextToken);
+
+    expect(next.familyId).toBe(old.familyId);
+    expect(next.generation).toBe(1);
+    expect(next.jti).not.toBe(old.jti);
+    expect(families.get(old.familyId as string)).toMatchObject({
+      generation: 1,
+      revokedAt: null,
+    });
+    expect(await verifyAuthToken(oldToken)).toBeNull();
+    expect((await verifyEstablishedAuthFamilyToken(oldToken))?.user.id).toBe(
+      ACTIVE_USER.id
+    );
+    expect((await verifyAuthToken(nextToken))?.user.id).toBe(ACTIVE_USER.id);
+  });
+
+  it('既有连接在 routine rotation 后保活，但该设备 logout 后立即拒绝旧 leaf', async () => {
+    const oldToken = await issueAuthToken(ACTIVE_USER);
+    const response = await POST(makeRequest(oldToken));
+    const successor = readSetCookieToken(response) as string;
+
+    expect(response.status).toBe(200);
+    expect(await verifyAuthToken(oldToken)).toBeNull();
+    expect((await verifyEstablishedAuthFamilyToken(oldToken))?.user.id).toBe(
+      ACTIVE_USER.id
+    );
+
+    await revokeToken(decode(successor), { reason: 'logout' });
+
+    expect(await verifyEstablishedAuthFamilyToken(oldToken)).toBeNull();
+    expect(await verifyEstablishedAuthFamilyToken(successor)).toBeNull();
+  });
+
+  it('同一叶子并发刷新只签出一个 winner；loser 检测重用并撤整族', async () => {
+    const oldToken = await issueAuthToken(ACTIVE_USER);
+    const familyId = decode(oldToken).familyId as string;
+
+    const responses = await Promise.all([
+      POST(makeRequest(oldToken)),
+      POST(makeRequest(oldToken)),
+    ]);
+    expect(responses.map((res) => res.status).sort()).toEqual([200, 401]);
+    expect(families.get(familyId)?.revokedReason).toBe('refresh_reuse');
+
+    const winner = responses.find((res) => res.status === 200) as Response;
+    const successor = readSetCookieToken(winner) as string;
+    expect(await verifyAuthToken(successor)).toBeNull();
+    expect(await verifyEstablishedAuthFamilyToken(oldToken)).toBeNull();
+    expect(await verifyEstablishedAuthFamilyToken(successor)).toBeNull();
+  });
+
+  it('refresh 先赢 CAS 时，受害者仍可用已消费旧 leaf logout 撤整族', async () => {
+    const victimToken = await issueAuthToken(ACTIVE_USER);
+    const familyId = decode(victimToken).familyId as string;
+    const findFamily = mocks.familyFindUnique.getMockImplementation();
+    if (!findFamily) throw new Error('family DB mock missing');
+
+    let releaseLogoutLookup!: () => void;
+    let markLogoutLookupStarted!: () => void;
+    const logoutLookupStarted = new Promise<void>((resolve) => {
+      markLogoutLookupStarted = resolve;
+    });
+    const holdLogoutLookup = new Promise<void>((resolve) => {
+      releaseLogoutLookup = resolve;
+    });
+    mocks.familyFindUnique.mockImplementationOnce(async (args) => {
+      markLogoutLookupStarted();
+      await holdLogoutLookup;
+      return findFamily(args);
+    });
+
+    // victim 的 logout 已带 g0/binding，但其 family 查询暂时卡住；攻击者用窃取的
+    // 同一个 g0 完成 CAS→g1。释放后 logout 必须允许已消费 g0 并按 familyId 撤整族。
+    const victimLogout = logout(makeLogoutRequest(victimToken));
+    await logoutLookupStarted;
+    const attackerRefresh = await POST(makeRequest(victimToken));
+    expect(attackerRefresh.status).toBe(200);
+    const attackerSuccessor = readSetCookieToken(attackerRefresh) as string;
+
+    releaseLogoutLookup();
+    const logoutResponse = await victimLogout;
+
+    expect(logoutResponse.status).toBe(200);
+    expect(families.get(familyId)).toMatchObject({
+      generation: 1,
+      revokedReason: 'logout',
+    });
+    expect(await verifyAuthToken(attackerSuccessor)).toBeNull();
+  });
+
+  it('旧 leaf 自然过期后仍可作为 logout 凭据撤销同 family 的 live successor', async () => {
+    const oldToken = await issueAuthToken(ACTIVE_USER);
+    const refreshed = await POST(makeRequest(oldToken));
+    const successor = readSetCookieToken(refreshed) as string;
+    const payload = jwt.decode(oldToken) as Record<string, unknown>;
+    const expiredOldLeaf = jwt.sign(
+      { ...payload, exp: Math.floor(Date.now() / 1000) - 1 },
+      JWT_SECRET,
+      { algorithm: 'HS256', noTimestamp: true }
+    );
+
+    const response = await logout(makeLogoutRequest(expiredOldLeaf));
+
+    expect(response.status).toBe(200);
+    expect(await verifyAuthToken(successor)).toBeNull();
+  });
+
+  it('浏览器当前 cookie 已是 B 时，迟到 binding-A 仍只撤 A 且绝不写/清 B', async () => {
+    const deviceA = await issueAuthToken(ACTIVE_USER);
+    const deviceB = await issueAuthToken(ACTIVE_USER);
+    const bindingA = getAuthTokenSessionBinding(deviceA);
+    if (!bindingA) throw new Error('family binding missing');
+
+    const response = await logout(
+      new Request('http://localhost:3000/api/auth/logout', {
+        method: 'POST',
+        headers: {
+          Cookie: `${COOKIE_NAME}=${deviceB}`,
+          'X-Lecture-Live-Auth-Session': bindingA,
+        },
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('set-cookie')).toBeNull();
+    expect(response.headers.get('clear-site-data')).toBeNull();
+    expect(await verifyAuthToken(deviceA)).toBeNull();
+    expect((await verifyAuthToken(deviceB))?.user.id).toBe(ACTIVE_USER.id);
+  });
+
+  it('两个 logout 都先读到 active 时，count1 winner/count0 follower 均返回幂等 2xx', async () => {
+    const token = await issueAuthToken(ACTIVE_USER);
+    const familyId = decode(token).familyId as string;
+    const binding = getAuthTokenSessionBinding(token);
+    if (!binding) throw new Error('family binding missing');
+    const defaultFind = mocks.familyFindUnique.getMockImplementation();
+    if (!defaultFind) throw new Error('family DB mock missing');
+
+    let preflightReads = 0;
+    let releasePreflights!: () => void;
+    let markBothStarted!: () => void;
+    const bothStarted = new Promise<void>((resolve) => {
+      markBothStarted = resolve;
+    });
+    const holdPreflights = new Promise<void>((resolve) => {
+      releasePreflights = resolve;
+    });
+    mocks.familyFindUnique.mockImplementation(async (args) => {
+      if (args.where.id === familyId && preflightReads < 2) {
+        const row = await defaultFind(args);
+        const snapshot = row ? { ...row } : null;
+        preflightReads += 1;
+        if (preflightReads === 2) markBothStarted();
+        await holdPreflights;
+        return snapshot;
+      }
+      return defaultFind(args);
+    });
+
+    const first = logout(makeLogoutRequest(token));
+    const second = logout(makeLogoutRequest(token));
+    await bothStarted;
+    releasePreflights();
+    const responses = await Promise.all([first, second]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(responses.every((response) => !response.headers.has('set-cookie'))).toBe(
+      true
+    );
+    expect(families.get(familyId)?.revokedReason).toBe('logout');
+  });
+
+  it('重放只撤被重用的设备 family，不影响同一用户另一登录', async () => {
+    const deviceA = await issueAuthToken(ACTIVE_USER);
+    const deviceB = await issueAuthToken(ACTIVE_USER);
+    const first = await POST(makeRequest(deviceA));
+    expect(first.status).toBe(200);
+    const successorA = readSetCookieToken(first) as string;
+
+    expect((await POST(makeRequest(deviceA))).status).toBe(401);
+    expect(await verifyAuthToken(successorA)).toBeNull();
+    expect((await verifyAuthToken(deviceB))?.user.id).toBe(ACTIVE_USER.id);
+  });
+
+  it('cutover 后所有 legacy cookie 强制重登，Redis miss/down 也绝不复活', async () => {
+    const redis = {
+      status: 'end',
+      exists: vi.fn(async () => 0),
+      set: vi.fn(async () => 'OK'),
+    };
+    mocks.getRedisClient.mockReturnValue(redis);
+    const legacy = signToken(ACTIVE_USER);
+    expect(decode(legacy).familyId).toBeUndefined();
+
+    const response = await POST(makeRequest(legacy));
+    expect(response.status).toBe(401);
+    expect(response.headers.get('set-cookie')).toContain('Max-Age=0');
+    expect(families.size).toBe(0);
+    expect(await verifyAuthToken(legacy)).toBeNull();
+
+    redis.status = 'ready';
+    expect(await verifyAuthToken(legacy)).toBeNull();
+    expect(redis.exists).not.toHaveBeenCalled();
+  });
+
+  it('不向 Redis/内存写入 raw successor JWT', async () => {
+    const redis = {
+      status: 'ready',
+      exists: vi.fn(async () => 0),
+      set: vi.fn(async () => 'OK'),
+    };
+    mocks.getRedisClient.mockReturnValue(redis);
+    const oldToken = await issueAuthToken(ACTIVE_USER);
+    const response = await POST(makeRequest(oldToken));
+    const successor = readSetCookieToken(response) as string;
+
+    expect(response.status).toBe(200);
+    expect(redis.set).not.toHaveBeenCalled();
+    expect(JSON.stringify([...families.values()])).not.toContain(successor);
+  });
+
+  it('CAS 数据库故障不签 token，返回 503 且不消费原叶子', async () => {
+    const token = await issueAuthToken(ACTIVE_USER);
+    mocks.familyUpdateMany.mockRejectedValueOnce(new Error('database unavailable'));
+
+    const response = await POST(makeRequest(token));
+    expect(response.status).toBe(503);
+    expect(readSetCookieToken(response)).toBeNull();
+    expect((await verifyAuthToken(token))?.user.id).toBe(ACTIVE_USER.id);
+  });
+
+  it('family 验证查询故障返回 503 并保留 cookie，不误判为无效 401', async () => {
+    const token = await issueAuthToken(ACTIVE_USER);
+    mocks.familyFindUnique.mockRejectedValueOnce(
+      new Error('family database unavailable')
+    );
+
+    const response = await POST(makeRequest(token));
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get('set-cookie')).toBeNull();
+    expect(families.get(decode(token).familyId as string)?.revokedAt).toBeNull();
+  });
+
+  it('user 验证查询故障同样返回 503，不删除仍可撤销的唯一 cookie', async () => {
+    const token = await issueAuthToken(ACTIVE_USER);
+    mocks.userFindUnique.mockRejectedValueOnce(
+      new Error('user database unavailable')
+    );
+
+    const response = await POST(makeRequest(token));
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('既有连接复核遇到 family DB 故障时失败关闭', async () => {
+    const token = await issueAuthToken(ACTIVE_USER);
+    mocks.familyFindUnique.mockRejectedValue(
+      new Error('database unavailable')
+    );
+
+    expect(await verifyEstablishedAuthFamilyToken(token)).toBeNull();
+    await expect(diagnoseEstablishedAuthFamilyToken(token)).resolves.toEqual({
+      status: 'revoked',
+    });
+  });
+
+  it('既有连接诊断只把 raw leaf 自然过期区分为可 strict 重握手，撤族后仍是 revoked', async () => {
+    const token = await issueAuthToken(ACTIVE_USER);
+    const payload = jwt.decode(token) as Record<string, unknown>;
+    const expired = jwt.sign(
+      {
+        ...payload,
+        exp: Math.floor(Date.now() / 1000) - 1,
       },
+      JWT_SECRET,
+      { algorithm: 'HS256', noTimestamp: true }
+    );
+
+    await expect(diagnoseEstablishedAuthFamilyToken(expired)).resolves.toEqual({
+      status: 'leaf_expired',
+    });
+
+    await revokeToken(decode(token), { reason: 'logout' });
+    await expect(diagnoseEstablishedAuthFamilyToken(expired)).resolves.toEqual({
+      status: 'revoked',
+    });
+
+    const expiredLegacy = jwt.sign(
+      {
+        ...decode(signToken(ACTIVE_USER)),
+        exp: Math.floor(Date.now() / 1000) - 1,
+      },
+      JWT_SECRET,
+      { algorithm: 'HS256', noTimestamp: true }
+    );
+    await expect(
+      diagnoseEstablishedAuthFamilyToken(expiredLegacy)
+    ).resolves.toEqual({ status: 'revoked' });
+  });
+
+  it('改密 tokenVersion 或封禁后拒绝 refresh', async () => {
+    const token = await issueAuthToken(ACTIVE_USER);
+    mocks.userFindUnique.mockResolvedValue({ ...ACTIVE_USER, tokenVersion: 1 });
+    expect((await POST(makeRequest(token))).status).toBe(401);
+
+    mocks.userFindUnique.mockResolvedValue({ ...ACTIVE_USER, status: 0 });
+    expect((await POST(makeRequest(token))).status).toBe(401);
+  });
+
+  it('伪造、过期、超过绝对上限均拒绝，缺绑定时先失败关闭', async () => {
+    const forged = jwt.sign(
+      { ...ACTIVE_USER, sessionStartedAt: Date.now(), jti: 'forged' },
       'wrong-secret-wrong-secret-wrong-secret',
       { expiresIn: '7d' }
     );
-    const res = await GET(makeRequest(forged));
-    expect(res.status).toBe(401);
-  });
-
-  it('已过期的 token：401', async () => {
     const expired = jwt.sign(
-      {
-        id: ACTIVE_USER.id,
-        email: ACTIVE_USER.email,
-        role: ACTIVE_USER.role,
-        tokenVersion: 0,
-        sessionStartedAt: Date.now(),
-        jti: 'expired-jti',
-      },
+      { ...ACTIVE_USER, sessionStartedAt: Date.now(), jti: 'expired' },
       JWT_SECRET,
       { expiresIn: '-1h' }
     );
-    const res = await GET(makeRequest(expired));
-    expect(res.status).toBe(401);
-  });
-
-  it('超过 30 天绝对上限的 token：401（宽限也救不回）', async () => {
     const stale = signToken(ACTIVE_USER, {
-      sessionStartedAt: Date.now() - 31 * 24 * 60 * 60 * 1000,
+      sessionStartedAt: Date.now() - 31 * DAY_MS,
     });
-    const res = await GET(makeRequest(stale));
-    expect(res.status).toBe(401);
-  });
 
-  it('没有 cookie / 无 token：401', async () => {
-    const res = await GET(
-      new Request('http://localhost:3000/api/auth/refresh', { method: 'GET' })
+    expect((await POST(makeRequest(forged))).status).toBe(401);
+    expect((await POST(makeRequest(expired))).status).toBe(401);
+    expect((await POST(makeRequest(stale))).status).toBe(401);
+    const missingBinding = await POST(
+      new Request('http://localhost:3000/api/auth/refresh', { method: 'POST' })
     );
-    expect(res.status).toBe(401);
-  });
-
-  it('合法签名但无宽限记录的旧 jti（从未被本流程 rotate 而被吊销）：401', async () => {
-    // 一个签名合法、绝对上限内的 token，但从没走过刷新 rotation，故没有宽限记录。
-    // 先把它的 jti 直接加进黑名单（模拟被 logout / change-password 吊销），
-    // 使 verifyAuthSession 返回 null，从而进入宽限分支——应因无宽限记录而 401。
-    const token = signToken(ACTIVE_USER);
-    const { revokeToken } = await import('@/lib/auth');
-    const decoded = jwt.verify(token, JWT_SECRET) as { jti: string; exp: number };
-    await revokeToken({ jti: decoded.jti, exp: decoded.exp });
-
-    const res = await GET(makeRequest(token));
-    expect(res.status).toBe(401);
+    expect(missingBinding.status).toBe(428);
+    expect(missingBinding.headers.get('set-cookie')).toBeNull();
+    expect(missingBinding.headers.get('clear-site-data')).toBeNull();
   });
 });
 
-/**
- * U51 / P6-5：refresh 保留原 sessionStartedAt，但旧实现的 exp / cookieMaxAge 是从「当下」
- * 起算 jwt_expiry 天，完全不看已用掉的寿命 → jwt_expiry=90、day-10 刷新会发出 exp=day40
- * 的 cookie，而 verifyToken 在 sessionStartedAt+30d 处硬杀。表现为「cookie 看着有效、
- * 用户中途被登出」，且每次刷新都复现。
- */
-describe('GET /api/auth/refresh — exp 钳到剩余绝对寿命 (U51 / P6-5)', () => {
-  const DAY_MS = 24 * 60 * 60 * 1000;
-  const ABSOLUTE_LIFETIME_MS = 30 * DAY_MS;
-
-  beforeEach(() => {
-    resetInMemoryStores();
-    getRedisClientMock.mockReturnValue(null);
-    enforceRateLimitMock.mockResolvedValue(null);
-    userFindUniqueMock.mockResolvedValue(ACTIVE_USER);
-  });
-
+describe('POST /api/auth/refresh — exp 钳到剩余绝对寿命', () => {
   function readCookieMaxAge(response: Response): number | null {
-    const setCookie = response.headers.get('set-cookie');
-    const match = setCookie?.match(/Max-Age=(\d+)/i);
+    const match = response.headers.get('set-cookie')?.match(/Max-Age=(\d+)/i);
     return match ? Number(match[1]) : null;
   }
 
-  it('jwt_expiry=90、会话已用 10 天：新 token 的 exp 不越过绝对上限', async () => {
-    getSiteSettingsMock.mockResolvedValue({ jwt_expiry: 90 });
+  it('jwt_expiry=90、会话已用 10 天：JWT 与 cookie 都不越过 30 天上限', async () => {
+    mocks.getSiteSettings.mockResolvedValue({ jwt_expiry: 90 });
     const sessionStartedAt = Date.now() - 10 * DAY_MS;
-    const oldToken = signToken(ACTIVE_USER, { sessionStartedAt });
+    const familyToken = await issueAuthToken(ACTIVE_USER, {
+      sessionStartedAt,
+      expiresInDays: 30,
+    });
 
-    const res = await GET(makeRequest(oldToken));
-    expect(res.status).toBe(200);
-
-    const newToken = readSetCookieToken(res) as string;
-    const decoded = jwt.verify(newToken, JWT_SECRET) as {
-      exp: number;
-      sessionStartedAt: number;
-    };
-    expect(decoded.sessionStartedAt).toBe(sessionStartedAt);
-
-    const absoluteDeadlineSec = Math.floor(
-      (sessionStartedAt + ABSOLUTE_LIFETIME_MS) / 1000
-    );
-    expect(decoded.exp).toBeLessThanOrEqual(absoluteDeadlineSec);
-    // 且不能被钳过头：剩余 20 天应基本用满（容忍几秒执行漂移）
-    expect(decoded.exp).toBeGreaterThan(absoluteDeadlineSec - 10);
+    const response = await POST(makeRequest(familyToken));
+    expect(response.status).toBe(200);
+    const successor = decode(readSetCookieToken(response) as string);
+    const absoluteDeadline = Math.floor((sessionStartedAt + 30 * DAY_MS) / 1000);
+    expect(successor.sessionStartedAt).toBe(sessionStartedAt);
+    expect(successor.exp).toBeLessThanOrEqual(absoluteDeadline);
+    expect(successor.exp).toBeGreaterThan(absoluteDeadline - 10);
+    expect(readCookieMaxAge(response)).toBeLessThanOrEqual(20 * 24 * 60 * 60 + 5);
   });
 
-  it('cookie 的 Max-Age 同样不越过绝对上限', async () => {
-    getSiteSettingsMock.mockResolvedValue({ jwt_expiry: 90 });
+  it('默认 7 天、会话已用 25 天：只签剩余约 5 天', async () => {
+    mocks.getSiteSettings.mockResolvedValue({ jwt_expiry: 7 });
     const sessionStartedAt = Date.now() - 25 * DAY_MS;
-
-    const res = await GET(
-      makeRequest(signToken(ACTIVE_USER, { sessionStartedAt }))
+    const response = await POST(
+      makeRequest(await issueAuthToken(ACTIVE_USER, { sessionStartedAt }))
     );
-    expect(res.status).toBe(200);
-
-    const maxAge = readCookieMaxAge(res);
-    expect(maxAge).not.toBeNull();
-    // 剩余 5 天；旧实现会写 30 天（钳到绝对上限常量后的值）
-    expect(maxAge as number).toBeLessThanOrEqual(5 * 24 * 60 * 60 + 5);
-    expect(maxAge as number).toBeGreaterThan(5 * 24 * 60 * 60 - 60);
-  });
-
-  it('默认 7 天配置、会话已用 25 天：也只签剩下的 5 天', async () => {
-    getSiteSettingsMock.mockResolvedValue({ jwt_expiry: 7 });
-    const sessionStartedAt = Date.now() - 25 * DAY_MS;
-
-    const res = await GET(
-      makeRequest(signToken(ACTIVE_USER, { sessionStartedAt }))
-    );
-    expect(res.status).toBe(200);
-
-    const decoded = jwt.verify(readSetCookieToken(res) as string, JWT_SECRET) as {
-      exp: number;
-    };
-    const absoluteDeadlineSec = Math.floor(
-      (sessionStartedAt + ABSOLUTE_LIFETIME_MS) / 1000
-    );
-    expect(decoded.exp).toBeLessThanOrEqual(absoluteDeadlineSec);
-  });
-
-  it('新会话（刚开始）不受影响：仍按配置签满 7 天', async () => {
-    getSiteSettingsMock.mockResolvedValue({ jwt_expiry: 7 });
-    const nowSec = Math.floor(Date.now() / 1000);
-
-    const res = await GET(makeRequest(signToken(ACTIVE_USER)));
-    expect(res.status).toBe(200);
-
-    const decoded = jwt.verify(readSetCookieToken(res) as string, JWT_SECRET) as {
-      exp: number;
-    };
-    expect(decoded.exp).toBeGreaterThanOrEqual(nowSec + 7 * 24 * 60 * 60 - 10);
-    expect(decoded.exp).toBeLessThanOrEqual(nowSec + 7 * 24 * 60 * 60 + 10);
+    expect(response.status).toBe(200);
+    const maxAge = readCookieMaxAge(response) as number;
+    expect(maxAge).toBeLessThanOrEqual(5 * 24 * 60 * 60 + 5);
+    expect(maxAge).toBeGreaterThan(5 * 24 * 60 * 60 - 60);
   });
 });

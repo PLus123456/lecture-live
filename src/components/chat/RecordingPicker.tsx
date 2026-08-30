@@ -34,6 +34,9 @@ import { useAuth } from '@/hooks/useAuth';
 import { useExitAnimation } from '@/hooks/useExitAnimation';
 import { toast } from '@/stores/toastStore';
 
+const MAX_CONVERSATION_RECORDINGS = 16;
+const RECORDING_PAGE_SIZE = 50;
+
 interface RecordingItem {
   id: string;
   title: string;
@@ -106,6 +109,38 @@ export function toggleSelectAllVisible(
   return Array.from(merged);
 }
 
+function parseRecordingPage(data: unknown): {
+  items: RecordingItem[];
+  nextCursor: string | null;
+} {
+  const list: unknown = Array.isArray(data)
+    ? data
+    : (data as { items?: unknown })?.items ?? [];
+  const nextCursor = Array.isArray(data)
+    ? null
+    : typeof (data as { nextCursor?: unknown })?.nextCursor === 'string'
+      ? (data as { nextCursor: string }).nextCursor
+      : null;
+  if (!Array.isArray(list)) return { items: [], nextCursor };
+  return {
+    items: list
+      .filter((s): s is Record<string, unknown> => !!s && typeof s === 'object')
+      .filter((s) => s.status === 'COMPLETED')
+      .map((s) => ({
+        id: String(s.id),
+        title: typeof s.title === 'string' ? s.title : '',
+        courseName: typeof s.courseName === 'string' ? s.courseName : null,
+        createdAt:
+          typeof s.createdAt === 'string'
+            ? s.createdAt
+            : new Date().toISOString(),
+        durationMs: typeof s.durationMs === 'number' ? s.durationMs : 0,
+        status: typeof s.status === 'string' ? s.status : 'COMPLETED',
+      })),
+    nextCursor,
+  };
+}
+
 function formatDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms <= 0) return '--';
   const min = Math.floor(ms / 60000);
@@ -147,6 +182,8 @@ export default function RecordingPicker({
 
   const [items, setItems] = useState<RecordingItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [rawSearch, setRawSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -173,8 +210,10 @@ export default function RecordingPicker({
     if (!open || !token) return;
     let cancelled = false;
     setLoading(true);
+    setItems([]);
+    setNextCursor(null);
     setLoadError(null);
-    fetch('/api/sessions?limit=100', {
+    fetch(`/api/sessions?limit=${RECORDING_PAGE_SIZE}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then(async (res) => {
@@ -185,32 +224,9 @@ export default function RecordingPicker({
       })
       .then((data: unknown) => {
         if (cancelled) return;
-        // GET /api/sessions 在 limit 模式下返回 { items, nextCursor, ... }，
-        // 不带 limit 时返回纯数组——两种格式都兼容。
-        const list: unknown = Array.isArray(data)
-          ? data
-          : (data as { items?: unknown })?.items ?? [];
-        if (!Array.isArray(list)) {
-          setItems([]);
-          return;
-        }
-        const cleaned: RecordingItem[] = list
-          .filter((s): s is Record<string, unknown> => !!s && typeof s === 'object')
-          .filter((s) => s.status === 'COMPLETED')
-          .map((s) => ({
-            id: String(s.id),
-            title: typeof s.title === 'string' ? s.title : '',
-            courseName:
-              typeof s.courseName === 'string' ? s.courseName : null,
-            createdAt:
-              typeof s.createdAt === 'string'
-                ? s.createdAt
-                : new Date().toISOString(),
-            durationMs:
-              typeof s.durationMs === 'number' ? s.durationMs : 0,
-            status: typeof s.status === 'string' ? s.status : 'COMPLETED',
-          }));
-        setItems(cleaned);
+        const page = parseRecordingPage(data);
+        setItems(page.items);
+        setNextCursor(page.nextCursor);
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -223,6 +239,32 @@ export default function RecordingPicker({
       cancelled = true;
     };
   }, [open, token]);
+
+  const loadMore = useCallback(async () => {
+    if (!token || !nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const res = await fetch(
+        `/api/sessions?limit=${RECORDING_PAGE_SIZE}&cursor=${encodeURIComponent(nextCursor)}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const page = parseRecordingPage(await res.json());
+      setItems((current) => {
+        const byId = new Map(current.map((item) => [item.id, item]));
+        for (const item of page.items) byId.set(item.id, item);
+        return Array.from(byId.values());
+      });
+      setNextCursor(page.nextCursor);
+    } catch (error) {
+      toast.error(
+        '加载失败',
+        error instanceof Error ? error.message : '网络异常'
+      );
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [token, nextCursor, loadingMore]);
 
   const visible = useMemo(
     () => filterRecordings(items, debouncedSearch),
@@ -239,6 +281,10 @@ export default function RecordingPicker({
     [visible, attachedSet],
   );
   const selectedSet = useMemo(() => new Set(selected), [selected]);
+  const selectionCapacity = Math.max(
+    0,
+    MAX_CONVERSATION_RECORDINGS - new Set(alreadyAttached).size
+  );
   const allVisibleSelected =
     visibleSelectableIds.length > 0 &&
     visibleSelectableIds.every((id) => selectedSet.has(id));
@@ -249,18 +295,29 @@ export default function RecordingPicker({
   const toggleRow = useCallback(
     (id: string) => {
       if (attachedSet.has(id)) return;
-      setSelected((prev) =>
-        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-      );
+      setSelected((prev) => {
+        if (prev.includes(id)) return prev.filter((x) => x !== id);
+        if (prev.length >= selectionCapacity) {
+          toast.error(
+            '已达到上限',
+            `每个对话最多附加 ${MAX_CONVERSATION_RECORDINGS} 条录音`
+          );
+          return prev;
+        }
+        return [...prev, id];
+      });
     },
-    [attachedSet],
+    [attachedSet, selectionCapacity],
   );
 
   const handleToggleSelectAll = useCallback(() => {
     setSelected((prev) =>
-      toggleSelectAllVisible(prev, visible, alreadyAttached),
+      toggleSelectAllVisible(prev, visible, alreadyAttached).slice(
+        0,
+        selectionCapacity
+      )
     );
-  }, [visible, alreadyAttached]);
+  }, [visible, alreadyAttached, selectionCapacity]);
 
   const handleAttach = useCallback(async () => {
     if (selected.length === 0 || submitting) return;
@@ -555,10 +612,25 @@ export default function RecordingPicker({
                 })}
               </ul>
             )}
+            {!loading && !loadError && nextCursor && (
+              <div className="flex justify-center px-5 py-3 border-t border-cream-100">
+                <button
+                  type="button"
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                  className="px-3 py-1.5 rounded-md text-xs text-rust-600 hover:bg-rust-50 disabled:opacity-40"
+                >
+                  {loadingMore ? '加载中…' : '加载更多录音 / Load more'}
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Footer */}
           <div className="px-5 py-3 border-t border-cream-200 bg-cream-50 flex items-center justify-end gap-2 shrink-0">
+            <span className="mr-auto text-[11px] text-charcoal-400">
+              最多 {MAX_CONVERSATION_RECORDINGS} 条；服务端还会校验 24 小时与容量上限
+            </span>
             <button
               onClick={onClose}
               disabled={submitting}

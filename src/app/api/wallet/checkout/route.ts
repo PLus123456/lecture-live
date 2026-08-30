@@ -5,11 +5,15 @@ import { getSiteSettings } from '@/lib/siteSettings';
 import { getRechargeSettings } from '@/lib/payment/settings';
 import { getPaymentProvider } from '@/lib/payment';
 import { isPaymentProviderName } from '@/lib/payment/types';
+import type { PaymentObjectRef, PaymentProviderMode } from '@/lib/payment/types';
+import { linkPaymentProviderObjects } from '@/lib/payment/webhookInbox';
+import { isPurchasableMembershipRole } from '@/lib/payment/tierPolicy';
 import {
   createPaymentOrder,
   spendFromBalance,
   WalletError,
   DEFAULT_ORDER_CURRENCY,
+  ORDER_TTL_MS,
 } from '@/lib/wallet';
 import { enforceRateLimit } from '@/lib/rateLimit';
 
@@ -60,6 +64,14 @@ export async function POST(req: Request) {
   if (!tier || !tier.active) {
     return NextResponse.json({ error: '档位不存在或已下架' }, { status: 400 });
   }
+  // 存量 ADMIN 档位或下单后端被绕过 UI 时都在建单/扣款前关闭失败。
+  // null 沿用历史会员档默认 PRO 的兼容语义。
+  if (
+    tier.kind === 'membership' &&
+    !isPurchasableMembershipRole(tier.grantRole ?? 'PRO')
+  ) {
+    return NextResponse.json({ error: '该会员档位不可购买' }, { status: 400 });
+  }
 
   // 用余额直接购买（会员/时间；topup 档位不可用余额买）
   if (body.mode === 'balance') {
@@ -104,31 +116,45 @@ export async function POST(req: Request) {
   const returnUrl = `${base}/home`;
   const kind: 'topup' | 'purchase' = tier.kind === 'topup' ? 'topup' : 'purchase';
   const currency = resolveCurrency(settings);
+  const providerMode: PaymentProviderMode =
+    provider.mode ?? (providerName === 'sandbox' ? 'sandbox' : 'unknown');
+  const providerAccount = provider.account?.trim() || 'default';
 
-  const order = await createPaymentOrder({
-    userId: payload.id,
-    provider: providerName,
-    kind,
-    amountCents: tier.priceCents,
-    currency,
-    tierId: kind === 'purchase' ? tier.id : undefined,
-    creditCents: tier.kind === 'topup' ? tier.creditCents ?? tier.priceCents : undefined,
-    returnUrl,
-    subject: tier.name,
-    // 冻结发放快照：回调结算按此发放，不再读 live 档位（H1 档位删/停不致退单、H2 冻结价防漂移）。
-    grant:
-      kind === 'purchase'
-        ? {
-            kind: tier.kind === 'membership' ? 'membership' : 'minutes',
-            priceCents: tier.priceCents,
-            tierId: tier.id,
-            tierName: tier.name,
-            grantRole: tier.grantRole,
-            durationDays: tier.durationDays,
-            grantMinutes: tier.grantMinutes,
-          }
-        : undefined,
-  });
+  let order: Awaited<ReturnType<typeof createPaymentOrder>>;
+  try {
+    order = await createPaymentOrder({
+      userId: payload.id,
+      provider: providerName,
+      providerMode,
+      providerAccount,
+      kind,
+      amountCents: tier.priceCents,
+      currency,
+      tierId: kind === 'purchase' ? tier.id : undefined,
+      creditCents: tier.kind === 'topup' ? tier.creditCents ?? tier.priceCents : undefined,
+      returnUrl,
+      subject: tier.name,
+      // 冻结发放快照：回调结算按此发放，不再读 live 档位（H1/H2）。
+      grant:
+        kind === 'purchase'
+          ? {
+              kind: tier.kind === 'membership' ? 'membership' : 'minutes',
+              priceCents: tier.priceCents,
+              tierId: tier.id,
+              tierName: tier.name,
+              grantRole: tier.grantRole,
+              durationDays: tier.durationDays,
+              grantMinutes: tier.grantMinutes,
+            }
+          : undefined,
+    });
+  } catch (err) {
+    if (err instanceof WalletError) {
+      return NextResponse.json({ error: err.message, code: err.code }, { status: 403 });
+    }
+    console.error('创建支付订单失败:', err);
+    return NextResponse.json({ error: '创建支付订单失败' }, { status: 500 });
+  }
 
   try {
     const charge = await provider.createCharge({
@@ -138,17 +164,27 @@ export async function POST(req: Request) {
       returnUrl,
       notifyUrl,
       currency,
+      // 与 creditPaidOrder 的 late_paid 判定共用同一个 expiresAt：网关先拒收，
+      // 我方才不会出现「钱收了但权益不发」的单子。createPaymentOrder 恒会写这一列，
+      // 兜底只为满足 schema 上的可空性。
+      expiresAt: order.expiresAt ?? new Date(Date.now() + ORDER_TTL_MS),
     });
     // P3-14：网关侧流水号在这里就拿到了，从前直接丢掉 → Stripe 订单的 providerRef 恒 null，
     // 对账时手里只有我方单号，网关后台那笔对不上。回调里再补是补不齐的（回调可能永远不来）。
     if (charge.providerRef) {
-      await prisma.paymentOrder
-        .updateMany({
-          where: { id: order.id, status: 'pending' },
-          data: { providerRef: charge.providerRef },
-        })
-        .catch(() => {});
+      await prisma.paymentOrder.updateMany({
+        where: { id: order.id, status: 'pending' },
+        data: { providerRef: charge.providerRef },
+      });
     }
+    const objectRefs = charge.objectRefs ?? inferCreatedObjectRefs(providerName, charge.providerRef);
+    await linkPaymentProviderObjects({
+      provider: providerName,
+      providerMode,
+      providerAccount,
+      orderId: order.id,
+      objectRefs,
+    });
     return NextResponse.json({
       ok: true,
       mode: 'pay',
@@ -172,4 +208,20 @@ export async function POST(req: Request) {
       .catch(() => {});
     return NextResponse.json({ error: '发起支付失败' }, { status: 502 });
   }
+}
+
+function inferCreatedObjectRefs(
+  provider: string,
+  providerRef: string | undefined
+): PaymentObjectRef[] | undefined {
+  if (!providerRef) return undefined;
+  if (provider === 'stripe') {
+    if (providerRef.startsWith('cs_')) {
+      return [{ objectType: 'checkout_session', objectId: providerRef }];
+    }
+    if (providerRef.startsWith('pi_')) {
+      return [{ objectType: 'payment_intent', objectId: providerRef }];
+    }
+  }
+  return [{ objectType: 'provider_order', objectId: providerRef }];
 }

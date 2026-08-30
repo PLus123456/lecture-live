@@ -19,7 +19,12 @@ const {
   deductMock,
   settleFullMock,
   getSiteSettingsMock,
-  persistArtifactMock,
+  stageArtifactMock,
+  settleStagedMock,
+  completeStagedMock,
+  rollbackStagedMock,
+  sessionFindUniqueMock,
+  getStoredArtifactMock,
 } = vi.hoisted(() => ({
   sessionUpdateManyMock: vi.fn(),
   transactionMock: vi.fn(),
@@ -31,16 +36,27 @@ const {
   deductMock: vi.fn(),
   settleFullMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
-  persistArtifactMock: vi.fn(),
+  stageArtifactMock: vi.fn(),
+  settleStagedMock: vi.fn(),
+  completeStagedMock: vi.fn(),
+  rollbackStagedMock: vi.fn(),
+  sessionFindUniqueMock: vi.fn(),
+  getStoredArtifactMock: vi.fn(),
 }));
 
 vi.mock('@/lib/sessionPersistence', () => ({
-  persistArtifact: persistArtifactMock,
+  stageArtifact: stageArtifactMock,
+  settleStagedArtifactsInTransaction: settleStagedMock,
+  completeStagedArtifactPublishes: completeStagedMock,
+  rollbackStagedArtifact: rollbackStagedMock,
   readArtifactFromReference: vi.fn(),
 }));
 vi.mock('@/lib/prisma', () => ({
   prisma: {
-    session: { updateMany: sessionUpdateManyMock },
+    session: {
+      updateMany: sessionUpdateManyMock,
+      findUnique: sessionFindUniqueMock,
+    },
     // R4：计费块把 deduct + settleFullReservation 包进 $transaction。桩为「立即执行回调并传入哑 tx」，
     // 回调里的 deduct / settle 都是本文件的模块级 mock（不依赖 tx 对象的具体方法），故 tx 可为 {}。
     $transaction: (...a: unknown[]) => transactionMock(...a),
@@ -60,6 +76,10 @@ vi.mock('@/lib/quota', () => ({
   settleFullReservation: settleFullMock,
 }));
 vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: getSiteSettingsMock }));
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_STATE: { RESERVED: 'RESERVED', ACTIVE: 'ACTIVE' },
+  getStoredArtifactById: getStoredArtifactMock,
+}));
 // getBillableMinutes 用真实实现（ceil(ms/60000)）锁死计费口径
 
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
@@ -68,6 +88,7 @@ const sonioxConfig = { restBaseUrl: 'https://x', apiKey: 'k' } as never;
 const session = {
   id: 'sess-full',
   userId: 'user-1',
+  fullTranscribeClaimId: 'claim-1',
   fullSonioxFileId: 'file-1',
   fullSonioxTranscriptionId: 'tr-1',
   targetLang: 'zh',
@@ -77,7 +98,36 @@ const session = {
 beforeEach(() => {
   vi.clearAllMocks();
   getSonioxTranscriptMock.mockResolvedValue({ tokens: [] });
-  convertMock.mockReturnValue([{ id: 'seg-0' }, { id: 'seg-1' }]);
+  convertMock.mockReturnValue([
+    {
+      id: 'seg-0',
+      sessionIndex: 0,
+      speaker: 'S1',
+      language: 'en',
+      text: 'hello',
+      globalStartMs: 0,
+      globalEndMs: 500,
+      startMs: 0,
+      endMs: 500,
+      isFinal: true,
+      confidence: 0.9,
+      timestamp: '00:00',
+    },
+    {
+      id: 'seg-1',
+      sessionIndex: 0,
+      speaker: 'S1',
+      language: 'en',
+      text: 'world',
+      globalStartMs: 500,
+      globalEndMs: 1000,
+      startMs: 500,
+      endMs: 1000,
+      isFinal: true,
+      confidence: 0.9,
+      timestamp: '00:00',
+    },
+  ]);
   extractMock.mockReturnValue({});
   getSiteSettingsMock.mockResolvedValue({ async_upload_billing_multiplier: 0.8 });
   deductMock.mockResolvedValue(undefined);
@@ -91,9 +141,28 @@ beforeEach(() => {
   // P1-17：delete 帮助函数返回「是否确认删除」，默认确认成功。
   deleteFileMock.mockResolvedValue(true);
   deleteTranscriptionMock.mockResolvedValue(true);
-  persistArtifactMock.mockResolvedValue({
-    path: 'local:full-transcripts/sess-full.json',
+  stageArtifactMock.mockResolvedValue({
+    category: 'full-transcripts',
+    reference: 'local:full-transcripts/sess-full-v1.json',
+    localReference: 'local:full-transcripts/sess-full-v1.json',
     storage: 'local',
+    storedArtifactId: 'artifact-full-1',
+    expectedPreviousArtifactId: null,
+    actualBytes: 100,
+    artifactType: 'full_transcript',
+  });
+  settleStagedMock.mockResolvedValue([
+    { staged: {}, settled: { artifact: {}, previous: null } },
+  ]);
+  completeStagedMock.mockResolvedValue([]);
+  rollbackStagedMock.mockResolvedValue(undefined);
+  sessionFindUniqueMock.mockResolvedValue({
+    fullTranscribeStatus: 'finalizing',
+    fullTranscriptPath: null,
+  });
+  getStoredArtifactMock.mockResolvedValue({
+    state: 'RESERVED',
+    reference: 'local:full-transcripts/sess-full-v1.json',
   });
 });
 
@@ -104,12 +173,14 @@ describe('finalizeFullTranscription', () => {
     const result = await finalizeFullTranscription(session as never, sonioxConfig);
 
     expect(result.outcome).toBe('completed');
-    expect(persistArtifactMock).toHaveBeenCalledTimes(1);
+    expect(stageArtifactMock).toHaveBeenCalledTimes(1);
 
     // 扣费恰好一次，口径 = ceil(getBillableMinutes(125000)=3 × 0.8=2.4 → ceil 3)。R4：在事务内带 tx 调用。
     expect(deductMock).toHaveBeenCalledTimes(1);
     expect(deductMock).toHaveBeenCalledWith('user-1', 3, expect.anything(), {
       sessionId: 'sess-full',
+      source: 'full_transcribe_finalize',
+      referenceId: 'sess-full',
     });
     // R4：把入口预留「转」为实扣——finalize 里恰好结算一次该会话的完整版预留（同一事务内、带 tx）。
     expect(settleFullMock).toHaveBeenCalledTimes(1);
@@ -117,6 +188,7 @@ describe('finalizeFullTranscription', () => {
 
     // finalize 的 updateMany 只写 full* 字段，绝不含 transcriptPath / status / recordingPath
     const finalizeCall = sessionUpdateManyMock.mock.calls[1][0];
+    expect(finalizeCall.where).toMatchObject({ fullTranscribeClaimId: 'claim-1' });
     expect(finalizeCall.data.fullTranscribeStatus).toBe('completed');
     expect(finalizeCall.data.fullTranscriptPath).toBeTruthy();
     expect(finalizeCall.data).not.toHaveProperty('transcriptPath');
@@ -205,6 +277,8 @@ describe('finalizeFullTranscription', () => {
     expect(deductMock).toHaveBeenCalledTimes(1);
     expect(deductMock).toHaveBeenCalledWith('user-1', 3, expect.anything(), {
       sessionId: 'sess-full',
+      source: 'full_transcribe_finalize',
+      referenceId: 'sess-full',
     });
     // 且预留只结算一次（对应扣费恰一次）。
     expect(settleFullMock).toHaveBeenCalledTimes(1);
@@ -239,12 +313,56 @@ describe('finalizeFullTranscription', () => {
     // 回退 finalizing → transcribing（带守卫；事务其实已提交时匹配 0 行、绝不回退终态）
     const revert = sessionUpdateManyMock.mock.calls.at(-1)?.[0];
     expect(revert).toEqual({
-      where: { id: 'sess-full', fullTranscribeStatus: 'finalizing' },
+      where: {
+        id: 'sess-full',
+        fullTranscribeClaimId: 'claim-1',
+        fullTranscribeStatus: 'finalizing',
+      },
       data: { fullTranscribeStatus: 'transcribing' },
     });
     // 转录留着重收尾 —— 绝不能删 Soniox 资源。
     expect(deleteTranscriptionMock).not.toHaveBeenCalled();
     expect(deleteFileMock).not.toHaveBeenCalled();
+  });
+
+  it('provider 转换结果未通过 canonical admission 时恢复 claim，且不 stage/不计费', async () => {
+    sessionUpdateManyMock.mockResolvedValue({ count: 1 });
+    convertMock.mockReturnValue([{ id: 'missing-required-fields' }]);
+
+    await expect(
+      finalizeFullTranscription(session as never, sonioxConfig)
+    ).rejects.toThrow(/required/);
+
+    expect(stageArtifactMock).not.toHaveBeenCalled();
+    expect(transactionMock).not.toHaveBeenCalled();
+    expect(deductMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock.mock.calls.at(-1)?.[0]).toMatchObject({
+      where: {
+        id: 'sess-full',
+        fullTranscribeClaimId: 'claim-1',
+        fullTranscribeStatus: 'finalizing',
+      },
+      data: { fullTranscribeStatus: 'transcribing' },
+    });
+  });
+
+  it('事务 ACK 丢失但 owner+ledger readback 均已提交时按成功收口，不删新对象', async () => {
+    sessionUpdateManyMock.mockResolvedValue({ count: 1 });
+    transactionMock.mockRejectedValueOnce(new Error('commit acknowledgement lost'));
+    sessionFindUniqueMock.mockResolvedValue({
+      fullTranscribeStatus: 'completed',
+      fullTranscriptPath: 'local:full-transcripts/sess-full-v1.json',
+    });
+    getStoredArtifactMock.mockResolvedValue({
+      state: 'ACTIVE',
+      reference: 'local:full-transcripts/sess-full-v1.json',
+    });
+
+    const result = await finalizeFullTranscription(session as never, sonioxConfig);
+
+    expect(result.outcome).toBe('completed');
+    expect(rollbackStagedMock).not.toHaveBeenCalled();
+    expect(deleteTranscriptionMock).toHaveBeenCalledTimes(1);
   });
 
   it('无 fullSonioxTranscriptionId：直接 claim_lost，不动任何东西', async () => {

@@ -32,6 +32,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { timingSafeEqual, randomUUID } from 'node:crypto'
+import { pathToFileURL } from 'node:url'
 
 // ============================ 配置 ============================
 
@@ -50,6 +51,8 @@ const CONFIG = {
   retentionHours: intEnv('AUDIO_WORKER_RETENTION_HOURS', 24),
   // 单任务处理超时（分钟），超时杀进程标记失败
   jobTimeoutMinutes: intEnv('AUDIO_WORKER_JOB_TIMEOUT_MINUTES', 150),
+  // 不可信输入的 ffprobe 必须远短于整个处理任务；坏容器不能占住 worker 数小时
+  probeTimeoutMs: intEnv('AUDIO_WORKER_PROBE_TIMEOUT_MS', 60_000),
   ffmpegBin: process.env.FFMPEG_BIN || 'ffmpeg',
   ffprobeBin: process.env.FFPROBE_BIN || 'ffprobe',
   // deep-filter 可执行文件；不配置则在 PATH 里找 deep-filter / deepFilter
@@ -57,6 +60,97 @@ const CONFIG = {
 }
 
 const VERSION = '1.0.0'
+
+// ============================ 媒体输入安全边界 ============================
+
+/** ffmpeg/ffprobe 只允许读取当前任务的本地文件和已显式建立的 pipe。 */
+export const MEDIA_PROTOCOL_WHITELIST = 'file,pipe'
+
+/**
+ * 只接收自包含的常见音视频容器。playlist/脚本型 demuxer 即使伪造 Content-Type 也不在此列。
+ * format_name 可能返回逗号分隔的候选（如 mov,mp4,m4a,3gp,3g2,mj2）。
+ */
+export const ALLOWED_MEDIA_CONTAINER_FORMATS = new Set([
+  'matroska', 'webm',
+  'mov', 'mp4', 'm4a', '3gp', '3g2', 'mj2',
+  'ogg', 'wav', 'aiff', 'aif', 'flac',
+  'mp3', 'mp2', 'mp1', 'aac', 'adts',
+  'asf', 'asf_o', 'wma', 'avi', 'm4v',
+  'mpeg', 'mpegvideo', 'mpegts', 'ac3', 'eac3', 'amr', 'caf', 'w64',
+])
+
+const DENIED_MEDIA_CONTAINER_FORMATS = new Set([
+  'hls', 'applehttp', 'm3u8',
+  'concat', 'ffconcat', 'dash',
+  'rtsp', 'rtp', 'sdp', 'rtp_mpegts',
+  'image2', 'image2pipe', 'xml_dash', 'webvtt',
+])
+
+const ALLOWED_MEDIA_FORMATS_ARG = [...ALLOWED_MEDIA_CONTAINER_FORMATS].join(',')
+const SAFE_INPUT_ARGS = ['-protocol_whitelist', MEDIA_PROTOCOL_WHITELIST]
+const SAFE_UNTRUSTED_INPUT_ARGS = [
+  ...SAFE_INPUT_ARGS,
+  '-format_whitelist', ALLOWED_MEDIA_FORMATS_ARG,
+]
+
+/** 纯文本 playlist/concat 文件没有这些受支持容器的魔数。 */
+export function sniffMediaContainerMagic(head) {
+  if (!Buffer.isBuffer(head) || head.length < 4) return false
+  const [b0, b1, b2, b3] = head
+  if (head.length >= 8) {
+    const box = head.toString('latin1', 4, 8)
+    if (['ftyp', 'styp', 'moov', 'free', 'mdat', 'skip'].includes(box)) return true
+  }
+  const ascii4 = head.toString('latin1', 0, 4)
+  if (['RIFF', 'OggS', 'fLaC', 'FORM', 'caff'].includes(ascii4)) return true
+  // Sony Wave64 以 RIFF GUID 开头，不是普通 WAV 的大写 `RIFF` chunk。
+  if (
+    head.length >= 16 &&
+    head.subarray(0, 16).equals(
+      Buffer.from([0x72, 0x69, 0x66, 0x66, 0x2e, 0x91, 0xcf, 0x11,
+        0xa5, 0xd6, 0x28, 0xdb, 0x04, 0xc1, 0x00, 0x00])
+    )
+  ) return true
+  if (b0 === 0x1a && b1 === 0x45 && b2 === 0xdf && b3 === 0xa3) return true
+  if (b0 === 0x49 && b1 === 0x44 && b2 === 0x33) return true
+  if (b0 === 0xff && (b1 & 0xe0) === 0xe0) return true
+  // AC-3 / E-AC-3 共用 0x0b77 syncword；后续还必须通过 ffprobe demuxer 白名单。
+  if (b0 === 0x0b && b1 === 0x77) return true
+  if (head.subarray(0, 6).toString('ascii') === '#!AMR\n') return true
+  if (head.subarray(0, 9).toString('ascii') === '#!AMR-WB\n') return true
+  if (b0 === 0x30 && b1 === 0x26 && b2 === 0xb2 && b3 === 0x75) return true
+  // MPEG program/video elementary stream 的 pack/sequence/VOP 开始码。
+  if (
+    b0 === 0x00 && b1 === 0x00 && b2 === 0x01 &&
+    [0x00, 0xb0, 0xb2, 0xb3, 0xb5, 0xb6, 0xb8, 0xba].includes(b3)
+  ) return true
+  // MPEG-TS 没有固定文件头；要求两个连续 packet 位置的 sync byte，
+  // 同时覆盖 188/192(M2TS)/204-byte packet，避免只看首字节 0x47 的误报。
+  for (const offset of [0, 4]) {
+    for (const packetSize of [188, 192, 204]) {
+      if (
+        head.length > offset + packetSize &&
+        head[offset] === 0x47 &&
+        head[offset + packetSize] === 0x47
+      ) return true
+    }
+  }
+  return false
+}
+
+export function classifyMediaContainerFormat(formatName) {
+  const tokens = String(formatName || '')
+    .split(',')
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean)
+  if (tokens.length === 0) return { allowed: false, reason: 'empty format_name' }
+  const denied = tokens.find((token) => DENIED_MEDIA_CONTAINER_FORMATS.has(token))
+  if (denied) return { allowed: false, reason: `denied demuxer: ${denied}` }
+  if (!tokens.some((token) => ALLOWED_MEDIA_CONTAINER_FORMATS.has(token))) {
+    return { allowed: false, reason: `demuxer not in allowlist: ${formatName}` }
+  }
+  return { allowed: true }
+}
 
 function intEnv(name, fallback) {
   const v = Number.parseInt(process.env[name] ?? '', 10)
@@ -92,7 +186,31 @@ const queue = []
 let runningCount = 0
 /** 运行中任务的子进程句柄，用于超时/关闭时终止 */
 const runningProcs = new Map()
+/** 覆盖完整 runPipeline catch/finally 的 promise；取消须等它收尾才释放 jobId。 */
+const runningPipelines = new Map()
+/** DELETE 单飞退役；存在期间禁止同 jobId 重用，防止 ABA 删新目录。 */
+const retiringJobs = new Map()
+/** 流式上传/启动请求也是 job 世代的一部分，DELETE 须取消并等待它们。 */
+const activeUploads = new Map()
+const activeStarts = new Map()
 let shuttingDown = false
+
+function trackJobOperation(registry, jobId, fields) {
+  let resolveDone
+  const operation = {
+    ...fields,
+    done: new Promise((resolve) => { resolveDone = resolve }),
+    finish() {
+      if (!resolveDone) return
+      const resolve = resolveDone
+      resolveDone = null
+      if (registry.get(jobId) === operation) registry.delete(jobId)
+      resolve()
+    },
+  }
+  registry.set(jobId, operation)
+  return operation
+}
 
 function jobDir(jobId) {
   return path.join(CONFIG.workDir, jobId)
@@ -133,9 +251,37 @@ async function appendJobLog(jobId, message) {
  * 运行子进程并收集输出。onStderrLine 用于解析 ffmpeg 进度。
  * 返回 { code, stdout, stderr }；spawn 失败（如命令不存在）时 reject。
  */
+function terminateChild(child) {
+  if (!child || child.killed) return
+  if (process.platform !== 'win32' && child.pid) {
+    try {
+      // run() 用 detached process group；杀整组，避免解析器派生进程在超时后残留。
+      process.kill(-child.pid, 'SIGKILL')
+      return
+    } catch {
+      // 子进程可能已退出或平台不支持负 pid，回落到直接 kill。
+    }
+  }
+  child.kill('SIGKILL')
+}
+
+/** 旧世代 child 延迟 close 时不得删除同 jobId 的新世代句柄。 */
+export function unregisterRunningProcess(registry, jobId, child) {
+  if (registry.get(jobId) === child) registry.delete(jobId)
+}
+
 function run(bin, args, { jobId, onStderrLine, timeoutMs } = {}) {
+  // DELETE/关机可能恰好发生在两个子进程之间。不只杀“当下那个”，
+  // 还必须禁止旧 pipeline 在收尾期间再 spawn 下一阶段。
+  if (jobId && (retiringJobs.has(jobId) || shuttingDown)) {
+    return Promise.reject(new Error('job cancelled before spawning child process'))
+  }
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(bin, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
+      windowsHide: true,
+    })
     if (jobId) runningProcs.set(jobId, child)
 
     let stdout = ''
@@ -144,7 +290,7 @@ function run(bin, args, { jobId, onStderrLine, timeoutMs } = {}) {
     let timer = null
     if (timeoutMs) {
       timer = setTimeout(() => {
-        child.kill('SIGKILL')
+        terminateChild(child)
       }, timeoutMs)
     }
 
@@ -168,12 +314,12 @@ function run(bin, args, { jobId, onStderrLine, timeoutMs } = {}) {
     })
     child.on('error', (err) => {
       if (timer) clearTimeout(timer)
-      if (jobId) runningProcs.delete(jobId)
+      if (jobId) unregisterRunningProcess(runningProcs, jobId, child)
       reject(err)
     })
     child.on('close', (code) => {
       if (timer) clearTimeout(timer)
-      if (jobId) runningProcs.delete(jobId)
+      if (jobId) unregisterRunningProcess(runningProcs, jobId, child)
       resolve({ code, stdout, stderr })
     })
   })
@@ -219,15 +365,62 @@ async function hasFfmpeg() {
 
 // ============================ 音频管线 ============================
 
-/** ffprobe 拿时长（毫秒），失败返回 null */
-async function probeDurationMs(file) {
+async function readMagicHead(file, length = 412) {
+  const handle = await fs.open(file, 'r')
+  try {
+    const head = Buffer.alloc(length)
+    const { bytesRead } = await handle.read(head, 0, length, 0)
+    return head.subarray(0, bytesRead)
+  } finally {
+    await handle.close()
+  }
+}
+
+async function probeFormatName(file, jobId) {
+  const { code, stdout, stderr } = await run(CONFIG.ffprobeBin, [
+    ...SAFE_UNTRUSTED_INPUT_ARGS,
+    '-v', 'error',
+    '-probesize', '10485760',
+    '-analyzeduration', '15000000',
+    '-show_entries', 'format=format_name',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    file,
+  ], { jobId, timeoutMs: CONFIG.probeTimeoutMs })
+  if (code !== 0) {
+    throw new Error(`ffprobe 容器识别失败(exit ${code}): ${stderr.slice(-300)}`)
+  }
+  return stdout.trim()
+}
+
+/**
+ * 在任何解析器看到上传内容前做两层 allowlist：二进制魔数 + ffprobe demuxer。
+ * 固定 input.bin 路径只能防参数注入，不能阻止 m3u8/concat 内容诱导 ffmpeg 访问网络或其它文件。
+ */
+export async function validateUploadedMediaContainer(file, jobId) {
+  const head = await readMagicHead(file)
+  if (!sniffMediaContainerMagic(head)) {
+    throw new Error('拒绝未知媒体容器（可能是 playlist/concat/文本脚本）')
+  }
+  const formatName = await probeFormatName(file, jobId)
+  const verdict = classifyMediaContainerFormat(formatName)
+  if (!verdict.allowed) {
+    throw new Error(`拒绝媒体容器：${verdict.reason}`)
+  }
+  return formatName
+}
+
+/** ffprobe 拿时长（毫秒）。合法 streaming WebM 可能没有 format.duration，此时返回 null。 */
+async function probeDurationMs(file, jobId) {
   try {
     const { code, stdout } = await run(CONFIG.ffprobeBin, [
+      ...SAFE_INPUT_ARGS,
       '-v', 'error',
+      '-probesize', '10485760',
+      '-analyzeduration', '15000000',
       '-show_entries', 'format=duration',
       '-of', 'json',
       file,
-    ])
+    ], { jobId, timeoutMs: CONFIG.probeTimeoutMs })
     if (code !== 0) return null
     const dur = Number.parseFloat(JSON.parse(stdout)?.format?.duration)
     return Number.isFinite(dur) && dur > 0 ? Math.round(dur * 1000) : null
@@ -287,7 +480,9 @@ async function runPipeline(state) {
   try {
     // ---------- 1. 探测 ----------
     await setStage('probe', 2)
-    const durationMs = await probeDurationMs(inputFile)
+    const containerFormat = await validateUploadedMediaContainer(inputFile, jobId)
+    await appendJobLog(jobId, `输入容器 ${containerFormat}`)
+    let durationMs = await probeDurationMs(inputFile, jobId)
     if (durationMs) await appendJobLog(jobId, `输入时长 ${Math.round(durationMs / 1000)}s`)
 
     // ---------- 2. 转码 48k 单声道 WAV ----------
@@ -295,13 +490,16 @@ async function runPipeline(state) {
     {
       const { code, stderr } = await run(
         CONFIG.ffmpegBin,
-        ['-hide_banner', '-nostdin', '-y', '-i', inputFile,
+        ['-hide_banner', '-nostdin', '-y', ...SAFE_UNTRUSTED_INPUT_ARGS, '-i', inputFile,
           '-vn', '-ac', '1', '-ar', '48000', '-c:a', 'pcm_s16le',
           '-progress', 'pipe:2', workWav],
         { jobId, timeoutMs: stepTimeout, onStderrLine: makeProgressParser(durationMs, 5, 20, state) },
       )
       if (code !== 0) throw new Error(`输入转码失败(ffmpeg exit ${code}): ${stderr.slice(-400)}`)
     }
+    // MediaRecorder 产生的 streaming WebM 可能没有容器 duration；安全解码为自生成 WAV 后再测。
+    if (!durationMs) durationMs = await probeDurationMs(workWav, jobId)
+    if (!durationMs) throw new Error('无法从已解码媒体取得有效时长，拒绝继续处理')
 
     // ---------- 3. loudnorm 双遍 ----------
     const targetI = p.targetLufs
@@ -310,7 +508,7 @@ async function runPipeline(state) {
     await setStage('measure', 22)
     const pass1 = await run(
       CONFIG.ffmpegBin,
-      ['-hide_banner', '-nostdin', '-i', workWav,
+      ['-hide_banner', '-nostdin', ...SAFE_INPUT_ARGS, '-i', workWav,
         '-af', `loudnorm=I=${targetI}:TP=${targetTp}:LRA=11:print_format=json`,
         '-f', 'null', '-'],
       { jobId, timeoutMs: stepTimeout },
@@ -330,7 +528,7 @@ async function runPipeline(state) {
       ].join(':')
       const pass2 = await run(
         CONFIG.ffmpegBin,
-        ['-hide_banner', '-nostdin', '-y', '-i', workWav,
+        ['-hide_banner', '-nostdin', '-y', ...SAFE_INPUT_ARGS, '-i', workWav,
           '-af', filters, '-ar', '48000', '-c:a', 'pcm_s16le',
           '-progress', 'pipe:2', normWav],
         { jobId, timeoutMs: stepTimeout, onStderrLine: makeProgressParser(durationMs, 30, 45, state) },
@@ -387,7 +585,7 @@ async function runPipeline(state) {
         // afftdn 兜底（与 echo360 的 AUDIO_FALLBACK_DENOISE 等价）
         const { code, stderr } = await run(
           CONFIG.ffmpegBin,
-          ['-hide_banner', '-nostdin', '-y', '-i', normWav,
+          ['-hide_banner', '-nostdin', '-y', ...SAFE_INPUT_ARGS, '-i', normWav,
             '-af', 'afftdn=nr=15', '-c:a', 'pcm_s16le',
             '-progress', 'pipe:2', denoisedWav],
           { jobId, timeoutMs: stepTimeout, onStderrLine: makeProgressParser(durationMs, 55, 75, state) },
@@ -414,7 +612,7 @@ async function runPipeline(state) {
       try {
         const remeasure = await run(
           CONFIG.ffmpegBin,
-          ['-hide_banner', '-nostdin', '-i', denoisedWav,
+          ['-hide_banner', '-nostdin', ...SAFE_INPUT_ARGS, '-i', denoisedWav,
             '-af', `loudnorm=I=${targetI}:TP=${targetTp}:LRA=11:print_format=json`,
             '-f', 'null', '-'],
           { jobId, timeoutMs: stepTimeout },
@@ -431,7 +629,7 @@ async function runPipeline(state) {
             cleanup.push(touched)
             const { code } = await run(
               CONFIG.ffmpegBin,
-              ['-hide_banner', '-nostdin', '-y', '-i', denoisedWav,
+              ['-hide_banner', '-nostdin', '-y', ...SAFE_INPUT_ARGS, '-i', denoisedWav,
                 '-af', `volume=${gain.toFixed(2)}dB`, '-c:a', 'pcm_s16le', touched],
               { jobId, timeoutMs: stepTimeout },
             )
@@ -456,7 +654,7 @@ async function runPipeline(state) {
     {
       const { code, stderr } = await run(
         CONFIG.ffmpegBin,
-        ['-hide_banner', '-nostdin', '-y', '-i', denoisedWav,
+        ['-hide_banner', '-nostdin', '-y', ...SAFE_INPUT_ARGS, '-i', denoisedWav,
           ...encodeArgs, '-progress', 'pipe:2', outFile],
         { jobId, timeoutMs: stepTimeout, onStderrLine: makeProgressParser(durationMs, 80, 97, state) },
       )
@@ -500,12 +698,13 @@ function pump() {
   while (!shuttingDown && runningCount < CONFIG.concurrency && queue.length > 0) {
     const jobId = queue.shift()
     const state = jobs.get(jobId)
-    if (!state || state.status !== 'queued') continue
+    if (!state || state.status !== 'queued' || retiringJobs.has(jobId)) continue
     runningCount += 1
     state.status = 'running'
     state.startedAt = new Date().toISOString()
     // 运行状态落盘后再跑管线；管线自身 try/catch，绝不抛出
-    saveState(state)
+    let pipelinePromise
+    pipelinePromise = saveState(state)
       .then(() => runPipeline(state))
       .catch(async (err) => {
         state.status = 'failed'
@@ -514,10 +713,64 @@ function pump() {
         await saveState(state).catch(() => {})
       })
       .finally(() => {
+        if (runningPipelines.get(jobId) === pipelinePromise) {
+          runningPipelines.delete(jobId)
+        }
         runningCount -= 1
         pump()
       })
+    runningPipelines.set(jobId, pipelinePromise)
   }
+}
+
+/**
+ * 完整退役一个 jobId。必须等子进程 close、runPipeline catch 和 finally
+ * 全部结束，再删目录/释放 ID；否则旧任务会覆写或删除立即复用 ID 的新任务。
+ */
+function retireJob(jobId) {
+  const inFlight = retiringJobs.get(jobId)
+  if (inFlight) return inFlight
+
+  let retirement
+  retirement = (async () => {
+    const state = jobs.get(jobId)
+    const qi = queue.indexOf(jobId)
+    if (qi >= 0) queue.splice(qi, 1)
+
+    if (state) {
+      state.status = 'failed'
+      state.error = 'cancelled'
+      state.finishedAt = new Date().toISOString()
+    }
+
+    // 操作可能正在“上传/读 start body/两个 ffmpeg 阶段之间”。循环
+    // 重新抓取当前世代的所有操作，直到完整静默，不留 spawn/write 缝隙。
+    for (;;) {
+      const upload = activeUploads.get(jobId)
+      const start = activeStarts.get(jobId)
+      const pipelinePromise = runningPipelines.get(jobId)
+      const proc = runningProcs.get(jobId)
+      upload?.cancel?.()
+      start?.cancel?.()
+      if (proc) terminateChild(proc)
+
+      const waits = [...new Set([
+        upload?.done,
+        start?.done,
+        pipelinePromise,
+      ].filter(Boolean))]
+      if (waits.length === 0) break
+      await Promise.allSettled(waits)
+    }
+
+    if (jobs.get(jobId) === state) jobs.delete(jobId)
+    await fs.rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {})
+  })().finally(() => {
+    if (retiringJobs.get(jobId) === retirement) retiringJobs.delete(jobId)
+  })
+
+  retiringJobs.set(jobId, retirement)
+  return retirement
 }
 
 // ============================ 启动恢复与清理 ============================
@@ -554,9 +807,12 @@ async function sweepStale() {
     const isFinished = state.status === 'succeeded' || state.status === 'failed'
     // 完成后超保留期，或 created（只传了 input 一直没 start）超 6 小时 → 清
     if ((isFinished && age > ttlMs) || (state.status === 'created' && age > 6 * 3600 * 1000)) {
-      jobs.delete(jobId)
-      await fs.rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {})
-      log('info', `清理过期任务 ${jobId}`)
+      // 从读取 age 到此处没有 await；再验世代后立即进入 retire 单飞，
+      // 使清理和 PUT/START/DELETE 共用同一 ABA 边界。
+      if (jobs.get(jobId) === state) {
+        await retireJob(jobId)
+        log('info', `清理过期任务 ${jobId}`)
+      }
     }
   }
   // 落盘目录里没有内存记录的孤儿目录（state.json 损坏等）也清掉
@@ -565,7 +821,14 @@ async function sweepStale() {
     if (!ent.isDirectory() || jobs.has(ent.name)) continue
     const st = await fs.stat(path.join(CONFIG.workDir, ent.name)).catch(() => null)
     if (st && now - st.mtimeMs > ttlMs) {
-      await fs.rm(path.join(CONFIG.workDir, ent.name), { recursive: true, force: true }).catch(() => {})
+      // stat 是 await 点：期间可能有新 PUT 认领同 ID。删除前重验，并由
+      // retireJob 先占位再 rm，不让新世代在 rm await 期间插入。
+      if (
+        jobs.has(ent.name) || activeUploads.has(ent.name) ||
+        activeStarts.has(ent.name) || runningPipelines.has(ent.name) ||
+        retiringJobs.has(ent.name)
+      ) continue
+      await retireJob(ent.name)
     }
   }
 }
@@ -665,6 +928,12 @@ async function handleRequest(req, res) {
   // PUT /jobs/:id/input — 流式接收音频
   if (req.method === 'PUT' && sub === 'input') {
     if (shuttingDown) return sendJson(res, 503, { error: 'shutting down' })
+    if (
+      retiringJobs.has(jobId) || runningPipelines.has(jobId) ||
+      activeUploads.has(jobId) || activeStarts.has(jobId)
+    ) {
+      return sendJson(res, 409, { error: 'job has an active operation' })
+    }
     const existing = jobs.get(jobId)
     if (existing && (existing.status === 'queued' || existing.status === 'running')) {
       return sendJson(res, 409, { error: `job is ${existing.status}` })
@@ -673,43 +942,85 @@ async function handleRequest(req, res) {
     if (Number.isFinite(declared) && declared > CONFIG.maxInputBytes) {
       return sendJson(res, 413, { error: 'input too large' })
     }
-    // 重新上传视为重建任务（覆盖旧目录，支持主服务器失败重派）
-    await fs.rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {})
-    await fs.mkdir(jobDir(jobId), { recursive: true })
+
     const state = newState(jobId)
     jobs.set(jobId, state)
+    const abortController = new AbortController()
+    const operation = trackJobOperation(activeUploads, jobId, {
+      state,
+      cancel: () => abortController.abort(),
+    })
+    const isCurrent = () =>
+      activeUploads.get(jobId) === operation &&
+      jobs.get(jobId) === state &&
+      !retiringJobs.has(jobId)
 
     const target = path.join(jobDir(jobId), 'input.bin')
     let received = 0
     try {
+      // 重新上传视为重建任务（覆盖旧目录，支持主服务器失败重派）。
+      // activeUploads 已在任何 await 之前登记，同 ID 的并发 PUT/DELETE 无法跨世代。
+      await fs.rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {})
+      if (!isCurrent()) throw new Error('job cancelled')
+      await fs.mkdir(jobDir(jobId), { recursive: true })
+      if (!isCurrent()) throw new Error('job cancelled')
+
       const counter = async function* (source) {
         for await (const chunk of source) {
+          if (!isCurrent()) throw new Error('job cancelled')
           received += chunk.length
           if (received > CONFIG.maxInputBytes) throw new Error('input too large')
           yield chunk
         }
       }
-      await pipeline(req, counter, createWriteStream(target))
+      await pipeline(
+        req,
+        counter,
+        createWriteStream(target),
+        { signal: abortController.signal }
+      )
+      if (!isCurrent()) throw new Error('job cancelled')
+
+      if (received === 0) throw new Error('empty body')
+      state.input = {
+        bytes: received,
+        contentType: req.headers['content-type'] || 'application/octet-stream',
+      }
+      await saveState(state)
+      if (!isCurrent()) throw new Error('job cancelled')
+      await appendJobLog(jobId, `收到输入 ${received} bytes`)
+      if (!isCurrent()) throw new Error('job cancelled')
+      return sendJson(res, 200, { received })
     } catch (err) {
-      jobs.delete(jobId)
-      await fs.rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {})
-      const tooLarge = String(err?.message || '').includes('too large')
-      return sendJson(res, tooLarge ? 413 : 400, { error: tooLarge ? 'input too large' : 'upload failed' })
+      const message = String(err?.message || '')
+      const cancelled =
+        abortController.signal.aborted || retiringJobs.has(jobId) ||
+        jobs.get(jobId) !== state || message.includes('cancelled')
+      if (jobs.get(jobId) === state && !retiringJobs.has(jobId)) {
+        jobs.delete(jobId)
+        await fs.rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {})
+      }
+      const tooLarge = message.includes('too large')
+      const empty = message.includes('empty body')
+      return sendJson(
+        res,
+        cancelled ? 409 : tooLarge ? 413 : 400,
+        { error: cancelled ? 'job cancelled' : tooLarge ? 'input too large' : empty ? 'empty body' : 'upload failed' }
+      )
+    } finally {
+      operation.finish()
     }
-    if (received === 0) {
-      jobs.delete(jobId)
-      await fs.rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {})
-      return sendJson(res, 400, { error: 'empty body' })
-    }
-    state.input = { bytes: received, contentType: req.headers['content-type'] || 'application/octet-stream' }
-    await saveState(state)
-    await appendJobLog(jobId, `收到输入 ${received} bytes`)
-    return sendJson(res, 200, { received })
   }
 
   // POST /jobs/:id/start — 入队
   if (req.method === 'POST' && sub === 'start') {
     if (shuttingDown) return sendJson(res, 503, { error: 'shutting down' })
+    if (
+      retiringJobs.has(jobId) || activeUploads.has(jobId) ||
+      activeStarts.has(jobId) || runningPipelines.has(jobId)
+    ) {
+      return sendJson(res, 409, { error: 'job has an active operation' })
+    }
     const state = jobs.get(jobId)
     if (!state || !state.input) return sendJson(res, 409, { error: 'input not uploaded' })
     if (state.status === 'queued' || state.status === 'running') {
@@ -718,20 +1029,49 @@ async function handleRequest(req, res) {
     }
     if (state.status === 'succeeded') return sendJson(res, 202, { status: 'succeeded' })
     if (queue.length >= CONFIG.queueLimit) return sendJson(res, 429, { error: 'queue full' })
-    let body
+
+    const operation = trackJobOperation(activeStarts, jobId, {
+      state,
+      cancel: () => {
+        if (typeof req.destroy === 'function' && !req.destroyed) {
+          req.destroy(new Error('job cancelled'))
+        }
+      },
+    })
+    const isCurrent = () =>
+      activeStarts.get(jobId) === operation &&
+      jobs.get(jobId) === state &&
+      !retiringJobs.has(jobId)
+
     try {
-      body = await readJsonBody(req)
-    } catch {
-      return sendJson(res, 400, { error: 'invalid json' })
+      const body = await readJsonBody(req)
+      if (!isCurrent()) throw new Error('job cancelled')
+      if (queue.length >= CONFIG.queueLimit) {
+        return sendJson(res, 429, { error: 'queue full' })
+      }
+
+      state.params = normalizeParams(body)
+      state.status = 'queued'
+      state.error = null
+      state.progress = 0
+      await saveState(state)
+      if (!isCurrent()) throw new Error('job cancelled')
+      await appendJobLog(jobId, `入队 params=${JSON.stringify(state.params)}`)
+      if (!isCurrent()) throw new Error('job cancelled')
+      enqueue(jobId)
+      return sendJson(res, 202, { status: 'queued', position: queue.length })
+    } catch (err) {
+      const cancelled =
+        retiringJobs.has(jobId) || jobs.get(jobId) !== state ||
+        String(err?.message || '').includes('cancelled')
+      return sendJson(
+        res,
+        cancelled ? 409 : 400,
+        { error: cancelled ? 'job cancelled' : 'invalid json' }
+      )
+    } finally {
+      operation.finish()
     }
-    state.params = normalizeParams(body)
-    state.status = 'queued'
-    state.error = null
-    state.progress = 0
-    await saveState(state)
-    await appendJobLog(jobId, `入队 params=${JSON.stringify(state.params)}`)
-    enqueue(jobId)
-    return sendJson(res, 202, { status: 'queued', position: queue.length })
   }
 
   // GET /jobs/:id — 状态
@@ -774,20 +1114,7 @@ async function handleRequest(req, res) {
 
   // DELETE /jobs/:id — 清理（幂等）
   if (req.method === 'DELETE' && !sub) {
-    const state = jobs.get(jobId)
-    if (state && state.status === 'running') {
-      // 运行中删除 = 终止任务
-      const proc = runningProcs.get(jobId)
-      if (proc) proc.kill('SIGKILL')
-      state.status = 'failed'
-      state.error = 'cancelled'
-      state.finishedAt = new Date().toISOString()
-    }
-    // 从等待队列摘除
-    const qi = queue.indexOf(jobId)
-    if (qi >= 0) queue.splice(qi, 1)
-    jobs.delete(jobId)
-    await fs.rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {})
+    await retireJob(jobId)
     res.writeHead(204)
     res.end()
     return undefined
@@ -852,6 +1179,9 @@ async function main() {
     if (shuttingDown) return
     shuttingDown = true
     log('info', '收到退出信号，停止接收新任务…')
+    for (const operation of activeUploads.values()) operation.cancel?.()
+    for (const operation of activeStarts.values()) operation.cancel?.()
+    for (const proc of runningProcs.values()) terminateChild(proc)
     server.close(() => process.exit(0))
     // 运行中的任务由重启恢复逻辑标记失败，主服务器会重新派发
     setTimeout(() => process.exit(0), 5000).unref()
@@ -860,7 +1190,14 @@ async function main() {
   process.on('SIGTERM', shutdown)
 }
 
-main().catch((err) => {
-  log('error', `启动失败: ${err?.message || err}`)
-  process.exit(1)
-})
+const invokedAsMain = Boolean(
+  process.argv[1] &&
+    pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url
+)
+
+if (invokedAsMain) {
+  main().catch((err) => {
+    log('error', `启动失败: ${err?.message || err}`)
+    process.exit(1)
+  })
+}

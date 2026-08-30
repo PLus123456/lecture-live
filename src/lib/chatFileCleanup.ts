@@ -16,6 +16,11 @@ import { olderThanDaysToCutoff } from '@/lib/adminCleanup';
 // U6：删行前先 best-effort 删 Cloudreve 物理文件（与 conversationCascade.ts 一致），
 // 否则行一删 cloudrevePath 即永久丢失，Cloudreve 上原文件 + .extracted.txt 成不可回收孤儿。
 import { deleteCloudreveAttachmentFiles } from '@/lib/storage/cloudreveFileDelete';
+import {
+  findBillableStoredArtifactsByOwners,
+  markStoredArtifactsDeletePendingInTransaction,
+  releaseStoredArtifactInTransaction,
+} from '@/lib/storage/storedArtifactLedger';
 
 export { olderThanDaysToCutoff };
 
@@ -132,15 +137,201 @@ export async function releaseUserStorageBytesRaw(
   );
 }
 
+interface ChatFileDeleteCandidate {
+  id: string;
+  userId: string;
+  bytes: bigint;
+  cloudrevePath: string;
+  extractedTextPath: string | null;
+}
+
+export interface ChatFileDatabaseMutationSummary {
+  candidateCount: number;
+  deleted: number;
+  releasedBytes: number;
+  queuedArtifactCount: number;
+  deletedIds: string[];
+  ownerIds: string[];
+}
+
+export interface ChatFileCleanupOptions {
+  /** Runs after delete/quota mutation and before commit. Throwing rolls the mutation back. */
+  onDatabaseMutation?: (
+    tx: Prisma.TransactionClient,
+    summary: ChatFileDatabaseMutationSummary
+  ) => Promise<void>;
+  /**
+   * Runs in the same transaction that releases ledger-backed quota after the remote delete.
+   * Throwing leaves the durable DELETE_PENDING rows charged and retryable.
+   */
+  onArtifactReleaseMutation?: (
+    tx: Prisma.TransactionClient,
+    summary: ChatFileArtifactReleaseSummary
+  ) => Promise<void>;
+}
+
+export interface ChatFileArtifactReleaseSummary {
+  artifactCount: number;
+  releasedArtifactCount: number;
+  releasedBytes: number;
+}
+
+export interface ChatFileCleanupResult {
+  deleted: number;
+  releasedBytes: number;
+  truncated: boolean;
+  /** False means durable StoredArtifact DELETE_PENDING rows or owner rows remain retryable. */
+  physicalDeleteComplete: boolean;
+  pendingArtifactCount: number;
+}
+
+async function deleteChatFileCandidates(
+  toDelete: ChatFileDeleteCandidate[],
+  truncated: boolean,
+  options?: ChatFileCleanupOptions
+): Promise<ChatFileCleanupResult> {
+  if (toDelete.length === 0 && !options?.onDatabaseMutation) {
+    return {
+      deleted: 0,
+      releasedBytes: 0,
+      truncated,
+      physicalDeleteComplete: true,
+      pendingArtifactCount: 0,
+    };
+  }
+  const ZERO = BigInt(0);
+  const ids = toDelete.map((row) => row.id);
+  const ledgerRows = await findBillableStoredArtifactsByOwners(
+    'chat_attachment',
+    ids
+  );
+  const ledgerOwnerIds = new Set(ledgerRows.map((row) => row.ownerId));
+
+  // Legacy rows have no durable artifact reference after their owner is deleted. Delete their
+  // physical objects first and only remove DB rows when the whole legacy batch is confirmed. A
+  // crash leaves the owner rows intact; replay treats remote 404 as success. Ledger-backed rows
+  // instead transition to DELETE_PENDING in the same transaction as owner deletion.
+  const legacyRows = toDelete.filter((row) => !ledgerOwnerIds.has(row.id));
+  const legacyPhysicalComplete =
+    legacyRows.length === 0 ||
+    (await deleteCloudreveAttachmentFiles(legacyRows));
+  const eligibleIds = new Set([
+    ...toDelete
+      .filter((row) => ledgerOwnerIds.has(row.id))
+      .map((row) => row.id),
+    ...(legacyPhysicalComplete ? legacyRows.map((row) => row.id) : []),
+  ]);
+
+  let totalReleased = ZERO;
+  let deletedIds: string[] = [];
+  let queuedArtifactCount = 0;
+  await prisma.$transaction(async (tx) => {
+    const lockedRows =
+      eligibleIds.size === 0
+        ? []
+        : await tx.$queryRaw<
+            Array<{ id: string; userId: string; bytes: bigint }>
+          >(Prisma.sql`
+            SELECT id, userId, bytes FROM ChatAttachment
+            WHERE id IN (${Prisma.join([...eligibleIds])})
+            FOR UPDATE
+          `);
+
+    const releaseByUser = new Map<string, bigint>();
+    for (const row of lockedRows) {
+      // Ledger rows retain chargedBytes until their physical delete is confirmed.
+      if (ledgerOwnerIds.has(row.id)) continue;
+      releaseByUser.set(
+        row.userId,
+        (releaseByUser.get(row.userId) ?? ZERO) + row.bytes
+      );
+    }
+    for (const [userId, bytes] of releaseByUser) {
+      await releaseUserStorageBytesRaw(tx, userId, bytes);
+      totalReleased += bytes;
+    }
+
+    deletedIds = lockedRows.map((row) => row.id);
+    const deletedIdSet = new Set(deletedIds);
+    if (deletedIds.length > 0) {
+      const pendingArtifactIds = ledgerRows
+        .filter((row) => deletedIdSet.has(row.ownerId))
+        .map((row) => row.id);
+      const pending =
+        pendingArtifactIds.length > 0
+          ? await markStoredArtifactsDeletePendingInTransaction(
+              tx,
+              pendingArtifactIds
+            )
+          : [];
+      queuedArtifactCount = pending.length;
+      await tx.chatAttachment.deleteMany({
+        where: { id: { in: deletedIds } },
+      });
+    }
+
+    await options?.onDatabaseMutation?.(tx, {
+      candidateCount: toDelete.length,
+      deleted: deletedIds.length,
+      releasedBytes: Number(totalReleased),
+      queuedArtifactCount,
+      deletedIds,
+      ownerIds: [...new Set(lockedRows.map((row) => row.userId))],
+    });
+  });
+
+  const deletedIdSet = new Set(deletedIds);
+  const ledgerDeletedRows = toDelete.filter(
+    (row) => deletedIdSet.has(row.id) && ledgerOwnerIds.has(row.id)
+  );
+  const ledgerPhysicalComplete =
+    ledgerDeletedRows.length === 0 ||
+    (await deleteCloudreveAttachmentFiles(ledgerDeletedRows));
+  let ledgerReleaseComplete = true;
+  let releasedArtifactCount = 0;
+  const artifactsToRelease = ledgerRows.filter((artifact) =>
+    deletedIdSet.has(artifact.ownerId)
+  );
+  if (ledgerPhysicalComplete && artifactsToRelease.length > 0) {
+    let releasedLedgerBytes = ZERO;
+    await prisma.$transaction(async (tx) => {
+      for (const artifact of artifactsToRelease) {
+        const released = await releaseStoredArtifactInTransaction(tx, artifact.id);
+        if (released) {
+          releasedArtifactCount += 1;
+          releasedLedgerBytes += artifact.chargedBytes;
+        } else {
+          ledgerReleaseComplete = false;
+        }
+      }
+      await options?.onArtifactReleaseMutation?.(tx, {
+        artifactCount: artifactsToRelease.length,
+        releasedArtifactCount,
+        releasedBytes: Number(releasedLedgerBytes),
+      });
+    });
+    totalReleased += releasedLedgerBytes;
+  }
+
+  return {
+    deleted: deletedIds.length,
+    releasedBytes: Number(totalReleased),
+    truncated,
+    physicalDeleteComplete:
+      legacyPhysicalComplete &&
+      ledgerPhysicalComplete &&
+      ledgerReleaseComplete,
+    pendingArtifactCount: Math.max(
+      0,
+      queuedArtifactCount - releasedArtifactCount
+    ),
+  };
+}
+
 /**
- * DELETE / POST 共用的核心清理逻辑：
- *  1. 把符合条件的行拉出来（硬上限 5000，超出留给下一次或 cron），含物理路径。
- *  2. 事务外 best-effort 删 Cloudreve 物理文件（原文件 + 抽取的 .txt）。
- *  3. 在一个事务里：raw SQL clamp 释放每个用户的 storageBytesUsed + 删行。
- *
- * U6：删物理文件必须在删行前做——行一删 cloudrevePath 即永久丢失，cron 也再扫不到。
- *
- * TODO U2 合并后改用 releaseStorageBytes(userId, bytes) 替代 raw SQL。
+ * DELETE / POST 共用的核心清理逻辑。Ledger-backed paths are persisted as
+ * DELETE_PENDING before the owner row is removed; legacy paths remain on the owner row until the
+ * remote delete succeeds. The optional callback is the transaction boundary for required audit.
  */
 export async function performChatFileCleanup(input: {
   olderThanDays: number;
@@ -148,11 +339,7 @@ export async function performChatFileCleanup(input: {
   userId?: string;
   kinds: ChatFileKind[];
   conversationId?: string;
-}): Promise<{
-  deleted: number;
-  releasedBytes: number;
-  truncated: boolean;
-}> {
+}, options?: ChatFileCleanupOptions): Promise<ChatFileCleanupResult> {
   const HARD_LIMIT = 5000;
   const cutoff = olderThanDaysToCutoff(input.olderThanDays);
 
@@ -162,6 +349,7 @@ export async function performChatFileCleanup(input: {
     ...(input.kinds.length > 0 ? { kind: { in: input.kinds } } : {}),
     ...(input.conversationId ? { conversationId: input.conversationId } : {}),
     ...(input.sizeBytesGT > 0 ? { bytes: { gt: BigInt(input.sizeBytesGT) } } : {}),
+    ...({ source: 'UPLOAD' } as unknown as Prisma.ChatAttachmentWhereInput),
   };
 
   const toDelete = await prisma.chatAttachment.findMany({
@@ -178,64 +366,51 @@ export async function performChatFileCleanup(input: {
     orderBy: [{ createdAt: 'asc' }],
   });
 
-  if (toDelete.length === 0) {
-    return { deleted: 0, releasedBytes: 0, truncated: false };
-  }
+  return deleteChatFileCandidates(
+    toDelete,
+    toDelete.length === HARD_LIMIT,
+    options
+  );
+}
 
-  const ZERO = BigInt(0);
-  const ids = toDelete.map((r) => r.id);
-  let totalReleased = ZERO;
-  let deletedCount = 0;
-
-  // U6：事务外 best-effort 删 Cloudreve 物理文件（原文件 + 抽取的 .txt），再删 DB 行。
-  // 顺序刻意放在删行前：一旦行删掉，cloudrevePath 就永久丢失、cron 也再扫不到。
-  // 与 conversationCascade.ts 同一范式；失败仅内部 warn，不阻塞 DB 清理。
-  //
-  // M25/M28 复核（2026-08-22）：conversationCascade 那边存在的「快照外新增行」缺口
-  // 在这里**不成立**，因为两处的删除谓词形状不同：
-  //   - conversationCascade：`deleteMany({ conversationId })` 是**范围**谓词，
-  //     会连带删掉快照之后才插入的新附件（其路径从没进过物理删除的入参）；
-  //   - 这里：锁读与删除都是 `id IN (${ids})`，ids 就是 toDelete 的主键列表。
-  //     lockedRows ⊆ toDelete，deleteMany 的目标 ⊆ lockedRows —— 本函数**不可能**
-  //     删到快照之外的任何一行，故不存在「行被删掉但物理文件没删」的孤儿窗口。
-  // 另：cloudrevePath 建行后永不更新，快照里的路径与锁定行的路径必然一致。
-  await deleteCloudreveAttachmentFiles(toDelete);
-
-  await prisma.$transaction(async (tx) => {
-    // B8（防重复退额度）：释放口径必须是「本事务实际删除的行」，而非删除前快照 toDelete。
-    // 用 FOR UPDATE 锁定并重读仍存在的行 —— 并发的单条 DELETE /api/chat-uploads/[id] 会被行锁
-    // 阻塞到本事务提交，其后 prisma.delete 命中不到行(P2025) → 跳过它自己的 release；反之若单删
-    // 先提交，则该行已不在锁定结果里、本处也不再退。故任一行的字节至多被释放一次，杜绝与并发
-    // 单删叠加造成的 over-release（此前按快照 byUser 无条件重复退，用户被多退一份直到次日字节对账才纠正）。
-    const lockedRows = await tx.$queryRaw<
-      Array<{ id: string; userId: string; bytes: bigint }>
-    >(Prisma.sql`
-      SELECT id, userId, bytes FROM ChatAttachment
-      WHERE id IN (${Prisma.join(ids)})
-      FOR UPDATE
-    `);
-
-    const releaseByUser = new Map<string, bigint>();
-    for (const row of lockedRows) {
-      releaseByUser.set(row.userId, (releaseByUser.get(row.userId) ?? ZERO) + row.bytes);
-    }
-    for (const [userId, bytes] of releaseByUser) {
-      await releaseUserStorageBytesRaw(tx, userId, bytes);
-      totalReleased += bytes;
-    }
-
-    const existingIds = lockedRows.map((r) => r.id);
-    if (existingIds.length > 0) {
-      await tx.chatAttachment.deleteMany({ where: { id: { in: existingIds } } });
-    }
-    deletedCount = existingIds.length;
+export async function performChatFileDelete(
+  id: string,
+  options?: ChatFileCleanupOptions
+): Promise<ChatFileCleanupResult & { found: boolean; ownerId: string | null }> {
+  const row = await prisma.chatAttachment.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      userId: true,
+      bytes: true,
+      cloudrevePath: true,
+      extractedTextPath: true,
+    },
   });
-
+  if (!row) {
+    await prisma.$transaction(async (tx) => {
+      await options?.onDatabaseMutation?.(tx, {
+        candidateCount: 0,
+        deleted: 0,
+        releasedBytes: 0,
+        queuedArtifactCount: 0,
+        deletedIds: [],
+        ownerIds: [],
+      });
+    });
+    return {
+      found: false,
+      ownerId: null,
+      deleted: 0,
+      releasedBytes: 0,
+      truncated: false,
+      physicalDeleteComplete: true,
+      pendingArtifactCount: 0,
+    };
+  }
   return {
-    // 实际删除并释放的行数（并发单删已删走的行不重复计入）。
-    deleted: deletedCount,
-    releasedBytes: Number(totalReleased),
-    // 是否触达本次硬上限（用初始候选量判断，与并发无关）。
-    truncated: toDelete.length === HARD_LIMIT,
+    found: true,
+    ownerId: row.userId,
+    ...(await deleteChatFileCandidates([row], false, options)),
   };
 }

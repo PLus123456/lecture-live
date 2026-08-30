@@ -20,6 +20,7 @@ import { useI18n } from '@/lib/i18n';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
 import { useExitAnimation } from '@/hooks/useExitAnimation';
 import ThemeSwitcher from '@/components/ThemeSwitcher';
+import { toast } from '@/stores/toastStore';
 
 interface MobileDrawerProps {
   open: boolean;
@@ -226,7 +227,14 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
           <button
             onClick={async () => {
               onClose();
-              await logout();
+              const result = await logout();
+              if (!result.durableRevocation) {
+                toast.error(
+                  t('auth.logoutIncomplete'),
+                  t('auth.logoutIncompleteDescription')
+                );
+                return;
+              }
               router.replace('/login');
             }}
             className="flex w-full items-center justify-center gap-2 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-700 transition-colors hover:bg-red-100"

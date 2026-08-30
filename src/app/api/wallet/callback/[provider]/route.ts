@@ -7,6 +7,17 @@ import { getSiteSettings } from '@/lib/siteSettings';
 import { logSystemEvent } from '@/lib/auditLog';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { resolveRequestClientIp } from '@/lib/clientIp';
+import {
+  claimWebhookEvent,
+  linkPaymentProviderObjects,
+  markWebhookEventFailed,
+  markWebhookEventProcessed,
+  openPaymentReviewCase,
+  persistVerifiedWebhookEvent,
+  resolvePaymentOrderReference,
+  settleStripePendingReversal,
+  type PersistedWebhookEvent,
+} from '@/lib/payment/webhookInbox';
 
 /**
  * 支付渠道异步通知回调（公开端点，中间件放行）。鉴权由 provider.verifyCallback 的验签承担。
@@ -84,43 +95,291 @@ async function handle(req: Request, providerName: string, isBrowserGet: boolean)
     return ackResponse(provider, false, 400);
   }
 
-  // 验签通过但无需到账也无需重试的通知（微信非交易类事件等）→ 回成功 ACK 止重推（P6-13）。
-  if (result.acknowledged && !result.reversal) {
-    if (isBrowserGet) return redirectBack(await returnBase(), 'cancel');
+  // SEC-026: a verified delivery must be durable before any success ACK. The stored payload is
+  // a <=16KiB normalized projection; raw request bodies/signatures are intentionally excluded.
+  let inbox: PersistedWebhookEvent;
+  try {
+    inbox = await persistVerifiedWebhookEvent({
+      provider: providerName,
+      result,
+      rawFingerprintSource: isBrowserGet ? req.url : rawBody,
+    });
+  } catch (err) {
+    console.error('支付回调 durable inbox 写入失败:', err);
+    if (isBrowserGet) return redirectBack(await returnBase(), 'failed');
+    return ackResponse(provider, false, 500);
+  }
+  if (inbox.status === 'processed') {
+    if (isBrowserGet) {
+      return redirectBack(await returnBase(), result.paid ? 'success' : 'cancel');
+    }
     return ackResponse(provider, true, 200);
   }
+  if (!(await claimWebhookEvent(inbox))) {
+    // Another worker owns this event (or its prior claim has not reached the stale threshold).
+    // Returning failure is deliberate: ACK success before the owner commits would lose the event
+    // if that worker crashes.
+    if (isBrowserGet) return redirectBack(await returnBase(), 'failed');
+    return ackResponse(provider, false, 500);
+  }
 
-  // 退款 / 拒付 / 争议（P3-16）：冻结权益 + 告警，绝不到账。
-  if (result.reversal) {
-    const reversal = await handlePaymentReversal({
-      outTradeNo: result.outTradeNo,
+  const providerMode = result.providerMode ?? (providerName === 'sandbox' ? 'sandbox' : 'unknown');
+  const providerAccount = result.providerAccount?.trim() || 'default';
+  try {
+    const orderRef = await resolvePaymentOrderReference({
       provider: providerName,
-      rawStatus: result.rawStatus,
-      providerRef: result.providerRef,
+      providerMode,
+      providerAccount,
+      outTradeNo: result.outTradeNo,
+      objectRefs: result.objectRefs,
     });
-    if (isBrowserGet) return redirectBack(await returnBase(), 'cancel');
-    return ackResponse(provider, reversal.handled, reversal.handled ? 200 : 400);
-  }
+    if (orderRef) {
+      await linkPaymentProviderObjects({
+        provider: providerName,
+        providerMode,
+        providerAccount,
+        orderId: orderRef.id,
+        eventId: inbox.eventId,
+        objectRefs: result.objectRefs,
+      });
+    }
 
-  let credit: Awaited<ReturnType<typeof creditPaidOrder>> | null = null;
-  if (result.paid) {
-    // 传入回调渠道名（H3 绑定订单 provider）与网关实付金额（M1/M2 对账）。
-    credit = await creditPaidOrder(
-      result.outTradeNo,
-      result.providerRef,
-      providerName,
-      result.amountCents,
-      result.currency
-    );
-  }
+    const stripeLifecycleRef =
+      providerName === 'stripe'
+        ? result.objectRefs?.find(
+            (ref) => ref.objectType === 'refund' || ref.objectType === 'dispute'
+          )
+        : undefined;
 
-  if (isBrowserGet) {
-    const base = credit?.returnUrl || (await returnBase());
-    return redirectBack(base, result.paid ? 'success' : 'cancel');
-  }
+    // A signed won-dispute / failed-or-canceled-refund update may release only the hold created
+    // for that exact dp_/re_ object. Never let the generic harmless ACK path bypass correlation.
+    if (result.reversalState === 'reinstated') {
+      if (!orderRef || !stripeLifecycleRef) {
+        await openPaymentReviewCase({
+          reason: 'unresolved_reversal_resolution',
+          event: inbox,
+          orderId: orderRef?.id,
+          userId: orderRef?.userId,
+          detail: {
+            provider: providerName,
+            eventType: inbox.eventType,
+            reversalState: result.reversalState,
+            objectRefs: result.objectRefs ?? [],
+          },
+        });
+        await markWebhookEventFailed(
+          inbox.id,
+          'terminal reversal resolution did not map to its source object',
+          'review'
+        );
+        if (isBrowserGet) return redirectBack(await returnBase(), 'failed');
+        return ackResponse(provider, false, 500);
+      }
+      await settleStripePendingReversal({
+        orderId: orderRef.id,
+        userId: orderRef.userId,
+        currentEventId: inbox.id,
+        providerMode,
+        providerAccount,
+        objectType: stripeLifecycleRef.objectType as 'refund' | 'dispute',
+        objectId: stripeLifecycleRef.objectId,
+        terminalState: 'reinstated',
+      });
+      if (isBrowserGet) return redirectBack(await returnBase(), 'cancel');
+      return ackResponse(provider, true, 200);
+    }
 
-  // 真实网关：到账成功（或本就已处理）才回成功 ACK，否则回失败让网关重试。
-  return ackResponse(provider, result.paid && (credit?.ok ?? false), 200);
+    // 验签通过但无需到账的通知也必须先完成 durable inbox + typed object mapping。
+    if (result.acknowledged && !result.reversal && !result.paid) {
+      await markWebhookEventProcessed(inbox.id);
+      if (isBrowserGet) return redirectBack(await returnBase(), 'cancel');
+      return ackResponse(provider, true, 200);
+    }
+
+    // Future/unknown signed event types are not automatically harmless. Preserve them in the
+    // durable review queue and return failure so the provider retries while an operator decides
+    // whether the new type can grant/revoke value. Provider adapters set `acknowledged` only from
+    // narrow, explicit no-op allowlists.
+    if (!result.paid && !result.reversal) {
+      await openPaymentReviewCase({
+        reason: 'unknown_payment_event',
+        event: inbox,
+        orderId: orderRef?.id,
+        userId: orderRef?.userId,
+        detail: {
+          provider: providerName,
+          providerMode,
+          providerAccount,
+          eventType: inbox.eventType,
+          objectRefs: result.objectRefs ?? [],
+        },
+      });
+      await markWebhookEventFailed(
+        inbox.id,
+        'signed payment event is not in the harmless no-op allowlist',
+        'review'
+      );
+      logSystemEvent(
+        'recharge.webhook.unknown_event',
+        `provider=${providerName} eventId=${inbox.eventId} type=${inbox.eventType}`
+      );
+      if (isBrowserGet) return redirectBack(await returnBase(), 'failed');
+      return ackResponse(provider, false, 500);
+    }
+
+    // Refund/dispute events without an exact provider-scoped mapping remain in review and return
+    // failure so the gateway retries. This replaces the old warn+200 silent data loss.
+    if (result.reversal) {
+      if (!orderRef) {
+        await openPaymentReviewCase({
+          reason: 'unresolved_reversal_object',
+          event: inbox,
+          detail: {
+            provider: providerName,
+            providerMode,
+            providerAccount,
+            eventType: inbox.eventType,
+            objectRefs: result.objectRefs ?? [],
+          },
+        });
+        await markWebhookEventFailed(inbox.id, 'reversal did not map to a local order', 'review');
+        logSystemEvent(
+          'recharge.reversal.unresolved',
+          `provider=${providerName} eventId=${inbox.eventId} type=${inbox.eventType}`
+        );
+        if (isBrowserGet) return redirectBack(await returnBase(), 'failed');
+        return ackResponse(provider, false, 500);
+      }
+      const reversal = await handlePaymentReversal({
+        outTradeNo: orderRef.outTradeNo,
+        provider: providerName,
+        rawStatus: result.rawStatus,
+        providerRef: result.providerRef,
+        reversalAmountCents: result.reversalAmountCents,
+        fullReversal: result.fullReversal,
+        reversalState: result.reversalState,
+        providerMode,
+        providerAccount,
+        sourceObjectType: stripeLifecycleRef?.objectType as
+          | 'refund'
+          | 'dispute'
+          | undefined,
+        sourceObjectId: stripeLifecycleRef?.objectId,
+        occurredAt: result.occurredAt,
+        currency: result.currency,
+      });
+      if (
+        stripeLifecycleRef &&
+        result.reversalState === 'withdrawn' &&
+        (reversal.handled ||
+          reversal.outcome === 'review' ||
+          reversal.outcome === 'partial_review')
+      ) {
+        await settleStripePendingReversal({
+          orderId: orderRef.id,
+          userId: orderRef.userId,
+          currentEventId: inbox.id,
+          providerMode,
+          providerAccount,
+          objectType: stripeLifecycleRef.objectType as 'refund' | 'dispute',
+          objectId: stripeLifecycleRef.objectId,
+          terminalState: 'withdrawn',
+        });
+      }
+      if (reversal.handled) {
+        await markWebhookEventProcessed(inbox.id);
+      } else if (reversal.outcome === 'review' || reversal.outcome === 'partial_review') {
+        await openPaymentReviewCase({
+          reason:
+            result.reversalState === 'pending'
+              ? 'stripe_pending_reversal'
+              : reversal.outcome === 'partial_review'
+              ? 'partial_reversal_unsupported'
+              : 'legacy_reversal_source_unresolved',
+          event: inbox,
+          orderId: orderRef.id,
+          userId: orderRef.userId,
+          detail: {
+            provider: providerName,
+            eventType: inbox.eventType,
+            reversalAmountCents: result.reversalAmountCents ?? null,
+            fullReversal: result.fullReversal ?? null,
+            reversalState: result.reversalState ?? null,
+            currency: result.currency ?? null,
+          },
+        });
+        await markWebhookEventFailed(
+          inbox.id,
+          reversal.outcome === 'partial_review'
+            ? 'partial reversal requires administrator disposition'
+            : 'legacy reversal requires review',
+          'review'
+        );
+      } else {
+        await markWebhookEventFailed(inbox.id, `reversal outcome=${reversal.outcome}`);
+      }
+      if (isBrowserGet) return redirectBack(await returnBase(), 'cancel');
+      return ackResponse(provider, reversal.handled, reversal.handled ? 200 : 500);
+    }
+
+    let credit: Awaited<ReturnType<typeof creditPaidOrder>> | null = null;
+    if (result.paid) {
+      if (!orderRef) {
+        await openPaymentReviewCase({
+          reason: 'unresolved_paid_object',
+          event: inbox,
+          detail: { provider: providerName, eventType: inbox.eventType },
+        });
+        await markWebhookEventFailed(inbox.id, 'paid event did not map to a local order', 'review');
+        if (isBrowserGet) return redirectBack(await returnBase(), 'failed');
+        return ackResponse(provider, false, 500);
+      }
+      // 传入回调渠道名（H3 绑定订单 provider）与网关实付金额（M1/M2 对账）。
+      credit = await creditPaidOrder(
+        orderRef.outTradeNo,
+        result.providerRef,
+        providerName,
+        result.amountCents,
+        result.currency,
+        result.occurredAt
+      );
+      if (credit.ok) {
+        await markWebhookEventProcessed(inbox.id);
+      } else if (credit.acknowledged) {
+        await openPaymentReviewCase({
+          reason: credit.status === 'late_paid' ? 'payment_after_expiry' : 'payment_review',
+          event: inbox,
+          orderId: orderRef.id,
+          userId: orderRef.userId,
+          detail: { status: credit.status ?? null },
+        });
+        await markWebhookEventProcessed(inbox.id);
+      } else {
+        await openPaymentReviewCase({
+          reason: 'payment_credit_rejected',
+          event: inbox,
+          orderId: orderRef.id,
+          userId: orderRef.userId,
+          detail: { status: credit.status ?? null },
+        });
+        await markWebhookEventFailed(inbox.id, 'payment credit rejected', 'review');
+      }
+    }
+
+    if (isBrowserGet) {
+      const base = credit?.returnUrl || (await returnBase());
+      return redirectBack(base, result.paid && (credit?.ok ?? false) ? 'success' : 'cancel');
+    }
+
+    // 真实网关：到账成功（或 durable no-op）才回成功 ACK，否则回失败让网关重试。
+    const ok = credit?.ok === true || credit?.acknowledged === true;
+    return ackResponse(provider, ok, ok ? 200 : 500);
+  } catch (err) {
+    await markWebhookEventFailed(inbox.id, err).catch(() => undefined);
+    console.error('支付回调处理失败:', err);
+    if (isBrowserGet) return redirectBack(await returnBase(), 'failed');
+    return ackResponse(provider, false, 500);
+  }
 }
 
 /**

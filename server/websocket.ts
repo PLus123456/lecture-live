@@ -5,7 +5,10 @@ import { createServer } from 'http';
 import { Server as SocketIO, Socket } from 'socket.io';
 import { setupLiveShare } from '../src/lib/liveShare/server';
 import { handleLiveShareInternalRequest } from '../src/lib/liveShare/internalHttp';
-import { getTrustedForwardedIp, shouldTrustProxyHeaders } from '../src/lib/clientIp';
+import {
+  resolveSocketClientIp,
+  validateTrustedProxyConfiguration,
+} from '../src/lib/clientIp';
 import {
   startBillingMaintenanceLoop,
   stopBillingMaintenanceLoop,
@@ -33,6 +36,10 @@ const MAX_CONNECTIONS_PER_IP = 50;
 // socket.io 帧头余量）。**改这里必须同步改那里**，两边脱钩就会重演直播死循环。
 const MAX_MESSAGE_SIZE_BYTES = 100 * 1024;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
+
+// 拓扑配置在监听端口前校验；多跳却没配 CIDR、非法 hop 等错误必须让进程启动失败，
+// 不能悄悄退化成所有 nginx 客户端共用 127.0.0.1 一个连接桶。
+const trustedProxyConfig = validateTrustedProxyConfiguration();
 
 // 每 socket 消息限流（令牌桶）：限制单个已认证 socket 的入站消息频率，
 // 防止被盗号/异常客户端用 broadcast / sync_snapshot 等消息洪泛打爆独立 WS 进程。
@@ -73,25 +80,13 @@ const wsLogger = logger.child({ component: 'websocket-server' });
 let isShuttingDown = false;
 
 function resolveClientIp(socket: Socket) {
-  if (shouldTrustProxyHeaders()) {
-    // 安全：优先 X-Real-IP（nginx 设为 $remote_addr，不可被客户端伪造），再回退
-    // X-Forwarded-For 最后一段。最左段是客户端可伪造的，不能用于每 IP 连接上限/限流。
-    const realIp = socket.handshake.headers['x-real-ip'];
-    if (typeof realIp === 'string' && realIp.trim()) {
-      return realIp.trim();
-    }
-
-    const forwardedFor = socket.handshake.headers['x-forwarded-for'];
-    const forwardedIp =
-      typeof forwardedFor === 'string'
-        ? getTrustedForwardedIp(forwardedFor)
-        : null;
-    if (forwardedIp) {
-      return forwardedIp;
-    }
-  }
-
-  return socket.handshake.address?.trim() || 'unknown';
+  const forwardedFor = socket.handshake.headers['x-forwarded-for'];
+  const realIp = socket.handshake.headers['x-real-ip'];
+  return resolveSocketClientIp({
+    peerIp: socket.handshake.address,
+    forwardedFor: typeof forwardedFor === 'string' ? forwardedFor : null,
+    realIp: typeof realIp === 'string' ? realIp : null,
+  });
 }
 
 function incrementConnectionCount(ip: string) {
@@ -151,6 +146,16 @@ io.use((socket, next) => {
   }
 
   const clientIp = resolveClientIp(socket);
+  if (clientIp === 'unknown') {
+    wsLogger.warn(
+      {
+        peerIp: socket.handshake.address,
+        trustedProxyHops: trustedProxyConfig.hops,
+      },
+      'Rejected websocket connection because client IP could not be verified'
+    );
+    return next(new Error('Client IP unavailable'));
+  }
   const currentConnections = connectionsByIp.get(clientIp) ?? 0;
 
   if (currentConnections >= MAX_CONNECTIONS_PER_IP) {
@@ -230,7 +235,15 @@ startDocTranslateLoop();
 const HOST = process.env.WS_HOST || '0.0.0.0';
 
 httpServer.listen(PORT, HOST, () => {
-  wsLogger.info({ port: PORT, host: HOST }, 'WebSocket server listening');
+  wsLogger.info(
+    {
+      port: PORT,
+      host: HOST,
+      trustedProxyHops: trustedProxyConfig.hops,
+      trustedProxyCidrs: trustedProxyConfig.cidrs,
+    },
+    'WebSocket server listening'
+  );
 });
 
 async function shutdown(signal: string) {

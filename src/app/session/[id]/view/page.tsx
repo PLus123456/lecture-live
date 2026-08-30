@@ -19,6 +19,11 @@ import { useSummaryStore } from '@/stores/summaryStore';
 import { useSharedLinksStore } from '@/stores/sharedLinksStore';
 import { useTranslationStore } from '@/stores/translationStore';
 import { useViewerSettingsStore } from '@/stores/viewerSettingsStore';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
 import { SettingsToggle, SettingsDrawer } from '@/components/viewer/ViewerSettingsPanel';
 import LiveShareBadge from '@/components/session/LiveShareBadge';
 import { ViewerTranscriptPanel } from './ViewerTranscriptPanel';
@@ -577,18 +582,24 @@ export default function ViewerPage() {
     clearTranscript();
     clearSummaries();
     clearTranslations();
+    const expected = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
+    let disposed = false;
+    const commitViewerUpdate = (update: () => void) =>
+      runAuthBoundaryCommit(expected, () => {
+        if (disposed || ownerSignal.aborted) return false;
+        update();
+        return true;
+      });
 
-    // M1：socket 是在 fetch 的 .then() 里才建的，而 React 的 cleanup 只会在**卸载
-    // 那一刻**跑一次 leaveAsViewer()——此时 viewerInstance 还是 null，是个空操作；
-    // 随后迟到的 .then() 照常 joinAsViewer，建出的 socket 再也没有任何代码路径断得掉
-    // （viewerInstance 是模块级单例，跟着整个 SPA 生命周期活着），永久计入服务端
-    // viewer_count。用 cancelled 闸门：resolve 之后一律先复查归属，已卸载就什么都不做。
-    let cancelled = false;
-
-    fetch(`/api/share/view/${encodeURIComponent(shareToken)}`)
-      .then((r) => r.json())
-      .then((data) => {
-        if (cancelled) return;
+    void (async () => {
+      try {
+        const response = await fetch(
+          `/api/share/view/${encodeURIComponent(shareToken)}`,
+          { signal: ownerSignal }
+        );
+        const data = await response.json();
+        const committed = await commitViewerUpdate(() => {
         if (data.error) {
           setError(data.error);
           setLoading(false);
@@ -639,76 +650,53 @@ export default function ViewerPage() {
           // （Wi-Fi 切换）在服务端有 15s 宽限，重连后 'connect' 会重新 join 并拿到
           // 全量 initial_state（C6），把内容清掉纯属自找闪烁。
           onConnectionChange: (state, info) => {
-            if (cancelled) return;
-            setConnectionState(state);
-            if (state !== 'closed') return;
+            // 归属闸门与其余回调一致：本页已卸载 / 账号边界已变时一律不落状态。
+            void commitViewerUpdate(() => {
+              setConnectionState(state);
+              if (state !== 'closed') return;
 
-            // 终态：服务端主动踢（撤销/过期驱逐、优雅关停强断）或握手被拒。
-            setLoading(false);
-            // 录制正常结束（SHARE_OFFLINE 已把页面切成静态完成态）后的静默断开
-            // 不是错误，别把已经好好的完成视图盖成错误页（transition 模式就是静默断）。
-            if (isCompletedRef.current) return;
-            setError(
-              (prev) => prev ?? (info?.message || t('viewer.loadSessionFailed'))
-            );
+              // 终态：服务端主动踢（撤销/过期驱逐、优雅关停强断）或握手被拒。
+              setLoading(false);
+              // 录制正常结束（SHARE_OFFLINE 已把页面切成静态完成态）后的静默断开
+              // 不是错误，别把已经好好的完成视图盖成错误页（transition 模式就是静默断）。
+              if (isCompletedRef.current) return;
+              setError(
+                (prev) => prev ?? (info?.message || t('viewer.loadSessionFailed'))
+              );
+            });
           },
           onInitialState: (snapshot) => {
-            // C6：每次 socket.io 自动重连都会重新 emit join → 服务端重发全量快照，
-            // 而 addFinalSegment/addBlock 按 id 追加不去重，盲目重填会让转录/摘要
-            // 成倍复制。重填前先清空三个 store，保证快照即为当前全量、无重复。
-            clearTranscript();
-            clearSummaries();
-            clearTranslations();
-            if (snapshot.segments) {
-              (snapshot.segments as TranscriptSegment[]).forEach(addFinalSegment);
-            }
-            if (snapshot.translations) {
-              Object.entries(snapshot.translations).forEach(([segmentId, translation]) => {
-                setTranslation(segmentId, translation);
-              });
-            }
-            if (snapshot.summaryBlocks) {
-              (snapshot.summaryBlocks as SummaryBlock[]).forEach(addBlock);
-            }
-            // 恢复当前预览文本
-            if (snapshot.previewText) {
-              updatePreview(snapshot.previewText);
-            }
-            if (snapshot.previewTranslation) {
-              updatePreviewTranslation(snapshot.previewTranslation);
-            }
-            // H1：主播端/服务端截断过 backlog 时明确告知观众，别让残缺历史冒充完整。
-            setBacklogTruncated(snapshot.truncated === true);
-            setLoading(false);
+            void commitViewerUpdate(() => {
+              // C6：每次 socket.io 自动重连都会重新 emit join → 服务端重发全量快照，
+              // 而 addFinalSegment/addBlock 按 id 追加不去重，盲目重填会让转录/摘要
+              // 成倍复制。重填前先清空三个 store，保证快照即为当前全量、无重复。
+              clearTranscript();
+              clearSummaries();
+              clearTranslations();
+              if (snapshot.segments) {
+                (snapshot.segments as TranscriptSegment[]).forEach(addFinalSegment);
+              }
+              if (snapshot.translations) {
+                Object.entries(snapshot.translations).forEach(([segmentId, translation]) => {
+                  setTranslation(segmentId, translation);
+                });
+              }
+              if (snapshot.summaryBlocks) {
+                (snapshot.summaryBlocks as SummaryBlock[]).forEach(addBlock);
+              }
+              // 恢复当前预览文本
+              if (snapshot.previewText) updatePreview(snapshot.previewText);
+              if (snapshot.previewTranslation) {
+                updatePreviewTranslation(snapshot.previewTranslation);
+              }
+              // H1：主播端/服务端截断过 backlog 时明确告知观众，别让残缺历史冒充完整。
+              setBacklogTruncated(snapshot.truncated === true);
+              setLoading(false);
+            });
           },
           onTranscriptDelta: (delta) => {
-            // 新段落到达时清空预览（该段落已从预览变为正式段落）
-            updatePreview({ finalText: '', nonFinalText: '' });
-            updatePreviewTranslation({
-              finalText: '',
-              nonFinalText: '',
-              state: 'idle',
-              sourceLanguage: null,
-            });
-            addFinalSegment(delta as TranscriptSegment);
-          },
-          onTranslationDelta: ({ segmentId, translation }) => {
-            setTranslation(segmentId, translation);
-          },
-          onSummaryUpdate: (block) => {
-            addBlock(block as SummaryBlock);
-          },
-          onStatusUpdate: ({ status: newStatus }) => {
-            if (cancelled) return;
-            if (newStatus === 'SERVER_SHUTDOWN') {
-              // M2：WS 进程优雅关停会向所有 socket 广播这条（server/websocket.ts），
-              // 此前全仓零消费。它不代表直播结束，只代表「本次连接即将中断」——
-              // 进程重启后 socket.io 会自动重连，所以只提示、不切静态完成态。
-              setConnectionState('reconnecting');
-              return;
-            }
-            if (newStatus === 'SHARE_OFFLINE' || newStatus === 'COMPLETED') {
-              // 录制结束：清空预览，切换到静态模式
+            void commitViewerUpdate(() => {
+              // 新段落到达时清空预览（该段落已从预览变为正式段落）
               updatePreview({ finalText: '', nonFinalText: '' });
               updatePreviewTranslation({
                 finalText: '',
@@ -716,37 +704,78 @@ export default function ViewerPage() {
                 state: 'idle',
                 sourceLanguage: null,
               });
-              isCompletedRef.current = true;
-              setIsCompleted(true);
-              setSessionInfo((prev) => prev ? { ...prev, status: newStatus } : prev);
-            } else if (newStatus === 'SHARE_LIVE') {
-              // C3：主播瞬断（Wi-Fi 切换 / ping 超时）后重连成功，服务端广播 SHARE_LIVE。
-              // 观众自身 socket 通常并未断开、内存快照仍在，只是此前可能因误报的
-              // SHARE_OFFLINE 被单向锁成静态完成态——这里解锁回实时视图，后续增量继续渲染。
-              isCompletedRef.current = false;
-              setIsCompleted(false);
-              setSessionInfo((prev) => prev ? { ...prev, status: 'LIVE' } : prev);
-            }
+              addFinalSegment(delta as TranscriptSegment);
+            });
+          },
+          onTranslationDelta: ({ segmentId, translation }) => {
+            void commitViewerUpdate(() => setTranslation(segmentId, translation));
+          },
+          onSummaryUpdate: (block) => {
+            void commitViewerUpdate(() => addBlock(block as SummaryBlock));
+          },
+          onStatusUpdate: ({ status: newStatus }) => {
+            void commitViewerUpdate(() => {
+              if (newStatus === 'SERVER_SHUTDOWN') {
+                // M2：WS 进程优雅关停会向所有 socket 广播这条（server/websocket.ts）。
+                // 它不代表直播结束，只代表「本次连接即将中断」——进程重启后 socket.io
+                // 会自动重连，所以只提示、不切静态完成态。
+                setConnectionState('reconnecting');
+                return;
+              }
+              if (newStatus === 'SHARE_OFFLINE' || newStatus === 'COMPLETED') {
+                // 录制结束：清空预览，切换到静态模式
+                updatePreview({ finalText: '', nonFinalText: '' });
+                updatePreviewTranslation({
+                  finalText: '',
+                  nonFinalText: '',
+                  state: 'idle',
+                  sourceLanguage: null,
+                });
+                isCompletedRef.current = true;
+                setIsCompleted(true);
+                setSessionInfo((prev) => prev ? { ...prev, status: newStatus } : prev);
+              } else if (newStatus === 'SHARE_LIVE') {
+                // C3：主播瞬断（Wi-Fi 切换 / ping 超时）后重连成功，服务端广播 SHARE_LIVE。
+                // 观众自身 socket 通常并未断开、内存快照仍在，只是此前可能因误报的
+                // SHARE_OFFLINE 被单向锁成静态完成态——这里解锁回实时视图。
+                isCompletedRef.current = false;
+                setIsCompleted(false);
+                setSessionInfo((prev) => prev ? { ...prev, status: 'LIVE' } : prev);
+              }
+            });
           },
           onPreviewUpdate: ({ previewText, previewTranslation }) => {
-            updatePreview(previewText);
-            updatePreviewTranslation(previewTranslation);
+            void commitViewerUpdate(() => {
+              updatePreview(previewText);
+              updatePreviewTranslation(previewTranslation);
+            });
           },
           onError: (err) => {
-            if (cancelled) return;
-            setError(err.message);
-            setLoading(false);
+            void commitViewerUpdate(() => {
+              setError(err.message);
+              setLoading(false);
+            });
           },
         });
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setError(t('viewer.loadSessionFailed'));
-        setLoading(false);
-      });
+        });
+        if (!committed.committed || !committed.value) return;
+      } catch (error) {
+        if (
+          disposed ||
+          ownerSignal.aborted ||
+          (error instanceof DOMException && error.name === 'AbortError')
+        ) {
+          return;
+        }
+        await commitViewerUpdate(() => {
+          setError(t('viewer.loadSessionFailed'));
+          setLoading(false);
+        });
+      }
+    })();
 
     return () => {
-      cancelled = true;
+      disposed = true;
       leaveAsViewer();
       clearTranscript();
       clearSummaries();

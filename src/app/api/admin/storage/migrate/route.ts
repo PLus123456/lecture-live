@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import { migrateLocalToCloudreve } from '@/lib/storage/migration';
 import { trackJob, JOB_TYPE } from '@/lib/jobQueue';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 // 手动触发本地 → Cloudreve 迁移
 export async function POST(req: Request) {
@@ -11,18 +11,57 @@ export async function POST(req: Request) {
     limit: 3,
     windowMs: 10 * 60_000,
   });
-  if (response) return response;
-
-  logAction(req, 'admin.storage.migrate', {
-    user: admin,
-    detail: '手动触发存储迁移：本地 → Cloudreve',
-  });
+  if (response || !admin) return response!;
 
   try {
     const result = await trackJob(
       {
         type: JOB_TYPE.STORAGE_MIGRATION,
-        triggeredBy: `admin:${admin!.id}`,
+        triggeredBy: `admin:${admin.id}`,
+        params: { direction: 'local_to_cloudreve' },
+        resultSummary: (value) => ({
+          migratedCount: value.migratedCount,
+          skippedCount: value.skippedCount,
+          errorCount: value.errorCount,
+        }),
+        errorSummary: (error) =>
+          error instanceof Error ? error.name : 'UnknownError',
+        terminalMutation: async (tx, terminal) => {
+          const completed = terminal.status === 'SUCCESS' ? terminal.result : null;
+          const errorClass =
+            terminal.status === 'FAILED'
+              ? terminal.error instanceof Error
+                ? terminal.error.name
+                : 'UnknownError'
+              : undefined;
+          await writeSecurityAudit(
+            req,
+            {
+              event: 'storage.migrate',
+              operator: { id: admin.id, email: admin.email, role: admin.role },
+              target: { type: 'storage_backend', id: 'global' },
+              before: { backend: 'local' },
+              after: completed
+                ? {
+                    backend: 'cloudreve',
+                    migratedCount: completed.migratedCount,
+                    skippedCount: completed.skippedCount,
+                    errorCount: completed.errorCount,
+                  }
+                : undefined,
+              reason: 'admin_manual_migration',
+              outcome: !completed
+                ? 'FAILED'
+                : completed.errorCount > 0
+                  ? 'PARTIAL'
+                  : 'SUCCESS',
+              metadata: completed
+                ? undefined
+                : { errorClass: errorClass ?? 'UnknownError' },
+            },
+            tx
+          );
+        },
       },
       () => migrateLocalToCloudreve(),
     );

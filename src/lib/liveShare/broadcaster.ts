@@ -28,11 +28,55 @@ export type BroadcasterConnectionState = 'connected' | 'reconnecting' | 'closed'
 
 interface BroadcasterCallbacks {
   onViewerCount?: (count: number) => void;
-  onError?: (error: { message: string }) => void;
+  // code 供主播端的 strict 重握手判定（BROADCASTER_AUTH_LEAF_EXPIRED）使用。
+  onError?: (error: { message: string; code?: string }) => void;
   onConnectionChange?: (
     state: BroadcasterConnectionState,
     info?: { reason?: string; message?: string }
   ) => void;
+}
+
+export interface LiveBroadcasterAuthState {
+  token: string | null;
+  epoch: number;
+  userId: string | null;
+  sessionBinding: string | null;
+}
+
+interface BroadcasterReauthOptions {
+  initial: LiveBroadcasterAuthState;
+  getCurrent: () => LiveBroadcasterAuthState;
+}
+
+const BROADCASTER_AUTH_LEAF_EXPIRED = 'BROADCASTER_AUTH_LEAF_EXPIRED';
+
+function hasSameAuthBoundary(
+  initial: LiveBroadcasterAuthState,
+  current: LiveBroadcasterAuthState
+): boolean {
+  return (
+    initial.epoch === current.epoch &&
+    initial.userId !== null &&
+    initial.userId === current.userId &&
+    initial.sessionBinding === current.sessionBinding
+  );
+}
+
+/**
+ * 这里只决定“是否值得发起一次新 strict 握手”，不授予任何权限。最终仍由服务端用
+ * 当前 Cookie 的 current leaf 完整鉴权；generic revoke、登出和账号切换从不走此路径。
+ */
+export function shouldStrictlyReauthenticateBroadcaster(
+  errorCode: string | undefined,
+  initial: LiveBroadcasterAuthState,
+  current: LiveBroadcasterAuthState
+): boolean {
+  return (
+    errorCode === BROADCASTER_AUTH_LEAF_EXPIRED &&
+    typeof current.token === 'string' &&
+    current.token.length > 0 &&
+    hasSameAuthBoundary(initial, current)
+  );
 }
 
 interface SnapshotPayload {
@@ -64,6 +108,11 @@ export class LiveBroadcaster {
   // 保险，也是**重连后**对齐服务端的唯一手段（重连的 socket 没有首帧快照）。
   // 关键：增量必须折回本字段，否则补发的是开分享瞬间的旧态（见 foldIntoSnapshot）。
   private lastSnapshot: SnapshotPayload | null = null;
+  private pendingStrictReauth = false;
+  private intentionallyDisconnected = false;
+  /** strict 重握手已经发起、正在等新连接。此时的断连不是终态，别让 M2 的连接态
+   *  上报把它当成「直播被掐断」而触发调用方撤链。 */
+  private strictReauthInFlight = false;
   /** M2：调用方主动 disconnect() 之后不再上报任何连接态（否则会把「正常停播」
    *  误报成 closed，进而触发调用方的撤链兜底，把 keepForPlayback 的回放链接撤掉）。 */
   private closedByCaller = false;
@@ -76,6 +125,7 @@ export class LiveBroadcaster {
       token: string;
       shareToken: string;
       callbacks?: BroadcasterCallbacks;
+      reauth?: BroadcasterReauthOptions;
     }
   ) {
     this.sessionId = options.sessionId;
@@ -94,6 +144,7 @@ export class LiveBroadcaster {
     // H1：补发走分块路径 —— 原来这里是无条件 emit 整份快照，快照一超 100KB 就被
     // 传输层以 1009 杀连接、客户端自动重连、再补发同一份，构成永久死循环。
     this.socket.on('connect', () => {
+      this.strictReauthInFlight = false;
       this.clearReconnectDeadline();
       this.reportConnection('connected');
       if (this.lastSnapshot) {
@@ -104,8 +155,63 @@ export class LiveBroadcaster {
     this.socket.on('viewer_count', (payload: { count: number }) => {
       this.callbacks?.onViewerCount?.(payload.count);
     });
-    this.socket.on('share_error', (error: { message: string }) => {
-      this.callbacks?.onError?.(error);
+    this.socket.on('share_error', (error: { message: string; code?: string }) => {
+      const currentAuth = options.reauth?.getCurrent();
+      if (
+        options.reauth &&
+        currentAuth &&
+        shouldStrictlyReauthenticateBroadcaster(
+          error.code,
+          options.reauth.initial,
+          currentAuth
+        )
+      ) {
+        // 服务端会紧接着发 `io server disconnect`。在 disconnect 前调用 connect 是
+        // no-op，所以这里只挂一次意图，真正重握手放到下面的 disconnect handler。
+        this.pendingStrictReauth = true;
+        return;
+      }
+      this.pendingStrictReauth = false;
+      options.callbacks?.onError?.(error);
+    });
+
+    this.socket.on('disconnect', (reason) => {
+      if (
+        reason !== 'io server disconnect' ||
+        !this.pendingStrictReauth ||
+        this.intentionallyDisconnected ||
+        !options.reauth
+      ) {
+        this.pendingStrictReauth = false;
+        this.reportDisconnect(reason);
+        return;
+      }
+
+      const currentAuth = options.reauth.getCurrent();
+      this.pendingStrictReauth = false;
+      if (
+        !shouldStrictlyReauthenticateBroadcaster(
+          BROADCASTER_AUTH_LEAF_EXPIRED,
+          options.reauth.initial,
+          currentAuth
+        )
+      ) {
+        this.reportDisconnect(reason);
+        return;
+      }
+
+      // token 通常仍是 __cookie_session__ sentinel；新权限来自浏览器此刻携带的最新
+      // HttpOnly Cookie。更新 auth 后显式 connect，服务端必须重新走 strict current leaf。
+      const auth = this.socket.auth;
+      this.socket.auth = {
+        ...(auth && typeof auth === 'object' ? auth : {}),
+        token: currentAuth.token,
+      };
+      this.strictReauthInFlight = true;
+      this.socket.connect();
+      // 重握手已发起：连接会自己回来，报重连而非终态，别让调用方的兜底把直播撤掉。
+      this.reportConnection('reconnecting', { reason: 'auth_refresh' });
+      this.armReconnectDeadline();
     });
 
     // M2：服务端优雅关停会向所有 socket 广播 SERVER_SHUTDOWN（server/websocket.ts）。
@@ -124,17 +230,6 @@ export class LiveBroadcaster {
     // 服务端 disconnect(true)/踢人 → active=false，客户端不会自动重连 → 终态；
     // 传输层抖动/WS 进程重启 → active=true，进入自动重连 → 只报 reconnecting，
     // 并起一个 deadline 兜底，避免无限「重连中」把 UI 永久钉在直播态。
-    this.socket.on('disconnect', (reason: string) => {
-      if (this.closedByCaller) return;
-      if (this.socket.active) {
-        this.reportConnection('reconnecting', { reason });
-        this.armReconnectDeadline();
-        return;
-      }
-      this.clearReconnectDeadline();
-      this.reportConnection('closed', { reason });
-    });
-
     // M2：连接错误。同样用 active 区分「还在退避重试」与「握手被中间件拒了」
     // （Origin 不允许 / 每 IP 连接数上限 —— server/websocket.ts 的 io.use）。
     this.socket.on('connect_error', (error: Error) => {
@@ -147,6 +242,27 @@ export class LiveBroadcaster {
       this.clearReconnectDeadline();
       this.reportConnection('closed', { message: error?.message });
     });
+  }
+
+  /**
+   * M2：底层断连的连接态上报。socket.active 是 socket.io-client 4.x 判定「还会不会自己
+   * 回来」的权威标志（socket.js：destroy() 清掉 subs 之后 active===false）：
+   * 服务端 disconnect(true)/踢人 → active=false，客户端不会自动重连 → 终态；
+   * 传输层抖动/WS 进程重启 → active=true，进入自动重连 → 只报 reconnecting，并起一个
+   * deadline 兜底，避免无限「重连中」把 UI 永久钉在直播态。
+   *
+   * 刻意与上面 strict 重握手共用**同一个** disconnect 监听：两者是同一条断连的两个动作，
+   * 分成两个 socket.on 会让行为依赖注册顺序（也让只保留一个 handler 的测试桩看不见前者）。
+   */
+  private reportDisconnect(reason: string) {
+    if (this.closedByCaller) return;
+    if (this.socket.active) {
+      this.reportConnection('reconnecting', { reason });
+      this.armReconnectDeadline();
+      return;
+    }
+    this.clearReconnectDeadline();
+    this.reportConnection('closed', { reason });
   }
 
   private reportConnection(
@@ -258,17 +374,16 @@ export class LiveBroadcaster {
     mutate(this.lastSnapshot);
   }
 
-  broadcastTranscriptDelta(delta: Partial<TranscriptSegment>) {
+  broadcastTranscriptDelta(delta: TranscriptSegment) {
     this.foldIntoSnapshot((snapshot) => {
-      const id = delta.id;
-      const index = id
-        ? snapshot.segments.findIndex((segment) => segment.id === id)
-        : -1;
+      const index = snapshot.segments.findIndex(
+        (segment) => segment.id === delta.id
+      );
       if (index === -1) {
-        snapshot.segments = [...snapshot.segments, delta as TranscriptSegment];
+        snapshot.segments = [...snapshot.segments, delta];
       } else {
         snapshot.segments = snapshot.segments.map((segment, i) =>
-          i === index ? (delta as TranscriptSegment) : segment
+          i === index ? delta : segment
         );
       }
     });
@@ -386,6 +501,9 @@ export class LiveBroadcaster {
   }
 
   disconnect() {
+    this.intentionallyDisconnected = true;
+    this.pendingStrictReauth = false;
+    this.strictReauthInFlight = false;
     this.closedByCaller = true;
     this.clearReconnectDeadline();
     this.socket.disconnect();

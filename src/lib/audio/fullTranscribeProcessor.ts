@@ -1,16 +1,19 @@
 /**
- * 完整版补全转录的后台处理管线（平行于 asyncUploadProcessor，但源是「会话已存的完整音频」）。
+ * 完整版补全转录后台管线。
  *
- * 与 async-upload 完全独立：读会话已有 recordingPath 的完整音频（含断网续采段）→ 转码 MP3 →
- * 上传 Soniox → 建异步转录任务，全程用 fullTranscribeStatus 状态机，**不动**任何实时录音产物。
- * 状态机：pending → transcoding → transcribing → (finalize) → completed / failed
+ * 路由已在读取录音前取得 durable claim，并把本地 path 或单次有界下载得到的 temp path 交给
+ * 本管线。这里绝不再次从 recordingPath 下载/整包 readFile，避免同一任务的双重 I/O 与 heap 放大。
  */
 import path from 'path';
 import fs from 'fs/promises';
 import { prisma } from '@/lib/prisma';
 import { logger } from '@/lib/logger';
-import { probeDurationSec, transcodeToMp3, validateMediaContainer } from '@/lib/audio/ffmpegTranscode';
-import { loadSessionAudioArtifact } from '@/lib/sessionPersistence';
+import {
+  probeDurationSec,
+  transcodeToMp3,
+  validateMediaContainer,
+} from '@/lib/audio/ffmpegTranscode';
+import type { PreparedFullTranscribeInput } from '@/lib/audio/fullTranscribeInput';
 import { resolveAndPersistTaskRegion } from '@/lib/soniox/env';
 import {
   uploadSonioxFile,
@@ -18,86 +21,101 @@ import {
   deleteSonioxFile,
   deleteSonioxTranscription,
 } from '@/lib/soniox/asyncFile';
-import { settleFullReservation } from '@/lib/quota';
+import { failFullTranscribeAttempt } from '@/lib/audio/fullTranscribeAdmission';
 
 const SONIOX_MAX_DURATION_SEC = 300 * 60;
-const TMP_ROOT = path.join(process.cwd(), 'data', 'full-transcribe-tmp');
 
 class PipelineHaltError extends Error {
   constructor() {
-    super('Full transcribe halted: session no longer in active state');
+    super('Full transcribe halted: claim is no longer active');
     this.name = 'PipelineHaltError';
   }
 }
 
-/**
- * 条件原子状态推进：仅当 fullTranscribeStatus ∈ allowedFrom 时才写 next。抢不到（被取消/
- * 重置）返回 false，调用方 halt。避免与用户取消 / 并发触发竞态。
- */
+export interface FullTranscribeProcessRequest {
+  sessionId: string;
+  claimId: string;
+  input: PreparedFullTranscribeInput;
+  authoritativeDurationMs: number;
+}
+
+/** Every transition is bound to the attempt id so a stale worker cannot mutate a retrigger. */
 async function setFullStatus(
   sessionId: string,
+  claimId: string,
   next: string,
   allowedFrom: string[],
   extra?: Record<string, unknown>
 ): Promise<boolean> {
   const res = await prisma.session.updateMany({
-    where: { id: sessionId, fullTranscribeStatus: { in: allowedFrom } },
+    where: {
+      id: sessionId,
+      fullTranscribeClaimId: claimId,
+      fullTranscribeStatus: { in: allowedFrom },
+    },
     data: { fullTranscribeStatus: next, ...(extra ?? {}) },
   });
   return res.count === 1;
 }
 
 /**
- * fire-and-forget 后台处理。由触发路由 claim 到 'pending' 之后调用（不阻塞响应）。
- * 任何步骤失败 → 标 failed + 记录 error；被取消（claim 抢不到）→ 静默 halt。
+ * Fire-and-forget processing after the trigger route has claimed, measured, and reserved quota.
+ * All terminal paths remove only this claim's work directory. Any processing failure marks this
+ * attempt failed and releases its registered reservation exactly once.
  */
-export async function processFullTranscribe(sessionId: string): Promise<void> {
-  const session = await prisma.session.findUnique({ where: { id: sessionId } });
-  if (!session) return;
-
-  const tmpDir = path.join(TMP_ROOT, sessionId.replace(/[^a-zA-Z0-9_-]/g, ''));
+export async function processFullTranscribe(
+  request: FullTranscribeProcessRequest
+): Promise<void> {
+  const { sessionId, claimId, input, authoritativeDurationMs } = request;
   let uploadedFileId: string | null = null;
-  // P5-18：已创建但尚未写进 DB 的 transcription 也要在失败路径清掉（DB 里没有 ID，cron 回收扫不到）。
   let createdTranscriptionId: string | null = null;
   let sonioxConfig: Awaited<ReturnType<typeof resolveAndPersistTaskRegion>> | null = null;
 
   try {
-    // pending → transcoding
-    if (!(await setFullStatus(sessionId, 'transcoding', ['pending']))) {
+    const session = await prisma.session.findUnique({ where: { id: sessionId } });
+    if (!session || session.fullTranscribeClaimId !== claimId) {
       throw new PipelineHaltError();
     }
 
-    // 读会话完整音频（含断网续采段）
-    const audio = await loadSessionAudioArtifact(session);
-    if (!audio || audio.data.length === 0) {
-      throw new Error('Session recording not found or empty');
+    if (!(await setFullStatus(sessionId, claimId, 'transcoding', ['pending']))) {
+      throw new PipelineHaltError();
     }
 
-    await fs.mkdir(tmpDir, { recursive: true });
-    const inputPath = path.join(tmpDir, audio.fileName || 'input.webm');
-    await fs.writeFile(inputPath, audio.data);
-
-    // 容器安全校验（P1-11）：交给 ffprobe/ffmpeg 前先做魔数 + demuxer 白名单，拒 playlist /
-    // 外部引用。会话音频虽由本系统产出，但引用可能来自 Cloudreve/历史数据，仍统一过闸。
-    await validateMediaContainer(inputPath);
-
-    const inputDurationSec = await probeDurationSec(inputPath);
+    if (!Number.isFinite(authoritativeDurationMs) || authoritativeDurationMs <= 0) {
+      throw new Error('Authoritative recording duration is missing');
+    }
+    const inputDurationSec = authoritativeDurationMs / 1000;
     if (inputDurationSec > SONIOX_MAX_DURATION_SEC) {
       throw new Error(
         `Duration ${Math.round(inputDurationSec / 60)} min exceeds Soniox 300-min limit`
       );
     }
 
-    // 转码 MP3（流式 WebM 容器头常缺时长，转码后以 MP3 probe 为权威）
-    const mp3Path = path.join(tmpDir, 'audio.mp3');
-    await transcodeToMp3({
-      inputPath,
+    await fs.mkdir(input.workDir, { recursive: true });
+    // Revalidate immediately before ffmpeg. The route already did this during authoritative
+    // measurement; the second check is cheap defense against a local artifact changing in between.
+    await validateMediaContainer(input.inputPath);
+
+    const mp3Path = path.join(input.workDir, 'audio.mp3');
+    const transcodeResult = await transcodeToMp3({
+      inputPath: input.inputPath,
       outputPath: mp3Path,
-      durationSec: inputDurationSec || undefined,
+      durationSec: inputDurationSec,
       bitrateKbps: 128,
     });
 
-    const durationSec = (await probeDurationSec(mp3Path)) || inputDurationSec;
+    // The durable lease may have been reclaimed while this worker waited for the shared ffmpeg
+    // slot or transcoded. Re-check before any paid remote work and refresh the lease timestamp.
+    if (
+      !(await setFullStatus(sessionId, claimId, 'transcoding', ['transcoding'], {
+        fullTranscribeStartedAt: new Date(),
+      }))
+    ) {
+      throw new PipelineHaltError();
+    }
+
+    const durationSec =
+      (await probeDurationSec(mp3Path)) || transcodeResult.durationSec || inputDurationSec;
     if (!durationSec) {
       throw new Error('Cannot detect audio duration — recording may be corrupted');
     }
@@ -107,8 +125,7 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
       );
     }
 
-    // P1-16：任务开始时解析并**持久化实际 region** 到 session.sonioxRegion，之后 poll/finalize/
-    // cancel/maintenance 全部读该字段解析同一 region，绝不落回可变默认 region。
+    // 按任务固定 region；后续 poll/finalize/cancel 都读取持久化值。
     sonioxConfig = await resolveAndPersistTaskRegion(sessionId, session.sonioxRegion);
     if (!sonioxConfig) throw new Error('Soniox credentials not configured');
 
@@ -118,6 +135,16 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
     });
     uploadedFileId = sonioxFile.id;
 
+    // Upload can itself be long. If the attempt was reclaimed meanwhile, delete the just-created
+    // file in the catch path and never create a Soniox transcription for a stale claim.
+    if (
+      !(await setFullStatus(sessionId, claimId, 'transcoding', ['transcoding'], {
+        fullTranscribeStartedAt: new Date(),
+      }))
+    ) {
+      throw new PipelineHaltError();
+    }
+
     const translation =
       session.targetLang && session.targetLang !== session.sourceLang
         ? ({ type: 'one_way', target_language: session.targetLang } as const)
@@ -126,8 +153,6 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
     const job = await createSonioxTranscription(sonioxConfig, {
       fileId: sonioxFile.id,
       languageHints: session.sourceLang ? [session.sourceLang] : undefined,
-      // 与 realtime 一致开启语言识别：否则 token 不带 language 字段，分段的 language
-      // 会全部落到 'en' 兜底（非英文上传标签错）。source 语言仍由 languageHints 提供。
       enableLanguageIdentification: true,
       enableSpeakerDiarization: true,
       translation,
@@ -135,35 +160,17 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
     });
     createdTranscriptionId = job.id;
 
-    // transcoding → transcribing（+ Soniox 引用）。抢不到（被取消）→ 清 Soniox 资源 + halt。
     if (
-      !(await setFullStatus(sessionId, 'transcribing', ['transcoding'], {
+      !(await setFullStatus(sessionId, claimId, 'transcribing', ['transcoding'], {
         fullSonioxFileId: sonioxFile.id,
         fullSonioxTranscriptionId: job.id,
       }))
     ) {
-      // P5-18：**transcription 也必须删**。CAS 抢不到时两个 Soniox ID 都没写进 DB，只删 file
-      // 会把已创建的 transcription 变成谁都查不到的孤儿（reclaim cron 只按 DB 里的 ID 回收），
-      // 永久占 Soniox 侧配额。先删 transcription 再删 file（transcription 引用 file，反序会留
-      // 更难回收的孤儿），与 asyncUploadProcessor 同一处的两删口径对齐。
-      await deleteSonioxTranscription(sonioxConfig, job.id).catch(() => undefined);
-      await deleteSonioxFile(sonioxConfig, sonioxFile.id).catch(() => undefined);
       throw new PipelineHaltError();
     }
-
-    // 清理本地临时文件（容忍失败，留给 cron 兜底）
-    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
-  } catch (err) {
-    // 清理临时文件
-    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
-
-    if (err instanceof PipelineHaltError) {
-      // 被取消/竞态：不覆盖最终状态、不当错误上报。
-      return;
-    }
-
-    // 上传到 Soniox 后才失败：清掉刚上传的资源避免泄漏配额。P5-18：transcription 与 file 都要删
-    // （先 transcription 后 file），二者的 ID 此时都还没写进 DB，不删就是 cron 也回收不到的孤儿。
+  } catch (error) {
+    // Until the final transcribing CAS succeeds the Soniox IDs exist only in this worker, so every
+    // error — including claim loss — must clean them before returning.
     if (sonioxConfig) {
       if (createdTranscriptionId) {
         await deleteSonioxTranscription(sonioxConfig, createdTranscriptionId).catch(
@@ -175,17 +182,19 @@ export async function processFullTranscribe(sessionId: string): Promise<void> {
       }
     }
 
-    const message = err instanceof Error ? err.message : 'Full transcribe failed';
-    logger.error({ err, sessionId }, 'full transcribe pipeline failed');
-    // 仅当仍处于活动态时才标 failed（避免覆盖用户取消）。
-    const marked = await setFullStatus(sessionId, 'failed', ['pending', 'transcoding'], {
-      fullTranscribeError: message.slice(0, 500),
+    if (error instanceof PipelineHaltError) return;
+
+    const message = error instanceof Error ? error.message : 'Full transcribe failed';
+    logger.error({ error, sessionId, claimId }, 'full transcribe pipeline failed');
+    await failFullTranscribeAttempt({
+      sessionId,
+      claimId,
+      allowedStatuses: ['pending', 'transcoding'],
+      error: message,
     }).catch(() => false);
-    // R4：抢到 failed 终态（恰好一次）→ 释放入口持有的转录分钟预留（fullReservedMinutes）。
-    // settleFullReservation 用 FOR UPDATE 读当前列并原子释放，与 finalize 结算 / 删会话 / cron
-    // releaseOrphanFullReservations 互斥，恰好释放一次。
-    if (marked) {
-      await settleFullReservation(sessionId).catch(() => undefined);
-    }
+  } finally {
+    // input.workDir is generated internally from sessionId+claimId; it never contains a local
+    // recording path. Cloudreve input lives inside it and is removed with the MP3.
+    await fs.rm(input.workDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }

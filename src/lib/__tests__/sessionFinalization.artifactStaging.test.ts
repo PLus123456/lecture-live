@@ -33,6 +33,8 @@ const {
   stageTranscriptMock,
   publishMock,
   rollbackMock,
+  settleStagedMock,
+  readbackMock,
   loadDraftMock,
 } = vi.hoisted(() => ({
   sessionFindUniqueMock: vi.fn(),
@@ -50,6 +52,8 @@ const {
   stageTranscriptMock: vi.fn(),
   publishMock: vi.fn(),
   rollbackMock: vi.fn(),
+  settleStagedMock: vi.fn(),
+  readbackMock: vi.fn(),
   loadDraftMock: vi.fn(),
 }));
 
@@ -61,6 +65,11 @@ vi.mock('@/lib/prisma', () => ({
       update: vi.fn().mockResolvedValue(undefined),
     },
     user: { findUnique: vi.fn().mockResolvedValue(null) },
+    // 收尾会 fire-and-forget 地跑 runBackgroundLLMTasks → isPaymentBenefitAvailable，
+    // 后者走 $queryRaw 查支付冻结。不桩它的话 rejection 逃出用例、变成 vitest 的
+    // unhandled error：**用例全绿但进程非零退出**（CI run 32793691955 就是这样）。
+    // 返回空数组 = 账户没有支付争议冻结。
+    $queryRaw: vi.fn(async () => []),
     $transaction: (...a: unknown[]) => transactionMock(...a),
   },
 }));
@@ -78,7 +87,10 @@ vi.mock('@/lib/transcriptDraftPersistence', () => ({
 vi.mock('@/lib/sessionPersistence', () => ({
   stageSessionAudioArtifact: stageAudioMock,
   stageSessionTranscriptArtifacts: stageTranscriptMock,
-  finalizeStagedArtifactPublish: publishMock,
+  // 收尾改成 stage → 事务内 settle → 提交后 complete；失败/抢输走 readback + rollback。
+  settleStagedArtifactsInTransaction: settleStagedMock,
+  completeStagedArtifactPublishes: publishMock,
+  readbackStagedArtifactPublication: readbackMock,
   rollbackStagedArtifact: rollbackMock,
   extractTranscriptText: vi.fn(() => ''),
   loadSessionTranscriptBundle: vi.fn().mockResolvedValue(null),
@@ -88,10 +100,14 @@ vi.mock('@/lib/audio/recordingDuration', () => ({
   resolveServerRecordingDurationMs: serverDurationMock,
   resolveTranscriptDurationMs: transcriptDurationMock,
   normalizeRecordedAudioDuration: vi.fn().mockResolvedValue(Buffer.alloc(4)),
+  measureAuthoritativeRecordingDurationMsFromBuffer: vi.fn().mockResolvedValue(1000),
+  RECORDING_DURATION_LIMIT_GRACE_MS: 60_000,
+  RecordingDurationMeasurementError: class RecordingDurationMeasurementError extends Error {},
 }));
 vi.mock('@/lib/billing', () => ({
   clampSessionDurationMs: (ms: number) => ms,
   getBillableMinutes: (ms: number) => (ms > 0 ? Math.ceil(ms / 60_000) : 0),
+  getMaxSessionDurationMs: () => null,
 }));
 vi.mock('@/lib/quota', () => ({ deductTranscriptionMinutes: deductMock }));
 vi.mock('@/lib/email/quotaAlert', () => ({
@@ -131,12 +147,26 @@ vi.mock('@/lib/apiResponseCache', () => ({
   invalidateFoldersApiCache: vi.fn().mockResolvedValue(undefined),
   invalidateSessionsApiCache: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock('@/lib/logger', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-  serializeError: (e: unknown) => e,
-}));
+vi.mock('@/lib/logger', () => {
+  const noop = vi.fn();
+  const child = { info: noop, warn: noop, error: noop, debug: noop, child: () => child };
+  return {
+    logger: { ...child, child: () => child },
+    serializeError: (e: unknown) => e,
+  };
+});
 
 import { finalizeSession } from '@/lib/sessionFinalization';
+
+/** settle 在事务内把每个 staged 换成可发布句柄；readback 默认判定「没提交过」。 */
+function settledStagedReset() {
+  settleStagedMock
+    .mockReset()
+    .mockImplementation(async (_tx: unknown, staged: unknown[]) =>
+      staged.map((item) => ({ staged: item, settled: {} }))
+    );
+  readbackMock.mockReset().mockResolvedValue({ outcome: 'not_committed', publications: [] });
+}
 
 /** 收尾前：录音/转录/摘要三个 path 都还是空 → 三类产物本次都要 stage。 */
 const SESSION = {
@@ -216,7 +246,23 @@ beforeEach(() => {
     hasGap: false,
   });
   loadDraftMock.mockReset().mockResolvedValue({
-    segments: [{ id: 's1' }],
+    // SEC-009：收尾时 transcript bundle 要过严格 schema，只有 {id} 会被 400 拒收。
+    segments: [
+      {
+        id: 's1',
+        sessionIndex: 0,
+        speaker: 'Speaker 1',
+        language: 'zh',
+        text: '一段转录',
+        globalStartMs: 0,
+        globalEndMs: 1000,
+        startMs: 0,
+        endMs: 1000,
+        isFinal: true,
+        confidence: 1,
+        timestamp: '00:00:00',
+      },
+    ],
     summaries: [],
     translations: {},
   });
@@ -224,8 +270,14 @@ beforeEach(() => {
   stageTranscriptMock
     .mockReset()
     .mockResolvedValue({ transcript: STAGED_TRANSCRIPT, summary: STAGED_SUMMARY });
-  publishMock.mockReset().mockResolvedValue({ path: 'published', storage: 'local' });
+  publishMock
+    .mockReset()
+    .mockResolvedValue([
+      { path: 'published', storage: 'local' },
+      { path: 'published', storage: 'local' },
+    ]);
   rollbackMock.mockReset().mockResolvedValue(undefined);
+  settledStagedReset();
 });
 
 describe('finalizeSession — M5：转录/摘要走 stage → CAS → publish 两阶段', () => {
@@ -244,9 +296,13 @@ describe('finalizeSession — M5：转录/摘要走 stage → CAS → publish �
     expect(res.transcriptPath).toBe(STAGED_TRANSCRIPT.reference);
     expect(res.summaryPath).toBe(STAGED_SUMMARY.reference);
 
-    // 提交之后才 publish，且三类都 publish（转录/摘要无 previousReference，publish 是纯语义调用）。
-    const published = publishMock.mock.calls
-      .map((c) => (c[1] as { reference: string }).reference)
+    // 提交之后才发布，且三类一次性交给 completeStagedArtifactPublishes
+    // （转录/摘要无 previousReference，publish 是纯语义调用）。
+    expect(publishMock).toHaveBeenCalledTimes(1);
+    const published = (
+      publishMock.mock.calls[0][1] as Array<{ staged: { reference: string } }>
+    )
+      .map((entry) => entry.staged.reference)
       .sort();
     expect(published).toEqual(
       [

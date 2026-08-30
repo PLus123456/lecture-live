@@ -15,6 +15,7 @@ const spawnState = vi.hoisted(() => ({
   lastArgs: [] as string[],
   allArgs: [] as string[][],
   nextProbeStdout: '',
+  nextFfmpegStderr: '',
 }));
 
 vi.mock('child_process', () => ({
@@ -30,10 +31,16 @@ vi.mock('child_process', () => ({
     proc.stderr = new EventEmitter();
     proc.kill = vi.fn();
     setImmediate(() => {
-      if (args.includes('format=format_name') || args.includes('format=duration')) {
+      if (
+        args.includes('format=format_name') ||
+        args.includes('format=duration') ||
+        args.includes('stream=index')
+      ) {
         if (spawnState.nextProbeStdout) {
           proc.stdout.emit('data', Buffer.from(spawnState.nextProbeStdout));
         }
+      } else if (spawnState.nextFfmpegStderr) {
+        proc.stderr.emit('data', Buffer.from(spawnState.nextFfmpegStderr));
       }
       proc.emit('close', 0);
     });
@@ -61,6 +68,8 @@ import {
   sniffContainerMagic,
   classifyContainerFormat,
   transcodeToMp3,
+  measureDecodedAudioDurationSec,
+  probeAudioStreamCount,
   validateMediaContainer,
   MediaValidationError,
 } from '../ffmpegTranscode';
@@ -69,6 +78,7 @@ beforeEach(() => {
   spawnState.lastArgs = [];
   spawnState.allArgs = [];
   spawnState.nextProbeStdout = '';
+  spawnState.nextFfmpegStderr = '';
   fsState.head = Buffer.alloc(0);
 });
 
@@ -127,6 +137,48 @@ describe('transcodeToMp3 ffmpeg 参数硬化', () => {
     expect(args[pwIdx + 1]).toBe('file,pipe');
     // 协议白名单必须在输入 -i 之前生效
     expect(pwIdx).toBeLessThan(args.indexOf('-i'));
+  });
+});
+
+describe('measureDecodedAudioDurationSec', () => {
+  it('headerless WebM 可解码时取 progress 实际时长，且沿用安全参数', async () => {
+    spawnState.nextFfmpegStderr = 'out_time_us=95250000\nprogress=end\n';
+
+    await expect(
+      measureDecodedAudioDurationSec('/tmp/headerless.webm')
+    ).resolves.toBe(95.25);
+
+    const args = spawnState.lastArgs;
+    expect(args).toContain('-nostdin');
+    const pwIdx = args.indexOf('-protocol_whitelist');
+    expect(args[pwIdx + 1]).toBe('file,pipe');
+    expect(pwIdx).toBeLessThan(args.indexOf('-i'));
+    const mapIdx = args.indexOf('-map');
+    expect(args[mapIdx + 1]).toBe('0:a:0');
+    const filterIdx = args.indexOf('-af');
+    expect(args[filterIdx + 1]).toBe('aresample=48000,asetpts=N/SR/TB');
+    expect(args.slice(args.indexOf('-f'), args.indexOf('-f') + 2)).toEqual([
+      '-f',
+      'null',
+    ]);
+  });
+});
+
+describe('probeAudioStreamCount', () => {
+  it('只按 ffprobe 返回的音频 stream index 计数', async () => {
+    spawnState.nextProbeStdout = '0\n2\n';
+
+    await expect(probeAudioStreamCount('/tmp/multi-track.mkv')).resolves.toBe(2);
+
+    const args = spawnState.lastArgs;
+    expect(args).toContain('-select_streams');
+    expect(args[args.indexOf('-select_streams') + 1]).toBe('a');
+    expect(args).toContain('stream=index');
+  });
+
+  it('异常 probe 输出 fail closed 为 0', async () => {
+    spawnState.nextProbeStdout = 'not-an-index\n';
+    await expect(probeAudioStreamCount('/tmp/bad.mkv')).resolves.toBe(0);
   });
 });
 

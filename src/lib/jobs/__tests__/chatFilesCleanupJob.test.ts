@@ -9,6 +9,10 @@ const userQueryRawMock = vi.fn();
 const executeRawMock = vi.fn();
 const transactionMock = vi.fn();
 const siteSettingFindUniqueMock = vi.fn();
+const findBillableStoredArtifactsByOwnerMock = vi.fn();
+const findBillableStoredArtifactsByConversationsMock = vi.fn();
+const markStoredArtifactsDeletePendingInTransactionMock = vi.fn();
+const releaseStoredArtifactMock = vi.fn();
 
 vi.mock('@/lib/prisma', () => ({
   prisma: {
@@ -27,6 +31,22 @@ vi.mock('@/lib/prisma', () => ({
 
 vi.mock('@/lib/storage/cloudreve', () => ({
   resolveCloudreveConfig: vi.fn().mockResolvedValue(null), // 默认未配置，DB 删除路径仍要走
+}));
+
+vi.mock('@/lib/storage/storedArtifactLedger', () => ({
+  STORED_ARTIFACT_TYPE: {
+    CHAT_EXTRACTED: 'chat_extracted',
+    INLINE_IMAGE: 'inline_image',
+  },
+  findBillableStoredArtifactsByOwner:
+    (...args: unknown[]) => findBillableStoredArtifactsByOwnerMock(...args),
+  findBillableStoredArtifactsByConversations:
+    (...args: unknown[]) => findBillableStoredArtifactsByConversationsMock(...args),
+  markStoredArtifactsDeletePendingInTransaction:
+    (...args: unknown[]) =>
+      markStoredArtifactsDeletePendingInTransactionMock(...args),
+  releaseStoredArtifact:
+    (...args: unknown[]) => releaseStoredArtifactMock(...args),
 }));
 
 vi.mock('@/lib/crypto', () => ({
@@ -90,12 +110,22 @@ describe('runChatFilesCleanup', () => {
     chatAttachmentDeleteMock.mockReset().mockResolvedValue(undefined);
     userQueryRawMock.mockReset().mockResolvedValue([]);
     executeRawMock.mockReset().mockResolvedValue(undefined);
-    // deleteAttachment 现把"删行 + 扣字节"包进 $transaction([...])，原子化。
-    // mock 把传入的 operations 数组 await 掉，使内部 delete/executeRaw 仍被求值、
-    // 各自断言保持有效；任一 operation reject 时整个事务 reject（原子语义）。
+    findBillableStoredArtifactsByOwnerMock.mockReset().mockResolvedValue([]);
+    findBillableStoredArtifactsByConversationsMock.mockReset().mockResolvedValue([]);
+    markStoredArtifactsDeletePendingInTransactionMock
+      .mockReset()
+      .mockResolvedValue([]);
+    releaseStoredArtifactMock.mockReset().mockResolvedValue(true);
+    // deleteAttachment 现在用 callback transaction，把 owner 删除与 ledger
+    // DELETE_PENDING 放在同一提交边界。注入最小 tx，保留旧配额断言。
     transactionMock
       .mockReset()
-      .mockImplementation(async (operations: unknown[]) => Promise.all(operations));
+      .mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) =>
+        callback({
+          chatAttachment: { delete: chatAttachmentDeleteMock },
+          $executeRaw: (...args: unknown[]) => executeRawMock(...args),
+        })
+      );
     siteSettingFindUniqueMock.mockReset();
   });
 

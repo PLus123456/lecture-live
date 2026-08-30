@@ -3,7 +3,8 @@ import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
 import { logAction } from '@/lib/auditLog';
 import { withRequestLogging } from '@/lib/requestLogger';
-import type { UserRole } from '@prisma/client';
+import { isPurchasableMembershipRole } from '@/lib/payment/tierPolicy';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 type TierKind = 'membership' | 'minutes' | 'topup';
 const TIER_KINDS: TierKind[] = ['membership', 'minutes', 'topup'];
@@ -57,6 +58,47 @@ interface TierRow {
   creditCents: number | null;
   active: boolean;
   sortOrder: number;
+}
+
+interface AuditableTierRow extends TierRow {
+  id?: string;
+}
+
+class TierResponseError extends Error {
+  constructor(
+    readonly status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = 'TierResponseError';
+  }
+}
+
+class RequiredSecurityAuditError extends Error {
+  constructor(readonly auditCause: unknown) {
+    super('required security audit failed');
+    this.name = 'RequiredSecurityAuditError';
+  }
+}
+
+function tierForAudit(tier: AuditableTierRow): Record<string, unknown> {
+  return {
+    ...(tier.id ? { id: tier.id } : {}),
+    kind: tier.kind,
+    name: tier.name,
+    priceCents: tier.priceCents,
+    grantRole: tier.grantRole,
+    durationDays: tier.durationDays,
+    grantMinutes: tier.grantMinutes,
+    creditCents: tier.creditCents,
+    active: tier.active,
+    sortOrder: tier.sortOrder,
+  };
+}
+
+function auditUnavailable(err: unknown): NextResponse {
+  console.error('充值档位安全审计失败:', err);
+  return NextResponse.json({ error: '安全审计服务暂时不可用' }, { status: 503 });
 }
 
 /**
@@ -115,15 +157,21 @@ function normalizeTier(
   };
 
   if (kind === 'membership') {
-    const role = (merged.grantRole ?? 'PRO') as UserRole;
-    if (!['ADMIN', 'PRO', 'FREE'].includes(role)) return { error: '授予角色无效' };
-    // M7：ADMIN 绝不可作为可购买档位的 grantRole —— 买到即得终身计费豁免 + 全部 admin API。
-    // 从前这里明确放行 ADMIN，仅靠 describeTier 的事后审计流水兜底（P6-15 自认无代码防线）。
-    // 只拦「本次请求真的要写 grantRole」的情况（新建 / 显式给了 grantRole / 换 kind 触发派生重写），
-    // 与 P3-7 的 0 元档同款口径：否则存量的 ADMIN 档连「停用」「改名」都改不动。
-    // 发放侧（wallet.ts applyGrantTx）另有一道硬拒，存量脏数据同样发不出去。
-    if (role === 'ADMIN' && (!partial || given('grantRole') || kindChanged)) {
-      return { error: '授予角色无效（不得创建授予管理员的档位）' };
+    const role = merged.grantRole ?? 'PRO';
+    if (!isPurchasableMembershipRole(role)) {
+      // 已存在的 ADMIN 商品必须还能被停用/整理，否则收紧校验反而会锁死补救入口。
+      // 这里只兼容「原本就是 ADMIN 且最终仍保持下架」的 PATCH；新建、重新上架、
+      // 换 kind 或显式写 ADMIN 一律拒绝。钱包最终发放边界还会独立 fail-closed。
+      const quarantiningLegacyAdmin =
+        partial &&
+        current?.kind === 'membership' &&
+        current.grantRole === 'ADMIN' &&
+        !given('kind') &&
+        !given('grantRole') &&
+        merged.active === false;
+      if (!quarantiningLegacyAdmin) {
+        return { error: '会员商品不能授予管理员角色' };
+      }
     }
     const days = intOrNull(merged.durationDays);
     if (!days || days <= 0) return { error: '会员档位必须设置正的时长天数' };
@@ -164,12 +212,28 @@ function describeTier(tier: {
 
 // 列出所有档位
 export const GET = withRequestLogging('admin:recharge:tiers:list', async (req: Request) => {
-  const { response } = await requireAdminAccess(req, { scope: 'admin:recharge:tiers:list' });
+  const { user: admin, response } = await requireAdminAccess(req, {
+    scope: 'admin:recharge:tiers:list',
+  });
   if (response) return response;
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
   const tiers = await prisma.rechargeTier.findMany({
     orderBy: [{ kind: 'asc' }, { sortOrder: 'asc' }, { createdAt: 'asc' }],
   });
-  return NextResponse.json({ tiers });
+  const payload = { tiers };
+  try {
+    await writeSecurityAudit(req, {
+      event: 'recharge.tiers.read',
+      operator: { id: admin.id, email: admin.email, role: admin.role },
+      target: { type: 'recharge_tier_collection' },
+      reason: 'admin_list',
+      outcome: 'SUCCESS',
+      metadata: { count: tiers.length },
+    });
+  } catch (err) {
+    return auditUnavailable(err);
+  }
+  return NextResponse.json(payload);
 });
 
 // 新建档位
@@ -187,7 +251,34 @@ export const POST = withRequestLogging('admin:recharge:tiers:create', async (req
   }
   const { data, error } = normalizeTier(body);
   if (error) return NextResponse.json({ error }, { status: 400 });
-  const tier = await prisma.rechargeTier.create({ data: data as never });
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
+
+  let tier;
+  try {
+    tier = await prisma.$transaction(async (tx) => {
+      const created = await tx.rechargeTier.create({ data: data as never });
+      try {
+        await writeSecurityAudit(
+          req,
+          {
+            event: 'recharge.tier.create',
+            operator: { id: admin.id, email: admin.email, role: admin.role },
+            target: { type: 'recharge_tier', id: created.id },
+            after: tierForAudit(created),
+            reason: 'admin_create',
+            outcome: 'SUCCESS',
+          },
+          tx
+        );
+      } catch (err) {
+        throw new RequiredSecurityAuditError(err);
+      }
+      return created;
+    });
+  } catch (err) {
+    if (err instanceof RequiredSecurityAuditError) return auditUnavailable(err.auditCause);
+    throw err;
+  }
   logAction(req, 'admin.recharge.tier.create', {
     user: admin,
     detail: `新建档位: ${describeTier(tier)}`,
@@ -209,20 +300,52 @@ export const PATCH = withRequestLogging('admin:recharge:tiers:update', async (re
     return NextResponse.json({ error: '请求体无效' }, { status: 400 });
   }
   if (!body.id) return NextResponse.json({ error: '缺少档位 id' }, { status: 400 });
-  // 局部更新须以现有行为基准（P3-9）：先读，缺省字段沿用当前值而不是回落到「新建默认值」。
-  const current = await prisma.rechargeTier.findUnique({ where: { id: body.id } });
-  if (!current) return NextResponse.json({ error: '档位不存在' }, { status: 404 });
-  const { data, error } = normalizeTier(body, current as unknown as TierRow);
-  if (error) return NextResponse.json({ error }, { status: 400 });
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
+
   try {
-    const tier = await prisma.rechargeTier.update({ where: { id: body.id }, data: data as never });
+    const { tier, current } = await prisma.$transaction(async (tx) => {
+      // 局部更新须在同一事务里读取实际旧值，避免并发更新后审计的 before 与真正被覆盖值不一致。
+      const current = await tx.rechargeTier.findUnique({ where: { id: body.id } });
+      if (!current) throw new TierResponseError(404, '档位不存在');
+      const { data, error } = normalizeTier(body, current as unknown as TierRow);
+      if (error) throw new TierResponseError(400, error);
+
+      let updated;
+      try {
+        updated = await tx.rechargeTier.update({ where: { id: body.id }, data: data as never });
+      } catch {
+        throw new TierResponseError(404, '档位不存在');
+      }
+      try {
+        await writeSecurityAudit(
+          req,
+          {
+            event: 'recharge.tier.update',
+            operator: { id: admin.id, email: admin.email, role: admin.role },
+            target: { type: 'recharge_tier', id: updated.id },
+            before: tierForAudit(current),
+            after: tierForAudit(updated),
+            reason: 'admin_update',
+            outcome: 'SUCCESS',
+          },
+          tx
+        );
+      } catch (err) {
+        throw new RequiredSecurityAuditError(err);
+      }
+      return { tier: updated, current };
+    });
     logAction(req, 'admin.recharge.tier.update', {
       user: admin,
       detail: `更新档位: ${describeTier(tier)}（原 ${describeTier(current)}）`,
     });
     return NextResponse.json({ tier });
-  } catch {
-    return NextResponse.json({ error: '档位不存在' }, { status: 404 });
+  } catch (err) {
+    if (err instanceof RequiredSecurityAuditError) return auditUnavailable(err.auditCause);
+    if (err instanceof TierResponseError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
+    throw err;
   }
 });
 
@@ -235,14 +358,43 @@ export const DELETE = withRequestLogging('admin:recharge:tiers:delete', async (r
   if (response) return response;
   const id = new URL(req.url).searchParams.get('id');
   if (!id) return NextResponse.json({ error: '缺少档位 id' }, { status: 400 });
+  if (!admin) return NextResponse.json({ error: '权限不足' }, { status: 403 });
   try {
-    const tier = await prisma.rechargeTier.delete({ where: { id } });
+    const tier = await prisma.$transaction(async (tx) => {
+      let deleted;
+      try {
+        deleted = await tx.rechargeTier.delete({ where: { id } });
+      } catch {
+        throw new TierResponseError(404, '档位不存在');
+      }
+      try {
+        await writeSecurityAudit(
+          req,
+          {
+            event: 'recharge.tier.delete',
+            operator: { id: admin.id, email: admin.email, role: admin.role },
+            target: { type: 'recharge_tier', id: deleted.id },
+            before: tierForAudit(deleted),
+            reason: 'admin_delete',
+            outcome: 'SUCCESS',
+          },
+          tx
+        );
+      } catch (err) {
+        throw new RequiredSecurityAuditError(err);
+      }
+      return deleted;
+    });
     logAction(req, 'admin.recharge.tier.delete', {
       user: admin,
       detail: `删除档位: ${describeTier(tier)}`,
     });
     return NextResponse.json({ ok: true });
-  } catch {
-    return NextResponse.json({ error: '档位不存在' }, { status: 404 });
+  } catch (err) {
+    if (err instanceof RequiredSecurityAuditError) return auditUnavailable(err.auditCause);
+    if (err instanceof TierResponseError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
+    throw err;
   }
 });

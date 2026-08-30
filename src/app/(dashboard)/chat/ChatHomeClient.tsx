@@ -19,7 +19,13 @@ import {
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 import { useAuth } from '@/hooks/useAuth';
+import {
+  getAuthBoundaryAbortSignal,
+  getAuthBoundarySnapshot,
+} from '@/stores/authStore';
+import { runAuthBoundaryCommit } from '@/lib/clientAuthCookieMutation';
 import { toast } from '@/stores/toastStore';
+import { selectChatAttachmentsForLlm } from '@/lib/llm/chatAttachmentSelection';
 import { formatBytes } from '@/lib/format';
 import { useChatStore } from '@/stores/chatStore';
 import {
@@ -133,6 +139,8 @@ export default function ChatHomeClient() {
   const handleStart = useCallback(async () => {
     const text = draft.trim();
     if (!text || creating || !token) return;
+    const expected = getAuthBoundarySnapshot();
+    const ownerSignal = getAuthBoundaryAbortSignal();
     setCreating(true);
     try {
       const recordingIds = pendingRecordings.map((r) => r.id);
@@ -161,7 +169,12 @@ export default function ChatHomeClient() {
       }
       // 预选文档：对话建好后立即上传，拿到 attachmentId 随首条消息一并带上。
       // 单个失败不阻断起聊（其它附件与正文照常发），仅 toast 提示。
-      const attachmentIds: string[] = [];
+      const uploadedAttachments: Array<{
+        id: string;
+        kind: 'image' | 'document' | 'text';
+        bytes: number;
+        llmUsable?: boolean;
+      }> = [];
       for (const file of pendingFiles) {
         try {
           const form = new FormData();
@@ -176,23 +189,71 @@ export default function ChatHomeClient() {
             toast.error(t('chat.uploadFailed'), file.name);
             continue;
           }
-          const upData = (await upRes.json()) as { attachmentId?: string };
-          if (upData.attachmentId) attachmentIds.push(upData.attachmentId);
-        } catch {
+          const upData = (await upRes.json()) as {
+            attachmentId?: string;
+            kind?: 'image' | 'document' | 'text';
+            bytes?: number | string;
+            llmUsable?: boolean;
+          };
+          if (upData.attachmentId && upData.llmUsable !== false) {
+            uploadedAttachments.push({
+              id: upData.attachmentId,
+              kind: upData.kind ?? 'document',
+              bytes:
+                typeof upData.bytes === 'string'
+                  ? parseInt(upData.bytes, 10) || file.size
+                  : upData.bytes ?? file.size,
+              llmUsable: upData.llmUsable,
+            });
+          } else if (upData.llmUsable === false) {
+            toast.error(t('chat.attachmentLlmUnavailable'), file.name);
+          }
+        } catch (error) {
+          if (
+            ownerSignal.aborted ||
+            (error &&
+              typeof error === 'object' &&
+              'name' in error &&
+              error.name === 'AbortError')
+          ) {
+            throw error;
+          }
           toast.error(t('chat.uploadFailed'), file.name);
         }
       }
-      setPendingFiles([]);
-      useChatStore.getState().setPendingFirstMessage({
-        conversationId: newId,
-        text,
-        ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+      const attachmentSelection =
+        selectChatAttachmentsForLlm(uploadedAttachments);
+      const attachmentIds = attachmentSelection.attachmentIds;
+      await runAuthBoundaryCommit(expected, () => {
+        if (ownerSignal.aborted) return;
+        if (attachmentSelection.omittedByLimits > 0) {
+          toast.info(
+            t('chat.attachmentSelectionLimited', {
+              n: attachmentSelection.omittedByLimits,
+            })
+          );
+        }
+        setPendingFiles([]);
+        useChatStore.getState().setPendingFirstMessage({
+          conversationId: newId,
+          text,
+          ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+        });
+        // 仅使下一个页面挂载绕过去抖。不从这个可能已过期的
+        // closure 再启动一条 async refresh，account cleanup 后就没有新 A sink 可复活。
+        useConversationListStore.getState().invalidate();
+        router.push(`/chat/${newId}`);
       });
-      // 强刷共享列表：路由变化触发的侧栏刷新不带 force，1.5s 去抖窗口内
-      // （进页面即刷过一次）新会话会缺席侧栏，这里显式补上。
-      void useConversationListStore.getState().refresh(token, { force: true });
-      router.push(`/chat/${newId}`);
     } catch (err) {
+      if (
+        ownerSignal.aborted ||
+        (err &&
+          typeof err === 'object' &&
+          'name' in err &&
+          err.name === 'AbortError')
+      ) {
+        return;
+      }
       toast.error(
         t('common.networkError'),
         err instanceof Error ? err.message : undefined

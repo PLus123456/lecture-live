@@ -1,8 +1,19 @@
 #!/bin/sh
 set -eu
 
-# 同步数据库结构
-node scripts/ensure-database.mjs
+# 同步数据库结构与安全 CHECK。生产容器不允许缺连接串或 AUTO_DB_PUSH=off 静默跳过，
+# 任一失败由 set -e 在 Web/WS 启动前终止容器。
+node scripts/ensure-database.mjs --require-database
+
+# One-time Stripe reconciliation maintenance is intentionally Web-only. The Next middleware
+# exposes just auth + ADMIN payment-review APIs; starting WS here would bypass that HTTP boundary
+# and re-enable live-share/billing loops while production is supposed to remain quarantined.
+if [ "${PAYMENT_RECONCILIATION_MAINTENANCE:-}" = "1" ]; then
+  echo "[payment:maintenance] starting restricted Web only; WebSocket is disabled"
+  # 容器内 loopback 无法被 Docker 的宿主端口转发访问；外部边界仍由 compose 的
+  # 127.0.0.1:3000 发布规则和 middleware 的维护模式 allowlist 双重限制。
+  exec env HOSTNAME=0.0.0.0 PORT=3000 node server.js
+fi
 
 # 启动 WebSocket 服务器（后台）
 node ws-server/websocket.js &

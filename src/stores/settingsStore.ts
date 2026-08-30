@@ -63,6 +63,7 @@ interface SettingsStore {
   consumePendingSystemStream: () => MediaStream | null;
   setPendingSessionTerms: (sessionId: string, terms: string[]) => void;
   clearPendingSessionTerms: () => void;
+  clearAccountBoundState: () => void;
   setSourceLang: (lang: string) => void;
   setTargetLang: (lang: string) => void;
   setLanguageHints: (hints: string[]) => void;
@@ -125,6 +126,28 @@ export const useSettingsStore = create<SettingsStore>()(
         set({ pendingSessionId, pendingSessionTerms }),
       clearPendingSessionTerms: () =>
         set({ pendingSessionId: null, pendingSessionTerms: null }),
+      clearAccountBoundState: () => {
+        const stream = get().pendingSystemStream;
+        if (stream) {
+          for (const track of stream.getTracks()) {
+            try { track.stop(); } catch { /* ignore */ }
+          }
+        }
+        set({
+          // 这些字段可能包含上一账号的课程/文件夹上下文或仍存活的媒体能力。
+          languageHints: ['en'],
+          domain: 'University Lecture',
+          topic: '',
+          terms: [],
+          llmProvider: '',
+          pendingAutoStart: false,
+          pendingSystemStream: null,
+          pendingSessionId: null,
+          pendingSessionTerms: null,
+          userSettingsOpen: false,
+          rechargeOpen: false,
+        });
+      },
       setSourceLang: (sourceLang) => set({ sourceLang }),
       setTargetLang: (targetLang) => set({ targetLang }),
       setLanguageHints: (languageHints) => set({ languageHints }),

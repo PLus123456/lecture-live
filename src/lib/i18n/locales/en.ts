@@ -60,6 +60,12 @@ export default {
   auth: {
     signIn: 'Sign In',
     signOut: 'Sign out',
+    logoutIncomplete: 'Secure sign-out is incomplete',
+    logoutIncompleteDescription:
+      'Local data was cleared, but the server could not confirm token revocation. Please retry when the service recovers.',
+    sessionServiceUnavailable: 'Sign-in service is temporarily unavailable',
+    sessionServiceUnavailableDescription:
+      'Your session has been preserved. Retry after the service recovers.',
     register: 'Register',
     createAccount: 'Create Account',
     signInToAccount: 'Sign in to your account',
@@ -515,6 +521,9 @@ export default {
     orBrowse: 'or browse',
     noKeywords: 'No keywords yet',
     noKeywordsDesc: 'Add manually or upload a file to extract',
+    keywordLimitReached:
+      '{count} keyword(s) were not added. The safe list allows at most 200 items, 120 characters each, and a bounded total size.',
+    keywordListInvalid: 'The current keyword list exceeds the safe limit. Remove some items before extracting again.',
     updatingContext: 'Updating ASR context...',
     injectKeywords: 'Inject {count} keywords into ASR',
   },
@@ -1224,6 +1233,10 @@ export default {
     providerNamePlaceholder: 'e.g.: Anthropic',
     apiUrl: 'API URL',
     apiKey: 'API Key',
+    llmApiKeyRequiredOnEndpointChange: 'Re-enter the API key when changing the LLM API URL or protocol',
+    llmApiKeyRetargetHint: 'Changing the API URL or protocol requires the key again so a saved key is never sent to a new host.',
+    llmCurrentPasswordRequired: 'Enter your current password to create or retarget an LLM gateway',
+    llmCurrentPasswordHint: 'Creating a gateway or changing its API URL or protocol requires an inline password check.',
     isAnthropicApi: 'Anthropic Native API',
     modelList: 'Model List',
     addModel: 'Add Model',
@@ -1358,8 +1371,8 @@ export default {
     jwtExpiryDesc: 'Number of days login tokens remain valid',
     bcryptRounds: 'Bcrypt Rounds',
     bcryptRoundsDesc: 'Password hashing rounds (higher is more secure but slower)',
-    trustedProxy: 'Trust Reverse Proxy Headers',
-    trustedProxyDesc: 'Enable to read client IP from X-Forwarded-For / X-Real-IP headers (enable when behind Nginx or other reverse proxy)',
+    trustedProxy: 'Trusted Proxy Topology (Read-only)',
+    trustedProxyDesc: 'Controlled only by startup environment variables; restart Web and WS after changes. The legacy database toggle has no effect.',
   },
 
   // 语言选项
@@ -1854,6 +1867,9 @@ export default {
     recordingPickerComingSoon: 'Coming soon',
     removeRecording: 'Remove recording',
     removeAttachment: 'Remove attachment',
+    attachmentLlmUnavailable: 'Not available to AI',
+    attachmentSelectionLimited:
+      '{n} attachment(s) over the AI limit were omitted from this message',
     uploadFailed: 'Upload failed',
     fileTooLarge: 'File too large',
     unsupportedFileType: 'Unsupported file type',

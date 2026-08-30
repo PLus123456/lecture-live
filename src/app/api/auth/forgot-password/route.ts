@@ -1,7 +1,11 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { enforceRateLimit } from '@/lib/rateLimit';
-import { resolveRequestClientIp } from '@/lib/clientIp';
+import {
+  enforcePublicAuthPrelude,
+  publicAuthAccountKey,
+  readPublicAuthJson,
+} from '@/lib/publicAuth';
 import { logAction } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
 import { getSiteSettings } from '@/lib/siteSettings';
@@ -19,14 +23,16 @@ const GENERIC_OK = {
 };
 
 export async function POST(req: Request) {
-  const siteSettings = await getSiteSettings().catch(() => null);
+  const prelude = await enforcePublicAuthPrelude(req, {
+    scope: 'forgot-password',
+    endpointIpLimit: 10,
+    endpointWindowMs: 15 * 60_000,
+  });
+  if (prelude.response) return prelude.response;
 
-  let body: { email?: string };
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
-  }
+  const parsed = await readPublicAuthJson<{ email?: string }>(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
 
   const email = normalizeEmail(body.email ?? '').slice(0, 255);
 
@@ -36,21 +42,12 @@ export async function POST(req: Request) {
         scope: 'auth:forgot-password',
         limit: 3,
         windowMs: 15 * 60_000,
-        key: `email:${email}`,
+        key: publicAuthAccountKey('email', email),
       })
     : null;
   if (emailLimited) return emailLimited;
 
-  const clientIp = resolveRequestClientIp(req);
-  if (clientIp !== 'unknown') {
-    const ipLimited = await enforceRateLimit(req, {
-      scope: 'auth:forgot-password:ip',
-      limit: 10,
-      windowMs: 15 * 60_000,
-      key: `ip:${clientIp}`,
-    });
-    if (ipLimited) return ipLimited;
-  }
+  const siteSettings = await getSiteSettings().catch(() => null);
 
   if (!email || !isValidEmailAddress(email) || !(await isEmailEnabled(siteSettings ?? undefined))) {
     return NextResponse.json(GENERIC_OK);
@@ -71,7 +68,7 @@ export async function POST(req: Request) {
     if (user && user.status === 1) {
       void sendPasswordResetEmail(user, {
         settings: siteSettings ?? undefined,
-        requestIp: clientIp === 'unknown' ? null : clientIp,
+        requestIp: prelude.clientIp === 'unknown' ? null : prelude.clientIp,
       }).catch((err) =>
         logger.error(
           { err: serializeError(err) },

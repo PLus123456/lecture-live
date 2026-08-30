@@ -1,18 +1,22 @@
 import { NextResponse } from 'next/server';
 import {
   changePassword,
+  getAuthTokenSessionBinding,
   getJwtExpiryConfig,
+  issueAuthToken,
   revokeToken,
   setAuthCookie,
-  signToken,
   validatePassword,
   verifyAuthSession,
 } from '@/lib/auth';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { logAction } from '@/lib/auditLog';
 import { getSiteSettings } from '@/lib/siteSettings';
+import { guardAuthMutationRequest } from '@/lib/publicAuth';
 
 export async function POST(req: Request) {
+  const requestGuard = guardAuthMutationRequest(req, { requireJson: true });
+  if (requestGuard) return requestGuard;
   try {
     const session = await verifyAuthSession(req);
     if (!session) {
@@ -60,20 +64,18 @@ export async function POST(req: Request) {
 
     logAction(req, 'user.password.change', { user: session.user });
 
-    await revokeToken(session.token);
+    await revokeToken(session.token, { reason: 'password_change' });
 
     const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry);
+    const token = await issueAuthToken(updatedUser, {
+      sessionStartedAt: Date.now(),
+      expiresInDays: jwtConfig.expiresInDays,
+    });
     const response = NextResponse.json({
       message: 'Password changed successfully',
+      sessionBinding: getAuthTokenSessionBinding(token),
     });
-    setAuthCookie(
-      response,
-      signToken(updatedUser, {
-        sessionStartedAt: Date.now(),
-        expiresInDays: jwtConfig.expiresInDays,
-      }),
-      { maxAge: jwtConfig.cookieMaxAge }
-    );
+    setAuthCookie(response, token, { maxAge: jwtConfig.cookieMaxAge });
     return response;
   } catch (error) {
     if (error instanceof Error && error.message === 'Current password is incorrect') {

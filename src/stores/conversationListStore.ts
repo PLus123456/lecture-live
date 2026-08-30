@@ -45,6 +45,8 @@ interface ConversationListStore {
   remove: (id: string) => void;
   /** 本地乐观改标题（重命名后调用） */
   rename: (id: string, title: string) => void;
+  /** 使下一次挂载刷新绕过去抖，不在旧 async closure 里直接启动新请求。 */
+  invalidate: () => void;
   /** 清空（登出时调用，防止换账号后残留上一个用户的列表） */
   clear: () => void;
 }
@@ -121,6 +123,10 @@ export const useConversationListStore = create<ConversationListStore>()(
           ? s.items.map((c) => (c.id === id ? { ...c, title } : c))
           : s.items,
       }));
+    },
+
+    invalidate: () => {
+      lastFetchedAt = 0;
     },
 
     clear: () => {

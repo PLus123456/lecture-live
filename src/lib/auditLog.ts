@@ -37,6 +37,7 @@ export function logAction(
   action: string,
   opts?: {
     user?: UserPayload | null;
+    userId?: string | null;
     userName?: string | null;
     detail?: string;
   }
@@ -45,7 +46,7 @@ export function logAction(
   writeAuditLog({
     action,
     detail: opts?.detail,
-    userId: opts?.user?.id ?? null,
+    userId: opts?.userId ?? opts?.user?.id ?? null,
     userName: opts?.userName ?? opts?.user?.email ?? null,
     ip: ip === 'unknown' ? null : ip,
   });

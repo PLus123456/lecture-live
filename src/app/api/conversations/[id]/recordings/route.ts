@@ -19,6 +19,15 @@ import {
 } from '@/lib/conversations';
 import { invalidateRagCacheForRecordings } from '@/lib/llm/embedding/transcriptRag';
 import { logger, serializeError } from '@/lib/logger';
+import {
+  CONVERSATION_RECORDING_LIMITS,
+  ConversationRecordingBodyError,
+  ConversationRecordingLimitError,
+  conversationRecordingErrorBody,
+  loadConversationRecordingUsage,
+  normalizeConversationRecordingIds,
+  readConversationRecordingJson,
+} from '@/lib/conversationRecordingPolicy';
 
 const apiLogger = logger.child({ component: 'conversation-recordings-api' });
 
@@ -56,6 +65,8 @@ async function listRecordings(conversationId: string): Promise<RecordingRow[]> {
     prisma.conversationSession.findMany({
       where: { conversationId },
       orderBy: { addedAt: 'asc' },
+      // 新写入最多 16 条；多取一条只用于识别历史超限，绝不无界物化脏数据。
+      take: CONVERSATION_RECORDING_LIMITS.maxRecordings + 1,
       select: {
         sessionId: true,
         addedAt: true,
@@ -88,21 +99,39 @@ type SessionIdsResult =
   | { ok: false; response: NextResponse };
 
 async function parseSessionIds(req: Request): Promise<SessionIdsResult> {
-  let body: unknown;
+  let body: Record<string, unknown>;
   try {
-    body = await req.json();
-  } catch {
+    body = await readConversationRecordingJson(req);
+  } catch (error) {
+    if (error instanceof ConversationRecordingBodyError) {
+      return {
+        ok: false,
+        response: NextResponse.json(conversationRecordingErrorBody(error), {
+          status: error.status,
+        }),
+      };
+    }
     return {
       ok: false,
       response: NextResponse.json({ error: 'Invalid JSON' }, { status: 400 }),
     };
   }
-  const raw = (body as { sessionIds?: unknown })?.sessionIds;
-  if (
-    !Array.isArray(raw) ||
-    raw.length === 0 ||
-    !raw.every((v) => typeof v === 'string' && v.length > 0)
-  ) {
+  const raw = body.sessionIds;
+  let sessionIds: string[];
+  try {
+    sessionIds = normalizeConversationRecordingIds(raw);
+  } catch (error) {
+    if (error instanceof ConversationRecordingBodyError) {
+      return {
+        ok: false,
+        response: NextResponse.json(conversationRecordingErrorBody(error), {
+          status: error.status,
+        }),
+      };
+    }
+    throw error;
+  }
+  if (sessionIds.length === 0) {
     return {
       ok: false,
       response: NextResponse.json(
@@ -111,7 +140,7 @@ async function parseSessionIds(req: Request): Promise<SessionIdsResult> {
       ),
     };
   }
-  return { ok: true, sessionIds: Array.from(new Set(raw as string[])) };
+  return { ok: true, sessionIds };
 }
 
 async function authorize(
@@ -168,42 +197,90 @@ export async function POST(
   const parsed = await parseSessionIds(req);
   if (!parsed.ok) return parsed.response;
 
-  if (await isConversationClosed(id)) {
-    return NextResponse.json(
-      { error: 'Conversation is closed (read-only)' },
-      { status: 409 }
-    );
-  }
-
-  // 来源录音（legacy）本就常驻上下文，不允许再往联表里挂一份重复的
-  const legacyForPost = await getLegacyBinding(id);
-  if (legacyForPost && parsed.sessionIds.includes(legacyForPost.sessionId)) {
-    return NextResponse.json(
-      { error: 'source recording is always attached; cannot attach it again' },
-      { status: 400 }
-    );
-  }
-
-  // 验证所有待挂载录音都属于当前用户
-  const ownedCount = await prisma.session.count({
-    where: { id: { in: parsed.sessionIds }, userId: auth.userId },
-  });
-  if (ownedCount !== parsed.sessionIds.length) {
-    return NextResponse.json(
-      { error: 'one or more sessionIds not owned by current user' },
-      { status: 403 }
-    );
-  }
-
   try {
-    await prisma.conversationSession.createMany({
-      data: parsed.sessionIds.map((sid) => ({
-        conversationId: id,
-        sessionId: sid,
-      })),
-      skipDuplicates: true,
+    await prisma.$transaction(async (tx) => {
+      // 同一 conversation 的挂载变更串行化。否则两个各自合法的并发 POST 都看见
+      // 旧计数，合并后可越过 16 条硬顶。
+      await tx.$queryRaw`
+        SELECT id FROM Conversation WHERE id = ${id} LIMIT 1 FOR UPDATE
+      `;
+      const conversation = await tx.conversation.findUnique({
+        where: { id },
+        select: {
+          endedAt: true,
+          sessionId: true,
+          sessions: {
+            select: { sessionId: true },
+            orderBy: { addedAt: 'asc' },
+            take: CONVERSATION_RECORDING_LIMITS.maxRecordings + 1,
+          },
+        },
+      });
+      if (!conversation) {
+        throw new ConversationRecordingLimitError(
+          'NOT_OWNED',
+          'Conversation not found',
+          403
+        );
+      }
+      if (conversation.endedAt) {
+        throw new Error('CONVERSATION_CLOSED');
+      }
+      if (
+        conversation.sessionId &&
+        parsed.sessionIds.includes(conversation.sessionId)
+      ) {
+        throw new Error('LEGACY_DUPLICATE');
+      }
+
+      const finalIds = Array.from(
+        new Set([
+          ...(conversation.sessionId ? [conversation.sessionId] : []),
+          ...conversation.sessions.map((row) => row.sessionId),
+          ...parsed.sessionIds,
+        ])
+      );
+      await loadConversationRecordingUsage(tx, auth.userId, finalIds);
+
+      for (
+        let offset = 0;
+        offset < parsed.sessionIds.length;
+        offset += CONVERSATION_RECORDING_LIMITS.dbBatchSize
+      ) {
+        const batch = parsed.sessionIds.slice(
+          offset,
+          offset + CONVERSATION_RECORDING_LIMITS.dbBatchSize
+        );
+        await tx.conversationSession.createMany({
+          data: batch.map((sid) => ({
+            conversationId: id,
+            sessionId: sid,
+          })),
+          skipDuplicates: true,
+        });
+      }
     });
   } catch (err) {
+    if (err instanceof ConversationRecordingLimitError) {
+      return NextResponse.json(conversationRecordingErrorBody(err), {
+        status: err.status,
+        ...(err.status === 503
+          ? { headers: { 'Retry-After': '30' } }
+          : {}),
+      });
+    }
+    if (err instanceof Error && err.message === 'CONVERSATION_CLOSED') {
+      return NextResponse.json(
+        { error: 'Conversation is closed (read-only)' },
+        { status: 409 }
+      );
+    }
+    if (err instanceof Error && err.message === 'LEGACY_DUPLICATE') {
+      return NextResponse.json(
+        { error: 'source recording is always attached; cannot attach it again' },
+        { status: 400 }
+      );
+    }
     apiLogger.error(
       { conversationId: id, err: serializeError(err) },
       'attach recordings failed'
@@ -251,8 +328,27 @@ export async function DELETE(
   }
 
   try {
-    await prisma.conversationSession.deleteMany({
-      where: { conversationId: id, sessionId: { in: parsed.sessionIds } },
+    await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`
+        SELECT id FROM Conversation WHERE id = ${id} LIMIT 1 FOR UPDATE
+      `;
+      for (
+        let offset = 0;
+        offset < parsed.sessionIds.length;
+        offset += CONVERSATION_RECORDING_LIMITS.dbBatchSize
+      ) {
+        await tx.conversationSession.deleteMany({
+          where: {
+            conversationId: id,
+            sessionId: {
+              in: parsed.sessionIds.slice(
+                offset,
+                offset + CONVERSATION_RECORDING_LIMITS.dbBatchSize
+              ),
+            },
+          },
+        });
+      }
     });
   } catch (err) {
     apiLogger.error(

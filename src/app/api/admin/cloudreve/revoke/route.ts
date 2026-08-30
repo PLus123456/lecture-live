@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
-import { logAction } from '@/lib/auditLog';
 import { clearPersistedTokens } from '@/lib/storage/cloudreve';
+import { prisma } from '@/lib/prisma';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 /**
  * POST /api/admin/cloudreve/revoke
@@ -15,14 +16,24 @@ export async function POST(req: Request) {
     limit: 10,
     windowMs: 60_000,
   });
-  if (response) return response;
+  if (response || !admin) return response!;
 
   try {
-    await clearPersistedTokens();
-
-    logAction(req, 'admin.cloudreve.revoke', {
-      user: admin,
-      detail: '管理员撤销 Cloudreve OAuth 授权（清除已持久化的 token）',
+    await prisma.$transaction(async (tx) => {
+      await clearPersistedTokens(tx);
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'cloudreve.revoke',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'cloudreve_oauth', id: 'global' },
+          before: { state: 'authorized_or_unknown' },
+          after: { state: 'revoked' },
+          reason: 'admin_oauth_revoke',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
     });
 
     return NextResponse.json({ ok: true });

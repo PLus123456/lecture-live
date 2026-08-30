@@ -2,11 +2,17 @@ import { NextResponse } from 'next/server';
 import { Prisma } from '@prisma/client';
 import {
   CLIENT_SESSION_TOKEN,
+  getAuthTokenSessionBinding,
   getJwtExpiryConfig,
   registerWithOptions,
   setAuthCookie,
   validatePassword,
 } from '@/lib/auth';
+import {
+  enforcePublicAuthPrelude,
+  publicAuthAccountKey,
+  readPublicAuthJson,
+} from '@/lib/publicAuth';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { resolveRequestClientIp } from '@/lib/clientIp';
 import { logAction } from '@/lib/auditLog';
@@ -32,28 +38,34 @@ function normalizeDisplayName(value: unknown): string {
 }
 
 export async function POST(req: Request) {
-  const siteSettings = await getSiteSettings().catch(() => null);
+  const prelude = await enforcePublicAuthPrelude(req, {
+    scope: 'register',
+    endpointIpLimit: 25,
+    endpointWindowMs: 10 * 60_000,
+  });
+  if (prelude.response) return prelude.response;
 
-  let body: { email?: string; password?: string; displayName?: string };
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json(
-      { error: 'Invalid request body' },
-      { status: 400 }
-    );
-  }
+  const parsed = await readPublicAuthJson<{
+    email?: string;
+    password?: string;
+    displayName?: string;
+  }>(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const siteSettings = await getSiteSettings().catch(() => null);
 
   const authLimit = siteSettings?.rate_limit_auth ?? 5;
   // 安全：按 email 维度限流。若退回纯 IP 桶，在 trusted_proxy=false（默认）下所有请求
   // 共用同一个 ip:unknown 全局桶，单一匿名攻击者发几次即可打满、锁死全站注册（自愈但可持续）。
   const emailKey = normalizeEmail(body.email ?? '').slice(0, 255);
-  const rateLimited = await enforceRateLimit(req, {
-    scope: 'auth:register',
-    limit: authLimit,
-    windowMs: 10 * 60_000,
-    ...(emailKey ? { key: `email:${emailKey}` } : {}),
-  });
+  const rateLimited = emailKey
+    ? await enforceRateLimit(req, {
+        scope: 'auth:register',
+        limit: authLimit,
+        windowMs: 10 * 60_000,
+        key: publicAuthAccountKey('email', emailKey),
+      })
+    : null;
   if (rateLimited) {
     return rateLimited;
   }
@@ -169,7 +181,7 @@ export async function POST(req: Request) {
     if (verificationRequired) {
       const sendResult = await sendVerificationEmail(user, {
         settings: siteSettings,
-        requestIp: clientIp === 'unknown' ? null : clientIp,
+        requestIp: prelude.clientIp === 'unknown' ? null : prelude.clientIp,
       }).catch((err) => {
         logger.error({ err: serializeError(err) }, '[register] 发送验证邮件失败');
         return { ok: false as const, error: 'send failed' };
@@ -214,12 +226,14 @@ export async function POST(req: Request) {
           role: user.role,
         },
         token: CLIENT_SESSION_TOKEN,
+        sessionBinding: getAuthTokenSessionBinding(token),
       },
       { status: 201 }
     );
 
     // 设置 HttpOnly cookie（使用数据库配置的过期天数）
     setAuthCookie(response, token, { maxAge: jwtConfig.cookieMaxAge });
+    response.headers.set('Clear-Site-Data', '"cache"');
 
     return response;
   } catch (error) {

@@ -17,6 +17,12 @@ import {
 import { useAuthStore } from '@/stores/authStore';
 import { useI18n } from '@/lib/i18n';
 import { formatCurrencyCents } from '@/lib/format';
+import {
+  buildAdminTierMutation,
+  isForbiddenAdminTier,
+  prepareTierForAdminEdit,
+  PURCHASABLE_MEMBERSHIP_ROLES,
+} from '@/lib/payment/tierPolicy';
 
 // ─── 类型 ───
 interface RechargeSettings {
@@ -376,10 +382,11 @@ function TiersSection() {
     if (!editing) return;
     setError(null);
     const method = editing.id ? 'PATCH' : 'POST';
+    const payload = buildAdminTierMutation(editing);
     const res = await fetch('/api/admin/recharge/tiers', {
       method,
       headers: { 'Content-Type': 'application/json', ...auth },
-      body: JSON.stringify(editing),
+      body: JSON.stringify(payload),
     });
     if (res.ok) {
       setEditing(null);
@@ -442,7 +449,10 @@ function TiersSection() {
                   )}
                 </td>
                 <td className="px-3 py-2 text-right whitespace-nowrap">
-                  <button className="p-1 text-charcoal-400 hover:text-rust-500" onClick={() => setEditing(tr)}>
+                  <button
+                    className="p-1 text-charcoal-400 hover:text-rust-500"
+                    onClick={() => setEditing(prepareTierForAdminEdit(tr))}
+                  >
                     <Pencil className="w-4 h-4" />
                   </button>
                   <button className="p-1 text-charcoal-400 hover:text-red-500" onClick={() => del(tr.id)}>
@@ -489,6 +499,7 @@ function TierForm({
   kindLabel: (k: string) => string;
 }) {
   const { t } = useI18n();
+  const legacyAdminTier = Boolean(editing.id && isForbiddenAdminTier(editing));
   const set = <K extends keyof Tier>(k: K, v: Tier[K] | undefined) =>
     setEditing({ ...editing, [k]: v });
   const priceYuan = ((editing.priceCents ?? 0) / 100).toString();
@@ -512,6 +523,7 @@ function TierForm({
           <select
             className={INPUT}
             value={editing.kind}
+            disabled={legacyAdminTier}
             onChange={(e) => set('kind', e.target.value as Tier['kind'])}
           >
             <option value="topup">{kindLabel('topup')}</option>
@@ -521,7 +533,13 @@ function TierForm({
         </div>
         <div>
           <label className={LABEL} htmlFor="tier-name">{t('adminRecharge.colName')}</label>
-          <input id="tier-name" className={INPUT} value={editing.name ?? ''} onChange={(e) => set('name', e.target.value)} />
+          <input
+            id="tier-name"
+            className={INPUT}
+            value={editing.name ?? ''}
+            disabled={legacyAdminTier}
+            onChange={(e) => set('name', e.target.value)}
+          />
         </div>
         <div>
           <label className={LABEL} htmlFor="tier-price">{t('adminRecharge.priceYuan')}</label>
@@ -530,6 +548,7 @@ function TierForm({
             type="number"
             className={INPUT}
             value={priceYuan}
+            disabled={legacyAdminTier}
             onChange={(e) => set('priceCents', Math.round(Number(e.target.value) * 100))}
           />
         </div>
@@ -540,11 +559,15 @@ function TierForm({
               <select
                 className={INPUT}
                 value={editing.grantRole ?? 'PRO'}
+                disabled={legacyAdminTier}
                 onChange={(e) => set('grantRole', e.target.value)}
               >
-                <option value="PRO">PRO</option>
-                <option value="ADMIN">ADMIN</option>
-                <option value="FREE">FREE</option>
+                {legacyAdminTier && <option value="ADMIN">ADMIN</option>}
+                {PURCHASABLE_MEMBERSHIP_ROLES.map((role) => (
+                  <option key={role} value={role}>
+                    {role}
+                  </option>
+                ))}
               </select>
             </div>
             <div>
@@ -553,6 +576,7 @@ function TierForm({
                 type="number"
                 className={INPUT}
                 value={editing.durationDays ?? 30}
+                disabled={legacyAdminTier}
                 onChange={(e) => set('durationDays', Math.floor(Number(e.target.value)))}
               />
             </div>
@@ -592,13 +616,15 @@ function TierForm({
             type="number"
             className={INPUT}
             value={editing.sortOrder ?? 0}
+            disabled={legacyAdminTier}
             onChange={(e) => set('sortOrder', Math.floor(Number(e.target.value)))}
           />
         </div>
         <label className="flex items-center gap-2 mt-6">
           <input
             type="checkbox"
-            checked={editing.active ?? true}
+            checked={legacyAdminTier ? false : (editing.active ?? true)}
+            disabled={legacyAdminTier}
             onChange={(e) => set('active', e.target.checked)}
             className="accent-rust-500"
           />

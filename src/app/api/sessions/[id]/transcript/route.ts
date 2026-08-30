@@ -8,14 +8,19 @@ import {
 import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { logAction } from '@/lib/auditLog';
-import { callLLM } from '@/lib/llm/gateway';
 import { extractAndAccumulateKeywords } from '@/lib/llm/folderKeywords';
-import { validatePersistedTranscriptBundle } from '@/lib/sessionApi';
+import {
+  admitPersistedTranscriptBundle,
+  readBoundedSessionJson,
+  SessionTranscriptPayloadError,
+} from '@/lib/sessionApi';
 import {
   extractTranscriptText,
   loadSessionTranscriptBundle,
   stageSessionTranscriptArtifacts,
-  finalizeStagedArtifactPublish,
+  settleStagedArtifactsInTransaction,
+  completeStagedArtifactPublishes,
+  readbackStagedArtifactPublication,
   rollbackStagedArtifact,
 } from '@/lib/sessionPersistence';
 import {
@@ -23,6 +28,7 @@ import {
   loadTranscriptDraft,
 } from '@/lib/transcriptDraftPersistence';
 import { invalidateRagCache } from '@/lib/llm/embedding/transcriptRag';
+import { StoredArtifactQuotaExceededError } from '@/lib/storage/storedArtifactLedger';
 
 // Save transcript + summary data
 export async function POST(
@@ -75,65 +81,86 @@ export async function POST(
   }
 
   try {
-    const body = await req.json();
-    let bundle = validatePersistedTranscriptBundle(body);
+    const body = await readBoundedSessionJson(req);
+    let bundle = admitPersistedTranscriptBundle(body);
 
     // 如果客户端提交的 segments 为空，尝试从服务端草稿恢复
-    if (!bundle || bundle.segments.length === 0) {
+    if (bundle.segments.length === 0) {
       const draft = await loadTranscriptDraft(session);
       if (draft && draft.segments.length > 0) {
         bundle = {
           segments: draft.segments,
-          summaries: bundle?.summaries?.length ? bundle.summaries : draft.summaries,
-          translations: Object.keys(bundle?.translations ?? {}).length > 0
-            ? bundle!.translations
+          summaries: bundle.summaries.length ? bundle.summaries : draft.summaries,
+          translations: Object.keys(bundle.translations).length > 0
+            ? bundle.translations
             : draft.translations,
         };
       }
     }
 
-    if (!bundle) {
-      return NextResponse.json(
-        { error: 'Invalid transcript payload' },
-        { status: 400 }
-      );
-    }
+    // Drafts written by an older deployment may predate the strict request
+    // schema. Re-admit the merged graph at the last boundary before staging.
+    bundle = admitPersistedTranscriptBundle(bundle);
 
     // P0-6：先写版本化临时对象；DB CAS 成功后才发布，失败回滚删临时对象、绝不覆盖终态转录。
     const staged = await stageSessionTranscriptArtifacts(session, bundle);
     const fullTranscript = extractTranscriptText(bundle);
     const folderIds = session.folders.map((entry) => entry.folderId);
 
-    const keywordResults = await Promise.all(
-      folderIds.map(async (folderId) => {
-        try {
-          const added = await extractAndAccumulateKeywords(
-            session.id,
-            folderId,
-            fullTranscript,
-            callLLM
-          );
-          return { folderId, added };
-        } catch (error) {
-          console.error('Keyword accumulation error:', error);
-          return { folderId, added: [] as string[] };
-        }
-      })
-    );
-
     // G2：原子条件更新，仅在会话仍非终态时写入 transcriptPath/summaryPath。旧代码裸 update
     // ({where:{id}}) 会在并发 finalize 已把会话推到 COMPLETED 后仍把转录写回，覆盖终态产物。
-    const persisted = await prisma.session.updateMany({
-      where: {
-        id: id,
-        status: { notIn: ['COMPLETED', 'ARCHIVED'] },
-      },
-      data: {
-        transcriptPath: staged.transcript.reference,
-        summaryPath: staged.summary.reference,
-      },
-    });
-    if (persisted.count === 0) {
+    let publication: Awaited<
+      ReturnType<typeof settleStagedArtifactsInTransaction>
+    > | null;
+    try {
+      publication = await prisma.$transaction(async (tx) => {
+        const persisted = await tx.session.updateMany({
+          where: {
+            id: id,
+            status: { notIn: ['COMPLETED', 'ARCHIVED'] },
+          },
+          data: {
+            transcriptPath: staged.transcript.reference,
+            summaryPath: staged.summary.reference,
+          },
+        });
+        if (persisted.count === 0) return null;
+        return settleStagedArtifactsInTransaction(tx, [
+          staged.transcript,
+          staged.summary,
+        ]);
+      });
+    } catch (error) {
+      try {
+        const owner = await prisma.session.findUnique({
+          where: { id },
+          select: { transcriptPath: true, summaryPath: true },
+        });
+        const readback = await readbackStagedArtifactPublication(
+          [staged.transcript, staged.summary],
+          [owner?.transcriptPath, owner?.summaryPath]
+        );
+        if (readback.outcome === 'committed') {
+          publication = readback.publications;
+        } else {
+          if (readback.outcome === 'not_committed') {
+            await Promise.all([
+              rollbackStagedArtifact(session, staged.transcript).catch(
+                () => undefined
+              ),
+              rollbackStagedArtifact(session, staged.summary).catch(
+                () => undefined
+              ),
+            ]);
+          }
+          throw error;
+        }
+      } catch (readbackError) {
+        if (readbackError === error) throw error;
+        throw error;
+      }
+    }
+    if (!publication) {
       await Promise.all([
         rollbackStagedArtifact(session, staged.transcript),
         rollbackStagedArtifact(session, staged.summary),
@@ -143,10 +170,30 @@ export async function POST(
         { status: 409 }
       );
     }
-    const stored = {
-      transcript: await finalizeStagedArtifactPublish(session, staged.transcript),
-      summary: await finalizeStagedArtifactPublish(session, staged.summary),
-    };
+    const [transcriptResult, summaryResult] =
+      await completeStagedArtifactPublishes(session, publication);
+    if (!transcriptResult || !summaryResult) {
+      throw new Error('transcript artifact publication was incomplete');
+    }
+    const stored = { transcript: transcriptResult, summary: summaryResult };
+    // 只有 transcriptPath CAS 成功、artifact 已发布后才触发付费关键词任务；并发保存的
+    // loser 不得在最终返回 409 前先花费额度并污染文件夹词池。
+    const keywordResults = await Promise.all(
+      folderIds.map(async (folderId) => {
+        try {
+          const added = await extractAndAccumulateKeywords(
+            session.id,
+            folderId,
+            user.id,
+            fullTranscript
+          );
+          return { folderId, added };
+        } catch (error) {
+          console.error('Keyword accumulation error:', error);
+          return { folderId, added: [] as string[] };
+        }
+      })
+    );
     await Promise.all([
       invalidateSessionsApiCache(user.id),
       invalidateFoldersApiCache(user.id),
@@ -175,6 +222,18 @@ export async function POST(
       ),
     });
   } catch (error) {
+    if (error instanceof SessionTranscriptPayloadError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
+    if (error instanceof StoredArtifactQuotaExceededError) {
+      return NextResponse.json(
+        {
+          error: 'Storage quota exceeded; transcript was not published',
+          quota: 'storage_bytes',
+        },
+        { status: 402 }
+      );
+    }
     console.error('Save transcript error:', error);
     return NextResponse.json(
       { error: 'Failed to save transcript' },

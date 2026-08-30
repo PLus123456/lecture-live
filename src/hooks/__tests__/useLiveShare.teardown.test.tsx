@@ -55,6 +55,22 @@ vi.mock('@/stores/authStore', () => ({
     (selector: (state: { token: string }) => unknown) => selector({ token: 'jwt' }),
     { getState: () => ({ token: 'jwt' }) }
   ),
+  // 账号边界闸门：本用例只关心收尾顺序，边界恒定「仍是同一主体」。
+  getAuthBoundarySnapshot: () => ({
+    epoch: 1,
+    userId: 'user-1',
+    sessionBinding: 'binding-1',
+  }),
+  getAuthBoundaryAbortSignal: () => ({ aborted: false }),
+  isAuthBoundaryCurrent: () => true,
+  isPersistedAuthBoundaryCurrent: () => true,
+}));
+
+vi.mock('@/lib/clientAuthCookieMutation', () => ({
+  runAuthBoundaryCommit: async (
+    _expected: unknown,
+    commit: () => unknown | Promise<unknown>
+  ) => ({ committed: true, value: await commit() }),
 }));
 
 import { useLiveShare } from '@/hooks/useLiveShare';

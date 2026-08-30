@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginViaForm } from './helpers';
 
 /**
  * 上传转录的配额门禁契约（P5-19 / P1-3）—— 全 route mock，不连真库、不连 Soniox。
@@ -58,9 +58,9 @@ test.beforeEach(async ({ page }) => {
     if (p === '/api/site-config')
       return fulfillJson(route, { site_name: 'QA', allow_registration: true });
     if (p === '/api/auth/login' && method === 'POST')
-      return fulfillJson(route, { user, token: '__cookie_session__' });
-    if (p === '/api/auth/refresh' && method === 'GET')
-      return fulfillJson(route, { user, token: '__cookie_session__' });
+      return fulfillJson(route, { user, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST'))
+      return fulfillJson(route, { user, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     if (p === '/api/users/quota') return fulfillJson(route, quotaPayload);
     if (p === '/api/folders') return fulfillJson(route, []);
 

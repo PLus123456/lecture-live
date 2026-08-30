@@ -14,7 +14,9 @@ import {
 import { deleteRecordingDraft } from '@/lib/recordingDraftPersistence';
 import {
   stageSessionAudioArtifact,
-  finalizeStagedArtifactPublish,
+  settleStagedArtifactsInTransaction,
+  completeStagedArtifactPublishes,
+  readbackStagedArtifactPublication,
   rollbackStagedArtifact,
   loadSessionAudioArtifact,
   resolveSessionAudioLocation,
@@ -22,12 +24,14 @@ import {
 } from '@/lib/sessionPersistence';
 import { CloudreveStorage } from '@/lib/storage/cloudreve';
 import {
+  measureAuthoritativeRecordingDurationMsFromBuffer,
   normalizeRecordedAudioDuration,
-  probeAudioDurationMsFromBuffer,
-  resolveExpectedRecordingDurationMs,
+  RECORDING_DURATION_LIMIT_GRACE_MS,
+  RecordingDurationMeasurementError,
 } from '@/lib/audio/recordingDuration';
-import { clampSessionDurationMs } from '@/lib/billing';
-import { checkQuota, releaseStorageBytes, reserveStorageBytes } from '@/lib/quota';
+import { getMaxSessionDurationMs } from '@/lib/billing';
+import { checkQuota } from '@/lib/quota';
+import { StoredArtifactQuotaExceededError } from '@/lib/storage/storedArtifactLedger';
 
 // Save audio recording
 export async function POST(
@@ -117,28 +121,23 @@ export async function POST(
       );
     }
 
-    // G2/G3：durationMs 派生自可被伪造的 transcript globalEndMs（resolveTranscriptDurationMs
-    // 会 Math.max 进来），必须按角色上界 clamp 后再落库，否则 SUM(durationMs)/3600000 存储
-    // 小时用量可被撑到 Int 上界。
-    // P5-14：三个来源（session.durationMs / transcript / serverStartedAt）都建立在
-    // 「走过实时链路」的前提上。直传口可以往一个从没连过 WS 的会话灌音频，那时三者同时为 0，
-    // 这段录音对 storage_hours 的贡献恒为 0 —— 等于绕开存储小时额度。用 ffprobe 读真时长兜底。
-    //
-    // session-persist#151：兜底条件此前是「三源皆 0 才 probe」，于是只要**先**往库里塞一个极小
-    // 正值就能把整条 ffprobe 分支跳过 —— PATCH /api/sessions/[id] 允许会话所有者首次写入任意
-    // durationMs（1ms ≥ 当前 0、非终态，两道守卫都不拦），随后直传数小时的低码率录音：
-    // resolveExpectedRecordingDurationMs 返回 1，probe 不跑，1ms 落库。该录音对 storage_hours
-    // 几乎零贡献，且 /full-transcribe 的预留与实扣都按 ceil(getBillableMinutes(1)×倍率)=1 分钟
-    // 计价 —— 1 分钟额度换数小时 Soniox 转录。PATCH 侧已彻底不再接受客户端 durationMs，这里再
-    // 把口径从「为 0 才探测」改成「与探测值取最大值」：任何来源的低报都被真实音频长度顶上去。
-    const probedDurationMs = await probeAudioDurationMsFromBuffer(
+    // SEC-018：recordingPath 一旦发布，durationMs 必须来自将要发布的媒体本身。客户端值、转录
+    // 时间戳和服务器墙钟都不能替代媒体测量，也不能用一个极小正值跳过测量。容器 duration 也
+    // 属于输入字节，因此统一安全解码到 null 后取实际音频帧时长；失败抛错并在 stage 前终止。
+    const durationMs = await measureAuthoritativeRecordingDurationMsFromBuffer(
       buffer,
       normalizedMimeType
     );
-    const durationMs = clampSessionDurationMs(
-      Math.max(await resolveExpectedRecordingDurationMs(session), probedDurationMs),
-      user.role
-    );
+    const maxDurationMs = getMaxSessionDurationMs(user.role);
+    if (
+      maxDurationMs !== null &&
+      durationMs > maxDurationMs + RECORDING_DURATION_LIMIT_GRACE_MS
+    ) {
+      return NextResponse.json(
+        { error: 'Recording exceeds the maximum session duration' },
+        { status: 422 }
+      );
+    }
 
     const normalizedBuffer = await normalizeRecordedAudioDuration({
       buffer,
@@ -146,80 +145,69 @@ export async function POST(
       durationMs,
     });
 
-    // P5-14：直传录音此前**完全不入 storage_bytes**（只过了 storage_hours 那道读时闸），
-    // 于是 32MB × 20 次/小时/用户 的字节量对字节配额完全隐形。这里补上净增量预留。
-    //
-    // 「净增量」而不是「全额」：同一会话在非终态期间可以反复 re-POST，全额累加会把用户额度
-    // 吃空且没有释放路径。旧录音大小只有本地存储能低成本拿到（stat）；Cloudreve 拿不到，
-    // 那种情况下跳过预留 —— 宁可漏计一次覆盖，也不能凭空永久吃掉用户额度。
-    const previousLocation = await resolveSessionAudioLocation(session).catch(
-      () => null
-    );
-    let reservedBytes = 0;
-    if (!previousLocation) {
-      reservedBytes = normalizedBuffer.length;
-    } else if (previousLocation.kind === 'local') {
-      reservedBytes = Math.max(0, normalizedBuffer.length - previousLocation.size);
-    }
-    if (reservedBytes > 0) {
-      const gotBytes = await reserveStorageBytes(user.id, reservedBytes);
-      if (!gotBytes) {
-        return NextResponse.json(
-          {
-            error: 'Storage quota exceeded; cannot save recording',
-            quota: 'storage_bytes',
-          },
-          { status: 402 }
-        );
-      }
-    }
-    /** 任何失败路径都要把刚预留的字节还回去。 */
-    const releaseReservedBytes = async () => {
-      if (reservedBytes > 0) {
-        await releaseStorageBytes(user.id, reservedBytes).catch(() => undefined);
-      }
-    };
-
     // P0-6：先写版本化临时对象（绝不覆盖旧固定 key），DB CAS 成功后才发布（删旧）；
     // CAS 失败则回滚删掉临时对象、绝不触碰已定稿的旧录音。
     const staged = await stageSessionAudioArtifact(
       session,
       normalizedBuffer,
       normalizedMimeType
-    ).catch(async (error) => {
-      await releaseReservedBytes();
-      throw error;
-    });
+    );
 
     // G3：原子条件更新，仅在会话仍处于非终态时写入 recordingPath，杜绝并发下
     // finalize 已把会话推到 COMPLETED 后本请求再覆写录音。
-    const persisted = await prisma.session.updateMany({
-      where: {
-        id: id,
-        status: { notIn: ['COMPLETED', 'ARCHIVED'] },
-      },
-      data: {
-        recordingPath: staged.reference,
-        ...(durationMs > 0 ? { durationMs } : {}),
-      },
-    });
+    let publication: Awaited<
+      ReturnType<typeof settleStagedArtifactsInTransaction>
+    > | null;
+    try {
+      publication = await prisma.$transaction(async (tx) => {
+        const persisted = await tx.session.updateMany({
+          where: {
+            id: id,
+            status: { notIn: ['COMPLETED', 'ARCHIVED'] },
+          },
+          data: {
+            recordingPath: staged.reference,
+            ...(durationMs > 0 ? { durationMs } : {}),
+          },
+        });
+        if (persisted.count === 0) return null;
+        return settleStagedArtifactsInTransaction(tx, [staged]);
+      });
+    } catch (error) {
+      try {
+        const owner = await prisma.session.findUnique({
+          where: { id },
+          select: { recordingPath: true },
+        });
+        const readback = await readbackStagedArtifactPublication(
+          [staged],
+          [owner?.recordingPath]
+        );
+        if (readback.outcome === 'committed') {
+          publication = readback.publications;
+        } else {
+          if (readback.outcome === 'not_committed') {
+            await rollbackStagedArtifact(session, staged).catch(() => undefined);
+          }
+          throw error;
+        }
+      } catch (readbackError) {
+        if (readbackError === error) throw error;
+        // Unknown publication outcome: preserve the staged object. TTL cleanup
+        // will reclaim it only if it remained RESERVED.
+        throw error;
+      }
+    }
 
-    if (persisted.count === 0) {
+    if (!publication) {
       await rollbackStagedArtifact(session, staged);
-      await releaseReservedBytes();
       return NextResponse.json(
         { error: 'Cannot overwrite recording of a finalized session' },
         { status: 409 }
       );
     }
-    // 本地覆盖且新录音更小：把腾出来的字节还给用户（预留只算了正向增量）。
-    if (previousLocation?.kind === 'local') {
-      const freed = previousLocation.size - normalizedBuffer.length;
-      if (freed > 0) {
-        await releaseStorageBytes(user.id, freed).catch(() => undefined);
-      }
-    }
-    const stored = await finalizeStagedArtifactPublish(session, staged);
+    const [stored] = await completeStagedArtifactPublishes(session, publication);
+    if (!stored) throw new Error('recording artifact publication was incomplete');
     await invalidateSessionsApiCache(user.id);
     await deleteRecordingDraft(session).catch(() => undefined);
 
@@ -229,6 +217,24 @@ export async function POST(
       storage: stored.storage,
     });
   } catch (error) {
+    if (error instanceof StoredArtifactQuotaExceededError) {
+      return NextResponse.json(
+        {
+          error: 'Storage quota exceeded; cannot save recording',
+          quota: 'storage_bytes',
+        },
+        { status: 402 }
+      );
+    }
+    if (error instanceof RecordingDurationMeasurementError) {
+      return NextResponse.json(
+        {
+          error: 'Could not verify recording duration; recording was not published',
+          retryable: true,
+        },
+        { status: 422 }
+      );
+    }
     console.error('Save audio error:', error);
     return NextResponse.json(
       { error: 'Failed to save audio' },

@@ -29,18 +29,23 @@
  * 作为 async-upload init 的配额门禁入参；服务端 ffprobe 才是最终真相）。
  */
 
+import {
+  createAccountObjectUrl,
+  revokeAccountObjectUrl,
+} from '@/lib/accountObjectUrls';
+
 /**
  * 解析音频/视频文件时长（用 <audio> 的 metadata 加载）。
  */
 export async function probeAudioDurationMs(file: File): Promise<number> {
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
+    const url = createAccountObjectUrl(file);
     const audio = document.createElement('audio');
     audio.preload = 'metadata';
     audio.src = url;
     audio.muted = true;
     const cleanup = () => {
-      URL.revokeObjectURL(url);
+      revokeAccountObjectUrl(url);
       audio.remove();
     };
     audio.addEventListener('loadedmetadata', () => {

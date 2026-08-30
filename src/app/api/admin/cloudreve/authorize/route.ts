@@ -7,6 +7,7 @@ import {
 } from '@/lib/storage/cloudreve';
 import { prisma } from '@/lib/prisma';
 import { resolvePublicAppOrigin } from '@/lib/requestOrigin';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 /**
  * PKCE code_verifier 在 SiteSetting 中的存活时间（10 分钟）。
@@ -28,14 +29,29 @@ function encodeCodeVerifier(verifier: string, now: number): string {
  * 发起 Cloudreve V4 OAuth 授权流程，返回授权 URL
  */
 export async function GET(req: Request) {
-  const { response } = await requireAdminAccess(req, {
+  const { user: admin, response } = await requireAdminAccess(req, {
     scope: 'admin:cloudreve:authorize',
     limit: 10,
     windowMs: 60_000,
   });
-  if (response) return response;
+  if (response || !admin) return response!;
 
   if (!(await isCloudreveConfiguredAsync())) {
+    try {
+      await writeSecurityAudit(req, {
+        event: 'cloudreve.authorize',
+        operator: { id: admin.id, email: admin.email, role: admin.role },
+        target: { type: 'cloudreve_oauth', id: 'global' },
+        before: { configured: false },
+        reason: 'oauth_not_configured',
+        outcome: 'DENIED',
+      });
+    } catch {
+      return NextResponse.json(
+        { error: '审计服务暂不可用，请稍后重试' },
+        { status: 503 }
+      );
+    }
     return NextResponse.json(
       { error: 'Cloudreve OAuth 未配置，请先在环境变量或管理面板中填写 Cloudreve 地址、Client ID、Client Secret' },
       { status: 400 }
@@ -50,20 +66,39 @@ export async function GET(req: Request) {
     const codeVerifier = generateCodeVerifier();
     const storedVerifier = encodeCodeVerifier(codeVerifier, Date.now());
 
-    await Promise.all([
-      prisma.siteSetting.upsert({
-        where: { key: 'cloudreve_code_verifier' },
-        update: { value: storedVerifier },
-        create: { key: 'cloudreve_code_verifier', value: storedVerifier },
-      }),
-      prisma.siteSetting.upsert({
-        where: { key: 'cloudreve_redirect_uri' },
-        update: { value: redirectUri },
-        create: { key: 'cloudreve_redirect_uri', value: redirectUri },
-      }),
-    ]);
-
     const authorizeUrl = await buildAuthorizeUrl(redirectUri, codeVerifier);
+
+    // PKCE 全局状态与成功审计同事务提交；审计不可用时不留下可消费的 verifier。
+    await prisma.$transaction(async (tx) => {
+      await Promise.all([
+        tx.siteSetting.upsert({
+          where: { key: 'cloudreve_code_verifier' },
+          update: { value: storedVerifier },
+          create: { key: 'cloudreve_code_verifier', value: storedVerifier },
+        }),
+        tx.siteSetting.upsert({
+          where: { key: 'cloudreve_redirect_uri' },
+          update: { value: redirectUri },
+          create: { key: 'cloudreve_redirect_uri', value: redirectUri },
+        }),
+      ]);
+      await writeSecurityAudit(
+        req,
+        {
+          event: 'cloudreve.authorize',
+          operator: { id: admin.id, email: admin.email, role: admin.role },
+          target: { type: 'cloudreve_oauth', id: 'global' },
+          before: { state: 'idle' },
+          after: {
+            state: 'authorization_pending',
+            redirectOrigin: new URL(redirectUri).origin,
+          },
+          reason: 'admin_oauth_authorization_start',
+          outcome: 'SUCCESS',
+        },
+        tx
+      );
+    });
 
     return NextResponse.json({ authorize_url: authorizeUrl });
   } catch (err) {

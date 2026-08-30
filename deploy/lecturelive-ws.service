@@ -2,6 +2,9 @@
 Description=LectureLive WebSocket Server
 After=network.target mysql.service redis.service
 Wants=mysql.service redis.service
+# 与 Web 双向绑定：直接启动任一 unit 都会纳入完整 Web+WS 启动事务，任一项
+# 退出或启动闸失败时另一项也会停止，避免只剩半套服务继续对外提供能力。
+BindsTo=lecturelive-web.service
 
 [Service]
 Type=simple
@@ -14,9 +17,11 @@ WorkingDirectory=/opt/lecturelive/ws-server
 Environment=WS_HOST=127.0.0.1
 # 使用 node --env-file 加载 .env（正确处理引号），不用 EnvironmentFile
 # websocket.js 是 esbuild 编译的产物，不再依赖 ts-node
+ExecStartPre=/usr/bin/grep -Fxq health-ready-v1 /opt/lecturelive/.runtime-security-version
+ExecStartPre=/usr/bin/node --env-file=/opt/lecturelive/.env /opt/lecturelive/scripts/check-production-payment-config.mjs
 ExecStart=/usr/bin/node --env-file=/opt/lecturelive/.env websocket.js
-Restart=always
-RestartSec=5
+# 启动安全闸失败必须保持停止，不能由 Restart=always 无限重试。
+Restart=no
 KillSignal=SIGTERM
 TimeoutStopSec=45
 StandardOutput=journal

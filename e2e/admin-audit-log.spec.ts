@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
+import { E2E_SESSION_BINDING, fulfillJson, installBrowserStubs, loginAsAdmin } from './helpers';
 
 /**
  * admin「日志」（审计日志）面板烟测。
@@ -72,11 +72,11 @@ test.beforeEach(async ({ page }) => {
       });
     }
     if (p === '/api/auth/login' && method === 'POST') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
     // 整页导航到 /admin 后 token 不在内存，靠 cookie 恢复；否则 AuthGuard 跳回 /login。
-    if (p === '/api/auth/refresh' && method === 'GET') {
-      return fulfillJson(route, { user: adminUser, token: '__cookie_session__' });
+    if (p === '/api/auth/refresh' && (method === 'GET' || method === 'POST')) {
+      return fulfillJson(route, { user: adminUser, token: '__cookie_session__', sessionBinding: E2E_SESSION_BINDING });
     }
 
     // AuditLogPanel 挂载：审计日志（按 action / keyword 过滤，模拟服务端）

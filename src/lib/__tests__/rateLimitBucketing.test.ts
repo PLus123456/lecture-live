@@ -20,8 +20,8 @@ const fakeRedis = {
 };
 
 vi.mock('@/lib/redis', () => ({ getRedisClient: () => fakeRedis }));
-// clientIp 会异步 import('@/lib/prisma') 刷新 trusted_proxy；给个不返回行的桩，
-// 让它回落到环境变量（这样测试可以直接改 TRUSTED_PROXY）。
+// 代理拓扑现在完全来自环境变量（TRUSTED_PROXY_HOPS / TRUSTED_PROXY_CIDRS），
+// 不再有数据库 trusted_proxy 布尔；prisma 桩仅为满足模块依赖。
 vi.mock('@/lib/prisma', () => ({
   prisma: { siteSetting: { findUnique: async () => null } },
 }));
@@ -46,13 +46,14 @@ function req(url: string, headers: Record<string, string> = {}): Request {
 const OPTS = { scope: 'test:scope', limit: 5, windowMs: 60_000 };
 
 const SAVED_ENV: Record<string, string | undefined> = {};
-const ENV_KEYS = ['TRUSTED_PROXY', 'TRUSTED_PROXY_IP_HEADER', 'JWT_SECRET'];
+const ENV_KEYS = ['TRUSTED_PROXY_HOPS', 'TRUSTED_PROXY_CIDRS', 'JWT_SECRET'];
 
 beforeEach(() => {
   for (const key of ENV_KEYS) SAVED_ENV[key] = process.env[key];
   process.env.JWT_SECRET = TEST_SECRET;
-  process.env.TRUSTED_PROXY = 'false';
-  delete process.env.TRUSTED_PROXY_IP_HEADER;
+  // 缺省按「直连、不经代理」跑：HTTP 侧不采信任何代理头，等价于旧的 TRUSTED_PROXY=false。
+  process.env.TRUSTED_PROXY_HOPS = '0';
+  delete process.env.TRUSTED_PROXY_CIDRS;
 
   fakeRedis.status = 'ready';
   fakeRedis.incr.mockReset().mockResolvedValue(1);
@@ -183,88 +184,91 @@ describe('H7 —— trusted_proxy=false 时默认桶不再塌缩', () => {
 });
 
 describe('H7 —— 可信代理开启时行为不变（回归）', () => {
-  it('X-Real-IP 解析出的 IP 仍然是 ip: 桶', async () => {
-    process.env.TRUSTED_PROXY = 'true';
-    const key = await bucketKeyFor(
-      req('http://localhost/api/llm/report', { 'x-real-ip': '203.0.113.7' })
-    );
+  // 新模型：TRUSTED_PROXY_HOPS=1 表示「客户端 → 本机 nginx → 应用」固定一跳。
+  // nginx 模板对两个头都用 proxy_set_header 覆盖成 $remote_addr，所以它们必然一致；
+  // 只给 X-Real-IP、不给 XFF 是**配置错误**，此时按 fail-closed 归入 anon 桶。
+  function proxied(ip: string, headers: Record<string, string> = {}) {
+    return req('http://localhost/api/llm/report', {
+      'x-forwarded-for': ip,
+      'x-real-ip': ip,
+      ...headers,
+    });
+  }
+
+  it('反代覆盖过的来源 IP 仍然是 ip: 桶', async () => {
+    process.env.TRUSTED_PROXY_HOPS = '1';
+    const key = await bucketKeyFor(proxied('203.0.113.7'));
     expect(key).toBe('ratelimit:test:scope:ip:203.0.113.7');
   });
 
   it('两个不同来源 IP 分属两个桶', async () => {
-    process.env.TRUSTED_PROXY = 'true';
-    const a = await bucketKeyFor(
-      req('http://localhost/api/llm/report', { 'x-real-ip': '203.0.113.7' })
-    );
-    const b = await bucketKeyFor(
-      req('http://localhost/api/llm/report', { 'x-real-ip': '198.51.100.9' })
-    );
+    process.env.TRUSTED_PROXY_HOPS = '1';
+    const a = await bucketKeyFor(proxied('203.0.113.7'));
+    const b = await bucketKeyFor(proxied('198.51.100.9'));
     expect(a).not.toBe(b);
   });
 
   it('真实 IP 优先于 JWT 身份（同一用户换 IP 不共享桶）', async () => {
-    process.env.TRUSTED_PROXY = 'true';
+    process.env.TRUSTED_PROXY_HOPS = '1';
     const token = signFor('user-a');
     const key = await bucketKeyFor(
-      req('http://localhost/api/llm/report', {
-        'x-real-ip': '203.0.113.7',
-        authorization: `Bearer ${token}`,
-      })
+      proxied('203.0.113.7', { authorization: `Bearer ${token}` })
     );
     expect(key).toContain('ip:203.0.113.7');
+  });
+
+  it('两个代理头互相矛盾时 fail-closed（攻击者伪造其一换不出桶）', async () => {
+    process.env.TRUSTED_PROXY_HOPS = '1';
+    const key = resolveRateLimitClientKey(
+      req('http://localhost/api/x', {
+        'x-forwarded-for': '203.0.113.7',
+        'x-real-ip': '1.2.3.4',
+      })
+    );
+    expect(key).not.toContain('ip:203.0.113.7');
+    expect(key).not.toContain('ip:1.2.3.4');
   });
 });
 
 describe('M22 —— 可信代理头的取值收窄', () => {
-  it('非 IP 字面量的 X-Real-IP 不再被当成来源（换不出无穷个桶）', async () => {
-    process.env.TRUSTED_PROXY = 'true';
+  function proxied(url: string, ip: string) {
+    return req(url, { 'x-forwarded-for': ip, 'x-real-ip': ip });
+  }
+
+  it('非 IP 字面量不再被当成来源（换不出无穷个桶）', async () => {
+    process.env.TRUSTED_PROXY_HOPS = '1';
     const a = resolveRateLimitClientKey(
-      req('http://localhost/api/share/view/T', { 'x-real-ip': 'bucket-aaaa' })
+      proxied('http://localhost/api/share/view/T', 'bucket-aaaa')
     );
     const b = resolveRateLimitClientKey(
-      req('http://localhost/api/share/view/T', { 'x-real-ip': 'bucket-bbbb' })
+      proxied('http://localhost/api/share/view/T', 'bucket-bbbb')
     );
     expect(a).toBe(b);
     expect(a).toMatch(/anon:/);
   });
 
   it('带端口 / IPv4-mapped 的写法归一到同一个桶', async () => {
-    process.env.TRUSTED_PROXY = 'true';
-    const plain = resolveRateLimitClientKey(
-      req('http://localhost/api/x', { 'x-real-ip': '203.0.113.7' })
-    );
+    process.env.TRUSTED_PROXY_HOPS = '1';
+    const plain = resolveRateLimitClientKey(proxied('http://localhost/api/x', '203.0.113.7'));
     const withPort = resolveRateLimitClientKey(
-      req('http://localhost/api/x', { 'x-real-ip': '203.0.113.7:51234' })
+      proxied('http://localhost/api/x', '203.0.113.7:51234')
     );
     const mapped = resolveRateLimitClientKey(
-      req('http://localhost/api/x', { 'x-real-ip': '::ffff:203.0.113.7' })
+      proxied('http://localhost/api/x', '::ffff:203.0.113.7')
     );
     expect(withPort).toBe(plain);
     expect(mapped).toBe(plain);
   });
 
-  it('TRUSTED_PROXY_IP_HEADER=x-forwarded-for 时伪造的 X-Real-IP 被彻底忽略', async () => {
-    process.env.TRUSTED_PROXY = 'true';
-    process.env.TRUSTED_PROXY_IP_HEADER = 'x-forwarded-for';
+  it('HOPS=0（直连部署）时代理头一律不采信', async () => {
+    process.env.TRUSTED_PROXY_HOPS = '0';
     const key = resolveRateLimitClientKey(
       req('http://localhost/api/x', {
-        'x-real-ip': '1.2.3.4',
-        'x-forwarded-for': '9.9.9.9, 203.0.113.7',
-      })
-    );
-    expect(key).toBe('ip:203.0.113.7');
-  });
-
-  it('TRUSTED_PROXY_IP_HEADER=x-real-ip 时伪造的 XFF 被彻底忽略', async () => {
-    process.env.TRUSTED_PROXY = 'true';
-    process.env.TRUSTED_PROXY_IP_HEADER = 'x-real-ip';
-    const key = resolveRateLimitClientKey(
-      req('http://localhost/api/x', {
+        'x-forwarded-for': '203.0.113.7',
         'x-real-ip': '203.0.113.7',
-        'x-forwarded-for': '9.9.9.9',
       })
     );
-    expect(key).toBe('ip:203.0.113.7');
+    expect(key).not.toContain('ip:203.0.113.7');
   });
 });
 

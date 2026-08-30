@@ -1,0 +1,74 @@
+// Build the TypeScript backfill into an isolated temporary executable. This keeps
+// the db-push path independent of a prebuilt Next bundle while still reusing the
+// exact production Cloudreve validation/authentication implementation.
+//
+// 产物必须落在**项目内**（这里是 node_modules 下的临时目录），不能放 os.tmpdir()：
+// `@prisma/client` 是 --external 的，运行时仍是裸说明符，而 ESM 的裸说明符解析是从
+// **导入文件所在目录**逐级向上找 node_modules 的，与 cwd 无关。放 /tmp 时 Node 从 /tmp
+// 一路向上都找不到 node_modules → ERR_MODULE_NOT_FOUND，回填必挂；而回填是 ensure-database
+// 的第 ⑦ 步，upgrade.sh 又是 `set -e` 且此前已 systemctl stop —— 一挂就是「服务停着、
+// 升级中止」。放进 node_modules 后向上第一跳就是项目自己的 node_modules。
+import { existsSync, mkdtempSync, rmSync } from 'fs';
+import path from 'path';
+import { spawnSync } from 'child_process';
+import { loadEnvFileIfNeeded } from './load-env.mjs';
+
+const root = process.cwd();
+loadEnvFileIfNeeded(root);
+
+const esbuild = path.join(
+  root,
+  'node_modules',
+  '.bin',
+  process.platform === 'win32' ? 'esbuild.cmd' : 'esbuild'
+);
+if (!existsSync(esbuild)) {
+  console.error('[backfill-stored-artifacts] esbuild is required for the database backfill');
+  process.exit(1);
+}
+
+const temp = mkdtempSync(
+  path.join(root, 'node_modules', '.lecture-live-artifact-backfill-')
+);
+const output = path.join(temp, 'backfill.mjs');
+try {
+  const build = spawnSync(
+    esbuild,
+    [
+      path.join(root, 'scripts', 'backfill-stored-artifacts.ts'),
+      '--bundle',
+      '--platform=node',
+      '--format=esm',
+      '--target=node24',
+      `--outfile=${output}`,
+      '--external:@prisma/client',
+      // 打成 ESM 时 esbuild 会给 CJS 依赖塞一个会抛错的 __require 垫片；pino 之类
+      // 在模块求值阶段 `require('node:os')` 的包会当场炸。补一个真的 require。
+      '--banner:js=import { createRequire as __nodeCreateRequire } from "node:module"; const require = __nodeCreateRequire(import.meta.url);',
+      `--alias:server-only=${path.join(root, 'deploy', 'shims', 'server-only.js')}`,
+    ],
+    { cwd: root, env: process.env, stdio: 'inherit' }
+  );
+  if (build.error || build.status !== 0) {
+    console.error(
+      '[backfill-stored-artifacts] build failed:',
+      build.error?.message ?? `exit ${build.status}`
+    );
+    process.exit(build.status || 1);
+  }
+
+  const run = spawnSync(process.execPath, [output], {
+    cwd: root,
+    env: process.env,
+    stdio: 'inherit',
+  });
+  if (run.error || run.status !== 0) {
+    console.error(
+      '[backfill-stored-artifacts] execution failed:',
+      run.error?.message ?? `exit ${run.status}`
+    );
+    process.exit(run.status || 1);
+  }
+} finally {
+  rmSync(temp, { recursive: true, force: true });
+}

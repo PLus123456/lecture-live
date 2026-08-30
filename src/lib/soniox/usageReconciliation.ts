@@ -321,7 +321,10 @@ async function applyUsageLogToGrant(
       return { outcome: 'backfilled' as const, minutes: 0, userId: '' };
     }
 
-    const snap = await deductTranscriptionMinutes(grant.userId, minutes, tx);
+    const snap = await deductTranscriptionMinutes(grant.userId, minutes, tx, {
+      source: refunded ? 'soniox_late_usage' : 'soniox_usage_topup',
+      referenceId: ref.grantId,
+    });
     await tx.sonioxStreamGrant.update({
       where: { id: ref.grantId },
       data: {
@@ -494,7 +497,10 @@ async function settleOrphanGrants(now: Date): Promise<{
             tx
           );
           if (settled.settledCount !== 1) return false;
-          const snap = await deductTranscriptionMinutes(grant.userId, minutes, tx);
+          const snap = await deductTranscriptionMinutes(grant.userId, minutes, tx, {
+            source: 'soniox_orphan_usage',
+            referenceId: grant.id,
+          });
           await tx.sonioxStreamGrant.update({
             where: { id: grant.id },
             data: { billedMinutes: snap && snap.role !== 'ADMIN' ? minutes : 0 },

@@ -6,32 +6,46 @@ const {
   requireAdminAccessMock,
   workerFindUniqueMock,
   workerUpdateMock,
+  workerDeleteMock,
+  securityAuditMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   workerFindUniqueMock: vi.fn(),
   workerUpdateMock: vi.fn(),
+  workerDeleteMock: vi.fn(),
+  securityAuditMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({
   requireAdminAccess: requireAdminAccessMock,
 }));
 
-vi.mock('@/lib/prisma', () => ({
-  prisma: {
+vi.mock('@/lib/prisma', () => {
+  const tx = {
     translationWorker: {
       findUnique: workerFindUniqueMock,
       update: workerUpdateMock,
+      delete: workerDeleteMock,
     },
-  },
-}));
+  };
+  return {
+    prisma: {
+      ...tx,
+      $transaction: async (fn: (value: typeof tx) => Promise<unknown>) => fn(tx),
+    },
+  };
+});
 
 vi.mock('@/lib/crypto', () => ({ encrypt: (v: string) => `enc:${v}` }));
 vi.mock('@/lib/auditLog', () => ({ logAction: vi.fn() }));
+vi.mock('@/lib/securityAudit', () => ({
+  writeSecurityAudit: securityAuditMock,
+}));
 vi.mock('@/lib/storage/cloudreve', () => ({
   validateCloudreveBaseUrl: vi.fn(),
 }));
 
-import { PATCH } from '@/app/api/admin/translate/workers/[id]/route';
+import { DELETE, PATCH } from '@/app/api/admin/translate/workers/[id]/route';
 
 const EXISTING = {
   id: 'w-1',
@@ -63,6 +77,8 @@ describe('PATCH /api/admin/translate/workers/[id] — 换靶闸范围：不设�
     requireAdminAccessMock.mockReset();
     workerFindUniqueMock.mockReset();
     workerUpdateMock.mockReset();
+    workerDeleteMock.mockReset().mockResolvedValue({ ...EXISTING });
+    securityAuditMock.mockReset().mockResolvedValue(undefined);
 
     requireAdminAccessMock.mockResolvedValue({
       user: { id: 'admin-1', role: 'ADMIN' },
@@ -84,6 +100,14 @@ describe('PATCH /api/admin/translate/workers/[id] — 换靶闸范围：不设�
     );
     expect(res.status).toBe(200);
     expect(workerUpdateMock).toHaveBeenCalled();
+    expect(securityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'translate-workers.update',
+        outcome: 'SUCCESS',
+      }),
+      expect.any(Object)
+    );
   });
 
   it('token 只传空白（= 保持原值）同样放行', async () => {
@@ -131,5 +155,30 @@ describe('PATCH /api/admin/translate/workers/[id] — 换靶闸范围：不设�
       { params }
     );
     expect(res.status).toBe(200);
+  });
+
+  it('审计失败时关闭失败，不确认 worker 更新', async () => {
+    securityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+    const res = await PATCH(makeRequest({ concurrency: 4 }), { params });
+    expect(res.status).toBe(500);
+  });
+
+  it('DELETE 与 SUCCESS audit 同事务', async () => {
+    const res = await DELETE(
+      new Request('http://localhost/api/admin/translate/workers/w-1', {
+        method: 'DELETE',
+      }),
+      { params }
+    );
+    expect(res.status).toBe(200);
+    expect(workerDeleteMock).toHaveBeenCalledWith({ where: { id: 'w-1' } });
+    expect(securityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'translate-workers.delete',
+        outcome: 'SUCCESS',
+      }),
+      expect.any(Object)
+    );
   });
 });

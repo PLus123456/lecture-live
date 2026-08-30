@@ -1,5 +1,3 @@
-import fs from 'fs/promises';
-import path from 'path';
 import { prisma } from '@/lib/prisma';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
@@ -15,7 +13,6 @@ import {
   resetExpiredTranscriptionQuotas,
   reconcileStorageBytes,
   settleAsyncReservation,
-  settleFullReservation,
   settlePoolOnLimitChange,
 } from '@/lib/quota';
 import {
@@ -26,6 +23,7 @@ import { runTranscriptionUsageReconciliation } from '@/lib/reconciliation';
 import { getRedisClient } from '@/lib/redis';
 import { sendExpiryReminderEmail } from '@/lib/email';
 import { pruneExpiredEmailTokens } from '@/lib/email/tokens';
+import { pruneExpiredAuthTokenFamilies } from '@/lib/authTokenFamilyMaintenance';
 import { finalizeSession } from '@/lib/sessionFinalization';
 import {
   runChatFilesCleanup,
@@ -40,8 +38,14 @@ import {
 } from '@/lib/soniox/asyncFile';
 import { finalizeAsyncTranscription } from '@/lib/audio/asyncTranscribeFinalize';
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
+import {
+  failFullTranscribeAttempt,
+  releaseTerminalFullTranscribeReservation,
+} from '@/lib/audio/fullTranscribeAdmission';
+import { cleanupFullTranscribeWorkDir } from '@/lib/audio/fullTranscribeInput';
 import { reclaimStaleInterpretSessions } from '@/lib/interpret/session';
 import { reconcileSonioxStreamUsage } from '@/lib/soniox/usageReconciliation';
+import { cleanupExpiredStoredArtifacts } from '@/lib/storage/storedArtifactCleanup';
 import { expireStalePaymentOrders } from '@/lib/wallet';
 
 const STALE_SESSION_THRESHOLD_MS = 4 * 60 * 60_000;
@@ -71,7 +75,6 @@ const FULL_TRANSCRIBE_RECLAIMABLE_STATUSES = [
   'finalizing',
 ];
 // 与 fullTranscribeProcessor 的 TMP_ROOT 约定一致：回收硬崩残留的转码临时目录时兜底清理。
-const FULL_TRANSCRIBE_TMP_ROOT = path.join(process.cwd(), 'data', 'full-transcribe-tmp');
 const MAINTENANCE_INTERVAL_MS = 15 * 60_000;
 const RECONCILIATION_LAST_RUN_KEY = 'billing.reconciliation.lastRunUtcDate';
 const billingLogger = logger.child({ component: 'billing-maintenance' });
@@ -85,11 +88,11 @@ type BillingMaintenanceGlobal = typeof globalThis & {
 export interface BillingMaintenanceSummary {
   resetUsers: number;
   expiredRoleDowngrades: number;
+  expiredPaymentOrders: number;
   reclaimedSessions: number;
   reclaimedAsyncUploads: number;
   reclaimedFullTranscribes: number;
   reclaimedStaleJobs: number;
-  expiredPaymentOrders: number;
   releasedOrphanReservations: number;
   releasedOrphanFullReservations: number;
   cleanedOrphanSoniox: number;
@@ -106,6 +109,7 @@ export interface BillingMaintenanceSummary {
   storageBytesReconciled: number;
   reconciliationRunId: string | null;
   prunedEmailTokens: number;
+  prunedAuthTokenFamilies: number;
   chatFilesCleanup: {
     agingDeleted: number;
     softCapDeleted: number;
@@ -352,7 +356,7 @@ export async function runBillingMaintenance(options?: {
   // 绕过 failJob：任务停在 TRANSLATING、钱不退、不排自动重试、也不再被对账捞到。
   let reclaimedStaleJobs = 0;
   try {
-    reclaimedStaleJobs = await reclaimAllStaleProcessingJobs(now);
+    reclaimedStaleJobs = await reclaimAllStaleProcessingJobs();
   } catch (err) {
     billingLogger.error(
       { err: serializeError(err) },
@@ -364,9 +368,10 @@ export async function runBillingMaintenance(options?: {
   // 未支付订单回收：过了 expiresAt + 72h 宽限期仍 pending 的订单置 expired。
   // 从前 PaymentOrder.expiresAt 与 @@index([status, expiresAt]) 是一对死列，pending 无限堆积。
   //
-  // 宽限期远大于建单时写入的 ORDER_TTL_MS（30min）：那 30 分钟只是给前端展示「订单已超时」，
-  // 按它回收会撞进网关重投窗口。真正的资损闸不在这里，而在 creditPaidOrder 的认领 CAS —— 它
-  // 收 pending+expired 两态，所以清扫早了也只是状态难看，晚到的真实回调照样恰好入账一次。
+  // 宽限期远大于建单时写入的 ORDER_TTL_MS（60min，且已下发给网关做硬过期）：按 TTL 回收会
+  // 撞进网关重投窗口。真正的资损闸不在这里，而在 creditPaidOrder 的行锁认领 —— 它的 UPDATE
+  // 收 pending/expired/failed 三态，所以清扫早了也只是状态难看，晚到的真实回调照样恰好入账一次；
+  // 真正晚于 expiresAt 的支付则被隔离成 late_paid，一分权益都不发。
   let expiredPaymentOrders = 0;
   try {
     expiredPaymentOrders = await expireStalePaymentOrders({ now });
@@ -407,6 +412,20 @@ export async function runBillingMaintenance(options?: {
       );
       // 不 rethrow —— 其他维护任务结果仍要返回
     }
+  }
+
+  // 统一 artifact 账本的 1h RESERVED/ORPHANED TTL 清理。ACTIVE 引用行没有 TTL，
+  // 所以不会把历史消息图片/会话产物按年龄删掉。
+  try {
+    const expiredArtifacts = await cleanupExpiredStoredArtifacts({ now });
+    if (expiredArtifacts.deleted > 0 || expiredArtifacts.failed > 0) {
+      billingLogger.info(expiredArtifacts, 'expired stored artifacts cleaned');
+    }
+  } catch (err) {
+    billingLogger.warn(
+      { err: serializeError(err) },
+      'expired stored artifact cleanup failed'
+    );
   }
 
   // 本地孤儿聊天图片目录清理（best-effort，独立于上面的附件清理，失败不影响其它维护）。
@@ -470,9 +489,28 @@ export async function runBillingMaintenance(options?: {
     }
   }
 
+  // SEC-008：持久 family 是撤销真源，但绝对寿命过后无需永久保留。每轮按 expiresAt
+  // + 24h 安全缓冲幂等清理；未过绝对上限的活跃/legacy family 均不会命中。
+  let prunedAuthTokenFamilies = 0;
+  try {
+    prunedAuthTokenFamilies = await pruneExpiredAuthTokenFamilies(now);
+    if (prunedAuthTokenFamilies > 0) {
+      billingLogger.info(
+        { prunedAuthTokenFamilies },
+        'expired auth token families pruned'
+      );
+    }
+  } catch (err) {
+    billingLogger.error(
+      { err: serializeError(err) },
+      'auth token family prune failed'
+    );
+  }
+
   if (
     resetUsers > 0 ||
     expiredRoleDowngrades > 0 ||
+    expiredPaymentOrders > 0 ||
     reclaimedSessions > 0 ||
     reclaimedAsyncUploads > 0 ||
     reclaimedFullTranscribes > 0 ||
@@ -483,6 +521,7 @@ export async function runBillingMaintenance(options?: {
     reclaimedInterpretSessions > 0 ||
     storageBytesReconciled > 0 ||
     prunedEmailTokens > 0 ||
+    prunedAuthTokenFamilies > 0 ||
     reconciliationRunId ||
     (chatFilesCleanup &&
       (chatFilesCleanup.agingDeleted > 0 ||
@@ -494,11 +533,11 @@ export async function runBillingMaintenance(options?: {
         source: options?.source ?? 'manual',
         resetUsers,
         expiredRoleDowngrades,
+        expiredPaymentOrders,
         reclaimedSessions,
         reclaimedAsyncUploads,
         reclaimedFullTranscribes,
         reclaimedStaleJobs,
-        expiredPaymentOrders,
         releasedOrphanReservations,
         releasedOrphanFullReservations,
         cleanedOrphanSoniox,
@@ -508,6 +547,7 @@ export async function runBillingMaintenance(options?: {
         storageBytesReconciled,
         reconciliationRunId,
         prunedEmailTokens,
+        prunedAuthTokenFamilies,
         chatFilesCleanup,
       })
     );
@@ -516,11 +556,11 @@ export async function runBillingMaintenance(options?: {
   return {
     resetUsers,
     expiredRoleDowngrades,
+    expiredPaymentOrders,
     reclaimedSessions,
     reclaimedAsyncUploads,
     reclaimedFullTranscribes,
     reclaimedStaleJobs,
-    expiredPaymentOrders,
     releasedOrphanReservations,
     releasedOrphanFullReservations,
     cleanedOrphanSoniox,
@@ -530,6 +570,7 @@ export async function runBillingMaintenance(options?: {
     storageBytesReconciled,
     reconciliationRunId,
     prunedEmailTokens,
+    prunedAuthTokenFamilies,
     chatFilesCleanup,
   };
 }
@@ -882,8 +923,8 @@ const FULL_RESERVATION_SWEEP_STALE_MS = 30 * 60_000;
  * 正常路径：finalize 把预留「转」为实扣并清列；删会话 inline 释放。但若某终态转移未清预留（processor/
  * reclaim 标 failed 时不 inline 释放、或 finalize 结算事务整体失败留下残留），预留会永久占着
  * transcriptionMinutesUsed → 额度泄漏。这里扫「fullReservedMinutes>0 且已终态(failed/completed)
- * 且 updatedAt 超 30min」的会话，统一走 settleFullReservation 条件原子认领后释放，兜住所有未 inline
- * 释放的路径。30min 陈旧门槛避免与刚 completed 的 finalize 结算(同样 release 预留)赛跑重复释放。
+ * 且 updatedAt 超 30min」的会话，在 Session 行锁内重验 claim/终态/时间后释放，兜住所有未 inline
+ * 释放的路径，也不会把旧快照误套到新 attempt。30min 门槛避免与刚 completed 的 finalize 赛跑。
  *
  * 完整版状态机的终态是 completed / failed（无 canceled，无用户取消路径）。
  */
@@ -896,16 +937,24 @@ export async function releaseOrphanFullReservations(now: Date): Promise<number> 
       fullTranscribeStatus: { in: TERMINAL },
       updatedAt: { lte: staleBefore },
     },
-    select: { id: true, userId: true, fullReservedMinutes: true },
+    select: {
+      id: true,
+      userId: true,
+      fullTranscribeClaimId: true,
+      fullReservedMinutes: true,
+    },
     take: 500,
     orderBy: { updatedAt: 'asc' },
   });
 
   let releasedCount = 0;
   for (const s of stuck) {
-    // settleFullReservation（FOR UPDATE 读当前列 → 清零 + 释放，恰好一次），与 finalize 结算 / 删会话 /
-    // 并发触发顶替 的释放互斥：并发多路径只有一个读到 >0 并释放。
-    const released = await settleFullReservation(s.id).catch(() => 0);
+    // 锁内复验同一 claim 仍处于陈旧终态；旧快照绝不能释放新一轮 retrigger 的预留。
+    const released = await releaseTerminalFullTranscribeReservation({
+      sessionId: s.id,
+      claimId: s.fullTranscribeClaimId,
+      updatedAtLte: staleBefore,
+    }).catch(() => 0);
     if (released > 0) {
       releasedCount += 1;
       billingLogger.info(
@@ -1050,6 +1099,7 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
       id: true,
       userId: true,
       fullTranscribeStatus: true,
+      fullTranscribeClaimId: true,
       fullSonioxFileId: true,
       fullSonioxTranscriptionId: true,
       // P1-16：按任务已固定的 region 解析 Soniox 配置。
@@ -1108,7 +1158,11 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
         // 立刻被当僵尸重扫；等 Soniox 真正 completed 后由本函数（或前端 poll）收尾。
         await prisma.session
           .updateMany({
-            where: { id: session.id, fullTranscribeStatus: status },
+            where: {
+              id: session.id,
+              fullTranscribeStatus: status,
+              fullTranscribeClaimId: session.fullTranscribeClaimId,
+            },
             data: { fullTranscribeStartedAt: now },
           })
           .catch(() => undefined);
@@ -1171,21 +1225,15 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
     // 其余：pending / transcoding 僵尸（无 Soniox 转录产物可救），或 salvageable 但 Soniox 明确报
     // error —— 原子 claim 再校验仍卡住且超时后标 failed。startedAt 由 in-flight finalize 的 claim
     // 刷新，故绝不误标刚发起收尾的会话。
-    const claimed = await prisma.session
-      .updateMany({
-        where: {
-          id: session.id,
-          fullTranscribeStatus: { in: ['pending', 'transcoding', 'transcribing', 'finalizing'] },
-          fullTranscribeStartedAt: { lte: threshold },
-        },
-        data: {
-          fullTranscribeStatus: 'failed',
-          fullTranscribeError: `自动回收：完整版转录停滞超过 ${thresholdHours} 小时`,
-        },
-      })
-      .catch(() => ({ count: 0 }));
+    const claimed = await failFullTranscribeAttempt({
+      sessionId: session.id,
+      claimId: session.fullTranscribeClaimId,
+      allowedStatuses: ['pending', 'transcoding', 'transcribing', 'finalizing'],
+      startedAtLte: threshold,
+      error: `自动回收：完整版转录停滞超过 ${thresholdHours} 小时`,
+    }).catch(() => false);
 
-    if (claimed.count !== 1) {
+    if (!claimed) {
       continue;
     }
     reclaimedCount += 1;
@@ -1193,21 +1241,11 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
       { sessionId: session.id, userId: session.userId },
       'reclaimed stuck full transcription'
     );
-    // R4：僵尸标 failed（抢到，恰好一次）→ 释放入口持有的转录分钟预留，避免额度泄漏。
-    // settleFullReservation（FOR UPDATE 读 fullReservedMinutes 当前列并原子释放）与 finalize 结算 /
-    // 删会话 / cron releaseOrphanFullReservations 互斥，恰好释放一次。
-    await settleFullReservation(session.id).catch(() => undefined);
-
     // best-effort 清本地转码临时目录（processFullTranscribe 正常自清，此处兜底硬崩残留）。
-    await fs
-      .rm(
-        path.join(
-          FULL_TRANSCRIBE_TMP_ROOT,
-          session.id.replace(/[^a-zA-Z0-9_-]/g, '')
-        ),
-        { recursive: true, force: true }
-      )
-      .catch(() => undefined);
+    await cleanupFullTranscribeWorkDir(
+      session.id,
+      session.fullTranscribeClaimId
+    );
 
     // best-effort 清 Soniox 上残留的 file + transcription（幂等，失败不抛）。
     if (sonioxConfig) {

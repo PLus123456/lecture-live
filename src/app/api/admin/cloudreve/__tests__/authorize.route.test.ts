@@ -7,12 +7,14 @@ const {
   buildAuthorizeUrlMock,
   generateCodeVerifierMock,
   siteSettingUpsertMock,
+  securityAuditMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   isCloudreveConfiguredAsyncMock: vi.fn(),
   buildAuthorizeUrlMock: vi.fn(),
   generateCodeVerifierMock: vi.fn(),
   siteSettingUpsertMock: vi.fn(),
+  securityAuditMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({
@@ -25,12 +27,21 @@ vi.mock('@/lib/storage/cloudreve', () => ({
   generateCodeVerifier: generateCodeVerifierMock,
 }));
 
-vi.mock('@/lib/prisma', () => ({
-  prisma: {
+vi.mock('@/lib/prisma', () => {
+  const tx = {
     siteSetting: {
       upsert: siteSettingUpsertMock,
     },
-  },
+  };
+  return {
+    prisma: {
+      ...tx,
+      $transaction: async (fn: (value: typeof tx) => Promise<unknown>) => fn(tx),
+    },
+  };
+});
+vi.mock('@/lib/securityAudit', () => ({
+  writeSecurityAudit: securityAuditMock,
 }));
 
 import { GET } from '@/app/api/admin/cloudreve/authorize/route';
@@ -52,6 +63,7 @@ describe('GET /api/admin/cloudreve/authorize', () => {
       'https://cloud.example.com/session/authorize?client_id=client-1'
     );
     siteSettingUpsertMock.mockResolvedValue({});
+    securityAuditMock.mockReset().mockResolvedValue(undefined);
   });
 
   it('支持从异步配置源读取 Cloudreve OAuth 配置并返回授权链接', async () => {
@@ -94,6 +106,14 @@ describe('GET /api/admin/cloudreve/authorize', () => {
       },
     });
     expect(buildAuthorizeUrlMock).toHaveBeenCalledWith(redirectUri, 'verifier-123');
+    expect(securityAuditMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        event: 'cloudreve.authorize',
+        outcome: 'SUCCESS',
+      }),
+      expect.any(Object)
+    );
   });
 
   it('优先使用当前访问域名生成 Cloudreve 回调地址', async () => {
@@ -134,5 +154,13 @@ describe('GET /api/admin/cloudreve/authorize', () => {
     });
     expect(siteSettingUpsertMock).not.toHaveBeenCalled();
     expect(buildAuthorizeUrlMock).not.toHaveBeenCalled();
+  });
+
+  it('PKCE 成功审计不可用时不返回授权 URL', async () => {
+    securityAuditMock.mockRejectedValue(new Error('audit unavailable'));
+    const response = await GET(
+      new Request('http://localhost:3000/api/admin/cloudreve/authorize')
+    );
+    expect(response.status).toBe(500);
   });
 });

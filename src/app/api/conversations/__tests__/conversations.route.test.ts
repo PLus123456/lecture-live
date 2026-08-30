@@ -8,7 +8,8 @@ const {
   conversationUpdateManyMock,
   conversationSessionCreateManyMock,
   sessionFindUniqueMock,
-  sessionCountMock,
+  sessionFindManyMock,
+  queryRawMock,
   transactionMock,
   invalidateRagCacheMock,
 } = vi.hoisted(() => ({
@@ -18,7 +19,8 @@ const {
   conversationUpdateManyMock: vi.fn(),
   conversationSessionCreateManyMock: vi.fn(),
   sessionFindUniqueMock: vi.fn(),
-  sessionCountMock: vi.fn(),
+  sessionFindManyMock: vi.fn(),
+  queryRawMock: vi.fn(),
   transactionMock: vi.fn(),
   invalidateRagCacheMock: vi.fn(),
 }));
@@ -54,8 +56,9 @@ vi.mock('@/lib/prisma', () => ({
     },
     session: {
       findUnique: sessionFindUniqueMock,
-      count: sessionCountMock,
+      findMany: sessionFindManyMock,
     },
+    $queryRaw: queryRawMock,
     $transaction: transactionMock,
   },
 }));
@@ -70,6 +73,11 @@ describe('GET /api/conversations', () => {
       email: 'u@example.com',
       role: 'PRO',
     });
+    queryRawMock.mockImplementation((query: { strings?: string[] }) =>
+      query.strings?.join('').includes('SiteSetting')
+        ? Promise.resolve([{ value: 'complete' }])
+        : Promise.resolve([])
+    );
   });
 
   it('未登录返回 401', async () => {
@@ -247,7 +255,7 @@ describe('POST /api/conversations', () => {
   });
 
   it('recordingIds 中有不属于用户的录音返回 403', async () => {
-    sessionCountMock.mockResolvedValue(1); // only 1 of 2 owned
+    sessionFindManyMock.mockResolvedValue([{ id: 's1', durationMs: 1 }]);
     const response = await POST(
       createJsonRequest('http://localhost:3000/api/conversations', {
         method: 'POST',
@@ -290,7 +298,10 @@ describe('POST /api/conversations', () => {
   });
 
   it('recordingIds=["s1","s2"] 创建对话并插入 junction 行', async () => {
-    sessionCountMock.mockResolvedValue(2);
+    sessionFindManyMock.mockResolvedValue([
+      { id: 's1', durationMs: 1 },
+      { id: 's2', durationMs: 1 },
+    ]);
     const createSessionMock = vi.fn();
     transactionMock.mockImplementation(async (cb) => {
       return cb({

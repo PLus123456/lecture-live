@@ -1,17 +1,18 @@
 import { NextResponse } from 'next/server';
 import { requireAdminAccess } from '@/lib/adminApi';
 import { prisma } from '@/lib/prisma';
+import { writeSecurityAudit } from '@/lib/securityAudit';
 
 // 获取单次对账运行详情（含差异明细）
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ runId: string }> }
 ) {
-  const { response } = await requireAdminAccess(req, {
+  const { user, response } = await requireAdminAccess(req, {
     scope: 'admin:reconciliation:detail',
     limit: 60,
   });
-  if (response) return response;
+  if (response || !user) return response!;
 
   const { runId } = await params;
 
@@ -64,13 +65,26 @@ export async function GET(
       }
     }
 
-    return NextResponse.json({
+    const responseBody = {
       ...run,
       mismatches: run.mismatches.map((m) => ({
         ...m,
         inflightMinutes: inflightByUser.get(m.userId) ?? 0,
       })),
+    };
+
+    await writeSecurityAudit(req, {
+      event: 'reconciliation.detail_read',
+      operator: user,
+      target: { type: 'reconciliation_run', id: run.id },
+      before: null,
+      after: null,
+      reason: 'admin-reconciliation-detail-read',
+      outcome: 'SUCCESS',
+      metadata: { mismatchCount: run.mismatches.length },
     });
+
+    return NextResponse.json(responseBody);
   } catch (err) {
     console.error('查询对账详情失败:', err);
     return NextResponse.json({ error: '查询失败' }, { status: 500 });

@@ -131,6 +131,7 @@ describe('POST /api/llm/extract-keywords', () => {
 
   it.each([
     { code: 'archive_limit' as const, status: 413 },
+    { code: 'memory_limit' as const, status: 413 },
     { code: 'invalid_archive' as const, status: 400 },
     { code: 'timeout' as const, status: 422 },
     { code: 'busy' as const, status: 503 },
@@ -448,6 +449,73 @@ describe('POST /api/llm/extract-keywords', () => {
     );
 
     expect(res.status).toBe(503);
+    expect(callLLMMock).not.toHaveBeenCalled();
+  });
+  // 结果只回给这次请求、不落库：客户端断开后继续跑剩余 map/reduce 就是白烧厂商 token。
+  it('客户端断开：停止派发剩余 map 调用，在途调用拿到 signal，任务按已发调用失败结算并回 499', async () => {
+    const controller = new AbortController();
+    const form = new FormData();
+    form.append('text', mkLongCjkText(400_000));
+    const req = new Request('http://localhost/api/llm/extract-keywords', {
+      method: 'POST',
+      body: form,
+      signal: controller.signal,
+    });
+    callLLMMock.mockImplementation(async () => {
+      // 第一次付费调用发出后用户关页面
+      controller.abort();
+      return JSON.stringify(['alpha']);
+    });
+
+    const res = await POST(req);
+
+    expect(res.status).toBe(499);
+    // 旧行为：断开后照样跑满 60 次 map + 1 次 reduce
+    expect(callLLMMock).toHaveBeenCalledTimes(1);
+    expect(callLLMMock.mock.calls[0][2]).toMatchObject({
+      signal: expect.any(AbortSignal),
+    });
+    expect(completeActiveJobMock).not.toHaveBeenCalled();
+    expect(failActiveJobMock).toHaveBeenCalledWith(
+      'keyword-job-1',
+      expect.anything(),
+      expect.objectContaining({ providerCallsStarted: 1 }),
+      expect.any(Number)
+    );
+  });
+
+  // Next middleware 把 >32MiB 的请求体静默截断后才交给路由：旧的 50MB 上限不可达，
+  // 32–50MB 的文件只会让 req.formData() 抛错 → 500。
+  it('声明长度超过 middleware 可达上限：读 body 前 413，提示真实上限', async () => {
+    const form = new FormData();
+    form.append('file', new File(['hello'], 'a.txt', { type: 'text/plain' }));
+    const req = mkFormRequest(form);
+    req.headers.set('content-length', String(40 * 1024 * 1024));
+
+    const res = await POST(req);
+
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { error: string }).error).toContain('max 31MB');
+    expect(extractTextFromFileMock).not.toHaveBeenCalled();
+    expect(callLLMMock).not.toHaveBeenCalled();
+  });
+
+  it('被截断的 multipart body（缺结尾 boundary）回 400 而不是 500', async () => {
+    const boundary = '----lecture-live-truncated';
+    const req = new Request('http://localhost/api/llm/extract-keywords', {
+      method: 'POST',
+      headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+      body:
+        `--${boundary}\r\n` +
+        'Content-Disposition: form-data; name="file"; filename="a.txt"\r\n' +
+        'Content-Type: text/plain\r\n\r\n' +
+        'hello wor',
+    });
+
+    const res = await POST(req);
+
+    expect(res.status).toBe(400);
+    expect(extractTextFromFileMock).not.toHaveBeenCalled();
     expect(callLLMMock).not.toHaveBeenCalled();
   });
 });

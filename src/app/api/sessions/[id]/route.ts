@@ -302,6 +302,9 @@ export async function PATCH(
     return NextResponse.json(
       {
         error: `Too many concurrent recordings in progress (max ${gateLimit}). Finish or discard an existing recording first.`,
+        // 机读标识：客户端据此区分「并发闸拒绝开录」与 CAS 冲突（后者带 currentStatus），
+        // 不依赖 error 文案（recordingLifecycle.isConcurrentRecordingLimitBody）。
+        code: 'concurrent_recording_limit',
       },
       { status: 409 }
     );

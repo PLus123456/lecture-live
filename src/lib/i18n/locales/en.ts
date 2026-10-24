@@ -340,6 +340,8 @@ export default {
         'This month\'s transcription quota has been exhausted. Saving and stopping the current recording now.',
       sessionReclaimed:
         'This recording was already ended on the server, so anything recorded now will not be saved to the original session. Please stop and export your local recording.',
+      concurrentRecordingLimit:
+        'Too many recordings are in progress at the same time, so this one could not start and has been stopped. Finish or stop another recording, then start again.',
     },
     finalizing: {
       title: 'Finalizing Session',
@@ -1762,7 +1764,7 @@ export default {
     softCapPercent: 'Soft-cap percent',
     softCapPercentDesc: 'When a user exceeds this fraction of their byte quota, LRU cleanup kicks in. Set 0 to disable.',
     maxUploadMb: 'Max upload size',
-    maxUploadMbDesc: 'Hard upper bound (MB) for a single uploaded file.',
+    maxUploadMbDesc: 'Hard upper bound (MB) for a single uploaded file. Values above 31 MB have no effect: request bodies over 32 MB are cut off before they reach the server.',
     quotaFreeMb: 'FREE quota',
     quotaFreeMbDesc: 'Total byte quota (MB) for FREE-role users.',
     quotaProMb: 'PRO quota',

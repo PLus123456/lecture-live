@@ -177,4 +177,19 @@ describe('POST /api/auth/resend-verification', () => {
       expect(body).toEqual(bodies[0]);
     }
   });
+
+  // 旧实现 normalizeEmail 对非字符串抛 TypeError（不在 try 内）→ 框架 500。
+  it('非字符串 email 回 400，既不查库也不发信', async () => {
+    for (const email of [42, ['user@example.com'], { $gt: '' }]) {
+      const res = await POST(
+        createJsonRequest('http://localhost/api/auth/resend-verification', {
+          method: 'POST',
+          body: { email },
+        })
+      );
+      expect(res.status).toBe(400);
+    }
+    expect(findUniqueMock).not.toHaveBeenCalled();
+    expect(sendVerificationEmailMock).not.toHaveBeenCalled();
+  });
 });

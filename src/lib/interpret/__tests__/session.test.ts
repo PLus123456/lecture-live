@@ -15,7 +15,7 @@ const {
   deductMock,
   recordUsageMock,
   settleGrantsMock,
-  grantAggregateMock,
+  grantFindManyMock,
 } = vi.hoisted(() => ({
   createMock: vi.fn(),
   findFirstMock: vi.fn(),
@@ -26,7 +26,7 @@ const {
   deductMock: vi.fn(),
   recordUsageMock: vi.fn(),
   settleGrantsMock: vi.fn(),
-  grantAggregateMock: vi.fn(),
+  grantFindManyMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -38,9 +38,9 @@ vi.mock('@/lib/prisma', () => ({
       findMany: findManyMock,
       update: updateMock,
     },
-    // R1-L2：cron 优先按 grants 的 usage-logs 实测时长计费（事务外聚合）。
+    // R1-L2：cron 优先按 grants 的 usage-logs 实测时长计费（事务外逐条读出、封顶后求和）。
     sonioxStreamGrant: {
-      aggregate: grantAggregateMock,
+      findMany: grantFindManyMock,
     },
     // cron reclaim 的认领+扣费同事务；默认实现执行回调并注入带 interpretSession 的 tx。
     $transaction: (...a: unknown[]) => transactionMock(...a),
@@ -54,9 +54,15 @@ vi.mock('@/lib/quota', () => ({
   deductTranscriptionMinutes: deductMock,
   recordInterpretUsage: recordUsageMock,
 }));
-vi.mock('@/lib/billing', () => ({
-  getBillableMinutes: (ms: number) => Math.ceil(ms / 60_000),
-}));
+vi.mock('@/lib/billing', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/billing')>();
+  return {
+    getBillableMinutes: (ms: number) => Math.ceil(ms / 60_000),
+  // 计费下限 / 实测求和是纯函数：用真实实现，保证测的是生产口径。
+  withMeasuredStreamFloorMs: actual.withMeasuredStreamFloorMs,
+  sumCappedStreamActualMs: actual.sumCappedStreamActualMs,
+  };
+});
 vi.mock('@/lib/interpret/anchor', () => ({
   MAX_INTERPRET_DURATION_MS: 6 * 60 * 60_000,
 }));
@@ -86,7 +92,7 @@ beforeEach(() => {
   recordUsageMock.mockResolvedValue(undefined);
   deductMock.mockResolvedValue({ role: 'FREE' });
   settleGrantsMock.mockResolvedValue({ settledCount: 0, releasedMinutes: 0, actualMsTotal: 0 });
-  grantAggregateMock.mockResolvedValue({ _sum: { actualMs: null } });
+  grantFindManyMock.mockResolvedValue([]);
   // cron reclaim 事务：执行回调并注入带 interpretSession.updateMany 的 tx（复用 updateManyMock）。
   transactionMock.mockImplementation(
     async (cb: (tx: unknown) => Promise<unknown>) =>
@@ -213,13 +219,22 @@ describe('claimInterpretSessionForDeduct', () => {
   });
 });
 
+/** 本锚点名下、已回填实测且合计 totalMinutes 的 grants（每条 ≤ 15 分钟连接上限）。 */
+function grantRows(totalMinutes: number): Array<{ actualMs: number; maxSessionSeconds: number }> {
+  const rows: Array<{ actualMs: number; maxSessionSeconds: number }> = [];
+  for (let remaining = totalMinutes; remaining > 0; remaining -= 15) {
+    rows.push({ actualMs: Math.min(15, remaining) * 60_000, maxSessionSeconds: 900 });
+  }
+  return rows;
+}
+
 describe('reclaimStaleInterpretSessions', () => {
   it('P1-1：无任何 grant 实测量（锚点从未串流）→ 按 0 结算，绝不回落墙钟扣 6h', async () => {
     // startedAt = now - 8h。旧行为：墙钟被夹到 MAX_INTERPRET(6h) → 扣 360 分钟（诚实用户被凭空计费：
     // /start 在建流前就落锚点，麦克风被拒 / Soniox 不可达时前端只置 error、永不调 deduct）。
     const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
-    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: null } });
+    grantFindManyMock.mockResolvedValueOnce([]);
     updateManyMock.mockResolvedValueOnce({ count: 1 });
 
     const n = await reclaimStaleInterpretSessions(NOW);
@@ -248,7 +263,7 @@ describe('reclaimStaleInterpretSessions', () => {
   it('P1-1：grants 存在但 actualMs 全为 0（usage-logs 未回填）→ 同样按 0 结算', async () => {
     const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
-    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 0 } });
+    grantFindManyMock.mockResolvedValueOnce([]);
     updateManyMock.mockResolvedValueOnce({ count: 1 });
 
     const n = await reclaimStaleInterpretSessions(NOW);
@@ -260,7 +275,7 @@ describe('reclaimStaleInterpretSessions', () => {
   it('P1-1：作废时输给 deduct（count=0）→ 不计入 reclaimed', async () => {
     const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
-    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: null } });
+    grantFindManyMock.mockResolvedValueOnce([]);
     updateManyMock.mockResolvedValueOnce({ count: 0 });
 
     const n = await reclaimStaleInterpretSessions(NOW);
@@ -273,15 +288,15 @@ describe('reclaimStaleInterpretSessions', () => {
     // startedAt = now - 8h（墙钟口径本应封 6h=360min），但实测串流只有 20 分钟 → 按 20 扣
     const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
-    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 20 * 60_000 } });
+    grantFindManyMock.mockResolvedValueOnce(grantRows(20));
     updateManyMock.mockResolvedValueOnce({ count: 1 });
 
     const n = await reclaimStaleInterpretSessions(NOW);
 
     expect(n).toBe(1);
-    expect(grantAggregateMock).toHaveBeenCalledWith({
+    expect(grantFindManyMock).toHaveBeenCalledWith({
       where: { interpretSessionId: 's1', actualMs: { gt: 0 } },
-      _sum: { actualMs: true },
+      select: { actualMs: true, maxSessionSeconds: true },
     });
     expect(updateManyMock).toHaveBeenCalledWith({
       where: { id: 's1', settledAt: null },
@@ -299,10 +314,26 @@ describe('reclaimStaleInterpretSessions', () => {
     });
   });
 
-  it('R1-L2：实测量超 6h 上限 → 仍封顶（防 Soniox 侧异常大值）', async () => {
+  it('R1-L2：单条实测异常大于其连接硬上限 → 按硬上限计（防 Soniox 侧异常大值）', async () => {
     const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
-    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 9 * 60 * 60_000 } });
+    grantFindManyMock.mockResolvedValueOnce([
+      { actualMs: 9 * 60 * 60_000, maxSessionSeconds: 900 },
+    ]);
+    updateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    await reclaimStaleInterpretSessions(NOW);
+
+    expect(deductMock).toHaveBeenCalledWith('u1', 15, expect.anything(), {
+      source: 'interpret_cron',
+      referenceId: 's1',
+    });
+  });
+
+  it('实测 6h15m（6h 上限 + 15 分钟宽限以内）→ 仍按 6h 封顶', async () => {
+    const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
+    findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
+    grantFindManyMock.mockResolvedValueOnce(grantRows(375));
     updateManyMock.mockResolvedValueOnce({ count: 1 });
 
     await reclaimStaleInterpretSessions(NOW);
@@ -313,10 +344,24 @@ describe('reclaimStaleInterpretSessions', () => {
     });
   });
 
+  it('同一锚点并行多开、实测 9h → 宽限之外的部分照实扣（9h − 15min = 525 分钟）', async () => {
+    const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
+    findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
+    grantFindManyMock.mockResolvedValueOnce(grantRows(9 * 60));
+    updateManyMock.mockResolvedValueOnce({ count: 1 });
+
+    await reclaimStaleInterpretSessions(NOW);
+
+    expect(deductMock).toHaveBeenCalledWith('u1', 525, expect.anything(), {
+      source: 'interpret_cron',
+      referenceId: 's1',
+    });
+  });
+
   it('认领输给 deduct(count=0) → 跳过、不扣费（互斥，不双扣）', async () => {
     const startedAt = new Date(NOW.getTime() - 8 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'u1', startedAt }]);
-    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 20 * 60_000 } });
+    grantFindManyMock.mockResolvedValueOnce(grantRows(20));
     updateManyMock.mockResolvedValueOnce({ count: 0 }); // deduct 抢先结算
 
     const n = await reclaimStaleInterpretSessions(NOW);
@@ -329,7 +374,7 @@ describe('reclaimStaleInterpretSessions', () => {
   it('ADMIN 用户：deduct 返回 role ADMIN → 不记台账', async () => {
     const startedAt = new Date(NOW.getTime() - 7.5 * 60 * 60_000);
     findManyMock.mockResolvedValueOnce([{ id: 's1', userId: 'admin', startedAt }]);
-    grantAggregateMock.mockResolvedValueOnce({ _sum: { actualMs: 20 * 60_000 } });
+    grantFindManyMock.mockResolvedValueOnce(grantRows(20));
     updateManyMock.mockResolvedValueOnce({ count: 1 });
     deductMock.mockResolvedValueOnce({ role: 'ADMIN' });
 

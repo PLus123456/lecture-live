@@ -746,11 +746,24 @@ export default function UserManagementPanel() {
     }
   }, [token]);
 
+  // 搜索框按键即时触发查询时，短前缀（"a"）命中行多、响应更慢，常常晚于完整关键词（"alice"）
+  // 的响应到达，把列表覆盖回宽泛结果 —— 输入框写着 alice，表里却是一大批用户，「全选 → 批量
+  // 删除」就会落到看不见的错误集合上（审计）。两道防线：输入去抖 300ms 再查；每次查询带序号，
+  // 只有最新一次的响应允许落地。
+  const [debouncedFilterText, setDebouncedFilterText] = useState('');
+  useEffect(() => {
+    if (filterText === debouncedFilterText) return;
+    const timer = setTimeout(() => setDebouncedFilterText(filterText), 300);
+    return () => clearTimeout(timer);
+  }, [filterText, debouncedFilterText]);
+  const usersRequestSeqRef = useRef(0);
+
   const fetchUsers = useCallback(async () => {
+    const seq = ++usersRequestSeqRef.current;
     setLoading(true);
     try {
       const params = new URLSearchParams();
-      if (filterText) params.set('filter', filterText);
+      if (debouncedFilterText) params.set('filter', debouncedFilterText);
       if (filterGroup) params.set('group', filterGroup);
 
       const res = await fetch(`/api/admin/users?${params.toString()}`, {
@@ -758,6 +771,8 @@ export default function UserManagementPanel() {
       });
       if (res.ok) {
         const data = await res.json();
+        // 已有更新的查询发出：本次（旧筛选条件）的结果作废，绝不覆盖列表 / 选中集。
+        if (seq !== usersRequestSeqRef.current) return;
         setUsers(data.users);
         // U30：过滤/刷新切换列表后，用新列表的 ID 集合过滤选中集，剔除已离屏用户。
         // 否则「批量删除」会命中当前列表看不到的陈旧选中项，且残留数恰等于新列表条数时
@@ -776,14 +791,18 @@ export default function UserManagementPanel() {
     } catch (err) {
       console.error('Failed to fetch users:', err);
     } finally {
-      setLoading(false);
+      if (seq === usersRequestSeqRef.current) setLoading(false);
     }
-  }, [token, filterText, filterGroup]);
+  }, [token, debouncedFilterText, filterGroup]);
 
   useEffect(() => {
     fetchUsers();
+  }, [fetchUsers]);
+
+  // 用户组列表与筛选条件无关：单独加载，不随每次筛选重拉。
+  useEffect(() => {
     fetchCustomGroups();
-  }, [fetchUsers, fetchCustomGroups]);
+  }, [fetchCustomGroups]);
 
   const toggleSelectAll = () => {
     if (selectedIds.size === users.length) {
@@ -903,7 +922,12 @@ export default function UserManagementPanel() {
             <input
               value={filterText}
               onChange={(e) => setFilterText(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && fetchUsers()}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter') return;
+                // 回车立即查询当前输入（跳过去抖）；关键词未变则视为手动刷新。
+                if (filterText !== debouncedFilterText) setDebouncedFilterText(filterText);
+                else void fetchUsers();
+              }}
               placeholder={t('admin.searchByNameEmail')}
               className="flex-1 px-2 py-1.5 text-sm bg-white border border-cream-200 rounded-lg
                          focus:outline-none focus:ring-2 focus:ring-rust-200"

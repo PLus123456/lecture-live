@@ -22,48 +22,53 @@ export interface PublicAuthPreludeResult {
 }
 
 /**
- * Cheap, fixed-cardinality gates for anonymous authentication routes.
+ * Cheap gates for anonymous authentication routes.
  *
  * This must run before reading the request body, loading site settings, or
  * deriving an account-specific key. The global bucket remains active even
  * when the proxy topology cannot safely identify a client IP.
+ *
+ * 顺序：先按来源 IP 的两个桶，再全站桶，且只有通过 IP 桶的请求才计入全站预算。
+ * 旧顺序（全站桶在前）下，单个客户端每分钟 600 个请求（正文都不必合法——这一层在解析
+ * 正文之前）就能把 `auth:public:global` 打满，全站所有人的登录 / 注册 / 找回密码一起 429；
+ * 它自己的 IP 桶（120/min）只在请求已被全站桶计数之后才生效，拦不住这种消耗。
+ * IP 解析不出来（拓扑无法安全识别来源）时仍只剩全站桶这一道固定基数的闸，与旧口径一致。
  */
 export async function enforcePublicAuthPrelude(
   req: Request,
   options: PublicAuthPreludeOptions
 ): Promise<PublicAuthPreludeResult> {
+  const clientIp = resolveRequestClientIp(req);
+
+  if (clientIp !== 'unknown') {
+    const sharedIpLimited = await enforceRateLimit(req, {
+      scope: 'auth:public:ip',
+      limit: PUBLIC_AUTH_IP_LIMIT,
+      windowMs: PUBLIC_AUTH_IP_WINDOW_MS,
+      key: `ip:${clientIp}`,
+    });
+    if (sharedIpLimited) {
+      return { clientIp, response: sharedIpLimited };
+    }
+
+    const endpointIpLimited = await enforceRateLimit(req, {
+      scope: `auth:${options.scope}:prelude:ip`,
+      limit: options.endpointIpLimit,
+      windowMs: options.endpointWindowMs,
+      key: `ip:${clientIp}`,
+    });
+    if (endpointIpLimited) {
+      return { clientIp, response: endpointIpLimited };
+    }
+  }
+
   const globallyLimited = await enforceRateLimit(req, {
     scope: 'auth:public:global',
     limit: PUBLIC_AUTH_GLOBAL_LIMIT,
     windowMs: PUBLIC_AUTH_GLOBAL_WINDOW_MS,
     key: 'global',
   });
-  if (globallyLimited) {
-    return { clientIp: 'unknown', response: globallyLimited };
-  }
-
-  const clientIp = resolveRequestClientIp(req);
-  if (clientIp === 'unknown') {
-    return { clientIp, response: null };
-  }
-
-  const sharedIpLimited = await enforceRateLimit(req, {
-    scope: 'auth:public:ip',
-    limit: PUBLIC_AUTH_IP_LIMIT,
-    windowMs: PUBLIC_AUTH_IP_WINDOW_MS,
-    key: `ip:${clientIp}`,
-  });
-  if (sharedIpLimited) {
-    return { clientIp, response: sharedIpLimited };
-  }
-
-  const endpointIpLimited = await enforceRateLimit(req, {
-    scope: `auth:${options.scope}:prelude:ip`,
-    limit: options.endpointIpLimit,
-    windowMs: options.endpointWindowMs,
-    key: `ip:${clientIp}`,
-  });
-  return { clientIp, response: endpointIpLimited };
+  return { clientIp, response: globallyLimited };
 }
 
 export function publicAuthAccountKey(
@@ -80,6 +85,22 @@ type PublicAuthJsonResult<T> =
 
 function invalidBodyResponse(): NextResponse {
   return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
+}
+
+/**
+ * 公开认证路由的字符串字段准入：缺省 / null 视为「未填」，交给各路由按业务口径处理；
+ * 其余非字符串（数字、数组、对象……）一律是畸形请求 → 400。必须排在任何 normalizeEmail /
+ * `.trim()` 之前——那些调用大多在 try 之外，对非字符串抛 TypeError 会直接变成框架 500。
+ */
+export function rejectMalformedStringFields(
+  body: Record<string, unknown>,
+  fields: readonly string[]
+): NextResponse | null {
+  const malformed = fields.some((field) => {
+    const value = body[field];
+    return value !== undefined && value !== null && typeof value !== 'string';
+  });
+  return malformed ? invalidBodyResponse() : null;
 }
 
 function oversizedBodyResponse(): NextResponse {

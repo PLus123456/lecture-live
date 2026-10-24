@@ -301,3 +301,52 @@ describe('POST /api/translate/text 管理员豁免', () => {
     );
   });
 });
+
+/**
+ * 上游错误串直接嵌着 provider 响应（401 里打码的 key 片段、限流文案里的组织 id、
+ * 内部模型名）。与 /api/llm/chat 同口径：SSE error 帧只下发固定文案，原文只进日志。
+ */
+describe('POST /api/translate/text 上游错误脱敏', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    verifyAuthMock.mockResolvedValue({ id: 'user-1', role: 'PRO' });
+    enforceApiRateLimitMock.mockResolvedValue(null);
+    getSiteSettingsMock.mockResolvedValue({
+      translation_text_enabled: true,
+      translation_text_billing_mode: 'free',
+      translation_text_price_cents_per_kchar: 0,
+      translation_text_daily_free_limit: 10,
+    });
+    resolveAuthorizedLlmSelectionMock.mockResolvedValue({
+      user: { role: 'PRO', allowedModels: '*' },
+      featureFlags: { allowTextTranslation: true },
+    });
+    resolveUserTranslationModelIdMock.mockResolvedValue(null);
+    resolveGroupBoundModelMock.mockResolvedValue({
+      routing: { purpose: 'TRANSLATION' },
+      provider: null,
+    });
+    consumeDailyTextQuotaMock.mockResolvedValue({ allowed: true, limit: 10 });
+    releaseDailyTextQuotaMock.mockResolvedValue(undefined);
+  });
+
+  it('provider 401 原文（含打码 key / 组织 id）不出现在 SSE error 帧里', async () => {
+    callLLMWithHistoryStreamMock.mockRejectedValue(
+      new Error(
+        'OpenAI-compatible API error (401): {"error":{"message":"Incorrect API key provided: sk-proj-****abcd in organization org-AbCdEf123"}}'
+      )
+    );
+
+    const res = await POST(makeReq({ text: 'hello', targetLang: 'zh' }));
+    const body = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(body).toContain('event: error');
+    expect(body).toContain('翻译失败，请稍后重试');
+    expect(body).not.toContain('sk-proj');
+    expect(body).not.toContain('org-AbCdEf123');
+    expect(body).not.toContain('OpenAI-compatible');
+    // 一字未出就失败 → 免费额度照常退回
+    expect(releaseDailyTextQuotaMock).toHaveBeenCalledWith('user-1');
+  });
+});

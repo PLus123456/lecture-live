@@ -221,7 +221,15 @@ chmod 600 "$UNIT_FILE"
 systemd-analyze verify "$UNIT_FILE" || error "systemd 单元验证失败，拒绝启动未完整加固的 worker"
 
 systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || systemctl restart "$SERVICE_NAME"
+systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || error "systemctl enable ${SERVICE_NAME} 失败"
+# 必须无条件 restart：脚本头承诺「重复执行 = 升级 worker 脚本并重启服务」，而此前的
+# `enable --now … || restart` 对已在运行的单元是空操作且返回 0，restart 永远走不到——
+# 新的 worker 脚本与重写的单元（环境变量 / 沙箱指令）都不生效，下面的健康检查打到的还是旧进程。
+# restart 对尚未运行的单元等同 start，首次安装同样适用。
+systemctl restart "$SERVICE_NAME" || {
+    journalctl -u "$SERVICE_NAME" -n 20 --no-pager || true
+    error "worker 启动失败（见上方日志）"
+}
 sleep 2
 
 # ── 7. 健康检查 ──

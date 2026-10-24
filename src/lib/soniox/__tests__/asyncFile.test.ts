@@ -153,4 +153,50 @@ describe('Soniox transcript ingress admission', () => {
       })
     ).toMatchObject({ id: 'tr-1', tokens: [{ text: 'hello' }] });
   });
+
+  // Soniox 统一翻译 token 格式：原文带 'original'（或语种对外的 'none'），译文带 'translation'
+  // + source_language。旧白名单只认 'translation' 且拒绝 source_language，整份 transcript 被拒。
+  it('接受统一翻译格式的 original / none / translation 与 source_language', () => {
+    const admitted = admitSonioxTranscriptResponse({
+      id: 'tr-2',
+      text: 'Good morning Guten Morgen Bonjour',
+      tokens: [
+        { text: 'Good morning', start_ms: 0, end_ms: 400, confidence: 0.9, language: 'en', translation_status: 'original' },
+        { text: 'Guten Morgen', start_ms: 0, end_ms: 400, confidence: 0.9, language: 'de', translation_status: 'translation', source_language: 'en' },
+        { text: 'Bonjour', start_ms: 500, end_ms: 800, confidence: 0.9, language: 'fr', translation_status: 'none' },
+      ],
+    });
+    expect(admitted.tokens.map((t) => t.translation_status)).toEqual([
+      'original',
+      'translation',
+      'none',
+    ]);
+    expect(admitted.tokens[1].source_language).toBe('en');
+  });
+
+  it('忽略未知字段且不把它们拷进规范化结果', () => {
+    const admitted = admitSonioxTranscriptResponse({
+      id: 'tr-3',
+      text: 'hi',
+      future_field: { nested: true },
+      tokens: [{ text: 'hi', start_ms: 0, end_ms: 50, confidence: 1, new_token_field: 'x' }],
+    });
+    expect(admitted).toEqual({
+      id: 'tr-3',
+      text: 'hi',
+      tokens: [{ text: 'hi', start_ms: 0, end_ms: 50, confidence: 1 }],
+    });
+  });
+
+  it('未文档化的 translation_status 取值仍被拒绝', () => {
+    expect(() =>
+      admitSonioxTranscriptResponse({
+        id: 'tr-4',
+        text: 'x',
+        tokens: [
+          { text: 'x', start_ms: 0, end_ms: 1, confidence: 1, translation_status: 'bogus' },
+        ],
+      })
+    ).toThrow(SonioxTranscriptPayloadError);
+  });
 });

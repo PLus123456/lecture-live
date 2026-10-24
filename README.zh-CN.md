@@ -171,6 +171,9 @@ npm run dev:ws
 # 1. 配置环境变量
 cp .env.example .env.local
 # 设置 DB_PASSWORD、MYSQL_ROOT_PASSWORD、REDIS_PASSWORD、JWT_SECRET、ENCRYPTION_KEY
+# compose 自身从 `.env`（不是 .env.local）读取 DB_PASSWORD、MYSQL_ROOT_PASSWORD、
+# REDIS_PASSWORD（及其 *_ENCODED）与 NEXT_PUBLIC_APP_URL / NEXT_PUBLIC_WS_URL；
+# NEXT_PUBLIC_* 在构建镜像时写死，修改后需先 `docker-compose build app` 重建。
 
 # 2. 启动整套服务
 docker-compose up -d
@@ -240,6 +243,8 @@ lecture-live/
 
 > LLM 供应商密钥与 Soniox 凭证更推荐通过管理后台录入，并以加密形式保存在数据库中。环境变量主要作为后备方案存在。
 
+**Soniox API Key 权限。** Soniox 的 API Key 现在按产品授予权限。服务端使用的 Key 需要：**Temporary API keys** + **Speech-to-text, real-time**（实时转录与同传）、**Speech-to-text, async**（写）+ **Files**（写）（上传文件转录）、**Usage and limits**（计费对账任务读取 `/v1/usage-logs`）。权限功能上线前创建的 Key 保持全权限。浏览器永远拿不到这把 Key：它只拿到短时、一次性的 `snx_temp_…` 临时 Key，并在 WebSocket 握手时通过 `Sec-WebSocket-Protocol: soniox-api-key, <key>` 发送，而不是放在首条 start 消息里——Soniox 自 2027 年 1 月 15 日起拒绝 start 消息鉴权。如果把某个区域的 WebSocket 地址指向自建反向代理，代理必须原样透传 `Sec-WebSocket-Protocol` 请求/响应头。
+
 ### Cloudreve OAuth（v4）
 
 LectureLive 接入 Cloudreve 存储时，使用的是 Cloudreve v4 的 OAuth 授权码流程，并启用了 PKCE。
@@ -282,7 +287,7 @@ LectureLive 接入 Cloudreve 存储时，使用的是 Cloudreve v4 的 OAuth 授
 | `npm run billing:reset-quotas` | 重置月度转录配额（含购买时长池结算与在途预留清理） |
 | `npm run billing:reconcile` | 打印只读的转录用量 drift 报表 |
 | `npm run billing:maintenance` | 执行计费维护任务（含上面两项，另加会话/预留回收 —— cron 首选这条） |
-| `npm run security:reencrypt-llm-keys` | 重新加密已存储的 LLM 密钥 |
+| `npm run security:reencrypt-llm-keys` | 轮换 `ENCRYPTION_KEY` 后重加密所有用旧密钥落库的值（LLM key、支付/Soniox/Cloudreve 密钥、worker token）；`-- --dry-run` 预览。退出码为 0 后才可删除 `ENCRYPTION_KEY_PREVIOUS` |
 
 ## 参与贡献
 

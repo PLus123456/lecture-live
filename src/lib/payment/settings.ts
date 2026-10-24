@@ -8,6 +8,7 @@ import {
   getStripeKeyMode,
   isStripeKeyAllowedForEnvironment,
 } from '@/lib/payment/stripeMode';
+import { isCentDenominatedCurrency } from '@/lib/payment/providers/stripe';
 
 /**
  * 充值系统配置（货币 + 各支付渠道开关与凭据）。存于 SiteSetting 的 `recharge_*` 键。
@@ -181,6 +182,13 @@ export async function updateRechargeSettings(
       const code = normalizeCurrencyCode(v);
       if (!code) {
         throw new RechargeSettingsError(`${field} 必须是 ISO-4217 三字母币种码（如 CNY）`);
+      }
+      // 审计 #7：金额模型只支持最小单位为 1/100 的币种。零位小数（JPY/KRW…）会让网关按显示价的
+      // 100 倍收款，三位小数（KWD/BHD…）只收 1/10 —— 下单、展示、对账都会错位，必须在保存时拒掉。
+      if (!isCentDenominatedCurrency(code)) {
+        throw new RechargeSettingsError(
+          `${field} 不支持 ${code}：它不是两位小数币种（最小货币单位不是 1/100）。本系统所有金额都按「分」（1/100）存储、展示并原样传给支付网关，零位小数币种（如 JPY、KRW）会按显示价的 100 倍收款，三位小数币种（如 KWD、BHD）只会收 1/10；请改用 CNY、USD、EUR 等两位小数币种`
+        );
       }
       value = code;
     } else if (kind === 'secret') {

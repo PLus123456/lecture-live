@@ -151,11 +151,13 @@ describe('setupLiveShare', () => {
     });
     clients.push(broadcaster);
 
-    await onceSocketEvent(broadcaster, 'connect');
-    const broadcasterInitialState = await onceSocketEvent<{
+    // 监听先于 await connect 挂好（见下方同类注释：ws 8.17+ 可能同步派发相邻帧）。
+    const broadcasterInitialStatePromise = onceSocketEvent<{
       status: string | null;
       segments: unknown[];
     }>(broadcaster, 'initial_state');
+    await onceSocketEvent(broadcaster, 'connect');
+    const broadcasterInitialState = await broadcasterInitialStatePromise;
 
     expect(broadcasterInitialState).toMatchObject({
       status: null,
@@ -165,7 +167,7 @@ describe('setupLiveShare', () => {
     broadcaster.emit('sync_snapshot', {
       segments: [{ id: 'seg-1', text: 'Hello' }],
       translations: { 'seg-1': '你好' },
-      summaryBlocks: [{ id: 'sum-1', text: 'Summary' }],
+      summaryBlocks: [{ id: 'sum-1', summary: 'Summary' }],
       status: 'RECORDING',
       previewText: { finalText: 'He', nonFinalText: 'l' },
       previewTranslation: {
@@ -186,7 +188,7 @@ describe('setupLiveShare', () => {
     const viewerInitialStatePromise = onceSocketEvent<{
       segments: Array<{ id: string; text: string }>;
       translations: Record<string, string>;
-      summaryBlocks: Array<{ id: string; text: string }>;
+      summaryBlocks: Array<{ id: string; summary: string }>;
       status: string | null;
       previewText: { finalText: string; nonFinalText: string };
       previewTranslation: {
@@ -206,7 +208,7 @@ describe('setupLiveShare', () => {
     await expect(viewerInitialStatePromise).resolves.toMatchObject({
       segments: [{ id: 'seg-1', text: 'Hello' }],
       translations: { 'seg-1': '你好' },
-      summaryBlocks: [{ id: 'sum-1', text: 'Summary' }],
+      summaryBlocks: [{ id: 'sum-1', summary: 'Summary' }],
       status: 'RECORDING',
       previewText: { finalText: 'He', nonFinalText: 'l' },
       previewTranslation: {
@@ -247,8 +249,11 @@ describe('setupLiveShare', () => {
     });
     clients.push(broadcaster);
 
+    // initial_state 可能与 CONNECT 回执落在同一批帧里被同步派发（ws 8.17+ 客户端默认
+    // allowSynchronousEvents）：监听必须在 await connect 之前挂好，否则偶发丢事件超时。
+    const broadcasterReady = onceSocketEvent(broadcaster, 'initial_state');
     await onceSocketEvent(broadcaster, 'connect');
-    await onceSocketEvent(broadcaster, 'initial_state');
+    await broadcasterReady;
 
     const longTranslation = 'x'.repeat(10_050);
     broadcaster.emit('sync_snapshot', {
@@ -292,8 +297,11 @@ describe('setupLiveShare', () => {
     });
     clients.push(broadcaster);
 
+    // initial_state 可能与 CONNECT 回执落在同一批帧里被同步派发（ws 8.17+ 客户端默认
+    // allowSynchronousEvents）：监听必须在 await connect 之前挂好，否则偶发丢事件超时。
+    const broadcasterReady = onceSocketEvent(broadcaster, 'initial_state');
     await onceSocketEvent(broadcaster, 'connect');
-    await onceSocketEvent(broadcaster, 'initial_state');
+    await broadcasterReady;
 
     const longText = 'a'.repeat(10_050);
     broadcaster.emit('sync_snapshot', {
@@ -352,8 +360,11 @@ describe('setupLiveShare', () => {
     });
     clients.push(broadcaster);
 
+    // initial_state 可能与 CONNECT 回执落在同一批帧里被同步派发（ws 8.17+ 客户端默认
+    // allowSynchronousEvents）：监听必须在 await connect 之前挂好，否则偶发丢事件超时。
+    const broadcasterReady = onceSocketEvent(broadcaster, 'initial_state');
     await onceSocketEvent(broadcaster, 'connect');
-    await onceSocketEvent(broadcaster, 'initial_state');
+    await broadcasterReady;
 
     const longText = 'b'.repeat(10_050);
     broadcaster.emit('broadcast', {
@@ -470,8 +481,11 @@ describe('setupLiveShare', () => {
     });
     clients.push(broadcaster);
 
+    // initial_state 可能与 CONNECT 回执落在同一批帧里被同步派发（ws 8.17+ 客户端默认
+    // allowSynchronousEvents）：监听必须在 await connect 之前挂好，否则偶发丢事件超时。
+    const broadcasterReady = onceSocketEvent(broadcaster, 'initial_state');
     await onceSocketEvent(broadcaster, 'connect');
-    await onceSocketEvent(broadcaster, 'initial_state');
+    await broadcasterReady;
 
     broadcaster.emit('sync_snapshot', {
       segments: [{ id: 'seg-1', text: 'Hello' }],
@@ -569,8 +583,11 @@ describe('setupLiveShare', () => {
       },
     });
     clients.push(broadcaster);
+    // initial_state 可能与 CONNECT 回执落在同一批帧里被同步派发（ws 8.17+ 客户端默认
+    // allowSynchronousEvents）：监听必须在 await connect 之前挂好，否则偶发丢事件超时。
+    const broadcasterReady = onceSocketEvent(broadcaster, 'initial_state');
     await onceSocketEvent(broadcaster, 'connect');
-    await onceSocketEvent(broadcaster, 'initial_state');
+    await broadcasterReady;
 
     const legitViewer = createClient(baseUrl, {
       transports: ['websocket'],

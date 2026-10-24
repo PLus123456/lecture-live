@@ -7,6 +7,7 @@ import {
   timingSafeEqual,
 } from 'crypto';
 import { NextResponse } from 'next/server';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { JWT_SECRET } from '@/lib/serverSecrets';
 import { getRedisClient } from '@/lib/redis';
@@ -19,6 +20,8 @@ import { getNextQuotaResetAt } from '@/lib/billing';
 // 直接引 tokens 而非 @/lib/email 桶文件：桶会拉进 mailer/模板（含 nodemailer），
 // 而 auth 是几乎所有路由的公共依赖，没必要为一句 updateMany 背上整个发信栈。
 import { invalidateUserEmailTokens } from '@/lib/email/tokens';
+// domains 是纯函数模块（无 IO、无发信依赖），可直接引。
+import { normalizeEmail } from '@/lib/email/domains';
 import {
   AUTH_SESSION_BINDING_HEADER,
   CLIENT_SESSION_TOKEN,
@@ -98,6 +101,11 @@ class AuthVerificationInfrastructureError extends Error {
     super('Auth verification persistence unavailable');
     this.name = 'AuthVerificationInfrastructureError';
   }
+}
+
+/** 供路由识别「认证真源暂时不可判定」（DB 故障），据此以 5xx 而非 401 作答。 */
+export function isAuthVerificationInfrastructureError(error: unknown): boolean {
+  return error instanceof AuthVerificationInfrastructureError;
 }
 
 export type RotateAuthTokenResult =
@@ -554,6 +562,17 @@ export async function revokeToken(
     throw new Error('Auth token family could not be persistently revoked');
   }
 
+  await indexRevokedLeaf(payload);
+}
+
+/**
+ * DB 撤销提交之后，把该 leaf 的 jti 写进内存 / Redis 快速拒绝索引。
+ * 它只是拒绝路径的辅助，不承担安全真源职责（真源是 DB family.revokedAt 与 tokenVersion），
+ * 因此任何失败都只降级、不抛出。
+ */
+async function indexRevokedLeaf(
+  payload: Pick<AuthTokenPayload, 'jti' | 'exp'>
+): Promise<void> {
   const expiresAt = getTokenExpiryDate(payload as AuthTokenPayload).getTime();
   const ttlSeconds = Math.max(
     1,
@@ -800,17 +819,29 @@ export function peekTokenJti(token: string): string | null {
   }
 }
 
-/** Verify JWT and return session data, reading from header or cookie */
+/**
+ * Verify JWT and return session data, reading from header or cookie.
+ *
+ * DB 故障（查询本身失败，而不是「查不到」）必须抛出、由路由落成 5xx，绝不能伪装成 null：
+ * 所有 HTTP 调用方都把 null 映射成 401，而前端 AuthSessionMonitor 把任何 401 视为会话失效——
+ * 立刻登出、持久撤销仍然有效的 token family，并在撤销确认前阻止重新登录。于是一次连接池
+ * 超时 / MySQL 重启就会把所有在线用户（后台任务指示器每 10~30s 就轮询一次）全部踢下线。
+ * refresh / logout 早已走 throwOnInfrastructureError 返回 503，这里与之同口径。
+ * verifyAuthToken（WS 握手 / SSR 首页）不在浏览器 fetch 链路上，仍保持返回 null。
+ */
 export async function verifyAuthSession(req: Request): Promise<AuthSession | null> {
   const token = extractToken(req);
   if (!token) {
     return null;
   }
 
-  return verifyToken(token);
+  return verifyToken(token, { throwOnInfrastructureError: true });
 }
 
-/** Verify JWT and return user payload, reading from header or cookie */
+/**
+ * Verify JWT and return user payload, reading from header or cookie.
+ * 认证真源（DB）不可用时抛出而不是返回 null，语义见 verifyAuthSession。
+ */
 export async function verifyAuth(req: Request): Promise<UserPayload | null> {
   const session = await verifyAuthSession(req);
   return session?.user ?? null;
@@ -1194,6 +1225,10 @@ export async function registerWithOptions(
     // 邮箱是否视为已验证。开启站点级邮箱验证硬门禁时，注册路由传 false，
     // 让新账号 emailVerifiedAt=null（未验证不得登录）；默认 true 保持历史行为。
     emailVerified?: boolean;
+    // 是否当场签发会话。验证门禁开启时注册不下发会话（验证后由 verify-email 签发）：
+    // 此时再建 AuthTokenFamily 既是永远用不上的孤儿行，也让「新建账号」比「邮箱已存在」
+    // 多一次写库耗时（L6 枚举的时序差）。默认 true 保持历史行为。
+    issueSession?: boolean;
   }
 ) {
   const role = normalizeUserRole(options?.role, 'FREE');
@@ -1217,6 +1252,9 @@ export async function registerWithOptions(
       storageBytesLimit,
     },
   });
+  if (options?.issueSession === false) {
+    return { user, token: null };
+  }
   const token = await issueAuthToken(
     {
       id: user.id,
@@ -1229,6 +1267,45 @@ export async function registerWithOptions(
   return { user, token };
 }
 
+/** 核对当前密码并算出新密码哈希（bcrypt 放在事务外，免得白占连接与行锁）。 */
+async function verifyCurrentPasswordAndHashNew(
+  userId: string,
+  currentPassword: string,
+  newPassword: string,
+  bcryptRounds?: number
+): Promise<string> {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user || !(await bcrypt.compare(currentPassword, user.passwordHash))) {
+    throw new Error('Current password is incorrect');
+  }
+  return bcrypt.hash(newPassword, bcryptRounds ?? 12);
+}
+
+/**
+ * 事务内的改密本体。改密与「作废该用户全部未消费邮件令牌」必须同进同退：只改密不作废，
+ * 一封没用过的重置链接就能在 1h 内把刚改的密码再改回去（tokenVersion++ 踢掉的会话拦不住它）。
+ */
+async function applyPasswordChange(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  passwordHash: string
+) {
+  await invalidateUserEmailTokens(userId, { db: tx });
+  return tx.user.update({
+    where: { id: userId },
+    data: {
+      passwordHash,
+      tokenVersion: { increment: 1 },
+    },
+    select: {
+      id: true,
+      email: true,
+      role: true,
+      tokenVersion: true,
+    },
+  });
+}
+
 export async function changePassword(
   userId: string,
   currentPassword: string,
@@ -1237,40 +1314,112 @@ export async function changePassword(
     bcryptRounds?: number;
   }
 ) {
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user || !(await bcrypt.compare(currentPassword, user.passwordHash))) {
-    throw new Error('Current password is incorrect');
+  const passwordHash = await verifyCurrentPasswordAndHashNew(
+    userId,
+    currentPassword,
+    newPassword,
+    options?.bcryptRounds
+  );
+  return prisma.$transaction((tx) =>
+    applyPasswordChange(tx, userId, passwordHash)
+  );
+}
+
+/**
+ * 自助改密：改密 + 撤销当前设备的 family + 为本设备签发新 family，全部同一事务提交。
+ *
+ * 旧路由是三步各自提交：changePassword 事务（新哈希 + tokenVersion++）先落库，随后
+ * revokeToken / issueAuthToken 任一步遇到瞬时 DB 故障就回 500——此时密码其实已经改了、
+ * 包括当前设备在内的所有会话都已失效，前端却提示「修改失败」，用户随后拿旧密码登录失败。
+ * 合进一个事务后：要么全部生效并下发新 cookie，要么全部回滚，失败提示如实。
+ */
+export async function changePasswordAndReissueSession(
+  current: AuthTokenPayload,
+  currentPassword: string,
+  newPassword: string,
+  options?: { bcryptRounds?: number; expiresInDays?: number }
+): Promise<{ user: TokenUserPayload; token: string }> {
+  if (!hasTokenFamily(current)) {
+    throw new Error('Legacy auth tokens require reauthentication');
   }
-  const passwordHash = await bcrypt.hash(newPassword, options?.bcryptRounds ?? 12);
-  // 改密与「作废该用户全部未消费邮件令牌」必须同进同退：只改密不作废，一封没用过的
-  // 重置链接就能在 1h 内把刚改的密码再改回去（tokenVersion++ 踢掉的会话拦不住它）。
-  return prisma.$transaction(async (tx) => {
-    await invalidateUserEmailTokens(userId, { db: tx });
-    return tx.user.update({
-      where: { id: userId },
+  const passwordHash = await verifyCurrentPasswordAndHashNew(
+    current.id,
+    currentPassword,
+    newPassword,
+    options?.bcryptRounds
+  );
+
+  const sessionStartedAt = Date.now();
+  const familyId = randomUUID();
+  const jti = randomUUID();
+  const result = await prisma.$transaction(async (tx) => {
+    const updated = await applyPasswordChange(tx, current.id, passwordHash);
+    // count=0（并发登出 / 已过期）不阻断改密：tokenVersion++ 已让该 family 的所有 leaf 失效。
+    await tx.authTokenFamily.updateMany({
+      where: { id: current.familyId, userId: current.id, revokedAt: null },
+      data: { revokedAt: new Date(), revokedReason: 'password_change' },
+    });
+    // 新 leaf 必须带自增后的 tokenVersion，所以在事务内、拿到 updated 之后再签名（纯计算）。
+    const token = signToken(updated, {
+      sessionStartedAt,
+      expiresInDays: options?.expiresInDays,
+      familyId,
+      generation: 0,
+      jti,
+    });
+    await tx.authTokenFamily.create({
       data: {
-        passwordHash,
-        tokenVersion: { increment: 1 },
-      },
-      select: {
-        id: true,
-        email: true,
-        role: true,
-        tokenVersion: true,
+        id: familyId,
+        userId: updated.id,
+        currentJtiHash: hashTokenJti(jti),
+        generation: 0,
+        sessionStartedAt: new Date(sessionStartedAt),
+        expiresAt: getFamilyExpiryDate(sessionStartedAt),
       },
     });
+    return { user: updated, token };
   });
+
+  await indexRevokedLeaf(current);
+  return result;
 }
 
 /** login() 在「密码正确但邮箱未验证」时抛出的哨兵错误，供路由映射到「需验证」响应。 */
 export const EMAIL_NOT_VERIFIED_ERROR = 'Email not verified';
 
+/** login() 在账号级限流命中（beforePasswordCheck 返回 false）时抛出的哨兵错误。 */
+export const LOGIN_THROTTLED_ERROR = 'Login throttled';
+
 export async function login(
   email: string,
   password: string,
-  options?: { jwtExpiryDays?: number; bcryptRounds?: number; requireEmailVerified?: boolean }
+  options?: {
+    jwtExpiryDays?: number;
+    bcryptRounds?: number;
+    requireEmailVerified?: boolean;
+    /**
+     * 命中真实账号之后、跑 bcrypt 之前调用；返回 false 表示该账号已被限流。
+     * 账号级桶必须按 user.id 记：按入参邮箱字符串记的桶，可以被「排序规则相等」的
+     * 不同写法各换出一个新桶，对同一账号的暴破就不再受账号级限流约束。
+     */
+    beforePasswordCheck?: (userId: string) => Promise<boolean>;
+  }
 ) {
-  const user = await prisma.user.findUnique({ where: { email } });
+  const found = await prisma.user.findUnique({ where: { email } });
+  // email 列是 Prisma 建表默认的 utf8mb4_unicode_ci（大小写 + 重音不敏感）：
+  // 'vïctim@x.edu' 会查到 'victim@x.edu' 那一行。只认与入参（归一化后）逐字符一致的账号，
+  // 其余一律按「账号不存在」处理——照样跑下面的哑 bcrypt，时序与真不存在无差别——
+  // 这样每个账号只有一种写法能触达口令比对，按邮箱记的限流桶才真正等价于按账号限流。
+  const user =
+    found && normalizeEmail(found.email) === normalizeEmail(email) ? found : null;
+
+  if (
+    user &&
+    options?.beforePasswordCheck &&
+    !(await options.beforePasswordCheck(user.id))
+  ) {
+    throw new Error(LOGIN_THROTTLED_ERROR);
+  }
 
   // 用户不存在时也执行一次固定成本的 bcrypt.compare，避免账户枚举时间侧信道。
   // 哑 hash 的 cost 需与当前 bcrypt_rounds 匹配，否则耗时差异仍会泄露账号是否存在。

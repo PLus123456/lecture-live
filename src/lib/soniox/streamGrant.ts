@@ -13,6 +13,13 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { logger } from '@/lib/logger';
 import {
+  getMaxSessionDurationMs,
+  STREAM_DURATION_CAP_GRACE_MS,
+  sumCappedStreamActualMs,
+  type AppUserRole,
+} from '@/lib/billing';
+import { MAX_INTERPRET_DURATION_MS } from '@/lib/interpret/anchor';
+import {
   releaseTranscriptionMinutes,
   reserveTranscriptionMinutesUpTo,
 } from '@/lib/quota';
@@ -67,6 +74,13 @@ export type CreateStreamGrantResult =
   | {
       ok: false;
       reason: 'quota_exhausted' | 'user_not_found' | 'too_many_streams';
+    }
+  | {
+      ok: false;
+      /** 本场（Session / InterpretSession）累计串流已达单场上限 + 宽限，不再签发。 */
+      reason: 'session_duration_limit';
+      /** 命中的单场上限（毫秒），供客户端提示。 */
+      limitMs: number;
     };
 
 /**
@@ -84,6 +98,77 @@ class TooManyStreamGrantsError extends Error {
   }
 }
 
+/** 单场时长闸命中的哨兵异常：与 TooManyStreamGrantsError 同理，必须抛出才能回滚已做的预扣。 */
+class StreamDurationLimitError extends Error {
+  constructor(readonly limitMs: number) {
+    super('stream duration limit reached');
+    this.name = 'StreamDurationLimitError';
+  }
+}
+
+/**
+ * 一场的串流时长上限，与结算封顶同口径：realtime 按角色单场上限（FREE 2h / PRO 4h，会话页
+ * 也按它自动收尾），interpret 按单场硬上限 6h（deduct / cron 的封顶）。ADMIN 不计费、不设闸。
+ */
+export function streamDurationCapMs(
+  kind: StreamGrantKind,
+  role: AppUserRole
+): number | null {
+  if (role === 'ADMIN') return null;
+  // 未知角色与结算侧 clampSessionDurationMs 同口径：没有上限可依。
+  return kind === 'interpret'
+    ? MAX_INTERPRET_DURATION_MS
+    : (getMaxSessionDurationMs(role) ?? null);
+}
+
+/**
+ * 尚无实测量的 grant，其流最晚在下一次 mint 之后这么久内结束：诚实客户端轮换时先停旧流再
+ * re-mint，断线重连时旧流早已断开。只用于下面的估算。
+ */
+const STREAM_HANDOVER_ALLOWANCE_MS = 60_000;
+
+export interface StreamGrantUsageRow {
+  mintedAt: Date;
+  maxSessionSeconds: number;
+  actualMs: number | null;
+  settledBy: string | null;
+}
+
+/**
+ * 同一场（Session / InterpretSession）的 grants 已用掉、或仍可能用掉的串流毫秒——mint 时长闸的口径。
+ *  - 已回填 usage-logs 实测（actualMs）→ 按实测（封顶到该连接的硬上限，防 Soniox 侧异常大值）；
+ *  - mint 失败、或 usage-logs 确认无用量而退了预扣的 → 0（key 没签出去 / 从没连上）；
+ *  - 其余（流可能仍在、或实测尚未回填）→ min(连接硬上限, 到下一次 mint 的间隔 + 交接余量)，
+ *    最新一条按「到 now」算。
+ * 诚实客户端同一场同一时刻只有一条流，估算不会低于其真实用量。并行多开会被低估，但实测回填后
+ * 照实计入，结算时也按实测补收超出部分（billing.withMeasuredStreamFloorMs）。
+ */
+export function estimateCommittedStreamMs(
+  rows: ReadonlyArray<StreamGrantUsageRow>,
+  nowMs: number
+): number {
+  const sorted = [...rows].sort(
+    (a, b) => a.mintedAt.getTime() - b.mintedAt.getTime()
+  );
+  let totalMs = 0;
+  sorted.forEach((row, index) => {
+    const connectionCapMs = Math.max(0, row.maxSessionSeconds) * 1000;
+    if (row.actualMs !== null) {
+      totalMs += Math.min(Math.max(0, row.actualMs), connectionCapMs);
+      return;
+    }
+    if (row.settledBy === 'mint_failed' || row.settledBy === 'usage_refund') {
+      return;
+    }
+    const nextMintMs =
+      index + 1 < sorted.length ? sorted[index + 1].mintedAt.getTime() : nowMs;
+    const spanMs =
+      Math.max(0, nextMintMs - row.mintedAt.getTime()) + STREAM_HANDOVER_ALLOWANCE_MS;
+    totalMs += Math.min(connectionCapMs, spanMs);
+  });
+  return totalMs;
+}
+
 /**
  * 原子「预扣 + 建 grant」。同一事务：收缩式预扣（reserveTranscriptionMinutesUpTo，FOR UPDATE）
  * 成功才落 grant 行；额度剩 0 返回 quota_exhausted（调用方 403 拒发 key）。
@@ -92,7 +177,8 @@ class TooManyStreamGrantsError extends Error {
 export async function createStreamGrantWithReservation(
   input: CreateStreamGrantInput
 ): Promise<CreateStreamGrantResult> {
-  const activeSince = new Date(Date.now() - STREAM_GRANT_ACTIVE_WINDOW_MS);
+  const nowMs = Date.now();
+  const activeSince = new Date(nowMs - STREAM_GRANT_ACTIVE_WINDOW_MS);
   try {
     return await prisma.$transaction(async (tx) => {
       const reservation = await reserveTranscriptionMinutesUpTo(
@@ -126,10 +212,60 @@ export async function createStreamGrantWithReservation(
       }
 
       const isAdmin = reservation.role === 'ADMIN';
+
+      // 单场时长闸。结算按单场上限封顶计费（FREE 2h / PRO 4h / 同传 6h），此前 mint 却不设上限：
+      // 绕过会话页自动收尾、或在同一场并行多开流，超出上限的串流全部免费。这里按本场已用 / 仍可能
+      // 用掉的串流量（estimateCommittedStreamMs）只放行到「上限 + 宽限」，最后一把 key 收缩到剩余
+      // 时长。放在预扣之后：复用它对用户行的 FOR UPDATE（一场恒属同一用户），并发 mint 已串行化，
+      // 「估算 + 建行」原子。
+      let grantedMinutes = reservation.reservedMinutes;
+      const durationCapMs = streamDurationCapMs(
+        input.kind,
+        reservation.role as AppUserRole
+      );
+      const scope =
+        input.kind === 'realtime'
+          ? input.sessionId
+            ? { sessionId: input.sessionId }
+            : null
+          : input.interpretSessionId
+            ? { interpretSessionId: input.interpretSessionId }
+            : null;
+      if (durationCapMs !== null && scope) {
+        const rows = await tx.sonioxStreamGrant.findMany({
+          where: scope,
+          select: {
+            mintedAt: true,
+            maxSessionSeconds: true,
+            actualMs: true,
+            settledBy: true,
+          },
+        });
+        const allowanceMinutes = Math.floor(
+          (durationCapMs +
+            STREAM_DURATION_CAP_GRACE_MS -
+            estimateCommittedStreamMs(rows, nowMs)) /
+            60_000
+        );
+        if (allowanceMinutes < 1) {
+          throw new StreamDurationLimitError(durationCapMs);
+        }
+        if (allowanceMinutes < grantedMinutes) {
+          if (!isAdmin) {
+            await releaseTranscriptionMinutes(
+              input.userId,
+              grantedMinutes - allowanceMinutes,
+              tx
+            );
+          }
+          grantedMinutes = allowanceMinutes;
+        }
+      }
+
       // ADMIN 不写 used（reserveUpTo 短路未扣），reservedMinutes 记 0 保证结算释放 0、对账不虚；
       // 连接上限仍按请求值全额（无限额用户没有收缩语义）。
-      const reservedMinutes = isAdmin ? 0 : reservation.reservedMinutes;
-      const maxSessionSeconds = reservation.reservedMinutes * 60;
+      const reservedMinutes = isAdmin ? 0 : grantedMinutes;
+      const maxSessionSeconds = grantedMinutes * 60;
 
       const grant = await tx.sonioxStreamGrant.create({
         data: {
@@ -156,6 +292,13 @@ export async function createStreamGrantWithReservation(
     // 其它异常原样上抛（调用方的 catch 会 500 并作废 interpret 锚点）。
     if (err instanceof TooManyStreamGrantsError) {
       return { ok: false as const, reason: 'too_many_streams' as const };
+    }
+    if (err instanceof StreamDurationLimitError) {
+      return {
+        ok: false as const,
+        reason: 'session_duration_limit' as const,
+        limitMs: err.limitMs,
+      };
     }
     throw err;
   }
@@ -209,10 +352,16 @@ export async function settleStreamGrants(
           : Prisma.sql`interpretSessionId = ${key.interpretSessionId}`;
 
     const rows = await tx.$queryRaw<
-      Array<{ id: string; userId: string; reservedMinutes: number; actualMs: number | null }>
+      Array<{
+        id: string;
+        userId: string;
+        reservedMinutes: number;
+        actualMs: number | null;
+        maxSessionSeconds: number;
+      }>
     >(
       Prisma.sql`
-        SELECT id, userId, reservedMinutes, actualMs
+        SELECT id, userId, reservedMinutes, actualMs, maxSessionSeconds
         FROM SonioxStreamGrant
         WHERE ${condition} AND settledAt IS NULL
         FOR UPDATE
@@ -233,10 +382,8 @@ export async function settleStreamGrants(
       (total, r) => total + Math.max(0, Number(r.reservedMinutes) || 0),
       0
     );
-    const actualMsTotal = rows.reduce(
-      (total, r) => total + Math.max(0, Number(r.actualMs) || 0),
-      0
-    );
+    // 每条先封顶到自己的连接硬上限（见 sumCappedStreamActualMs）：deduct 拿它当计费下限。
+    const actualMsTotal = sumCappedStreamActualMs(rows);
     if (settled.count > 0 && releasedMinutes > 0) {
       // 同一结算键下的 grants 恒属同一 user（键即用户内实体），合并一次释放。
       await releaseTranscriptionMinutes(rows[0].userId, releasedMinutes, tx);
@@ -275,11 +422,13 @@ export async function countActiveStreamGrants(
  * 挂到 reclaim 按内容 0 分钟免单」。诚实用户正常收尾不走此口径，体验不变。
  */
 export async function sumSessionGrantActualMs(sessionId: string): Promise<number> {
-  const agg = await prisma.sonioxStreamGrant.aggregate({
+  // 逐条封顶到各自的连接硬上限再求和（见 sumCappedStreamActualMs）：finalize 拿它当计费下限，
+  // 对账侧的异常大值不能直接变成扣费。
+  const rows = await prisma.sonioxStreamGrant.findMany({
     where: { sessionId, actualMs: { gt: 0 } },
-    _sum: { actualMs: true },
+    select: { actualMs: true, maxSessionSeconds: true },
   });
-  return agg._sum.actualMs ?? 0;
+  return sumCappedStreamActualMs(rows);
 }
 
 /**

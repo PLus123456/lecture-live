@@ -4,8 +4,8 @@
  *
  * Async 和 realtime 的 token shape 几乎一致，除了：
  * - async token 没有 is_final（都是已完成的）→ 全部标记 is_final: true
- * - async 的 translation_status 只有 "translation"（翻译 token）或 absent（原文）；
- *   TokenProcessor 期望的是 'none' | 'original' | 'translation'，我们把 absent → 'original'
+ * - async 的 translation_status 可能是 "translation"（译文）、"original" / "none"（原文）或缺省
+ *   （未开翻译）；这里一律按 `!== 'translation'` 认原文，并统一标成 'original' 交给 TokenProcessor
  *
  * ⚠️ 分段：async（文件）路径拿不到 realtime 的两个分段驱动 ——
  *   1. Soniox WebSocket 的 endpoint 事件（停顿/说话人边界触发 onEndpoint）：文件 API 不产出；

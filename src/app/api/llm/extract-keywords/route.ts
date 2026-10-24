@@ -10,6 +10,11 @@ import {
 } from '@/lib/llm/prompts';
 import { extractTextFromFile } from '@/lib/fileParser';
 import { DocumentParserError } from '@/lib/documentParserProcess';
+import {
+  MIDDLEWARE_CLIENT_MAX_BODY_BYTES,
+  MULTIPART_OVERHEAD_BYTES,
+  parseFormDataWithLimit,
+} from '@/lib/requestBodyLimit';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { estimateTokens } from '@/lib/llm/tokenizer';
 import { chunkText } from '@/lib/llm/chunking';
@@ -58,6 +63,17 @@ class KeywordRequestError extends Error {
   ) {
     super(message);
     this.name = 'KeywordRequestError';
+  }
+}
+
+/**
+ * 客户端已断开。关键词结果只回给这一次请求、不落库 —— 断开后继续跑剩余 map/reduce
+ * 调用就是白烧平台的厂商 token，所以 map 循环与每次付费调用前都要检查 abort。
+ */
+class KeywordRequestCancelledError extends Error {
+  constructor() {
+    super('Keyword extraction request was cancelled');
+    this.name = 'KeywordRequestCancelledError';
   }
 }
 
@@ -249,6 +265,15 @@ const MAX_KEYWORD_SOURCE_CHARS = 400_000;
 // P4-2：map 阶段的块数硬顶 = 单请求 LLM 调用次数硬顶。
 const MAX_KEYWORD_CHUNKS = 60;
 
+// 上传文件大小上限。旧值写死 50MB，但 Next middleware 会把超过 32MiB 的请求体静默截断后
+// 才交给本路由（见 MIDDLEWARE_CLIENT_MAX_BODY_BYTES）：32–50MB 的文件 multipart 尾界丢失，
+// req.formData() 抛错落进外层 catch 变成 500。按真正可达的上限封顶（同 chat-uploads），
+// 并改为限量解析：声明长度越线在读 body 前 413，被截断 / 畸形的 body 回 400。
+const MAX_KEYWORD_FILE_BYTES =
+  MIDDLEWARE_CLIENT_MAX_BODY_BYTES - MULTIPART_OVERHEAD_BYTES;
+const MAX_KEYWORD_BODY_BYTES = MAX_KEYWORD_FILE_BYTES + MULTIPART_OVERHEAD_BYTES;
+const MAX_KEYWORD_FILE_MB = Math.floor(MAX_KEYWORD_FILE_BYTES / (1024 * 1024));
+
 /**
  * 上传文件 MIME → KeywordSourceType 映射。之前恒用 'transcript'，导致 PPTX/DOCX/PDF/TXT
  * 都套用转录稿 prompt 提示、prompts.ts 里的按类型分支成了死代码（v3 finding U53）。
@@ -275,13 +300,16 @@ function mimeToKeywordSourceType(mime: string): KeywordSourceType {
 async function extractKeywordsFromChunks(
   chunks: ReadonlyArray<string>,
   systemPrompt: string,
-  callKeywordLLM: (system: string, user: string) => Promise<string>
+  callKeywordLLM: (system: string, user: string) => Promise<string>,
+  signal?: AbortSignal
 ): Promise<string[][]> {
   const results: string[][] = new Array(chunks.length).fill(null).map(() => []);
   let cursor = 0;
 
   async function worker(): Promise<void> {
     while (cursor < chunks.length) {
+      // 客户端断开后不再派发剩余块（最多 60 次付费调用），已在途的由 signal 中断。
+      if (signal?.aborted) return;
       const idx = cursor++;
       try {
         const raw = await callKeywordLLM(
@@ -290,6 +318,8 @@ async function extractKeywordsFromChunks(
         );
         results[idx] = parseKeywordExtractionResult(raw);
       } catch (error) {
+        // abort 引起的失败不是「该段为空」，交给下面统一按取消处理。
+        if (signal?.aborted) return;
         keywordLogger.warn(
           { chunkIndex: idx, err: serializeError(error) },
           '关键词段提取失败，该段视为空'
@@ -304,6 +334,7 @@ async function extractKeywordsFromChunks(
     () => worker()
   );
   await Promise.all(workers);
+  if (signal?.aborted) throw new KeywordRequestCancelledError();
   return results;
 }
 
@@ -313,7 +344,8 @@ async function extractKeywordsFromChunks(
 async function mergeKeywordLists(
   lists: ReadonlyArray<ReadonlyArray<string>>,
   existingKeywords: ReadonlyArray<string>,
-  callKeywordLLM: (system: string, user: string) => Promise<string>
+  callKeywordLLM: (system: string, user: string) => Promise<string>,
+  signal?: AbortSignal
 ): Promise<string[]> {
   // 先在本地过滤已知词并去重；该结果同时覆盖所有提前返回和 LLM 失败回退分支。
   const flat = collectKeywordCandidates(lists, existingKeywords);
@@ -332,6 +364,8 @@ async function mergeKeywordLists(
       existingKeywords
     );
   } catch (error) {
+    // 客户端已断开：不把取消吞成「字面去重」的成功结果。
+    if (signal?.aborted) throw new KeywordRequestCancelledError();
     keywordLogger.warn(
       { err: serializeError(error) },
       '关键词合并 LLM 调用失败，回退到字面去重'
@@ -366,7 +400,16 @@ export async function POST(req: Request) {
   }
 
   try {
-    const formData = await req.formData();
+    const parsedForm = await parseFormDataWithLimit(req, MAX_KEYWORD_BODY_BYTES);
+    if (!parsedForm.ok) {
+      return parsedForm.reason === 'too-large'
+        ? NextResponse.json(
+            { error: `File too large (max ${MAX_KEYWORD_FILE_MB}MB)` },
+            { status: 413 }
+          )
+        : NextResponse.json({ error: 'Invalid multipart body' }, { status: 400 });
+    }
+    const formData = parsedForm.value;
     const file = formData.get('file') as File | null;
     const textInput = formData.get('text') as string | null;
     const existingKeywords = parseExistingKeywords(
@@ -392,11 +435,11 @@ export async function POST(req: Request) {
         );
       }
 
-      // 文件大小限制 (50MB)
-      if (file.size > 50 * 1024 * 1024) {
+      // 文件大小限制（middleware 实际可达的上限，见 MAX_KEYWORD_FILE_BYTES）
+      if (file.size > MAX_KEYWORD_FILE_BYTES) {
         return NextResponse.json(
-          { error: 'File too large (max 50MB)' },
-          { status: 400 }
+          { error: `File too large (max ${MAX_KEYWORD_FILE_MB}MB)` },
+          { status: 413 }
         );
       }
 
@@ -519,12 +562,14 @@ export async function POST(req: Request) {
         const chunkResults = await extractKeywordsFromChunks(
           chunkTexts,
           mapSystem,
-          callKeywordLLM
+          callKeywordLLM,
+          req.signal
         );
         return mergeKeywordLists(
           chunkResults,
           existingKeywords,
-          callKeywordLLM
+          callKeywordLLM,
+          req.signal
         );
       };
     }
@@ -565,6 +610,8 @@ export async function POST(req: Request) {
           503
         );
       }
+      // 尚未发出的调用在客户端断开后直接放弃：不出网，也就不按调用上界结算。
+      if (req.signal.aborted) throw new KeywordRequestCancelledError();
       providerCallsStarted += 1;
       const callReservation = conservativeLlmCallTokens(
         system,
@@ -578,6 +625,8 @@ export async function POST(req: Request) {
         response = await callLLM(system, userMessage, {
           purpose: 'KEYWORD_EXTRACTION',
           maxOutputTokens: provider.maxTokens,
+          // 在途调用随客户端断开中断（已出网的仍按调用上界保守结算）。
+          signal: req.signal,
           onUsage: (usage) => {
             measured = trustedLlmUsageTokens(usage, callReservation);
           },
@@ -634,7 +683,8 @@ export async function POST(req: Request) {
           '关键词失败任务终态写入结果未知，保守保留预留'
         );
       });
-      throw error;
+      // 在途调用被 signal 中断时 gateway 抛的是 AbortError：统一按取消回 499。
+      throw req.signal.aborted ? new KeywordRequestCancelledError() : error;
     }
 
     await completeActiveJob(
@@ -651,11 +701,19 @@ export async function POST(req: Request) {
     );
     return NextResponse.json({ keywords });
   } catch (error) {
+    if (error instanceof KeywordRequestCancelledError) {
+      return NextResponse.json({ error: 'Request cancelled' }, { status: 499 });
+    }
     if (error instanceof DocumentParserError) {
       if (error.code === 'cancelled') {
         return NextResponse.json({ error: 'Request cancelled' }, { status: 499 });
       }
-      if (error.code === 'archive_limit' || error.code === 'input_limit') {
+      if (
+        error.code === 'archive_limit' ||
+        error.code === 'input_limit' ||
+        // 子进程 RSS 越线被看门狗强杀：与解压炸弹同属「过大或过于复杂」
+        error.code === 'memory_limit'
+      ) {
         return NextResponse.json(
           { error: 'Document is too large or complex', code: 'document_too_complex' },
           { status: 413 }

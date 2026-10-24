@@ -9,7 +9,7 @@ import {
 } from '@/lib/quota';
 import { claimInterpretSessionForDeduct } from '@/lib/interpret/session';
 import { settleStreamGrants } from '@/lib/soniox/streamGrant';
-import { getBillableMinutes } from '@/lib/billing';
+import { getBillableMinutes, withMeasuredStreamFloorMs } from '@/lib/billing';
 import { logSystemEvent } from '@/lib/auditLog';
 import { logger } from '@/lib/logger';
 import {
@@ -165,9 +165,14 @@ export async function POST(req: Request) {
       // `{durationMs:1}` 就能把串了 N 小时的场一分钟结掉。这里用被结算 grants 的 Soniox 实测量做
       // 下限：它是本路径下唯一不可伪造的服务端口径。实测尚未回填时收益仍归零 —— 迟到的 usage-log
       // 会经 usageReconciliation 的差额补扣补上（P1-2，同一机制）。
-      const chargeMs = Math.min(
-        anchored ? effectiveMs : Math.max(effectiveMs, settledActualMs),
-        MAX_INTERPRET_DURATION_MS
+      // 6h 封顶之外，Soniox 实测超出「上限 + 宽限」的部分照实计（同一锚点并行多开时，墙钟口径
+      // 远小于实际串流量），见 withMeasuredStreamFloorMs。
+      const chargeMs = withMeasuredStreamFloorMs(
+        Math.min(
+          anchored ? effectiveMs : Math.max(effectiveMs, settledActualMs),
+          MAX_INTERPRET_DURATION_MS
+        ),
+        settledActualMs
       );
       const billableMinutes = getBillableMinutes(chargeMs);
 

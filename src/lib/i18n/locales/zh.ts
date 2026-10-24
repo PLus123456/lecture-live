@@ -327,6 +327,7 @@ export default {
       lowQuotaWarning: '剩余转写额度不足 {minutes} 分钟，额度耗尽后将自动结束本次录制。',
       quotaExhaustedStop: '本月转写额度已耗尽，系统正在自动结束并保存当前录制。',
       sessionReclaimed: '本场录音已在服务器结束，继续录制的内容不会保存到原会话。请停止并导出本地录音。',
+      concurrentRecordingLimit: '同时进行中的录音过多，本次录音未能开始，已自动停止。请先结束或停止其它录音后再重新开始。',
     },
     finalizing: {
       title: '正在保存会话',
@@ -1740,7 +1741,7 @@ export default {
     softCapPercent: '软上限百分比',
     softCapPercentDesc: '用户字节配额占用率超过此值时，按 LRU 自动清理至阈值以下。填 0 表示关闭。',
     maxUploadMb: '单次最大上传',
-    maxUploadMbDesc: '单次上传单个文件的硬上限（MB）。',
+    maxUploadMbDesc: '单次上传单个文件的硬上限（MB）。超过 31MB 的设置不会生效：超过 32MB 的请求体到达服务端前就会被截断。',
     quotaFreeMb: 'FREE 配额',
     quotaFreeMbDesc: 'FREE 用户的总字节配额（MB）。',
     quotaProMb: 'PRO 配额',

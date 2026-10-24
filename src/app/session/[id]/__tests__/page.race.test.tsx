@@ -571,7 +571,10 @@ describe('会话页异步归属与时序', () => {
     });
 
     await waitFor(() => {
-      expect(summaryMocks.onNewSentence).toHaveBeenCalledWith('续录的新句子');
+      expect(summaryMocks.onNewSentence).toHaveBeenCalledWith('续录的新句子', {
+        startMs: 1000,
+        endMs: 2000,
+      });
     });
   });
 });

@@ -20,6 +20,7 @@ import {
 import { loadTranscriptDraft } from '@/lib/transcriptDraftPersistence';
 import {
   MAX_PERSISTED_SNAPSHOT_BYTES,
+  jsonByteLength,
   readSnapshotChunkMeta,
   trimSnapshotToByteBudget,
 } from './snapshotChunking';
@@ -136,6 +137,31 @@ const MAX_SNAPSHOT_SEGMENTS = 10_000;
 const MAX_SNAPSHOT_SUMMARY_BLOCKS = 10_000;
 const MAX_SNAPSHOT_TRANSLATIONS = 10_000;
 const MAX_TRANSLATION_LENGTH = 10_000;
+// id / 译文 key 的长度上限（与 sessionApi 的 maxIdUtf8Bytes 同量级）。超长整条丢弃而不截断——
+// 截断会让两个不同的 id 撞成同一个 key、互相覆盖。
+const MAX_RECORD_KEY_LENGTH = 256;
+// speaker / language / timestamp / status / 语言元数据等短字段（与 sessionApi maxMetadataUtf8Bytes 同量级）
+const MAX_METADATA_LENGTH = 256;
+// 摘要块 keyPoints / suggestedQuestions 条数与 definitions 条目数（与 sessionApi 同口径）
+const MAX_SUMMARY_LIST_ITEMS = 200;
+const MAX_SUMMARY_DEFINITIONS = 200;
+const UNSAFE_RECORD_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * 单场直播内存快照的总字节预算（UTF-8 JSON 口径，三大集合合计）。
+ *
+ * 只有「条数 + 单条文本长度」两道闸时，总量上界是 条数上限 × 单条消息上限（100KB）：
+ * 一个已登录用户给自己的会话开直播，用塞了大字段的增量就能让单场快照涨到 GB 级，
+ * WS 进程堆溢出崩溃（裸机 unit 是 BindsTo + Restart=no，Web 随之一起停）。现在：
+ *   ① 单条按白名单重建（未知字段丢弃、各字段封顶），
+ *   ② 整场按本预算记账，超限时丢最早的内容（与 trimSnapshotToByteBudget 同一取舍：
+ *      最新内容价值最高），并置 truncated 让晚加入的观众知道历史不全。
+ * 主播端单次全量同步最多 ~1.3MB（MAX_SYNC_SNAPSHOT_CHUNKS × 56KB），这里留足 3 倍余量，
+ * 正常的长课堂（5 小时+）不会触发裁剪。
+ */
+export const MAX_LIVE_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+// 裁到预算的 3/4：留出回差，避免此后每条增量都触发一次整场重算。
+const LIVE_SNAPSHOT_TRIM_TARGET_BYTES = 3 * 1024 * 1024;
 
 // 截断超量数组，保护服务端内存（非数组归一为空数组）
 function clampArray(input: unknown, max: number): unknown[] {
@@ -143,74 +169,126 @@ function clampArray(input: unknown, max: number): unknown[] {
   return input.length > max ? input.slice(0, max) : input;
 }
 
-// 单条字符串长度封顶（仅截长度，类型不符时原样返回，由上层处理）
-function clampString(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  return value.length > MAX_TRANSLATION_LENGTH
-    ? value.slice(0, MAX_TRANSLATION_LENGTH)
-    : value;
+function clampText(value: unknown, max: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  return value.length > max ? value.slice(0, max) : value;
 }
 
-// 原地截断 transcript segment 的文本字段长度，防止单条 segment.text 撑爆内存。
-// 数组条数已由 clampArray / MAX_SNAPSHOT_SEGMENTS 另行限制，这里只管单条长度。
-function sanitizeSegment(segment: unknown): unknown {
-  if (!segment || typeof segment !== 'object') return segment;
-  const seg = segment as { text?: unknown; translatedText?: unknown };
-  if (typeof seg.text === 'string') {
-    seg.text = clampString(seg.text);
-  }
-  if (typeof seg.translatedText === 'string') {
-    seg.translatedText = clampString(seg.translatedText);
-  }
-  return segment;
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
-// 原地截断 summary block 内各字符串字段长度（summary / keyPoints[*] /
-// definitions 各 value / suggestedQuestions[*]），防止单条快照撑爆内存。
-// 数组/对象条数由 MAX_SNAPSHOT_SUMMARY_BLOCKS 等另行限制，这里只管单条长度。
-function sanitizeSummaryBlock(block: unknown): unknown {
-  if (!block || typeof block !== 'object') return block;
-  const b = block as {
-    summary?: unknown;
-    keyPoints?: unknown;
-    definitions?: unknown;
-    suggestedQuestions?: unknown;
-  };
-
-  if (typeof b.summary === 'string') {
-    b.summary = clampString(b.summary);
-  }
-
-  if (Array.isArray(b.keyPoints)) {
-    for (let i = 0; i < b.keyPoints.length; i += 1) {
-      b.keyPoints[i] = clampString(b.keyPoints[i]);
-    }
-  }
-
-  if (Array.isArray(b.suggestedQuestions)) {
-    for (let i = 0; i < b.suggestedQuestions.length; i += 1) {
-      b.suggestedQuestions[i] = clampString(b.suggestedQuestions[i]);
-    }
-  }
-
-  if (b.definitions && typeof b.definitions === 'object') {
-    const defs = b.definitions as Record<string, unknown>;
-    for (const key of Object.keys(defs)) {
-      defs[key] = clampString(defs[key]);
-    }
-  }
-
-  return block;
+function isSafeRecordKey(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= MAX_RECORD_KEY_LENGTH &&
+    !UNSAFE_RECORD_KEYS.has(value)
+  );
 }
 
-// 清洗 sync_snapshot 的 translations：仅接受 string 值，单条长度封顶 + 条目数封顶
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function setIfDefined(target: Record<string, unknown>, key: string, value: unknown) {
+  if (value !== undefined) target[key] = value;
+}
+
+function sanitizeStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  for (const item of value) {
+    if (out.length >= MAX_SUMMARY_LIST_ITEMS) break;
+    const text = clampText(item, MAX_TRANSLATION_LENGTH);
+    if (text !== undefined) out.push(text);
+  }
+  return out;
+}
+
+/**
+ * 按白名单重建 transcript segment（字段与 sessionApi 的 SEGMENT_KEYS 同口径）：未知字段一律
+ * 丢弃、文本封顶 MAX_TRANSLATION_LENGTH、短字段封顶 MAX_METADATA_LENGTH、类型不符的字段不带。
+ * 不补默认值——缺什么就缺什么，观众端行为与原样转发一致。
+ * 返回 null = 整条丢弃（非对象，或 id 存在但不合法）。
+ */
+function sanitizeSegment(segment: unknown): Record<string, unknown> | null {
+  if (!isPlainObject(segment)) return null;
+  const out: Record<string, unknown> = {};
+  if (segment.id !== undefined) {
+    if (!isSafeRecordKey(segment.id)) return null;
+    out.id = segment.id;
+  }
+  setIfDefined(out, 'sessionIndex', finiteNumber(segment.sessionIndex));
+  setIfDefined(out, 'speaker', clampText(segment.speaker, MAX_METADATA_LENGTH));
+  setIfDefined(out, 'language', clampText(segment.language, MAX_METADATA_LENGTH));
+  setIfDefined(out, 'text', clampText(segment.text, MAX_TRANSLATION_LENGTH));
+  setIfDefined(
+    out,
+    'translatedText',
+    clampText(segment.translatedText, MAX_TRANSLATION_LENGTH)
+  );
+  for (const key of ['globalStartMs', 'globalEndMs', 'startMs', 'endMs', 'confidence']) {
+    setIfDefined(out, key, finiteNumber(segment[key]));
+  }
+  if (typeof segment.isFinal === 'boolean') out.isFinal = segment.isFinal;
+  setIfDefined(out, 'timestamp', clampText(segment.timestamp, MAX_METADATA_LENGTH));
+  return out;
+}
+
+/**
+ * 按白名单重建 summary block（SUMMARY_KEYS + 旧版 SummarizeResponse 的 LEGACY 字段）：
+ * summary / keyPoints[*] / definitions 各 value / suggestedQuestions[*] 封顶
+ * MAX_TRANSLATION_LENGTH，列表与 definitions 条目数封顶，timeRange 只保留数值起止（或旧版字符串）。
+ * 返回 null = 整条丢弃（非对象，或 id 存在但不合法）。
+ */
+function sanitizeSummaryBlock(block: unknown): Record<string, unknown> | null {
+  if (!isPlainObject(block)) return null;
+  const out: Record<string, unknown> = {};
+  if (block.id !== undefined) {
+    if (!isSafeRecordKey(block.id)) return null;
+    out.id = block.id;
+  }
+  setIfDefined(out, 'blockIndex', finiteNumber(block.blockIndex));
+
+  if (typeof block.timeRange === 'string') {
+    out.timeRange = clampText(block.timeRange, MAX_METADATA_LENGTH);
+  } else if (isPlainObject(block.timeRange)) {
+    const timeRange: Record<string, unknown> = {};
+    setIfDefined(timeRange, 'startMs', finiteNumber(block.timeRange.startMs));
+    setIfDefined(timeRange, 'endMs', finiteNumber(block.timeRange.endMs));
+    out.timeRange = timeRange;
+  }
+
+  setIfDefined(out, 'keyPoints', sanitizeStringList(block.keyPoints));
+  if (isPlainObject(block.definitions)) {
+    const definitions: Record<string, string> = {};
+    let count = 0;
+    for (const [term, definition] of Object.entries(block.definitions)) {
+      if (count >= MAX_SUMMARY_DEFINITIONS) break;
+      const text = clampText(definition, MAX_TRANSLATION_LENGTH);
+      if (!isSafeRecordKey(term) || text === undefined) continue;
+      definitions[term] = text;
+      count += 1;
+    }
+    out.definitions = definitions;
+  }
+  setIfDefined(out, 'summary', clampText(block.summary, MAX_TRANSLATION_LENGTH));
+  setIfDefined(out, 'suggestedQuestions', sanitizeStringList(block.suggestedQuestions));
+  if (typeof block.frozen === 'boolean') out.frozen = block.frozen;
+  setIfDefined(out, 'timestamp', finiteNumber(block.timestamp));
+  return out;
+}
+
+// 清洗 sync_snapshot 的 translations：key 须是合法记录键（长度封顶、拒原型链键），
+// 仅接受 string 值，单条长度封顶 + 条目数封顶
 function sanitizeSnapshotTranslations(input: unknown): Record<string, string> {
   if (!input || typeof input !== 'object') return {};
   const out: Record<string, string> = {};
   let count = 0;
   for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
     if (count >= MAX_SNAPSHOT_TRANSLATIONS) break;
-    if (typeof value !== 'string') continue;
+    if (!isSafeRecordKey(key) || typeof value !== 'string') continue;
     out[key] =
       value.length > MAX_TRANSLATION_LENGTH
         ? value.slice(0, MAX_TRANSLATION_LENGTH)
@@ -218,6 +296,119 @@ function sanitizeSnapshotTranslations(input: unknown): Record<string, string> {
     count += 1;
   }
   return out;
+}
+
+// 列表版：先按条数上限截断，再逐条白名单重建，丢弃不合法的条目。
+function sanitizeSegmentList(input: unknown): Record<string, unknown>[] {
+  return clampArray(input, MAX_SNAPSHOT_SEGMENTS)
+    .map(sanitizeSegment)
+    .filter((segment): segment is Record<string, unknown> => segment !== null);
+}
+
+function sanitizeSummaryBlockList(input: unknown): Record<string, unknown>[] {
+  return clampArray(input, MAX_SNAPSHOT_SUMMARY_BLOCKS)
+    .map(sanitizeSummaryBlock)
+    .filter((block): block is Record<string, unknown> => block !== null);
+}
+
+// ── 快照字节记账（MAX_LIVE_SNAPSHOT_BYTES）────────────────────────────────────
+// 口径与 snapshotChunking.trimSnapshotToByteBudget 一致：每条 JSON 字节 + 分隔符。
+// 记账值挂在 WeakMap 上而不是快照对象里：快照对象会原样作为 initial_state 发给观众。
+const snapshotByteUsage = new WeakMap<LiveSnapshot, number>();
+
+function itemBytes(item: unknown): number {
+  return jsonByteLength(item) + 1;
+}
+
+function translationEntryBytes(key: string, value: string): number {
+  return jsonByteLength(key) + jsonByteLength(value) + 2;
+}
+
+function measureSnapshotBytes(snapshot: LiveSnapshot): number {
+  let bytes = 0;
+  for (const segment of snapshot.segments) bytes += itemBytes(segment);
+  for (const block of snapshot.summaryBlocks) bytes += itemBytes(block);
+  for (const [key, value] of Object.entries(snapshot.translations)) {
+    bytes += translationEntryBytes(key, value);
+  }
+  return bytes;
+}
+
+function getSnapshotBytes(snapshot: LiveSnapshot): number {
+  let bytes = snapshotByteUsage.get(snapshot);
+  if (bytes === undefined) {
+    bytes = measureSnapshotBytes(snapshot);
+    snapshotByteUsage.set(snapshot, bytes);
+  }
+  return bytes;
+}
+
+function addSnapshotBytes(snapshot: LiveSnapshot, delta: number) {
+  snapshotByteUsage.set(snapshot, getSnapshotBytes(snapshot) + delta);
+}
+
+function segmentIdOf(segment: unknown): string | null {
+  if (!segment || typeof segment !== 'object') return null;
+  const id = (segment as { id?: unknown }).id;
+  return typeof id === 'string' ? id : null;
+}
+
+/**
+ * 超出 MAX_LIVE_SNAPSHOT_BYTES 时就地裁到 LIVE_SNAPSHOT_TRIM_TARGET_BYTES：依次丢最早的
+ * segment（连同它的译文）→ 最早的摘要块 → 最早写入的孤儿译文，保证一定能回到预算内。
+ */
+function enforceLiveSnapshotBudget(snapshot: LiveSnapshot, sessionId: string) {
+  let bytes = getSnapshotBytes(snapshot);
+  if (bytes <= MAX_LIVE_SNAPSHOT_BYTES) return;
+
+  let droppedSegments = 0;
+  while (
+    bytes > LIVE_SNAPSHOT_TRIM_TARGET_BYTES &&
+    droppedSegments < snapshot.segments.length
+  ) {
+    const segment = snapshot.segments[droppedSegments];
+    bytes -= itemBytes(segment);
+    const id = segmentIdOf(segment);
+    if (id !== null && Object.prototype.hasOwnProperty.call(snapshot.translations, id)) {
+      bytes -= translationEntryBytes(id, snapshot.translations[id]);
+      delete snapshot.translations[id];
+    }
+    droppedSegments += 1;
+  }
+  if (droppedSegments > 0) snapshot.segments.splice(0, droppedSegments);
+
+  let droppedSummaryBlocks = 0;
+  while (
+    bytes > LIVE_SNAPSHOT_TRIM_TARGET_BYTES &&
+    droppedSummaryBlocks < snapshot.summaryBlocks.length
+  ) {
+    bytes -= itemBytes(snapshot.summaryBlocks[droppedSummaryBlocks]);
+    droppedSummaryBlocks += 1;
+  }
+  if (droppedSummaryBlocks > 0) snapshot.summaryBlocks.splice(0, droppedSummaryBlocks);
+
+  let droppedTranslations = 0;
+  if (bytes > LIVE_SNAPSHOT_TRIM_TARGET_BYTES) {
+    for (const key of Object.keys(snapshot.translations)) {
+      if (bytes <= LIVE_SNAPSHOT_TRIM_TARGET_BYTES) break;
+      bytes -= translationEntryBytes(key, snapshot.translations[key]);
+      delete snapshot.translations[key];
+      droppedTranslations += 1;
+    }
+  }
+
+  snapshot.truncated = true;
+  snapshotByteUsage.set(snapshot, Math.max(0, bytes));
+  liveShareLogger.warn(
+    {
+      sessionId,
+      droppedSegments,
+      droppedSummaryBlocks,
+      droppedTranslations,
+      budgetBytes: MAX_LIVE_SNAPSHOT_BYTES,
+    },
+    'Live snapshot exceeded its byte budget; dropped the oldest content'
+  );
 }
 
 // L5：未鉴权的 join 会打一次匿名 prisma.shareLink.findUnique。全局令牌桶
@@ -371,12 +562,8 @@ function buildSnapshotFrom(parsed: {
   status?: string;
 }): LiveSnapshot {
   const clamped = {
-    segments: clampArray(parsed.segments, MAX_SNAPSHOT_SEGMENTS).map(
-      sanitizeSegment
-    ),
-    summaryBlocks: clampArray(parsed.summaries, MAX_SNAPSHOT_SUMMARY_BLOCKS).map(
-      sanitizeSummaryBlock
-    ),
+    segments: sanitizeSegmentList(parsed.segments),
+    summaryBlocks: sanitizeSummaryBlockList(parsed.summaries),
     translations: sanitizeSnapshotTranslations(parsed.translations),
   };
 
@@ -396,7 +583,7 @@ function buildSnapshotFrom(parsed: {
     segments: trimmed.segments,
     translations: trimmed.translations,
     summaryBlocks: trimmed.summaryBlocks,
-    status: typeof parsed.status === 'string' ? parsed.status : null,
+    status: clampText(parsed.status, MAX_METADATA_LENGTH) ?? null,
     previewText: EMPTY_STREAMING_PREVIEW_TEXT,
     previewTranslation: EMPTY_STREAMING_PREVIEW_TRANSLATION,
     sourceLang: null,
@@ -463,56 +650,41 @@ async function getSessionSnapshot(sessionId: string): Promise<LiveSnapshot> {
   return persisted;
 }
 
-function mergeTranscriptSegment(snapshot: LiveSnapshot, segment: unknown) {
-  if (!segment || typeof segment !== 'object') {
-    return snapshot;
-  }
+// 以下 store* 只接收已经过 sanitize* 白名单重建的条目，并负责条数上限与字节记账。
 
-  sanitizeSegment(segment);
+function storeSegment(snapshot: LiveSnapshot, segment: Record<string, unknown>) {
+  const id = typeof segment.id === 'string' ? segment.id : null;
+  const index =
+    id === null
+      ? -1
+      : snapshot.segments.findIndex((item) => segmentIdOf(item) === id);
 
-  const maybeSegment = segment as { id?: string };
-  if (!maybeSegment.id) {
-    // 无 id 段落只能追加，无法去重——达到条数上限后拒绝新增，防止 broadcast
+  if (index === -1) {
+    // 新 id / 无 id（只能追加、无法去重）：仅在未达上限时追加，防止 broadcast
     // 增量路径绕过 sync_snapshot 的 MAX_SNAPSHOT_SEGMENTS（U24）。
     if (snapshot.segments.length < MAX_SNAPSHOT_SEGMENTS) {
       snapshot.segments.push(segment);
+      addSnapshotBytes(snapshot, itemBytes(segment));
     }
-    return snapshot;
+    return;
   }
 
-  const index = snapshot.segments.findIndex((item) => {
-    if (!item || typeof item !== 'object') return false;
-    return (item as { id?: string }).id === maybeSegment.id;
-  });
-
-  if (index === -1) {
-    // 新 id：仅在未达上限时追加（已存在的 id 走原地替换，不增长，故不受限）。
-    if (snapshot.segments.length < MAX_SNAPSHOT_SEGMENTS) {
-      snapshot.segments.push(segment);
-    }
-  } else {
-    snapshot.segments[index] = segment;
-  }
-
-  return snapshot;
+  // 已存在的 id 走原地替换，不增长条数（字节按新旧差值记账）。
+  addSnapshotBytes(snapshot, itemBytes(segment) - itemBytes(snapshot.segments[index]));
+  snapshot.segments[index] = segment;
 }
 
-function mergeSummaryBlock(snapshot: LiveSnapshot, block: unknown) {
-  if (!block || typeof block !== 'object') {
-    return snapshot;
-  }
-
-  sanitizeSummaryBlock(block);
-
-  const maybeBlock = block as { id?: string; blockIndex?: number };
+function storeSummaryBlock(snapshot: LiveSnapshot, block: Record<string, unknown>) {
+  const blockId = typeof block.id === 'string' ? block.id : null;
+  const blockIndex = typeof block.blockIndex === 'number' ? block.blockIndex : null;
   const index = snapshot.summaryBlocks.findIndex((item) => {
     if (!item || typeof item !== 'object') return false;
-    const existing = item as { id?: string; blockIndex?: number };
-    if (maybeBlock.id && existing.id) {
-      return existing.id === maybeBlock.id;
+    const existing = item as { id?: unknown; blockIndex?: unknown };
+    if (blockId !== null && typeof existing.id === 'string') {
+      return existing.id === blockId;
     }
-    if (typeof maybeBlock.blockIndex === 'number' && typeof existing.blockIndex === 'number') {
-      return existing.blockIndex === maybeBlock.blockIndex;
+    if (blockIndex !== null && typeof existing.blockIndex === 'number') {
+      return existing.blockIndex === blockIndex;
     }
     return false;
   });
@@ -522,84 +694,123 @@ function mergeSummaryBlock(snapshot: LiveSnapshot, block: unknown) {
     // MAX_SNAPSHOT_SUMMARY_BLOCKS（U24）。已存在的走原地替换，不增长。
     if (snapshot.summaryBlocks.length < MAX_SNAPSHOT_SUMMARY_BLOCKS) {
       snapshot.summaryBlocks.push(block);
+      addSnapshotBytes(snapshot, itemBytes(block));
     }
-  } else {
-    snapshot.summaryBlocks[index] = block;
+    return;
   }
 
-  return snapshot;
+  addSnapshotBytes(snapshot, itemBytes(block) - itemBytes(snapshot.summaryBlocks[index]));
+  snapshot.summaryBlocks[index] = block;
 }
 
+/** key 须已过 isSafeRecordKey、value 已封顶。 */
+function storeTranslation(snapshot: LiveSnapshot, key: string, value: string) {
+  const exists = Object.prototype.hasOwnProperty.call(snapshot.translations, key);
+  // 新 key 达到条目上限时拒绝新增，防止 broadcast 增量路径绕过
+  // MAX_SNAPSHOT_TRANSLATIONS（U24）。已存在的 key 走覆盖，不增长。
+  if (!exists && Object.keys(snapshot.translations).length >= MAX_SNAPSHOT_TRANSLATIONS) {
+    return;
+  }
+  const previousBytes = exists
+    ? translationEntryBytes(key, snapshot.translations[key])
+    : 0;
+  snapshot.translations[key] = value;
+  addSnapshotBytes(snapshot, translationEntryBytes(key, value) - previousBytes);
+}
+
+interface SanitizedTranslationDelta {
+  segmentId: string;
+  translation: string;
+  sourceLang?: string;
+  targetLang?: string;
+  translationMode?: string;
+}
+
+/**
+ * 把一条 broadcast 增量按事件类型白名单重建。返回 null = 不认识的类型 / 载荷不合法，
+ * 整条丢弃：既不并入快照，也不转发给观众（观众端只认这五种事件，转发其它名字无意义，
+ * 转发 socket.io 保留名还会让 emit 直接抛错）。转发给观众的也是重建后的载荷，
+ * 保证实时观众与晚加入观众（initial_state）看到的是同一份数据。
+ */
+function sanitizeLiveEventPayload(type: string, payload: unknown): unknown | null {
+  switch (type) {
+    case 'transcript_delta':
+      return sanitizeSegment(payload);
+    case 'summary_update':
+      return sanitizeSummaryBlock(payload);
+    case 'translation_delta': {
+      if (!isPlainObject(payload)) return null;
+      const translation = clampText(payload.translation, MAX_TRANSLATION_LENGTH);
+      if (!isSafeRecordKey(payload.segmentId) || translation === undefined) return null;
+      const out: SanitizedTranslationDelta = {
+        segmentId: payload.segmentId,
+        translation,
+      };
+      const sourceLang = clampText(payload.sourceLang, MAX_METADATA_LENGTH);
+      const targetLang = clampText(payload.targetLang, MAX_METADATA_LENGTH);
+      const translationMode = clampText(payload.translationMode, MAX_METADATA_LENGTH);
+      if (sourceLang !== undefined) out.sourceLang = sourceLang;
+      if (targetLang !== undefined) out.targetLang = targetLang;
+      if (translationMode !== undefined) out.translationMode = translationMode;
+      return out;
+    }
+    case 'status_update': {
+      if (!isPlainObject(payload)) return null;
+      const status = clampText(payload.status, MAX_METADATA_LENGTH);
+      return status === undefined ? null : { status };
+    }
+    case 'preview_update': {
+      if (!isPlainObject(payload)) return null;
+      const p = payload as {
+        previewText?: StreamingPreviewText | string;
+        previewTranslation?: StreamingPreviewTranslation | string;
+      };
+      return {
+        previewText: p.previewText
+          ? normalizePreviewText(p.previewText)
+          : EMPTY_STREAMING_PREVIEW_TEXT,
+        previewTranslation: p.previewTranslation
+          ? normalizePreviewTranslation(p.previewTranslation)
+          : EMPTY_STREAMING_PREVIEW_TRANSLATION,
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+/** payload 必须是 sanitizeLiveEventPayload 对同一 type 的非 null 返回值。 */
 function mergeEventIntoSnapshot(
   snapshot: LiveSnapshot,
-  event: LiveEventPayload
+  type: LiveEventPayload['type'],
+  payload: unknown
 ): LiveSnapshot {
-  switch (event.type) {
+  switch (type) {
     case 'transcript_delta':
-      mergeTranscriptSegment(snapshot, event.payload);
+      storeSegment(snapshot, payload as Record<string, unknown>);
       break;
     case 'translation_delta': {
-      if (
-        event.payload &&
-        typeof event.payload === 'object' &&
-        typeof (event.payload as { segmentId?: string }).segmentId === 'string' &&
-        typeof (event.payload as { translation?: string }).translation === 'string'
-      ) {
-        const payload = event.payload as {
-          segmentId: string;
-          translation: string;
-          sourceLang?: string;
-          targetLang?: string;
-          translationMode?: string;
-        };
-        // 新 segmentId 达到条目上限时拒绝新增，防止 broadcast 增量路径绕过
-        // MAX_SNAPSHOT_TRANSLATIONS（U24）。已存在的 key 走覆盖，不增长。
-        const isNewTranslationKey = !Object.prototype.hasOwnProperty.call(
-          snapshot.translations,
-          payload.segmentId
-        );
-        if (
-          !isNewTranslationKey ||
-          Object.keys(snapshot.translations).length < MAX_SNAPSHOT_TRANSLATIONS
-        ) {
-          snapshot.translations[payload.segmentId] =
-            payload.translation.length > MAX_TRANSLATION_LENGTH
-              ? payload.translation.slice(0, MAX_TRANSLATION_LENGTH)
-              : payload.translation;
-        }
-        // 更新翻译元数据（如果 delta 中携带）
-        if (typeof payload.sourceLang === 'string') snapshot.sourceLang = payload.sourceLang;
-        if (typeof payload.targetLang === 'string') snapshot.targetLang = payload.targetLang;
-        if (typeof payload.translationMode === 'string') snapshot.translationMode = payload.translationMode;
-      }
+      const delta = payload as SanitizedTranslationDelta;
+      storeTranslation(snapshot, delta.segmentId, delta.translation);
+      // 更新翻译元数据（如果 delta 中携带）
+      if (delta.sourceLang !== undefined) snapshot.sourceLang = delta.sourceLang;
+      if (delta.targetLang !== undefined) snapshot.targetLang = delta.targetLang;
+      if (delta.translationMode !== undefined) snapshot.translationMode = delta.translationMode;
       break;
     }
     case 'summary_update':
-      mergeSummaryBlock(snapshot, event.payload);
+      storeSummaryBlock(snapshot, payload as Record<string, unknown>);
       break;
-    case 'status_update': {
-      if (
-        event.payload &&
-        typeof event.payload === 'object' &&
-        typeof (event.payload as { status?: string }).status === 'string'
-      ) {
-        snapshot.status = (event.payload as { status: string }).status;
-      }
+    case 'status_update':
+      snapshot.status = (payload as { status: string }).status;
       break;
-    }
     case 'preview_update': {
-      if (event.payload && typeof event.payload === 'object') {
-        const p = event.payload as {
-          previewText?: StreamingPreviewText | string;
-          previewTranslation?: StreamingPreviewTranslation | string;
-        };
-        snapshot.previewText = p.previewText
-          ? normalizePreviewText(p.previewText)
-          : EMPTY_STREAMING_PREVIEW_TEXT;
-        snapshot.previewTranslation = p.previewTranslation
-          ? normalizePreviewTranslation(p.previewTranslation)
-          : EMPTY_STREAMING_PREVIEW_TRANSLATION;
-      }
+      const preview = payload as {
+        previewText: StreamingPreviewText;
+        previewTranslation: StreamingPreviewTranslation;
+      };
+      snapshot.previewText = preview.previewText;
+      snapshot.previewTranslation = preview.previewTranslation;
       break;
     }
   }
@@ -954,6 +1165,7 @@ function handleSyncSnapshot(
     staging.receivedChunks += 1;
     if (staging.receivedChunks >= staging.expectedChunks) {
       staging.snapshot.updatedAt = Date.now();
+      enforceLiveSnapshotBudget(staging.snapshot, sessionId);
       snapshots.set(sessionId, staging.snapshot);
       socket.data.snapshotStaging = undefined;
     }
@@ -996,25 +1208,19 @@ function handleSyncSnapshot(
   }
 
   const nextSnapshot: LiveSnapshot = {
-    segments: clampArray(payload.segments, MAX_SNAPSHOT_SEGMENTS).map(
-      sanitizeSegment
-    ),
+    segments: sanitizeSegmentList(payload.segments),
     translations: sanitizeSnapshotTranslations(payload.translations),
-    summaryBlocks: clampArray(
-      payload.summaryBlocks,
-      MAX_SNAPSHOT_SUMMARY_BLOCKS
-    ).map(sanitizeSummaryBlock),
-    status: typeof payload.status === 'string' ? payload.status : null,
+    summaryBlocks: sanitizeSummaryBlockList(payload.summaryBlocks),
+    status: clampText(payload.status, MAX_METADATA_LENGTH) ?? null,
     previewText: ext.previewText
       ? normalizePreviewText(ext.previewText)
       : EMPTY_STREAMING_PREVIEW_TEXT,
     previewTranslation: ext.previewTranslation
       ? normalizePreviewTranslation(ext.previewTranslation)
       : EMPTY_STREAMING_PREVIEW_TRANSLATION,
-    sourceLang: typeof ext.sourceLang === 'string' ? ext.sourceLang : null,
-    targetLang: typeof ext.targetLang === 'string' ? ext.targetLang : null,
-    translationMode:
-      typeof ext.translationMode === 'string' ? ext.translationMode : null,
+    sourceLang: clampText(ext.sourceLang, MAX_METADATA_LENGTH) ?? null,
+    targetLang: clampText(ext.targetLang, MAX_METADATA_LENGTH) ?? null,
+    translationMode: clampText(ext.translationMode, MAX_METADATA_LENGTH) ?? null,
     truncated: (payload as { truncated?: unknown }).truncated === true,
     updatedAt: Date.now(),
   };
@@ -1032,13 +1238,14 @@ function handleSyncSnapshot(
   }
 
   socket.data.snapshotStaging = undefined;
+  enforceLiveSnapshotBudget(nextSnapshot, sessionId);
   snapshots.set(sessionId, nextSnapshot);
 }
 
 /**
- * H1：把一个续块并进暂存快照。刻意复用 mergeTranscriptSegment / mergeSummaryBlock
- * 与译文条目上限 —— 它们已经带了 U24 的「增量路径不得绕过条数上限」守卫，也按 id
- * 去重，所以重复块（极端时序下同一批次被重发）是幂等的。
+ * H1：把一个续块并进暂存快照。刻意复用 storeSegment / storeSummaryBlock / storeTranslation
+ * —— 它们已经带了 U24 的「增量路径不得绕过条数上限」守卫与字节记账，也按 id 去重，
+ * 所以重复块（极端时序下同一批次被重发）是幂等的。
  * 续块只带三大集合；status / preview / 语言等头部字段只随首块来（见 I3）。
  */
 function mergeSnapshotChunk(
@@ -1046,28 +1253,21 @@ function mergeSnapshotChunk(
   payload: Partial<LiveSnapshot>
 ) {
   if (Array.isArray(payload.segments)) {
-    for (const segment of payload.segments) {
-      mergeTranscriptSegment(snapshot, segment);
+    for (const raw of payload.segments) {
+      const segment = sanitizeSegment(raw);
+      if (segment) storeSegment(snapshot, segment);
     }
   }
   if (Array.isArray(payload.summaryBlocks)) {
-    for (const block of payload.summaryBlocks) {
-      mergeSummaryBlock(snapshot, block);
+    for (const raw of payload.summaryBlocks) {
+      const block = sanitizeSummaryBlock(raw);
+      if (block) storeSummaryBlock(snapshot, block);
     }
   }
 
   const translations = sanitizeSnapshotTranslations(payload.translations);
   for (const [key, value] of Object.entries(translations)) {
-    const isNewKey = !Object.prototype.hasOwnProperty.call(
-      snapshot.translations,
-      key
-    );
-    if (
-      !isNewKey ||
-      Object.keys(snapshot.translations).length < MAX_SNAPSHOT_TRANSLATIONS
-    ) {
-      snapshot.translations[key] = value;
-    }
+    storeTranslation(snapshot, key, value);
   }
 }
 
@@ -1092,8 +1292,20 @@ async function handleBroadcast(
   }
 
   const sessionId = socket.data.sessionId as string;
+  // 不认识的事件类型 / 不合法载荷：静默丢弃，不回 share_error —— 主播端收到 share_error
+  // 会当成故障整条撤销分享链接（useLiveShare 的 teardown），版本错配不该升级成撤链。
+  const payload = sanitizeLiveEventPayload(event.type, event.payload);
+  if (payload === null) {
+    liveShareLogger.debug(
+      { socketId: socket.id, sessionId, eventType: event.type },
+      'Dropped live share event with unknown type or malformed payload'
+    );
+    return;
+  }
+
   const snapshot = await getSessionSnapshot(sessionId);
-  mergeEventIntoSnapshot(snapshot, event);
+  mergeEventIntoSnapshot(snapshot, event.type, payload);
+  enforceLiveSnapshotBudget(snapshot, sessionId);
   snapshots.set(sessionId, snapshot);
 
   liveShareLogger.debug(
@@ -1105,7 +1317,7 @@ async function handleBroadcast(
     'Broadcasted live share event'
   );
 
-  socket.to(getRoomId(sessionId)).emit(event.type, event.payload);
+  socket.to(getRoomId(sessionId)).emit(event.type, payload);
 }
 
 /**

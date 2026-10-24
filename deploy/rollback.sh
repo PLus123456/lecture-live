@@ -60,12 +60,18 @@ fi
 
 # 清理并恢复（web + ws 一起，保留 data、.env、backups，以及 systemd ExecStartPre
 # 必需的 fail-closed 脚本）。旧备份可能还没有 scripts/，不能让回滚把启动闸删掉。
+# src：托管 CLI（deploy/lecture-live）把源码 git 检出放在 $APP_DIR/src，install/upgrade/卸载
+#      都刻意保留它；回滚要退的是运行产物，不是源码，删掉它 = 丢掉检出（及其中未提交的改动），
+#      而且早于托管安装的备份里根本没有 src，回滚后 `lecture-live update` 直接找不到源码。
 # -mindepth 1 避免删除 APP_DIR 本身
 find "$APP_DIR" -mindepth 1 -maxdepth 1 \
-    ! -name "data" ! -name ".env" ! -name "backups" ! -name "scripts" \
+    ! -name "data" ! -name ".env" ! -name "backups" ! -name "scripts" ! -name "src" \
     -exec rm -rf {} +
 
-tar xzf "$BACKUP_FILE" -C "$APP_DIR"
+# 旧版 upgrade.sh 的备份把 ./src 也打了进去：解包时按锚定路径跳过，否则旧文件会覆盖到
+# 保留下来的源码检出上，混成「半新半旧」的工作区。data/.env/backups 同理只认顶层路径。
+tar xzf "$BACKUP_FILE" -C "$APP_DIR" --anchored \
+    --exclude=./src --exclude=./data --exclude=./.env --exclude=./backups
 chown -R $APP_USER:$APP_USER "$APP_DIR"
 chmod 600 "$APP_DIR/.env"
 

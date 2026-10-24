@@ -7,6 +7,9 @@ import {
   getQuotaCycleStartAt,
   getRemainingTranscriptionMinutes,
   getRemainingTranscriptionMs,
+  STREAM_DURATION_CAP_GRACE_MS,
+  sumCappedStreamActualMs,
+  withMeasuredStreamFloorMs,
 } from '@/lib/billing';
 
 describe('billing helpers', () => {
@@ -45,5 +48,27 @@ describe('billing helpers', () => {
     expect(clampSessionDurationMs(Number.NaN, 'FREE')).toBe(0);
     expect(getBillableMinutes(-1)).toBe(0);
     expect(getQuotaCycleStartAt(null).toISOString()).toBe(new Date(0).toISOString());
+  });
+});
+
+describe('withMeasuredStreamFloorMs / sumCappedStreamActualMs', () => {
+  it('实测不超过「上限 + 15 分钟宽限」→ 计费不变；超出部分按「实测 − 宽限」计', () => {
+    const twoHours = 2 * 60 * 60_000;
+    expect(withMeasuredStreamFloorMs(twoHours, twoHours + 15 * 60_000)).toBe(twoHours);
+    expect(withMeasuredStreamFloorMs(twoHours, 3 * 60 * 60_000)).toBe(165 * 60_000);
+    expect(withMeasuredStreamFloorMs(40 * 60_000, 0)).toBe(40 * 60_000);
+    expect(withMeasuredStreamFloorMs(40 * 60_000, Number.NaN)).toBe(40 * 60_000);
+    expect(STREAM_DURATION_CAP_GRACE_MS).toBe(15 * 60_000);
+  });
+
+  it('实测逐条封顶到各自的连接硬上限再求和', () => {
+    expect(
+      sumCappedStreamActualMs([
+        { actualMs: 9 * 60 * 60_000, maxSessionSeconds: 900 },
+        { actualMs: 120_000, maxSessionSeconds: 900 },
+        { actualMs: null, maxSessionSeconds: 900 },
+        { actualMs: -5, maxSessionSeconds: 900 },
+      ])
+    ).toBe(900_000 + 120_000);
   });
 });

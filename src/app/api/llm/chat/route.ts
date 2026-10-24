@@ -1022,22 +1022,26 @@ async function handleSessionChat(args: HandleSessionChatArgs): Promise<Response>
     userId,
     parsed.requestedModel || undefined
   );
+  // 未显式选模型（或伪造/陈旧 id 且无组默认）时 selection.providerConfig 为空，gateway
+  // 会落到 CHAT 用途默认模型。思考深度上限必须对**实际要用的那个模型**收紧：此前拿
+  // undefined 去 clamp，auto/forced 原样透传，gateway 再按该模型默认深度（如 high）开
+  // 思考 —— 受限组只要不传 model 就能绕过组上限。
+  const provider =
+    selection.providerConfig ?? (await getProviderForPurpose('CHAT'));
   const thinkingCap = selection.featureFlags.maxThinkingDepth;
   const finalDepth = resolveEffectiveThinkingDepth(
     thinkingCap,
     parsed.depth,
-    selection.providerConfig
+    provider
   );
 
   const effectivePreference = resolveEffectivePreference(
     parsed.thinkingPreference,
     finalDepth,
     thinkingCap,
-    selection.providerConfig
+    provider
   );
 
-  const provider =
-    selection.providerConfig ?? (await getProviderForPurpose('CHAT'));
   const budget = computeContextBudget(provider, provider.contextWindow);
 
   // ── 持久化 user 消息 ──
@@ -1190,21 +1194,22 @@ async function handleGlobalChat(args: HandleGlobalChatArgs): Promise<Response> {
     userId,
     parsed.requestedModel || undefined
   );
+  // 与 legacy 路径同口径：思考深度上限对实际要用的模型（含 CHAT 用途默认）收紧。
+  const provider =
+    selection.providerConfig ?? (await getProviderForPurpose('CHAT'));
   const thinkingCap = selection.featureFlags.maxThinkingDepth;
   const finalDepth = resolveEffectiveThinkingDepth(
     thinkingCap,
     parsed.depth,
-    selection.providerConfig
+    provider
   );
   const effectivePreference = resolveEffectivePreference(
     parsed.thinkingPreference,
     finalDepth,
     thinkingCap,
-    selection.providerConfig
+    provider
   );
 
-  const provider =
-    selection.providerConfig ?? (await getProviderForPurpose('CHAT'));
   const budget = computeContextBudget(provider, provider.contextWindow);
 
   // ── 并行加载附件 + 各 session 的 transcript / summary / report ──

@@ -666,6 +666,117 @@ describe('Stripe verifyCallback', () => {
       })
     ).rejects.toThrow(/currency/i);
   });
+
+  it('▶ 审计 #7：零位 / 三位小数币种在 fetch 前就拒（历史脏配置兜底，绝不按错位单位扣款）', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    for (const currency of ['JPY', 'krw', 'KWD']) {
+      await expect(
+        stripeProvider().createCharge({
+          outTradeNo: 'LLS-JPY',
+          amountCents: 1000, // 系统里显示 ¥10.00；JPY 下 Stripe 会照收 ¥1000
+          subject: 'x',
+          currency,
+          returnUrl: 'https://app.test/home',
+          notifyUrl: 'https://app.test/api/wallet/callback/stripe',
+          expiresAt: CHARGE_EXPIRES_AT,
+        })
+      ).rejects.toThrow(/two-decimal/i);
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  describe('审计 #4：已付事件的 occurredAt 取承诺付款时刻（creditPaidOrder 过期闸的输入）', () => {
+    // createCharge 把订单 expiresAt（已取整到秒）原样下发为 expires_at，故订单 expiresAt === EXPIRES_AT_S*1000；
+    // creditPaidOrder 的闸是 `paidAt >= expiresAt → late_paid`。
+    const EXPIRES_AT_S = 1_790_000_000;
+    const SESSION_CREATED_S = EXPIRES_AT_S - 3600;
+    const SETTLED_LATE_S = EXPIRES_AT_S + 3 * 86_400; // SEPA/ACH 数日后到账
+
+    const event = (type: string, object: Record<string, unknown>, created: number) =>
+      JSON.stringify({ id: `evt_${type}`, type, livemode: false, created, data: { object } });
+
+    it('▶ async_payment_succeeded 到账晚于 expires_at：会话已 complete → 收到 expires_at−1s，不判 late_paid', async () => {
+      const body = event(
+        'checkout.session.async_payment_succeeded',
+        {
+          id: 'cs_async_late',
+          object: 'checkout.session',
+          client_reference_id: 'LLS-SEPA',
+          status: 'complete',
+          payment_status: 'paid',
+          amount_total: 3900,
+          currency: 'eur',
+          created: SESSION_CREATED_S,
+          expires_at: EXPIRES_AT_S,
+        },
+        SETTLED_LATE_S
+      );
+      const res = await stripeProvider().verifyCallback(stripeReq(body), body);
+      expect(res?.paid).toBe(true);
+      // 旧实现：occurredAt = event.created（到账时刻）≥ 订单 expiresAt → 每一笔延迟支付都 late_paid。
+      expect(res?.occurredAt?.getTime()).toBe((EXPIRES_AT_S - 1) * 1000);
+      expect(res!.occurredAt!.getTime()).toBeLessThan(EXPIRES_AT_S * 1000);
+    });
+
+    it('▶ payment_intent.succeeded 晚到：取 PaymentIntent.created（确认时刻），先到的 PI 事件也不会把订单焊成 late_paid', async () => {
+      const piCreated = EXPIRES_AT_S - 600;
+      const body = event(
+        'payment_intent.succeeded',
+        {
+          id: 'pi_sepa',
+          object: 'payment_intent',
+          status: 'succeeded',
+          metadata: { out_trade_no: 'LLS-SEPA' },
+          amount_received: 3900,
+          currency: 'eur',
+          created: piCreated,
+        },
+        SETTLED_LATE_S
+      );
+      const res = await stripeProvider().verifyCallback(stripeReq(body), body);
+      expect(res?.paid).toBe(true);
+      expect(res?.occurredAt?.getTime()).toBe(piCreated * 1000);
+    });
+
+    it('卡类同步支付（event.created 早于 expires_at）：occurredAt 原样，不改口径', async () => {
+      const paidAt = SESSION_CREATED_S + 120;
+      const body = event(
+        'checkout.session.completed',
+        {
+          id: 'cs_card',
+          object: 'checkout.session',
+          client_reference_id: 'LLS-CARD',
+          status: 'complete',
+          payment_status: 'paid',
+          amount_total: 3900,
+          currency: 'usd',
+          expires_at: EXPIRES_AT_S,
+        },
+        paidAt
+      );
+      const res = await stripeProvider().verifyCallback(stripeReq(body), body);
+      expect(res?.occurredAt?.getTime()).toBe(paidAt * 1000);
+    });
+
+    it('缺少「完成于过期前」的证据（无 status / expires_at）→ 仍按 event.created，拿不准不放宽', async () => {
+      const body = event(
+        'checkout.session.async_payment_succeeded',
+        {
+          id: 'cs_no_evidence',
+          object: 'checkout.session',
+          client_reference_id: 'LLS-NOEV',
+          payment_status: 'paid',
+          amount_total: 3900,
+          currency: 'eur',
+        },
+        SETTLED_LATE_S
+      );
+      const res = await stripeProvider().verifyCallback(stripeReq(body), body);
+      expect(res?.paid).toBe(true);
+      expect(res?.occurredAt?.getTime()).toBe(SETTLED_LATE_S * 1000);
+    });
+  });
 });
 
 /* ------------------------------------------------------------------ */

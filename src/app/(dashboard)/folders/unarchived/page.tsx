@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 import NewSessionModal from '@/components/NewSessionModal';
 import ExportModal from '@/components/ExportModal';
+import { getOrCreateSessionShareUrl } from '@/components/folder/sessionShareLink';
 import ActionSheet, { type ActionSheetItem } from '@/components/mobile/ActionSheet';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { useAuth } from '@/hooks/useAuth';
@@ -305,13 +306,13 @@ export default function UnarchivedPage() {
     const id = sessionId || singleSelectedId; if (!id || !token) return;
     resetMessages(); setSaving(true);
     try {
-      const r = await fetch('/api/share/create', {
-        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders },
-        body: JSON.stringify({ sessionId: id, isLive: false, expiresInHours: 72 }),
+      // 复用已有回放链接（不改写其有效期）或新建 72h 链接；URL 用服务端返回的真实路由。
+      const url = await getOrCreateSessionShareUrl({
+        sessionId: id,
+        authHeaders,
+        expiresInHours: 72,
+        failureMessage: t('foldersPage.shareFailed'),
       });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data.error || t('foldersPage.shareFailed'));
-      const url = `${window.location.origin}/session/${id}/view/${data.token}`;
       await navigator.clipboard.writeText(url);
       setSuccess(t('foldersPage.shareCopied'));
       toast.success(t('foldersPage.shareCopied'));

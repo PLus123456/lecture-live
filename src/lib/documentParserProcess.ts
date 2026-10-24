@@ -2,7 +2,7 @@ import 'server-only';
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { logger } from '@/lib/logger';
 import {
   inspectDocumentArchive,
@@ -15,9 +15,18 @@ export const DOCUMENT_PARSE_TIMEOUT_MS = 30_000;
 // Next 进程里按默认堆解析、超出只截断到 MAX_OUTPUT_CHARS，不会失败。
 // 1GB 仍然把爆炸半径限制在单个可终止的子进程内，同时给真实讲义留出余量。
 export const DOCUMENT_PARSER_MAX_OLD_SPACE_MB = 1024;
+// 子进程常驻内存（RSS）硬顶。--max-old-space-size 只限 V8 堆：pdfjs 解 FlateDecode 流用的
+// Uint8Array 是堆外 ArrayBuffer，不受它约束 —— 实测 3MB 的「压缩炸弹」PDF（单个内容流解压
+// 出 3GB 空白）在 30s 超时前把子进程 RSS 推到 3.2GB，两个并发槽合计 ~6.4GB，足以触发宿主
+// OOM。父进程按 /proc/<pid>/status 的 VmRSS 轮询，越线即 SIGKILL（非 Linux 无 /proc 时为
+// no-op，仍由堆上限 + 超时兜底）。取值 = 1GB 堆 + 解析器自身与缓冲的余量。
+export const DOCUMENT_PARSER_MAX_RSS_MB = 1536;
+const RSS_POLL_INTERVAL_MS = 250;
 // 对齐 chat_files_max_upload_mb 的默认值（100MB）。低于上传上限时，65–100MB 的
 // 附件能传上去却静默拿不到抽取文本 —— 用户看不到任何提示，只是「AI 读不到这份文件」。
 // 文档翻译另有 translation_doc_max_mb=30 的更严限制，不受此影响。
+// 子进程经 argv[4] 拿到同一个值（见 parserExecArgs）。注意经 HTTP 上传的文件另受 Next
+// middleware 32MiB 请求体上限约束（requestBodyLimit.MIDDLEWARE_CLIENT_MAX_BODY_BYTES）。
 export const DOCUMENT_PARSER_MAX_INPUT_BYTES = 100 * 1024 * 1024;
 export const DOCUMENT_PARSER_MAX_CONCURRENCY = 2;
 export const DOCUMENT_PARSER_MAX_QUEUED_BYTES = 128 * 1024 * 1024;
@@ -64,6 +73,7 @@ export type DocumentParserErrorCode =
   | 'busy'
   | 'timeout'
   | 'cancelled'
+  | 'memory_limit'
   | 'worker_failed';
 
 export class DocumentParserError extends Error {
@@ -83,6 +93,8 @@ interface ParserOptions {
   workerPath?: string;
   /** Test-only lower heap ceiling; values above the production ceiling are rejected. */
   maxOldSpaceMb?: number;
+  /** Test-only lower RSS ceiling; values above the production ceiling are rejected. */
+  maxRssMb?: number;
 }
 
 interface PendingSlot {
@@ -161,6 +173,17 @@ function acquireParserSlot(bytes: number, signal?: AbortSignal): Promise<() => v
   });
 }
 
+/** Linux：读 /proc/<pid>/status 的 VmRSS（字节）；不可读（已退出 / 非 Linux）返回 null。 */
+function readProcessRssBytes(pid: number): number | null {
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, 'utf8');
+    const match = /^VmRSS:\s+(\d+)\s+kB$/mu.exec(status);
+    return match ? Number(match[1]) * 1024 : null;
+  } catch {
+    return null;
+  }
+}
+
 function terminateChild(child: ChildProcess): void {
   if (!child.pid) return;
   if (process.platform !== 'win32') {
@@ -229,7 +252,14 @@ function parserExecArgs(
   ) {
     args.push('--allow-addons');
   }
-  args.push(paths.workerPath, operation, mimeType);
+  // argv[4]：把父进程的输入上限传给子进程，两侧单一真源（子进程曾写死 64MB，与这里的
+  // 100MB 不一致，65–100MB 的附件过了准入却在子进程里被 archive_limit 拒掉）。
+  args.push(
+    paths.workerPath,
+    operation,
+    mimeType,
+    String(DOCUMENT_PARSER_MAX_INPUT_BYTES)
+  );
   return args;
 }
 
@@ -323,6 +353,14 @@ export async function runRestrictedDocumentParser(
   ) {
     throw new DocumentParserError('Invalid document parser heap limit', 'worker_failed');
   }
+  const maxRssMb = options.maxRssMb ?? DOCUMENT_PARSER_MAX_RSS_MB;
+  if (
+    !Number.isSafeInteger(maxRssMb) ||
+    maxRssMb < 64 ||
+    maxRssMb > DOCUMENT_PARSER_MAX_RSS_MB
+  ) {
+    throw new DocumentParserError('Invalid document parser memory limit', 'worker_failed');
+  }
 
   const release = await acquireParserSlot(buffer.byteLength, options.signal);
   try {
@@ -386,6 +424,24 @@ export async function runRestrictedDocumentParser(
         );
       }, timeoutMs);
       timer.unref?.();
+      // RSS 看门狗：堆外内存（解压缓冲）不受 --max-old-space-size 约束，见常量注释。
+      const rssLimitBytes = maxRssMb * 1024 * 1024;
+      const childPid = child.pid;
+      const rssWatchdog =
+        process.platform === 'linux' && childPid
+          ? setInterval(() => {
+              const rss = readProcessRssBytes(childPid);
+              if (rss !== null && rss > rssLimitBytes) {
+                requestTermination(
+                  new DocumentParserError(
+                    'Document parser exceeded its memory limit',
+                    'memory_limit'
+                  )
+                );
+              }
+            }, RSS_POLL_INTERVAL_MS)
+          : null;
+      rssWatchdog?.unref?.();
 
       const resultStream = child.stdio[3];
       if (!resultStream || typeof resultStream.on !== 'function') {
@@ -440,6 +496,7 @@ export async function runRestrictedDocumentParser(
       });
       child.on('close', (code) => {
         clearTimeout(timer);
+        if (rssWatchdog) clearInterval(rssWatchdog);
         options.signal?.removeEventListener('abort', onAbort);
         if (terminalError) {
           logChildFailure(terminalError.code, code);

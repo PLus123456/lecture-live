@@ -113,7 +113,7 @@ beforeEach(() => {
   });
   fetchMock.mockReset().mockResolvedValue({
     ok: true,
-    json: async () => ({ api_key: 'temp:abc', expires_at: '2099-01-01T00:00:00Z' }),
+    json: async () => ({ api_key: 'snx_temp_abc', expires_at: '2099-01-01T00:00:00Z' }),
   });
   vi.stubGlobal('fetch', fetchMock);
 });
@@ -204,6 +204,38 @@ describe('POST temporary-key — 门禁链', () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(settleAnchorVoidMock).toHaveBeenCalledWith('is-new', 'mint_failed');
   });
+
+  it('单场时长闸命中（session_duration_limit）→ 403 + 机读 code / limitMs，不签发', async () => {
+    createGrantMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'session_duration_limit',
+      limitMs: 4 * 60 * 60_000,
+    });
+    const res = await POST(req({ kind: 'realtime', sessionId: 'sess-1' }));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      error: 'Session duration limit reached',
+      code: 'session_duration_limit',
+      limitMs: 4 * 60 * 60_000,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('interpret 单场时长闸命中 → 403，锚点**不**作废（名下已有串流，要照常按实测结算）', async () => {
+    interpretFindFirstMock.mockResolvedValueOnce({ id: 'is-long' });
+    createGrantMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'session_duration_limit',
+      limitMs: 6 * 60 * 60_000,
+    });
+    const res = await POST(
+      req({ kind: 'interpret', anchorId: '11111111-1111-1111-1111-111111111111' })
+    );
+    expect(res.status).toBe(403);
+    expect((await res.json()).code).toBe('session_duration_limit');
+    expect(settleAnchorVoidMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST temporary-key — 成功路径的 Soniox 参数（L1 三件套）', () => {
@@ -233,7 +265,7 @@ describe('POST temporary-key — 成功路径的 Soniox 参数（L1 三件套）
 
     const payload = (await res.json()) as Record<string, unknown>;
     expect(payload.max_session_duration_seconds).toBe(900);
-    expect(payload.api_key).toBe('temp:abc');
+    expect(payload.api_key).toBe('snx_temp_abc');
   });
 
   it('收缩预扣：只剩 3 分钟 → key 上限收缩到 180s', async () => {
@@ -298,7 +330,7 @@ describe('POST temporary-key — 成功路径的 Soniox 参数（L1 三件套）
 });
 
 describe('POST temporary-key — 失败回滚', () => {
-  it('Soniox 签发失败(!ok) → 回滚预扣 + 作废本次补建空锚点 + 透传状态码', async () => {
+  it('Soniox 签发失败(!ok) → 回滚预扣 + 作废本次补建空锚点 + 502', async () => {
     ensureActiveInterpretMock.mockResolvedValueOnce({ id: 'is-new', created: true });
     fetchMock.mockResolvedValueOnce({
       ok: false,
@@ -309,6 +341,34 @@ describe('POST temporary-key — 失败回滚', () => {
     expect(res.status).toBe(502);
     expect(rollbackGrantMock).toHaveBeenCalledWith('grant-1');
     expect(settleAnchorVoidMock).toHaveBeenCalledWith('is-new', 'mint_failed');
+  });
+
+  // 上游 401 是「服务端 Soniox key 失效」，若原样透传，AuthSessionMonitor 会把它当成用户登录态
+  // 失效直接登出；403 是 key 缺权限（permission_denied）。两者都映射成 502，并照常回滚预扣。
+  it.each([
+    [401, 'unauthenticated'],
+    [403, 'permission_denied'],
+  ])('Soniox 上游 %i (%s) 不透传给浏览器 → 502 + 回滚预扣', async (status, errorType) => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status,
+      text: async () =>
+        JSON.stringify({ status_code: status, error_type: errorType, request_id: 'req-1' }),
+    });
+    const res = await POST(req({ kind: 'realtime', sessionId: 'sess-1' }));
+    expect(res.status).toBe(502);
+    expect(rollbackGrantMock).toHaveBeenCalledWith('grant-1');
+  });
+
+  it('Soniox 上游限流 429 → 503（暂不可用），回滚预扣', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 429,
+      text: async () => JSON.stringify({ status_code: 429, error_type: 'limit_exceeded' }),
+    });
+    const res = await POST(req({ kind: 'realtime', sessionId: 'sess-1' }));
+    expect(res.status).toBe(503);
+    expect(rollbackGrantMock).toHaveBeenCalledWith('grant-1');
   });
 
   it('P1-1：锚点来自 /start（created=false）时 mint 失败**也**作废它', async () => {

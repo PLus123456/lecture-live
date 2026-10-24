@@ -36,6 +36,15 @@ vi.mock('@/lib/payment/entitlementAdmission', () => ({
 }));
 vi.mock('@/lib/llm/gateway', () => ({
   callLLMWithHistoryStream: callLLMWithHistoryStreamMock,
+  LlmUpstreamStatusError: class LlmUpstreamStatusError extends Error {
+    constructor(
+      message: string,
+      readonly status: number
+    ) {
+      super(message);
+      this.name = 'LlmUpstreamStatusError';
+    }
+  },
 }));
 vi.mock('@/lib/llm/summaryModel', () => ({
   resolveGroupBoundModel: resolveGroupBoundModelMock,
@@ -125,6 +134,7 @@ import {
   ActiveJobConcurrencyExceededError,
 } from '@/lib/jobQueue';
 import { POST } from '@/app/api/translate/llm-proxy/v1/chat/completions/route';
+import { LlmUpstreamStatusError } from '@/lib/llm/gateway';
 import { encodeTranslationProxyCache } from '@/lib/translate/llmProxyAdmission';
 
 const TOKEN = 'a'.repeat(64);
@@ -443,5 +453,54 @@ describe('POST translation LLM proxy durable admission and settlement', () => {
     const response = await POST(makeReq());
     expect(response.status).toBe(502);
     expect(failActiveJobMock).not.toHaveBeenCalled();
+  });
+  // 上游在流开始前就回非 2xx（限流 / 过载）：没有输出 token，不能按 maxOutputTokens 满额扣
+  // 任务预算 —— 否则一阵 429 风暴就把整单预算烧光，之后所有重试都 insufficient_quota。
+  it('上游流前非 2xx 只按输入上界结算，不计 maxOutputTokens', async () => {
+    callLLMWithHistoryStreamMock.mockRejectedValue(
+      new LlmUpstreamStatusError('OpenAI-compatible API error (429): rate limited', 429)
+    );
+
+    const response = await POST(makeReq());
+
+    expect(response.status).toBe(502);
+    const reservation = claimLlmTokenBudgetMock.mock.calls[0][0].units as number;
+    const settled = failActiveJobMock.mock.calls[0][3] as number;
+    // maxOutputTokens = min(provider.maxTokens=1000, 8192) = 1000
+    expect(settled).toBe(reservation - 1000);
+    expect(settled).toBeGreaterThan(0);
+    expect(taskUpdateManyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: {
+          llmInputTokens: { increment: settled },
+          llmOutputTokens: { increment: 0 },
+        },
+      })
+    );
+  });
+
+  // 付费重试会换新调度行：任务预算只统计该行创建之后的已结算代理调用。
+  it('owner 预算按当前调度行的创建时刻起算（settledSince）', async () => {
+    const attemptCreatedAt = new Date('2026-10-20T08:00:00.000Z');
+    jobFindUniqueMock.mockImplementation(
+      async (args: { where: { activeKey?: string; id?: string } }) =>
+        args.where.activeKey
+          ? null
+          : {
+              status: 'PROCESSING',
+              type: 'doc_translate',
+              createdAt: attemptCreatedAt,
+            }
+    );
+
+    const response = await POST(makeReq());
+
+    expect(response.status).toBe(200);
+    expect(claimLlmTokenBudgetMock.mock.calls[0][0].owner).toEqual({
+      limit: 180_000,
+      settledUnitsFloor: 0,
+      maxActiveJobs: 1,
+      settledSince: attemptCreatedAt,
+    });
   });
 });

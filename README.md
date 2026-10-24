@@ -175,6 +175,10 @@ npm run dev:ws
 cp .env.example .env.local
 # Set DB_PASSWORD, MYSQL_ROOT_PASSWORD, REDIS_PASSWORD, JWT_SECRET,
 # ENCRYPTION_KEY, and SETUP_BOOTSTRAP_TOKEN (`openssl rand -hex 32`).
+# Compose itself reads DB_PASSWORD, MYSQL_ROOT_PASSWORD, REDIS_PASSWORD (and their
+# *_ENCODED forms) plus NEXT_PUBLIC_APP_URL / NEXT_PUBLIC_WS_URL from `.env`, not
+# `.env.local`. NEXT_PUBLIC_* are baked into the image at build time, so run
+# `docker-compose build app` after changing them.
 
 # 2. Launch the full stack
 docker-compose up -d
@@ -254,6 +258,8 @@ See [`.env.example`](.env.example) for the full environment variable list. The m
 
 > LLM provider keys and Soniox credentials are best managed from the admin dashboard, where they can be stored encrypted in the database. Environment variables are mainly a fallback path.
 
+**Soniox API key permissions.** Soniox keys are now issued with per-product permissions. The server-side key needs: **Temporary API keys** + **Speech-to-text, real-time** (live transcription and interpretation), **Speech-to-text, async** (write) + **Files** (write) (uploaded-file transcription), and **Usage and limits** (the billing reconciliation cron reads `/v1/usage-logs`). Keys created before permissions existed keep full access. Browsers never see this key: they receive a short-lived, single-use `snx_temp_…` key and send it in the WebSocket handshake (`Sec-WebSocket-Protocol: soniox-api-key, <key>`), not in the start message — Soniox refuses start-message authentication from 15 January 2027. If you point a region's WebSocket URL at your own reverse proxy, it must pass the `Sec-WebSocket-Protocol` request/response headers through unchanged.
+
 LLM provider endpoints are configured entirely from the admin dashboard — there is no
 environment allowlist to maintain. On a self-hosted deployment the administrator and whoever
 can edit the deployment env are the same person, so such a list adds no boundary while costing
@@ -309,7 +315,7 @@ LectureLive uses the Cloudreve v4 OAuth authorization code flow with PKCE for st
 | `npm run billing:reset-quotas` | Reset monthly transcription quotas (settles purchased-minute pools and clears in-flight reservations) |
 | `npm run billing:reconcile` | Print a read-only transcription usage drift report |
 | `npm run billing:maintenance` | Run billing maintenance tasks (includes both of the above plus session/reservation reclamation — prefer this for cron) |
-| `npm run security:reencrypt-llm-keys` | Re-encrypt stored LLM provider keys |
+| `npm run security:reencrypt-llm-keys` | After rotating `ENCRYPTION_KEY`, re-encrypt every value stored with the old key (LLM keys, payment/Soniox/Cloudreve secrets, worker tokens); `-- --dry-run` previews. Remove `ENCRYPTION_KEY_PREVIOUS` only after it exits 0 |
 
 ## Contributing
 

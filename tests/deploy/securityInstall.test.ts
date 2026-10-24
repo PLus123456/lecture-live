@@ -224,17 +224,117 @@ describe('artifact 回填脚本的运行前提（部署阻断级）', () => {
     expect(launcher).toMatch(/--banner:js=.*const require = /);
   });
 
-  it('Docker runner 镜像必须自带 esbuild（回填要现编 TS）', () => {
+  it('Docker：builder 预编译回填脚本，runner 直接执行产物（runner 没有 src/ 可现编）', () => {
+    const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+    const builderStage = dockerfile.slice(
+      dockerfile.indexOf('AS builder'),
+      dockerfile.indexOf('AS runner')
+    );
+    const runnerStage = dockerfile.slice(dockerfile.indexOf('AS runner'));
+
+    // 回填源码 import ../src/**（以及 @/ 别名），runner 只有 scripts/ —— 现编必挂。
+    // builder 用同一个 launcher 的 --build-only 预编译，runner 原样带上产物。
+    expect(builderStage).toContain(
+      'node scripts/backfill-stored-artifacts.mjs --build-only dist/backfill-stored-artifacts.mjs'
+    );
+    expect(runnerStage).toContain(
+      'COPY --from=builder /app/dist/backfill-stored-artifacts.mjs ./dist/backfill-stored-artifacts.mjs'
+    );
+    expect(runnerStage).not.toMatch(/COPY[^\n]*\/app\/src/);
+    // launcher 没有源码时执行的正是这份产物
+    expect(launcher).toContain("path.join(root, 'dist', 'backfill-stored-artifacts.mjs')");
+    expect(launcher).toContain("'--build-only'");
+  });
+
+  it('Docker：/app/data 在镜像里预建并在切换用户前归 nextjs 所有', () => {
     const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
     const runnerStage = dockerfile.slice(dockerfile.indexOf('AS runner'));
 
-    // 脚本硬依赖 node_modules/.bin/esbuild，缺了直接 exit 1。
-    expect(launcher).toContain("'.bin'");
-    expect(launcher).toContain('esbuild');
+    // 命名卷首次挂载只复制「镜像里已存在目录」的属主；不预建则卷根是 root:root 0755。
+    const mkdirData = runnerStage.search(/mkdir -p[^\n]*\/app\/data/);
+    const chownApp = runnerStage.indexOf('chown -R nextjs:nodejs /app');
+    const userSwitch = runnerStage.indexOf('USER nextjs');
+    expect(mkdirData).toBeGreaterThan(0);
+    expect(chownApp).toBeGreaterThan(mkdirData);
+    expect(userSwitch).toBeGreaterThan(chownApp);
+  });
 
-    expect(runnerStage).toContain('/app/node_modules/esbuild ./node_modules/esbuild');
-    // 平台二进制在 @esbuild/<platform> 下，只带 JS 壳跑不起来。
-    expect(runnerStage).toContain('/app/node_modules/@esbuild ./node_modules/@esbuild');
-    expect(runnerStage).toContain('/app/node_modules/.bin/esbuild');
+  it('Docker：NEXT_PUBLIC_* 作为 build args 进入 next build，空值不得以空串内联', () => {
+    const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+    const compose = readFileSync(path.join(ROOT, 'docker-compose.yml'), 'utf8');
+    const builderStage = dockerfile.slice(
+      dockerfile.indexOf('AS builder'),
+      dockerfile.indexOf('AS runner')
+    );
+
+    for (const name of ['NEXT_PUBLIC_APP_URL', 'NEXT_PUBLIC_WS_URL']) {
+      expect(builderStage).toContain(`ARG ${name}`);
+      // 不能用 ENV 固化：空 ENV 也是「已定义」，Next 会把空串内联进服务端 bundle
+      expect(builderStage).not.toMatch(new RegExp(`^ENV[^\\n]*${name}`, 'm'));
+      expect(builderStage).toContain(
+        `if [ -z "\${${name}:-}" ]; then unset ${name}; fi;`
+      );
+      expect(compose).toContain(`${name}: \${${name}:-}`);
+    }
+    expect(builderStage.indexOf('unset NEXT_PUBLIC_WS_URL')).toBeLessThan(
+      builderStage.indexOf('npm run build')
+    );
+    expect(compose).toMatch(/build:\n\s+context: \.\n/);
+  });
+
+  it('Docker：next build 只拿到一次性随机的 JWT_SECRET / ENCRYPTION_KEY（否则 import 即 FATAL，镜像建不出来）', () => {
+    const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+    const builderStage = dockerfile.slice(
+      dockerfile.indexOf('AS builder'),
+      dockerfile.indexOf('AS runner')
+    );
+
+    for (const name of ['JWT_SECRET', 'ENCRYPTION_KEY']) {
+      // 只作用于 npm run build 这一条命令的进程环境，每次构建随机生成
+      expect(builderStage).toContain(
+        `${name}="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"`
+      );
+      // 绝不能固化进镜像：既不 ENV 也不 ARG（ARG 会出现在 docker history 里）
+      expect(dockerfile).not.toMatch(new RegExp(`^(ENV|ARG)[^\\n]*${name}`, 'm'));
+    }
+    expect(builderStage.indexOf('ENCRYPTION_KEY="$(node')).toBeLessThan(
+      builderStage.indexOf('npm run build')
+    );
+  });
+
+  it('Docker：base 阶段装 openssl —— 否则 Prisma 判不出 OpenSSL 版本，生成要 libssl.so.1.1 的引擎，容器启动即挂', () => {
+    const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+    const baseStage = dockerfile.slice(0, dockerfile.indexOf('AS deps'));
+
+    expect(baseStage).toContain('FROM node:24-alpine AS base');
+    expect(baseStage).toMatch(/^RUN apk add --no-cache openssl$/m);
+  });
+
+  it('Docker：WS 的运行时依赖（build:ws 的 --external）要装进 ws-server/node_modules，与裸机 install.sh 同口径', () => {
+    const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+    const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as {
+      scripts: Record<string, string>;
+    };
+    const wsPkg = JSON.parse(
+      readFileSync(path.join(ROOT, 'deploy', 'ws-package.json'), 'utf8')
+    ) as { dependencies: Record<string, string> };
+
+    const wsDepsStage = dockerfile.slice(
+      dockerfile.indexOf('AS ws-deps'),
+      dockerfile.indexOf('AS builder')
+    );
+    expect(wsDepsStage).toContain('COPY deploy/ws-package.json ./package.json');
+    expect(wsDepsStage).toContain('npm install --omit=dev');
+    expect(wsDepsStage).toContain('prisma@5 generate');
+    expect(dockerfile).toContain('COPY --from=ws-deps /ws/node_modules ./ws-server/node_modules');
+
+    // build:ws 留作运行时 require 的包（可选的 bufferutil / utf-8-validate 除外）都得在清单里
+    const externals = [...pkg.scripts['build:ws'].matchAll(/--external:(\S+)/g)]
+      .map((m) => m[1])
+      .filter((name) => name !== 'bufferutil' && name !== 'utf-8-validate');
+    expect(externals.length).toBeGreaterThan(0);
+    for (const name of externals) {
+      expect(wsPkg.dependencies).toHaveProperty(name);
+    }
   });
 });

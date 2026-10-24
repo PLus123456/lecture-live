@@ -216,6 +216,46 @@ describe('reclaimStaleFullTranscribes', () => {
     expect(failAttemptMock).not.toHaveBeenCalled();
   });
 
+  it('审计 #8：Soniox completed 但收尾永久失败 → 标 failed 释放预留/名额（不带 startedAtLte）+ 清理', async () => {
+    sessionFindManyMock.mockResolvedValue([
+      candidate({ fullSonioxFileId: 'f8', fullSonioxTranscriptionId: 't8' }),
+    ]);
+    getSonioxTranscriptionMock.mockResolvedValue({ status: 'completed' });
+    finalizeMock.mockRejectedValue(
+      Object.assign(new Error('Soniox transcript.tokens must be an array'), {
+        name: 'SonioxTranscriptPayloadError',
+      })
+    );
+
+    const n = await reclaimStaleFullTranscribes(NOW);
+
+    // 修复前：只记 "left for retry"，claim 每次刷新 startedAt → 每轮都重下 transcript 再失败，永不收敛。
+    expect(n).toBe(1);
+    expect(failAttemptMock).toHaveBeenCalledTimes(1);
+    const failArgs = failAttemptMock.mock.calls[0][0];
+    expect(failArgs).toMatchObject({
+      sessionId: 's1',
+      claimId: 'claim-1',
+      allowedStatuses: ['transcribing'],
+    });
+    // claim 刚把 startedAt 刷成 now：带阈值永远命中不了。
+    expect(failArgs.startedAtLte).toBeUndefined();
+    expect(deleteFileMock).toHaveBeenCalledWith(SONIOX, 'f8');
+    expect(deleteTranscriptionMock).toHaveBeenCalledWith(SONIOX, 't8');
+  });
+
+  it('审计 #8：收尾瞬时失败（上游 5xx）→ 仍留待重试，绝不标 failed', async () => {
+    sessionFindManyMock.mockResolvedValue([candidate({})]);
+    getSonioxTranscriptionMock.mockResolvedValue({ status: 'completed' });
+    finalizeMock.mockRejectedValue(new Error('Soniox get transcript failed: HTTP 502'));
+
+    const n = await reclaimStaleFullTranscribes(NOW);
+
+    expect(n).toBe(0);
+    expect(failAttemptMock).not.toHaveBeenCalled();
+    expect(deleteTranscriptionMock).not.toHaveBeenCalled();
+  });
+
   it('按 fullTranscribeStartedAt 超阈值筛选（transcribing 且 startedAt<=阈值）', async () => {
     sessionFindManyMock.mockResolvedValue([]);
     await reclaimStaleFullTranscribes(NOW);

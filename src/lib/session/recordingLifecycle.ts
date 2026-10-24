@@ -17,11 +17,31 @@
 export type StatusSyncResult =
   | 'ok'
   | 'conflict' // 400/409：状态迁移冲突——会话多半已被收尾/回收（真正的 reclaim 信号）
+  | 'concurrency-limit' // 409：CREATED→RECORDING 撞上「并发在途录音数」上限（B4），会话仍是 CREATED
   | 'not-found' // 404：会话已被删除（同样应视为 reclaim，本地不该继续假装在录）
   | 'unauthorized' // 401：token 失效/过期，需重新认证，**不是**会话被回收
   | 'forbidden' // 403：无权限，**不是**会话被回收
   | 'rejected' // 其它 4xx 兜底（保守视为被拒，但不特指某语义）
   | 'network-error';
+
+/**
+ * R5：识别 PATCH /api/sessions/:id 的「并发在途录音数超限」409（B4 并发闸）。
+ *
+ * 同一端点还有另一种 409 —— 状态 CAS 落空（`Session was modified concurrently`），那是
+ * 真正的 reclaim/并发收尾信号，响应体**总会**带 `currentStatus` 字段（可能为 null）；并发闸
+ * 分支不带该字段，且 error 文案固定为「Too many concurrent recordings ...」。服务端若日后
+ * 补上机读 code（concurrent_recording_limit）也一并识别。两者混淆的代价：把并发超限当成
+ * 「会话已被回收」只弹误导提示，录音却继续往一个永远无法收尾的 CREATED 会话里录。
+ */
+export function isConcurrentRecordingLimitBody(body: unknown): boolean {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  const record = body as Record<string, unknown>;
+  if (record.code === 'concurrent_recording_limit') return true;
+  if ('currentStatus' in record) return false;
+  return (
+    typeof record.error === 'string' && /concurrent recordings/i.test(record.error)
+  );
+}
 
 /**
  * 把 PATCH 状态同步的响应归类。
@@ -39,7 +59,7 @@ export type StatusSyncResult =
  *                     否则一次瞬断/服务端抖动就会误报。
  */
 export function classifyStatusSync(
-  outcome: { ok: boolean; status: number } | { error: true }
+  outcome: { ok: boolean; status: number; body?: unknown } | { error: true }
 ): StatusSyncResult {
   if ('error' in outcome) return 'network-error';
   if (outcome.ok) return 'ok';
@@ -47,6 +67,10 @@ export function classifyStatusSync(
   if (status === 401) return 'unauthorized';
   if (status === 403) return 'forbidden';
   if (status === 404) return 'not-found';
+  // R5：并发闸 409 先于通用冲突判定 —— 它不是「会话被回收」，而是「这次开录被拒」。
+  if (status === 409 && isConcurrentRecordingLimitBody(outcome.body)) {
+    return 'concurrency-limit';
+  }
   if (status === 400 || status === 409) return 'conflict';
   if (status >= 400 && status < 500) return 'rejected';
   return 'network-error';
@@ -105,6 +129,23 @@ export type RecoveryMode =
   | 'fresh';
 
 /**
+ * 全局实时 store 是否明确归属于本会话（P0-3）。
+ *
+ * **未绑定（activeSessionId 为空）一律不算归属**：所有合法写入方都会先绑定 —— useSoniox
+ * 开录/续录时 setActiveSessionId，会话页冷恢复 draft 时也先绑定再灌数据。未绑定却持有
+ * 录音态/段落的 store 只可能是「某个写入方漏绑」（如旧的冷恢复路径：恢复 A 的草稿后未绑定，
+ * 导航到 B 时 B 把 A 的转录当成自己的展示、续录、PUT 进 B 的草稿 —— 审计 high），或 P0-3
+ * 之前的陈旧 sessionStorage 快照。两者都不能证明属于本会话，按外来数据处理；真正属于本会话的
+ * 未落库数据此时都已在服务端 draft 里，resume-cold 会从那里恢复。
+ */
+export function isLiveStoreOwnedBy(
+  storeActiveSessionId: string | null | undefined,
+  pageSessionId: string
+): boolean {
+  return Boolean(storeActiveSessionId) && storeActiveSessionId === pageSessionId;
+}
+
+/**
  * 全局实时 store 的 recordingState 只有在明确绑定到本会话时才作数（P0-3）。
  *
  * 背景：transcript store 是 SPA 内的内存单例，导航到别的会话不会销毁它。若直接拿
@@ -113,18 +154,17 @@ export type RecoveryMode =
  * processor，造成 A 的转录写进 B、音频/转录错配（审计 critical）。
  *
  * 规则：
- * - store 已绑定到别的会话（activeSessionId 有值且 ≠ 本会话）→ 一律视为「本会话本地无录音」
- *   （返回 null），绝不据此走 live-refresh。
- * - store 未绑定（activeSessionId 为空，如旧版持久化数据 / 刷新前未写入）→ 保守回退到
- *   信任 recordingState，保持既有刷新恢复行为不回归。
  * - store 绑定到本会话 → 返回其 recordingState。
+ * - store 绑定到别的会话，或**未绑定**（见 isLiveStoreOwnedBy）→ 视为「本会话本地无录音」
+ *   （返回 null），绝不据此走 live-refresh。此前未绑定会回退信任 recordingState，正是冷恢复
+ *   漏绑后 A 的 paused 态串到 B 的入口。
  */
 export function localRecordingForSession(
   storeActiveSessionId: string | null | undefined,
   pageSessionId: string,
   storeRecordingState: string | null | undefined
 ): string | null {
-  if (storeActiveSessionId && storeActiveSessionId !== pageSessionId) {
+  if (!isLiveStoreOwnedBy(storeActiveSessionId, pageSessionId)) {
     return null;
   }
   return storeRecordingState ?? null;
@@ -200,12 +240,13 @@ export function isProtectedRecordingContext(
 /**
  * P1-8 / P0-3：回放页是否应「让位」给活跃录音 store（不清空、不灌历史）。按 sessionId 隔离：
  *
- * - store 绑定到**本**会话（或未绑定的旧数据 activeSessionId 为空）且处于受保护录音上下文
- *   → 让位：本会话的实时录音/暂停/收尾尚未安全落库，回放页不得清空或覆盖。
- * - store 绑定到**别的**会话（activeSessionId 有值且 ≠ 回放页会话）→ **不让位**：回放 B
- *   绝不能被 A 的实时 store 挡住，否则要么把 A 的 live segments 暴露成 B 的回放（跨会话
- *   泄漏），要么 B 自己的历史永远灌不进来（数据丢失）——P0-3 回归。回放 B 应清掉外来
- *   的 A store 并载入 B 自己的历史（A 的未落库数据由会话页 unmount 的最终 flush 保护）。
+ * - store 绑定到**本**会话且处于受保护录音上下文 → 让位：本会话的实时录音/暂停/收尾
+ *   尚未安全落库，回放页不得清空或覆盖。
+ * - store 绑定到**别的**会话，或**未绑定**（见 isLiveStoreOwnedBy）→ **不让位**：回放 B
+ *   绝不能被外来 live store 挡住，否则要么把它的 live segments 暴露成 B 的回放（跨会话
+ *   泄漏，ChatTab/导出也会读到别的会话的转录），要么 B 自己的历史永远灌不进来（数据丢失）。
+ *   回放 B 应清掉外来 store 并载入 B 自己的历史（外来会话的未落库数据由会话页 unmount 的
+ *   最终 flush / 服务端 draft 保护）。
  * - 非受保护态（idle/stopped）→ 不让位，回放页可正常同步展示历史。
  */
 export function shouldPlaybackYieldToLiveStore(
@@ -215,7 +256,7 @@ export function shouldPlaybackYieldToLiveStore(
 ): boolean {
   return (
     isProtectedRecordingContext(storeRecordingState) &&
-    (storeActiveSessionId == null || storeActiveSessionId === playbackSessionId)
+    isLiveStoreOwnedBy(storeActiveSessionId, playbackSessionId)
   );
 }
 

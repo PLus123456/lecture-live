@@ -54,6 +54,9 @@ vi.mock('@/lib/prisma', () => ({
       update: taskUpdateMock,
       findUnique: taskFindUniqueMock,
       deleteMany: taskDeleteManyMock,
+      // 上传前的「未确认报价数量闸」与懒清理
+      findMany: vi.fn().mockResolvedValue([]),
+      count: vi.fn().mockResolvedValue(0),
     },
   },
 }));

@@ -5,6 +5,7 @@ import {
   enforcePublicAuthPrelude,
   publicAuthAccountKey,
   readPublicAuthJson,
+  rejectMalformedStringFields,
 } from '@/lib/publicAuth';
 import { logAction } from '@/lib/auditLog';
 import { logger, serializeError } from '@/lib/logger';
@@ -33,6 +34,9 @@ export async function POST(req: Request) {
   const parsed = await readPublicAuthJson<{ email?: string }>(req);
   if (!parsed.ok) return parsed.response;
   const body = parsed.body;
+  // 非字符串 email 会让 normalizeEmail 抛 TypeError → 框架 500（与账号无关，回 400 不泄露信息）。
+  const malformed = rejectMalformedStringFields(body, ['email']);
+  if (malformed) return malformed;
 
   const email = normalizeEmail(body.email ?? '').slice(0, 255);
 

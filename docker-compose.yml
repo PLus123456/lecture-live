@@ -1,7 +1,15 @@
 version: '3.8'
 services:
   app:
-    build: .
+    build:
+      context: .
+      # NEXT_PUBLIC_* 在 next build 时内联进前端 bundle（直播 WS 地址、CSP connect-src 都来自它），
+      # 运行期的 env_file 改不了已构建的产物。compose 的变量插值只读宿主 shell 与本目录的 .env
+      # （不读 .env.local），所以这两项要同样写进 .env；修改后须 `docker compose build` 重建镜像。
+      # 标准 nginx 拓扑下 WS 走同源 /socket.io/，NEXT_PUBLIC_WS_URL 填与 NEXT_PUBLIC_APP_URL 相同的地址即可。
+      args:
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
     ports:
       - "127.0.0.1:3000:3000"
       - "127.0.0.1:3001:3001"     # WebSocket server for live share

@@ -104,11 +104,17 @@ vi.mock('@/lib/audio/recordingDuration', () => ({
   RECORDING_DURATION_LIMIT_GRACE_MS: 60_000,
   RecordingDurationMeasurementError: class RecordingDurationMeasurementError extends Error {},
 }));
-vi.mock('@/lib/billing', () => ({
-  clampSessionDurationMs: (ms: number) => ms,
-  getBillableMinutes: (ms: number) => (ms > 0 ? Math.ceil(ms / 60_000) : 0),
-  getMaxSessionDurationMs: () => null,
-}));
+vi.mock('@/lib/billing', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/billing')>();
+  return {
+    clampSessionDurationMs: (ms: number) => ms,
+    getBillableMinutes: (ms: number) => (ms > 0 ? Math.ceil(ms / 60_000) : 0),
+    getMaxSessionDurationMs: () => null,
+  // 计费下限 / 实测求和是纯函数：用真实实现，保证测的是生产口径。
+  withMeasuredStreamFloorMs: actual.withMeasuredStreamFloorMs,
+  sumCappedStreamActualMs: actual.sumCappedStreamActualMs,
+  };
+});
 vi.mock('@/lib/quota', () => ({ deductTranscriptionMinutes: deductMock }));
 vi.mock('@/lib/email/quotaAlert', () => ({
   maybeSendTranscriptionQuotaAlert: vi.fn().mockResolvedValue(undefined),

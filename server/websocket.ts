@@ -5,6 +5,7 @@ import { createServer } from 'http';
 import { Server as SocketIO, Socket } from 'socket.io';
 import { setupLiveShare } from '../src/lib/liveShare/server';
 import { handleLiveShareInternalRequest } from '../src/lib/liveShare/internalHttp';
+import { createIpConnectionTracker } from '../src/lib/liveShare/connectionTracker';
 import {
   resolveSocketClientIp,
   validateTrustedProxyConfiguration,
@@ -75,7 +76,9 @@ function consumeRateToken(state: SocketRateState, nowMs: number): boolean {
   return true;
 }
 
-const connectionsByIp = new Map<string, number>();
+// 每 IP 连接名额：与 engine.io 底层连接生命周期绑定、恰好释放一次（见 connectionTracker.ts——
+// 旧的「中间件 +1、connection 里挂 disconnect -1」会被握手中途断开的连接永久漏掉名额）。
+const connectionTracker = createIpConnectionTracker(MAX_CONNECTIONS_PER_IP);
 const wsLogger = logger.child({ component: 'websocket-server' });
 let isShuttingDown = false;
 
@@ -87,21 +90,6 @@ function resolveClientIp(socket: Socket) {
     forwardedFor: typeof forwardedFor === 'string' ? forwardedFor : null,
     realIp: typeof realIp === 'string' ? realIp : null,
   });
-}
-
-function incrementConnectionCount(ip: string) {
-  const nextCount = (connectionsByIp.get(ip) ?? 0) + 1;
-  connectionsByIp.set(ip, nextCount);
-}
-
-function decrementConnectionCount(ip: string) {
-  const nextCount = (connectionsByIp.get(ip) ?? 1) - 1;
-  if (nextCount <= 0) {
-    connectionsByIp.delete(ip);
-    return;
-  }
-
-  connectionsByIp.set(ip, nextCount);
 }
 
 // SHARE-REVOKE-001：API 进程的撤销通知走这个 listener。必须在 socket.io attach
@@ -156,19 +144,20 @@ io.use((socket, next) => {
     );
     return next(new Error('Client IP unavailable'));
   }
-  const currentConnections = connectionsByIp.get(clientIp) ?? 0;
-
-  if (currentConnections >= MAX_CONNECTIONS_PER_IP) {
+  const acquired = connectionTracker.acquire(socket, clientIp);
+  if (acquired === 'closed') {
+    // 底层连接已在握手途中断开：socket.io 随后会丢弃这个 socket，不占名额。
+    return next(new Error('Connection closed during handshake'));
+  }
+  if (acquired === 'limit') {
     wsLogger.warn(
-      { clientIp, connections: currentConnections },
+      { clientIp, connections: connectionTracker.count(clientIp) },
       'Rejected websocket connection because IP connection limit was exceeded'
     );
     return next(new Error('Too many connections from this IP'));
   }
 
   socket.data.clientIp = clientIp;
-  socket.data.connectionTracked = true;
-  incrementConnectionCount(clientIp);
   return next();
 });
 
@@ -203,14 +192,8 @@ io.on('connection', (socket) => {
     socket.disconnect(true);
   });
 
+  // 名额释放由 connectionTracker 负责（中间件里已绑定到连接生命周期），这里只记日志。
   socket.once('disconnect', () => {
-    if (!socket.data.connectionTracked) {
-      return;
-    }
-
-    decrementConnectionCount(socket.data.clientIp as string);
-    socket.data.connectionTracked = false;
-
     wsLogger.info(
       {
         socketId: socket.id,
@@ -284,7 +267,7 @@ async function shutdown(signal: string) {
         resolve();
       });
     });
-    connectionsByIp.clear();
+    connectionTracker.clear();
     clearTimeout(forceCloseTimer);
     wsLogger.info({ signal }, 'WebSocket server stopped cleanly');
     process.exit(0);

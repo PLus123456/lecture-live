@@ -20,6 +20,8 @@ import {
   sanitizeGlossary,
   sanitizeLangCode,
   sweepExpiredQuotes,
+  countOutstandingQuotes,
+  MAX_OUTSTANDING_QUOTES_PER_USER,
 } from '@/lib/translate/taskApi';
 
 export const runtime = 'nodejs';
@@ -84,6 +86,20 @@ export async function POST(req: Request) {
     const flags = await resolveUserFeatureFlags(dbUser);
     if (!flags.allowDocTranslation) {
       return NextResponse.json({ error: '当前用户组未开通文档翻译' }, { status: 403 });
+    }
+
+    // 未确认报价数量闸（读 body 之前）：每个报价都在本地盘留一份源 PDF 且不计存储配额，
+    // 不设上限时一个账号按限流反复「上传不确认」就能把 data/ 盘（与录音共用）堆满。
+    // 先顺手清掉本人已过期的报价，过期的不占名额。
+    await sweepExpiredQuotes(user.id).catch(() => undefined);
+    if ((await countOutstandingQuotes(user.id)) >= MAX_OUTSTANDING_QUOTES_PER_USER) {
+      return NextResponse.json(
+        {
+          error: `未确认的报价过多（最多 ${MAX_OUTSTANDING_QUOTES_PER_USER} 个），请先确认或删除已有报价`,
+          code: 'too_many_pending_quotes',
+        },
+        { status: 429 }
+      );
     }
 
     const form = await req.formData();
@@ -161,7 +177,12 @@ export async function POST(req: Request) {
         if (error.code === 'cancelled') {
           return NextResponse.json({ error: 'Request cancelled' }, { status: 499 });
         }
-        if (error.code === 'input_limit' || error.code === 'archive_limit') {
+        if (
+          error.code === 'input_limit' ||
+          error.code === 'archive_limit' ||
+          // 子进程 RSS 越线被看门狗强杀（如对象流解压炸弹）：同属「过大或过于复杂」
+          error.code === 'memory_limit'
+        ) {
           return NextResponse.json(
             { error: 'PDF 过大或过于复杂', code: 'document_too_complex' },
             { status: 413 }
@@ -191,9 +212,6 @@ export async function POST(req: Request) {
         { status: 413 }
       );
     }
-
-    // 顺手清理本人超时未确认的旧报价
-    await sweepExpiredQuotes(user.id).catch(() => undefined);
 
     // ADMIN 免单：报价直接出 0（/confirm 与 /retry 侧还有一道同样的豁免，双保险）
     const estimatedCents = isBillingExempt(dbUser.role)

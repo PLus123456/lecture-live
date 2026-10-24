@@ -25,6 +25,7 @@ import { logSystemEvent } from '@/lib/auditLog';
 import {
   clampSessionDurationMs,
   getBillableMinutes,
+  withMeasuredStreamFloorMs,
   type AppUserRole,
 } from '@/lib/billing';
 import { MAX_INTERPRET_DURATION_MS } from '@/lib/interpret/anchor';
@@ -40,6 +41,8 @@ const FETCH_OVERLAP_MS = 15 * 60_000;
 const INITIAL_LOOKBACK_MS = 24 * 60 * 60_000;
 /** usage-logs API 单窗上限 31 天，留余量。 */
 const MAX_WINDOW_MS = 30 * 24 * 60 * 60_000;
+/** 单页 usage-logs 请求超时。 */
+const USAGE_LOGS_FETCH_TIMEOUT_MS = 30_000;
 /** 孤儿判定：mintedAt + key TTL + 连接硬上限之后再等这么久（等 usage-log 落账+回填）。 */
 const ORPHAN_SETTLE_GRACE_MS = 30 * 60_000;
 /** 每轮孤儿结算批量上限：本轮**真正处理**（尝试结算）的 grant 数上限，被跳过的不计入。 */
@@ -129,9 +132,17 @@ async function fetchRegionUsageLogs(
 
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${apiKey}` },
+      // 与其它 Soniox REST 调用同口径的超时：上游无响应时别把整个维护周期挂住。
+      signal: AbortSignal.timeout(USAGE_LOGS_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) {
-      throw new Error(`usage-logs fetch failed: HTTP ${res.status}`);
+      // Soniox 的 key 现在按权限授予：只开了「Temporary API keys / Speech-to-text」的 key 读
+      // usage-logs 会 403 permission_denied —— 对账从此每轮失败，孤儿 grant 永远退不了/扣不了。
+      const hint =
+        res.status === 403
+          ? " (the Soniox API key needs the 'Usage and limits' permission)"
+          : '';
+      throw new Error(`usage-logs fetch failed: HTTP ${res.status}${hint}`);
     }
     const data = (await res.json()) as {
       usage_logs?: SonioxUsageLogEntry[];
@@ -207,10 +218,15 @@ async function computeLateTopUpMinutes(
       select: { role: true },
     });
     if (!owner) return 0; // 用户已删：与 realtime 分支的 `if (!session) return 0` 同口径
+    // ③ 封顶只保护「上限 + 宽限」以内的实测：超出部分（同一锚点并行多开）照实补扣，
+    //    与 deduct / cron 同口径（withMeasuredStreamFloorMs）。
     const measuredMinutes = getBillableMinutes(
-      clampSessionDurationMs(
-        Math.min(measuredMs, MAX_INTERPRET_DURATION_MS),
-        owner.role as AppUserRole
+      withMeasuredStreamFloorMs(
+        clampSessionDurationMs(
+          Math.min(measuredMs, MAX_INTERPRET_DURATION_MS),
+          owner.role as AppUserRole
+        ),
+        measuredMs
       )
     );
     return Math.max(0, measuredMinutes - charged - grantChargedMinutes);
@@ -224,10 +240,37 @@ async function computeLateTopUpMinutes(
       user: { select: { role: true } },
     },
   });
-  if (!session) return 0;
+  if (!session) {
+    // Session 行用户随时可删（SEC-030：它不是计费真源），grant.sessionId 是无外键的裸列，删行后
+    // 迟到的实测照样会落到这里。旧实现直接 return 0，于是「多开几条流 → 秒 finalize（只扣 1 分钟、
+    // 释放全部预扣）→ 删会话 → 流继续跑到 Soniox 硬上限」整段免单，可无限循环。改读不随会话删除
+    // 的 TranscriptionCharge 逐笔台账（finalize 那笔 source='session_finalize'、referenceId=sessionId）
+    // + User.role，口径与下面会话尚在时一致。
+    const owner = await tx.user.findUnique({
+      where: { id: grant.userId },
+      select: { role: true },
+    });
+    if (!owner) return 0; // 用户已删：与 interpret 分支同口径
+    const ledger = await tx.transcriptionCharge.aggregate({
+      where: { referenceId: grant.sessionId as string, source: 'session_finalize' },
+      _sum: { minutes: true },
+    });
+    const measuredMinutes = getBillableMinutes(
+      withMeasuredStreamFloorMs(
+        clampSessionDurationMs(measuredMs, owner.role as AppUserRole),
+        measuredMs
+      )
+    );
+    const charged = Math.max(0, ledger._sum.minutes ?? 0);
+    return Math.max(0, measuredMinutes - charged - grantChargedMinutes);
+  }
   // 角色时长上限（FREE 2h / PRO 4h）是刻意的用户保护，补扣不得绕过它 —— 实测量同样过 clamp。
+  // 保护只到「上限 + 宽限」为止：超出部分是绕过收尾 / 并行多开的串流，与 finalize 同口径照实补扣。
   const measuredMinutes = getBillableMinutes(
-    clampSessionDurationMs(measuredMs, session.user.role)
+    withMeasuredStreamFloorMs(
+      clampSessionDurationMs(measuredMs, session.user.role),
+      measuredMs
+    )
   );
   // finalize 把 durationMs 写成「含 grant 实测的 Math.max 再 clamp」，getBillableMinutes(它) 就是
   // 本场权威扣费额；Session.billedMinutes 台账在时更精确。取两者较大者：宁可少补，绝不重复扣。

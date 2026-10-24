@@ -473,10 +473,12 @@ cmd_rollback() {
                 exit 1
             fi
             echo -e '${CYAN}[→]${NC} 恢复备份...'
+            # 与 deploy/rollback.sh 同口径：保留 src（托管安装的源码检出），解包时按锚定路径跳过旧备份里的 ./src
             find $APP_DIR -mindepth 1 -maxdepth 1 \
-                ! -name data ! -name .env ! -name backups ! -name scripts \
+                ! -name data ! -name .env ! -name backups ! -name scripts ! -name src \
                 -exec rm -rf {} +
-            tar xzf '$selected' -C $APP_DIR
+            tar xzf '$selected' -C $APP_DIR --anchored \
+                --exclude=./src --exclude=./data --exclude=./.env --exclude=./backups
             chown -R lecturelive:lecturelive $APP_DIR
             chmod 600 $APP_DIR/.env
             [[ -f $APP_DIR/.runtime-security-version ]] && \

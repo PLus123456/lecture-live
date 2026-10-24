@@ -1603,4 +1603,96 @@ describe('POST /api/llm/chat (mode routing)', () => {
       });
     });
   });
+  /**
+   * 未传 model（或伪造 id 且无组默认）时 selection.providerConfig 为空，gateway 落到
+   * CHAT 用途默认模型。思考深度上限必须对这个实际模型收紧 —— 此前拿 undefined 去
+   * clamp，auto/forced 原样透传，gateway 再按默认模型的 high 开思考，绕过组上限。
+   */
+  describe('思考深度组上限：未传 model 时按 CHAT 默认模型收紧', () => {
+    const cappedSelection = {
+      user: { role: 'FREE' },
+      featureFlags: {
+        maxThinkingDepth: 'medium',
+        allowRealtimeSummary: true,
+        allowFinalSummary: true,
+      },
+    };
+    const depthDefaultModel = {
+      contextWindow: 200_000,
+      displayName: 'default-chat',
+      supportsImage: false,
+      thinkingMode: 'DEPTH',
+      thinkingDepth: 'high',
+      dbModelId: 'chat-default',
+    };
+
+    function streamOptions(): { thinkingPreference?: string } {
+      return callLLMWithHistoryStreamMock.mock.calls[0][2] as {
+        thinkingPreference?: string;
+      };
+    }
+
+    it('legacy 路径：auto（不带 thinkingEnabled）被收紧到组上限', async () => {
+      resolveAuthorizedLlmSelectionMock.mockResolvedValue(cappedSelection);
+      getProviderForPurposeMock.mockResolvedValue(depthDefaultModel);
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-legacy',
+        userId: 'user-1',
+        sessionId: 'sess-1',
+        endedAt: null,
+        degradationLevel: 1,
+        session: { id: 'sess-1', userId: 'user-1', targetLang: 'zh' },
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-legacy',
+          question: 'hello',
+          transcript: [{ text: 'live segment', startMs: 0 }],
+        },
+      });
+      const res = await POST(req, {} as never);
+      await consumeSseEvents(res);
+
+      expect(streamOptions().thinkingPreference).toBe('medium');
+      expect(resolveEffectiveThinkingDepthMock).toHaveBeenCalledWith(
+        'medium',
+        'medium',
+        expect.objectContaining({ thinkingMode: 'DEPTH', thinkingDepth: 'high' })
+      );
+    });
+
+    it('global 路径：forced（thinkingEnabled:true 无深度）同样收紧', async () => {
+      resolveAuthorizedLlmSelectionMock.mockResolvedValue(cappedSelection);
+      getProviderForPurposeMock.mockResolvedValue(depthDefaultModel);
+      conversationFindUniqueMock.mockResolvedValue({
+        id: 'conv-global',
+        userId: 'user-1',
+        sessionId: null,
+        endedAt: null,
+        degradationLevel: 1,
+        session: null,
+        messages: [],
+        sessions: [],
+        attachments: [],
+      });
+
+      const req = createJsonRequest('http://localhost:3000/api/llm/chat', {
+        method: 'POST',
+        body: {
+          conversationId: 'conv-global',
+          question: 'hello',
+          thinkingEnabled: true,
+        },
+      });
+      const res = await POST(req, {} as never);
+      await consumeSseEvents(res);
+
+      expect(streamOptions().thinkingPreference).toBe('medium');
+    });
+  });
 });

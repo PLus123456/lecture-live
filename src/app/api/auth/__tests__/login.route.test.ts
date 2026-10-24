@@ -30,6 +30,7 @@ vi.mock('@/lib/email/loginAlert', () => ({
 vi.mock('@/lib/auth', () => ({
   CLIENT_SESSION_TOKEN: '__cookie_session__',
   EMAIL_NOT_VERIFIED_ERROR: 'Email not verified',
+  LOGIN_THROTTLED_ERROR: 'Login throttled',
   getJwtExpiryConfig: (days?: number) => ({
     expiresInDays: days ?? 7,
     cookieMaxAge: (days ?? 7) * 24 * 60 * 60,
@@ -298,6 +299,103 @@ describe('POST /api/auth/login', () => {
         'Abcd1234',
         expect.objectContaining({ requireEmailVerified: false })
       );
+    });
+  });
+
+  describe('畸形入参 / 设置不可用 / 按账号限流', () => {
+    const post = (body: unknown) =>
+      POST(
+        createJsonRequest('http://localhost:3000/api/auth/login', {
+          method: 'POST',
+          body,
+        })
+      );
+
+    // 旧实现 normalizeEmail 在 try 之外对非字符串抛 TypeError → 框架 500。
+    it('非字符串 email / password 回 400，绝不进入 login()', async () => {
+      for (const body of [
+        { email: 123, password: 'Abcd1234' },
+        { email: ['alice@example.com'], password: 'Abcd1234' },
+        { email: { $ne: '' }, password: 'Abcd1234' },
+        { email: 'alice@example.com', password: 12345678 },
+      ]) {
+        const response = await post(body);
+        expect(response.status).toBe(400);
+      }
+      expect(loginMock).not.toHaveBeenCalled();
+    });
+
+    // 旧实现 getSiteSettings().catch(() => null) 后 requireEmailVerified 恒 false：DB 一抖，
+    // 未验证账号就能登录。
+    it('站点设置读不出来时回 503，不在丢掉邮箱验证门禁的情况下继续登录', async () => {
+      getSiteSettingsMock.mockRejectedValue(new Error('db down'));
+
+      const response = await post({ email: 'alice@example.com', password: 'Abcd1234' });
+
+      expect(response.status).toBe(503);
+      expect(loginMock).not.toHaveBeenCalled();
+      expect(setAuthCookieMock).not.toHaveBeenCalled();
+    });
+
+    // utf8mb4_unicode_ci 下 'alïce@example.com' 与 'alice@example.com' 相等，却换出新的 email 桶。
+    it('非 ASCII 写法直接回通用 401，不查库、不跑口令比对', async () => {
+      for (const email of ['alïce@example.com', 'ａlice@example.com', 'ali​ce@example.com']) {
+        const response = await post({ email, password: 'Abcd1234' });
+        expect(response.status).toBe(401);
+        await expect(readJson<Record<string, string>>(response)).resolves.toEqual({
+          error: 'Invalid email or password',
+        });
+      }
+      expect(loginMock).not.toHaveBeenCalled();
+    });
+
+    it('无点域名等存量 ASCII 邮箱照常交给 login()（不被严格格式校验锁在门外）', async () => {
+      loginMock.mockResolvedValue({
+        user: { id: 'admin-1', email: 'admin@localhost', displayName: 'Admin', role: 'ADMIN' },
+        token: 'server-jwt',
+      });
+
+      const response = await post({ email: 'admin@localhost', password: 'Abcd1234' });
+
+      expect(response.status).toBe(200);
+      expect(loginMock).toHaveBeenCalledWith(
+        'admin@localhost',
+        'Abcd1234',
+        expect.any(Object)
+      );
+    });
+
+    it('账号级桶按 user.id 计数；命中时把限流响应原样回给客户端', async () => {
+      const limited = new Response('{"error":"Too many requests"}', {
+        status: 429,
+        headers: { 'Retry-After': '42' },
+      });
+      enforceRateLimitMock.mockImplementation(
+        async (_req: Request, options: { scope: string }) =>
+          options.scope === 'auth:login:user' ? limited : null
+      );
+      loginMock.mockImplementation(
+        async (
+          _email: string,
+          _password: string,
+          options: { beforePasswordCheck?: (userId: string) => Promise<boolean> }
+        ) => {
+          if (options.beforePasswordCheck && !(await options.beforePasswordCheck('user-1'))) {
+            throw new Error('Login throttled');
+          }
+          throw new Error('unreachable');
+        }
+      );
+
+      const response = await post({ email: 'alice@example.com', password: 'Abcd1234' });
+
+      expect(response.status).toBe(429);
+      expect(response.headers.get('Retry-After')).toBe('42');
+      const userGate = enforceRateLimitMock.mock.calls.find(
+        ([, options]) => options.scope === 'auth:login:user'
+      )?.[1];
+      expect(userGate).toMatchObject({ key: 'user:user-1', limit: 9 });
+      expect(setAuthCookieMock).not.toHaveBeenCalled();
     });
   });
 });

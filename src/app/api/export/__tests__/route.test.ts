@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
- * L58：export 的 64MB 硬上限此前只看声明长度
+ * L58：export 的 body 硬上限（当时 64MB，现与会话产物落盘上限对齐）此前只看声明长度
  * （`Number(req.headers.get('content-length') ?? '')` → chunked 请求得 0 而非 NaN，
  * 预检整段被跳过），随后 `req.json()` 把任意大的 body 缓冲进内存。
  * 现在改成流式累计字节，越线断流。
@@ -16,6 +16,7 @@ vi.mock('@/lib/auth', () => ({ verifyAuth: verifyAuthMock }));
 vi.mock('@/lib/rateLimit', () => ({ enforceRateLimit: enforceRateLimitMock }));
 
 import { POST } from '@/app/api/export/route';
+import { SESSION_TRANSCRIPT_LIMITS } from '@/lib/sessionApi';
 
 /** 无 content-length 的流式请求；pulled() 用来验证"真的断流了"。 */
 function makeChunkedJsonRequest(chunkCount: number, chunkSize: number) {
@@ -88,7 +89,7 @@ describe('POST /api/export', () => {
   });
 
   it('L58：无 content-length 的超大 body → 413，且不把全部分块读进内存', async () => {
-    // 1200 × 64KB ≈ 75MB > 64MB 上限
+    // 1200 × 64KB ≈ 75MB，远超上限
     const { req, pulled } = makeChunkedJsonRequest(1200, 64 * 1024);
     expect(req.headers.get('content-length')).toBeNull();
 
@@ -96,6 +97,18 @@ describe('POST /api/export', () => {
 
     expect(response.status).toBe(413);
     expect(pulled()).toBeLessThan(1200);
+  });
+
+  it('上限与会话产物落盘上限对齐：超过 maxPersistedJsonBytes + 1MB 即 413（此前 64MB 才拦）', async () => {
+    // 64KB × 160 = 10MB：旧上限下会被整段读进内存、再以 400（非法 JSON）收场
+    const overLimitChunks =
+      Math.ceil((SESSION_TRANSCRIPT_LIMITS.maxPersistedJsonBytes + 1024 * 1024) / (64 * 1024)) + 16;
+    const { req, pulled } = makeChunkedJsonRequest(overLimitChunks, 64 * 1024);
+
+    const response = await POST(req);
+
+    expect(response.status).toBe(413);
+    expect(pulled()).toBeLessThan(overLimitChunks);
   });
 
   it('非法 JSON → 400（此前落进 catch 回含糊的 500）', async () => {

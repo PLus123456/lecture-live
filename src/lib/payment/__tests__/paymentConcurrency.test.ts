@@ -40,7 +40,10 @@ vi.mock('@/lib/userRoles', () => ({
   }),
   resolveRoleStorageBytesLimit: vi.fn().mockResolvedValue(BigInt(1024)),
 }));
-vi.mock('@/lib/quota', () => ({ settlePoolOnLimitChange: vi.fn() }));
+vi.mock('@/lib/quota', () => ({
+  settlePoolOnLimitChange: vi.fn(),
+  computePoolOwed: vi.fn().mockResolvedValue(0),
+}));
 vi.mock('@/lib/auditLog', () => ({ logSystemEvent: vi.fn() }));
 vi.mock('@/lib/email', () => ({ sendSubscriptionSuccessEmail: vi.fn().mockResolvedValue({ ok: true }) }));
 vi.mock('@/lib/logger', () => ({ logger: { warn: vi.fn(), error: vi.fn() } }));

@@ -11,6 +11,7 @@ import {
 } from '@/lib/soniox/asyncFile';
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
 import { failFullTranscribeAttempt } from '@/lib/audio/fullTranscribeAdmission';
+import { isTransientFullTranscribeFinalizeError } from '@/lib/audio/fullTranscribeFinalizeErrors';
 
 // 完整版补全转录状态轮询（前端 poll 驱动收尾，同 async-transcribe-status 模式）：
 //   - 终态(completed/failed/null) 直接返回
@@ -142,8 +143,15 @@ export async function GET(
       hasFullTranscript: Boolean(latest?.fullTranscriptPath),
     });
   } catch (err) {
-    // 拉 transcript / 落盘失败：回退 transcribing 让下次 poll 重试（claim 已置 finalizing）。
-    logger.error({ err, sessionId: id }, 'full transcribe finalize failed, reverting');
+    // 拉 transcript / 落盘失败：先回退 transcribing（claim 已置 finalizing；finalize 抛出前通常已
+    // 自行回退，这里兜住「那次回退本身失败」，条件更新绝不覆盖别的 claim）。
+    const transient = isTransientFullTranscribeFinalizeError(err);
+    logger.error(
+      { err, sessionId: id, transient },
+      transient
+        ? 'full transcribe finalize failed (transient), reverting'
+        : 'full transcribe finalize failed permanently'
+    );
     await prisma.session.updateMany({
       where: {
         id,
@@ -152,6 +160,46 @@ export async function GET(
       },
       data: { fullTranscribeStatus: 'transcribing' },
     });
-    return NextResponse.json({ status: 'transcribing', error: null, hasFullTranscript: false });
+    if (transient) {
+      return NextResponse.json({ status: 'transcribing', error: null, hasFullTranscript: false });
+    }
+
+    // 审计 #8：永久失败（准入拒绝 / 超字节上限 / 确定性 4xx 等）重试不会自愈。旧实现一律回退
+    // transcribing：每次 poll 重下 transcript 再失败，任务永久卡住、占着补全名额与额度预留。
+    // 这里与 Soniox error 分支同口径：claim 绑定地标 failed 并在同一事务里释放预留（名额随终态
+    // 释放）。只从 transcribing 转出 —— 回退之后若并发 poll 已重新 claim，交给它，不报旧失败。
+    // 原始错误只进日志（可能含服务端路径），对用户只回固定文案。
+    const publicError = 'Full transcription could not be finalized';
+    const failed = await failFullTranscribeAttempt({
+      sessionId: id,
+      claimId: session.fullTranscribeClaimId,
+      allowedStatuses: ['transcribing'],
+      error: publicError,
+    }).catch(() => false);
+    if (!failed) {
+      const latest = await prisma.session.findUnique({
+        where: { id },
+        select: {
+          fullTranscribeStatus: true,
+          fullTranscribeError: true,
+          fullTranscriptPath: true,
+        },
+      });
+      return NextResponse.json({
+        status: latest?.fullTranscribeStatus ?? 'transcribing',
+        error: latest?.fullTranscribeError ?? null,
+        hasFullTranscript: Boolean(latest?.fullTranscriptPath),
+      });
+    }
+    // 抢到终态才清 Soniox 残留（与 error 分支一致，best-effort；未确认删除的 ID 留作
+    // reclaimOrphanSonioxResources 的 outbox 重试）。
+    if (session.fullSonioxFileId) {
+      await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(() => undefined);
+    }
+    await deleteSonioxTranscription(
+      sonioxConfig,
+      session.fullSonioxTranscriptionId
+    ).catch(() => undefined);
+    return NextResponse.json({ status: 'failed', error: publicError, hasFullTranscript: false });
   }
 }

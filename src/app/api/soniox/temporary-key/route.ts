@@ -24,6 +24,30 @@ import {
 const KEY_EXPIRES_IN_SECONDS = 60;
 
 /**
+ * Soniox 签发失败时回给浏览器的状态码。**绝不原样透传上游的 401/403**：AuthSessionMonitor
+ * 把本站 API 的任何 401 都当成「登录态失效」直接登出用户，而这里的 401 只说明**服务端**那把
+ * Soniox key 失效/被删；403 则是 key 缺权限（Soniox 的 key 现在按权限授予：签发临时 key 需要
+ * 「Temporary API keys」+「Speech-to-text, real-time」两项，缺一项回 permission_denied）。
+ * 两者都是运维配置问题，与用户的会话、额度都无关。上游限流（429 limit_exceeded）→ 503；其余 → 502。
+ */
+function upstreamMintFailureStatus(upstreamStatus: number): number {
+  return upstreamStatus === 429 ? 503 : 502;
+}
+
+/** 从 Soniox 错误体里取 error_type / request_id 供日志定位（体不是 JSON 时返回空）。 */
+function parseSonioxErrorBody(text: string): { errorType?: string; requestId?: string } {
+  try {
+    const parsed = JSON.parse(text) as { error_type?: unknown; request_id?: unknown };
+    return {
+      errorType: typeof parsed.error_type === 'string' ? parsed.error_type : undefined,
+      requestId: typeof parsed.request_id === 'string' ? parsed.request_id : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+/**
  * POST /api/soniox/temporary-key —— R1-L1/L2：mint 即计费闸门。
  *
  * 浏览器直连 Soniox 串流，本端点是服务端唯一必经点。旧实现只发 key 不设限，单连接可串流
@@ -34,7 +58,10 @@ const KEY_EXPIRES_IN_SECONDS = 60;
  *  3. single_use —— 一 key 一连接，堵「预扣一份并发开 N 条流」（实测第二条连接 401）；
  *  4. client_reference_id 由服务端构造（kind:userId:grantId，客户端不可控）——每条流在
  *     Soniox /v1/usage-logs 留下可归属记录（实测暴力断连也入账），供 usage cron 精确对账：
- *     正常收尾按实结算退差、孤儿有用量转实扣、key 没用过退预扣。
+ *     正常收尾按实结算退差、孤儿有用量转实扣、key 没用过退预扣；
+ *  5. 单场时长闸 —— 本场累计串流达单场上限 + 宽限（FREE 2h / PRO 4h / 同传 6h，+15min）即拒发
+ *     （403 code=session_duration_limit），最后一把 key 收缩到剩余时长。结算按单场上限封顶计费，
+ *     没有这道闸，绕过会话页自动收尾或并行多开流，超出上限的部分全部免费。
  *
  * 流量护栏：IP 粗限流（鉴权前，挡匿名刷）＋按 user 细限流＋并发活跃 grant 上限（保护我们
  * 在 Soniox 的组织级配额，也掐死脚本高频 mint）。
@@ -215,6 +242,18 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
   if (!grant.ok) {
+    if (grant.reason === 'session_duration_limit') {
+      // 本场累计串流已达单场上限 + 宽限（见 createStreamGrantWithReservation）。锚点**不作废**：
+      // 它名下已有串流，要照常由 deduct / cron 按实测结算。客户端凭 code 收尾，而不是当成断线去重连。
+      return NextResponse.json(
+        {
+          error: 'Session duration limit reached',
+          code: 'session_duration_limit',
+          limitMs: grant.limitMs,
+        },
+        { status: 403 }
+      );
+    }
     // 锚点一并作废：这条流拿不到 key、不可能串流，留着只会被 cron 7h 后误扣。
     if (interpretSessionId) {
       await settleInterpretSessionAsVoid(interpretSessionId, 'mint_failed');
@@ -258,9 +297,16 @@ export async function POST(req: Request) {
     );
 
     if (!response.ok) {
-      const errorText = await response.text();
-      // 安全：仅记录状态码，避免完整错误响应中可能包含的敏感信息
-      console.error(`Soniox API error: status=${response.status}`, errorText.slice(0, 200));
+      const errorText = await response.text().catch(() => '');
+      const { errorType, requestId } = parseSonioxErrorBody(errorText);
+      // 安全：仅记录状态码/错误类型，避免完整错误响应中可能包含的敏感信息
+      console.error(
+        `Soniox API error: status=${response.status} error_type=${errorType ?? 'unknown'} request_id=${requestId ?? '-'}` +
+          (response.status === 401 || response.status === 403
+            ? ' (check the server Soniox API key and its permissions: Temporary API keys + Speech-to-text, real-time)'
+            : ''),
+        errorText.slice(0, 200)
+      );
       // 签发失败 = 客户端拿不到 key、不可能串流：立即退预扣（settledBy=mint_failed），
       // 空锚点一并作废。回滚失败不阻塞（usage cron 查无用量会 usage_refund 兜底退）。
       await rollbackStreamGrant(grant.grantId);
@@ -269,11 +315,19 @@ export async function POST(req: Request) {
       }
       return NextResponse.json(
         { error: 'Failed to get temporary key' },
-        { status: response.status }
+        { status: upstreamMintFailureStatus(response.status) }
       );
     }
 
     const data = await response.json();
+    // 浏览器只能经 Sec-WebSocket-Protocol 递交 key（@soniox/client 2.x 的唯一方式），而 Soniox
+    // 文档明确旧 `temp:` 格式的 key 不是合法的 protocols list 项（浏览器构造 WebSocket 时直接
+    // SyntaxError）。现行签发的都是 snx_temp_ 前缀；万一不是，服务端留一条可定位的日志。
+    if (typeof data?.api_key === 'string' && !data.api_key.startsWith('snx_temp_')) {
+      console.warn(
+        'Soniox issued a temporary key without the snx_temp_ prefix; browsers cannot send it in the WebSocket protocols list.'
+      );
+    }
 
     return NextResponse.json({
       ...data,

@@ -46,6 +46,14 @@ export class StripeProvider implements PaymentProvider {
     if (!/^[a-z]{3}$/.test(currency)) {
       throw new Error(`Stripe createCharge: invalid currency ${params.currency}`);
     }
+    // 审计 #7 纵深门禁：amountCents 恒按 1/100 计、unit_amount 原样透传。零位小数币种（JPY 等）在
+    // Stripe 侧以整单位计 → 按显示价 100 倍收款；三位小数币种（KWD 等）→ 只收 1/10。配置保存侧已拒，
+    // 这里兜住保存校验上线前就已落库的历史配置：宁可下单失败，也不按错位的单位扣用户的钱。
+    if (!isCentDenominatedCurrency(currency)) {
+      throw new Error(
+        `Stripe createCharge: ${currency.toUpperCase()} is not a two-decimal currency; amounts are stored in 1/100 units`
+      );
+    }
     const form = new URLSearchParams();
     form.set('mode', 'payment');
     form.set('success_url', appendQuery(params.returnUrl, 'recharge', 'success'));
@@ -126,6 +134,8 @@ export class StripeProvider implements PaymentProvider {
           amount_refunded?: number;
           refunded?: boolean;
           currency?: string;
+          created?: number;
+          expires_at?: number;
           payment_intent?: string | { id?: string };
           latest_charge?: string | { id?: string };
           charge?: string | { id?: string };
@@ -258,7 +268,8 @@ export class StripeProvider implements PaymentProvider {
       eventType: event.type,
       providerMode,
       providerAccount,
-      occurredAt,
+      // 审计 #4：已付事件报「顾客承诺付款」的时刻，而不是延迟支付方式数日后的到账时刻（见下方函数）。
+      occurredAt: paid ? stripePaymentCommittedAt(event.type, obj, occurredAt) : occurredAt,
       objectRefs,
       // Only explicitly understood terminal/no-op events are safe to ACK.
       ...(!paid && knownHarmlessNoop ? { acknowledged: true } : {}),
@@ -324,6 +335,76 @@ const HARMLESS_NOOP_EVENT_TYPES = new Set([
 
 function objectId(value: string | { id?: string } | undefined): string | undefined {
   return typeof value === 'string' ? value : value?.id;
+}
+
+/**
+ * 审计 #4：已付事件交给 creditPaidOrder 过期闸（paidAt >= expiresAt → late_paid）的时刻。
+ *
+ * event.created 是**事件**生成时刻。卡类同步支付它≈付款时刻；但延迟到账支付方式（SEPA / ACH /
+ * Konbini / 银行转账…）的顾客是在 expires_at 之前完成 Checkout（completed + payment_status=unpaid，
+ * 按无害事件 ACK），资金数日后才到账，届时才发 checkout.session.async_payment_succeeded /
+ * payment_intent.succeeded —— 原样拿 event.created 当 paidAt，这类支付**每一笔**都会被判
+ * late_paid：钱收了、权益一分不发，且没有任何后台动作能补发。
+ *
+ * 过期闸真正要问的是「顾客是否在订单有效期内承诺付款」，所以取 Stripe 自己能证明的承诺时刻作上界：
+ *  - Checkout Session（status=complete）：过期的会话无法再完成，complete 本身就证明完成发生在
+ *    expires_at 之前 → min(event.created, expires_at − 1s)。expires_at 由 createCharge 按订单
+ *    expiresAt（已取整到秒）下发，故 expires_at − 1s 恒早于订单 expiresAt；
+ *  - PaymentIntent：created 是确认（新版 API 惰性创建）或会话创建（旧版）时刻，都不晚于承诺付款
+ *    → min(event.created, pi.created)。
+ * 证据字段缺失 / 非数字时原样返回 event.created（维持旧口径：拿不准就落 late_paid 交人工复核）。
+ * 只把时刻往前收、绝不往后推；两个上界都不早于建单（会话与 PI 都在订单落库之后才由 createCharge
+ * 创建），所以不会误触「付款早于下单」那道闸（payment_before_order）。
+ */
+function stripePaymentCommittedAt(
+  eventType: string | undefined,
+  obj: { status?: string; created?: number; expires_at?: number },
+  eventCreatedAt: Date | undefined
+): Date | undefined {
+  if (!eventCreatedAt) return eventCreatedAt;
+  let boundSec: number | null = null;
+  if (
+    (eventType === 'checkout.session.completed' ||
+      eventType === 'checkout.session.async_payment_succeeded') &&
+    obj.status === 'complete' &&
+    typeof obj.expires_at === 'number' &&
+    Number.isFinite(obj.expires_at)
+  ) {
+    boundSec = obj.expires_at - 1;
+  } else if (
+    eventType === 'payment_intent.succeeded' &&
+    typeof obj.created === 'number' &&
+    Number.isFinite(obj.created)
+  ) {
+    boundSec = obj.created;
+  }
+  if (boundSec == null) return eventCreatedAt;
+  const boundMs = boundSec * 1000;
+  return boundMs < eventCreatedAt.getTime() ? new Date(boundMs) : eventCreatedAt;
+}
+
+/**
+ * 审计 #7：最小货币单位**不是** 1/100 的 ISO-4217 币种（零位小数 + 三位小数，外加两种四位小数的
+ * 记账单位）。本系统所有金额（priceCents / amountCents / walletBalanceCents）一律按 1/100 存储、
+ * 展示（formatCurrencyCents 除以 100），并原样作为 Stripe 的 unit_amount 下发：
+ *  - 零位小数（JPY、KRW…）在 Stripe 侧以整单位计 → 显示 ¥10.00 的档位实收 ¥1000（100 倍）；
+ *  - 三位小数（KWD、BHD…）以 1/1000 计 → 只收显示价的 1/10。
+ * 名单取 ISO-4217 与 Stripe 零位小数表的并集（含 Stripe 按零位小数处理的 MGA、特例 ISK）。
+ * 支付宝 / 微信只收 CNY，自身已拒其它币种；需要防的只有 Stripe 这一条可配币种的通道。
+ */
+const NON_CENT_CURRENCIES: ReadonlySet<string> = new Set([
+  // 零位小数
+  'BIF', 'CLP', 'DJF', 'GNF', 'ISK', 'JPY', 'KMF', 'KRW', 'MGA', 'PYG', 'RWF', 'UGX', 'UYI',
+  'VND', 'VUV', 'XAF', 'XOF', 'XPF',
+  // 三位小数
+  'BHD', 'IQD', 'JOD', 'KWD', 'LYD', 'OMR', 'TND',
+  // 四位小数（记账单位）
+  'CLF', 'UYW',
+]);
+
+/** 币种的最小货币单位是否为 1/100（本系统金额模型唯一支持的口径）。大小写不敏感。 */
+export function isCentDenominatedCurrency(code: string): boolean {
+  return !NON_CENT_CURRENCIES.has(code.trim().toUpperCase());
 }
 
 function normalizeStripeObjectType(

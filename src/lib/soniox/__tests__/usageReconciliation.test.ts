@@ -22,6 +22,7 @@ const {
   interpretFindUniqueMock,
   txInterpretFindUniqueMock,
   txUserFindUniqueMock,
+  txChargeAggregateMock,
   transactionMock,
   deductMock,
   regionConfigMock,
@@ -38,6 +39,7 @@ const {
   const txSessionFindUniqueMock = vi.fn();
   const txInterpretFindUniqueMock = vi.fn();
   const txUserFindUniqueMock = vi.fn();
+  const txChargeAggregateMock = vi.fn();
   return {
     siteFindUniqueMock: vi.fn(),
     siteUpsertMock: vi.fn(),
@@ -51,6 +53,7 @@ const {
     interpretFindUniqueMock: vi.fn(),
     txInterpretFindUniqueMock,
     txUserFindUniqueMock,
+    txChargeAggregateMock,
     transactionMock: vi.fn(),
     deductMock: vi.fn(),
     regionConfigMock: vi.fn(),
@@ -70,6 +73,8 @@ const {
       session: { findUnique: txSessionFindUniqueMock },
       // M9：interpret 分支现在要按用户角色 clamp（FREE 2h / PRO 4h），故 tx 需带 user 读取。
       user: { findUnique: txUserFindUniqueMock },
+      // Session 行被删后，realtime 差额补扣改读 TranscriptionCharge 逐笔台账。
+      transcriptionCharge: { aggregate: txChargeAggregateMock },
     },
   };
 });
@@ -153,6 +158,7 @@ beforeEach(() => {
   interpretFindUniqueMock.mockReset();
   txInterpretFindUniqueMock.mockReset();
   txUserFindUniqueMock.mockReset();
+  txChargeAggregateMock.mockReset();
   transactionMock.mockReset();
   deductMock.mockReset();
   regionConfigMock.mockReset();
@@ -177,6 +183,7 @@ beforeEach(() => {
   interpretFindUniqueMock.mockResolvedValue(null);
   txInterpretFindUniqueMock.mockResolvedValue(null);
   txUserFindUniqueMock.mockResolvedValue({ role: 'FREE' });
+  txChargeAggregateMock.mockResolvedValue({ _sum: { minutes: null } });
   transactionMock.mockImplementation(
     async (cb: (tx: unknown) => Promise<unknown>) => cb(TX)
   );
@@ -448,8 +455,42 @@ describe('P1-2 迟到差额补扣（提前结算后继续串流的兜底）', ()
     expect(stats.lateCharged).toBe(1);
   });
 
-  it('realtime：角色时长上限（FREE 2h）是刻意保护，补扣不得绕过它', async () => {
-    // 实测 3h（多条流合计），FREE clamp 到 2h=120 分钟；finalize 已按 clamp 后的 120 扣过 → 差额 0
+  it('realtime：会话行已被删除 → 改按 TranscriptionCharge 台账补差额（删会话不是免单开关）', async () => {
+    // 多开流 → 秒 finalize（只扣 1 分钟、释放预扣）→ DELETE 会话 → 流继续跑满 15 分钟。
+    // 旧实现找不到 Session 行直接 return 0，这 14 分钟永远收不回来。
+    fetchMock.mockResolvedValueOnce(
+      usagePage([
+        { uuid: 'log1', client_reference_id: 'rt:u1:g1', input_audio_duration_ms: 900_000 },
+      ])
+    );
+    grantUpdateManyMock.mockResolvedValueOnce({ count: 1 });
+    grantFindUniqueMock.mockResolvedValueOnce({
+      userId: 'u1',
+      sessionId: 's-deleted',
+      interpretSessionId: null,
+      settledAt: new Date('2026-07-16T11:50:00.000Z'),
+      settledBy: 'session_finalize',
+      maxSessionSeconds: 900,
+      billedMinutes: null,
+    });
+    txGrantFindManyMock.mockResolvedValueOnce([
+      { actualMs: 900_000, maxSessionSeconds: 900, billedMinutes: null },
+    ]);
+    txSessionFindUniqueMock.mockResolvedValueOnce(null);
+    txUserFindUniqueMock.mockResolvedValueOnce({ role: 'FREE' });
+    txChargeAggregateMock.mockResolvedValueOnce({ _sum: { minutes: 1 } });
+
+    const stats = await reconcileSonioxStreamUsage(NOW);
+
+    expect(txChargeAggregateMock).toHaveBeenCalledWith({
+      where: { referenceId: 's-deleted', source: 'session_finalize' },
+      _sum: { minutes: true },
+    });
+    expect(deductMock).toHaveBeenCalledWith('u1', 14, TX, expect.anything());
+    expect(stats.lateCharged).toBe(1);
+  });
+
+  function realtimeGrantSettledAtCap(streams: number) {
     fetchMock.mockResolvedValueOnce(
       usagePage([
         { uuid: 'log1', client_reference_id: 'rt:u1:g1', input_audio_duration_ms: 900_000 },
@@ -466,7 +507,7 @@ describe('P1-2 迟到差额补扣（提前结算后继续串流的兜底）', ()
       billedMinutes: null,
     });
     txGrantFindManyMock.mockResolvedValueOnce(
-      Array.from({ length: 12 }, () => ({
+      Array.from({ length: streams }, () => ({
         actualMs: 900_000,
         maxSessionSeconds: 900,
         billedMinutes: null,
@@ -477,11 +518,26 @@ describe('P1-2 迟到差额补扣（提前结算后继续串流的兜底）', ()
       billedMinutes: 120,
       user: { role: 'FREE' },
     });
+  }
+
+  it('realtime：实测 2h15m（FREE 上限 2h + 15 分钟宽限以内）→ 角色上限照旧保护，差额 0', async () => {
+    // 9 条流 × 15 分钟；finalize 已按封顶后的 120 扣过
+    realtimeGrantSettledAtCap(9);
 
     const stats = await reconcileSonioxStreamUsage(NOW);
 
     expect(deductMock).not.toHaveBeenCalled();
     expect(stats.lateCharged).toBe(0);
+  });
+
+  it('realtime：实测 3h（超出上限 + 宽限：绕过收尾 / 并行多开）→ 宽限之外的 45 分钟照实补扣', async () => {
+    // 12 条流 × 15 分钟 = 180 分钟；计费 = max(120, 180 − 15) = 165，已扣 120 → 补 45
+    realtimeGrantSettledAtCap(12);
+
+    const stats = await reconcileSonioxStreamUsage(NOW);
+
+    expect(deductMock).toHaveBeenCalledWith('u1', 45, TX, expect.anything());
+    expect(stats.lateCharged).toBe(1);
   });
 
   it('ADMIN：deduct 短路不扣费 → grant 台账不虚记分钟', async () => {
@@ -714,7 +770,7 @@ describe('孤儿 grant 结算', () => {
 
 describe('M9 interpret 迟到补扣的角色时长 clamp', () => {
   /** interpret grant：被 deduct 结算，锚点已记 chargedMinutes 分钟。 */
-  function interpretGrantSettled(chargedMinutes: number) {
+  function interpretGrantSettled(chargedMinutes: number, streams = 12) {
     fetchMock.mockResolvedValueOnce(
       usagePage([
         { uuid: 'log1', client_reference_id: 'it:u1:g1', input_audio_duration_ms: 900_000 },
@@ -731,9 +787,9 @@ describe('M9 interpret 迟到补扣的角色时长 clamp', () => {
       billedMinutes: null,
     });
     txInterpretFindUniqueMock.mockResolvedValueOnce({ billedMinutes: chargedMinutes });
-    // 本锚点名下 12 条流 × 15 分钟 = 实测 3 小时。
+    // 本锚点名下 streams 条流 × 15 分钟（默认 12 条 = 实测 3 小时）。
     txGrantFindManyMock.mockResolvedValueOnce(
-      Array.from({ length: 12 }, () => ({
+      Array.from({ length: streams }, () => ({
         actualMs: 900_000,
         maxSessionSeconds: 900,
         billedMinutes: null,
@@ -741,10 +797,8 @@ describe('M9 interpret 迟到补扣的角色时长 clamp', () => {
     );
   }
 
-  it('FREE 用户实测 3h、已按 2h 上限扣过 → 差额 0，绝不补扣超上限那 60 分钟', async () => {
-    // 旧代码：getBillableMinutes(10_800_000) - 120 - 0 = 180 - 120 = 60 → 足额补扣，
-    // 把「FREE 2h / PRO 4h 是刻意的用户保护」这条（realtime 分支白纸黑字写着的）绕过去了。
-    interpretGrantSettled(120);
+  it('FREE 用户实测 2h15m（上限 2h + 15 分钟宽限以内）、已按 2h 扣过 → 差额 0，角色上限照旧保护', async () => {
+    interpretGrantSettled(120, 9);
     txUserFindUniqueMock.mockResolvedValueOnce({ role: 'FREE' });
 
     const stats = await reconcileSonioxStreamUsage(NOW);
@@ -756,6 +810,17 @@ describe('M9 interpret 迟到补扣的角色时长 clamp', () => {
     expect(deductMock).not.toHaveBeenCalled();
     expect(stats.lateCharged).toBe(0);
     expect(stats.backfilled).toBe(1);
+  });
+
+  it('FREE 用户实测 3h（超出上限 + 宽限）→ 只补扣宽限之外的 45 分钟，而不是旧版的足额 60', async () => {
+    // 计费 = max(clamp 120, 180 − 15 = 165)；已扣 120 → 补 45
+    interpretGrantSettled(120);
+    txUserFindUniqueMock.mockResolvedValueOnce({ role: 'FREE' });
+
+    const stats = await reconcileSonioxStreamUsage(NOW);
+
+    expect(deductMock).toHaveBeenCalledWith('u1', 45, TX, expect.anything());
+    expect(stats.lateCharged).toBe(1);
   });
 
   it('ADMIN 无时长上限 → 同样的实测量仍按全额补差（证明 clamp 是按角色而非一刀切）', async () => {

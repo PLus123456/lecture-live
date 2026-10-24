@@ -1,3 +1,22 @@
+// ENCRYPTION_KEY 轮换工具（npm run security:reencrypt-llm-keys）。
+//
+// 文件名沿用历史（最初只处理 LLM 供应商 key），现在覆盖**全部**用 ENCRYPTION_KEY 加密落库的值：
+//   - LlmProvider.apiKey（另把 legacy `enc:`（JWT_SECRET 派生）与明文 key 迁成当前格式，行为同旧版）；
+//   - SiteSetting 里 `enc:v2:` 前缀的值（Stripe / 微信支付密钥、Soniox key、Cloudreve token、
+//     音频增强 worker token、SMTP 密码等敏感设置）；
+//   - TranslationWorker.token。
+// 此前只轮换 LlmProvider：按 .env.example 的步骤删掉 ENCRYPTION_KEY_PREVIOUS 后，其余密钥全部
+// 解密失败——支付/转录/存储静默失效，生产支付预检（check-production-payment-config）直接拒绝启动。
+//
+// 用法（先在 .env 里把新密钥写进 ENCRYPTION_KEY、旧密钥写进 ENCRYPTION_KEY_PREVIOUS 并重启服务）：
+//   node --env-file=<部署 .env> scripts/reencrypt-llm-provider-keys.mjs --dry-run   # 只统计不写库
+//   node --env-file=<部署 .env> scripts/reencrypt-llm-provider-keys.mjs             # 正式重加密
+// 退出码 0 = 已没有任何值依赖旧密钥，此后才可删除 ENCRYPTION_KEY_PREVIOUS；
+// 退出码 1 = 仍有值用当前/旧密钥都解不开（日志只列位置），这时删除旧密钥会让它们永久失效。
+//
+// 安全约束：日志与返回值只含位置（供应商名、设置 key、worker 名/id）与计数，绝不输出明文；
+// 每次写回都是 CAS（WHERE 原密文快照），并发改过的值原样保留（SEC-034）。
+
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from 'crypto';
 import { PrismaClient } from '@prisma/client';
 import nextEnv from '@next/env';
@@ -70,45 +89,78 @@ function decryptWithKey(payload, key) {
   return decrypted;
 }
 
-function inspectStoredValue(value) {
-  if (!value) {
-    return { plaintext: value, needsUpdate: false };
+/**
+ * `enc:v2:` 值归属判定：当前密钥能解 → current；只有旧密钥能解 → previous（附明文，仅供
+ * 重加密使用）；都解不开或格式坏 → undecryptable。缺 ENCRYPTION_KEY 属配置错误，直接抛出。
+ */
+function classifyCurrentFormat(value) {
+  const currentKey = deriveCurrentKey(getCurrentEncryptionSecret());
+  let payload;
+  try {
+    payload = parsePayload(value, CURRENT_PREFIX);
+  } catch {
+    return { kind: 'undecryptable' };
   }
-
-  if (value.startsWith(CURRENT_PREFIX)) {
-    const payload = parsePayload(value, CURRENT_PREFIX);
+  try {
+    decryptWithKey(payload, currentKey);
+    return { kind: 'current' };
+  } catch {
+    // 不是当前密钥加密的，继续试旧密钥
+  }
+  const previousSecret = getPreviousEncryptionSecret();
+  if (previousSecret) {
     try {
       return {
-        plaintext: decryptWithKey(payload, deriveCurrentKey(getCurrentEncryptionSecret())),
-        needsUpdate: false,
+        kind: 'previous',
+        plaintext: decryptWithKey(payload, deriveCurrentKey(previousSecret)),
       };
     } catch {
-      const previousSecret = getPreviousEncryptionSecret();
-      if (!previousSecret) {
-        throw new Error(
-          'Unable to decrypt current-format value. Set ENCRYPTION_KEY_PREVIOUS to rotate keys.'
-        );
-      }
-
-      return {
-        plaintext: decryptWithKey(payload, deriveCurrentKey(previousSecret)),
-        needsUpdate: true,
-      };
+      // 旧密钥也解不开
     }
   }
+  return { kind: 'undecryptable' };
+}
 
-  if (value.startsWith(LEGACY_PREFIX)) {
-    const payload = parsePayload(value, LEGACY_PREFIX);
-    return {
-      plaintext: decryptWithKey(payload, deriveLegacyKey(getJwtSecret())),
-      needsUpdate: true,
-    };
+function verdictFromCurrentFormat(value) {
+  const verdict = classifyCurrentFormat(value);
+  if (verdict.kind === 'current') return { action: 'skip' };
+  if (verdict.kind === 'previous') return { action: 'rewrite', plaintext: verdict.plaintext };
+  return { action: 'undecryptable' };
+}
+
+/** LlmProvider.apiKey：除旧密钥轮换外，沿用旧版把 legacy `enc:` 与明文 key 迁成当前格式。 */
+function inspectProviderKey(value) {
+  if (!value) {
+    return { action: 'skip' };
   }
+  if (value.startsWith(CURRENT_PREFIX)) {
+    return verdictFromCurrentFormat(value);
+  }
+  if (value.startsWith(LEGACY_PREFIX)) {
+    try {
+      return {
+        action: 'rewrite',
+        plaintext: decryptWithKey(
+          parsePayload(value, LEGACY_PREFIX),
+          deriveLegacyKey(getJwtSecret())
+        ),
+      };
+    } catch {
+      return { action: 'undecryptable' };
+    }
+  }
+  return { action: 'rewrite', plaintext: value };
+}
 
-  return {
-    plaintext: value,
-    needsUpdate: true,
-  };
+/**
+ * SiteSetting / TranslationWorker：只改写「只能用 ENCRYPTION_KEY_PREVIOUS 解开」的 `enc:v2:` 值。
+ * 明文设置（站点名等，本就不是密文）与 legacy `enc:`（JWT_SECRET 派生，不受本次轮换影响）一律不碰。
+ */
+function inspectRotationOnly(value) {
+  if (typeof value !== 'string' || !value.startsWith(CURRENT_PREFIX)) {
+    return { action: 'skip' };
+  }
+  return verdictFromCurrentFormat(value);
 }
 
 function encryptCurrent(plaintext) {
@@ -126,7 +178,58 @@ function encryptCurrent(plaintext) {
   return `${CURRENT_PREFIX}${iv.toString('hex')}:${tag}:${encrypted}`;
 }
 
-export async function reencryptProviderKeys(client = prisma, logger = console) {
+/**
+ * 逐行判定 + CAS 写回的公共流程。rows 的 value 是密文快照；label(row) 只能返回位置信息。
+ */
+async function rotateRows({ store, rows, inspect, label, write, logger, dryRun }) {
+  const summary = {
+    store,
+    scannedCount: rows.length,
+    updatedCount: 0,
+    alreadyCurrentCount: 0,
+    skippedConcurrentCount: 0,
+    undecryptableCount: 0,
+  };
+
+  for (const row of rows) {
+    const verdict = inspect(row.value);
+    if (verdict.action === 'skip') {
+      summary.alreadyCurrentCount += 1;
+      continue;
+    }
+    if (verdict.action === 'undecryptable') {
+      summary.undecryptableCount += 1;
+      logger.warn(
+        `Cannot decrypt ${label(row)} with ENCRYPTION_KEY or ENCRYPTION_KEY_PREVIOUS; left unchanged`
+      );
+      continue;
+    }
+    if (dryRun) {
+      summary.updatedCount += 1;
+      logger.log(`[dry-run] Would re-encrypt ${label(row)}`);
+      continue;
+    }
+
+    // SEC-034：读取之后端点 PATCH 等可能已写入新值。只在密文仍与读取快照一致时写回，
+    // 避免迟到写把旧值覆盖回去；同时轮换的另一个脚本实例也受同一 CAS 保护。
+    const count = await write(row, encryptCurrent(verdict.plaintext));
+    if (count === 1) {
+      summary.updatedCount += 1;
+      logger.log(`Re-encrypted ${label(row)}`);
+    } else {
+      summary.skippedConcurrentCount += 1;
+      logger.warn(`Skipped ${label(row)}: changed concurrently (no value overwritten)`);
+    }
+  }
+
+  return summary;
+}
+
+export async function reencryptProviderKeys(
+  client = prisma,
+  logger = console,
+  { dryRun = false } = {}
+) {
   const providers = await client.llmProvider.findMany({
     select: {
       id: true,
@@ -136,38 +239,133 @@ export async function reencryptProviderKeys(client = prisma, logger = console) {
     orderBy: { sortOrder: 'asc' },
   });
 
-  let updatedCount = 0;
-  let skippedConcurrentCount = 0;
+  return rotateRows({
+    store: 'LlmProvider.apiKey',
+    rows: providers.map((provider) => ({ ...provider, value: provider.apiKey })),
+    inspect: inspectProviderKey,
+    label: (row) => `API key for provider: ${row.name}`,
+    write: async (row, next) =>
+      (
+        await client.llmProvider.updateMany({
+          where: { id: row.id, apiKey: row.value },
+          data: { apiKey: next },
+        })
+      ).count,
+    logger,
+    dryRun,
+  });
+}
 
-  for (const provider of providers) {
-    const { plaintext, needsUpdate } = inspectStoredValue(provider.apiKey);
-    if (!needsUpdate) {
-      continue;
-    }
+export async function reencryptSiteSettings(
+  client = prisma,
+  logger = console,
+  { dryRun = false } = {}
+) {
+  const settings = await client.siteSetting.findMany({
+    where: { value: { startsWith: CURRENT_PREFIX } },
+    select: { key: true, value: true },
+    orderBy: { key: 'asc' },
+  });
 
-    // SEC-034：端点 PATCH 可能在本脚本读取后已经换了新 key。
-    // 只在 ciphertext 仍与读取快照一致时重加密，避免迟到写把旧 key
-    // 覆盖回新端点。这个 CAS 也保护同时轮换的另一个脚本实例。
-    const result = await client.llmProvider.updateMany({
-      where: { id: provider.id, apiKey: provider.apiKey },
-      data: { apiKey: encryptCurrent(plaintext) },
-    });
+  return rotateRows({
+    store: 'SiteSetting.value',
+    rows: settings,
+    inspect: inspectRotationOnly,
+    label: (row) => `site setting: ${row.key}`,
+    write: async (row, next) =>
+      (
+        await client.siteSetting.updateMany({
+          where: { key: row.key, value: row.value },
+          data: { value: next },
+        })
+      ).count,
+    logger,
+    dryRun,
+  });
+}
 
-    if (result.count === 1) {
-      updatedCount += 1;
-      logger.log(`Re-encrypted API key for provider: ${provider.name}`);
-    } else {
-      skippedConcurrentCount += 1;
-      logger.warn(
-        `Skipped provider changed concurrently (no key overwritten): ${provider.name}`
-      );
-    }
+export async function reencryptTranslationWorkerTokens(
+  client = prisma,
+  logger = console,
+  { dryRun = false } = {}
+) {
+  const workers = await client.translationWorker.findMany({
+    where: { token: { startsWith: CURRENT_PREFIX } },
+    select: { id: true, name: true, token: true },
+    orderBy: { sortOrder: 'asc' },
+  });
+
+  return rotateRows({
+    store: 'TranslationWorker.token',
+    rows: workers.map((worker) => ({ ...worker, value: worker.token })),
+    inspect: inspectRotationOnly,
+    label: (row) => `translation worker token: ${row.name} (${row.id})`,
+    write: async (row, next) =>
+      (
+        await client.translationWorker.updateMany({
+          where: { id: row.id, token: row.value },
+          data: { token: next },
+        })
+      ).count,
+    logger,
+    dryRun,
+  });
+}
+
+export async function reencryptAllEncryptedValues(
+  client = prisma,
+  logger = console,
+  { dryRun = false } = {}
+) {
+  // 先确认当前密钥已配置：缺它时任何判定都没有意义，直接失败。
+  getCurrentEncryptionSecret();
+  if (!getPreviousEncryptionSecret()) {
+    logger.warn(
+      'ENCRYPTION_KEY_PREVIOUS is not set: only verifying that every value decrypts with ENCRYPTION_KEY'
+    );
   }
 
-  logger.log(
-    `Finished. Updated ${updatedCount} provider(s); skipped ${skippedConcurrentCount} concurrent change(s).`
-  );
-  return { updatedCount, skippedConcurrentCount };
+  const stores = [];
+  for (const rotate of [
+    reencryptProviderKeys,
+    reencryptSiteSettings,
+    reencryptTranslationWorkerTokens,
+  ]) {
+    stores.push(await rotate(client, logger, { dryRun }));
+  }
+
+  const totals = {
+    scannedCount: 0,
+    updatedCount: 0,
+    alreadyCurrentCount: 0,
+    skippedConcurrentCount: 0,
+    undecryptableCount: 0,
+  };
+  for (const summary of stores) {
+    for (const key of Object.keys(totals)) totals[key] += summary[key];
+    logger.log(
+      `${summary.store}: scanned=${summary.scannedCount} ` +
+        `${dryRun ? 'would-re-encrypt' : 're-encrypted'}=${summary.updatedCount} ` +
+        `already-current=${summary.alreadyCurrentCount} ` +
+        `skipped-concurrent=${summary.skippedConcurrentCount} ` +
+        `undecryptable=${summary.undecryptableCount}`
+    );
+  }
+
+  if (totals.undecryptableCount > 0) {
+    logger.warn(
+      `${totals.undecryptableCount} value(s) decrypt with neither ENCRYPTION_KEY nor ENCRYPTION_KEY_PREVIOUS. ` +
+        'Do NOT remove ENCRYPTION_KEY_PREVIOUS until they are re-entered or removed.'
+    );
+  } else if (dryRun) {
+    logger.log('Dry run finished; re-run without --dry-run to apply.');
+  } else if (totals.skippedConcurrentCount > 0) {
+    logger.warn('Some values changed concurrently; re-run once more before removing ENCRYPTION_KEY_PREVIOUS.');
+  } else {
+    logger.log('Finished. No stored value depends on ENCRYPTION_KEY_PREVIOUS any more.');
+  }
+
+  return { dryRun, stores, ...totals };
 }
 
 const invokedAsMain = Boolean(
@@ -175,9 +373,19 @@ const invokedAsMain = Boolean(
 );
 
 if (invokedAsMain) {
-  reencryptProviderKeys()
+  const dryRun = process.argv.includes('--dry-run');
+  reencryptAllEncryptedValues(prisma, console, { dryRun })
+    .then((result) => {
+      // 无法解密的值存在 / 并发改动未收敛时非零退出：运维据此判断能否删除旧密钥。
+      if (result.undecryptableCount > 0 || (!dryRun && result.skippedConcurrentCount > 0)) {
+        process.exitCode = 1;
+      }
+    })
     .catch((error) => {
-      console.error('Failed to re-encrypt provider API keys:', error);
+      console.error(
+        'Failed to re-encrypt stored secrets:',
+        error instanceof Error ? error.message : error
+      );
       process.exitCode = 1;
     })
     .finally(async () => {

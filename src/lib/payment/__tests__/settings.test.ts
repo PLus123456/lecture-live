@@ -141,6 +141,23 @@ describe('updateRechargeSettings：币种与 Stripe 模式一致性', () => {
     ).toBe('USD');
   });
 
+  it('▶ 审计 #7：零位 / 三位小数币种直接拒，并给出能看懂的原因（金额一律按 1/100 存储）', async () => {
+    // JPY 等零位小数：显示 ¥10.00 的档位 Stripe 实收 ¥1000；KWD 等三位小数：只收 1/10。
+    for (const code of ['JPY', 'krw', 'KWD', 'BHD']) {
+      const attempt = updateRechargeSettings({ currency: code });
+      await expect(attempt).rejects.toBeInstanceOf(RechargeSettingsError);
+      await expect(attempt).rejects.toThrow(/不是两位小数币种/);
+    }
+    expect(siteSettingUpsertMock).not.toHaveBeenCalled();
+
+    // 两位小数币种照常保存。
+    await updateRechargeSettings({ currency: 'eur' });
+    expect(
+      siteSettingUpsertMock.mock.calls.find((c) => c[0].where.key === 'recharge_currency')?.[0]
+        .create.value
+    ).toBe('EUR');
+  });
+
   it('▶ 换 sk_live_ 密钥却让 webhook 密钥留掩码 → 拒绝（P3-4 分裂态）', async () => {
     await expect(
       updateRechargeSettings({

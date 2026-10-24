@@ -181,7 +181,8 @@ export const useSettingsStore = create<SettingsStore>()(
             : s.terms;
 
         return {
-          model: 'stt-rt-v4' as const,
+          // stt-rt-v4 已于 2026-06-30 下线，仅作为别名转发到 v5；直接用正式名。
+          model: 'stt-rt-v5' as const,
           sourceLang: s.sourceLang,
           targetLang: s.targetLang,
           languageHints: s.languageHints,

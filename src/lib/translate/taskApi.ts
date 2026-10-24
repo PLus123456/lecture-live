@@ -113,7 +113,34 @@ export function sanitizeGlossary(raw: unknown): { src: string; dst: string }[] |
 }
 
 /** 未确认报价的保留时长 */
-const QUOTE_TTL_MS = 30 * 60_000;
+export const QUOTE_TTL_MS = 30 * 60_000;
+
+/**
+ * 单用户同时持有的未确认（且未过期）报价上限。每个报价都在本地盘留一份 ≤30MB 的源 PDF、
+ * 不计任何存储配额；此前只有「本人下次上传时懒清理 20 条」，一个开通了文档翻译的账号
+ * 按限流 60 次/分钟持续上传不确认，30 分钟就能堆出 ~54GB（与录音共用 data/ 盘）。
+ */
+export const MAX_OUTSTANDING_QUOTES_PER_USER = 10;
+
+/** 全局清扫单轮上限（调度 tick 里跑，每 20s 一轮，足以追平任何上传速率） */
+const GLOBAL_QUOTE_SWEEP_BATCH = 50;
+
+async function deleteExpiredQuoteRows(
+  rows: ReadonlyArray<{ id: string }>
+): Promise<number> {
+  let swept = 0;
+  for (const row of rows) {
+    // 条件删除：并发 confirm 已把它推进 PENDING 时 count=0，文件原样保留。
+    const res = await prisma.translationTask
+      .deleteMany({ where: { id: row.id, status: 'QUOTED' } })
+      .catch(() => ({ count: 0 }));
+    if (res.count > 0) {
+      swept += 1;
+      await deleteTaskFiles(row.id).catch(() => undefined);
+    }
+  }
+  return swept;
+}
 
 /**
  * 懒清理该用户超时未确认的 QUOTED 任务（连文件）。上传新文件时顺手调用，
@@ -126,14 +153,32 @@ export async function sweepExpiredQuotes(userId: string): Promise<void> {
     select: { id: true },
     take: 20,
   });
-  for (const row of stale) {
-    await prisma.translationTask
-      .deleteMany({ where: { id: row.id, status: 'QUOTED' } })
-      .then(async (res) => {
-        if (res.count > 0) await deleteTaskFiles(row.id);
-      })
-      .catch(() => undefined);
-  }
+  await deleteExpiredQuoteRows(stale);
+}
+
+/**
+ * 全局清扫所有用户的过期报价（由文档翻译调度 tick 驱动）。只靠「本人下次上传时懒清理」
+ * 的话，用户停止上传后剩下的过期报价与源文件会永久留在盘上。
+ */
+export async function sweepAllExpiredQuotes(
+  limit = GLOBAL_QUOTE_SWEEP_BATCH
+): Promise<number> {
+  const cutoff = new Date(Date.now() - QUOTE_TTL_MS);
+  const stale = await prisma.translationTask.findMany({
+    where: { status: 'QUOTED', createdAt: { lt: cutoff } },
+    select: { id: true },
+    orderBy: { createdAt: 'asc' },
+    take: limit,
+  });
+  return deleteExpiredQuoteRows(stale);
+}
+
+/** 该用户当前持有的未过期、未确认报价数（上传前的数量闸）。 */
+export async function countOutstandingQuotes(userId: string): Promise<number> {
+  const cutoff = new Date(Date.now() - QUOTE_TTL_MS);
+  return prisma.translationTask.count({
+    where: { userId, status: 'QUOTED', createdAt: { gte: cutoff } },
+  });
 }
 
 /** 语言代码白名单校验（pdf2zh 的 lang 代码形态：字母/连字符，2-10 位） */

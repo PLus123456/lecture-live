@@ -266,8 +266,13 @@ export class RecordingArchiveManager {
         this.startedAt;
     }
 
+    // 审计 #3：已有采集但已经死了（麦克风拔出 / 系统共享被停止 → 源 track ended，UA 随之把
+    // recorder 停成 inactive）也必须重新采集。旧判据只看「流对象在不在 / 源与设备变没变」，
+    // 同源同设备续录时沿用死流：归档不再写块，getSenderStream 克隆出的也是 ended 轨，
+    // Soniox 收不到音频 —— 「继续」之后 UI 显示录音中，实际什么都没录（只能刷新页面自救）。
     const needsReplacement =
       !this.sourceStream ||
+      !this.hasLiveCapture() ||
       (!options.preserveData && this.archiveRecorder !== null) ||
       options.preAcquiredStream !== undefined ||
       previousSourceType !== options.sourceType ||

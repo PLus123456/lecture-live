@@ -241,6 +241,56 @@ describe('RecordingArchiveManager P1-10 硬件掉线', () => {
     expect(mgr.hasLiveCapture()).toBe(false);
     expect(endedSpy).toHaveBeenCalledTimes(1);
   });
+
+  it('审计 #3：掉线后同源同设备续录（preserveData）→ 重新采集，而不是沿用死流', async () => {
+    const deadTrack = new FakeTrack();
+    const freshTrack = new FakeTrack();
+    acquireMicrophoneStream
+      .mockResolvedValueOnce(new FakeMediaStream([deadTrack]))
+      .mockResolvedValueOnce(new FakeMediaStream([freshTrack]));
+
+    const mgr = new RecordingArchiveManager('sess-audit3');
+    await mgr.ensureArchive({ sourceType: 'mic', deviceId: 'mic-a' });
+    const firstRecorder = FakeMediaRecorder.instances.at(-1)!;
+
+    // 麦克风被拔出：track ended，UA 随之把 recorder 停成 inactive。
+    deadTrack.readyState = 'ended';
+    firstRecorder.state = 'inactive';
+    deadTrack.emit('ended');
+    expect(mgr.hasLiveCapture()).toBe(false);
+
+    // 用户插回、点「继续」：useSoniox 的续录走 ensureArchive(preserveData: true)、同一设备。
+    await mgr.ensureArchive({
+      sourceType: 'mic',
+      deviceId: 'mic-a',
+      preserveData: true,
+    });
+
+    // 修复前：流对象还在、源与设备没变 → 不重新采集，归档停写、发送流克隆的也是 ended 轨。
+    expect(acquireMicrophoneStream).toHaveBeenCalledTimes(2);
+    expect(FakeMediaRecorder.instances.length).toBe(2);
+    expect(FakeMediaRecorder.instances.at(-1)!.state).toBe('recording');
+    expect(mgr.hasLiveCapture()).toBe(true);
+  });
+
+  it('审计 #3 守卫：采集健在（暂停中）时 preserveData 续录不重建采集', async () => {
+    acquireMicrophoneStream.mockResolvedValue(
+      new FakeMediaStream([new FakeTrack()])
+    );
+    const mgr = new RecordingArchiveManager('sess-audit3-live');
+    await mgr.ensureArchive({ sourceType: 'mic', deviceId: 'mic-a' });
+    await mgr.pause();
+
+    await mgr.ensureArchive({
+      sourceType: 'mic',
+      deviceId: 'mic-a',
+      preserveData: true,
+    });
+
+    // 不能为一次普通的暂停/续录多切一个 WebM 文档、多弹一次授权。
+    expect(acquireMicrophoneStream).toHaveBeenCalledTimes(1);
+    expect(FakeMediaRecorder.instances.length).toBe(1);
+  });
 });
 
 describe('RecordingArchiveManager account boundary persistence fence', () => {

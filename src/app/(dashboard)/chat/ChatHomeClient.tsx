@@ -56,7 +56,9 @@ const ACCEPT_FILE_INPUT_STRING = [
   '.md', '.txt', '.json', '.yaml', '.yml',
   '.py', '.js', '.ts', '.tsx', '.jsx', '.go', '.rs', '.java', '.cpp', '.c', '.h',
 ].join(',');
-const MAX_FILE_BYTES = 50 * 1024 * 1024; // 50MB
+// 与服务端 /api/chat-uploads 的 31MiB 硬顶一致（Next middleware 截断 32MiB 以上的请求体，见
+// requestBodyLimit.ts）；管理后台配置的更小值仍由服务端判定。
+const MAX_FILE_BYTES = 31 * 1024 * 1024;
 
 /**
  * 「最近对话」时间格式：当天显示 HH:MM；7 天内显示 X 天前；更早显示 YYYY-MM-DD。

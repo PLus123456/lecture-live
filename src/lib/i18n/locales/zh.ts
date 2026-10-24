@@ -1741,7 +1741,7 @@ export default {
     softCapPercent: '软上限百分比',
     softCapPercentDesc: '用户字节配额占用率超过此值时，按 LRU 自动清理至阈值以下。填 0 表示关闭。',
     maxUploadMb: '单次最大上传',
-    maxUploadMbDesc: '单次上传单个文件的硬上限（MB）。',
+    maxUploadMbDesc: '单次上传单个文件的硬上限（MB）。超过 31MB 的设置不会生效：超过 32MB 的请求体到达服务端前就会被截断。',
     quotaFreeMb: 'FREE 配额',
     quotaFreeMbDesc: 'FREE 用户的总字节配额（MB）。',
     quotaProMb: 'PRO 配额',

@@ -280,6 +280,9 @@ describe('session detail route', () => {
     );
 
     expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body.code).toBe('concurrent_recording_limit');
+    expect(body).not.toHaveProperty('currentStatus');
     expect(txSessionUpdateManyMock).not.toHaveBeenCalled();
     expect(sessionUpdateManyMock).not.toHaveBeenCalled();
   });

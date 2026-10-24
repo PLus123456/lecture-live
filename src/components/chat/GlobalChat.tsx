@@ -107,7 +107,10 @@ const ACCEPT_FILE_INPUT_STRING = [
   '.h',
 ].join(',');
 
-const MAX_FILE_BYTES = 50 * 1024 * 1024; // 50MB（U13 会从 SiteSetting 拉到真实上限）
+// 与服务端 /api/chat-uploads 的硬顶一致：Next middleware 会截断超过 32MiB 的请求体，服务端按
+// 32MiB − 1MiB multipart 余量 = 31MiB 封顶（requestBodyLimit.ts，server-only 无法在此 import）。
+// 管理后台配置的更小值仍由服务端判定。
+const MAX_FILE_BYTES = 31 * 1024 * 1024;
 
 /** 把 File 读成 base64 data URL — 与 ChatTab 同步 */
 function readFileAsDataUrl(file: File): Promise<string> {

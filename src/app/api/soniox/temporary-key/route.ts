@@ -58,7 +58,10 @@ function parseSonioxErrorBody(text: string): { errorType?: string; requestId?: s
  *  3. single_use —— 一 key 一连接，堵「预扣一份并发开 N 条流」（实测第二条连接 401）；
  *  4. client_reference_id 由服务端构造（kind:userId:grantId，客户端不可控）——每条流在
  *     Soniox /v1/usage-logs 留下可归属记录（实测暴力断连也入账），供 usage cron 精确对账：
- *     正常收尾按实结算退差、孤儿有用量转实扣、key 没用过退预扣。
+ *     正常收尾按实结算退差、孤儿有用量转实扣、key 没用过退预扣；
+ *  5. 单场时长闸 —— 本场累计串流达单场上限 + 宽限（FREE 2h / PRO 4h / 同传 6h，+15min）即拒发
+ *     （403 code=session_duration_limit），最后一把 key 收缩到剩余时长。结算按单场上限封顶计费，
+ *     没有这道闸，绕过会话页自动收尾或并行多开流，超出上限的部分全部免费。
  *
  * 流量护栏：IP 粗限流（鉴权前，挡匿名刷）＋按 user 细限流＋并发活跃 grant 上限（保护我们
  * 在 Soniox 的组织级配额，也掐死脚本高频 mint）。
@@ -239,6 +242,18 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
   if (!grant.ok) {
+    if (grant.reason === 'session_duration_limit') {
+      // 本场累计串流已达单场上限 + 宽限（见 createStreamGrantWithReservation）。锚点**不作废**：
+      // 它名下已有串流，要照常由 deduct / cron 按实测结算。客户端凭 code 收尾，而不是当成断线去重连。
+      return NextResponse.json(
+        {
+          error: 'Session duration limit reached',
+          code: 'session_duration_limit',
+          limitMs: grant.limitMs,
+        },
+        { status: 403 }
+      );
+    }
     // 锚点一并作废：这条流拿不到 key、不可能串流，留着只会被 cron 7h 后误扣。
     if (interpretSessionId) {
       await settleInterpretSessionAsVoid(interpretSessionId, 'mint_failed');

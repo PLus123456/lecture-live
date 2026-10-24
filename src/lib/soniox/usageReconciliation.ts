@@ -25,6 +25,7 @@ import { logSystemEvent } from '@/lib/auditLog';
 import {
   clampSessionDurationMs,
   getBillableMinutes,
+  withMeasuredStreamFloorMs,
   type AppUserRole,
 } from '@/lib/billing';
 import { MAX_INTERPRET_DURATION_MS } from '@/lib/interpret/anchor';
@@ -217,10 +218,15 @@ async function computeLateTopUpMinutes(
       select: { role: true },
     });
     if (!owner) return 0; // 用户已删：与 realtime 分支的 `if (!session) return 0` 同口径
+    // ③ 封顶只保护「上限 + 宽限」以内的实测：超出部分（同一锚点并行多开）照实补扣，
+    //    与 deduct / cron 同口径（withMeasuredStreamFloorMs）。
     const measuredMinutes = getBillableMinutes(
-      clampSessionDurationMs(
-        Math.min(measuredMs, MAX_INTERPRET_DURATION_MS),
-        owner.role as AppUserRole
+      withMeasuredStreamFloorMs(
+        clampSessionDurationMs(
+          Math.min(measuredMs, MAX_INTERPRET_DURATION_MS),
+          owner.role as AppUserRole
+        ),
+        measuredMs
       )
     );
     return Math.max(0, measuredMinutes - charged - grantChargedMinutes);
@@ -250,14 +256,21 @@ async function computeLateTopUpMinutes(
       _sum: { minutes: true },
     });
     const measuredMinutes = getBillableMinutes(
-      clampSessionDurationMs(measuredMs, owner.role as AppUserRole)
+      withMeasuredStreamFloorMs(
+        clampSessionDurationMs(measuredMs, owner.role as AppUserRole),
+        measuredMs
+      )
     );
     const charged = Math.max(0, ledger._sum.minutes ?? 0);
     return Math.max(0, measuredMinutes - charged - grantChargedMinutes);
   }
   // 角色时长上限（FREE 2h / PRO 4h）是刻意的用户保护，补扣不得绕过它 —— 实测量同样过 clamp。
+  // 保护只到「上限 + 宽限」为止：超出部分是绕过收尾 / 并行多开的串流，与 finalize 同口径照实补扣。
   const measuredMinutes = getBillableMinutes(
-    clampSessionDurationMs(measuredMs, session.user.role)
+    withMeasuredStreamFloorMs(
+      clampSessionDurationMs(measuredMs, session.user.role),
+      measuredMs
+    )
   );
   // finalize 把 durationMs 写成「含 grant 实测的 Math.max 再 clamp」，getBillableMinutes(它) 就是
   // 本场权威扣费额；Session.billedMinutes 台账在时更精确。取两者较大者：宁可少补，绝不重复扣。

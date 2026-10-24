@@ -204,6 +204,38 @@ describe('POST temporary-key — 门禁链', () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(settleAnchorVoidMock).toHaveBeenCalledWith('is-new', 'mint_failed');
   });
+
+  it('单场时长闸命中（session_duration_limit）→ 403 + 机读 code / limitMs，不签发', async () => {
+    createGrantMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'session_duration_limit',
+      limitMs: 4 * 60 * 60_000,
+    });
+    const res = await POST(req({ kind: 'realtime', sessionId: 'sess-1' }));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      error: 'Session duration limit reached',
+      code: 'session_duration_limit',
+      limitMs: 4 * 60 * 60_000,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('interpret 单场时长闸命中 → 403，锚点**不**作废（名下已有串流，要照常按实测结算）', async () => {
+    interpretFindFirstMock.mockResolvedValueOnce({ id: 'is-long' });
+    createGrantMock.mockResolvedValueOnce({
+      ok: false,
+      reason: 'session_duration_limit',
+      limitMs: 6 * 60 * 60_000,
+    });
+    const res = await POST(
+      req({ kind: 'interpret', anchorId: '11111111-1111-1111-1111-111111111111' })
+    );
+    expect(res.status).toBe(403);
+    expect((await res.json()).code).toBe('session_duration_limit');
+    expect(settleAnchorVoidMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST temporary-key — 成功路径的 Soniox 参数（L1 三件套）', () => {

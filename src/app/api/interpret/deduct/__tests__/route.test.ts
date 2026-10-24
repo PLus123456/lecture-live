@@ -53,9 +53,15 @@ vi.mock('@/lib/interpret/session', () => ({
 vi.mock('@/lib/soniox/streamGrant', () => ({
   settleStreamGrants: settleGrantsMock,
 }));
-vi.mock('@/lib/billing', () => ({
-  getBillableMinutes: (ms: number) => Math.ceil(ms / 60_000),
-}));
+vi.mock('@/lib/billing', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/billing')>();
+  return {
+    getBillableMinutes: (ms: number) => Math.ceil(ms / 60_000),
+  // 计费下限 / 实测求和是纯函数：用真实实现，保证测的是生产口径。
+  withMeasuredStreamFloorMs: actual.withMeasuredStreamFloorMs,
+  sumCappedStreamActualMs: actual.sumCappedStreamActualMs,
+  };
+});
 vi.mock('@/lib/auditLog', () => ({ logSystemEvent: logSystemEventMock }));
 vi.mock('@/lib/interpret/anchor', () => ({
   MAX_INTERPRET_DURATION_MS: 6 * 60 * 60_000,
@@ -211,12 +217,12 @@ describe('POST interpret/deduct — P3-8 降级路径（无 anchorId 盲认领�
     });
   });
 
-  it('无 anchorId + 实测量超 6h 上限 → 仍封顶（防 Soniox 侧异常大值）', async () => {
+  it('无 anchorId + 实测 6h10m（6h 上限 + 15 分钟宽限以内）→ 仍按 6h 封顶', async () => {
     unanchored(1);
     settleGrantsMock.mockResolvedValueOnce({
-      settledCount: 1,
-      releasedMinutes: 15,
-      actualMsTotal: 9 * 60 * 60_000,
+      settledCount: 25,
+      releasedMinutes: 375,
+      actualMsTotal: 370 * 60_000,
     });
 
     await POST(req({ durationMs: 1 }));
@@ -227,16 +233,47 @@ describe('POST interpret/deduct — P3-8 降级路径（无 anchorId 盲认领�
     });
   });
 
-  it('带 anchorId（正常路径）：实测量不参与，仍按锚点口径扣（不改变诚实用户体验）', async () => {
+  it('无 anchorId + 实测 9h（超出上限 + 宽限）→ 宽限之外的部分照实扣（单条异常值已由 settleStreamGrants 逐条封顶）', async () => {
+    unanchored(1);
+    settleGrantsMock.mockResolvedValueOnce({
+      settledCount: 36,
+      releasedMinutes: 540,
+      actualMsTotal: 9 * 60 * 60_000,
+    });
+
+    await POST(req({ durationMs: 1 }));
+
+    expect(deductMock).toHaveBeenCalledWith('user-1', 525, expect.anything(), {
+      source: 'interpret_deduct',
+      referenceId: 'is-1',
+    });
+  });
+
+  it('带 anchorId（正常路径）：实测不超过锚点墙钟 → 仍按锚点口径扣（不改变诚实用户体验）', async () => {
     settleGrantsMock.mockResolvedValueOnce({
       settledCount: 1,
       releasedMinutes: 15,
-      actualMsTotal: 42 * 60_000,
+      actualMsTotal: 9 * 60_000,
     });
 
     await POST(req({ durationMs: 600_000, anchorId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }));
 
     expect(deductMock).toHaveBeenCalledWith('user-1', 10, expect.anything(), {
+      source: 'interpret_deduct',
+      referenceId: 'is-1',
+    });
+  });
+
+  it('带 anchorId 但同一锚点并行多开（10 分钟墙钟、实测 42 分钟）→ 按「实测 − 15 分钟宽限」扣 27 分钟', async () => {
+    settleGrantsMock.mockResolvedValueOnce({
+      settledCount: 4,
+      releasedMinutes: 60,
+      actualMsTotal: 42 * 60_000,
+    });
+
+    await POST(req({ durationMs: 600_000, anchorId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }));
+
+    expect(deductMock).toHaveBeenCalledWith('user-1', 27, expect.anything(), {
       source: 'interpret_deduct',
       referenceId: 'is-1',
     });

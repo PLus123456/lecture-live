@@ -515,6 +515,15 @@ export default function ActiveSessionPage() {
     toast.error(message);
   }, [t]);
 
+  // 服务端按单场时长闸拒发 key（本场累计串流已达上限 + 宽限）。处理与本地计时到点相同：提示并
+  // 收尾（见下方 effect）——handleStopWithFinalization 定义在 useSoniox 之后，这里只记下状态。
+  const [serverDurationLimit, setServerDurationLimit] = useState<{
+    limitMs: number | null;
+  } | null>(null);
+  const handleSessionDurationLimit = useCallback((limitMs: number | null) => {
+    setServerDurationLimit({ limitMs });
+  }, []);
+
   const handleAutoResumeNotice = useCallback((reason: 'disconnect') => {
     if (reason !== 'disconnect') {
       return;
@@ -735,6 +744,7 @@ export default function ActiveSessionPage() {
     onAutoPause: handleAutoPauseNotice,
     onAutoResume: handleAutoResumeNotice,
     onReconnectFailed: handleReconnectFailedNotice,
+    onSessionDurationLimit: handleSessionDurationLimit,
     onTranscriptionInterrupted: handleTranscriptionInterrupted,
   });
   const { initLocal, translateSentence, destroy: destroyTranslator } = useLocalTranslation({
@@ -1777,6 +1787,7 @@ export default function ActiveSessionPage() {
     quotaWarningShownRef.current = false;
     quotaLimitReachedRef.current = false;
     maxDurationReachedRef.current = false;
+    setServerDurationLimit(null);
 
     await startRecording();
 
@@ -1860,6 +1871,32 @@ export default function ActiveSessionPage() {
     maxSessionDurationMs,
     recordingState,
     remainingQuotaMs,
+    t,
+  ]);
+
+  // 服务端单场时长闸拒发 key：与上面的本地计时到点同一提示与收尾。本地计时与 Soniox 实测串流有
+  // 出入（例如在别的设备上续录过本场），以服务端为准。暂停中同样收尾——这场已经录不了了。
+  useEffect(() => {
+    if (!serverDurationLimit || isFinalizing || maxDurationReachedRef.current) {
+      return;
+    }
+    maxDurationReachedRef.current = true;
+    const limitMs = serverDurationLimit.limitMs ?? maxSessionDurationMs ?? 0;
+    const message = t('session.notices.maxDurationReached', {
+      duration: formatDuration(limitMs),
+    });
+    setBillingNotice({ tone: 'warning', message });
+    if (recordingState === 'recording' || recordingState === 'paused') {
+      void handleStopWithFinalization();
+    } else {
+      toast.error(message);
+    }
+  }, [
+    handleStopWithFinalization,
+    isFinalizing,
+    maxSessionDurationMs,
+    recordingState,
+    serverDurationLimit,
     t,
   ]);
 

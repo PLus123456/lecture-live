@@ -12,6 +12,7 @@ import {
 import { ACCOUNT_BOUNDARY_CLEAR_EVENT } from '@/lib/clientAccountCleanup';
 import { TokenProcessor } from '@/lib/soniox/tokenProcessor';
 import { buildSonioxConfig, startSonioxRecording } from '@/lib/soniox/client';
+import { isSessionDurationLimitError } from '@/lib/soniox/temporaryKeyError';
 import {
   getAllAudioChunks,
   getArchiveMimeType,
@@ -123,6 +124,11 @@ interface UseSonioxOptions {
   /** 断网自动重连达上限、放弃重连时触发（供上层弹出「重连失败，请手动继续」提示）。 */
   onReconnectFailed?: () => void;
   /**
+   * 服务端拒绝再签发 key：本场累计串流已达单场上限（403 session_duration_limit）。此时不进入/
+   * 不继续自动重连（只会被同样拒绝），交给上层提示并收尾。limitMs 为服务端给出的上限。
+   */
+  onSessionDurationLimit?: (limitMs: number | null) => void;
+  /**
    * 断网续采：网络断开但本地采集仍在继续（音频照常写入，只有 Soniox 转录连接中断）时触发。
    * 与 onAutoPause 的区别在于「录音没有暂停」——供上层提示「转录暂停但录音继续」，而非「已暂停」。
    */
@@ -199,6 +205,7 @@ export function useSoniox(
   const onAutoPause = options.onAutoPause;
   const onAutoResume = options.onAutoResume;
   const onReconnectFailed = options.onReconnectFailed;
+  const onSessionDurationLimit = options.onSessionDurationLimit;
   const onTranscriptionInterrupted = options.onTranscriptionInterrupted;
 
   const markAudioActivity = useCallback(() => {
@@ -1306,6 +1313,14 @@ export function useSoniox(
             return;
           }
           console.error('Reconnect attempt failed:', error);
+          // 本场时长已满：服务端不会再签发 key，继续重连只会空转到上限再误报「重连失败」。
+          if (isSessionDurationLimitError(error)) {
+            shouldReconnectRef.current = false;
+            reconnectAttemptsRef.current = 0;
+            setConnectionState('error');
+            onSessionDurationLimit?.(error.limitMs ?? null);
+            return;
+          }
           // H2：建连途中用户已手动暂停时不要再排下一轮重连 —— 否则 connectionState 会被反复
           // 推回 'reconnecting'（暂停中显示"重连中"），要等下一个退避 tick 的守卫才自愈。
           if (hasManualPauseIntent(shouldReconnectRef.current)) {
@@ -1324,6 +1339,7 @@ export function useSoniox(
       cancelStableConn,
       markConnectedStable,
       onReconnectFailed,
+      onSessionDurationLimit,
       accumulatePausedTime,
       audioActivityThreshold,
       installCaptureEndedHandler,
@@ -1684,6 +1700,7 @@ export function useSoniox(
         }
 
         console.error('Failed to start recording:', error);
+        const durationLimit = isSessionDurationLimitError(error) ? error : null;
         // P1-2：区分「仍有实时采集(hasLiveCapture)」与「仅有可恢复历史块」。只有前者才可
         // 保持 recording；后者归档已停/句柄为空，继续显示 recording 会形成「计时继续但无音频」
         // 的假录音，应落到 paused（靠 resume-cold / 手动继续兜底）。
@@ -1695,10 +1712,16 @@ export function useSoniox(
         setConnectionState('error');
         if (!recoverable) {
           setRecordingState('idle');
+          if (durationLimit) onSessionDurationLimit?.(durationLimit.limitMs ?? null);
           return;
         }
         const keepRecording = hasLive && previousRecordingState !== 'paused';
         setRecordingState(keepRecording ? 'recording' : 'paused');
+        // 本场时长已满：重连同样会被拒，不进自动重连状态机，交给上层收尾。
+        if (durationLimit) {
+          onSessionDurationLimit?.(durationLimit.limitMs ?? null);
+          return;
+        }
         // P1-5：初始 temporary-key/WS 建连失败，但本地归档已在采集(hasLive)、且非暂停续录：
         // 与运行中断线走同一条自动重连状态机（attemptReconnect），而不是静默停在
         // recording/error 让实时转录永不自行恢复（审计 P1-5）。归档不受影响，仅重建转录连接。
@@ -1719,6 +1742,7 @@ export function useSoniox(
       installCaptureEndedHandler,
       markAudioActivity,
       onAutoResume,
+      onSessionDurationLimit,
       onTranscriptionInterrupted,
       pauseForInterruption,
       setConnectionState,

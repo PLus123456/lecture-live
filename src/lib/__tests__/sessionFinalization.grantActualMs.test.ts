@@ -101,13 +101,19 @@ vi.mock('@/lib/audio/recordingDuration', () => ({
   RecordingDurationMeasurementError: class RecordingDurationMeasurementError extends Error {},
 }));
 // billing 是纯函数模块，复刻真实口径（clamp FREE 2h、ceil 到分钟）——它正是本条的计费口径本身。
-vi.mock('@/lib/billing', () => ({
-  clampSessionDurationMs: (ms: number, role: string) =>
-    role === 'ADMIN' ? ms : Math.min(ms, 2 * 60 * 60_000),
-  getBillableMinutes: (ms: number) => (ms > 0 ? Math.ceil(ms / 60_000) : 0),
-  getMaxSessionDurationMs: (role: string) =>
-    role === 'ADMIN' ? null : 2 * 60 * 60_000,
-}));
+vi.mock('@/lib/billing', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/billing')>();
+  return {
+    clampSessionDurationMs: (ms: number, role: string) =>
+      role === 'ADMIN' ? ms : Math.min(ms, 2 * 60 * 60_000),
+    getBillableMinutes: (ms: number) => (ms > 0 ? Math.ceil(ms / 60_000) : 0),
+    getMaxSessionDurationMs: (role: string) =>
+      role === 'ADMIN' ? null : 2 * 60 * 60_000,
+  // 计费下限 / 实测求和是纯函数：用真实实现，保证测的是生产口径。
+  withMeasuredStreamFloorMs: actual.withMeasuredStreamFloorMs,
+  sumCappedStreamActualMs: actual.sumCappedStreamActualMs,
+  };
+});
 vi.mock('@/lib/quota', () => ({ deductTranscriptionMinutes: deductMock }));
 vi.mock('@/lib/email/quotaAlert', () => ({
   maybeSendTranscriptionQuotaAlert: vi.fn().mockResolvedValue(undefined),
@@ -247,6 +253,39 @@ describe('finalizeSession — P5-6：Soniox 实测量恒为时长下限', () => 
     expect(txSessionUpdateManyMock.mock.calls[0][0].data).toMatchObject({
       status: 'COMPLETED',
       durationMs: 15 * 60_000,
+    });
+  });
+
+  it('实测 2h10m（FREE 上限 2h + 15 分钟宽限以内）→ 仍按 2h 封顶计费，durationMs 记 2h', async () => {
+    sumGrantActualMsMock.mockResolvedValueOnce(130 * 60_000);
+
+    await finalizeSession({ sessionId: 'sess-1', actor: null });
+
+    expect(deductMock).toHaveBeenCalledWith(
+      'u1',
+      120,
+      expect.anything(),
+      expect.objectContaining({ sessionId: 'sess-1' })
+    );
+    expect(txSessionUpdateManyMock.mock.calls[0][0].data).toMatchObject({
+      durationMs: 2 * 60 * 60_000,
+    });
+  });
+
+  it('实测 3h（绕过会话页自动收尾 / 并行多开）→ 宽限之外照实计费 165 分钟，durationMs 仍记封顶值', async () => {
+    sumGrantActualMsMock.mockResolvedValueOnce(3 * 60 * 60_000);
+
+    await finalizeSession({ sessionId: 'sess-1', actor: null });
+
+    // max(封顶 120, 180 − 15) = 165
+    expect(deductMock).toHaveBeenCalledWith(
+      'u1',
+      165,
+      expect.anything(),
+      expect.objectContaining({ sessionId: 'sess-1' })
+    );
+    expect(txSessionUpdateManyMock.mock.calls[0][0].data).toMatchObject({
+      durationMs: 2 * 60 * 60_000,
     });
   });
 

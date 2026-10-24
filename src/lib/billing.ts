@@ -33,6 +33,48 @@ export function clampSessionDurationMs(
   return Math.min(normalizedDurationMs, limitMs);
 }
 
+/**
+ * 单场串流时长上限之上的宽限（mint 时长闸与结算共用同一个值）。
+ *
+ * 吸收诚实客户端「Soniox 串流量 > 录音计时」的正常差额：key 轮换 / 断线重连的交接、暂停后
+ * 连接要过约 20s 才被 Soniox 断开，以及 mint 闸对尚未回填实测量的 grant 的保守估计。客户端在
+ * 录音计时到达上限时自行收尾，正常录音碰不到「上限 + 宽限」。
+ */
+export const STREAM_DURATION_CAP_GRACE_MS = 15 * 60_000;
+
+/**
+ * 在「按单场上限封顶后的计费时长」之上，补收 Soniox 实测串流超出「上限 + 宽限」的部分。
+ *
+ * 单场上限（角色 2h/4h、同传 6h）保护诚实用户不被按超长的墙钟/内容时长计费；但 mint 闸只能按
+ * 已回填的实测量与保守估计放行，并行多开的流要等 usage-logs 回填后才看得见。结算若把实测量也
+ * 一并封顶，超出部分就成了白嫖。以「实测 − 宽限」作计费下限：实测不超过上限 + 宽限的诚实用户
+ * 结果不变，多开或绕过客户端上限串流的，为超出部分付费。
+ */
+/**
+ * 一组 SonioxStreamGrant 的实测串流毫秒合计，每条先封顶到自己的连接硬上限（Soniox 到点硬断，
+ * 单条流不可能更长）。实测量参与计费下限（withMeasuredStreamFloorMs）之后，对账侧偶发的异常
+ * 大值只能多算到「签出去的 key 合计可串的时长」为止。
+ */
+export function sumCappedStreamActualMs(
+  rows: ReadonlyArray<{ actualMs: number | null; maxSessionSeconds: number }>
+): number {
+  return rows.reduce((totalMs, row) => {
+    const actualMs = Math.max(0, Number(row.actualMs) || 0);
+    const connectionCapMs = Math.max(0, Number(row.maxSessionSeconds) || 0) * 1000;
+    return totalMs + Math.min(actualMs, connectionCapMs);
+  }, 0);
+}
+
+export function withMeasuredStreamFloorMs(
+  cappedDurationMs: number,
+  measuredStreamMs: number
+): number {
+  const measuredMs = Number.isFinite(measuredStreamMs)
+    ? Math.max(0, Math.trunc(measuredStreamMs))
+    : 0;
+  return Math.max(cappedDurationMs, measuredMs - STREAM_DURATION_CAP_GRACE_MS);
+}
+
 export function getBillableMinutes(durationMs: number): number {
   const normalizedDurationMs = Number.isFinite(durationMs)
     ? Math.max(0, durationMs)

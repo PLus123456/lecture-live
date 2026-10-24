@@ -20,6 +20,7 @@ import type {
 import type { TemporaryApiKeyResponse } from '@/types/soniox';
 import { BrowserAudioInputSource } from '@/lib/audio/browserAudioInputSource';
 import { resolveAutoRegion } from '@/lib/soniox/clientPing';
+import { TemporaryKeyError } from '@/lib/soniox/temporaryKeyError';
 
 const SONIOX_MIN_ENDPOINT_DELAY_MS = 500;
 const SONIOX_MAX_ENDPOINT_DELAY_MS = 3000;
@@ -179,8 +180,19 @@ export async function fetchTemporaryApiKey(
     signal,
   });
   if (!res.ok) {
-    const errorBody = await res.json().catch(() => ({})) as { error?: string };
-    throw new Error(errorBody.error || 'Failed to get temporary API key');
+    const errorBody = await res.json().catch(() => ({})) as {
+      error?: string;
+      code?: unknown;
+      limitMs?: unknown;
+    };
+    throw new TemporaryKeyError(
+      errorBody.error || 'Failed to get temporary API key',
+      res.status,
+      typeof errorBody.code === 'string' ? errorBody.code : undefined,
+      typeof errorBody.limitMs === 'number' && Number.isFinite(errorBody.limitMs)
+        ? errorBody.limitMs
+        : undefined
+    );
   }
   const data = await res.json();
   signal?.throwIfAborted();

@@ -56,8 +56,15 @@ const sonioxMocks = vi.hoisted(() => ({
   reconnect: vi.fn(async () => {}),
   finalizeRemoteDraft: vi.fn(async () => true),
 }));
+// 记下页面传给 useSoniox 的回调（服务端时长闸的 onSessionDurationLimit 由测试直接触发）。
+const sonioxOptions = vi.hoisted(() => ({
+  current: null as null | { onSessionDurationLimit?: (limitMs: number | null) => void },
+}));
 vi.mock('@/hooks/useSoniox', () => ({
-  useSoniox: () => sonioxMocks,
+  useSoniox: (_sessionId: unknown, options: unknown) => {
+    sonioxOptions.current = options as typeof sonioxOptions.current;
+    return sonioxMocks;
+  },
 }));
 
 const summaryMocks = vi.hoisted(() => ({
@@ -475,6 +482,51 @@ describe('会话页：全局实时 store 归属与收尾', () => {
     expect(vi.mocked(toast.error)).toHaveBeenCalledWith('session.notices.concurrentRecordingLimit');
     expect(vi.mocked(toast.error)).not.toHaveBeenCalledWith('session.notices.sessionReclaimed');
     expect(screen.getByText('session.notices.concurrentRecordingLimit')).toBeInTheDocument();
+  });
+
+  it('服务端单场时长闸拒发 key → 提示「已达时长上限」并收尾（暂停中同样收尾）', async () => {
+    sessionMeta['sess-a'] = jsonResponse({ id: 'sess-a', title: '甲课', status: 'PAUSED', sourceLang: 'en', targetLang: 'zh' });
+    useTranscriptStore.setState({
+      recordingState: 'paused',
+      activeSessionId: 'sess-a',
+      recordingStartTime: Date.now() - 60_000,
+      pausedAt: Date.now(),
+      segments: [seg('seg-1', 'A 的一句', 0)],
+    });
+
+    render(<ActiveSessionPage />);
+    await waitFor(() => {
+      expect(screen.getByTitle('session.actions.stopTitle')).not.toBeDisabled();
+    });
+
+    await act(async () => {
+      sonioxOptions.current?.onSessionDurationLimit?.(4 * 60 * 60_000);
+    });
+
+    await waitFor(() => {
+      expect(finalizeCalls).toHaveLength(1);
+    });
+    expect(sonioxMocks.stop).toHaveBeenCalled();
+    expect(screen.getByText('session.notices.maxDurationReached')).toBeInTheDocument();
+  });
+
+  it('服务端单场时长闸拒发 key 时本地并未在录（idle）→ 只提示，不收尾', async () => {
+    sessionMeta['sess-a'] = jsonResponse({ id: 'sess-a', title: '甲课', status: 'CREATED', sourceLang: 'en', targetLang: 'zh' });
+
+    render(<ActiveSessionPage />);
+    await waitFor(() => {
+      expect(sonioxOptions.current?.onSessionDurationLimit).toBeTypeOf('function');
+    });
+
+    await act(async () => {
+      sonioxOptions.current?.onSessionDurationLimit?.(4 * 60 * 60_000);
+    });
+
+    await waitFor(() => {
+      expect(vi.mocked(toast.error)).toHaveBeenCalledWith('session.notices.maxDurationReached');
+    });
+    expect(finalizeCalls).toHaveLength(0);
+    expect(sonioxMocks.stop).not.toHaveBeenCalled();
   });
 
   it('#5：元信息拉取失败时，收尾不带英文占位标题（避免覆盖服务端标题）', async () => {

@@ -10,7 +10,11 @@
 import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { logger } from '@/lib/logger';
-import { getBillableMinutes } from '@/lib/billing';
+import {
+  getBillableMinutes,
+  sumCappedStreamActualMs,
+  withMeasuredStreamFloorMs,
+} from '@/lib/billing';
 import { deductTranscriptionMinutes, recordInterpretUsage } from '@/lib/quota';
 import { MAX_INTERPRET_DURATION_MS } from '@/lib/interpret/anchor';
 import { settleStreamGrants } from '@/lib/soniox/streamGrant';
@@ -241,11 +245,12 @@ export async function reclaimStaleInterpretSessions(now: Date): Promise<number> 
   for (const s of stale) {
     // R1-L2：按 Soniox usage-logs 实测串流量计费（usage cron 已回填各 grant.actualMs，
     // 7h 阈值远晚于回填窗口）：崩溃在第 3 分钟的诚实用户按 3 分钟扣，改装客户端串满多少扣多少。
-    const grantAgg = await prisma.sonioxStreamGrant.aggregate({
+    // 逐条封顶到各自的连接硬上限再求和（防对账侧异常大值，见 sumCappedStreamActualMs）。
+    const grantRows = await prisma.sonioxStreamGrant.findMany({
       where: { interpretSessionId: s.id, actualMs: { gt: 0 } },
-      _sum: { actualMs: true },
+      select: { actualMs: true, maxSessionSeconds: true },
     });
-    const grantActualMs = grantAgg._sum.actualMs ?? 0;
+    const grantActualMs = sumCappedStreamActualMs(grantRows);
 
     // P1-1：查无实测量（该锚点根本没有 grant，或 grants 的 actualMs 全为空）→ **按 0 结算**，
     // 绝不回落墙钟。INTERPRET_RECLAIM_STALE_MS(7h) > MAX_INTERPRET_DURATION_MS(6h)，墙钟口径恒被
@@ -264,7 +269,11 @@ export async function reclaimStaleInterpretSessions(now: Date): Promise<number> 
       continue;
     }
 
-    const elapsedMs = Math.min(grantActualMs, MAX_INTERPRET_DURATION_MS);
+    // 6h 封顶只到「上限 + 宽限」为止：超出部分（同一锚点并行多开）照实计，与 deduct 同口径。
+    const elapsedMs = withMeasuredStreamFloorMs(
+      Math.min(grantActualMs, MAX_INTERPRET_DURATION_MS),
+      grantActualMs
+    );
     const billable = getBillableMinutes(elapsedMs);
 
     // 认领 + 结算 grants + 扣费 + 记台账**同事务**原子：任一步失败整体回滚 → 会话保持未结算

@@ -1,5 +1,9 @@
-import { describe, expect, it } from 'vitest';
-import { buildSonioxConfig } from '@/lib/soniox/client';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { buildSonioxConfig, fetchTemporaryApiKey } from '@/lib/soniox/client';
+import {
+  isSessionDurationLimitError,
+  TemporaryKeyError,
+} from '@/lib/soniox/temporaryKeyError';
 import type { SessionConfig } from '@/types/transcript';
 
 function makeConfig(overrides: Partial<SessionConfig> = {}): SessionConfig {
@@ -59,5 +63,54 @@ describe('buildSonioxConfig', () => {
       { source: 'Soniox', target: 'Soniox' },
       { source: 'WebSocket', target: 'WebSocket' },
     ]);
+  });
+});
+
+describe('fetchTemporaryApiKey 的拒绝', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubResponse(status: number, body: unknown) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify(body), { status }))
+    );
+  }
+
+  it('单场时长闸（403 session_duration_limit）→ TemporaryKeyError，带状态码 / code / limitMs', async () => {
+    stubResponse(403, {
+      error: 'Session duration limit reached',
+      code: 'session_duration_limit',
+      limitMs: 4 * 60 * 60_000,
+    });
+
+    const error = await fetchTemporaryApiKey('token', 'eu', {
+      kind: 'realtime',
+      sessionId: 's1',
+    }).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(TemporaryKeyError);
+    expect(error).toMatchObject({
+      message: 'Session duration limit reached',
+      status: 403,
+      code: 'session_duration_limit',
+      limitMs: 4 * 60 * 60_000,
+    });
+    expect(isSessionDurationLimitError(error)).toBe(true);
+  });
+
+  it('额度耗尽等其它拒绝 → 不是时长上限（上层照旧按断线 / 报错处理）', async () => {
+    stubResponse(403, { error: 'Quota exceeded' });
+
+    const error = await fetchTemporaryApiKey('token', 'eu', {
+      kind: 'realtime',
+      sessionId: 's1',
+    }).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(TemporaryKeyError);
+    expect(error).toMatchObject({ message: 'Quota exceeded', status: 403 });
+    expect(isSessionDurationLimitError(error)).toBe(false);
+    expect(isSessionDurationLimitError(new Error('session_duration_limit'))).toBe(false);
   });
 });

@@ -36,6 +36,7 @@ import {
   clampSessionDurationMs,
   getBillableMinutes,
   getMaxSessionDurationMs,
+  withMeasuredStreamFloorMs,
 } from '@/lib/billing';
 import { deductTranscriptionMinutes } from '@/lib/quota';
 import { maybeSendTranscriptionQuotaAlert } from '@/lib/email/quotaAlert';
@@ -393,6 +394,10 @@ export async function finalizeSession(
         '[finalize] duration mismatch'
       );
     }
+    // 单场上限只封顶「按录音 / 内容 / 墙钟估出来的时长」：Soniox 实测串流超出上限 + 宽限的部分
+    // （绕过会话页自动收尾、同一场并行多开流）照实计费，见 withMeasuredStreamFloorMs。
+    // Session.durationMs 仍记封顶后的值。
+    billingDurationMs = withMeasuredStreamFloorMs(billingDurationMs, grantActualMs);
     const billableMinutes = getBillableMinutes(billingDurationMs);
 
     if (!transcriptPath) {

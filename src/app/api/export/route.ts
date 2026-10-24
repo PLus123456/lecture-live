@@ -12,12 +12,17 @@ import {
   sanitizeTextInput,
 } from '@/lib/security';
 import { parseJsonWithLimit } from '@/lib/requestBodyLimit';
+import { SESSION_TRANSCRIPT_LIMITS } from '@/lib/sessionApi';
 
 const MAX_SEGMENTS = 50_000;
-// 导出请求体是纯文本 JSON（segments + translations + summaries）。MAX_SEGMENTS=50k
-// 配上每段文本，合理上限在几十 MB；这里用 64MB 绝对硬上限做 OOM 兜底，挡掉在
-// req.json() 把整个 body 缓冲进内存之前的明显超大请求。精确的段数校验仍在下方。
-const ABSOLUTE_MAX_BODY_BYTES = 64 * 1024 * 1024;
+// 导出请求体是纯文本 JSON（segments + translations + summaries），导出的就是一场会话的
+// 转录产物，而产物本身落盘上限是 SESSION_TRANSCRIPT_LIMITS.maxPersistedJsonBytes（8MB）——
+// 合法请求不可能更大。此前是 64MB：限流（30 次 / 10 分钟）在读 body 之前就放行，一个用户
+// 并发 30 个 64MB 请求，缓冲 + 解码 + JSON.parse 的峰值足以把 Next 进程顶到 OOM。
+// 这里给信封（标题/语言等）留 1MB 余量。精确的段数校验仍在下方。
+// 注意：route.ts 只能导出路由处理器/路由配置字段（next build 会校验），常量不导出。
+const ABSOLUTE_MAX_BODY_BYTES =
+  SESSION_TRANSCRIPT_LIMITS.maxPersistedJsonBytes + 1024 * 1024;
 
 interface ExportRequestBody {
   format: 'markdown' | 'srt' | 'json' | 'txt';

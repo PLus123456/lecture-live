@@ -175,6 +175,10 @@ npm run dev:ws
 cp .env.example .env.local
 # Set DB_PASSWORD, MYSQL_ROOT_PASSWORD, REDIS_PASSWORD, JWT_SECRET,
 # ENCRYPTION_KEY, and SETUP_BOOTSTRAP_TOKEN (`openssl rand -hex 32`).
+# Compose itself reads DB_PASSWORD, MYSQL_ROOT_PASSWORD, REDIS_PASSWORD (and their
+# *_ENCODED forms) plus NEXT_PUBLIC_APP_URL / NEXT_PUBLIC_WS_URL from `.env`, not
+# `.env.local`. NEXT_PUBLIC_* are baked into the image at build time, so run
+# `docker-compose build app` after changing them.
 
 # 2. Launch the full stack
 docker-compose up -d
@@ -311,7 +315,7 @@ LectureLive uses the Cloudreve v4 OAuth authorization code flow with PKCE for st
 | `npm run billing:reset-quotas` | Reset monthly transcription quotas (settles purchased-minute pools and clears in-flight reservations) |
 | `npm run billing:reconcile` | Print a read-only transcription usage drift report |
 | `npm run billing:maintenance` | Run billing maintenance tasks (includes both of the above plus session/reservation reclamation — prefer this for cron) |
-| `npm run security:reencrypt-llm-keys` | Re-encrypt stored LLM provider keys |
+| `npm run security:reencrypt-llm-keys` | After rotating `ENCRYPTION_KEY`, re-encrypt every value stored with the old key (LLM keys, payment/Soniox/Cloudreve secrets, worker tokens); `-- --dry-run` previews. Remove `ENCRYPTION_KEY_PREVIOUS` only after it exits 0 |
 
 ## Contributing
 

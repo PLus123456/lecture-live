@@ -27,7 +27,7 @@
 import { existsSync } from 'fs';
 import path from 'path';
 import { spawnSync } from 'child_process';
-import { loadEnvFileIfNeeded } from './load-env.mjs';
+import { loadEnvFileIfNeeded, readEnvFileValue } from './load-env.mjs';
 
 // 各运维脚本与本文件同在 scripts/ 下；用本文件所在目录定位，不受 cwd 影响。
 const SCRIPT_DIR = import.meta.dirname;
@@ -37,8 +37,14 @@ const ROOT = process.cwd();
 // 不能把“开发环境可跳过”的兼容语义带进正式服务启动路径。
 const REQUIRE_DATABASE = process.argv.includes('--require-database');
 
+// 进程环境（Docker env_file / systemd --env-file / 手工 export）优先，其次 env 文件。
+// 此前只读 process.env，而且判定发生在载入 env 文件**之前**：.env.example 教的「在 .env.local
+// 里设 AUTO_DB_PUSH=false 关闭自动建表」永远不生效，npm start / start:ws / db:ensure 照样对库跑
+// 数据迁移 + db push。readEnvFileValue 兜住「DATABASE_URL 已由环境注入、loadEnvFileIfNeeded
+// 整段不加载 env 文件」的情形。
 function isAutoDbPushDisabled() {
-  const value = process.env.AUTO_DB_PUSH?.trim().toLowerCase();
+  const raw = process.env.AUTO_DB_PUSH ?? readEnvFileValue('AUTO_DB_PUSH', ROOT);
+  const value = raw?.trim().toLowerCase();
   return value === '0' || value === 'false' || value === 'off';
 }
 
@@ -63,11 +69,21 @@ function runStep(label, command, args) {
     console.error(`[db:init] ${label} —— 启动失败:`, result.error.message);
     process.exit(1);
   }
-  if (typeof result.status === 'number' && result.status !== 0) {
-    console.error(`[db:init] ${label} —— 退出码 ${result.status}，已中止。`);
-    process.exit(result.status);
+  // 被信号杀掉（OOM killer 的 SIGKILL、手工 kill）时 status 为 null、signal 有值。此前只判
+  // 「数字且非 0」，信号终止被当成成功：后续步骤照跑，最后还宣告 schema 已就绪、放行启动。
+  if (result.signal || result.status !== 0) {
+    const reason = result.signal
+      ? `被信号 ${result.signal} 终止`
+      : `退出码 ${result.status}`;
+    console.error(`[db:init] ${label} —— ${reason}，已中止。`);
+    process.exit(
+      typeof result.status === 'number' && result.status !== 0 ? result.status : 1
+    );
   }
 }
+
+// 先载入 env 文件再做任何判定（见 isAutoDbPushDisabled 的说明）。
+loadEnvFileIfNeeded(ROOT);
 
 if (isAutoDbPushDisabled()) {
   if (REQUIRE_DATABASE) {
@@ -79,8 +95,6 @@ if (isAutoDbPushDisabled()) {
   console.log('[db:init] AUTO_DB_PUSH disabled, skipping schema sync.');
   process.exit(0);
 }
-
-loadEnvFileIfNeeded(ROOT);
 
 const hasDatabaseUrl = Boolean(process.env.DATABASE_URL?.trim());
 const hasEnvFile =

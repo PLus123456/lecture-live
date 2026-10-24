@@ -15,7 +15,19 @@ FROM base AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN npm run build && npm run build:ws
+# next build 会把 NEXT_PUBLIC_* 内联进浏览器 bundle（服务端 bundle 也内联构建期已定义的值）。
+# 构建上下文排除了 .env*（.dockerignore），不经 build args 传入时客户端只能拿到 useLiveShare
+# 的兜底 http://localhost:3001 —— 主播与观众都去连自己机器的 localhost，直播必挂；CSP 的
+# connect-src 同样在构建期生成。由 docker-compose.yml 的 build.args 传入。
+ARG NEXT_PUBLIC_APP_URL
+ARG NEXT_PUBLIC_WS_URL
+# 空值必须 unset，不能以空串进入 next build：Next 连「已定义的空串」也会内联进服务端
+# bundle，运行时 env_file 里的真实值反而读不到（requestOrigin / publicAuth 按它判定来源）。
+# 最后一步按与运行时同一套 esbuild 参数预编译 artifact 回填脚本（见 runner 阶段说明）。
+RUN if [ -z "${NEXT_PUBLIC_APP_URL:-}" ]; then unset NEXT_PUBLIC_APP_URL; fi; \
+    if [ -z "${NEXT_PUBLIC_WS_URL:-}" ]; then unset NEXT_PUBLIC_WS_URL; fi; \
+    npm run build && npm run build:ws \
+    && node scripts/backfill-stored-artifacts.mjs --build-only dist/backfill-stored-artifacts.mjs
 
 # Production
 FROM base AS runner
@@ -49,19 +61,20 @@ COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/docker-entrypoint.sh ./docker-entrypoint.sh
 COPY --from=builder /app/deploy/shims ./deploy/shims
-# ensure-database 的第 ⑦ 步（artifact 账本回填）会用 esbuild 现编 scripts/*.ts。
-# runner 里缺它 → 回填脚本 exit 1 → entrypoint 的 `set -e` 在 Web/WS 启动前打死容器，
-# 也就是每次启动都失败。只带 esbuild 自身与它的平台二进制包。
-COPY --from=deps /app/node_modules/esbuild ./node_modules/esbuild
-COPY --from=deps /app/node_modules/@esbuild ./node_modules/@esbuild
+# ensure-database 的第 ⑦ 步（artifact 账本回填）：scripts/backfill-stored-artifacts.ts 依赖
+# ../src/** 与 tsconfig 的 @/ 别名，runner 里两者都没有，现编必挂（exit 1 → entrypoint 的
+# `set -e` 在 Web/WS 启动前打死容器，每次启动都失败）。builder 阶段已用同一套 esbuild 参数
+# 预编译好；launcher 发现没有源码时直接执行这份产物（@prisma/client 仍从 /app/node_modules 解析）。
+COPY --from=builder /app/dist/backfill-stored-artifacts.mjs ./dist/backfill-stored-artifacts.mjs
 
 # 重建 prisma CLI 的 .bin 软链（npm 原本创建的 node_modules/.bin/prisma → ../prisma/build/index.js，
-# 该文件带 `#!/usr/bin/env node` shebang，ensure-database.mjs 直接 spawn 它）
-RUN mkdir -p /app/node_modules/.bin \
+# 该文件带 `#!/usr/bin/env node` shebang，ensure-database.mjs 直接 spawn 它）。
+# /app/data 必须在镜像里预建并归 nextjs 所有：docker-compose 把命名卷挂在这里，而命名卷首次
+# 挂载时只有「镜像里已存在的目录」才会把属主/权限复制进卷；目录不存在则卷根是 root:root 0755，
+# 以 nextjs(1001) 运行的应用写不进任何本地产物（草稿、录音、转录、上传分片……全部 EACCES）。
+RUN mkdir -p /app/node_modules/.bin /app/data \
  && ln -sf ../prisma/build/index.js /app/node_modules/.bin/prisma \
  && chmod +x /app/node_modules/prisma/build/index.js \
- && ln -sf ../esbuild/bin/esbuild /app/node_modules/.bin/esbuild \
- && chmod +x /app/node_modules/esbuild/bin/esbuild \
  && chown -R nextjs:nodejs /app && chmod 755 /app/docker-entrypoint.sh
 
 USER nextjs

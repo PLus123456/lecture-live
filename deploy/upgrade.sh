@@ -95,8 +95,13 @@ echo ""
 info "备份当前版本..."
 mkdir -p "$BACKUP_DIR"
 if [[ -f "$APP_DIR/server.js" ]]; then
+    # 排除项必须锚定到顶层（--anchored + ./ 前缀）：GNU tar 的 --exclude 默认不锚定，旧写法
+    # `--exclude=data` 会把运行产物里任何一层叫 data 的目录（node_modules/*/data 等）一起丢掉，
+    # 回滚得到的是残缺产物；同时排除 ./src —— 托管 CLI 的源码检出（含 node_modules、.next 缓存，
+    # 动辄数 GB）不是回滚对象，打进去只会在服务停机窗口里拖长压缩、把磁盘写满。
     tar czf "$BACKUP_DIR/app-${TIMESTAMP}.tar.gz" \
-        -C "$APP_DIR" --exclude=data --exclude=backups --exclude=.env .
+        -C "$APP_DIR" --anchored \
+        --exclude=./data --exclude=./backups --exclude=./.env --exclude=./src .
     info "备份完成: $BACKUP_DIR/app-${TIMESTAMP}.tar.gz"
 fi
 

@@ -171,6 +171,9 @@ npm run dev:ws
 # 1. 配置环境变量
 cp .env.example .env.local
 # 设置 DB_PASSWORD、MYSQL_ROOT_PASSWORD、REDIS_PASSWORD、JWT_SECRET、ENCRYPTION_KEY
+# compose 自身从 `.env`（不是 .env.local）读取 DB_PASSWORD、MYSQL_ROOT_PASSWORD、
+# REDIS_PASSWORD（及其 *_ENCODED）与 NEXT_PUBLIC_APP_URL / NEXT_PUBLIC_WS_URL；
+# NEXT_PUBLIC_* 在构建镜像时写死，修改后需先 `docker-compose build app` 重建。
 
 # 2. 启动整套服务
 docker-compose up -d
@@ -284,7 +287,7 @@ LectureLive 接入 Cloudreve 存储时，使用的是 Cloudreve v4 的 OAuth 授
 | `npm run billing:reset-quotas` | 重置月度转录配额（含购买时长池结算与在途预留清理） |
 | `npm run billing:reconcile` | 打印只读的转录用量 drift 报表 |
 | `npm run billing:maintenance` | 执行计费维护任务（含上面两项，另加会话/预留回收 —— cron 首选这条） |
-| `npm run security:reencrypt-llm-keys` | 重新加密已存储的 LLM 密钥 |
+| `npm run security:reencrypt-llm-keys` | 轮换 `ENCRYPTION_KEY` 后重加密所有用旧密钥落库的值（LLM key、支付/Soniox/Cloudreve 密钥、worker token）；`-- --dry-run` 预览。退出码为 0 后才可删除 `ENCRYPTION_KEY_PREVIOUS` |
 
 ## 参与贡献
 

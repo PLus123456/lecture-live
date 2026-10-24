@@ -883,6 +883,10 @@ export async function PATCH(req: Request) {
         return NextResponse.json({ error: '邮箱已被其他用户使用' }, { status: 409 });
       }
       data.email = fields.email;
+      // 换绑邮箱：新地址从未被证明可达，验证状态必须清空（管理员本次显式 markEmailVerified
+      // 背书时由下方分支重新记）。旧地址上未消费的验证/重置链接在事务内一并作废——
+      // 否则旧邮箱的持有者仍能凭验证链接直接拿到会话、凭重置链接改密，换绑形同虚设。
+      data.emailVerifiedAt = null;
     }
 
     if (fields.displayName !== undefined) {
@@ -905,7 +909,10 @@ export async function PATCH(req: Request) {
     // （那会把「什么时候验证的」这条审计线索抹掉）。
     if (fields.markEmailVerified !== undefined) {
       if (fields.markEmailVerified) {
-        if (!existing.emailVerifiedAt) data.emailVerifiedAt = new Date();
+        // 同一次请求里换绑了邮箱：旧时间戳属于旧地址，按新地址重新记验证时刻。
+        if (!existing.emailVerifiedAt || data.email !== undefined) {
+          data.emailVerifiedAt = new Date();
+        }
       } else {
         data.emailVerifiedAt = null;
       }
@@ -1119,8 +1126,30 @@ export async function PATCH(req: Request) {
     const user = await prisma.$transaction(async (tx) => {
       // 管理员代改密码与自助改密同源：不作废未消费的邮件令牌，一封没用过的重置链接
       // 就能在 1h 内把管理员刚设的密码改掉（tokenVersion++ 踢掉的会话拦不住它）。
-      if (data.passwordHash !== undefined) {
+      // 换绑邮箱同理：令牌绑的是 userId 而非地址，旧地址收到的链接必须随换绑同事务失效。
+      if (data.passwordHash !== undefined || data.email !== undefined) {
         await invalidateUserEmailTokens(userId, { db: tx });
+      }
+      // 「重置本月用量」对无池用户此前只写 used=0，却把在途预留（异步上传 / 完整版补全 / 未结
+      // stream grant）原样留在列上。预留本就计在 used 里，随后结算时又从**新周期**的 used 里再释放
+      // 一遍：GREATEST(0, 实扣 − 预留) 把刚完成的转录白扣成 0，对账还冒出正向 drift。与月度重置 /
+      // ensureQuotaWindow 同序：同一事务内先清预留列、再归零 used。持池用户已由
+      // settlePoolOnUsageReset 清过，这里再清一次是幂等 no-op。
+      if (fields.resetTranscriptionUsage === true) {
+        await tx.session.updateMany({
+          where: {
+            userId,
+            OR: [
+              { asyncReservedMinutes: { gt: 0 } },
+              { fullReservedMinutes: { gt: 0 } },
+            ],
+          },
+          data: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+        });
+        await tx.sonioxStreamGrant.updateMany({
+          where: { userId, settledAt: null, reservedMinutes: { gt: 0 } },
+          data: { reservedMinutes: 0 },
+        });
       }
       const updated = await tx.user.update({
         where: { id: userId },

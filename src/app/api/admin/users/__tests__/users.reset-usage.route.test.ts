@@ -19,6 +19,8 @@ const {
   logActionMock,
   settlePoolOnLimitChangeMock,
   settlePoolOnUsageResetMock,
+  sessionUpdateManyMock,
+  grantUpdateManyMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   userFindUniqueMock: vi.fn(),
@@ -28,6 +30,8 @@ const {
   logActionMock: vi.fn(),
   settlePoolOnLimitChangeMock: vi.fn(),
   settlePoolOnUsageResetMock: vi.fn(),
+  sessionUpdateManyMock: vi.fn(),
+  grantUpdateManyMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({ requireAdminAccess: requireAdminAccessMock }));
@@ -99,8 +103,14 @@ describe('PATCH /api/admin/users — resetTranscriptionUsage（P5-2）', () => {
     getSiteSettingsMock.mockResolvedValue({ bcrypt_rounds: 4, password_min_length: 8 });
     userFindUniqueMock.mockResolvedValue(EXISTING);
     userUpdateMock.mockResolvedValue({ ...EXISTING });
+    sessionUpdateManyMock.mockResolvedValue({ count: 0 });
+    grantUpdateManyMock.mockResolvedValue({ count: 0 });
     transactionMock.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) =>
-      fn({ user: { update: userUpdateMock } })
+      fn({
+        user: { update: userUpdateMock },
+        session: { updateMany: sessionUpdateManyMock },
+        sonioxStreamGrant: { updateMany: grantUpdateManyMock },
+      })
     );
   });
 
@@ -113,6 +123,31 @@ describe('PATCH /api/admin/users — resetTranscriptionUsage（P5-2）', () => {
     expect(data.transcriptionUsageReconcileFrom).toBeInstanceOf(Date);
   });
 
+  // 无池用户：只把 used 清零而留着在途预留，之后结算会从新周期 used 里再释放一遍预留，
+  // 把刚完成的转录白扣成 0。必须在同一事务里先清预留列（异步/完整版/未结 grant），再写 used=0。
+  it('▶ 无池用户：同事务先清在途预留（Session 两列 + 未结 grant），再清零 used', async () => {
+    const res = await patch({ userId: 'u1', resetTranscriptionUsage: true });
+
+    expect(res.status).toBe(200);
+    expect(sessionUpdateManyMock).toHaveBeenCalledWith({
+      where: {
+        userId: 'u1',
+        OR: [{ asyncReservedMinutes: { gt: 0 } }, { fullReservedMinutes: { gt: 0 } }],
+      },
+      data: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+    });
+    expect(grantUpdateManyMock).toHaveBeenCalledWith({
+      where: { userId: 'u1', settledAt: null, reservedMinutes: { gt: 0 } },
+      data: { reservedMinutes: 0 },
+    });
+    expect(sessionUpdateManyMock.mock.invocationCallOrder[0]).toBeLessThan(
+      userUpdateMock.mock.invocationCallOrder[0]
+    );
+    expect(grantUpdateManyMock.mock.invocationCallOrder[0]).toBeLessThan(
+      userUpdateMock.mock.invocationCallOrder[0]
+    );
+  });
+
   it('不重置用量的普通编辑不得写 transcriptionUsageReconcileFrom', async () => {
     const res = await patch({ userId: 'u1', displayName: '李四' });
 
@@ -120,6 +155,8 @@ describe('PATCH /api/admin/users — resetTranscriptionUsage（P5-2）', () => {
     const data = userUpdateMock.mock.calls[0][0].data;
     expect(data.transcriptionUsageReconcileFrom).toBeUndefined();
     expect(settlePoolOnUsageResetMock).not.toHaveBeenCalled();
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+    expect(grantUpdateManyMock).not.toHaveBeenCalled();
   });
 
   it('▶ 持池用户：先按旧上限结算池子，再清零（否则本周期已动用的池分钟永久免费）', async () => {

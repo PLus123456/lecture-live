@@ -217,21 +217,81 @@ async function ensureQuotaWindow(
     return user;
   }
 
+  // 审计 #8（锁行复核）：顶层 PrismaClient 调用方（getQuotaSnapshot / checkQuota / 字节配额读写等）
+  // 此前在一份**非锁定**的快照上判「已过期」后，就用几条各自提交的语句无条件清列。若两次读之间
+  // 有并发事务已完成「重置 + 在新周期落一笔预留」（mint / async-init 都是事务内 ensureQuotaWindow
+  // → 预留），这里的清列会把对方**新周期**的 asyncReserved/fullReserved/grant.reservedMinutes 抹成 0，
+  // 而那笔预留仍留在 used 里 —— 结算时释放 0，用户被永久多扣（直到下次重置）。
+  // 修法：自开一个短事务，先 `FOR UPDATE` 锁住 User 行并按**当前值**复核 quotaResetAt<=now，
+  // 仍过期才清列 + 重置；已被并发请求推进则什么都不清，直接回读。锁序 User → Session/Grant 与
+  // reserveTranscriptionMinutes 等「先锁 User 再 ensureQuotaWindow」的事务一致。
+  // db 已是事务客户端时保持原样（外层已决定锁序；先锁 User 的调用方本就不受此竞态影响）。
+  const client = db as unknown as {
+    $transaction?: (
+      cb: (tx: QuotaDbClient) => Promise<QuotaUserRecord | null>
+    ) => Promise<QuotaUserRecord | null>;
+  };
+  if (typeof client.$transaction === 'function') {
+    return client.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<
+        Array<{
+          quotaResetAt: Date | string | null;
+          purchasedMinutesBalance: number | bigint | null;
+        }>
+      >`
+        SELECT quotaResetAt, purchasedMinutesBalance
+        FROM User WHERE id = ${userId} FOR UPDATE
+      `;
+      const row = locked[0];
+      if (!row) return null;
+      const lockedResetAt =
+        row.quotaResetAt == null ? null : new Date(row.quotaResetAt);
+      if (lockedResetAt == null || lockedResetAt.getTime() > now.getTime()) {
+        // 并发请求已推进窗口：绝不再清列（那些可能是对方新周期的预留），回读当前值即可。
+        return tx.user.findUnique({
+          where: { id: userId },
+          select: QUOTA_USER_SELECT,
+        });
+      }
+      return resetExpiredQuotaWindow(
+        userId,
+        now,
+        tx,
+        Number(row.purchasedMinutesBalance ?? 0) > 0
+      );
+    });
+  }
+  return resetExpiredQuotaWindow(
+    userId,
+    now,
+    db,
+    user.purchasedMinutesBalance > 0
+  );
+}
+
+/**
+ * ensureQuotaWindow 的「已过期」分支：结算持池用户 owed → 先清在途预留列 → 再归零 used 并推进窗口。
+ * 顶层调用方经上面的锁行复核后在短事务里调用；事务内调用方直接调用（行为与旧实现一致）。
+ */
+async function resetExpiredQuotaWindow(
+  userId: string,
+  now: Date,
+  db: QuotaDbClient,
+  hasPurchasedPool: boolean
+): Promise<QuotaUserRecord | null> {
   // 充值系统（Model A）：在清预留 + 归零 used 之前，先算持池用户本周期已消费的池子分钟（owed），
   // 稍后随重置从 gross 池扣减。owed 用**清空前**的预留快照并排除在途预留（见 computePoolOwed）。
   // L15：used 与在途预留必须同龄 —— 见 computePoolOwedSameAge（不再复用本函数开头那份快照）。
-  const poolOwed =
-    user.purchasedMinutesBalance > 0
-      ? await computePoolOwedSameAge(userId, db)
-      : 0;
+  const poolOwed = hasPurchasedPool
+    ? await computePoolOwedSameAge(userId, db)
+    : 0;
 
   // B1（防跨周期二次释放，审查 R1）：**先清**该用户在途预留列，**再**把 used 归零。
   // 顺序是关键——若先归零 used 再清列，两条非事务 updateMany 之间会出现「used=0 但 col=est」的
   // 窗口，让并发 finalize 的 settle 读到未清的 est 二次释放、把新周期真实扣费抹掉（用 GREATEST 截 0
   // → 完成的转录白扣 0）。先清列则该坏窗口不存在：settle 只会读到已清的 0、不释放。
-  // db 为事务客户端时两条本就同事务原子提交、顺序无碍；db 为普通 client 时靠此顺序消除坏窗口。
-  // 无条件清（本分支已确定 quotaResetAt<=now 过期）：即便随后乐观锁重置输给并发请求(count=0)，
-  // 对方也会同样重置 used→0，预留作废、清列正确且幂等。
+  // 顶层调用方现在整段跑在锁住 User 行的短事务里（见 ensureQuotaWindow #8），事务内调用方与外层同事务，
+  // 顺序仍按「先清列再归零」保持，不依赖提交时机。
   // R4：异步上传(asyncReservedMinutes)与完整版补全(fullReservedMinutes)两类在途预留一并清 —— 二者
   // 都计入 transcriptionMinutesUsed，used 归零即两笔预留同时作废。一条 updateMany 原子清两列。
   await db.session.updateMany({
@@ -555,15 +615,30 @@ export async function resetExpiredTranscriptionQuotas(
   });
 
   if (expiredUsers.length > 0) {
+    const expiredUserIds = expiredUsers.map((u) => u.id);
     await prisma.session.updateMany({
       where: {
-        userId: { in: expiredUsers.map((u) => u.id) },
+        userId: { in: expiredUserIds },
         OR: [
           { asyncReservedMinutes: { gt: 0 } },
           { fullReservedMinutes: { gt: 0 } },
         ],
       },
       data: { asyncReservedMinutes: 0, fullReservedMinutes: 0 },
+    });
+    // 审计 #5：非持池用户的批量重置此前**漏清** Soniox 串流 grant 的在途预留。grant.reservedMinutes
+    // 同样计入 transcriptionMinutesUsed：只把 used 归零、不清这一列，跨月仍未结的 grant（午夜前 mint、
+    // 跨月串流 / 孤儿）之后由 finalize / deduct / usage-cron 结算时，会按行上残留的 reservedMinutes
+    // 从**新周期**的 used 里再释放一遍（GREATEST 截 0）——等于把上月没用完的额度带进下月白送。
+    // 与 ensureQuotaWindow / 上面持池循环同口径、同序：先清 grant 预留，再归零 used；grant 本身保持
+    // 未结，照常按 actualMs 结算（只作废预留、不作废计费）。上方 TOCTOU 说明对本列同样适用。
+    await prisma.sonioxStreamGrant.updateMany({
+      where: {
+        userId: { in: expiredUserIds },
+        settledAt: null,
+        reservedMinutes: { gt: 0 },
+      },
+      data: { reservedMinutes: 0 },
     });
   }
 

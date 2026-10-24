@@ -936,6 +936,7 @@ describe('resetExpiredTranscriptionQuotas', () => {
   });
 
   it('无过期窗口：findMany 空 → 不清预留；返回 updateMany count=0', async () => {
+    streamGrantUpdateManyMock.mockReset();
     userFindManyMock
       .mockResolvedValueOnce([]) // poolHolders
       .mockResolvedValueOnce([]); // expiredUsers
@@ -943,6 +944,34 @@ describe('resetExpiredTranscriptionQuotas', () => {
 
     expect(await resetExpiredTranscriptionQuotas(new Date())).toBe(0);
     expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+    expect(streamGrantUpdateManyMock).not.toHaveBeenCalled();
+  });
+
+  it('▶ 审计 #5：非持池到期用户的未结 grant 预留也要在归零 used **之前**清零', async () => {
+    // 旧实现批量分支只清 Session 两列：grant.reservedMinutes 残留，跨月结算（finalize / 孤儿退款）
+    // 时会从新周期的 used 里再释放一遍 → 上月没用完的额度被带进下月白送。
+    streamGrantUpdateManyMock.mockReset();
+    streamGrantUpdateManyMock.mockResolvedValue({ count: 2 });
+    userFindManyMock
+      .mockResolvedValueOnce([]) // poolHolders（无持池用户 → 全部走批量分支）
+      .mockResolvedValueOnce([{ id: 'u1' }, { id: 'u2' }]);
+    userUpdateManyMock.mockResolvedValueOnce({ count: 2 });
+
+    const now = new Date('2026-02-01T00:00:00.000Z');
+    expect(await resetExpiredTranscriptionQuotas(now)).toBe(2);
+
+    expect(streamGrantUpdateManyMock).toHaveBeenCalledWith({
+      where: {
+        userId: { in: ['u1', 'u2'] },
+        settledAt: null,
+        reservedMinutes: { gt: 0 },
+      },
+      data: { reservedMinutes: 0 },
+    });
+    // 顺序与 ensureQuotaWindow 一致：先清 grant 预留，再归零 used。
+    expect(streamGrantUpdateManyMock.mock.invocationCallOrder[0]).toBeLessThan(
+      userUpdateManyMock.mock.invocationCallOrder[0]
+    );
   });
 });
 
@@ -1612,7 +1641,17 @@ describe('购买时长池 Model A（gross 池）', () => {
       quotaResetAt: new Date('2020-01-01T00:00:00.000Z'), // 早已过期
     });
 
+    /** 审计 #8：顶层调用方的「已过期」分支先 FOR UPDATE 锁行复核（这里仍过期 → 继续结算）。 */
+    const mockLockedStillExpired = () =>
+      queryRawMock.mockResolvedValueOnce([
+        {
+          quotaResetAt: new Date('2020-01-01T00:00:00.000Z'),
+          purchasedMinutesBalance: 100,
+        },
+      ]);
+
     it('▶ owed 取事务内重读的 used，而不是函数开头那份陈旧快照', async () => {
+      mockLockedStillExpired();
       // 开头快照 used=150（陈旧）；事务内重读 used=200（期间又落了 50 分钟消费）。
       userFindUniqueMock
         .mockResolvedValueOnce(expiredPoolUser(150)) // ensureQuotaWindow 开头的窗口检查读
@@ -1637,6 +1676,7 @@ describe('购买时长池 Model A（gross 池）', () => {
     });
 
     it('▶ used 与在途预留必须落在同一个事务快照内（对齐 cron 路径的 P5-11）', async () => {
+      mockLockedStillExpired();
       const readOrder: string[] = [];
       let insideTx = false;
       transactionMock.mockImplementationOnce(async (fn: (tx: unknown) => unknown) => {
@@ -1971,5 +2011,83 @@ describe('P5-5 对账改读台账：expected 对 billedMinutes 求和，不按�
     const result = await reconcileTranscriptionUsage(0.8);
 
     expect(result).toEqual([]);
+  });
+});
+
+describe('审计 #8：ensureQuotaWindow 顶层调用方先锁行复核再清列', () => {
+  const expiredAt = new Date('2020-01-01T00:00:00.000Z');
+
+  beforeEach(() => {
+    userFindUniqueMock.mockReset();
+    userUpdateManyMock.mockReset();
+    sessionUpdateManyMock.mockReset().mockResolvedValue({ count: 0 });
+    streamGrantUpdateManyMock.mockReset().mockResolvedValue({ count: 0 });
+    executeRawMock.mockReset();
+    queryRawMock.mockReset();
+  });
+
+  it('▶ 锁内读到窗口已被并发请求推进 → 不清任何预留列、不重置，回读当前值', async () => {
+    // 非锁定快照仍是旧周期；拿到行锁时对方事务已「重置 + 在新周期预扣 15」并提交。
+    // 旧实现照快照无条件清列：把对方新周期的预留列抹成 0，used 里却还留着那 15 → 结算释放 0、永久多扣。
+    userFindUniqueMock
+      .mockResolvedValueOnce({
+        ...freeUser({ transcriptionMinutesUsed: 40 }),
+        quotaResetAt: expiredAt,
+      })
+      .mockResolvedValueOnce(freeUser({ transcriptionMinutesUsed: 15 }));
+    queryRawMock.mockResolvedValueOnce([
+      { quotaResetAt: futureReset, purchasedMinutesBalance: 0 },
+    ]);
+
+    const snap = await getQuotaSnapshot('user-free');
+
+    expect(sessionUpdateManyMock).not.toHaveBeenCalled();
+    expect(streamGrantUpdateManyMock).not.toHaveBeenCalled();
+    expect(userUpdateManyMock).not.toHaveBeenCalled();
+    expect(executeRawMock).not.toHaveBeenCalled();
+    expect(snap?.transcriptionMinutesUsed).toBe(15);
+    // 复核必须是锁定读（FOR UPDATE），非锁定读在事务里拿的是快照、复核等于没做。
+    const lockSql = (queryRawMock.mock.calls[0][0] as TemplateStringsArray).join('?');
+    expect(lockSql).toMatch(/FOR UPDATE/);
+  });
+
+  it('锁内复核仍过期 → 在同一短事务内先清预留列、再归零 used', async () => {
+    const events: string[] = [];
+    let insideTx = false;
+    transactionMock.mockImplementationOnce(async (fn: (tx: unknown) => unknown) => {
+      insideTx = true;
+      try {
+        return await fn(mockDb);
+      } finally {
+        insideTx = false;
+      }
+    });
+    userFindUniqueMock
+      .mockResolvedValueOnce({
+        ...freeUser({ transcriptionMinutesUsed: 40 }),
+        quotaResetAt: expiredAt,
+      })
+      .mockResolvedValueOnce(freeUser({ transcriptionMinutesUsed: 0 }));
+    queryRawMock.mockImplementationOnce(async () => {
+      events.push(`lock:${insideTx}`);
+      return [{ quotaResetAt: expiredAt, purchasedMinutesBalance: 0 }];
+    });
+    sessionUpdateManyMock.mockImplementationOnce(async () => {
+      events.push(`session:${insideTx}`);
+      return { count: 1 };
+    });
+    streamGrantUpdateManyMock.mockImplementationOnce(async () => {
+      events.push(`grant:${insideTx}`);
+      return { count: 1 };
+    });
+    userUpdateManyMock.mockImplementationOnce(async () => {
+      events.push(`reset:${insideTx}`);
+      return { count: 1 };
+    });
+
+    const snap = await getQuotaSnapshot('user-free');
+
+    expect(events).toEqual(['lock:true', 'session:true', 'grant:true', 'reset:true']);
+    expect(snap?.transcriptionMinutesUsed).toBe(0);
   });
 });

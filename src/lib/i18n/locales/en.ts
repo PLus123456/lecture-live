@@ -340,6 +340,8 @@ export default {
         'This month\'s transcription quota has been exhausted. Saving and stopping the current recording now.',
       sessionReclaimed:
         'This recording was already ended on the server, so anything recorded now will not be saved to the original session. Please stop and export your local recording.',
+      concurrentRecordingLimit:
+        'Too many recordings are in progress at the same time, so this one could not start and has been stopped. Finish or stop another recording, then start again.',
     },
     finalizing: {
       title: 'Finalizing Session',

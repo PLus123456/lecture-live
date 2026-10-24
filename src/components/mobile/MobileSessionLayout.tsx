@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useAuthStore } from '@/stores/authStore';
 import TranscriptPanel from '@/components/TranscriptPanel';
 import TranslationPanel from '@/components/TranslationPanel';
@@ -122,7 +122,6 @@ export default function MobileSessionLayout({
 }: MobileSessionLayoutProps) {
   const [activeTab, setActiveTab] = useState<MobileTab>('transcript');
   const keyboardHeight = useKeyboardHeight();
-  const contentRef = useRef<HTMLDivElement>(null);
 
   // 用户组是否开通实时摘要（缺省 → 放行；服务端才是权威门禁）
   const realtimeSummaryEnabled = useAuthStore(
@@ -136,7 +135,8 @@ export default function MobileSessionLayout({
     }
   }, [realtimeSummaryEnabled, activeTab]);
 
-  useSwipeGesture(contentRef, {
+  // callback ref：录音中每秒的计时重渲染不会再重置手势起点（否则竖向滚动会被误判成切 Tab）
+  const contentSwipeRef = useSwipeGesture<HTMLDivElement>({
     onSwipeLeft: () =>
       setActiveTab((current) =>
         getNextTab(current, hasTranslation, realtimeSummaryEnabled, 'left')
@@ -179,7 +179,7 @@ export default function MobileSessionLayout({
       />
 
       <div
-        ref={contentRef}
+        ref={contentSwipeRef}
         className="min-h-0 flex-1 overflow-hidden"
         data-session-id={sessionId}
       >

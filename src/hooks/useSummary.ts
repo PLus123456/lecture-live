@@ -4,7 +4,7 @@ import { useRef, useCallback } from 'react';
 import { useSummaryStore } from '@/stores/summaryStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useAuthStore } from '@/stores/authStore';
-import { SummaryManager } from '@/lib/llm/summaryManager';
+import { SummaryManager, type SentenceTiming } from '@/lib/llm/summaryManager';
 
 export function useSummary() {
   const managerRef = useRef<SummaryManager | null>(null);
@@ -46,14 +46,21 @@ export function useSummary() {
         setLoading(false);
         setError(error);
       },
+      // 审计 #6：刷新 / 冷恢复后新建的 manager 接续 store 里本会话已有的块与滚动上下文（store
+      // 归属已由会话页 init 判定，外来数据在 init 前清空），否则块号从 #1、时间从 00:00 重来、
+      // LLM 丢失此前的上下文。惰性读取：冷恢复的草稿在 init 之后才异步灌进 store。
+      getBaseline: () => {
+        const { blocks, runningContext } = useSummaryStore.getState();
+        return { blocks, runningContext };
+      },
     });
 
     managerRef.current = manager;
   }, [addBlock, freezeLastBlock, updateRunningContext, setLoading, setError]);
 
   const onNewSentence = useCallback(
-    (sentence: string) => {
-      managerRef.current?.onNewSentence(sentence);
+    (sentence: string, timing?: SentenceTiming) => {
+      managerRef.current?.onNewSentence(sentence, timing);
       const count = managerRef.current?.bufferedSentenceCount ?? 0;
       setBatchSentences(count);
     },

@@ -34,6 +34,7 @@ import { useSwipeGesture } from '@/hooks/useSwipeGesture';
 import PlaybackSharePopover from '@/components/session/PlaybackSharePopover';
 import ChatTab from '@/components/session/ChatTab';
 import { useI18n } from '@/lib/i18n';
+import { shouldShowSessionReportPending } from '@/lib/llm/reportState';
 import type { TranscriptSegment } from '@/types/transcript';
 import type { SummaryBlock } from '@/types/summary';
 import type { SessionReportData } from '@/types/report';
@@ -197,18 +198,21 @@ function ReportContent({
     );
   }
 
+  // 与 desktop 同口径（shouldShowSessionReportPending）：后台仍在生成时，旧的
+  // worth=true/report=null 失败对象也显示「生成中」，而不是「生成失败」+ 重新生成按钮。
+  if (shouldShowSessionReportPending(reportData, Boolean(reportPendingBg))) {
+    return (
+      <div
+        className="text-center text-charcoal-400 text-sm py-12"
+        data-testid="report-generating-bg"
+      >
+        <Loader2 className="w-6 h-6 mx-auto mb-2 opacity-40 animate-spin" />
+        <p>{t('playback.reportGeneratingBg')}</p>
+      </div>
+    );
+  }
+
   if (!reportData) {
-    if (reportPendingBg) {
-      return (
-        <div
-          className="text-center text-charcoal-400 text-sm py-12"
-          data-testid="report-generating-bg"
-        >
-          <Loader2 className="w-6 h-6 mx-auto mb-2 opacity-40 animate-spin" />
-          <p>{t('playback.reportGeneratingBg')}</p>
-        </div>
-      );
-    }
     return (
       <div className="text-center text-charcoal-400 text-sm py-12">
         <ClipboardList className="w-6 h-6 mx-auto mb-2 opacity-30" />
@@ -408,7 +412,6 @@ export default function MobilePlaybackLayout({
   const router = useRouter();
   const { t } = useI18n();
   const [activeTab, setActiveTab] = useState<MobilePlaybackTab>('report');
-  const contentRef = useRef<HTMLDivElement>(null);
   const activeSegmentRef = useRef<HTMLDivElement>(null);
   const tabs: Array<{ key: MobilePlaybackTab; label: string; icon: React.ReactNode }> = [
     { key: 'report', label: t('playback.tabReport'), icon: <ClipboardList className="h-4 w-4" /> },
@@ -423,8 +426,8 @@ export default function MobilePlaybackLayout({
   // 「实时/完整版」切换后要展示的转录：父级 computes 传 displaySegments；未接完整版则回退实时。
   const transcriptSegments = displaySegments ?? segments;
 
-  // 滑动切换 Tab
-  useSwipeGesture(contentRef, {
+  // 滑动切换 Tab（callback ref：播放时每 100ms 的重渲染不会再重置手势起点）
+  const contentSwipeRef = useSwipeGesture<HTMLDivElement>({
     onSwipeLeft: () => {
       const idx = effectiveTabKeys.indexOf(activeTab);
       if (idx < effectiveTabKeys.length - 1) setActiveTab(effectiveTabKeys[idx + 1]);
@@ -512,7 +515,7 @@ export default function MobilePlaybackLayout({
       </div>
 
       {/* ─── 内容区 ─── */}
-      <div ref={contentRef} className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={contentSwipeRef} className="min-h-0 flex-1 overflow-y-auto">
         <div className="px-4 py-4">
           {/* Report */}
           {activeTab === 'report' && (

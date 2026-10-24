@@ -1,5 +1,11 @@
 import type { SummaryBlock, SummaryState, IncrementalSummaryResult } from '@/types/summary';
 
+/** 一句话在录音时间轴上的位置（与转录段落 globalStartMs/globalEndMs 同一时间轴，已扣除暂停）。 */
+export interface SentenceTiming {
+  startMs: number;
+  endMs: number;
+}
+
 export class SummaryManager {
   private state: SummaryState = { blocks: [], runningContext: '' };
   private transcriptBuffer: string[] = [];
@@ -27,6 +33,12 @@ export class SummaryManager {
   private static readonly MAX_BUFFERED_CHARS = 40_000;
   private recordingStartMs = Date.now();
   private currentStartMs = 0;
+  // 审计 #6：block 的时间范围必须落在录音时间轴上（与转录段落时间戳、回放音频一致）。此前只用
+  // 「Date.now() − 构造时刻」：manager 在页面挂载时构造、setRecordingStartMs 从未被调用 →
+  // 范围包含开录前的空闲与全部暂停时长，还含 LLM 响应耗时。现按本批句子的段落时间戳计算；
+  // 调用方没给时间戳时才退回旧的墙钟估算。
+  private bufferStartMs: number | null = null;
+  private bufferEndMs: number | null = null;
   private courseContext: string;
   private targetLanguage: string;
   private triggerSentences: number;
@@ -37,6 +49,7 @@ export class SummaryManager {
   private onStateUpdate?: (state: SummaryState) => void;
   private onSummaryStart?: () => void;
   private onSummaryError?: (error: string) => void;
+  private getBaseline?: () => SummaryState;
 
   constructor(options: {
     courseContext?: string;
@@ -48,6 +61,12 @@ export class SummaryManager {
     onStateUpdate?: (state: SummaryState) => void;
     onSummaryStart?: () => void;
     onSummaryError?: (error: string) => void;
+    /**
+     * 审计 #6：本 manager 尚未产出任何 block 时，从这里接续已有的块与滚动上下文（页面刷新 /
+     * 冷恢复后新建的 manager 否则会从「Block #1、00:00、空上下文」重新开始）。惰性读取：冷恢复
+     * 的后端草稿是在 manager 构造之后才异步灌进 store 的。
+     */
+    getBaseline?: () => SummaryState;
   }) {
     this.courseContext = options.courseContext ?? 'General university lecture';
     this.targetLanguage = options.targetLanguage ?? 'zh';
@@ -58,15 +77,17 @@ export class SummaryManager {
     this.onStateUpdate = options.onStateUpdate;
     this.onSummaryStart = options.onSummaryStart;
     this.onSummaryError = options.onSummaryError;
+    this.getBaseline = options.getBaseline;
   }
 
   setRecordingStartMs(ms: number) {
     this.recordingStartMs = ms;
   }
 
-  onNewSentence(sentence: string) {
+  onNewSentence(sentence: string, timing?: SentenceTiming) {
     this.transcriptBuffer.push(sentence);
     this.sentenceCount++;
+    if (timing) this.extendBufferRange(timing.startMs, timing.endMs);
 
     if (
       this.sentenceCount >= this.triggerSentences ||
@@ -92,8 +113,15 @@ export class SummaryManager {
     const abort = new AbortController();
     this.inflightAbort = abort;
 
+    this.adoptBaselineIfFresh();
+
     const newTranscript = this.transcriptBuffer.join(' ');
+    // 本批句子的时间范围在发请求时快照：结果回来时 buffer 里可能已有新句子。
+    const batchStartMs = this.bufferStartMs;
+    const batchEndMs = this.bufferEndMs;
     this.transcriptBuffer = [];
+    this.bufferStartMs = null;
+    this.bufferEndMs = null;
     this.sentenceCount = 0;
     this.lastSummaryTime = Date.now();
 
@@ -133,13 +161,18 @@ export class SummaryManager {
       if (gen !== this.generation) return;
 
       // 追加新 block（不修改任何旧 block）
+      // 起点接续上一块的终点（块首尾相接）；若接续来的旧块终点晚于本批第一句（旧版墙钟数据），
+      // 取本批第一句，避免出现起点晚于终点的倒置范围。
+      const startMs = batchStartMs === null
+        ? this.currentStartMs
+        : Math.min(this.currentStartMs, batchStartMs);
+      const endMs = batchEndMs === null
+        ? Date.now() - this.recordingStartMs
+        : Math.max(batchEndMs, startMs);
       const newBlock: SummaryBlock = {
         id: crypto.randomUUID(),
         blockIndex: this.state.blocks.length,
-        timeRange: {
-          startMs: this.currentStartMs,
-          endMs: Date.now() - this.recordingStartMs,
-        },
+        timeRange: { startMs, endMs },
         keyPoints: result.new_key_points,
         definitions: result.new_definitions,
         summary: result.new_summary,
@@ -157,8 +190,11 @@ export class SummaryManager {
     } catch (error) {
       // 旧代次的失败（含 reset() 主动 abort 掉的那次）不许回写任何状态、不许报错给 UI。
       if (gen !== this.generation) return;
-      // 失败时 buffer 保留，下次重试
+      // 失败时 buffer 保留，下次重试（时间范围一并并回）
       this.transcriptBuffer.unshift(newTranscript);
+      if (batchStartMs !== null && batchEndMs !== null) {
+        this.extendBufferRange(batchStartMs, batchEndMs);
+      }
       this.trimBufferToLimit();
       this.consecutiveFailures += 1;
       // 指数退避（30s → 60s → … 封顶 5 分钟），避免必败请求每个触发周期重打一次。
@@ -179,6 +215,28 @@ export class SummaryManager {
         this.isSummarizing = false;
         this.inflightAbort = null;
       }
+    }
+  }
+
+  private extendBufferRange(startMs: number, endMs: number): void {
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+    this.bufferStartMs = this.bufferStartMs === null ? startMs : Math.min(this.bufferStartMs, startMs);
+    this.bufferEndMs = this.bufferEndMs === null ? endMs : Math.max(this.bufferEndMs, endMs);
+  }
+
+  /** 审计 #6：本 manager 还没有自己的块时，接续 baseline（store 里本会话已有的块与上下文）。 */
+  private adoptBaselineIfFresh(): void {
+    if (!this.getBaseline || this.state.blocks.length > 0 || this.state.runningContext) return;
+    const baseline = this.getBaseline();
+    if (baseline.blocks.length === 0 && !baseline.runningContext) return;
+    // 浅拷贝每个块：下面「冻结上一个 block」会改 frozen，不能就地改 store 里的对象。
+    this.state = {
+      blocks: baseline.blocks.map((block) => ({ ...block })),
+      runningContext: baseline.runningContext,
+    };
+    const lastEndMs = baseline.blocks[baseline.blocks.length - 1]?.timeRange?.endMs;
+    if (typeof lastEndMs === 'number' && Number.isFinite(lastEndMs)) {
+      this.currentStartMs = lastEndMs;
     }
   }
 
@@ -224,6 +282,8 @@ export class SummaryManager {
     this.retryNotBefore = 0;
     this.state = { blocks: [], runningContext: '' };
     this.transcriptBuffer = [];
+    this.bufferStartMs = null;
+    this.bufferEndMs = null;
     this.sentenceCount = 0;
     this.lastSummaryTime = Date.now();
     this.currentStartMs = 0;

@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   LogOut,
@@ -49,7 +49,6 @@ function getQuotaPercent(limit?: number, used?: number) {
 }
 
 export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
-  const drawerRef = useRef<HTMLDivElement>(null);
   const { mounted, leaving } = useExitAnimation(open, 250);
   const { t } = useI18n();
   const router = useRouter();
@@ -59,7 +58,8 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
   const setUserSettingsOpen = useSettingsStore((state) => state.setUserSettingsOpen);
   const setRechargeOpen = useSettingsStore((state) => state.setRechargeOpen);
 
-  useSwipeGesture(drawerRef, {
+  // callback ref：抽屉打开后（晚于首个 effect 才挂载）也能挂上监听器，父组件重渲染不重置手势起点
+  const drawerSwipeRef = useSwipeGesture<HTMLDivElement>({
     onSwipeRight: onClose,
     threshold: 48,
   });
@@ -120,7 +120,7 @@ export default function MobileDrawer({ open, onClose }: MobileDrawerProps) {
         onClick={onClose}
       />
       <div
-        ref={drawerRef}
+        ref={drawerSwipeRef}
         className={`safe-top absolute bottom-0 left-0 top-0 flex w-[280px] max-w-[82vw] flex-col border-r border-cream-200 bg-white shadow-2xl ${leaving ? 'animate-slide-out-left' : 'animate-slide-in-left'}`}
       >
         <div className="flex items-start justify-between border-b border-cream-200 px-5 py-5">

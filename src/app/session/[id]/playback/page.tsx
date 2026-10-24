@@ -429,6 +429,28 @@ export default function PlaybackPage() {
     const createdUrls: string[] = [];
     const abortController = new AbortController();
 
+    // 音频段被替换（新音源就绪 / 旧音源卸下）时**就地同步**重置播放状态。此前交给一个依赖
+    // audioSegments 的独立 effect：它跑在提交之后，会把与新音频段同批写下的换源恢复点
+    // （pendingSeekMsRef / currentTimeMs）清成 0 —— 切换「原声/增强」总是从头播放；而且恢复点
+    // 能否生效还取决于那个 effect 与新 <audio> 的 loadedmetadata 谁先到。就地重置后，恢复点在
+    // 新 <audio> 渲染之前就已就位，由 onLoadedMetadata 消费。
+    // nextTimeMs 为 null 表示保留当前显示进度（换源重载期间不闪回 0）。
+    const resetPlaybackForAudioChange = (
+      pendingSeekMs: number | null,
+      nextTimeMs: number | null
+    ) => {
+      if (playbackClockRef.current !== null) {
+        window.clearInterval(playbackClockRef.current);
+        playbackClockRef.current = null;
+      }
+      setIsPlaying(false);
+      isPlayingRef.current = false;
+      playbackClockStateRef.current = null;
+      shouldResumePlaybackRef.current = false;
+      pendingSeekMsRef.current = pendingSeekMs;
+      if (nextTimeMs !== null) setCurrentTimeMs(nextTimeMs);
+    };
+
     const audioUrl = isShareMode
       ? `/api/share/view/${encodeURIComponent(shareToken!)}/audio`
       : `/api/sessions/${sessionId}/audio${
@@ -511,8 +533,6 @@ export default function PlaybackPage() {
           return segment;
         });
 
-        setAudioSegments(nextSegments);
-
         // 切换音源：恢复切换前的播放进度（找到所属段 + 段内偏移，交给 onLoadedMetadata 消费）
         const resumeMs = pendingVariantResumeMsRef.current;
         pendingVariantResumeMsRef.current = null;
@@ -521,17 +541,16 @@ export default function PlaybackPage() {
             (seg) => resumeMs < seg.startOffsetMs + seg.durationMs
           );
           const target = idx >= 0 ? idx : nextSegments.length - 1;
-          setActiveAudioIndex(target);
-          setCurrentTimeMs(resumeMs);
-          pendingSeekMsRef.current = Math.max(
-            0,
-            resumeMs - nextSegments[target].startOffsetMs
+          resetPlaybackForAudioChange(
+            Math.max(0, resumeMs - nextSegments[target].startOffsetMs),
+            resumeMs
           );
+          setActiveAudioIndex(target);
         } else {
+          resetPlaybackForAudioChange(null, 0);
           setActiveAudioIndex(0);
-          setCurrentTimeMs(0);
         }
-        setIsPlaying(false);
+        setAudioSegments(nextSegments);
       })
       .catch((err) => {
         console.error('Failed to load audio:', err);
@@ -542,6 +561,11 @@ export default function PlaybackPage() {
       abortController.abort();
       createdUrls.forEach((url) => revokeAccountObjectUrl(url));
       recordingBlobRef.current = null;
+      // 换源进行中（已记下恢复进度）时保留显示进度，其余情况（换 token / 卸载）归零。
+      resetPlaybackForAudioChange(
+        null,
+        pendingVariantResumeMsRef.current !== null ? null : 0
+      );
       setAudioSegments([]);
       setActiveAudioIndex(0);
     };
@@ -915,16 +939,6 @@ export default function PlaybackPage() {
       stopPlaybackClock();
     };
   }, [stopPlaybackClock]);
-
-  useEffect(() => {
-    stopPlaybackClock();
-    setIsPlaying(false);
-    isPlayingRef.current = false;
-    setCurrentTimeMs(0);
-    playbackClockStateRef.current = null;
-    shouldResumePlaybackRef.current = false;
-    pendingSeekMsRef.current = null;
-  }, [audioSegments, stopPlaybackClock]);
 
   const togglePlayback = useCallback(() => {
     if (!audioRef.current || !activeAudioSegment) return;
@@ -1740,6 +1754,18 @@ export default function PlaybackPage() {
           />
         )}
 
+        {/* 重新生成标题确认弹窗（移动端）。此前只在 desktop 分支渲染：移动端「信息」页的
+            重新生成按钮只把 regenerateConfirmOpen 置 true，却没有任何弹窗出现，点了毫无反应。 */}
+        <ConfirmDialog
+          open={regenerateConfirmOpen}
+          title={t('playback.regenerateTitle')}
+          message={t('playback.regenerateTitleConfirm')}
+          confirmText={t('playback.regenerateTitle')}
+          loading={regeneratingTitle}
+          onConfirm={handleRegenerateTitleConfirm}
+          onCancel={() => setRegenerateConfirmOpen(false)}
+        />
+
         {/* 完整版转录·收费确认弹窗（移动端；desktop 分支末尾另有一份，二者互斥渲染） */}
         <ConfirmDialog
           open={fullConfirmOpen}
@@ -2369,7 +2395,10 @@ export default function PlaybackPage() {
 
             {/* Time + progress bar */}
             <div className="flex-1 flex items-center gap-3">
-              <span className="text-[11px] font-mono text-charcoal-500 tabular-nums w-16 text-right">
+              <span
+                className="text-[11px] font-mono text-charcoal-500 tabular-nums w-16 text-right"
+                data-testid="playback-current-time"
+              >
                 {formatDuration(currentTimeMs)}
               </span>
 

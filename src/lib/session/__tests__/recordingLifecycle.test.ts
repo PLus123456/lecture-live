@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyStatusSync,
+  isConcurrentRecordingLimitBody,
+  isLiveStoreOwnedBy,
   isSessionReclaimedResult,
   localRecordingForSession,
   resolveFinalizeOutcome,
@@ -42,6 +44,54 @@ describe('classifyStatusSync', () => {
   it('fetch 抛错（断网）→ network-error，不误判回收', () => {
     expect(classifyStatusSync({ error: true })).toBe('network-error');
   });
+
+  it('R5：并发闸 409（无 currentStatus + 固定文案）→ concurrency-limit，不当成回收', () => {
+    const body = {
+      error:
+        'Too many concurrent recordings in progress (max 3). Finish or discard an existing recording first.',
+    };
+    expect(classifyStatusSync({ ok: false, status: 409, body })).toBe('concurrency-limit');
+    expect(isSessionReclaimedResult('concurrency-limit')).toBe(false);
+    // 服务端日后补机读 code 也识别
+    expect(
+      classifyStatusSync({ ok: false, status: 409, body: { code: 'concurrent_recording_limit' } })
+    ).toBe('concurrency-limit');
+  });
+
+  it('R5 负向：CAS 落空 409（带 currentStatus）/ 无 body → 仍是 conflict', () => {
+    expect(
+      classifyStatusSync({
+        ok: false,
+        status: 409,
+        body: { error: 'Session was modified concurrently', currentStatus: 'COMPLETED' },
+      })
+    ).toBe('conflict');
+    expect(classifyStatusSync({ ok: false, status: 409 })).toBe('conflict');
+    expect(classifyStatusSync({ ok: false, status: 409, body: 'nope' })).toBe('conflict');
+  });
+});
+
+describe('isConcurrentRecordingLimitBody', () => {
+  it('currentStatus 存在时一律不是并发闸（哪怕文案相近）', () => {
+    expect(
+      isConcurrentRecordingLimitBody({ error: 'Too many concurrent recordings', currentStatus: null })
+    ).toBe(false);
+  });
+  it('非对象 / 数组 / 无关文案 → false', () => {
+    expect(isConcurrentRecordingLimitBody(null)).toBe(false);
+    expect(isConcurrentRecordingLimitBody([])).toBe(false);
+    expect(isConcurrentRecordingLimitBody({ error: 'Cannot complete session before audio is saved' })).toBe(false);
+  });
+});
+
+describe('isLiveStoreOwnedBy（P0-3：未绑定不算归属）', () => {
+  it('仅当 activeSessionId 与页面会话相同才归属', () => {
+    expect(isLiveStoreOwnedBy('sess-a', 'sess-a')).toBe(true);
+    expect(isLiveStoreOwnedBy('sess-b', 'sess-a')).toBe(false);
+    expect(isLiveStoreOwnedBy(null, 'sess-a')).toBe(false);
+    expect(isLiveStoreOwnedBy(undefined, 'sess-a')).toBe(false);
+    expect(isLiveStoreOwnedBy('', 'sess-a')).toBe(false);
+  });
 });
 
 describe('isSessionReclaimedResult（P2-1）', () => {
@@ -71,9 +121,12 @@ describe('localRecordingForSession（P0-3 跨会话隔离）', () => {
     expect(localRecordingForSession('sess-A', 'sess-A', 'paused')).toBe('paused');
   });
 
-  it('向后兼容：store 未绑定（activeSessionId 空）→ 回退信任 recordingState，不回归刷新恢复', () => {
-    expect(localRecordingForSession(null, 'sess-B', 'recording')).toBe('recording');
-    expect(localRecordingForSession(undefined, 'sess-B', 'paused')).toBe('paused');
+  it('store 未绑定（activeSessionId 空）→ 同样视为外来（null）：冷恢复漏绑的 A 不得串到 B', () => {
+    // 旧行为回退信任 recordingState：冷恢复 A（未绑定的 paused）后导航到新会话 B，
+    // B 会据此走 live-refresh，展示/续录/PUT A 的转录到 B（审计 high）。
+    expect(localRecordingForSession(null, 'sess-B', 'recording')).toBeNull();
+    expect(localRecordingForSession(undefined, 'sess-B', 'paused')).toBeNull();
+    expect(deriveRecoveryMode(true, 'CREATED', localRecordingForSession(null, 'sess-B', 'paused'))).toBe('fresh');
   });
 
   it('配合 deriveRecoveryMode：别会话录音态被过滤后不再 live-refresh', () => {
@@ -214,9 +267,9 @@ describe('shouldPlaybackYieldToLiveStore（P1-8 / P0-3 按 sessionId 隔离）',
     expect(shouldPlaybackYieldToLiveStore('sess-a', 'sess-a', 'paused')).toBe(true);
     expect(shouldPlaybackYieldToLiveStore('sess-a', 'sess-a', 'finalizing')).toBe(true);
   });
-  it('未绑定的旧数据（activeSessionId 空）+ 受保护态 → 让位（向后兼容）', () => {
-    expect(shouldPlaybackYieldToLiveStore(null, 'sess-a', 'recording')).toBe(true);
-    expect(shouldPlaybackYieldToLiveStore(undefined, 'sess-a', 'paused')).toBe(true);
+  it('未绑定（activeSessionId 空）+ 受保护态 → 不让位：外来数据不得挡住回放、也不得被 ChatTab/导出读到', () => {
+    expect(shouldPlaybackYieldToLiveStore(null, 'sess-a', 'recording')).toBe(false);
+    expect(shouldPlaybackYieldToLiveStore(undefined, 'sess-a', 'paused')).toBe(false);
   });
   it('P0-3 关键回归：store 绑定到别的会话 → **不让位**，回放 B 绝不被 A 的 live store 挡住（跨会话泄漏/丢历史）', () => {
     expect(shouldPlaybackYieldToLiveStore('sess-b', 'sess-a', 'recording')).toBe(false);

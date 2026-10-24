@@ -125,21 +125,29 @@ export default function RechargeModal() {
   const symbol = config?.currencySymbol ?? '¥';
   const providers = config?.providers ?? [];
 
+  // 两个下单入口都必须在 finally 里释放 busy：此前 fetch 抛错（断网/超时）会跳过 setBusy(false)，
+  // 而本弹窗常驻挂在 dashboard layout 里不卸载，所有购买按钮从此一直禁用到整页刷新。
   const buyWithBalance = async (tierId: string) => {
     setBusy(true);
     setMsg(null);
-    const res = await fetch('/api/wallet/checkout', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify({ tierId, mode: 'balance' }),
-    });
-    setBusy(false);
-    if (res.ok) {
-      setMsg(t('recharge.buySuccess'));
-      await loadWallet();
-      await fetchQuotas();
-    } else {
-      setMsg((await res.json()).error ?? t('common.operationFailed'));
+    try {
+      const res = await fetch('/api/wallet/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        body: JSON.stringify({ tierId, mode: 'balance' }),
+      });
+      if (res.ok) {
+        setMsg(t('recharge.buySuccess'));
+        await loadWallet();
+        await fetchQuotas();
+      } else {
+        const data = await res.json().catch(() => null);
+        setMsg(data?.error ?? t('common.operationFailed'));
+      }
+    } catch {
+      setMsg(t('common.networkError'));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -147,24 +155,30 @@ export default function RechargeModal() {
     setBusy(true);
     setMsg(null);
     setQr(null);
-    const res = await fetch('/api/wallet/checkout', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify({ tierId, mode: 'pay', provider }),
-    });
-    setBusy(false);
-    setPendingPay(null);
-    if (!res.ok) {
-      setMsg((await res.json()).error ?? t('common.operationFailed'));
-      return;
-    }
-    const d = await res.json();
-    if (d.payUrl) {
-      // 跳转支付页（支付宝/Stripe/沙箱）
-      window.location.href = d.payUrl;
-    } else if (d.qrCode) {
-      // 扫码支付（微信）
-      setQr(d.qrCode);
+    try {
+      const res = await fetch('/api/wallet/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        body: JSON.stringify({ tierId, mode: 'pay', provider }),
+      });
+      setPendingPay(null);
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        setMsg(data?.error ?? t('common.operationFailed'));
+        return;
+      }
+      const d = await res.json();
+      if (d.payUrl) {
+        // 跳转支付页（支付宝/Stripe/沙箱）
+        window.location.href = d.payUrl;
+      } else if (d.qrCode) {
+        // 扫码支付（微信）
+        setQr(d.qrCode);
+      }
+    } catch {
+      setMsg(t('common.networkError'));
+    } finally {
+      setBusy(false);
     }
   };
 

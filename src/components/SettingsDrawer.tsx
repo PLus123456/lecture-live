@@ -47,6 +47,8 @@ export default function SettingsDrawer({
   const [termsInput, setTermsInput] = useState(settings.terms.join(', '));
 
   // Re-snapshot whenever the drawer opens
+  // 只在「打开」时重新快照草稿：不能依赖 currentMicDeviceId —— 抽屉打开期间点选麦克风会改变它，
+  // 若随之重新快照，用户尚未「应用」的语言 / 领域 / 主题 / 术语修改会被静默清掉。
   useEffect(() => {
     if (isOpen) {
       setDraft({
@@ -58,7 +60,13 @@ export default function SettingsDrawer({
         terms: settings.terms,
       });
       setTermsInput(settings.terms.join(', '));
-      // 刷新麦克风列表
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
+
+  // 刷新麦克风列表：打开时，以及打开期间切换麦克风后（列表与「使用中」回退项跟上当前设备）。
+  useEffect(() => {
+    if (isOpen) {
       navigator.mediaDevices.enumerateDevices()
         .then((devices) => {
           const mics = normalizeMicrophoneDevices(devices, {

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { X } from 'lucide-react';
 import { useSwipeGesture } from '@/hooks/useSwipeGesture';
 import { useExitAnimation } from '@/hooks/useExitAnimation';
@@ -20,10 +20,11 @@ export default function BottomSheet({
   children,
   maxHeight = '85vh',
 }: BottomSheetProps) {
-  const sheetRef = useRef<HTMLDivElement>(null);
   const { mounted, leaving } = useExitAnimation(open, 250);
 
-  useSwipeGesture(sheetRef, {
+  // 下滑关闭只挂在顶部把手/标题栏上：挂在整个面板上时，用户在可滚动内容里往回滚（手指下滑）
+  // 也会被当成「下滑关闭」。callback ref 保证面板打开后（晚于首个 effect 才挂载）也能挂上。
+  const handleSwipeRef = useSwipeGesture<HTMLDivElement>({
     onSwipeDown: onClose,
     threshold: 56,
   });
@@ -62,11 +63,14 @@ export default function BottomSheet({
       />
       <div className="absolute inset-x-0 bottom-0 flex justify-center">
         <div
-          ref={sheetRef}
           className={`w-full rounded-t-2xl bg-white shadow-2xl ${leaving ? 'animate-sheet-out' : 'animate-sheet-in'}`}
           style={{ maxHeight }}
         >
-          <div className="flex items-center justify-between border-b border-cream-200 px-4 pb-3 pt-2">
+          <div
+            ref={handleSwipeRef}
+            data-testid="bottom-sheet-handle"
+            className="flex items-center justify-between border-b border-cream-200 px-4 pb-3 pt-2"
+          >
             <div className="flex-1">
               <div className="mx-auto mb-2 h-1.5 w-12 rounded-full bg-cream-300" />
               {title ? (

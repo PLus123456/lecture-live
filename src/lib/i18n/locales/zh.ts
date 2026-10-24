@@ -327,6 +327,7 @@ export default {
       lowQuotaWarning: '剩余转写额度不足 {minutes} 分钟，额度耗尽后将自动结束本次录制。',
       quotaExhaustedStop: '本月转写额度已耗尽，系统正在自动结束并保存当前录制。',
       sessionReclaimed: '本场录音已在服务器结束，继续录制的内容不会保存到原会话。请停止并导出本地录音。',
+      concurrentRecordingLimit: '同时进行中的录音过多，本次录音未能开始，已自动停止。请先结束或停止其它录音后再重新开始。',
     },
     finalizing: {
       title: '正在保存会话',

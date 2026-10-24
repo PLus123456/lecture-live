@@ -281,4 +281,60 @@ describe('artifact 回填脚本的运行前提（部署阻断级）', () => {
     );
     expect(compose).toMatch(/build:\n\s+context: \.\n/);
   });
+
+  it('Docker：next build 只拿到一次性随机的 JWT_SECRET / ENCRYPTION_KEY（否则 import 即 FATAL，镜像建不出来）', () => {
+    const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+    const builderStage = dockerfile.slice(
+      dockerfile.indexOf('AS builder'),
+      dockerfile.indexOf('AS runner')
+    );
+
+    for (const name of ['JWT_SECRET', 'ENCRYPTION_KEY']) {
+      // 只作用于 npm run build 这一条命令的进程环境，每次构建随机生成
+      expect(builderStage).toContain(
+        `${name}="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"`
+      );
+      // 绝不能固化进镜像：既不 ENV 也不 ARG（ARG 会出现在 docker history 里）
+      expect(dockerfile).not.toMatch(new RegExp(`^(ENV|ARG)[^\\n]*${name}`, 'm'));
+    }
+    expect(builderStage.indexOf('ENCRYPTION_KEY="$(node')).toBeLessThan(
+      builderStage.indexOf('npm run build')
+    );
+  });
+
+  it('Docker：base 阶段装 openssl —— 否则 Prisma 判不出 OpenSSL 版本，生成要 libssl.so.1.1 的引擎，容器启动即挂', () => {
+    const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+    const baseStage = dockerfile.slice(0, dockerfile.indexOf('AS deps'));
+
+    expect(baseStage).toContain('FROM node:24-alpine AS base');
+    expect(baseStage).toMatch(/^RUN apk add --no-cache openssl$/m);
+  });
+
+  it('Docker：WS 的运行时依赖（build:ws 的 --external）要装进 ws-server/node_modules，与裸机 install.sh 同口径', () => {
+    const dockerfile = readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8');
+    const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as {
+      scripts: Record<string, string>;
+    };
+    const wsPkg = JSON.parse(
+      readFileSync(path.join(ROOT, 'deploy', 'ws-package.json'), 'utf8')
+    ) as { dependencies: Record<string, string> };
+
+    const wsDepsStage = dockerfile.slice(
+      dockerfile.indexOf('AS ws-deps'),
+      dockerfile.indexOf('AS builder')
+    );
+    expect(wsDepsStage).toContain('COPY deploy/ws-package.json ./package.json');
+    expect(wsDepsStage).toContain('npm install --omit=dev');
+    expect(wsDepsStage).toContain('prisma@5 generate');
+    expect(dockerfile).toContain('COPY --from=ws-deps /ws/node_modules ./ws-server/node_modules');
+
+    // build:ws 留作运行时 require 的包（可选的 bufferutil / utf-8-validate 除外）都得在清单里
+    const externals = [...pkg.scripts['build:ws'].matchAll(/--external:(\S+)/g)]
+      .map((m) => m[1])
+      .filter((name) => name !== 'bufferutil' && name !== 'utf-8-validate');
+    expect(externals.length).toBeGreaterThan(0);
+    for (const name of externals) {
+      expect(wsPkg.dependencies).toHaveProperty(name);
+    }
+  });
 });

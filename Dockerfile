@@ -1,4 +1,9 @@
 FROM node:24-alpine AS base
+# Prisma 要靠 `openssl version` 判定该用哪个 query engine。当前 Alpine 镜像自带 libssl.so.3，却
+# 不带 openssl 命令（库也已挪到 /usr/lib，Prisma 5 的目录探测找不到）→ 回落 openssl-1.1.x：
+# deps 阶段生成的是要 libssl.so.1.1 的引擎，容器一启动 ensure-database 的第一条查询就报
+# 「Error loading shared library libssl.so.1.1」。放在 base：生成（deps）与运行（runner）都要探测。
+RUN apk add --no-cache openssl
 
 # Install dependencies
 FROM base AS deps
@@ -9,6 +14,16 @@ COPY prisma ./prisma
 # 否则 npm ci 在 postinstall 阶段因找不到脚本而非零退出、整个构建失败。
 COPY scripts ./scripts
 RUN npm ci
+
+# WebSocket 服务器的运行时依赖，与裸机 deploy/install.sh 同口径（deploy/ws-package.json +
+# prisma generate）。dist/websocket.js 把 @prisma/client / ioredis / jsonwebtoken / bcryptjs 留作
+# 运行时 require，Next standalone 的 node_modules 并不带它们：缺了它们 WS 一启动就
+# MODULE_NOT_FOUND，entrypoint 随即让整个容器退出。
+FROM base AS ws-deps
+WORKDIR /ws
+COPY deploy/ws-package.json ./package.json
+COPY prisma ./prisma
+RUN npm install --omit=dev --no-audit --no-fund && npx --yes prisma@5 generate
 
 # Build the app
 FROM base AS builder
@@ -23,9 +38,15 @@ ARG NEXT_PUBLIC_APP_URL
 ARG NEXT_PUBLIC_WS_URL
 # 空值必须 unset，不能以空串进入 next build：Next 连「已定义的空串」也会内联进服务端
 # bundle，运行时 env_file 里的真实值反而读不到（requestOrigin / publicAuth 按它判定来源）。
+# next build 收集页面数据时会 import 服务端模块，而 serverSecrets.ts 在 import 时就校验
+# JWT_SECRET / ENCRYPTION_KEY（缺失或弱值直接 FATAL）——构建上下文不带任何 .env，不给值镜像
+# 根本建不出来。这里只给 next build 这一个进程注入一次性随机值：不进 ENV、不落任何层，
+# next.config.js 也不内联它们；运行时的真实值照旧来自 env_file。
 # 最后一步按与运行时同一套 esbuild 参数预编译 artifact 回填脚本（见 runner 阶段说明）。
 RUN if [ -z "${NEXT_PUBLIC_APP_URL:-}" ]; then unset NEXT_PUBLIC_APP_URL; fi; \
     if [ -z "${NEXT_PUBLIC_WS_URL:-}" ]; then unset NEXT_PUBLIC_WS_URL; fi; \
+    JWT_SECRET="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")" \
+    ENCRYPTION_KEY="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")" \
     npm run build && npm run build:ws \
     && node scripts/backfill-stored-artifacts.mjs --build-only dist/backfill-stored-artifacts.mjs
 
@@ -46,8 +67,9 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 
-# WebSocket 服务器编译产物
+# WebSocket 服务器编译产物 + 它的运行时依赖（见 ws-deps 阶段）
 COPY --from=builder /app/dist/websocket.js ./ws-server/websocket.js
+COPY --from=ws-deps /ws/node_modules ./ws-server/node_modules
 
 # Prisma client（standalone 产物中可能不含完整 client）
 COPY --from=deps /app/node_modules/.prisma ./node_modules/.prisma

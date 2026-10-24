@@ -144,6 +144,12 @@ async function parsePptxForAttachment(buffer) {
   const parseOffice = module.parseOffice ?? module.default?.parseOffice;
   if (typeof parseOffice !== 'function') throw new Error('PPTX parser unavailable');
   const ast = await parseOffice(buffer);
+  // officeparser v8 删除了同步的 ast.toText()（旧写法在 v8 下会静默返回空串，PPTX 附件全变空白）。
+  // ast.to('text') 在 v7 / v8 都可用；toText 只留作兜底。
+  if (typeof ast?.to === 'function') {
+    const rendered = await ast.to('text');
+    return typeof rendered?.value === 'string' ? rendered.value : '';
+  }
   return typeof ast?.toText === 'function' ? ast.toText() : '';
 }
 

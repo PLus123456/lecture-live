@@ -5,10 +5,56 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   DOCUMENT_PARSER_MAX_QUEUED_BYTES,
   DOCUMENT_PARSER_MAX_OLD_SPACE_MB,
+  extractAttachmentDocumentText,
   extractKeywordDocumentText,
   inspectPdfDocument,
   runRestrictedDocumentParser,
 } from '@/lib/documentParserProcess';
+
+const MIME_PPTX =
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+
+/** 最小可解析 PPTX：一页一个文本框。 */
+async function buildMinimalPptx(slideText: string): Promise<Buffer> {
+  const nsP = 'http://schemas.openxmlformats.org/presentationml/2006/main';
+  const nsA = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+  const nsR = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  const zip = new JSZip();
+  zip.file(
+    '[Content_Types].xml',
+    `${xml}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+      '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+      '<Default Extension="xml" ContentType="application/xml"/>' +
+      '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>' +
+      '<Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>' +
+      '</Types>'
+  );
+  zip.file(
+    '_rels/.rels',
+    `${xml}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>' +
+      '</Relationships>'
+  );
+  zip.file(
+    'ppt/presentation.xml',
+    `${xml}<p:presentation xmlns:p="${nsP}" xmlns:r="${nsR}" xmlns:a="${nsA}">` +
+      '<p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>'
+  );
+  zip.file(
+    'ppt/_rels/presentation.xml.rels',
+    `${xml}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+      '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>' +
+      '</Relationships>'
+  );
+  zip.file(
+    'ppt/slides/slide1.xml',
+    `${xml}<p:sld xmlns:p="${nsP}" xmlns:a="${nsA}" xmlns:r="${nsR}"><p:cSld><p:spTree><p:sp>` +
+      `<p:txBody><a:bodyPr/><a:p><a:r><a:t>${slideText}</a:t></a:r></a:p></p:txBody>` +
+      '</p:sp></p:spTree></p:cSld></p:sld>'
+  );
+  return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
 
 const PROBE_WORKER = path.join(
   process.cwd(),
@@ -67,6 +113,15 @@ describe('restricted document parser process', () => {
     await expect(inspectPdfDocument(Buffer.concat(chunks))).resolves.toEqual({
       pages: 1,
     });
+  });
+
+  // officeparser v8 删除了 ast.toText()：旧 worker 写法在 v8 下不报错、只返回空串，
+  // 聊天附件里的 PPTX 会静默变成空白。这里走真实受限子进程 + 真实 officeparser 守住。
+  it('extracts PPTX attachment text through the Office parser', async () => {
+    const buffer = await buildMinimalPptx('LectureLive slide text');
+    const result = await extractAttachmentDocumentText(buffer, MIME_PPTX);
+    expect(result.text).toContain('LectureLive slide text');
+    expect(result.truncated).toBe(false);
   });
 
   it('has an explicit V8 heap ceiling, high enough for ordinary documents', () => {

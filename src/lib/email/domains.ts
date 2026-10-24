@@ -54,6 +54,28 @@ export function normalizeEmail(email: string): string {
   return (email ?? '').trim().toLowerCase();
 }
 
+/**
+ * 登录入参的最小准入（入参应已 normalizeEmail）：1~254 个可打印 ASCII 字符（0x21–0x7E）。
+ *
+ * 为什么不直接用 isValidEmailAddress 当登录门槛：setup 向导建首个管理员、管理员建号/改邮箱
+ * 都只经 `<input type="email">`，它放行 `admin@localhost` 这类无点域名、`a..b@x.com` 这类
+ * 连续点——严格校验会把这些存量账号直接锁在门外（包括管理员自己）。
+ *
+ * 这里只挡真正危险的那一类：email 列的排序规则是 utf8mb4_unicode_ci（大小写 + 重音不敏感，
+ * 控制 / 零宽字符可忽略），重音字母、全角字符、控制字符等非 ASCII 写法会与真实账号
+ * 「排序规则相等」、却各自哈希出一个新的按邮箱限流桶。可打印 ASCII 在该排序规则下只剩
+ * 大小写等价，而大小写已由 normalizeEmail 抹平。合法注册路径（checkRegistrationEmail）
+ * 只收 ASCII，故不会误伤任何能正常注册出来的账号。
+ */
+export function isLoginEmailCandidate(email: string): boolean {
+  return (
+    typeof email === 'string' &&
+    email.length > 0 &&
+    email.length <= 254 &&
+    /^[\x21-\x7e]+$/.test(email)
+  );
+}
+
 /** 取邮箱域名（已小写）；非法邮箱返回 null。 */
 export function getEmailDomain(email: string): string | null {
   const normalized = normalizeEmail(email);

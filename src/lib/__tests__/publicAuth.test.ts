@@ -24,7 +24,9 @@ describe('SEC-007 public auth admission', () => {
     resolveRequestClientIpMock.mockReset().mockReturnValue('203.0.113.9');
   });
 
-  it('stops at the fixed global gate before resolving an IP', async () => {
+  // 旧顺序（全站桶在前）下，被自己 IP 桶拒绝的请求也已计入全站预算：单个客户端每分钟
+  // 600 个空请求就能让全站登录 / 注册 / 找回密码一起 429。
+  it('a request rejected by its IP buckets never consumes the site-wide budget', async () => {
     const blocked = new Response('limited', { status: 429 });
     enforceRateLimitMock.mockResolvedValueOnce(blocked);
 
@@ -38,12 +40,22 @@ describe('SEC-007 public auth admission', () => {
     expect(enforceRateLimitMock).toHaveBeenCalledTimes(1);
     expect(enforceRateLimitMock).toHaveBeenCalledWith(
       expect.any(Request),
-      expect.objectContaining({ scope: 'auth:public:global', key: 'global' })
+      expect.objectContaining({ scope: 'auth:public:ip', key: 'ip:203.0.113.9' })
     );
-    expect(resolveRequestClientIpMock).not.toHaveBeenCalled();
+
+    enforceRateLimitMock.mockClear();
+    enforceRateLimitMock.mockResolvedValueOnce(null).mockResolvedValueOnce(blocked);
+    const endpointBlocked = await enforcePublicAuthPrelude(
+      new Request('http://local'),
+      { scope: 'login', endpointIpLimit: 50, endpointWindowMs: 60_000 }
+    );
+    expect(endpointBlocked.response).toBe(blocked);
+    expect(
+      enforceRateLimitMock.mock.calls.map((call) => call[1].scope)
+    ).toEqual(['auth:public:ip', 'auth:login:prelude:ip']);
   });
 
-  it('keeps the global gate when IP is unknown and uses bounded fixed keys otherwise', async () => {
+  it('keeps the global gate when IP is unknown and checks it last otherwise', async () => {
     resolveRequestClientIpMock.mockReturnValueOnce('unknown');
     await enforcePublicAuthPrelude(new Request('http://local'), {
       scope: 'login',
@@ -51,6 +63,10 @@ describe('SEC-007 public auth admission', () => {
       endpointWindowMs: 60_000,
     });
     expect(enforceRateLimitMock).toHaveBeenCalledTimes(1);
+    expect(enforceRateLimitMock).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({ scope: 'auth:public:global', key: 'global' })
+    );
 
     enforceRateLimitMock.mockClear();
     resolveRequestClientIpMock.mockReturnValueOnce('198.51.100.4');
@@ -60,12 +76,12 @@ describe('SEC-007 public auth admission', () => {
       endpointWindowMs: 600_000,
     });
     expect(enforceRateLimitMock.mock.calls.map((call) => call[1])).toEqual([
-      expect.objectContaining({ scope: 'auth:public:global', key: 'global' }),
       expect.objectContaining({ scope: 'auth:public:ip', key: 'ip:198.51.100.4' }),
       expect.objectContaining({
         scope: 'auth:register:prelude:ip',
         key: 'ip:198.51.100.4',
       }),
+      expect.objectContaining({ scope: 'auth:public:global', key: 'global' }),
     ]);
   });
 

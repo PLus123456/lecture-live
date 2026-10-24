@@ -12,6 +12,7 @@ import {
   enforcePublicAuthPrelude,
   publicAuthAccountKey,
   readPublicAuthJson,
+  rejectMalformedStringFields,
 } from '@/lib/publicAuth';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { resolveRequestClientIp } from '@/lib/clientIp';
@@ -37,6 +38,33 @@ function normalizeDisplayName(value: unknown): string {
   return value.trim().slice(0, MAX_DISPLAY_NAME_LENGTH);
 }
 
+/**
+ * P2002 的 meta.target 形状随数据库而异：PostgreSQL / SQLite 给字段数组（['email']），
+ * MySQL 给索引名字符串（'User_email_key'，个别版本带表名前缀 'User.User_email_key'）。
+ * 本项目跑 MySQL——旧实现只认数组，于是「邮箱已存在」永远落进 400 分支，
+ * L6 的「与成功响应完全一致」在生产上从未生效（注册接口仍是一个精确的邮箱枚举器）。
+ */
+function isEmailUniqueTarget(target: unknown): boolean {
+  if (Array.isArray(target)) {
+    return target.some(
+      (field) => typeof field === 'string' && field.toLowerCase() === 'email'
+    );
+  }
+  return typeof target === 'string' && /(^|[._])email([._]|$)/i.test(target);
+}
+
+/** 需邮箱验证时注册的唯一对外响应：新建账号与邮箱已存在两条路径必须逐字节一致（L6）。 */
+function verificationPendingResponse(email: string): NextResponse {
+  return NextResponse.json(
+    {
+      verificationRequired: true,
+      email,
+      message: '注册成功，请前往邮箱完成验证后再登录',
+    },
+    { status: 201 }
+  );
+}
+
 export async function POST(req: Request) {
   const prelude = await enforcePublicAuthPrelude(req, {
     scope: 'register',
@@ -52,6 +80,9 @@ export async function POST(req: Request) {
   }>(req);
   if (!parsed.ok) return parsed.response;
   const body = parsed.body;
+  // 非字符串 email 会让下面 try 之外的 normalizeEmail 抛 TypeError → 框架 500。
+  const malformed = rejectMalformedStringFields(body, ['email']);
+  if (malformed) return malformed;
   const siteSettings = await getSiteSettings().catch(() => null);
 
   const authLimit = siteSettings?.rate_limit_auth ?? 5;
@@ -162,6 +193,8 @@ export async function POST(req: Request) {
       bcryptRounds: siteSettings.bcrypt_rounds,
       jwtExpiryDays: jwtConfig.expiresInDays,
       emailVerified: !verificationRequired,
+      // 需验证时不当场签会话：既不留孤儿 family 行，也不比「邮箱已存在」路径多一次写库。
+      issueSession: !verificationRequired,
     });
 
     logAction(req, 'user.register', {
@@ -179,42 +212,35 @@ export async function POST(req: Request) {
 
     // 需要验证：不签发会话，改发验证邮件，前端进入「去邮箱查收」态。
     if (verificationRequired) {
-      const sendResult = await sendVerificationEmail(user, {
+      // 刻意不 await（同 forgot-password / resend-verification）：SMTP 往返 200ms~3s，
+      // 而「邮箱已存在」路径在 P2002 处立即返回——等发信就等于给枚举者一个时序侧信道，
+      // 通用响应文案挡不住它。代价是发信失败不再能当场告诉用户（旧的 emailSendFailed）：
+      // 失败以 error 级别落日志供运维排查；用户在「去邮箱查收」页仍有「重新发送」入口。
+      // 依旧**不** fail-open 放行（把账号标成已验证）——那会让打爆 SMTP 的人绕过验证门禁。
+      void sendVerificationEmail(user, {
         settings: siteSettings,
         requestIp: prelude.clientIp === 'unknown' ? null : prelude.clientIp,
-      }).catch((err) => {
-        logger.error({ err: serializeError(err) }, '[register] 发送验证邮件失败');
-        return { ok: false as const, error: 'send failed' };
-      });
-      if (!sendResult.ok) {
-        // 账号已创建但验证信没发出去。**不能**照旧回「请前往邮箱查收」——那封信根本不存在，
-        // 用户会一直等；而账号已占住了这个唯一邮箱，重注册撞 P2002、登录被 403 挡、
-        // 走重置密码又要经同一条坏 SMTP，等于死胡同。
-        // 也**不**在此 fail-open 放行（把账号标成已验证）：isEmailEnabled 那处 fail-open 是
-        // 管理员可见的全局姿态，而这里的失败是单次、可被攻击者诱发的（打爆 SMTP 即可绕过验证）。
-        // 故：保留门禁，如实告知，并把既有的「重新发送」入口给他——SMTP 修好后本人即可自助恢复。
-        logger.error(
-          { userId: user.id },
-          '[register] 验证邮件发送失败，账号已创建但用户无法完成验证；请检查 SMTP 配置'
-        );
-        return NextResponse.json(
-          {
-            verificationRequired: true,
-            emailSendFailed: true,
-            email: user.email,
-            message: '账号已创建，但验证邮件发送失败，请稍后重试发送',
-          },
-          { status: 201 }
-        );
-      }
-      return NextResponse.json(
-        {
-          verificationRequired: true,
-          email: user.email,
-          message: '注册成功，请前往邮箱完成验证后再登录',
-        },
-        { status: 201 }
-      );
+      })
+        .then((sendResult) => {
+          if (!sendResult.ok) {
+            logger.error(
+              { userId: user.id, error: sendResult.error },
+              '[register] 验证邮件发送失败，账号已创建但用户无法完成验证；请检查 SMTP 配置'
+            );
+          }
+        })
+        .catch((err) => {
+          logger.error(
+            { err: serializeError(err), userId: user.id },
+            '[register] 发送验证邮件失败'
+          );
+        });
+      return verificationPendingResponse(user.email);
+    }
+
+    if (!token) {
+      // issueSession 只在 verificationRequired 时为 false，走到这里必有会话；防御性兜底。
+      throw new Error('Registration session was not issued');
     }
 
     const response = NextResponse.json(
@@ -241,10 +267,6 @@ export async function POST(req: Request) {
       error instanceof Prisma.PrismaClientKnownRequestError &&
       error.code === 'P2002'
     ) {
-      const target = Array.isArray(error.meta?.target)
-        ? (error.meta?.target as string[])
-        : [];
-
       // L6：邮箱已注册时返回 400、成功时返回 201 —— 单看状态码就能枚举「这个邮箱
       // 有没有注册过」，与 forgot-password 的「恒定响应」标准不一致。
       //
@@ -254,15 +276,8 @@ export async function POST(req: Request) {
       // 没开邮箱验证时无法隐藏：成功路径必须下发会话 cookie，注册流程结构上就会
       // 泄露这一位信息（这是注册接口的固有性质，不是本处的疏漏）。此时维持 400，
       // 但文案保持中性、不点名邮箱。
-      if (target.includes('email') && verificationRequired) {
-        return NextResponse.json(
-          {
-            verificationRequired: true,
-            email: normalizedEmailForResponse,
-            message: '注册成功，请前往邮箱完成验证后再登录',
-          },
-          { status: 201 }
-        );
+      if (isEmailUniqueTarget(error.meta?.target) && verificationRequired) {
+        return verificationPendingResponse(normalizedEmailForResponse);
       }
 
       return NextResponse.json(

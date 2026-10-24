@@ -1,10 +1,9 @@
 import { NextResponse } from 'next/server';
 import {
-  changePassword,
+  changePasswordAndReissueSession,
   getAuthTokenSessionBinding,
   getJwtExpiryConfig,
-  issueAuthToken,
-  revokeToken,
+  isAuthVerificationInfrastructureError,
   setAuthCookie,
   validatePassword,
   verifyAuthSession,
@@ -47,6 +46,10 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
+    // 非字符串口令会让 bcrypt.compare 抛 "Illegal arguments" → 落进下面的 500。
+    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+      return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
+    }
 
     const passwordError = validatePassword(newPassword, {
       minLength: siteSettings.password_min_length,
@@ -55,22 +58,21 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: passwordError }, { status: 400 });
     }
 
-    const updatedUser = await changePassword(
-      session.user.id,
+    // 改密 + 撤销当前 family + 签发新 family 同一事务提交（见 changePasswordAndReissueSession）：
+    // 旧实现三步各自提交，后两步任一步瞬时失败就回 500，而密码其实已经改掉、所有会话都已失效。
+    const jwtConfig = getJwtExpiryConfig(siteSettings.jwt_expiry);
+    const { token } = await changePasswordAndReissueSession(
+      session.token,
       currentPassword,
       newPassword,
-      { bcryptRounds: siteSettings.bcrypt_rounds }
+      {
+        bcryptRounds: siteSettings.bcrypt_rounds,
+        expiresInDays: jwtConfig.expiresInDays,
+      }
     );
 
     logAction(req, 'user.password.change', { user: session.user });
 
-    await revokeToken(session.token, { reason: 'password_change' });
-
-    const jwtConfig = getJwtExpiryConfig(siteSettings?.jwt_expiry);
-    const token = await issueAuthToken(updatedUser, {
-      sessionStartedAt: Date.now(),
-      expiresInDays: jwtConfig.expiresInDays,
-    });
     const response = NextResponse.json({
       message: 'Password changed successfully',
       sessionBinding: getAuthTokenSessionBinding(token),
@@ -80,6 +82,13 @@ export async function POST(req: Request) {
   } catch (error) {
     if (error instanceof Error && error.message === 'Current password is incorrect') {
       return NextResponse.json({ error: error.message }, { status: 403 });
+    }
+    // 认证真源（DB）暂不可判定：503 而不是 401，前端不会因此登出并撤销仍有效的会话。
+    if (isAuthVerificationInfrastructureError(error)) {
+      return NextResponse.json(
+        { error: 'Session verification unavailable' },
+        { status: 503 }
+      );
     }
     console.error('Change password error:', error);
     return NextResponse.json(

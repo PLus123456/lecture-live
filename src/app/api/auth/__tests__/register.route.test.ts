@@ -111,27 +111,69 @@ describe('POST /api/auth/register', () => {
     expect(body.emailSendFailed).toBeUndefined();
   });
 
-  // #11：账号已创建但验证信没发出去。旧实现只 logger.warn，照样回「请前往邮箱完成验证」，
-  // 用户空等一封不存在的邮件，而邮箱已被占用 → 重注册 P2002、登录 403、重置走同一坏 SMTP。
-  it('验证邮件发送失败 → 如实回 emailSendFailed 而不是「请查收」', async () => {
-    sendVerificationEmailMock.mockResolvedValue({ ok: false, error: 'smtp down' });
+  // 发信不再 await：等 SMTP 往返（200ms~3s）会让「新建账号」明显慢于「邮箱已存在」（P2002
+  // 立即返回），通用响应挡不住这个时序侧信道。发信结果因此不能再进响应（旧的 emailSendFailed），
+  // 但失败必须以 error 级别落日志——这类故障此前只有 warn，淹没在噪音里。
+  it('验证邮件发送失败不改变响应（与成功逐字节一致），但以 error 级别记日志', async () => {
+    const okRes = await post(validBody);
+    const okBody = await readJson<Record<string, unknown>>(okRes);
 
+    sendVerificationEmailMock.mockResolvedValue({ ok: false, error: 'smtp down' });
+    loggerErrorMock.mockClear();
     const res = await post(validBody);
     const body = await readJson<Record<string, unknown>>(res);
 
-    expect(body.verificationRequired).toBe(true);
-    expect(body.emailSendFailed).toBe(true);
-    expect(body.message).not.toContain('请前往邮箱');
-    // 运维要能在日志里看见——这类故障此前只有 warn，淹没在噪音里
-    expect(loggerErrorMock).toHaveBeenCalled();
+    expect(res.status).toBe(okRes.status);
+    expect(body).toEqual(okBody);
+    expect(body.emailSendFailed).toBeUndefined();
+    await vi.waitFor(() => expect(loggerErrorMock).toHaveBeenCalled());
   });
 
-  it('sendVerificationEmail 抛错同样计为发送失败', async () => {
+  it('sendVerificationEmail 抛错同样只记日志、不影响响应', async () => {
     sendVerificationEmailMock.mockRejectedValue(new Error('connection refused'));
 
     const res = await post(validBody);
     const body = await readJson<Record<string, unknown>>(res);
-    expect(body.emailSendFailed).toBe(true);
+    expect(res.status).toBe(201);
+    expect(body.verificationRequired).toBe(true);
+    expect(body.emailSendFailed).toBeUndefined();
+    await vi.waitFor(() => expect(loggerErrorMock).toHaveBeenCalled());
+  });
+
+  it('不等待验证邮件发送完成就响应（杜绝「新账号 vs 已存在」的时序枚举）', async () => {
+    let releaseSend: (value: { ok: boolean }) => void = () => {};
+    sendVerificationEmailMock.mockReturnValue(
+      new Promise<{ ok: boolean }>((resolve) => {
+        releaseSend = resolve;
+      })
+    );
+
+    const outcome = await Promise.race([
+      post(validBody).then((res) => res.status),
+      new Promise<'still-waiting-on-smtp'>((resolve) =>
+        setTimeout(() => resolve('still-waiting-on-smtp'), 500)
+      ),
+    ]);
+    releaseSend({ ok: true });
+
+    expect(outcome).toBe(201);
+    expect(sendVerificationEmailMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('需验证时不当场签会话（issueSession=false：不留孤儿 family，也不多一次写库）', async () => {
+    await post(validBody);
+    expect(registerWithOptionsMock.mock.calls[0][3]).toMatchObject({
+      emailVerified: false,
+      issueSession: false,
+    });
+  });
+
+  it('非字符串 email 回 400，绝不进入建号流程', async () => {
+    for (const email of [123, ['user@example.com'], { a: 1 }]) {
+      const res = await post({ ...validBody, email });
+      expect(res.status).toBe(400);
+    }
+    expect(registerWithOptionsMock).not.toHaveBeenCalled();
   });
 
   // 发信失败不得 fail-open 放行：那会让攻击者打爆 SMTP 即可绕过邮箱验证门禁。
@@ -223,6 +265,38 @@ describe('POST /api/auth/register —— L6 邮箱枚举 / L7 displayName 归一
     expect(duplicate.status).toBe(success.status);
     expect(duplicate.status).toBe(201);
     expect(duplicateJson).toEqual(successJson);
+  });
+
+  // 生产跑 MySQL：Prisma 对 MySQL 的 P2002 给的 meta.target 是索引名字符串而非字段数组。
+  // 旧实现只认数组，于是这条在生产上永远落进 400 分支——注册接口成了精确的邮箱枚举器。
+  it('MySQL 形状的 meta.target（索引名字符串）同样回与成功一致的 201', async () => {
+    const success = await post(body);
+    const successJson = await readJson(success);
+
+    for (const target of ['User_email_key', 'User.User_email_key']) {
+      registerWithOptionsMock.mockRejectedValueOnce(
+        new Prisma.PrismaClientKnownRequestError('dup', {
+          code: 'P2002',
+          clientVersion: 'test',
+          meta: { target },
+        })
+      );
+      const duplicate = await post(body);
+      expect(duplicate.status).toBe(201);
+      await expect(readJson(duplicate)).resolves.toEqual(successJson);
+    }
+  });
+
+  it('其他唯一键冲突（非 email）仍回中性 400，不冒充注册成功', async () => {
+    registerWithOptionsMock.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError('dup', {
+        code: 'P2002',
+        clientVersion: 'test',
+        meta: { target: 'PRIMARY' },
+      })
+    );
+    const res = await post(body);
+    expect(res.status).toBe(400);
   });
 
   it('关闭邮箱验证时维持 400（成功路径必须下发会话，结构上藏不住），文案保持中性', async () => {

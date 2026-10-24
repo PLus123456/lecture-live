@@ -254,6 +254,8 @@ See [`.env.example`](.env.example) for the full environment variable list. The m
 
 > LLM provider keys and Soniox credentials are best managed from the admin dashboard, where they can be stored encrypted in the database. Environment variables are mainly a fallback path.
 
+**Soniox API key permissions.** Soniox keys are now issued with per-product permissions. The server-side key needs: **Temporary API keys** + **Speech-to-text, real-time** (live transcription and interpretation), **Speech-to-text, async** (write) + **Files** (write) (uploaded-file transcription), and **Usage and limits** (the billing reconciliation cron reads `/v1/usage-logs`). Keys created before permissions existed keep full access. Browsers never see this key: they receive a short-lived, single-use `snx_temp_…` key and send it in the WebSocket handshake (`Sec-WebSocket-Protocol: soniox-api-key, <key>`), not in the start message — Soniox refuses start-message authentication from 15 January 2027. If you point a region's WebSocket URL at your own reverse proxy, it must pass the `Sec-WebSocket-Protocol` request/response headers through unchanged.
+
 LLM provider endpoints are configured entirely from the admin dashboard — there is no
 environment allowlist to maintain. On a self-hosted deployment the administrator and whoever
 can edit the deployment env are the same person, so such a list adds no boundary while costing

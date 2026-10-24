@@ -13,7 +13,7 @@ export interface RealtimeToken {
 }
 
 export interface SonioxSessionConfig {
-  model: 'stt-rt-v4';
+  model: 'stt-rt-v5';
   language_hints?: string[];
   language_hints_strict?: boolean;
   enable_speaker_diarization?: boolean;

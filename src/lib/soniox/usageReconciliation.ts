@@ -40,6 +40,8 @@ const FETCH_OVERLAP_MS = 15 * 60_000;
 const INITIAL_LOOKBACK_MS = 24 * 60 * 60_000;
 /** usage-logs API 单窗上限 31 天，留余量。 */
 const MAX_WINDOW_MS = 30 * 24 * 60 * 60_000;
+/** 单页 usage-logs 请求超时。 */
+const USAGE_LOGS_FETCH_TIMEOUT_MS = 30_000;
 /** 孤儿判定：mintedAt + key TTL + 连接硬上限之后再等这么久（等 usage-log 落账+回填）。 */
 const ORPHAN_SETTLE_GRACE_MS = 30 * 60_000;
 /** 每轮孤儿结算批量上限：本轮**真正处理**（尝试结算）的 grant 数上限，被跳过的不计入。 */
@@ -129,9 +131,17 @@ async function fetchRegionUsageLogs(
 
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${apiKey}` },
+      // 与其它 Soniox REST 调用同口径的超时：上游无响应时别把整个维护周期挂住。
+      signal: AbortSignal.timeout(USAGE_LOGS_FETCH_TIMEOUT_MS),
     });
     if (!res.ok) {
-      throw new Error(`usage-logs fetch failed: HTTP ${res.status}`);
+      // Soniox 的 key 现在按权限授予：只开了「Temporary API keys / Speech-to-text」的 key 读
+      // usage-logs 会 403 permission_denied —— 对账从此每轮失败，孤儿 grant 永远退不了/扣不了。
+      const hint =
+        res.status === 403
+          ? " (the Soniox API key needs the 'Usage and limits' permission)"
+          : '';
+      throw new Error(`usage-logs fetch failed: HTTP ${res.status}${hint}`);
     }
     const data = (await res.json()) as {
       usage_logs?: SonioxUsageLogEntry[];

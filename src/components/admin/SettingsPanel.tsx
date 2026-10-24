@@ -1395,6 +1395,8 @@ function AsrPanel({
         </h3>
         <p className="text-xs text-charcoal-400 dark:text-charcoal-400 mb-4">
           配置各区域的 Soniox 语音识别 API Key。至少需要配置一个区域。如已通过环境变量配置则无需在此设置。
+          Key 需在 Soniox Console 开通的权限：Temporary API keys + Speech-to-text real-time（实时转录）、
+          Speech-to-text async + Files（文件转录）、Usage and limits（计费对账）。
         </p>
 
         {sonioxLoading ? (

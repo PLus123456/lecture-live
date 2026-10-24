@@ -260,7 +260,7 @@ export function useInterpret() {
       // 构建 two_way 配置
       const settings = useSettingsStore.getState();
       const baseConfig: SessionConfig = {
-        model: 'stt-rt-v4',
+        model: 'stt-rt-v5',
         sourceLang: langA,
         targetLang: langB,
         languageHints: [langA, langB],

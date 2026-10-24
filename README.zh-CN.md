@@ -240,6 +240,8 @@ lecture-live/
 
 > LLM 供应商密钥与 Soniox 凭证更推荐通过管理后台录入，并以加密形式保存在数据库中。环境变量主要作为后备方案存在。
 
+**Soniox API Key 权限。** Soniox 的 API Key 现在按产品授予权限。服务端使用的 Key 需要：**Temporary API keys** + **Speech-to-text, real-time**（实时转录与同传）、**Speech-to-text, async**（写）+ **Files**（写）（上传文件转录）、**Usage and limits**（计费对账任务读取 `/v1/usage-logs`）。权限功能上线前创建的 Key 保持全权限。浏览器永远拿不到这把 Key：它只拿到短时、一次性的 `snx_temp_…` 临时 Key，并在 WebSocket 握手时通过 `Sec-WebSocket-Protocol: soniox-api-key, <key>` 发送，而不是放在首条 start 消息里——Soniox 自 2027 年 1 月 15 日起拒绝 start 消息鉴权。如果把某个区域的 WebSocket 地址指向自建反向代理，代理必须原样透传 `Sec-WebSocket-Protocol` 请求/响应头。
+
 ### Cloudreve OAuth（v4）
 
 LectureLive 接入 Cloudreve 存储时，使用的是 Cloudreve v4 的 OAuth 授权码流程，并启用了 PKCE。

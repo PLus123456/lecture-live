@@ -117,7 +117,7 @@ export type RecordingState = 'idle' | 'recording' | 'paused' | 'finalizing' | 's
 export type TranslationMode = 'soniox' | 'local' | 'both';
 
 export interface SessionConfig {
-  model: 'stt-rt-v4';
+  model: 'stt-rt-v5';
   sourceLang: string;
   targetLang: string;
   languageHints: string[];

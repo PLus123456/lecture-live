@@ -4,7 +4,7 @@ import type { SessionConfig } from '@/types/transcript';
 
 function makeConfig(overrides: Partial<SessionConfig> = {}): SessionConfig {
   return {
-    model: 'stt-rt-v4',
+    model: 'stt-rt-v5',
     sourceLang: 'en',
     targetLang: 'zh',
     languageHints: ['en', 'zh'],

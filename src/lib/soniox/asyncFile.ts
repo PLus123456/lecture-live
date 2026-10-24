@@ -23,7 +23,7 @@ import {
   readJsonBodyBounded,
 } from '@/lib/boundedBody';
 
-export const SONIOX_ASYNC_MODEL = 'stt-async-v4';
+export const SONIOX_ASYNC_MODEL = 'stt-async-v5';
 
 // 出站 Soniox 请求超时（防慢速/无响应上游拖住事件循环与连接）。
 // 上传可能是数百 MB 的转码音频，给足 10 分钟；其余控制类请求 30 秒。
@@ -91,9 +91,21 @@ export interface SonioxAsyncToken {
   speaker?: string | null;
   language?: string | null;
   is_audio_event?: boolean | null;
-  /** Soniox 文档：翻译 token 上有 translation_status: "translation"。原文 token 不带该字段 */
-  translation_status?: string | null;
+  /**
+   * Soniox 统一 token 格式（实时与异步相同）："none"（不在翻译语种对内）/ "original"（被翻译的原文）/
+   * "translation"（译文）。未开翻译时整个字段缺省。
+   */
+  translation_status?: SonioxTranslationStatus | null;
+  /** 仅译文 token 携带：其原文的语种。 */
+  source_language?: string | null;
 }
+
+export type SonioxTranslationStatus = 'none' | 'original' | 'translation';
+const SONIOX_TRANSLATION_STATUSES: ReadonlySet<string> = new Set<SonioxTranslationStatus>([
+  'none',
+  'original',
+  'translation',
+]);
 
 export interface SonioxTranscriptResponse {
   id: string;
@@ -107,18 +119,6 @@ export class SonioxTranscriptPayloadError extends Error {
     this.name = 'SonioxTranscriptPayloadError';
   }
 }
-
-const SONIOX_TRANSCRIPT_KEYS = new Set(['id', 'text', 'tokens']);
-const SONIOX_TOKEN_KEYS = new Set([
-  'text',
-  'start_ms',
-  'end_ms',
-  'confidence',
-  'speaker',
-  'language',
-  'is_audio_event',
-  'translation_status',
-]);
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -152,17 +152,19 @@ function requireTimelineNumber(value: unknown, label: string): number {
   return value;
 }
 
-/** Canonicalize an untrusted provider response without copying unknown nesting. */
+/**
+ * Canonicalize an untrusted provider response without copying unknown nesting.
+ *
+ * 只拷贝已知字段（逐项校验类型与字节上限），未知字段**忽略而不是拒绝**：整个响应体在 JSON.parse
+ * 之前已被 SONIOX_TRANSCRIPT_MAX_RESPONSE_BYTES 封顶，丢弃未知键不会放大任何资源消耗；而拒绝未知键
+ * 会让 Soniox 每次给 token 加一个字段（如统一翻译格式里译文 token 的 source_language）就把**全部**
+ * 文件转录打成失败。
+ */
 export function admitSonioxTranscriptResponse(
   value: unknown
 ): SonioxTranscriptResponse {
   if (!isPlainRecord(value)) {
     throw new SonioxTranscriptPayloadError('Soniox transcript must be an object');
-  }
-  for (const key in value) {
-    if (Object.hasOwn(value, key) && !SONIOX_TRANSCRIPT_KEYS.has(key)) {
-      throw new SonioxTranscriptPayloadError(`Soniox transcript.${key} is not allowed`);
-    }
   }
   if (!Array.isArray(value.tokens)) {
     throw new SonioxTranscriptPayloadError('Soniox transcript.tokens must be an array');
@@ -178,11 +180,6 @@ export function admitSonioxTranscriptResponse(
     const label = `Soniox transcript.tokens[${index}]`;
     if (!isPlainRecord(raw)) {
       throw new SonioxTranscriptPayloadError(`${label} must be an object`);
-    }
-    for (const key in raw) {
-      if (Object.hasOwn(raw, key) && !SONIOX_TOKEN_KEYS.has(key)) {
-        throw new SonioxTranscriptPayloadError(`${label}.${key} is not allowed`);
-      }
     }
     const text = requireBoundedString(
       raw.text,
@@ -214,7 +211,7 @@ export function admitSonioxTranscriptResponse(
       end_ms: endMs,
       confidence: raw.confidence,
     };
-    for (const key of ['speaker', 'language'] as const) {
+    for (const key of ['speaker', 'language', 'source_language'] as const) {
       if (raw[key] !== undefined && raw[key] !== null) {
         token[key] = requireBoundedString(
           raw[key],
@@ -230,12 +227,17 @@ export function admitSonioxTranscriptResponse(
       token.is_audio_event = raw.is_audio_event;
     }
     if (raw.translation_status !== undefined && raw.translation_status !== null) {
-      if (raw.translation_status !== 'translation') {
+      // 旧实现只认 'translation'：开了翻译时原文 token 带的 'original' / 'none' 会让整份
+      // transcript 被拒（文件转录 + 翻译整条失败）。下游转换器本就按 `!== 'translation'` 认原文。
+      if (
+        typeof raw.translation_status !== 'string' ||
+        !SONIOX_TRANSLATION_STATUSES.has(raw.translation_status)
+      ) {
         throw new SonioxTranscriptPayloadError(
           `${label}.translation_status is invalid`
         );
       }
-      token.translation_status = raw.translation_status;
+      token.translation_status = raw.translation_status as SonioxTranslationStatus;
     }
     tokens.push(token);
   }

@@ -38,6 +38,7 @@ import {
 } from '@/lib/soniox/asyncFile';
 import { finalizeAsyncTranscription } from '@/lib/audio/asyncTranscribeFinalize';
 import { finalizeFullTranscription } from '@/lib/audio/fullTranscribeFinalize';
+import { isTransientFullTranscribeFinalizeError } from '@/lib/audio/fullTranscribeFinalizeErrors';
 import {
   failFullTranscribeAttempt,
   releaseTerminalFullTranscribeReservation,
@@ -1206,6 +1207,46 @@ export async function reclaimStaleFullTranscribes(now: Date): Promise<number> {
             );
           }
         } catch (finalizeErr) {
+          // 审计 #8：永久失败（准入拒绝 / 超字节上限 / 确定性 4xx 等）重试不会自愈。旧实现一律
+          // 「left for retry」：而 claim 每次刷新 startedAt，本函数之后每轮都会再下一遍 transcript、
+          // 再失败，任务永久卡在 transcribing，占着补全名额与额度预留。这里标 failed 并原子释放预留。
+          // 不带 startedAtLte：claim 刚把 fullTranscribeStartedAt 刷成 now，带阈值永远命中不了。
+          // 只从 transcribing（finalize 抛出前已回退到的状态）转出，绝不抢并发 poll 刚 claim 的 finalizing。
+          if (!isTransientFullTranscribeFinalizeError(finalizeErr)) {
+            const failed = await failFullTranscribeAttempt({
+              sessionId: session.id,
+              claimId: session.fullTranscribeClaimId,
+              allowedStatuses: ['transcribing'],
+              error: 'Full transcription could not be finalized',
+            }).catch(() => false);
+            billingLogger.error(
+              {
+                sessionId: session.id,
+                userId: session.userId,
+                markedFailed: failed,
+                err: serializeError(finalizeErr),
+              },
+              'reclaim full-transcribe auto-finalize failed permanently'
+            );
+            if (failed) {
+              reclaimedCount += 1;
+              // 与下方「标 failed」分支同款收尾：清转码临时目录 + best-effort 清 Soniox 残留。
+              await cleanupFullTranscribeWorkDir(
+                session.id,
+                session.fullTranscribeClaimId
+              );
+              if (session.fullSonioxFileId) {
+                await deleteSonioxFile(sonioxConfig, session.fullSonioxFileId).catch(
+                  () => undefined
+                );
+              }
+              await deleteSonioxTranscription(
+                sonioxConfig,
+                session.fullSonioxTranscriptionId
+              ).catch(() => undefined);
+            }
+            continue;
+          }
           // 拉 transcript / 落盘瞬时故障：不在回收侧标 failed，留待重试。claim 已把状态置 finalizing
           // 并刷新 startedAt，下一轮回收超阈值后经 allowClaimFrom(含 finalizing) 再次 salvage 收尾。
           billingLogger.error(

@@ -25,6 +25,7 @@ import {
   DEFAULT_IDLE_TIMEOUT_MS,
 } from '@/lib/billing';
 import type { RealtimeToken } from '@/types/soniox';
+import type { TranscriptSegment } from '@/types/transcript';
 
 type RecordingHandle = {
   stop?: () => Promise<void> | void;
@@ -67,6 +68,51 @@ const PAUSE_HANDLE_STALE_MS = 15_000;
 function hasManualPauseIntent(shouldReconnect: boolean): boolean {
   const state = useTranscriptStore.getState().recordingState;
   return !shouldReconnect && state !== 'recording';
+}
+
+/**
+ * 审计 #6：从已有段落推导续录基准（段号计数 + 已录到的音频时刻）。
+ *
+ * stop() 会清空 recordingStartTime 与 processor（「本场结束」语义）。但收尾失败时页面会把会话
+ * 回落成 paused，且两者都随 sessionStorage 持久化 —— 刷新 / SPA 返回后计时基准已经没了：
+ * reconnectAfterRefresh 直接 return，续录的 startNewRecording 也拿不到 coldResumeStartTime，
+ * 新 processor 从 seg-1、00:00 重新编号：与已有段撞 id（译文按段 id 存，互相覆盖）、时间轴叠回开头。
+ * 没有计时基准时，已有段落本身就是唯一可信的续接依据：段号接在最大编号之后（不止看段数，防编号
+ * 有空洞时撞号），时间偏移取最后一段的结束时刻（真实录音时长的下界，宁可略早也不叠回开头）。
+ */
+function deriveResumeBaseFromSegments(segments: readonly TranscriptSegment[]): {
+  segmentCount: number;
+  lastEndMs: number;
+} {
+  let segmentCount = segments.length;
+  let lastEndMs = 0;
+  for (const segment of segments) {
+    const match = /^seg-(\d+)$/.exec(segment.id);
+    if (match) {
+      segmentCount = Math.max(segmentCount, Number(match[1]));
+    }
+    if (Number.isFinite(segment.globalEndMs)) {
+      lastEndMs = Math.max(lastEndMs, segment.globalEndMs);
+    }
+  }
+  return { segmentCount, lastEndMs };
+}
+
+/**
+ * 审计 #6：计时基准（recordingStartTime）已丢、但已有段落时，按「冻结点 − 已录音频 − 累计暂停」
+ * 反推一个等价的起点：代入 computeResumeOffset 的同一公式恰好得到 lastEndMs，续录段落接在最后
+ * 一段之后。无段落时返回 null —— 没有可撞的 id/时间轴，保持原有「从 now 重新起算」行为。
+ */
+function deriveColdResumeStartTime(
+  segments: readonly TranscriptSegment[],
+  freezePoint: number,
+  totalPausedMs: number
+): number | null {
+  if (segments.length === 0) {
+    return null;
+  }
+  const { lastEndMs } = deriveResumeBaseFromSegments(segments);
+  return freezePoint - lastEndMs - totalPausedMs;
 }
 
 interface UseSonioxOptions {
@@ -877,6 +923,72 @@ export function useSoniox(
     ]
   );
 
+  // P1-10：硬件掉线（麦克风拔出 / 系统共享被停止，源 track ended）时，若归档已无实时采集，
+  // UI 不应继续显示 recording。反映为 paused + 断连，让用户看到明确信号。
+  //
+  // 审计 #2：门控改为「仍是当前这只归档 + 主体边界未变」，不再看安装它那次 startNewRecording
+  // 的 runId。重连与寿命轮换（每 ~14.5min 一次）都会 bump runId，旧门控在第一次轮换后就永久
+  // 失效 —— 之后拔麦 / 停止共享，UI 仍显示「录音中 / 已连接」而实际什么都没采。attemptReconnect
+  // 新建归档时同样要装上它（否则那只归档压根没有处理器）。stop/卸载不会误触发：stop() 同步递增
+  // 归档的采集代际，掉线回调在归档内部就被拦下；卸载会把 archiveManagerRef 置空。
+  //
+  // 审计 #3：Soniox 句柄的音源是同一设备的克隆轨，掉线后同样已死。必须丢弃 recordingRef 并作废
+  // 其回调代次 —— 否则 15s 内点「继续」会走 startImpl 的短暂停复用分支，把死句柄 resume 成
+  // 「录音中 / 已连接」（假录音）。同时停掉自动重连状态机：掉线是要用户明确处理的信号，不能被
+  // 重连悄悄接着录（acquireMicrophoneStream 找不到原设备时会回落到默认麦克风）。
+  const installCaptureEndedHandler = useCallback(
+    (archiveManager: RecordingArchiveManager, ownerSignal: AbortSignal) => {
+      archiveManager.setCaptureEndedHandler(() => {
+        if (
+          ownerSignal.aborted ||
+          accountBoundaryInvalidatedRef.current ||
+          archiveManagerRef.current !== archiveManager
+        ) {
+          return;
+        }
+        if (archiveManager.hasLiveCapture()) {
+          return;
+        }
+
+        if (reconnectTimerRef.current) {
+          clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = null;
+        }
+        if (rotationTimerRef.current) {
+          clearTimeout(rotationTimerRef.current);
+          rotationTimerRef.current = null;
+        }
+        cancelStableConn();
+        shouldReconnectRef.current = false;
+        reconnectAttemptsRef.current = 0;
+
+        // 先作废代次再停：死连接迟到的 onError / onConnectionChange 不得再触发自动重连或改写状态，
+        // 在途的重连尝试也会在下一个 await 后的代次复查处放弃。
+        const deadRecording = recordingRef.current;
+        recordingRef.current = null;
+        runIdRef.current += 1;
+        if (deadRecording) {
+          try {
+            void Promise.resolve(deadRecording.recording.stop?.()).catch(() => {});
+          } catch {
+            /* best-effort：句柄本就已死 */
+          }
+        }
+
+        // 记下暂停意图：续录时 ensureArchive 换上新采集，新 recorder 必须继承 paused、等连上才
+        // resume（与 pauseForInterruption 的完整暂停同款，P1-1），否则「UI 暂停却已在采集」。
+        void archiveManager.pause().catch(() => undefined);
+        processorRef.current?.onEndpoint();
+        setConnectionState('disconnected');
+        if (useTranscriptStore.getState().recordingState === 'recording') {
+          setPausedAt(Date.now());
+          setRecordingState('paused');
+        }
+      });
+    },
+    [cancelStableConn, setConnectionState, setPausedAt, setRecordingState]
+  );
+
   // R1-L1：安排连接寿命轮换。key 响应带 max_session_duration_seconds（=本次预扣分钟），到点
   // Soniox 服务端硬断；提前 ROTATION_LEAD_S 主动轮换。稳定引用（无依赖）：实际轮换经
   // rotateConnectionRef 中转，可被 attemptReconnect 安全引用而不成环。
@@ -974,6 +1086,13 @@ export function useSoniox(
         processorRef.current?.onEndpoint();
         processorRef.current?.startNewSession(offsetMs);
 
+        // 审计 #1：本次尝试「当前持有」的代次。建连前是 genAtStart；下面为新连接 bump runId 之后
+        // 改为新的 runId。catch 必须按它判「是否已被 stop/卸载/新一轮接管」—— 旧实现拿 genAtStart
+        // 比，而 bump 恰好发生在 startSonioxRecording 之前，于是 mint 临时 key 失败（断网时最常见，
+        // 额度耗尽 403 也是）时 catch 一律当成「已被接管」静默 return：不再排下一轮重连、到上限也
+        // 不触发 onReconnectFailed，connectionState 永远停在 'connecting'，整节课实时转录就此死掉。
+        let attemptOwnerRunId = genAtStart;
+
         try {
           const settings = useSettingsStore.getState();
           const currentToken = useAuthStore.getState().token;
@@ -1001,6 +1120,8 @@ export function useSoniox(
           archiveManager.setChunkStoredHandler(({ seq, blob, mimeType }) => {
             return uploadDraftChunk(seq, blob, mimeType);
           });
+          // 审计 #2：重连可能新建归档（如刷新恢复后手动「重新连接」），必须同样装上掉线处理器。
+          installCaptureEndedHandler(archiveManager, ownerSignal);
           await archiveManager.ensureArchive({
             sourceType,
             deviceId: sourceType === 'mic' ? selectedMicDeviceId : undefined,
@@ -1045,6 +1166,7 @@ export function useSoniox(
 
           const runId = runIdRef.current + 1;
           runIdRef.current = runId;
+          attemptOwnerRunId = runId;
           const connectStartMs = performance.now();
           const reconnectOwnerIsCurrent = () =>
             !ownerSignal.aborted &&
@@ -1179,7 +1301,7 @@ export function useSoniox(
           if (
             ownerSignal.aborted ||
             accountBoundaryInvalidatedRef.current ||
-            runIdRef.current !== genAtStart
+            runIdRef.current !== attemptOwnerRunId
           ) {
             return;
           }
@@ -1204,6 +1326,7 @@ export function useSoniox(
       onReconnectFailed,
       accumulatePausedTime,
       audioActivityThreshold,
+      installCaptureEndedHandler,
       markAudioActivity,
       onAutoResume,
       pauseForInterruption,
@@ -1300,9 +1423,18 @@ export function useSoniox(
       // reconnectAfterRefresh 从未运行，overallStartTimeRef 与 processor 段偏移都为空。
       // 此时用户点『继续』走 start→startNewRecording(preserveStartTime)，若不回退读取
       // store.recordingStartTime，startedAt 会退化为 now → 计时清零、已录时长丢失（U21）。
+      const coldResumeStoreState = useTranscriptStore.getState();
       const coldResumeStartTime =
         startOptions?.preserveStartTime && !overallStartTimeRef.current
-          ? useTranscriptStore.getState().recordingStartTime
+          ? coldResumeStoreState.recordingStartTime ??
+            // 审计 #6：stop() 后收尾失败、页面回落 paused 时计时基准已被清空 —— 从已有段落反推
+            // 等价起点。否则 startedAt 退化为 now，新 processor 段号从 seg-1、时间从 00:00 起，
+            // 与已有段撞 id、叠回时间轴开头。
+            deriveColdResumeStartTime(
+              coldResumeStoreState.segments,
+              coldResumeStoreState.pausedAt ?? Date.now(),
+              coldResumeStoreState.totalPausedMs
+            )
           : null;
       const startedAt =
         startOptions?.preserveStartTime && overallStartTimeRef.current
@@ -1325,7 +1457,9 @@ export function useSoniox(
             coldResumeStartTime -
             storeState.totalPausedMs
         );
-        processor.setSegmentCounterOffset(storeState.segments.length);
+        processor.setSegmentCounterOffset(
+          deriveResumeBaseFromSegments(storeState.segments).segmentCount
+        );
         processor.startNewSession(resumeOffsetMs);
       }
 
@@ -1381,24 +1515,8 @@ export function useSoniox(
         archiveManager.setChunkStoredHandler(({ seq, blob, mimeType }) => {
           return uploadDraftChunk(seq, blob, mimeType);
         });
-        // P1-10：硬件掉线（麦克风拔出 / 系统共享停止，源 track ended）时，若归档已无实时
-        // 采集，UI 不应继续显示 recording。反映为 paused + 断连，让用户看到明确信号。
-        archiveManager.setCaptureEndedHandler(() => {
-          if (
-            !startOwnerIsCurrent() ||
-            archiveManagerRef.current !== archiveManager
-          ) {
-            return;
-          }
-          if (archiveManager.hasLiveCapture()) {
-            return;
-          }
-          setConnectionState('disconnected');
-          if (useTranscriptStore.getState().recordingState === 'recording') {
-            setPausedAt(Date.now());
-            setRecordingState('paused');
-          }
-        });
+        // P1-10：硬件掉线处理器（门控与收尾语义见 installCaptureEndedHandler，审计 #2/#3）。
+        installCaptureEndedHandler(archiveManager, ownerSignal);
         // P0-4：recorder.start() 之前先与服务端协商起始 seq（nextSeq = 服务端 maxSeq+1），
         // 冷启动/续录都据此设定归档起点，杜绝从 0 起覆盖服务端已有录音开头。
         const negotiatedStartSeq = await negotiateStartSeq();
@@ -1598,6 +1716,7 @@ export function useSoniox(
       cancelStableConn,
       markConnectedStable,
       ensureProcessor,
+      installCaptureEndedHandler,
       markAudioActivity,
       onAutoResume,
       onTranscriptionInterrupted,
@@ -1609,7 +1728,6 @@ export function useSoniox(
       resetBackupMeta,
       setRecordingStartTime,
       setActiveSessionId,
-      setPausedAt,
       setRecordingState,
       negotiateStartSeq,
       scheduleRotation,
@@ -2188,23 +2306,38 @@ export function useSoniox(
    */
   const reconnectAfterRefresh = useCallback(async () => {
     const storeState = useTranscriptStore.getState();
-    if (!storeState.recordingStartTime) return;
-
-    // 恢复 overallStartTimeRef（刷新后 ref 丢失）
-    overallStartTimeRef.current = storeState.recordingStartTime;
 
     // 暂停态刷新：用暂停冻结点 pausedAt 算 offset，暂停空档不计入录音时长（与
     // computeResumeOffset 一致）；录音态刷新（pausedAt 为空）等价于在刷新这一刻暂停，用 now。
     // 加负值护栏。旧代码一律用 Date.now()，暂停挂机后刷新会把整段空档算进续录偏移，
     // 导致后续段时间戳整体前移（审计 high）。
     const freezePoint = storeState.pausedAt ?? Date.now();
+
+    // 审计 #6：stop() 已清空计时基准、但收尾失败被页面回落成 paused 并持久化时，这里曾直接
+    // return —— processor / 段号偏移 / 暂停冻结点全没恢复，用户点「继续」后新段从 seg-1、00:00
+    // 起编号，与已有段撞 id。改为从已有段落反推等价起点并写回 store（计时也随之对齐）。
+    const recordingStartTime =
+      storeState.recordingStartTime ??
+      deriveColdResumeStartTime(
+        storeState.segments,
+        freezePoint,
+        storeState.totalPausedMs
+      );
+    if (!recordingStartTime) return;
+    if (storeState.recordingStartTime == null) {
+      setRecordingStartTime(recordingStartTime);
+    }
+
+    // 恢复 overallStartTimeRef（刷新后 ref 丢失）
+    overallStartTimeRef.current = recordingStartTime;
+
     const offsetMs = Math.max(
       0,
-      freezePoint - storeState.recordingStartTime - storeState.totalPausedMs
+      freezePoint - recordingStartTime - storeState.totalPausedMs
     );
 
     // 把刷新前残留的 preview 文本保存为一个 segment，防止丢失
-    let segmentOffset = storeState.segments.length;
+    let segmentOffset = deriveResumeBaseFromSegments(storeState.segments).segmentCount;
     const rescuedPreviewText = combinePreviewText(storeState.currentPreviewText).trim();
     if (rescuedPreviewText) {
       const lastSeg = storeState.segments[storeState.segments.length - 1];
@@ -2283,6 +2416,7 @@ export function useSoniox(
     ensureProcessor,
     setConnectionState,
     setPausedAt,
+    setRecordingStartTime,
     setRecordingState,
     setTranslationEntry,
     updatePreview,

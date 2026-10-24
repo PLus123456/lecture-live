@@ -22,7 +22,10 @@ import {
   resolveSessionAudioLocation,
   openLocalAudioRangeStream,
 } from '@/lib/sessionPersistence';
-import { CloudreveStorage } from '@/lib/storage/cloudreve';
+import {
+  CloudreveRangeNotSatisfiableError,
+  CloudreveStorage,
+} from '@/lib/storage/cloudreve';
 import {
   measureAuthoritativeRecordingDurationMsFromBuffer,
   normalizeRecordedAudioDuration,
@@ -321,6 +324,20 @@ export async function GET(
           headers,
         });
       } catch (streamError) {
+        // 审计 #7（与 share 路由 P4-3 同款）：Range 不可满足直接回 416。旧代码把它也当「流式失败」
+        // 落进下方缓冲回退 —— loadSessionAudioArtifact 不设上限地把**整段录音**读进内存之后才
+        // 返回 416，一条 `Range: bytes=999999999-` 就换一次整文件缓冲，并发即可打爆进程内存。
+        if (streamError instanceof CloudreveRangeNotSatisfiableError) {
+          return new Response(null, {
+            status: 416,
+            headers: {
+              ...(streamError.contentRange
+                ? { 'Content-Range': streamError.contentRange }
+                : {}),
+              'Accept-Ranges': 'bytes',
+            },
+          });
+        }
         console.error(
           'Audio stream error, falling back to buffered load:',
           streamError

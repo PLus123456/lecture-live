@@ -659,7 +659,7 @@ export async function spendFromBalance(
     return spendOnTierTx(tx, userId, tierId, opts);
   });
 
-  // 余额购买此前完全不发通知：钱扣了、角色变了、tokenVersion++ 还把人踢下线，用户零感知。
+  // 余额购买此前完全不发通知：钱扣了、角色变了，用户零感知。
   // 网关支付走 creditPaidOrder 有确认信，纯余额出账没有 —— 同一笔消费两条路径待遇不同。
   // 必须排在事务**提交之后**：放事务里既拖长事务，回滚后还会留下一封说谎的确认信。
   void notifyBalancePurchase(userId, spec).catch(() => undefined);
@@ -872,8 +872,10 @@ async function applyGrantTx(
         storageHoursLimit: quotas.storageHoursLimit,
         allowedModels: quotas.allowedModels,
         storageBytesLimit,
-        // 自增 tokenVersion 让旧 JWT 失效，下次请求按新角色重签发。
-        tokenVersion: { increment: 1 },
+        // 刻意**不**自增 tokenVersion：verifyToken 每次请求都从 DB 读 role，升级即时生效，不需要
+        // 「让旧 JWT 失效再重签」。旧实现在这里 ++，买家购买成功后的下一个请求（RechargeModal 紧接着
+        // loadWallet）就 401，AuthSessionMonitor 把它当会话失效 → 登出并吊销该用户所有设备的会话。
+        // 降级路径（到期 cron、退款冲正）仍保留 ++：那里踢下线是有意为之。
       },
     });
     const purchaseTx = await tx.walletTransaction.create({

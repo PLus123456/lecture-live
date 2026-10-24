@@ -9,7 +9,7 @@ import type {
   PaymentProviderName,
 } from '@/lib/payment/types';
 import { resolveRoleQuotas, resolveRoleStorageBytesLimit } from '@/lib/userRoles';
-import { settlePoolOnLimitChange } from '@/lib/quota';
+import { computePoolOwed, settlePoolOnLimitChange } from '@/lib/quota';
 import {
   lockFundingAllocations,
   lockFundingLotForOrder,
@@ -99,6 +99,7 @@ interface LockedReversalUser {
   originalRole: UserRole | null;
   roleExpiresAt: Date | string | null;
   transcriptionMinutesLimit: number;
+  transcriptionMinutesUsed: number;
 }
 
 interface EntitlementRow {
@@ -295,7 +296,7 @@ export async function handlePaymentReversal(
       // Global lock order matches fulfillment: PaymentOrder -> User -> entitlement/source rows.
       const users = await tx.$queryRaw<LockedReversalUser[]>`
         SELECT walletBalanceCents, purchasedMinutesBalance, role, originalRole, roleExpiresAt,
-               transcriptionMinutesLimit
+               transcriptionMinutesLimit, transcriptionMinutesUsed
         FROM User WHERE id = ${order.userId} FOR UPDATE
       `;
       const user = users[0];
@@ -554,6 +555,23 @@ async function freezeEntitlements(
       : 0;
   let membershipMsToRemove = 0;
   const membershipRevocations = new Map<string, number>();
+  // purchasedMinutesBalance 是 gross 池（Model A）：本周期超出基础额度的消费记在 used − limit 里，
+  // 要到月度重置才从池里扣（owed）。旧实现把整池都当「可回收」——「买 100 分钟 → 用掉 → 拒付」
+  // 会把已经用掉的 100 分钟「回收」成 0、估值成全额、不记一分钱债务，月度重置时 owed 又被
+  // GREATEST(0, …) 吞掉，可无限重复。只有 pool − owed 才真在池里；已消费部分照本模块约定记成债务。
+  // owed 与月度重置同口径（computePoolOwed：排除在途预留）；used ≤ limit 时 owed 恒 0，不必查。
+  let poolConsumedThisCycle: number | null = null;
+  const consumedPoolMinutes = async (): Promise<number> => {
+    if (poolConsumedThisCycle === null) {
+      const used = Number(mutableUser.transcriptionMinutesUsed);
+      const limit = Number(mutableUser.transcriptionMinutesLimit);
+      poolConsumedThisCycle =
+        Number.isFinite(used) && Number.isFinite(limit) && used > Math.max(0, limit)
+          ? await computePoolOwed(userId, used, limit, tx)
+          : 0;
+    }
+    return poolConsumedThisCycle;
+  };
   for (const allocation of allocations) {
     if (allocation.reversedAt) continue;
     const allocationCents = Math.max(0, Number(allocation.amountCents));
@@ -576,7 +594,11 @@ async function freezeEntitlements(
           )
         );
         if (entitlement.kind === 'minutes') {
-          recoveredUnits = Math.min(stillAttributable, mutableUser.purchasedMinutesBalance);
+          const recoverablePool = Math.max(
+            0,
+            mutableUser.purchasedMinutesBalance - (await consumedPoolMinutes())
+          );
+          recoveredUnits = Math.min(stillAttributable, recoverablePool);
           if (recoveredUnits > 0) {
             await tx.$executeRaw`
               UPDATE User

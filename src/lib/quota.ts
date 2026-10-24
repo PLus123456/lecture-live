@@ -122,8 +122,9 @@ const QUOTA_USER_SELECT = {
  * owed = max(0, (used − 在途预留) − limit)。**必须排除在途预留**（async/full/grant reservedMinutes）：
  * 预留只是计入 used 的占位、尚未真正消费，会在下个周期结算时重新扣费——若把预留也算作已消费，
  * 会对同一批分钟重复扣池子。仅对持池用户（purchased>0）调用，其余用户 owed 恒 0、无需查询。
+ * 导出给退款/拒付反向（refundHandling）：本周期已消费的池分钟不可再当作「可回收」。
  */
-async function computePoolOwed(
+export async function computePoolOwed(
   userId: string,
   used: number,
   limit: number,

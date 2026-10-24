@@ -16,6 +16,7 @@ const {
   resolveRoleQuotasMock,
   resolveRoleStorageBytesLimitMock,
   settlePoolOnLimitChangeMock,
+  computePoolOwedMock,
 } = vi.hoisted(() => ({
   orderFindUniqueMock: vi.fn(),
   orderUpdateManyMock: vi.fn(),
@@ -32,6 +33,7 @@ const {
   resolveRoleQuotasMock: vi.fn(),
   resolveRoleStorageBytesLimitMock: vi.fn(),
   settlePoolOnLimitChangeMock: vi.fn(),
+  computePoolOwedMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => {
@@ -55,7 +57,10 @@ vi.mock('@/lib/userRoles', () => ({
   resolveRoleQuotas: resolveRoleQuotasMock,
   resolveRoleStorageBytesLimit: resolveRoleStorageBytesLimitMock,
 }));
-vi.mock('@/lib/quota', () => ({ settlePoolOnLimitChange: settlePoolOnLimitChangeMock }));
+vi.mock('@/lib/quota', () => ({
+  settlePoolOnLimitChange: settlePoolOnLimitChangeMock,
+  computePoolOwed: computePoolOwedMock,
+}));
 
 import { handlePaymentReversal } from '@/lib/payment/refundHandling';
 
@@ -106,6 +111,7 @@ beforeEach(() => {
     resolveRoleQuotasMock,
     resolveRoleStorageBytesLimitMock,
     settlePoolOnLimitChangeMock,
+    computePoolOwedMock,
   ]) {
     m.mockReset();
   }
@@ -382,6 +388,55 @@ describe('handlePaymentReversal（P3-16）', () => {
     expect(walletTxCreateMock).toHaveBeenCalledWith({
       data: expect.objectContaining({ minutesDelta: -100, amountCents: 0 }),
     });
+    expect(rawSql().some((s) => /INSERT INTO PaymentDebt/.test(s))).toBe(true);
+    expect(rawSql().some((s) => /INSERT INTO PaymentAccountHold/.test(s))).toBe(true);
+  });
+
+  // 池是 gross 的：本周期超出基础额度的消费（used − limit，排除在途预留）要到月度重置才从池里扣。
+  // 「买 100 分钟 → 本周期用掉 → 拒付」时这 100 分钟已不在池里，必须记债务，不能当作已回收。
+  it('▶ 分钟档：本周期已消费的池分钟不可回收 → 全额记债 + 冻结，不扣池', async () => {
+    entitlementQueryMock.mockResolvedValueOnce([
+      { id: 'ent-min', userId: 'u1', kind: 'minutes', totalUnits: 100, revokedUnits: 0, status: 'active' },
+    ]);
+    fundingLotQueryMock.mockResolvedValueOnce([
+      { id: 'lot-min', userId: 'u1', originalCents: 1000, remainingCents: 0, status: 'active' },
+    ]);
+    allocationQueryMock.mockResolvedValueOnce([
+      {
+        id: 'alloc-min',
+        fundingLotId: 'lot-min',
+        userId: 'u1',
+        spendTransactionId: 'spend-min',
+        entitlementId: 'ent-min',
+        targetKind: 'minutes',
+        amountCents: 1000,
+        entitlementUnits: 100,
+        recoveredUnits: 0,
+        debtCents: 0,
+        reversedAt: null,
+      },
+    ]);
+    orderFindUniqueMock.mockResolvedValue(MINUTES_ORDER);
+    orderUpdateManyMock.mockResolvedValue({ count: 1 });
+    userFindUniqueMock
+      .mockResolvedValueOnce({
+        walletBalanceCents: 0,
+        purchasedMinutesBalance: 100,
+        role: 'FREE',
+        originalRole: null,
+        roleExpiresAt: null,
+        transcriptionMinutesLimit: 60,
+        transcriptionMinutesUsed: 160,
+      })
+      .mockResolvedValueOnce({ walletBalanceCents: 0 });
+    computePoolOwedMock.mockResolvedValueOnce(100);
+
+    await handlePaymentReversal({ outTradeNo: 'LL1', provider: 'wechat' });
+
+    expect(computePoolOwedMock).toHaveBeenCalledWith('u1', 160, 60, expect.anything());
+    expect(rawSql().some((s) => /purchasedMinutesBalance = purchasedMinutesBalance -/.test(s))).toBe(
+      false
+    );
     expect(rawSql().some((s) => /INSERT INTO PaymentDebt/.test(s))).toBe(true);
     expect(rawSql().some((s) => /INSERT INTO PaymentAccountHold/.test(s))).toBe(true);
   });

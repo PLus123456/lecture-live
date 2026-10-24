@@ -234,7 +234,27 @@ async function computeLateTopUpMinutes(
       user: { select: { role: true } },
     },
   });
-  if (!session) return 0;
+  if (!session) {
+    // Session 行用户随时可删（SEC-030：它不是计费真源），grant.sessionId 是无外键的裸列，删行后
+    // 迟到的实测照样会落到这里。旧实现直接 return 0，于是「多开几条流 → 秒 finalize（只扣 1 分钟、
+    // 释放全部预扣）→ 删会话 → 流继续跑到 Soniox 硬上限」整段免单，可无限循环。改读不随会话删除
+    // 的 TranscriptionCharge 逐笔台账（finalize 那笔 source='session_finalize'、referenceId=sessionId）
+    // + User.role，口径与下面会话尚在时一致。
+    const owner = await tx.user.findUnique({
+      where: { id: grant.userId },
+      select: { role: true },
+    });
+    if (!owner) return 0; // 用户已删：与 interpret 分支同口径
+    const ledger = await tx.transcriptionCharge.aggregate({
+      where: { referenceId: grant.sessionId as string, source: 'session_finalize' },
+      _sum: { minutes: true },
+    });
+    const measuredMinutes = getBillableMinutes(
+      clampSessionDurationMs(measuredMs, owner.role as AppUserRole)
+    );
+    const charged = Math.max(0, ledger._sum.minutes ?? 0);
+    return Math.max(0, measuredMinutes - charged - grantChargedMinutes);
+  }
   // 角色时长上限（FREE 2h / PRO 4h）是刻意的用户保护，补扣不得绕过它 —— 实测量同样过 clamp。
   const measuredMinutes = getBillableMinutes(
     clampSessionDurationMs(measuredMs, session.user.role)

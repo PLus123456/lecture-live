@@ -972,7 +972,9 @@ describe('applyGrantTx：发放段防线', () => {
   // P3-6：roleExpiresAt 是读-改-写。快照读 + 盲写在并发网关回调下必然 lost update
   // （两笔各扣一次钱、到期只延一期，且台账看起来完全正常）。锁读是唯一能串行化它的手段。
   it('▶ P3-6 用 SELECT … FOR UPDATE 锁读用户行，并据锁读的到期日叠加续期', async () => {
-    const existing = new Date('2026-09-01T00:00:00.000Z');
+    // 必须是「未来」的到期日：已过期的会员按设计从 now 起算（不叠加），写死的日历日期
+    // 一旦被真实时间越过，这条用例就会无声地改测另一条分支并失败。
+    const existing = new Date(Date.now() + 10 * 86_400_000);
     rechargeTierFindUniqueMock.mockResolvedValueOnce(membershipTier);
     queryRawMock.mockResolvedValueOnce([
       {
@@ -995,6 +997,28 @@ describe('applyGrantTx：发放段防线', () => {
     expect(roleUpdate?.[0].data.roleExpiresAt.getTime()).toBe(
       existing.getTime() + 30 * 86_400_000
     );
+  });
+
+  // 升级不能踢下线：verifyToken 每次都从 DB 读 role，tokenVersion++ 只会让买家下一个请求 401，
+  // 被 AuthSessionMonitor 当成会话失效登出并吊销所有设备的会话。
+  it('▶ 会员发放不自增 tokenVersion（升级即时生效，买家不被登出）', async () => {
+    rechargeTierFindUniqueMock.mockResolvedValueOnce(membershipTier);
+    queryRawMock.mockResolvedValueOnce([
+      {
+        walletBalanceCents: 3000,
+        role: 'FREE',
+        originalRole: null,
+        roleExpiresAt: null,
+        transcriptionMinutesLimit: 60,
+      },
+    ]);
+    userFindUniqueMock.mockResolvedValueOnce({ walletBalanceCents: 0 });
+
+    await spendFromBalance('u1', 't-pro');
+
+    const roleUpdate = userUpdateMock.mock.calls.find((c) => c[0]?.data?.role === 'PRO');
+    expect(roleUpdate).toBeDefined();
+    expect(roleUpdate?.[0].data).not.toHaveProperty('tokenVersion');
   });
 
   // M7：发放侧从前只挡「买家已经是 ADMIN」，完全不看 spec.grantRole；而档位管理口的

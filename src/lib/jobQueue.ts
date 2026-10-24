@@ -94,6 +94,13 @@ export interface ActiveJobResourceReservation {
     settledUnitsFloor: number;
     /** 同一 (type, sessionId) 最多允许多少个在途资源任务。 */
     maxActiveJobs: number;
+    /**
+     * 只统计该时刻（含）之后创建的已结算行；缺省 = 终身预算（历史语义）。
+     * 用于「付费一次、预算重置一次」的 owner：文档翻译用户重试会重新扣费并换新调度行，
+     * 上一代失败烧掉的预算不能继续压在新付费的这一代头上，否则重试永远跑不完。
+     * 在途行（并发/预留）不受影响，始终全部计入。
+     */
+    settledSince?: Date;
   };
 }
 
@@ -173,7 +180,10 @@ function validateResourceReservation(
         !Number.isSafeInteger(owner.settledUnitsFloor) ||
         owner.settledUnitsFloor < 0 ||
         !Number.isSafeInteger(owner.maxActiveJobs) ||
-        owner.maxActiveJobs <= 0))
+        owner.maxActiveJobs <= 0 ||
+        (owner.settledSince !== undefined &&
+          (!(owner.settledSince instanceof Date) ||
+            Number.isNaN(owner.settledSince.getTime())))))
   ) {
     throw new Error('Invalid active-job resource reservation');
   }
@@ -325,9 +335,13 @@ export async function claimActiveJob(
             resource.owner.maxActiveJobs
           );
         }
+        const settledSinceWhere = resource.owner.settledSince
+          ? { createdAt: { gte: resource.owner.settledSince } }
+          : {};
         const ownerSettled = await tx.jobQueue.aggregate({
           where: {
             ...ownerWhere,
+            ...settledSinceWhere,
             status: { in: [JOB_STATUS.SUCCESS, JOB_STATUS.FAILED] },
             actualUnits: { not: null },
           },
@@ -336,6 +350,7 @@ export async function claimActiveJob(
         const ownerUnknown = await tx.jobQueue.aggregate({
           where: {
             ...ownerWhere,
+            ...settledSinceWhere,
             status: { in: [JOB_STATUS.SUCCESS, JOB_STATUS.FAILED] },
             actualUnits: null,
           },

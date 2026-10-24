@@ -31,6 +31,7 @@ const {
   deleteOutputGenerationMock,
   deleteTranslateJobMock,
   refundWalletCentsMock,
+  sweepAllExpiredQuotesMock,
 } = vi.hoisted(() => ({
   taskUpdateManyMock: vi.fn(),
   taskFindUniqueMock: vi.fn(),
@@ -55,6 +56,7 @@ const {
   deleteOutputGenerationMock: vi.fn(),
   deleteTranslateJobMock: vi.fn(),
   refundWalletCentsMock: vi.fn(),
+  sweepAllExpiredQuotesMock: vi.fn(),
 }));
 
 vi.mock('@/lib/prisma', () => ({
@@ -123,6 +125,9 @@ vi.mock('@/lib/logger', () => ({
   logger: { child: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }) },
   serializeError: (e: unknown) => e,
 }));
+vi.mock('@/lib/translate/taskApi', () => ({
+  sweepAllExpiredQuotes: sweepAllExpiredQuotesMock,
+}));
 
 import {
   enqueueDocTranslate,
@@ -184,6 +189,7 @@ beforeEach(() => {
   taskFindUniqueMock.mockResolvedValue(null);
   createJobMock.mockResolvedValue('job-new');
   refundWalletCentsMock.mockResolvedValue(undefined);
+  sweepAllExpiredQuotesMock.mockResolvedValue(0);
   // 被 `.catch(...)` 链式调用的 mock 必须返回 Promise，否则 undefined.catch 抛 TypeError
   // 并被对账的外层 catch 吞掉，测试会静默通过（假绿）。
   deleteTranslateJobMock.mockResolvedValue(undefined);
@@ -1499,5 +1505,176 @@ describe('executeTick — 断链任务自愈 (H5)', () => {
     // canRetry 分支，task 本来就不写 FAILED，但 job 行会被重写、nextRetryAt 被一 tick
     // 一次地顺延 —— 排定的重试永远到不了期。必须钉住 job 行零重写。
     expect(findJobFailedWrite()).toBeUndefined();
+  });
+});
+
+// H6 解绑回炉：worker 连续不可达 ≥10 分钟时回炉，必须与 404 / created 一样走 requeue*，
+// 在同一事务里吊销任务侧 proxyTokenHash / proxyGeneration / workerId。此前只裸改 JobQueue
+// 状态，任务仍挂着本代 proxyGeneration，之后每轮 claimJob（要求 proxyGeneration=null）都
+// 回滚 → 调度行永久卡 SUBMITTED、占住派发槽，直到 24h 死线。
+describe('reconcileProcessingJob — 持续不可达解绑 (H6)', () => {
+  const longAgo = () => new Date(Date.now() - 11 * 60_000).toISOString();
+
+  function arrangeUnreachable(params: Record<string, unknown>, proxyGeneration: string | null) {
+    const rawParams = JSON.stringify(params);
+    jobFindManyMock.mockImplementation(
+      async (args: { where?: { status?: string }; select?: unknown }) =>
+        args.where?.status === 'PROCESSING' && !args.select
+          ? [
+              {
+                id: 'job-1',
+                startedAt: new Date(Date.now() - 30 * 60_000),
+                attempt: 1,
+                maxAttempts: 3,
+                params: rawParams,
+              },
+            ]
+          : []
+    );
+    taskFindUniqueMock.mockResolvedValue({
+      id: 't1',
+      userId: 'u1',
+      status: 'TRANSLATING',
+      chargedCents: 100,
+      refundedAt: null,
+      pageCount: 1,
+      modelId: 'm1',
+      proxyGeneration,
+      workerId: 'w1',
+      jobQueueId: 'job-1',
+      user: { role: 'PRO', customGroupId: null },
+    });
+    getTranslateJobMock.mockRejectedValue(
+      new TranslateWorkerError('bad gateway', 502)
+    );
+    return rawParams;
+  }
+
+  it('generation 行：回 SUBMITTED 与任务侧 token/代次/workerId 吊销同事务，params 一并解绑', async () => {
+    const proxyGeneration = 'd'.repeat(64);
+    arrangeUnreachable(
+      { taskId: 't1', workerId: 'w1', proxyGeneration, unreachableSince: longAgo() },
+      proxyGeneration
+    );
+
+    await runDocTranslateTick();
+
+    const requeue = jobUpdateManyMock.mock.calls.find(
+      (call) => call[0]?.data?.status === 'SUBMITTED'
+    );
+    expect(requeue?.[0]).toMatchObject({
+      where: {
+        id: 'job-1',
+        status: 'PROCESSING',
+        params: { contains: `"proxyGeneration":"${proxyGeneration}"` },
+      },
+    });
+    const nextParams = JSON.parse(requeue?.[0].data.params) as Record<string, unknown>;
+    expect(nextParams.workerId).toBeUndefined();
+    expect(nextParams.unreachableSince).toBeUndefined();
+    expect(taskUpdateManyMock).toHaveBeenCalledWith({
+      where: { id: 't1', jobQueueId: 'job-1', proxyGeneration },
+      data: { proxyTokenHash: null, proxyGeneration: null, workerId: null },
+    });
+    // 吊销与状态转换在同一个 $transaction 回调里
+    expect(transactionMock).toHaveBeenCalled();
+  });
+
+  it('legacy 行：按完整 params 快照 CAS 回炉并吊销 token/workerId', async () => {
+    const rawParams = arrangeUnreachable(
+      { taskId: 't1', workerId: 'w1', unreachableSince: longAgo() },
+      null
+    );
+
+    await runDocTranslateTick();
+
+    const requeue = jobUpdateManyMock.mock.calls.find(
+      (call) => call[0]?.data?.status === 'SUBMITTED'
+    );
+    // 快照 CAS 用的是**原始** params：若先单独写 params 再回炉，这里永远失配
+    expect(requeue?.[0].where).toMatchObject({
+      id: 'job-1',
+      status: 'PROCESSING',
+      params: rawParams,
+    });
+    expect(JSON.parse(requeue?.[0].data.params)).toEqual({ taskId: 't1' });
+    expect(taskUpdateManyMock).toHaveBeenCalledWith({
+      where: {
+        id: 't1',
+        jobQueueId: 'job-1',
+        proxyGeneration: null,
+        status: { in: ['PENDING', 'TRANSLATING'] },
+      },
+      data: { proxyTokenHash: null, workerId: null },
+    });
+  });
+
+  it('未满 10 分钟只记首次不可达时刻，不回炉', async () => {
+    const proxyGeneration = 'e'.repeat(64);
+    arrangeUnreachable({ taskId: 't1', workerId: 'w1', proxyGeneration }, proxyGeneration);
+
+    await runDocTranslateTick();
+
+    expect(
+      jobUpdateManyMock.mock.calls.some((call) => call[0]?.data?.status === 'SUBMITTED')
+    ).toBe(false);
+    expect(
+      taskUpdateManyMock.mock.calls.some((call) => call[0]?.data?.proxyGeneration === null)
+    ).toBe(false);
+  });
+
+  it('新代 claim 不继承上一代的不可达计时', async () => {
+    jobFindManyMock.mockImplementation(
+      async (args: { where?: { status?: string } }) =>
+        args.where?.status === 'SUBMITTED'
+          ? [
+              {
+                id: 'job-1',
+                startedAt: null,
+                attempt: 1,
+                maxAttempts: 3,
+                params: JSON.stringify({
+                  taskId: 't1',
+                  workerId: 'w-dead',
+                  unreachableSince: longAgo(),
+                }),
+              },
+            ]
+          : []
+    );
+    // claim 后读不到任务 → dispatch 立即终结，只关心 claim 写入的 params
+    taskFindUniqueMock.mockResolvedValue(null);
+
+    await runDocTranslateTick();
+
+    const claim = jobUpdateManyMock.mock.calls.find(
+      (call) => call[0]?.data?.status === 'PROCESSING'
+    );
+    const claimed = JSON.parse(claim?.[0].data.params) as Record<string, unknown>;
+    expect(claimed.unreachableSince).toBeUndefined();
+    expect(claimed.workerId).toBeUndefined();
+  });
+});
+
+describe('executeTick — 过期报价全局清扫', () => {
+  it('机队被停用（fleet=null）时 tick 仍清扫过期报价', async () => {
+    getTranslateFleetConfigMock.mockResolvedValue(null);
+
+    await runDocTranslateTick();
+
+    expect(sweepAllExpiredQuotesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('清扫异常不影响后续对账/派发', async () => {
+    sweepAllExpiredQuotesMock.mockRejectedValue(new Error('db flake'));
+
+    await runDocTranslateTick();
+
+    // 第 1 步对账照常查询 PROCESSING 行
+    expect(jobFindManyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ status: 'PROCESSING' }),
+      })
+    );
   });
 });

@@ -183,6 +183,37 @@ describe('translation retry generation/refund admission', () => {
     expect(enqueueDocTranslateMock).toHaveBeenCalledWith('task-1', 'user-1');
   });
 
+  // 用户为重试重新付费：任务级 LLM token 计量（代理端预算下限）必须清零，
+  // 否则上一代失败烧掉的预算一直压在新一代头上，重试从第一个付费请求起就 429。
+  it('付费重试同事务清零任务级 LLM token 计量', async () => {
+    taskFindUniqueMock
+      .mockResolvedValueOnce({
+        id: 'task-1',
+        userId: 'user-1',
+        status: 'FAILED',
+        estimatedCents: 100,
+        chargedCents: 100,
+        refundedAt: new Date('2026-08-20T00:00:00Z'),
+        jobQueueId: 'job-1',
+        proxyGeneration: null,
+        updatedAt: new Date('2026-08-20T12:00:00.000Z'),
+      })
+      .mockResolvedValueOnce({ id: 'task-1', status: 'PENDING' });
+
+    const response = await request();
+
+    expect(response.status).toBe(200);
+    expect(txTaskUpdateManyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PENDING',
+          llmInputTokens: 0,
+          llmOutputTokens: 0,
+        }),
+      })
+    );
+  });
+
   it('enqueue 结果未知且任务已绑定新代时返回409，不误标FAILED或退款', async () => {
     taskFindUniqueMock.mockResolvedValue({
       id: 'task-1',

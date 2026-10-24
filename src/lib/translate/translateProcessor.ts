@@ -27,6 +27,7 @@ import {
   saveOutputFile,
   deleteOutputGeneration,
 } from '@/lib/translate/taskStorage';
+import { sweepAllExpiredQuotes } from '@/lib/translate/taskApi';
 import { logger, serializeError } from '@/lib/logger';
 
 /**
@@ -326,6 +327,15 @@ async function executeTick(): Promise<void> {
     translateLogger.warn(
       { err: serializeError(error) },
       '任务生存期死线扫描异常（下轮重试）'
+    )
+  );
+
+  // 0.5) 全局清扫过期未确认报价（连源文件）。只靠「本人下次上传时懒清理」的话，用户停止
+  // 上传后过期报价会永久占盘。同样排在 `if (!fleet)` 之前：站点关掉文档翻译后残留的报价也要清。
+  await sweepAllExpiredQuotes().catch((error) =>
+    translateLogger.warn(
+      { err: serializeError(error) },
+      '过期报价清扫异常（下轮重试）'
     )
   );
 
@@ -662,6 +672,9 @@ async function claimJob(job: JobRow): Promise<string | null> {
   const params: TranslateJobParams = {
     ...parseJobParams(job.params),
     workerId: undefined,
+    // 不可达计时属于上一代绑定的那台 worker；新代若继承旧时间戳，换台后的第一次
+    // 瞬时失败就会被误判为「已持续不可达 10 分钟」而立刻解绑。
+    unreachableSince: undefined,
     proxyGeneration,
     remoteJobId: translationRemoteJobId(job.id, proxyGeneration),
     dispatchState: 'claiming',
@@ -700,11 +713,15 @@ function generationMarker(proxyGeneration: string): string {
  * 只能把调用方所持的 dispatch 代次回炉。JobQueue 状态转换和任务
  * token/代次撤销同事务：新 claim 必须等这个行锁提交后才能写新代次，
  * 因此旧进程不会清掉新 worker 的凭据。
+ *
+ * nextParams：需要顺带改写调度参数（如解绑不可达 worker、清不可达计时）时，与状态
+ * 转换写在同一条 CAS 里 —— 分两步写的话，先写的 params 会让 legacy 快照 CAS 失配。
  */
 async function requeueClaimedJob(
   taskId: string,
   jobId: string,
-  proxyGeneration: string
+  proxyGeneration: string,
+  nextParams?: TranslateJobParams
 ): Promise<boolean> {
   return prisma.$transaction(async (tx) => {
     const requeued = await tx.jobQueue.updateMany({
@@ -713,7 +730,11 @@ async function requeueClaimedJob(
         status: JOB_STATUS.PROCESSING,
         params: { contains: generationMarker(proxyGeneration) },
       },
-      data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
+      data: {
+        status: JOB_STATUS.SUBMITTED,
+        startedAt: null,
+        ...(nextParams ? { params: JSON.stringify(nextParams) } : {}),
+      },
     });
     if (requeued.count !== 1) return false;
     const revoked = await tx.translationTask.updateMany({
@@ -732,7 +753,11 @@ async function requeueClaimedJob(
 }
 
 /** migration 期无 generation 的 PROCESSING 行也必须用完整 params 快照 CAS。 */
-async function requeueLegacyJob(taskId: string, job: JobRow): Promise<boolean> {
+async function requeueLegacyJob(
+  taskId: string,
+  job: JobRow,
+  nextParams?: TranslateJobParams
+): Promise<boolean> {
   return prisma.$transaction(async (tx) => {
     const requeued = await tx.jobQueue.updateMany({
       where: {
@@ -740,7 +765,11 @@ async function requeueLegacyJob(taskId: string, job: JobRow): Promise<boolean> {
         status: JOB_STATUS.PROCESSING,
         params: job.params,
       },
-      data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
+      data: {
+        status: JOB_STATUS.SUBMITTED,
+        startedAt: null,
+        ...(nextParams ? { params: JSON.stringify(nextParams) } : {}),
+      },
     });
     if (requeued.count !== 1) return false;
     const revoked = await tx.translationTask.updateMany({
@@ -950,6 +979,9 @@ async function dispatchJob(
     remoteJobId,
     dispatchState: 'claiming',
     workerId: undefined,
+    // job.params 是 claim 之前读到的 SUBMITTED 快照；与 claimJob 同口径丢弃上一代的
+    // 不可达计时，否则下面任一次 writeJobParamsForGeneration 会把它写回新代。
+    unreachableSince: undefined,
   };
   const task = await loadTask(params.taskId);
   if (!task) {
@@ -1377,19 +1409,26 @@ async function reconcileProcessingJob(
       ? new Date(params.unreachableSince as string).getTime()
       : Date.now();
     if (Date.now() - firstFailureMs >= WORKER_UNREACHABLE_REBIND_MS) {
-      await writeJobParamsSnapshot(
-        job,
-        proxyGeneration,
-        { ...params, workerId: undefined, unreachableSince: undefined }
-      );
-      await prisma.jobQueue.updateMany({
-        where: { id: job.id, status: JOB_STATUS.PROCESSING },
-        data: { status: JOB_STATUS.SUBMITTED, startedAt: null },
-      });
-      translateLogger.warn(
-        { jobId: job.id, taskId: task.id, worker: bound.name },
-        'worker 持续不可达，解绑重派'
-      );
+      // 必须走与 404 / created 同一套 requeue*：调度行回 SUBMITTED 与任务侧
+      // proxyTokenHash / proxyGeneration / workerId 吊销同事务。此前这里只裸改 JobQueue，
+      // 任务仍挂着本代 proxyGeneration → 之后每轮 claimJob 的 `proxyGeneration: null`
+      // CAS 都命中 0 行并回滚，调度行永久卡在 SUBMITTED（直到 24h 死线才退款），
+      // 且作为最老的 SUBMITTED 行每轮占掉派发槽 —— 单台 worker 断电 10 分钟就能让
+      // 全站文档翻译停摆。解绑 workerId、清不可达计时与状态转换写在同一条 CAS 里。
+      const nextParams: TranslateJobParams = {
+        ...params,
+        workerId: undefined,
+        unreachableSince: undefined,
+      };
+      const requeued = proxyGeneration
+        ? await requeueClaimedJob(task.id, job.id, proxyGeneration, nextParams)
+        : await requeueLegacyJob(task.id, job, nextParams);
+      if (requeued) {
+        translateLogger.warn(
+          { jobId: job.id, taskId: task.id, worker: bound.name },
+          'worker 持续不可达，解绑重派'
+        );
+      }
       return;
     }
     if (!params.unreachableSince) {

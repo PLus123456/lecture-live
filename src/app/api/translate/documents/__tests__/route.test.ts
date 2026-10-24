@@ -9,6 +9,7 @@ const {
   translationTaskCreateMock,
   saveSourceFileMock,
   userFindUniqueMock,
+  countOutstandingQuotesMock,
   MockDocumentParserError,
 } = vi.hoisted(() => ({
   verifyAuthMock: vi.fn(),
@@ -19,6 +20,7 @@ const {
   translationTaskCreateMock: vi.fn(),
   saveSourceFileMock: vi.fn(),
   userFindUniqueMock: vi.fn(),
+  countOutstandingQuotesMock: vi.fn(),
   MockDocumentParserError: class DocumentParserError extends Error {
     constructor(
       message: string,
@@ -60,6 +62,8 @@ vi.mock('@/lib/translate/taskApi', () => ({
   sanitizeLangCode: (value: unknown, fallback: string) =>
     typeof value === 'string' ? value : fallback,
   sweepExpiredQuotes: vi.fn().mockResolvedValue(undefined),
+  countOutstandingQuotes: countOutstandingQuotesMock,
+  MAX_OUTSTANDING_QUOTES_PER_USER: 10,
 }));
 vi.mock('@/lib/prisma', () => ({
   prisma: {
@@ -103,6 +107,7 @@ describe('POST /api/translate/documents parser boundary', () => {
       default_target_lang: 'zh',
     });
     resolveUserFeatureFlagsMock.mockResolvedValue({ allowDocTranslation: true });
+    countOutstandingQuotesMock.mockResolvedValue(0);
     // 合并后路由以 DB 行（而非 JWT 载荷）判角色/组/模型门禁，见 #232/#233。
     userFindUniqueMock.mockResolvedValue({
       id: 'user-1',
@@ -112,9 +117,25 @@ describe('POST /api/translate/documents parser boundary', () => {
     });
   });
 
+  // 每个未确认报价都在本地盘留一份源 PDF 且不计存储配额：数量闸必须在读 body 之前。
+  it('未确认报价达到上限 → 429，在读 body / 解析 PDF / 建任务之前拒绝', async () => {
+    countOutstandingQuotesMock.mockResolvedValue(10);
+
+    const response = await POST(makePdfRequest());
+
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toMatchObject({
+      code: 'too_many_pending_quotes',
+    });
+    expect(inspectPdfDocumentMock).not.toHaveBeenCalled();
+    expect(translationTaskCreateMock).not.toHaveBeenCalled();
+    expect(saveSourceFileMock).not.toHaveBeenCalled();
+  });
+
   it.each([
     { code: 'cancelled', status: 499 },
     { code: 'input_limit', status: 413 },
+    { code: 'memory_limit', status: 413 },
     { code: 'timeout', status: 422 },
     { code: 'busy', status: 503 },
     { code: 'worker_failed', status: 503 },

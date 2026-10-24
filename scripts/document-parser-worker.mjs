@@ -13,7 +13,21 @@ const MIME_XLS = 'application/vnd.ms-excel';
 const MIME_PPTX =
   'application/vnd.openxmlformats-officedocument.presentationml.presentation';
 
-const MAX_INPUT_BYTES = 64 * 1024 * 1024;
+// 输入上限的唯一真源是父进程 documentParserProcess.ts 的 DOCUMENT_PARSER_MAX_INPUT_BYTES，
+// 由它作为 argv[4] 传入。此前这里写死 64MB 而父进程早已放宽到 100MB：65–100MB 的附件
+// 过了父进程准入，却在子进程里被当成 archive_limit 拒掉，「放宽」从未真正生效。
+// 缺失/畸形时退回同值兜底；硬顶防止被传入离谱的值。
+const DEFAULT_MAX_INPUT_BYTES = 100 * 1024 * 1024;
+const HARD_MAX_INPUT_BYTES = 128 * 1024 * 1024;
+
+function resolveMaxInputBytes(raw) {
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= HARD_MAX_INPUT_BYTES
+    ? parsed
+    : DEFAULT_MAX_INPUT_BYTES;
+}
+
+const MAX_INPUT_BYTES = resolveMaxInputBytes(process.argv[4]);
 const MAX_KEYWORD_TEXT_CHARS = 4_000_000;
 const MAX_ATTACHMENT_TEXT_CHARS = 2_000_000;
 const TRUNCATION_MARKER = '\n\n…[文档过长，已截断]';
@@ -140,8 +154,8 @@ async function parseXlsx(buffer) {
 
 async function parsePptxForAttachment(buffer) {
   await preflightOffice(buffer, MIME_PPTX);
-  const module = await import('officeparser');
-  const parseOffice = module.parseOffice ?? module.default?.parseOffice;
+  const officeParser = await import('officeparser');
+  const parseOffice = officeParser.parseOffice ?? officeParser.default?.parseOffice;
   if (typeof parseOffice !== 'function') throw new Error('PPTX parser unavailable');
   const ast = await parseOffice(buffer);
   // officeparser v8 删除了同步的 ast.toText()（旧写法在 v8 下会静默返回空串，PPTX 附件全变空白）。

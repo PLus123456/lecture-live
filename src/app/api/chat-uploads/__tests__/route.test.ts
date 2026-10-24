@@ -133,6 +133,10 @@ vi.mock('@/lib/logger', () => {
 
 import { POST, GET } from '@/app/api/chat-uploads/route';
 import {
+  __getChatUploadAdmissionForTests,
+  __resetChatUploadAdmissionForTests,
+} from '@/lib/llm/chatUploadAdmission';
+import {
   CHAT_ATTACHMENT_TEXT_MAX_BYTES,
   CHAT_ATTACHMENT_TEXT_MAX_CHARS,
 } from '@/lib/llm/chatAttachmentPolicy';
@@ -590,6 +594,95 @@ describe('POST /api/chat-uploads', () => {
       )
     );
     expect(response.status).toBe(400);
+  });
+});
+
+/**
+ * #9：Next middleware 把 >32MiB 的请求体静默截断后才交给路由，chat_files_max_upload_mb
+ * 默认 100MB 实际不可达（32–100MB 只会得到 400 Invalid multipart body）——有效上限按
+ * 32MiB - multipart 余量封顶，并在读 body 前给出明确 413。
+ * #7：进程级在途上传字节准入，读 body 之前同步预留，容量不足立即 429。
+ */
+describe('POST /api/chat-uploads — 上限对齐与在途字节准入', () => {
+  beforeEach(() => {
+    __resetChatUploadAdmissionForTests();
+    verifyAuthMock.mockResolvedValue({
+      id: 'user-1',
+      email: 'alice@example.com',
+      role: 'PRO',
+    });
+    enforceApiRateLimitMock.mockResolvedValue(null);
+    getSiteSettingsMock.mockResolvedValue({ chat_files_max_upload_mb: 100 });
+    conversationFindUniqueMock.mockResolvedValue({ userId: 'user-1', endedAt: null });
+    reserveStoredArtifactMock.mockImplementation(
+      async (input: { artifactType: string; expectedBytes: number }) => ({
+        id: `artifact-${input.artifactType}`,
+        userId: 'user-1',
+        expectedBytes: BigInt(input.expectedBytes),
+        state: 'RESERVED',
+      })
+    );
+    recordReservedStoredArtifactLocationMock.mockResolvedValue(undefined);
+    settleStoredArtifactMock.mockResolvedValue({ artifact: {}, previous: null });
+    createCloudreveStorageMock.mockResolvedValue({ upload: uploadMock });
+    uploadMock.mockImplementation(
+      async (_uid: string, _cat: string, fileName: string) =>
+        `/user-1/chat-uploads/${fileName}`
+    );
+    chatAttachmentCreateMock.mockResolvedValue({ id: 'att-1' });
+    executeRawMock.mockResolvedValue(1);
+    isExtractableMimeMock.mockImplementation((mt: string) =>
+      mt.toLowerCase().startsWith('text/')
+    );
+  });
+
+  function textUpload() {
+    return createMultipartRequest(
+      'http://localhost:3000/api/chat-uploads',
+      { conversationId: 'conv-1' },
+      { fieldName: 'file', fileName: 'a.txt', contents: 'hello', type: 'text/plain' }
+    );
+  }
+
+  it('配置 100MB 时声明 40MB 的上传在读 body 前 413，提示真实可用上限', async () => {
+    const request = textUpload();
+    request.headers.set('content-length', String(40 * 1024 * 1024));
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(413);
+    const body = (await readJson(response)) as { error: string };
+    expect(body.error).toContain('max 31 MB');
+    expect(conversationFindUniqueMock).not.toHaveBeenCalled();
+    expect(uploadMock).not.toHaveBeenCalled();
+  });
+
+  it('同一用户第 3 个并发上传 429，在途请求结束后预留释放', async () => {
+    const gates: Array<() => void> = [];
+    extractTextFromBufferMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          gates.push(() => resolve({ text: 'x', truncated: false }));
+        })
+    );
+
+    const first = POST(textUpload());
+    const second = POST(textUpload());
+    await vi.waitFor(() => expect(gates).toHaveLength(2));
+
+    const third = await POST(textUpload());
+    expect(third.status).toBe(429);
+    expect(((await readJson(third)) as { code: string }).code).toBe(
+      'upload_capacity_busy'
+    );
+
+    gates.forEach((open) => open());
+    expect((await first).status).toBe(200);
+    expect((await second).status).toBe(200);
+
+    extractTextFromBufferMock.mockResolvedValue({ text: 'x', truncated: false });
+    expect((await POST(textUpload())).status).toBe(200);
+    expect(__getChatUploadAdmissionForTests()).toMatchObject({ requests: 0, bytes: 0 });
   });
 });
 

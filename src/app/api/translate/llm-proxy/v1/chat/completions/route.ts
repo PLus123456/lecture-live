@@ -2,7 +2,11 @@ import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { isPaymentBenefitAvailable } from '@/lib/payment/entitlementAdmission';
-import { callLLMWithHistoryStream, type LLMStreamEvent } from '@/lib/llm/gateway';
+import {
+  callLLMWithHistoryStream,
+  LlmUpstreamStatusError,
+  type LLMStreamEvent,
+} from '@/lib/llm/gateway';
 import { resolveGroupBoundModel } from '@/lib/llm/summaryModel';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { logger, serializeError } from '@/lib/logger';
@@ -246,6 +250,20 @@ export async function POST(req: Request) {
 
   const spentTokens = task.llmInputTokens + task.llmOutputTokens;
   const tokenBudget = translationProxyTaskBudget(task.pageCount);
+  // 任务 token 预算按「本次付费尝试」计：用户重试会重新扣费、清零任务计量并换一条新调度行，
+  // 只统计该调度行创建之后的已结算代理调用（同一付费尝试内的自动重试共用同一行、共享预算）。
+  // 读不到时退回终身预算口径（更保守）。
+  let attemptStartedAt: Date | undefined;
+  if (task.jobQueueId) {
+    const attemptJob = await prisma.jobQueue
+      .findUnique({
+        where: { id: task.jobQueueId },
+        select: { createdAt: true },
+      })
+      .catch(() => null);
+    attemptStartedAt =
+      attemptJob?.createdAt instanceof Date ? attemptJob.createdAt : undefined;
+  }
   let jobId: string;
   try {
     jobId = await claimLlmTokenBudget({
@@ -260,6 +278,7 @@ export async function POST(req: Request) {
         settledUnitsFloor: spentTokens,
         // pdf2zh 的 qps 仍可排队；同一任务只有一个付费请求在途，彻底关闭并发穿透。
         maxActiveJobs: 1,
+        ...(attemptStartedAt ? { settledSince: attemptStartedAt } : {}),
       },
       params: {
         requestHash,
@@ -494,6 +513,18 @@ export async function POST(req: Request) {
     return completionResponse(task.id, parsed.stream, cachedValue);
   } catch (error) {
     if (!successSettlementStarted) {
+      // 上游在流开始前就回了非 2xx（429 限流 / 401 / 5xx 过载）：可证明没有输出 token，
+      // 只按输入上界保守结算。此前一律按 输入 + maxOutputTokens 满额结算 —— 上游限流风暴
+      // 时每次失败都按 ~8K 输出 token 扣任务预算，几十次就把整单烧光，之后的自动重试与
+      // 付费重试全被 insufficient_quota 拒绝。流中途失败仍按满额（输出可能已产生）。
+      if (
+        error instanceof LlmUpstreamStatusError &&
+        actualTokens === reservedTokens
+      ) {
+        actualTokens = Math.max(0, reservedTokens - maxOutputTokens);
+        settledInputTokens = actualTokens;
+        settledOutputTokens = 0;
+      }
       try {
         await failActiveJob(
           jobId,

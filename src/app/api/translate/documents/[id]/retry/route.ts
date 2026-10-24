@@ -156,6 +156,12 @@ export async function POST(
           proxyTokenHash: null, // 旧 worker 凭据不得跨代次复活
           proxyGeneration: null,
           workerId: null,
+          // 用户为这次重试重新付了费：任务级 LLM token 预算也随之重置（代理端按新调度行
+          // 起算已结算用量，见 llm-proxy 的 settledSince）。否则上一代失败烧掉的预算一直压在
+          // 新一代头上，重试从第一个付费请求起就被 insufficient_quota 拒绝，永远跑不完。
+          // 历史用量仍完整保留在 llm_tokens 账本（JobQueue 行）里。
+          llmInputTokens: 0,
+          llmOutputTokens: 0,
           updatedAt: pendingAt,
         },
       });

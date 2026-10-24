@@ -18,6 +18,21 @@ function sanitizeApiError(text: string, maxLen = 200): string {
 }
 
 /**
+ * 上游在**开始返回正文之前**就回了非 2xx（限流 / 鉴权 / 过载 / 参数错误）。此时可以证明
+ * 本次调用没有产生输出 token：保守结算的调用方不应再按 maxOutputTokens 满额计费。
+ * message 与旧的普通 Error 文案逐字一致 —— chat 路由的上下文超长判定靠嗅探它。
+ */
+export class LlmUpstreamStatusError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+    this.name = 'LlmUpstreamStatusError';
+  }
+}
+
+/**
  * 出站 LLM 请求超时（防慢速上游拖垮请求处理器 / 连接耗尽）。
  *  - 非流式调用（callXxx / embedding）：整次请求总超时。
  *  - 流式调用（streamXxx）：仅给「响应头到达」设超时，拿到响应头即清除计时器，
@@ -54,6 +69,16 @@ async function fetchStreamWithHeadersTimeout(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * 非流式出站请求的 signal：整次总超时 + 可选外部取消（客户端断开）。
+ * 此前 callXxx 只用 AbortSignal.timeout，CallOptions.signal 被静默丢弃 —— 调用方
+ * 以为传了 signal 就能在客户端断开时停止上游计费，实际请求仍会跑满直到返回或 120s 超时。
+ */
+function nonStreamingRequestSignal(externalSignal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS);
+  return externalSignal ? AbortSignal.any([externalSignal, timeout]) : timeout;
 }
 
 /* ------------------------------------------------------------------ */
@@ -632,15 +657,17 @@ interface CallOptions {
    */
   maxOutputTokens?: number;
   /**
-   * 流式正文的 UTF-8 上限。网关会由此推导一个包含 SSE/JSON 转义开销的
-   * wire 上限，在单行拼接或 JSON.parse 前 cancel 超大上游响应。
+   * 流式 正文 + 思考 的解码后 UTF-8 字节上限（按增量累计，超限即 cancel 上游）。
+   * 网关另由它推导单行上限（异常巨行在拼接 / JSON.parse 前 cancel）；wire 总量只保留
+   * 16MiB 粗闸 —— 不能用 wire 字节代替正文字节：SSE 每帧的包装开销远大于正文本身。
    */
   maxResponseUtf8Bytes?: number;
   /** 非流式调用成功返回时上报 provider usage，供外层结算。 */
   onUsage?: (usage: LLMCallUsage | undefined) => void;
   /**
-   * 外部取消信号（如客户端断开时由路由层 abort）。透传到出站 provider fetch：一旦 abort，
-   * 进行中的响应体 read 会立即中断，停止继续拉流 / 继续计费 / 长时间占用连接。
+   * 外部取消信号（如客户端断开时由路由层 abort）。透传到出站 provider fetch（流式与非流式
+   * 都生效；非流式与 120s 总超时合并）：一旦 abort，进行中的请求 / 响应体 read 会立即中断，
+   * 停止继续拉流 / 继续计费 / 长时间占用连接。
    */
   signal?: AbortSignal;
 }
@@ -707,12 +734,19 @@ export async function callLLM(
     },
     async () => {
       const result = provider.isAnthropic
-        ? await callAnthropic(provider, systemPrompt, userMessage, thinkingParams)
+        ? await callAnthropic(
+            provider,
+            systemPrompt,
+            userMessage,
+            thinkingParams,
+            options?.signal
+          )
         : await callOpenAICompatible(
             provider,
             systemPrompt,
             userMessage,
-            thinkingParams
+            thinkingParams,
+            options?.signal
           );
       options?.onUsage?.(result.usage);
       return result;
@@ -749,12 +783,19 @@ export async function callLLMWithHistory(
   };
   const executor = () =>
     provider.isAnthropic
-      ? callAnthropicWithHistory(provider, systemPrompt, messages, thinkingParams)
+      ? callAnthropicWithHistory(
+          provider,
+          systemPrompt,
+          messages,
+          thinkingParams,
+          options?.signal
+        )
       : callOpenAICompatibleWithHistory(
           provider,
           systemPrompt,
           messages,
-          thinkingParams
+          thinkingParams,
+          options?.signal
         );
 
   if (options?.detailed) {
@@ -775,8 +816,9 @@ export async function callLLMWithHistory(
 async function readSseLines(
   res: Response,
   onData: (data: string) => void,
-  maxWireBytes = 16 * 1024 * 1024
+  limits: StreamWireLimits = streamingByteLimits()
 ): Promise<void> {
+  const { wireBytes: maxWireBytes, lineBytes: maxLineBytes } = limits;
   const body = res.body;
   if (!body) throw new Error('Streaming response has no body');
   const declared = res.headers.get('content-length')?.trim();
@@ -811,20 +853,29 @@ async function readSseLines(
         throw new Error('LLM streaming response exceeded byte limit');
       }
       buffer += decoder.decode(value, { stream: true });
-      // 即使上游不发换行，buffer 也不得越过 wire 上限继续增长。
-      if (buffer.length > maxWireBytes) {
-        await reader.cancel('LLM SSE line exceeds byte limit').catch(() => undefined);
-        throw new Error('LLM streaming response line exceeded byte limit');
-      }
 
-      // SSE 事件以空行分隔；逐行处理 data: 前缀
+      // SSE 事件以空行分隔；逐行处理 data: 前缀。单行上限按「行」判，而不是按整个
+      // 读到的块判 —— 一个网络块里可以合法地装着成百上千个完整小帧。
+      let lineStart = 0;
       let newlineIdx: number;
-      while ((newlineIdx = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newlineIdx).replace(/\r$/, '');
-        buffer = buffer.slice(newlineIdx + 1);
+      while ((newlineIdx = buffer.indexOf('\n', lineStart)) >= 0) {
+        if (newlineIdx - lineStart > maxLineBytes) {
+          throw new Error(
+            'LLM streaming response exceeded byte limit (single SSE line too large)'
+          );
+        }
+        const line = buffer.slice(lineStart, newlineIdx).replace(/\r$/, '');
+        lineStart = newlineIdx + 1;
         if (line.startsWith('data:')) {
           onData(line.slice(5).trim());
         }
+      }
+      buffer = lineStart > 0 ? buffer.slice(lineStart) : buffer;
+      // 即使上游不发换行，未成行的残留也不得越过单行上限继续增长（在拼接/JSON.parse 前 cancel）。
+      if (buffer.length > maxLineBytes) {
+        throw new Error(
+          'LLM streaming response exceeded byte limit (single SSE line too large)'
+        );
       }
     }
     // flush 残留行
@@ -845,18 +896,70 @@ async function readSseLines(
   }
 }
 
-function streamingWireByteLimit(maxResponseUtf8Bytes?: number): number {
+/** SSE 整条响应的 wire 总字节硬顶：只是粗粒度 DoS 闸，不是正文上限。 */
+const STREAM_WIRE_MAX_BYTES = 16 * 1024 * 1024;
+
+interface StreamWireLimits {
+  /** 整条 SSE 响应累计 wire 字节上限（粗粒度 DoS 闸）。 */
+  wireBytes: number;
+  /** 单行（尚未遇到换行的 buffer）上限：异常巨行在拼接 / JSON.parse 前 cancel。 */
+  lineBytes: number;
+}
+
+interface StreamByteLimits extends StreamWireLimits {
+  /** 解码后 正文 + 思考 的 UTF-8 字节预算；undefined = 调用方未设上限（如 chat）。 */
+  contentBytes?: number;
+}
+
+/**
+ * 由调用方的「正文 UTF-8 上限」推导流式读取的各道闸。
+ *
+ * 旧实现把 wire 总上限取成 `正文上限 × 8 + 64KiB`（注释假设开销只来自 JSON 转义），
+ * 但真实 SSE 每个增量帧都带 ~200–270 字节的 id/model/choices 包装：OpenAI 兼容流
+ * 逐 token 一帧，40KiB 正文上限对应的 384KiB wire 闸在 ~1.4K 输出 token（实际正文
+ * 才 ~9KB）就把合法翻译响应判成「超限」，代理端回 502、按满额预留结算、pdf2zh 重试
+ * 再失败。现在：
+ *  - 正文上限按**解码后**的 text + thinking 字节计（contentBytes，见 createStreamContentBudget）；
+ *  - 单行上限保留旧公式 —— 一条 data 行最多承载整段正文（\uXXXX 转义 ≈6 倍 + 帧 64KiB）；
+ *  - wire 总上限回到 16MiB，只防恶意/失控上游无限灌流。
+ */
+function streamingByteLimits(maxResponseUtf8Bytes?: number): StreamByteLimits {
   if (
     !Number.isSafeInteger(maxResponseUtf8Bytes) ||
     (maxResponseUtf8Bytes ?? 0) <= 0
   ) {
-    return 16 * 1024 * 1024;
+    return {
+      wireBytes: STREAM_WIRE_MAX_BYTES,
+      lineBytes: STREAM_WIRE_MAX_BYTES,
+    };
   }
-  // JSON \uXXXX 转义最多约6倍，再给 event/usage 帧 64KiB。
-  return Math.min(
-    16 * 1024 * 1024,
-    Math.max(64 * 1024, (maxResponseUtf8Bytes as number) * 8 + 64 * 1024)
-  );
+  const contentBytes = maxResponseUtf8Bytes as number;
+  return {
+    wireBytes: STREAM_WIRE_MAX_BYTES,
+    lineBytes: Math.min(
+      STREAM_WIRE_MAX_BYTES,
+      Math.max(64 * 1024, contentBytes * 8 + 64 * 1024)
+    ),
+    contentBytes,
+  };
+}
+
+/**
+ * 解码后正文 + 思考字节的累计预算。思考增量与正文共用同一预算：二者都会在网关内存里
+ * 累积（result.text / result.thinking），且推理模型的 reasoning 增量可以远超正文。
+ * 超限在 onEvent 下发之前抛错 —— 抛在 readSseLines 的 onData 内，会 cancel 上游 reader。
+ */
+function createStreamContentBudget(
+  maxBytes: number | undefined
+): (delta: string) => void {
+  let used = 0;
+  return (delta: string) => {
+    if (maxBytes === undefined) return;
+    used += Buffer.byteLength(delta, 'utf8');
+    if (used > maxBytes) {
+      throw new Error('LLM streaming response exceeded byte limit');
+    }
+  };
 }
 
 /**
@@ -989,7 +1092,8 @@ async function callAnthropic(
   provider: LLMProviderConfig,
   system: string,
   userMsg: string,
-  params: ThinkingParams
+  params: ThinkingParams,
+  signal?: AbortSignal
 ): Promise<LLMCallResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
@@ -1011,12 +1115,15 @@ async function callAnthropic(
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
+    signal: nonStreamingRequestSignal(signal),
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Anthropic API error (${res.status}): ${sanitizeApiError(errText)}`);
+    throw new LlmUpstreamStatusError(
+      `Anthropic API error (${res.status}): ${sanitizeApiError(errText)}`,
+      res.status
+    );
   }
 
   const data = await res.json() as {
@@ -1051,7 +1158,8 @@ async function callAnthropicWithHistory(
   provider: LLMProviderConfig,
   system: string,
   messages: Array<{ role: string; content: string }>,
-  params: ThinkingParams
+  params: ThinkingParams,
+  signal?: AbortSignal
 ): Promise<LLMCallResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
@@ -1073,12 +1181,15 @@ async function callAnthropicWithHistory(
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
+    signal: nonStreamingRequestSignal(signal),
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Anthropic API error (${res.status}): ${sanitizeApiError(errText)}`);
+    throw new LlmUpstreamStatusError(
+      `Anthropic API error (${res.status}): ${sanitizeApiError(errText)}`,
+      res.status
+    );
   }
 
   const data = await res.json() as {
@@ -1163,8 +1274,9 @@ async function streamAnthropicWithHistory(
       64 * 1024,
       'Anthropic API'
     );
-    throw new Error(
-      `Anthropic API error (${res.status}): ${sanitizeApiError(errText)}`
+    throw new LlmUpstreamStatusError(
+      `Anthropic API error (${res.status}): ${sanitizeApiError(errText)}`,
+      res.status
     );
   }
 
@@ -1181,6 +1293,8 @@ async function streamAnthropicWithHistory(
   // （代理/网络切断、上游未发终止事件即 EOF），这里会保持 false —— 读完流后据此抛错，
   // 避免把「半句正文 + EOF」当成功落库。
   let sawTerminal = false;
+  const limits = streamingByteLimits(maxResponseUtf8Bytes);
+  const consumeContent = createStreamContentBudget(limits.contentBytes);
 
   await readSseLines(res, (data) => {
     if (!data || data === '[DONE]') return;
@@ -1212,12 +1326,14 @@ async function streamAnthropicWithHistory(
     if (eventType === 'content_block_delta') {
       const delta = parsed.delta as Record<string, unknown> | undefined;
       if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+        consumeContent(delta.text);
         onEvent({ type: 'text', delta: delta.text });
         text += delta.text;
       } else if (
         delta?.type === 'thinking_delta' &&
         typeof delta.thinking === 'string'
       ) {
+        consumeContent(delta.thinking);
         onEvent({ type: 'thinking', delta: delta.thinking });
         thinking += delta.thinking;
       }
@@ -1240,7 +1356,7 @@ async function streamAnthropicWithHistory(
         onEvent({ type: 'usage', outputTokens });
       }
     }
-  }, streamingWireByteLimit(maxResponseUtf8Bytes));
+  }, limits);
 
   if (streamError) {
     throw new Error(`Anthropic streaming error: ${streamError}`);
@@ -1292,7 +1408,8 @@ async function callOpenAICompatible(
   provider: LLMProviderConfig,
   system: string,
   userMsg: string,
-  params: ThinkingParams
+  params: ThinkingParams,
+  signal?: AbortSignal
 ): Promise<LLMCallResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
@@ -1314,12 +1431,15 @@ async function callOpenAICompatible(
       Authorization: `Bearer ${provider.apiKey}`,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
+    signal: nonStreamingRequestSignal(signal),
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`OpenAI-compatible API error (${res.status}): ${sanitizeApiError(errText)}`);
+    throw new LlmUpstreamStatusError(
+      `OpenAI-compatible API error (${res.status}): ${sanitizeApiError(errText)}`,
+      res.status
+    );
   }
 
   const data = await res.json() as {
@@ -1348,7 +1468,8 @@ async function callOpenAICompatibleWithHistory(
   provider: LLMProviderConfig,
   system: string,
   messages: Array<{ role: string; content: string }>,
-  params: ThinkingParams
+  params: ThinkingParams,
+  signal?: AbortSignal
 ): Promise<LLMCallResult> {
   const body: Record<string, unknown> = {
     model: provider.model,
@@ -1367,12 +1488,15 @@ async function callOpenAICompatibleWithHistory(
       Authorization: `Bearer ${provider.apiKey}`,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
+    signal: nonStreamingRequestSignal(signal),
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`OpenAI-compatible API error (${res.status}): ${sanitizeApiError(errText)}`);
+    throw new LlmUpstreamStatusError(
+      `OpenAI-compatible API error (${res.status}): ${sanitizeApiError(errText)}`,
+      res.status
+    );
   }
 
   const data = await res.json() as {
@@ -1453,8 +1577,9 @@ async function streamOpenAICompatibleWithHistory(
       64 * 1024,
       'OpenAI-compatible API'
     );
-    throw new Error(
-      `OpenAI-compatible API error (${res.status}): ${sanitizeApiError(errText)}`
+    throw new LlmUpstreamStatusError(
+      `OpenAI-compatible API error (${res.status}): ${sanitizeApiError(errText)}`,
+      res.status
     );
   }
 
@@ -1468,6 +1593,8 @@ async function streamOpenAICompatibleWithHistory(
   // 是否收到终止标记：`data: [DONE]`、finish_reason 非空、或（include_usage 保证的）
   // 末尾 usage chunk。三者任一即视为干净收尾；都没有就说明流在正文中途被截断。
   let sawTerminal = false;
+  const limits = streamingByteLimits(maxResponseUtf8Bytes);
+  const consumeContent = createStreamContentBudget(limits.contentBytes);
 
   await readSseLines(res, (data) => {
     if (!data) return;
@@ -1498,6 +1625,7 @@ async function streamOpenAICompatibleWithHistory(
     const delta = choices?.[0]?.delta as Record<string, unknown> | undefined;
     if (delta) {
       if (typeof delta.content === 'string' && delta.content) {
+        consumeContent(delta.content);
         onEvent({ type: 'text', delta: delta.content });
         text += delta.content;
       }
@@ -1508,6 +1636,7 @@ async function streamOpenAICompatibleWithHistory(
             ? delta.reasoning
             : '';
       if (reasoning) {
+        consumeContent(reasoning);
         onEvent({ type: 'thinking', delta: reasoning });
         thinking += reasoning;
       }
@@ -1529,7 +1658,7 @@ async function streamOpenAICompatibleWithHistory(
       }
       onEvent({ type: 'usage', inputTokens, outputTokens });
     }
-  }, streamingWireByteLimit(maxResponseUtf8Bytes));
+  }, limits);
 
   if (streamError) {
     throw new Error(`OpenAI-compatible streaming error: ${streamError}`);

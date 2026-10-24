@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   DOCUMENT_PARSER_MAX_QUEUED_BYTES,
   DOCUMENT_PARSER_MAX_OLD_SPACE_MB,
+  DOCUMENT_PARSER_MAX_RSS_MB,
   extractAttachmentDocumentText,
   extractKeywordDocumentText,
   inspectPdfDocument,
@@ -61,6 +62,14 @@ const PROBE_WORKER = path.join(
   'tests',
   'fixtures',
   'document-parser-probe.mjs'
+);
+const RSS_PROBE_WORKER = path.join(
+  process.cwd(),
+  'src',
+  'lib',
+  '__tests__',
+  'fixtures',
+  'document-parser-rss-probe.mjs'
 );
 
 function findCentralRecord(buffer: Buffer, target: string): number {
@@ -318,4 +327,44 @@ describe('restricted document parser process', () => {
     controllers.forEach((controller) => controller.abort());
     await Promise.all(tasks);
   });
+  // 堆外内存（pdfjs 解 FlateDecode 炸弹的 Uint8Array）不受 --max-old-space-size 约束：
+  // 实测 3MB 炸弹 PDF 在 30s 超时前把子进程 RSS 推到 3.2GB。父进程 RSS 看门狗必须先杀掉它。
+  it.runIf(process.platform === 'linux')(
+    'kills a child whose off-heap memory crosses the RSS ceiling',
+    async () => {
+      const startedAt = Date.now();
+      await expect(
+        runRestrictedDocumentParser('keyword-text', Buffer.from('x'), 'test/rss', {
+          workerPath: RSS_PROBE_WORKER,
+          maxRssMb: 256,
+          timeoutMs: 5_000,
+        })
+      ).rejects.toMatchObject({ code: 'memory_limit' });
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+    }
+  );
+
+  it('rejects an RSS override above the production ceiling', async () => {
+    await expect(
+      runRestrictedDocumentParser('keyword-text', Buffer.from('x'), 'test/ok', {
+        workerPath: PROBE_WORKER,
+        maxRssMb: DOCUMENT_PARSER_MAX_RSS_MB + 1,
+      })
+    ).rejects.toMatchObject({ code: 'worker_failed' });
+  });
+
+  // 子进程的输入上限曾写死 64MB，父进程却已放宽到 100MB：65–100MB 的附件过了父进程准入，
+  // 在子进程里被 archive_limit 拒掉。现在由父进程经 argv 传入，两侧同一真源。
+  it('accepts inputs between the old 64MB child cap and the parent cap', async () => {
+    const payload = Buffer.alloc(65 * 1024 * 1024, 0x20);
+    payload.write('%PDF-1.4\n', 0, 'latin1');
+    const error = await runRestrictedDocumentParser(
+      'attachment-text',
+      payload,
+      'application/pdf'
+    ).catch((caught) => caught);
+    expect(error).toBeInstanceOf(Error);
+    // 走到了真正的 PDF 解析（结构非法），而不是被输入上限挡在门外
+    expect(error).toMatchObject({ code: 'invalid_document' });
+  }, 30_000);
 });

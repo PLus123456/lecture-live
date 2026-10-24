@@ -11,6 +11,7 @@ import { isTranslationModelAllowed } from '@/lib/translate/modelAccess';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { spendWalletCents, WalletError } from '@/lib/wallet';
 import { isBillingExempt } from '@/lib/billing';
+import { logger, serializeError } from '@/lib/logger';
 import {
   LLMValidationError,
   readOptionalIdentifier,
@@ -26,6 +27,11 @@ import {
 
 /** 单次句子翻译输入上限（字符）。Google Translate 同级：5k；给到 10k 容纳整段摘录 */
 const MAX_TEXT_LENGTH = 10_000;
+
+/** 流式翻译失败时下发给客户端的固定文案（原始错误只进日志） */
+const TEXT_TRANSLATION_FAILED_MESSAGE = '翻译失败，请稍后重试';
+
+const translateTextLogger = logger.child({ component: 'translate-text' });
 
 function sseFrame(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -213,10 +219,17 @@ export async function POST(req: Request) {
           if (!emitted && consumedQuota) {
             await releaseDailyTextQuota(user.id).catch(() => {});
           }
-          const message =
-            err instanceof Error ? err.message : '翻译失败，请稍后重试';
+          // 安全：原始错误只进服务端日志。gateway 的错误串直接嵌着上游 provider 响应
+          // （401 里打码的 API key 片段、限流文案里的组织 id、内部模型名 / 出站策略原因），
+          // 与 /api/llm/chat 同口径，客户端只回固定文案。
+          if (!upstreamAbort.signal.aborted) {
+            translateTextLogger.warn(
+              { userId: user.id, err: serializeError(err) },
+              '句子翻译上游调用失败'
+            );
+          }
           try {
-            send('error', { message });
+            send('error', { message: TEXT_TRANSLATION_FAILED_MESSAGE });
           } catch {
             // 客户端已断开，忽略
           }

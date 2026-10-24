@@ -20,6 +20,18 @@ import 'server-only';
  * body。区别在于内存占用被硬钉在 maxBytes，而不是任由对端决定。
  */
 
+/**
+ * next.config.js 的 `experimental.middlewareClientMaxBodySize: '32mb'`：经过 middleware
+ * （matcher 覆盖全部 /api/*）的请求体超过它时，Next 会把**交给路由的 body 也静默截断**到
+ * 前 32MiB（见 next/dist/server/body-streams.js cloneBodyStream），multipart 尾界随之丢失 →
+ * 路由只能回 400 "Invalid multipart body"。任何「允许上传 X MB」的路由配置都必须按它封顶；
+ * 改 next.config.js 时这里必须同步。
+ */
+export const MIDDLEWARE_CLIENT_MAX_BODY_BYTES = 32 * 1024 * 1024;
+
+/** multipart boundary / 分段头 / 其它小表单字段的开销余量。 */
+export const MULTIPART_OVERHEAD_BYTES = 1024 * 1024;
+
 export type LimitedBodyFailure = { ok: false; reason: 'too-large' | 'invalid' };
 
 export type LimitedBodyResult<T> = { ok: true; value: T } | LimitedBodyFailure;
@@ -31,13 +43,22 @@ export type LimitedBodyResult<T> = { ok: true; value: T } | LimitedBodyFailure;
  * 绝不能写成 `Number.isFinite(Number(header ?? ''))` —— 那正是被绕过的写法。
  */
 export function declaredLengthExceeds(req: Request, maxBytes: number): boolean {
+  const declared = declaredContentLength(req);
+  return declared !== null && declared > maxBytes;
+}
+
+/**
+ * 解析请求声明的 content-length；缺失 / 畸形 / 负数返回 null（= 未知，调用方按上限保守处理）。
+ * 只能用于早退与在途预算的预留量，**不能**替代流式实际字节上限。
+ */
+export function declaredContentLength(req: Request): number | null {
   const raw = req.headers.get('content-length');
-  if (raw === null) return false;
+  if (raw === null) return null;
   const trimmed = raw.trim();
-  if (!trimmed) return false;
+  if (!trimmed) return null;
   const declared = Number(trimmed);
-  if (!Number.isFinite(declared) || declared < 0) return false;
-  return declared > maxBytes;
+  if (!Number.isFinite(declared) || declared < 0) return null;
+  return declared;
 }
 
 /**

@@ -794,6 +794,77 @@ describe('activeKey 排他键 (P5-16)', () => {
     expect(createMock).not.toHaveBeenCalled();
   });
 
+  // 文档翻译付费重试会换新调度行：上一代失败烧掉的预算不能压在新一代头上。
+  it('owner.settledSince 只统计该时刻之后创建的已结算行，在途行仍全部计入', async () => {
+    const since = new Date('2026-10-01T00:00:00.000Z');
+    createMock.mockResolvedValue({ id: 'proxy-job-new' });
+    aggregateMock
+      .mockResolvedValueOnce({
+        _count: { _all: 0 },
+        _sum: { reservedUnits: BigInt(0) },
+      })
+      .mockResolvedValueOnce({ _sum: { actualUnits: BigInt(0) } })
+      .mockResolvedValueOnce({ _sum: { reservedUnits: BigInt(0) } })
+      .mockResolvedValue({ _sum: { reservedUnits: BigInt(0), actualUnits: BigInt(0) } });
+
+    await claimActiveJob({
+      type: JOB_TYPE.TRANSLATION_LLM_PROXY,
+      sessionId: 'translation-task-1',
+      userId: 'user-1',
+      activeKey: 'translation_llm:task:hash-since',
+      resourceReservation: {
+        scope: 'llm_tokens',
+        units: 1000,
+        perUserLimit: 5000,
+        globalLimit: 10_000,
+        windowStart: RESOURCE_WINDOW_START,
+        windowEnd: RESOURCE_WINDOW_END,
+        owner: {
+          limit: 3000,
+          settledUnitsFloor: 0,
+          maxActiveJobs: 1,
+          settledSince: since,
+        },
+      },
+    });
+
+    const [active, settled, unknown] = aggregateMock.mock.calls.map(
+      (call) => call[0] as { where: Record<string, unknown> }
+    );
+    expect(active.where.createdAt).toBeUndefined();
+    expect(settled.where).toMatchObject({
+      sessionId: 'translation-task-1',
+      createdAt: { gte: since },
+    });
+    expect(unknown.where).toMatchObject({ createdAt: { gte: since } });
+  });
+
+  it('owner.settledSince 非法时拒绝预留', async () => {
+    await expect(
+      claimActiveJob({
+        type: JOB_TYPE.TRANSLATION_LLM_PROXY,
+        sessionId: 'translation-task-1',
+        userId: 'user-1',
+        activeKey: 'translation_llm:task:hash-bad-since',
+        resourceReservation: {
+          scope: 'llm_tokens',
+          units: 1000,
+          perUserLimit: 5000,
+          globalLimit: 10_000,
+          windowStart: RESOURCE_WINDOW_START,
+          windowEnd: RESOURCE_WINDOW_END,
+          owner: {
+            limit: 3000,
+            settledUnitsFloor: 0,
+            maxActiveJobs: 1,
+            settledSince: new Date(Number.NaN),
+          },
+        },
+      })
+    ).rejects.toThrow('Invalid active-job resource reservation');
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
   it('资源终态 CAS、成功幂等键保留和业务计量 mutation 在同一事务', async () => {
     findUniqueMock.mockResolvedValueOnce({ resourceScope: 'llm_tokens' });
     const mutation = vi.fn(async (tx: unknown) => {

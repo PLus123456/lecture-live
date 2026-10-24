@@ -11,13 +11,21 @@
 import crypto from 'crypto';
 import { randomBytes } from 'node:crypto';
 import { NextResponse } from 'next/server';
-import { verifyAuth } from '@/lib/auth';
+import { verifyAuth, type UserPayload } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { enforceApiRateLimit } from '@/lib/rateLimit';
 import { CloudreveStorage } from '@/lib/storage/cloudreve';
 import { getSiteSettings } from '@/lib/siteSettings';
 import { sanitizeHeaderFilename } from '@/lib/security';
-import { parseFormDataWithLimit, isUploadedFile } from '@/lib/requestBodyLimit';
+import {
+  declaredContentLength,
+  declaredLengthExceeds,
+  isUploadedFile,
+  MIDDLEWARE_CLIENT_MAX_BODY_BYTES,
+  MULTIPART_OVERHEAD_BYTES,
+  parseFormDataWithLimit,
+} from '@/lib/requestBodyLimit';
+import { tryReserveChatUploadBody } from '@/lib/llm/chatUploadAdmission';
 import {
   DocumentParserError,
 } from '@/lib/documentParserProcess';
@@ -178,10 +186,52 @@ export async function POST(req: Request) {
   const siteSettings = await getSiteSettings();
   const maxBytes = Math.min(
     Math.max(1, siteSettings.chat_files_max_upload_mb) * 1024 * 1024,
-    ABSOLUTE_MAX_BYTES
+    ABSOLUTE_MAX_BYTES,
+    // Next middleware 会把超过 32MiB 的请求体静默截断后才交给本路由（见
+    // MIDDLEWARE_CLIENT_MAX_BODY_BYTES 注释）：管理员配的更大值（默认 100MB）实际不可达，
+    // 32–100MB 的上传只会得到一个看不懂的 400 Invalid multipart body。按真正可用的上限封顶，
+    // 超限的上传在读 body 前就拿到明确的 413。
+    MIDDLEWARE_CLIENT_MAX_BODY_BYTES - MULTIPART_OVERHEAD_BYTES
   );
   // multipart 的 boundary/header 开销给 1MB 余量，避免刚好卡在上限的合法文件被误杀。
-  const bodyCapBytes = maxBytes + 1024 * 1024;
+  const bodyCapBytes = maxBytes + MULTIPART_OVERHEAD_BYTES;
+  const tooLargeResponse = () =>
+    NextResponse.json(
+      { error: `File too large (max ${Math.floor(maxBytes / (1024 * 1024))} MB)` },
+      { status: 413 }
+    );
+  // 声明长度已越线：直接 413，不占在途预算（parseFormDataWithLimit 内部同口径早退）。
+  if (declaredLengthExceeds(req, bodyCapBytes)) {
+    return tooLargeResponse();
+  }
+
+  // 进程级在途上传字节准入（见 chatUploadAdmission）：按声明长度预留，chunked/缺失时按
+  // 上限保守预留；必须在读 body 之前，否则并发大上传照样把进程堆打满。
+  const releaseUploadAdmission = tryReserveChatUploadBody(
+    user.id,
+    Math.min(declaredContentLength(req) ?? bodyCapBytes, bodyCapBytes) || 1
+  );
+  if (!releaseUploadAdmission) {
+    return NextResponse.json(
+      { error: 'Upload capacity is busy; retry later', code: 'upload_capacity_busy' },
+      { status: 429, headers: { 'Retry-After': '5' } }
+    );
+  }
+  try {
+    return await handleChatUpload(req, user, maxBytes, bodyCapBytes, tooLargeResponse);
+  } finally {
+    // 解析出的 Buffer / FormData 在路由返回后即不可达；预留随响应一起释放。
+    releaseUploadAdmission();
+  }
+}
+
+async function handleChatUpload(
+  req: Request,
+  user: UserPayload,
+  maxBytes: number,
+  bodyCapBytes: number,
+  tooLargeResponse: () => Response
+): Promise<Response> {
   // ledger 发布是否已经尝试过（决定失败时走回滚还是保留）。
   let publicationAttempted = false;
 
@@ -189,10 +239,7 @@ export async function POST(req: Request) {
   const parsed = await parseFormDataWithLimit(req, bodyCapBytes);
   if (!parsed.ok) {
     if (parsed.reason === 'too-large') {
-      return NextResponse.json(
-        { error: `File too large (max ${Math.floor(maxBytes / (1024 * 1024))} MB)` },
-        { status: 413 }
-      );
+      return tooLargeResponse();
     }
     return NextResponse.json({ error: 'Invalid multipart body' }, { status: 400 });
   }

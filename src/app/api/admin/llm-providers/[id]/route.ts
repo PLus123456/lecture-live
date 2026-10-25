@@ -138,7 +138,7 @@ export async function PATCH(
           },
         });
         return NextResponse.json(
-          { error: 'apiBase 必须是已加入服务端允许列表的安全 http(s) origin' },
+          { error: 'apiBase 不符合 LLM 出站规则：须为 HTTPS，不含账号密码、查询串或片段，且主机只能解析到公网地址' },
           { status: 400 }
         );
       }

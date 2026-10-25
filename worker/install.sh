@@ -38,7 +38,7 @@ NODE_MAJOR="$(node -e 'console.log(process.versions.node.split(".")[0])')"
 [[ "$NODE_MAJOR" -ge 20 ]] || error "Node 版本过低（当前 $(node -v)），需要 ≥ 20"
 info "Node: $(node -v) ($NODE_BIN)"
 
-# 单元使用 ProtectProc/ProcSubset/ProtectKernelLogs 等 systemd 249+ 沙箱指令。
+# 单元使用 ProtectProc/ProcSubset/ProtectKernelLogs 等 systemd 沙箱指令（最晚的两条自 247 起）。
 # 旧版若静默忽略，运维会误以为解析器已受约束，因此安装阶段 fail closed。
 command -v systemd-analyze &>/dev/null || error "未找到 systemd-analyze，无法验证 worker 沙箱"
 SYSTEMD_VERSION="$(systemd-analyze --version | awk 'NR==1 {print $2}')"

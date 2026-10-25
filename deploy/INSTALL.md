@@ -320,7 +320,7 @@ sudo bash deploy/rollback.sh
 sudo bash deploy/rollback.sh app-20260322_143000.tar.gz
 
 # 托管安装也可以用交互入口：列出备份供选择，然后调用同一个 deploy/rollback.sh
-# （托管检出里的 deploy/ 必须只有 root 能改，见「源码检出与备份的所有权」）
+# （托管检出里的 deploy/ 与 backups/ 都必须只有 root 能改，见「源码检出与备份的所有权」）
 sudo lecture-live rollback
 
 # 查看所有备份
@@ -491,31 +491,37 @@ sudo bash deploy/upgrade.sh
 - `backups/` 与托管源码检出 `src/` 归 root；其余（`data/`、`ws-server/`、运行产物）照旧归 `lecturelive`。
 
 `.env` 与 `backups/` 必须是真实的文件/目录：是软链（或 `.env` 有别的硬链接）时脚本会拒绝并停下，
-免得以 root 跟着它去改别处文件的属主。备份要放在别的盘上，请用 bind mount 挂到 `/opt/lecturelive/backups`。
+免得以 root 照着它去读、去解包别处的文件。备份要放在别的盘上，请用 bind mount 挂到 `/opt/lecturelive/backups`。
 
-`setup.sh`、`install.sh`、`upgrade.sh`、`rollback.sh` 每次运行都会按上面收紧（`deploy/ensure-root-ownership.sh`），
-其中从 `/opt/lecturelive/src` 运行的 `install.sh` / `upgrade.sh` 还会把这份检出收归 root。托管 CLI
-在以 root 执行检出里的任何东西之前，都会检查整条路径与要执行的整棵目录树（回滚只查 `deploy/`）：
-有一项不归 root、或组/其他用户可写，就报出该项并拒绝，不做任何改动。手工部署的源码在谁的家目录里都可以，
-直接在源码目录执行 `sudo bash deploy/upgrade.sh` / `deploy/rollback.sh` 即可，不受这项检查影响。
+`setup.sh`、`install.sh`、`upgrade.sh`、`rollback.sh` 每次运行都会先经过 `deploy/ensure-root-ownership.sh`：
+收紧 `/opt/lecturelive` 本身，把 `.env` 换成一份归 root 的新文件（内容照搬），并核对 `backups/`——里面有
+root 以外的人能改的条目就拒绝。备份只核对、不替你收回：chown 证明不了旧归档没被改过。`src/` 由托管 CLI
+自己把关：以 root 执行检出里的任何东西之前，它会检查整条路径与要执行的整棵目录树（回滚查 `deploy/` 与
+`backups/`），有一项不归 root、或组/其他用户可写，就报出该项并拒绝，不做任何改动；新装的检出从克隆起就归 root。
+手工部署的源码在谁的家目录里都可以，直接在源码目录执行 `sudo bash deploy/upgrade.sh` / `deploy/rollback.sh`，
+不受 CLI 这项检查影响。
 
-**从旧版本升级**：此前这四个脚本会把整个 `/opt/lecturelive`（含 `src/`、`backups/` 与 `.env`）交给 `lecturelive`，
-新版 CLI 会因此拒绝 `update` / `rollback`（同样因为这一点，旧版 `lecture-live update` 以 root 跑 `git pull`
-时，git 2.35.2 起默认就会报 `detected dubious ownership` 而失败）。确认服务用户没有被入侵过后，收回一次即可：
+**从旧版本升级**：此前这四个脚本会把整个 `/opt/lecturelive`（含 `src/`、`backups/` 与 `.env`）交给 `lecturelive`。
+新版脚本会因此拒绝旧的 `backups/`，托管 CLI 还会拒绝旧的 `src/`（同样因为这一点，旧版 `lecture-live update`
+以 root 跑 `git pull` 时，git 2.35.2 起默认就会报 `detected dubious ownership` 而失败）。确认服务用户没有被
+入侵过后收回一次即可。先停掉服务、确认已没有 `lecturelive` 进程，否则它事先打开的可写文件在 chown 之后照样能写：
 
 ```bash
+sudo systemctl stop lecturelive-web lecturelive-ws
+sudo pkill -u lecturelive; pgrep -u lecturelive || echo "已无 lecturelive 进程"
 sudo chown root:lecturelive /opt/lecturelive && sudo chmod go-w /opt/lecturelive
-sudo chown -R root:root /opt/lecturelive/src /opt/lecturelive/backups
-sudo chmod -R go-w /opt/lecturelive/src /opt/lecturelive/backups
-sudo lecture-live update
+sudo chown -R root:root /opt/lecturelive/backups && sudo chmod -R go-w /opt/lecturelive/backups
+# 托管安装（有 /opt/lecturelive/src）再加上这一行：
+sudo chown -R root:root /opt/lecturelive/src && sudo chmod -R go-w /opt/lecturelive/src
+sudo lecture-live update   # 手工部署则在源码目录执行 sudo bash deploy/upgrade.sh
 ```
 
-`.env` 不用手动处理：新版 `upgrade.sh` 在读它之前就会把它换成一份归 root 的新文件（内容照搬）。
+`.env` 不用手动处理：新版脚本在读它之前就会把它换成一份归 root 的新文件（内容照搬）。
 
-拿不准时不要沿用旧检出：先执行上面第一行，再把旧检出挪走
-（`sudo mv /opt/lecturelive/src /root/lecturelive-src.old`），`sudo git clone https://github.com/PLus123456/lecture-live.git /opt/lecturelive/src`
-重新克隆后再 `sudo lecture-live update`；旧备份也别再用来回滚。`.env` 的内容同样要人工核对一遍，
-尤其是 `NODE_OPTIONS`、`LD_PRELOAD` 这类会让进程加载额外代码的变量，应用本身一个都不需要。
+拿不准时不要沿用旧检出与旧备份：照上面停服务、清掉 `lecturelive` 进程并收紧 `/opt/lecturelive` 之后，把它们挪走
+（`sudo mv /opt/lecturelive/src /root/lecturelive-src.old`、`sudo mv /opt/lecturelive/backups /root/lecturelive-backups.old`），
+`sudo git clone https://github.com/PLus123456/lecture-live.git /opt/lecturelive/src` 重新克隆后再 `sudo lecture-live update`。
+`.env` 的内容同样要人工核对一遍，尤其是 `NODE_OPTIONS`、`LD_PRELOAD` 这类会让进程加载额外代码的变量，应用本身一个都不需要。
 
 ---
 

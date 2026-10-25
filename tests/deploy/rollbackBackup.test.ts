@@ -345,6 +345,19 @@ describe('deploy/lecture-live rollback 委托 deploy/rollback.sh', () => {
     expect(existsSync(env.record)).toBe(false);
   }, 30_000);
 
+  it('备份目录里有服务用户能改的归档时拒绝，而且在列出备份之前：它们会以 root 解包', () => {
+    const env = layout();
+    const srcDir = path.join(env.dir, 'opt/lecturelive/src');
+    addRollbackScript(srcDir, env.record);
+
+    const result = runCmdRollback({ ...env, srcDir }, '1\n', () => chmodSync(env.newer, 0o664));
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('rollback 要以 root 解包');
+    expect(result.stdout).toContain(env.newer);
+    expect(result.stdout).not.toContain('可用备份');
+    expect(existsSync(env.record)).toBe(false);
+  }, 30_000);
+
   it('托管检出所在的 $APP_DIR 可被他人写入时同样拒绝：能把整个 src 换掉', () => {
     const env = layout();
     const srcDir = path.join(env.dir, 'opt/lecturelive/src');

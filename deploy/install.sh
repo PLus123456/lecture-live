@@ -37,9 +37,9 @@ elif ! getent group "$APP_USER" &>/dev/null; then
 fi
 info "运行用户: $(id $APP_USER)"
 
-# 先收回 root 之后要信任的几处（$APP_DIR 本身、.env、backups/，从托管检出运行时还有 src/，见
-# ensure-root-ownership.sh），放在任何可能失败的步骤与以 root 运行的 node --env-file 之前。
-bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER" "$SRC_DIR"
+# 先收紧并核对 root 之后要信任的几处（$APP_DIR 本身、.env、backups/，见 ensure-root-ownership.sh），
+# 放在任何可能失败的步骤与以 root 运行的 node --env-file 之前。
+bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"
 
 # ── 检查编译产物 ──
 [[ -d "$SRC_DIR/.next/standalone" ]] || error "未找到 .next/standalone，请先运行 npm run build"

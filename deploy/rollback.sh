@@ -26,6 +26,10 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 [[ $EUID -eq 0 ]] || error "请使用 sudo 运行此脚本"
 
+# 读任何备份之前先收紧并核对（ensure-root-ownership.sh）：备份会以 root 解包，backups/ 里有 root 以外
+# 的人能改的条目就拒绝；$APP_DIR 本身同时收紧，回滚期间没人能把 backups/ 整个换掉。
+bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"
+
 # 找备份文件
 if [[ -n "${1:-}" ]]; then
     BACKUP_FILE="$BACKUP_DIR/$1"
@@ -73,7 +77,9 @@ find "$APP_DIR" -mindepth 1 -maxdepth 1 \
 
 # 旧版 upgrade.sh 的备份把 ./src 也打了进去：解包时按锚定路径跳过，否则旧文件会覆盖到
 # 保留下来的源码检出上，混成「半新半旧」的工作区。data/.env/backups 同理只认顶层路径。
-tar xzf "$BACKUP_FILE" -C "$APP_DIR" --anchored \
+# --no-overwrite-dir：已存在的目录不按归档里记的属主与权限改写——尤其 $APP_DIR 本身，旧版备份里
+# 记的是服务用户；有了它，$APP_DIR 在解包期间也一直只有 root 能改。
+tar xzf "$BACKUP_FILE" -C "$APP_DIR" --anchored --no-overwrite-dir \
     --exclude=./src --exclude=./data --exclude=./.env --exclude=./backups
 # 恢复出的运行产物交给服务用户；src/、backups/ 与 .env 不交，$APP_DIR 本身归 root
 # （.env 归 root、服务只读，见 ensure-root-ownership.sh）
@@ -93,7 +99,8 @@ if [[ ! -f "$RUNTIME_SECURITY_MARKER" ]] || \
     # 升级失败时必须留这条退路，否则首次升级中途失败就没有任何可上线的目标。
     if [[ -f "$UNIT_BACKUP" ]]; then
         info "备份早于 readiness 路由，同代回退 systemd unit: $(basename "$UNIT_BACKUP")"
-        tar xzf "$UNIT_BACKUP" -C /etc/systemd/system
+        # 只取 upgrade.sh 打进去的这两个 unit：别的成员一概不解进 /etc/systemd/system
+        tar xzf "$UNIT_BACKUP" -C /etc/systemd/system lecturelive-web.service lecturelive-ws.service
         systemctl daemon-reload
         LEGACY_RUNTIME=true
         warn "已退回旧版 systemd unit：本次上线不含 readiness/支付预检启动闸，"

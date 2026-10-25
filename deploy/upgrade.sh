@@ -37,10 +37,9 @@ if ! getent group "$APP_USER" &>/dev/null; then
     usermod -g "$APP_USER" "$APP_USER"
 fi
 
-# 先收回 root 之后要信任的几处（$APP_DIR 本身、.env、backups/，从托管检出运行时还有 src/，见
-# ensure-root-ownership.sh）。必须早于下面任何以 root 运行的 node --env-file；也放在任何可能失败的
-# 步骤之前：本次升级中途失败时，托管 CLI 的 lecture-live rollback 照样过得了它的所有权检查。
-bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER" "$SRC_DIR"
+# 先收紧并核对 root 之后要信任的几处（$APP_DIR 本身、.env、backups/，见 ensure-root-ownership.sh）。
+# 必须早于下面任何以 root 运行的 node --env-file，也早于停服：备份不可信时直接拒绝，旧服务照常运行。
+bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"
 
 cd "$SRC_DIR"
 

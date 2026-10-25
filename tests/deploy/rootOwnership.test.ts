@@ -25,8 +25,9 @@ import { afterEach, describe, expect, it } from 'vitest';
  *   ① lecture-live update 不再去 /home/*\/lecture-live 里找检出；
  *   ② update / install / rollback / self-install 在以 root 执行检出里的东西之前，要求整条路径与
  *      要执行的目录树都只有 root 能改（first_writable_by_others / require_root_only）；
- *   ③ setup/install/upgrade/rollback 不再把整个 /opt/lecturelive 交给服务用户：$APP_DIR 本身、
- *      .env、backups/ 与（从托管检出运行时）src/ 归 root（deploy/ensure-root-ownership.sh）。
+ *   ③ setup/install/upgrade/rollback 不再把整个 /opt/lecturelive 交给服务用户：$APP_DIR 本身收紧、
+ *      .env 换成归 root 的新文件、backups/ 只核对不收归（deploy/ensure-root-ownership.sh）；
+ *      rollback.sh 在读任何备份之前核对，unit 备份只解出那两个 unit。
  * 照例从脚本里抠出真实的函数/命令在临时目录里执行。普通用户做不了 chown root，所以：CLI 的检查
  * 本来就认「root 或当前用户」（CLI 总以 root 运行，二者相同），这里由当前用户代替 root；部署脚本
  * 里的 chown 换成只记录参数的桩，chmod 照常真改。
@@ -566,6 +567,10 @@ describe('self-install 不会把服务用户能改的 CLI 装成 root 命令', (
 describe('deploy/ensure-root-ownership.sh', () => {
   const USER = userInfo().username;
 
+  /**
+   * 旧布局下的部署目录：$APP_DIR 本身与 .env 归服务用户（普通用户做不了 chown，这里用组/其他可写
+   * 来模拟）；backups/ 与 src/ 先摆成 root 在 umask 022 下会建出的样子，要测的问题由各用例自己制造。
+   */
   function deployment(root: string) {
     const appDir = path.join(root, 'opt/lecturelive');
     write(path.join(appDir, 'server.js'));
@@ -576,22 +581,18 @@ describe('deploy/ensure-root-ownership.sh', () => {
     write(path.join(appDir, 'src/.git/config'), '[core]\n');
     write(path.join(appDir, 'src/deploy/upgrade.sh'));
     normalizeModes(root);
-    // 旧版 chown -R 之后服务用户能改它们；普通用户做不了 chown，这里用组/其他可写来模拟
     chmodSync(appDir, 0o777);
     chmodSync(path.join(appDir, '.env'), 0o666);
-    chmodSync(path.join(appDir, 'backups'), 0o777);
-    chmodSync(path.join(appDir, 'backups/systemd-20261020_100000.tar.gz'), 0o666);
-    chmodSync(path.join(appDir, 'src/.git/config'), 0o664);
     return appDir;
   }
 
-  /** chown 换成只记录参数的桩；chmod、mkdir 照常真执行。 */
-  function run(root: string, args: string[]) {
+  /** chown 换成只记录参数的桩；chmod、mkdir、mv 照常真执行。script 可以换成改过的副本。 */
+  function run(root: string, args: string[], script = OWNERSHIP_SCRIPT) {
     const bin = path.join(root, 'fake-bin');
     const log = path.join(root, 'chown.log');
     write(path.join(bin, 'chown'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\n`);
     chmodSync(path.join(bin, 'chown'), 0o755);
-    const result = spawnSync('bash', ['--norc', OWNERSHIP_SCRIPT, ...args], {
+    const result = spawnSync('bash', ['--norc', script, ...args], {
       env: minimalEnv(`${bin}:${process.env.PATH}`),
       encoding: 'utf8',
     });
@@ -607,23 +608,106 @@ describe('deploy/ensure-root-ownership.sh', () => {
     return chowns;
   }
 
-  it('$APP_DIR 归 root:<服务用户>、去掉组/其他写；.env 归 root:<服务用户> 0640；backups/ 整个归 root', () => {
+  it('$APP_DIR 收紧为 root:<服务用户>、去掉组/其他写；.env 换成 root:<服务用户> 0640；backups/ 只核对不改', () => {
     const root = sandbox();
     const appDir = deployment(root);
 
     const chowns = runOk(root, [appDir, USER]);
-    // .env 先写成新文件、收好属主与权限，再原子地换上去
-    expect(chowns).toEqual([
-      `root:${USER} ${appDir}`,
-      `root:${USER} ${appDir}/.env.new`,
-      `-R root:root ${appDir}/backups`,
-    ]);
+    // .env 先写成新文件、收好属主与权限，再原子地换上去；backups/ 已经只有 root 能改，什么都不用动
+    expect(chowns).toEqual([`root:${USER} ${appDir}`, `root:${USER} ${appDir}/.env.new`]);
     expect(mode(appDir)).toBe(0o755);
     expect(mode(path.join(appDir, '.env'))).toBe(0o640);
     expect(readFileSync(path.join(appDir, '.env'), 'utf8')).toBe('JWT_SECRET=x\n');
     expect(existsSync(path.join(appDir, '.env.new'))).toBe(false);
-    expect(mode(path.join(appDir, 'backups'))).toBe(0o755);
-    expect(mode(path.join(appDir, 'backups/systemd-20261020_100000.tar.gz'))).toBe(0o644);
+  });
+
+  it('$APP_DIR 原本对其他人关闭时保持关闭，但服务用户的组仍能进入', () => {
+    const root = sandbox();
+    const appDir = deployment(root);
+    chmodSync(appDir, 0o700);
+
+    runOk(root, [appDir, USER]);
+    expect(mode(appDir)).toBe(0o750);
+  });
+
+  it('不碰 src/：托管 CLI 以 root 执行检出之前自己会查，就地 chown 也证明不了旧检出没被改过', () => {
+    const root = sandbox();
+    const appDir = deployment(root);
+    chmodSync(path.join(appDir, 'src/.git/config'), 0o664);
+
+    const chowns = runOk(root, [appDir, USER]);
+    expect(chowns.some((line) => line.includes(`${appDir}/src`))).toBe(false);
+    expect(mode(path.join(appDir, 'src/.git/config'))).toBe(0o664);
+  });
+
+  it.each([
+    ['backups/systemd-20261020_100000.tar.gz', 0o664],
+    ['backups', 0o777],
+  ])('backups/ 里有 root 以外的人能改的条目时拒绝，不替它收回：%s', (relative, bits) => {
+    const root = sandbox();
+    const appDir = deployment(root);
+    const env = path.join(appDir, '.env');
+    const envInode = statSync(env).ino;
+    chmodSync(path.join(appDir, relative), bits);
+
+    const { result, chowns } = run(root, [appDir, USER]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(path.join(appDir, relative));
+    expect(result.stderr).toContain('源码检出与备份的所有权');
+    // 只收紧了 $APP_DIR 本身（之后没人能再调包）；备份原样不动，.env 也还没碰
+    expect(chowns).toEqual([`root:${USER} ${appDir}`]);
+    expect(mode(path.join(appDir, relative))).toBe(bits);
+    expect(statSync(env).ino).toBe(envInode);
+  });
+
+  it.skipIf(IS_ROOT)('backups/ 里的归档归别人所有同样拒绝（把「当前用户」换成无关的 uid 来模拟）', () => {
+    const root = sandbox();
+    const appDir = deployment(root);
+    const original = readFileSync(OWNERSHIP_SCRIPT, 'utf8');
+    expect(original).toContain('-uid "$EUID"');
+    const foreign = path.join(root, 'ensure-root-ownership.sh');
+    writeFileSync(foreign, original.replaceAll('-uid "$EUID"', '-uid 123456789'));
+
+    const { result } = run(root, [appDir, USER], foreign);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(`${appDir}/backups`);
+  });
+
+  it.each(['.env', 'backups'])(
+    '%s 是软链时拒绝，不照着它去读、去改（否则能让 root 处理任意位置的文件）',
+    (entry) => {
+      const root = sandbox();
+      const appDir = deployment(root);
+      // 比如指向 /etc/shadow 或别处的目录
+      const target = path.join(root, 'elsewhere', entry === '.env' ? 'shadow' : 'bin');
+      if (entry === '.env') write(target, 'root:x:0:0\n');
+      else write(path.join(target, 'sudo'));
+      normalizeModes(path.join(root, 'elsewhere'));
+      const targetFile = entry === '.env' ? target : path.join(target, 'sudo');
+      chmodSync(targetFile, 0o600);
+      rmSync(path.join(appDir, entry), { recursive: true });
+      symlinkSync(target, path.join(appDir, entry));
+
+      const { result, chowns } = run(root, [appDir, USER]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(`${appDir}/${entry} 是软链`);
+      expect(chowns).toEqual([`root:${USER} ${appDir}`]);
+      expect(mode(targetFile)).toBe(0o600);
+    }
+  );
+
+  it('.env 还有别的硬链接时拒绝：照着它复制，会把另一处文件的内容变成服务用户可读', () => {
+    const root = sandbox();
+    const appDir = deployment(root);
+    const other = path.join(root, 'elsewhere/env-copy');
+    mkdirSync(path.dirname(other), { recursive: true });
+    linkSync(path.join(appDir, '.env'), other);
+
+    const { result, chowns } = run(root, [appDir, USER]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('硬链接');
+    expect(chowns).toEqual([`root:${USER} ${appDir}`]);
+    expect(mode(other)).toBe(0o666);
   });
 
   it('.env 换成新的 inode：服务用户事先留着的可写描述符写不进新文件', () => {
@@ -656,93 +740,6 @@ describe('deploy/ensure-root-ownership.sh', () => {
     expect(readFileSync(path.join(appDir, '.env'), 'utf8')).toBe('JWT_SECRET=x\n');
   });
 
-  it('$APP_DIR 原本对其他人关闭时保持关闭，但服务用户的组仍能进入', () => {
-    const root = sandbox();
-    const appDir = deployment(root);
-    chmodSync(appDir, 0o700);
-
-    runOk(root, [appDir, USER]);
-    expect(mode(appDir)).toBe(0o750);
-  });
-
-  it('不传调用方的检出（setup/rollback）、或调用方是别处的检出时，不碰 src/', () => {
-    const root = sandbox();
-    const appDir = deployment(root);
-    const elsewhere = path.join(root, 'home/ops/lecture-live');
-    mkdirSync(elsewhere, { recursive: true });
-
-    for (const args of [[appDir, USER], [appDir, USER, elsewhere]]) {
-      const chowns = runOk(root, args);
-      expect(chowns.some((line) => line.includes(`${appDir}/src`))).toBe(false);
-      expect(mode(path.join(appDir, 'src/.git/config'))).toBe(0o664);
-    }
-  });
-
-  it('从托管检出运行时（install/upgrade 传入自己的 $SRC_DIR）把它整个收归 root', () => {
-    const root = sandbox();
-    const appDir = deployment(root);
-
-    // upgrade.sh 的 SRC_DIR 来自 pwd（不解析软链），可能经软链指向托管检出：按真实路径比较
-    const viaLink = path.join(root, 'src-link');
-    symlinkSync(path.join(appDir, 'src'), viaLink);
-    const chowns = runOk(root, [appDir, USER, viaLink]);
-    expect(chowns).toContain(`-R root:root ${appDir}/src`);
-    expect(mode(path.join(appDir, 'src/.git/config'))).toBe(0o644);
-  });
-
-  it('$APP_DIR/src 本身是软链时不收归：不以 root 跟着它去改别处的属主', () => {
-    const root = sandbox();
-    const appDir = deployment(root);
-    const real = path.join(root, 'srv/lecture-live');
-    write(path.join(real, 'deploy/upgrade.sh'));
-    normalizeModes(path.join(root, 'srv'));
-    chmodSync(path.join(real, 'deploy/upgrade.sh'), 0o664);
-    rmSync(path.join(appDir, 'src'), { recursive: true });
-    symlinkSync(real, path.join(appDir, 'src'));
-
-    const chowns = runOk(root, [appDir, USER, real]);
-    expect(chowns.some((line) => line.includes(real) || line.includes(`${appDir}/src`))).toBe(false);
-    expect(mode(path.join(real, 'deploy/upgrade.sh'))).toBe(0o664);
-  });
-
-  it.each(['.env', 'backups'])(
-    '%s 是软链时拒绝，且不跟着它 chown/chmod（否则能让 root 改任意文件的属主与权限）',
-    (entry) => {
-      const root = sandbox();
-      const appDir = deployment(root);
-      // 比如指向 /etc/shadow 或 /usr/bin
-      const target = path.join(root, 'elsewhere', entry === '.env' ? 'shadow' : 'bin');
-      if (entry === '.env') write(target, 'root:x:0:0\n');
-      else write(path.join(target, 'sudo'));
-      normalizeModes(path.join(root, 'elsewhere'));
-      const targetFile = entry === '.env' ? target : path.join(target, 'sudo');
-      chmodSync(targetFile, 0o600);
-      rmSync(path.join(appDir, entry), { recursive: true });
-      symlinkSync(target, path.join(appDir, entry));
-
-      const { result, chowns } = run(root, [appDir, USER]);
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain(`${appDir}/${entry} 是软链`);
-      // 先收紧 $APP_DIR 本身（之后没人能再调包），然后就停下
-      expect(chowns).toEqual([`root:${USER} ${appDir}`]);
-      expect(mode(targetFile)).toBe(0o600);
-    }
-  );
-
-  it('.env 还有别的硬链接时拒绝：照着它复制，会把另一处文件的内容变成服务用户可读', () => {
-    const root = sandbox();
-    const appDir = deployment(root);
-    const other = path.join(root, 'elsewhere/env-copy');
-    mkdirSync(path.dirname(other), { recursive: true });
-    linkSync(path.join(appDir, '.env'), other);
-
-    const { result, chowns } = run(root, [appDir, USER]);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain('硬链接');
-    expect(chowns).toEqual([`root:${USER} ${appDir}`]);
-    expect(mode(other)).toBe(0o666);
-  });
-
   it('$APP_DIR 尚不存在时先建出来（install.sh 在首次安装时最早调用它）', () => {
     const root = sandbox();
     const appDir = path.join(root, 'opt/lecturelive');
@@ -761,7 +758,10 @@ describe('deploy/ensure-root-ownership.sh', () => {
 
 describe('setup/install/upgrade/rollback 不再把整个 $APP_DIR 交给服务用户', () => {
   const HANDOFF = 'find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name src ! -name backups ! -name .env';
-  const PROTECT = 'bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"';
+  const PROTECT = 'bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"\n';
+  // 部署目标是 Linux，--no-overwrite-dir 是 GNU tar 的选项；CI（ubuntu）照常执行相关用例
+  const GNU_TAR =
+    spawnSync('tar', ['--version'], { encoding: 'utf8' }).stdout?.includes('GNU tar') ?? false;
 
   it.each(DEPLOY_SCRIPTS)('%s：没有对 $APP_DIR 的 chown -R；交接之后再收紧一次', (name) => {
     const script = read(`deploy/${name}`);
@@ -772,7 +772,7 @@ describe('setup/install/upgrade/rollback 不再把整个 $APP_DIR 交给服务�
     expect(script).toContain('SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"');
     const handoff = script.indexOf(HANDOFF);
     expect(handoff).toBeGreaterThan(0);
-    expect(script.indexOf(`${PROTECT}\n`, handoff)).toBeGreaterThan(handoff);
+    expect(script.indexOf(PROTECT, handoff)).toBeGreaterThan(handoff);
   });
 
   it.each(DEPLOY_SCRIPTS)('%s：交接命令只把 src/、backups/ 与 .env 以外的顶层条目交给服务用户', (name) => {
@@ -807,10 +807,10 @@ describe('setup/install/upgrade/rollback 不再把整个 $APP_DIR 交给服务�
   });
 
   it.each(['install.sh', 'upgrade.sh'])(
-    '%s：任何可能失败的步骤之前就收回（含自己所在的托管检出），cp -a 之后、启动之前再收紧',
+    '%s：任何可能失败的步骤与以 root 运行的 node --env-file 之前先收紧并核对，cp -a 之后、启动之前再来一次',
     (name) => {
       const script = read(`deploy/${name}`);
-      const early = script.indexOf(`${PROTECT} "$SRC_DIR"\n`);
+      const early = script.indexOf(PROTECT);
       expect(early).toBeGreaterThan(0);
       for (const later of [
         'ensure-security-env.sh',
@@ -823,7 +823,7 @@ describe('setup/install/upgrade/rollback 不再把整个 $APP_DIR 交给服务�
       }
       // cp -a 会把 standalone 目录的属主与权限带到 $APP_DIR 本身上
       const copy = script.indexOf('cp -a "$SRC_DIR/.next/standalone/." "$APP_DIR/"');
-      const late = script.indexOf(`${PROTECT}\n`, copy);
+      const late = script.indexOf(PROTECT, copy);
       expect(copy).toBeGreaterThan(early);
       expect(late).toBeGreaterThan(copy);
       expect(late).toBeLessThan(script.indexOf('systemctl start lecturelive-web lecturelive-ws'));
@@ -832,23 +832,90 @@ describe('setup/install/upgrade/rollback 不再把整个 $APP_DIR 交给服务�
 
   it('upgrade.sh：早于 npm ci；install.sh：早于产物检查', () => {
     const upgrade = read('deploy/upgrade.sh');
-    expect(upgrade.indexOf(`${PROTECT} "$SRC_DIR"`)).toBeLessThan(upgrade.indexOf('\nnpm ci\n'));
+    expect(upgrade.indexOf(PROTECT)).toBeLessThan(upgrade.indexOf('\nnpm ci\n'));
     const install = read('deploy/install.sh');
-    expect(install.indexOf(`${PROTECT} "$SRC_DIR"`)).toBeLessThan(
+    expect(install.indexOf(PROTECT)).toBeLessThan(
       install.indexOf('[[ -d "$SRC_DIR/.next/standalone" ]]')
     );
   });
 
-  it('rollback.sh：解包之后、启动之前收紧；setup.sh：建好目录之后', () => {
+  it('rollback.sh：读任何备份之前先核对，解包之后、启动之前再收紧；setup.sh：建好目录之后', () => {
     const rollback = read('deploy/rollback.sh');
+    const early = rollback.indexOf(PROTECT);
+    expect(early).toBeGreaterThan(0);
+    for (const reader of [
+      'ls -t "$BACKUP_DIR"',
+      'tar tzf "$BACKUP_FILE"',
+      'tar xzf "$BACKUP_FILE"',
+      'tar xzf "$UNIT_BACKUP"',
+    ]) {
+      expect(rollback.indexOf(reader)).toBeGreaterThan(early);
+    }
     const restore = rollback.indexOf('tar xzf "$BACKUP_FILE"');
-    const protect = rollback.indexOf(`${PROTECT}\n`);
-    expect(protect).toBeGreaterThan(restore);
-    expect(protect).toBeLessThan(rollback.indexOf('systemctl start lecturelive-web lecturelive-ws'));
+    const late = rollback.indexOf(PROTECT, restore);
+    expect(late).toBeGreaterThan(restore);
+    expect(late).toBeLessThan(rollback.indexOf('systemctl start lecturelive-web lecturelive-ws'));
+    // 解包期间 $APP_DIR 也不能被归档里记的属主改回服务用户（行为见下面 GNU tar 的用例）
+    expect(extractCommand(rollback, 'tar xzf "$BACKUP_FILE"')).toContain('--no-overwrite-dir');
 
     const setup = read('deploy/setup.sh');
-    expect(setup.indexOf(`${PROTECT}\n`)).toBeGreaterThan(
+    expect(setup.indexOf(PROTECT)).toBeGreaterThan(
       setup.indexOf('mkdir -p "$APP_DIR" "$WS_DIR" "$APP_DIR/data" "$APP_DIR/backups"')
     );
+  });
+
+  it('rollback.sh：unit 备份只解出 upgrade.sh 打进去的那两个 unit，夹带的别的成员不落地', () => {
+    const rollback = read('deploy/rollback.sh');
+    const line = rollback
+      .split('\n')
+      .map((text) => text.trim())
+      .find((text) => text.startsWith('tar xzf "$UNIT_BACKUP"'));
+    expect(line).toBe(
+      'tar xzf "$UNIT_BACKUP" -C /etc/systemd/system lecturelive-web.service lecturelive-ws.service'
+    );
+    expect(read('deploy/upgrade.sh')).toContain(
+      'tar czf "$BACKUP_DIR/systemd-${TIMESTAMP}.tar.gz" -C /etc/systemd/system \\\n        lecturelive-web.service lecturelive-ws.service'
+    );
+
+    const root = sandbox();
+    const staging = path.join(root, 'staging');
+    for (const member of ['lecturelive-web.service', 'lecturelive-ws.service', 'ssh.service.d/x.conf']) {
+      write(path.join(staging, member), member);
+    }
+    const archive = path.join(root, 'systemd-1.tar.gz');
+    const pack = spawnSync(
+      'tar',
+      ['czf', archive, '-C', staging, 'lecturelive-web.service', 'lecturelive-ws.service', 'ssh.service.d'],
+      { encoding: 'utf8' }
+    );
+    expect(pack.status).toBe(0);
+    const unitDir = path.join(root, 'etc/systemd/system');
+    mkdirSync(unitDir, { recursive: true });
+
+    const result = bash(`UNIT_BACKUP='${archive}'\n${line!.replace('/etc/systemd/system', unitDir)}`);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(readdirSync(unitDir).sort()).toEqual(['lecturelive-web.service', 'lecturelive-ws.service']);
+  });
+
+  it.skipIf(!GNU_TAR)('rollback.sh：解包不按归档里记的属主与权限改写已存在的 $APP_DIR', () => {
+    const command = extractCommand(read('deploy/rollback.sh'), 'tar xzf "$BACKUP_FILE"');
+    expect(command).toContain('--no-overwrite-dir');
+    const root = sandbox();
+    const staging = path.join(root, 'staging');
+    write(path.join(staging, 'server.js'), 'old-server');
+    // 归档里记下的「./」与现在的 $APP_DIR 不同（旧版备份里记的是服务用户）
+    chmodSync(staging, 0o700);
+    const backup = path.join(root, 'app-1.tar.gz');
+    expect(spawnSync('tar', ['czf', backup, '-C', staging, '.']).status).toBe(0);
+    const appDir = path.join(root, 'opt/lecturelive');
+    mkdirSync(appDir, { recursive: true });
+    chmodSync(appDir, 0o755);
+
+    const result = bash(`APP_DIR='${appDir}'\nBACKUP_FILE='${backup}'\n${command}`);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(readFileSync(path.join(appDir, 'server.js'), 'utf8')).toBe('old-server');
+    expect(mode(appDir)).toBe(0o755);
   });
 }, 30_000);

@@ -529,6 +529,9 @@ cmd_rollback() {
     if [[ ! -d "$BACKUP_DIR" ]] || ! ls "$BACKUP_DIR"/app-*.tar.gz &>/dev/null; then
         fatal "没有可用的备份文件"
     fi
+    # 备份会以 root 解包（systemd-*.tar.gz 更是解进 /etc/systemd/system）：选之前先确认只有 root 能改。
+    # rollback.sh 自己还会再核对一次。
+    require_root_only "$(readlink -f "$BACKUP_DIR")" "rollback 要以 root 解包 $BACKUP_DIR 里的备份"
 
     echo "  可用备份:"
     echo ""

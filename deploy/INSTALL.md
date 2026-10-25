@@ -146,7 +146,7 @@ sudo bash deploy/install.sh
 这会：
 - 将 Next.js standalone 产物复制到 `/opt/lecturelive`
 - 将编译好的 `websocket.js` + 精简依赖部署到 `/opt/lecturelive/ws-server`
-- 在引导密钥缺失或过短时生成强随机 `SETUP_BOOTSTRAP_TOKEN`，只写入权限为 600 的部署 `.env`
+- 在引导密钥缺失或过短时生成强随机 `SETUP_BOOTSTRAP_TOKEN`，只写入归 root、服务用户只读（`root:lecturelive 0640`）的部署 `.env`
 - 加载部署 `.env` 运行统一数据库编排并安装安全约束；缺连接串、禁用同步或迁移失败时停止启动
 - 配置 systemd 服务并启动
 
@@ -289,7 +289,10 @@ sudo bash deploy/upgrade.sh
 ```
 
 托管安装（`sudo lecture-live install` 装的）用 `sudo lecture-live update`：先 `git pull --ff-only`
-源码检出 `/opt/lecturelive/src`，再执行同一个 `deploy/upgrade.sh`。
+源码检出 `/opt/lecturelive/src`，再执行同一个 `deploy/upgrade.sh`。它只认 `/opt/lecturelive/src` 与
+`/root/lecture-live`，不会去 `/home/*` 里找源码，而且这份检出必须只有 root 能改（见下方
+[源码检出与备份的所有权](#源码检出与备份的所有权)）；源码放在自己家目录里的手工部署照上面的命令在源码目录执行
+`sudo bash deploy/upgrade.sh`。
 
 升级**全程停机**（不是热切换），按下面的顺序执行，任一步失败都保持 Web/WS 停止：
 
@@ -317,6 +320,7 @@ sudo bash deploy/rollback.sh
 sudo bash deploy/rollback.sh app-20260322_143000.tar.gz
 
 # 托管安装也可以用交互入口：列出备份供选择，然后调用同一个 deploy/rollback.sh
+# （托管检出里的 deploy/ 与 backups/ 都必须只有 root 能改，见「源码检出与备份的所有权」）
 sudo lecture-live rollback
 
 # 查看所有备份
@@ -453,13 +457,14 @@ sudo bash deploy/upgrade.sh
 ## 部署目录结构
 
 ```
-/opt/lecturelive/
+/opt/lecturelive/          # root:lecturelive，无组/其他写
 ├── server.js              # Next.js standalone 入口
 ├── .next/static/          # 前端静态资源
 ├── public/                # 公共资源
-├── .env                   # 环境变量（chmod 600）
+├── .env                   # 环境变量；root:lecturelive 0640，服务只读
 ├── data/                  # 应用数据（转录、摘要等）
-├── backups/               # 升级时自动备份：产物 app-*.tar.gz（web + ws 一起）+ systemd-*.tar.gz
+├── backups/               # 升级时自动备份：产物 app-*.tar.gz（web + ws 一起）+ systemd-*.tar.gz；归 root
+├── src/                   # 仅托管安装：lecture-live 的源码检出；归 root
 └── ws-server/             # WebSocket 服务器
     ├── websocket.js       # esbuild 编译的 JS（不再需要 ts-node）
     ├── package.json       # 精简依赖（只有 socket.io/prisma/ioredis 等）
@@ -468,6 +473,56 @@ sudo bash deploy/upgrade.sh
     ├── data -> ../data    # 软链接
     └── .env -> ../.env    # 软链接
 ```
+
+除特别标注的几处外，目录里的东西都归服务用户 `lecturelive`。
+
+### 源码检出与备份的所有权
+
+这几处的内容之后会以 root 执行、读取或解包：`lecture-live update` / `install` 以 root 在 `src/` 里跑
+`git pull`、`npm ci`、`next build` 与 `deploy/*.sh`，`lecture-live rollback` 以 root 执行
+`src/deploy/rollback.sh`，`rollback.sh` 又以 root 把 `backups/systemd-*.tar.gz` 解进
+`/etc/systemd/system`；`install.sh` / `upgrade.sh` 以 root 用 `node --env-file=/opt/lecturelive/.env`
+编译、迁移数据库，而 node 会应用 `.env` 里的 `NODE_OPTIONS` 等运行时选项。服务用户能改其中任何一处，
+就能拿到 root。所以：
+
+- `/opt/lecturelive` 本身归 `root:lecturelive`、无组/其他写：服务用户能进入、读取，但不能在里面改名或
+  替换条目（否则能把整个 `src/` 或 `backups/` 换成自己的）；
+- `.env` 归 `root:lecturelive`、`0640`：服务只读；
+- `backups/` 与托管源码检出 `src/` 归 root；其余（`data/`、`ws-server/`、运行产物）照旧归 `lecturelive`。
+
+`.env` 与 `backups/` 必须是真实的文件/目录，`backups/` 里也只能有普通文件：遇到软链、子目录或多重硬链接，
+脚本会拒绝并停下，免得以 root 照着它们去读、去解包别处的文件（root 名下的软链照样能指到服务用户可写的归档）。
+备份要放在别的盘上，请用 bind mount 挂到 `/opt/lecturelive/backups`。
+
+`setup.sh`、`install.sh`、`upgrade.sh`、`rollback.sh` 每次运行都会先经过 `deploy/ensure-root-ownership.sh`：
+收紧 `/opt/lecturelive` 本身，把 `.env` 换成一份归 root 的新文件（内容照搬），并核对 `backups/`——里面有
+root 以外的人能改的条目就拒绝。备份只核对、不替你收回：chown 证明不了旧归档没被改过。`src/` 由托管 CLI
+自己把关：以 root 执行检出里的任何东西之前，它会检查整条路径与要执行的整棵目录树（回滚查 `deploy/` 与
+`backups/`），有一项不归 root、或组/其他用户可写，就报出该项并拒绝，不做任何改动；新装的检出从克隆起就归 root。
+手工部署的源码在谁的家目录里都可以，直接在源码目录执行 `sudo bash deploy/upgrade.sh` / `deploy/rollback.sh`，
+不受 CLI 这项检查影响。
+
+**从旧版本升级**：此前这四个脚本会把整个 `/opt/lecturelive`（含 `src/`、`backups/` 与 `.env`）交给 `lecturelive`。
+新版脚本会因此拒绝旧的 `backups/`，托管 CLI 还会拒绝旧的 `src/`（同样因为这一点，旧版 `lecture-live update`
+以 root 跑 `git pull` 时，git 2.35.2 起默认就会报 `detected dubious ownership` 而失败）。确认服务用户没有被
+入侵过后收回一次即可。先停掉服务、确认已没有 `lecturelive` 进程，否则它事先打开的可写文件在 chown 之后照样能写：
+
+```bash
+sudo systemctl stop lecturelive-web lecturelive-ws
+sudo pkill -u lecturelive; pgrep -u lecturelive || echo "已无 lecturelive 进程"
+sudo chown root:lecturelive /opt/lecturelive && sudo chmod go-w /opt/lecturelive
+sudo chown -R root:root /opt/lecturelive/backups && sudo chmod -R go-w /opt/lecturelive/backups
+# 托管安装（有 /opt/lecturelive/src）再加上这一行：
+sudo chown -R root:root /opt/lecturelive/src && sudo chmod -R go-w /opt/lecturelive/src
+sudo lecture-live update   # 手工部署则在源码目录执行 sudo bash deploy/upgrade.sh
+```
+
+`.env` 不用手动处理：新版脚本在读它之前就会把它换成一份归 root 的新文件（内容照搬）。
+
+拿不准时不要沿用旧检出与旧备份：照上面停服务、清掉 `lecturelive` 进程并收紧 `/opt/lecturelive` 之后，把它们挪走
+（`sudo mv /opt/lecturelive/src /root/lecturelive-src.old`、`sudo mv /opt/lecturelive/backups /root/lecturelive-backups.old`），
+`sudo git clone https://github.com/PLus123456/lecture-live.git /opt/lecturelive/src` 重新克隆后再 `sudo lecture-live update`。
+`.env` 的内容同样要人工核对一遍，尤其是 `NODE_OPTIONS`、`LD_PRELOAD` 这类会让进程加载额外代码的变量，应用本身一个都不需要。
 
 ---
 

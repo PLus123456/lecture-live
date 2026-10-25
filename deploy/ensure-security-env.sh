@@ -41,7 +41,8 @@ ensure_env_default() {
 }
 
 # 复制自 .env.example 的文件通常是 0644；在写入秘密前先收紧，写完再复核一次。
-chmod 600 "$ENV_FILE"
+# 0640 而不是 0600：部署 .env 归 root、由服务用户的组只读（见 ensure-root-ownership.sh）。
+chmod 640 "$ENV_FILE"
 
 BOOTSTRAP_TOKEN=$(read_env_value SETUP_BOOTSTRAP_TOKEN)
 if [[ ${#BOOTSTRAP_TOKEN} -lt 32 ]]; then
@@ -68,4 +69,4 @@ elif [[ -z "$(read_env_value TRUSTED_PROXY_CIDRS)" ]]; then
 fi
 unset PROXY_HOPS
 
-chmod 600 "$ENV_FILE"
+chmod 640 "$ENV_FILE"

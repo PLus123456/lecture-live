@@ -37,6 +37,10 @@ if ! getent group "$APP_USER" &>/dev/null; then
     usermod -g "$APP_USER" "$APP_USER"
 fi
 
+# 先收紧并核对 root 之后要信任的几处（$APP_DIR 本身、.env、backups/，见 ensure-root-ownership.sh）。
+# 必须早于下面任何以 root 运行的 node --env-file，也早于停服：备份不可信时直接拒绝，旧服务照常运行。
+bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"
+
 cd "$SRC_DIR"
 
 # 进入升级流程后第一时间收紧/补齐生产环境；不要等 npm ci 完成后才修复旧 0644 文件。
@@ -235,9 +239,13 @@ ln -sfn "$APP_DIR/data" "$WS_DIR/data"
 ln -sfn "$APP_DIR/.env" "$WS_DIR/.env"
 
 # ── 9. 修复权限 ──
-chown -R $APP_USER:$APP_USER "$APP_DIR"
+# 运行产物、data、ws-server 交给服务用户；src/、backups/ 与 .env 不交（.env 归 root、服务只读，
+# 见 ensure-root-ownership.sh）。上面的 cp -a 会把 standalone 目录的属主与权限带到 $APP_DIR 本身上，
+# 所以交接完再收紧一次。
+find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name src ! -name backups ! -name .env \
+    -exec chown -R "$APP_USER:$APP_USER" {} +
+bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"
 chown -R $APP_USER:$APP_USER "$MAINTENANCE_DIR"
-chmod 600 "$APP_DIR/.env"
 
 # ── 10. 更新 systemd 并启动 ──
 info "启动服务..."

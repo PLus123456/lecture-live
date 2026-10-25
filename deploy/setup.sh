@@ -6,6 +6,7 @@
 # ============================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="/opt/lecturelive"
 WS_DIR="/opt/lecturelive/ws-server"
 APP_USER="lecturelive"
@@ -83,7 +84,11 @@ getent group "$APP_USER" || error "用户组 $APP_USER 创建/验证失败"
 # ── 6. 创建应用目录 ──
 info "准备应用目录..."
 mkdir -p "$APP_DIR" "$WS_DIR" "$APP_DIR/data" "$APP_DIR/backups"
-chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+# data、ws-server 交给服务用户；$APP_DIR 本身、.env 与 backups/ 归 root，已有的托管源码检出 src/
+# 也不交出去（见 ensure-root-ownership.sh）——在已部署的机器上重跑本脚本同样安全。
+find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name src ! -name backups ! -name .env \
+    -exec chown -R "$APP_USER:$APP_USER" {} +
+bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"
 
 # ── 7. 防火墙（P6-1）──
 # 应用端口本该只对 nginx 可见：web 与 ws 现在都由各自 systemd 单元收敛到 127.0.0.1

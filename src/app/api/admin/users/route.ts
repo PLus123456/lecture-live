@@ -289,7 +289,10 @@ export async function POST(req: Request) {
           // 而后台也看不到这个字段，谁都诊断不出来。
           // 让用户去验证一个管理员替他填的地址也没有意义：地址填错了，验证信照样收不到。
           emailVerifiedAt: new Date(),
-          ...quotas,
+          // 只写 User 的配额列；并发上限、能力开关与用途模型由用户组在运行时解析。
+          transcriptionMinutesLimit: quotas.transcriptionMinutesLimit,
+          storageHoursLimit: quotas.storageHoursLimit,
+          allowedModels: quotas.allowedModels,
           storageBytesLimit,
         },
         select: USER_SELECT,

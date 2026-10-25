@@ -42,9 +42,13 @@ const managedUser = {
 
 // 捕获 PATCH /api/admin/users 的请求体，供保存后断言
 let capturedPatch: Record<string, unknown> | null = null;
+let capturedCreate: Record<string, unknown> | null = null;
+let users = [managedUser];
 
 test.beforeEach(async ({ page }) => {
   capturedPatch = null;
+  capturedCreate = null;
+  users = [managedUser];
   await installBrowserStubs(page);
 
   await page.route('**/api/**', async (route) => {
@@ -75,7 +79,13 @@ test.beforeEach(async ({ page }) => {
     }
 
     if (p === '/api/admin/users' && method === 'GET') {
-      return fulfillJson(route, { users: [managedUser] });
+      return fulfillJson(route, { users });
+    }
+    if (p === '/api/admin/users' && method === 'POST') {
+      capturedCreate = request.postDataJSON();
+      const user = { ...managedUser, ...capturedCreate, id: 'created-user' };
+      users = [...users, user];
+      return fulfillJson(route, { user }, 201);
     }
     if (p === '/api/admin/users' && method === 'PATCH') {
       capturedPatch = request.postDataJSON();
@@ -111,6 +121,26 @@ test.beforeEach(async ({ page }) => {
     return fulfillJson(route, {});
   });
 });
+
+for (const role of ['FREE', 'PRO', 'ADMIN']) {
+  test(`新建 ${role} 用户成功后关闭弹窗并刷新列表`, async ({ page }) => {
+    await loginAsAdmin(page, { prewarm: ['/admin?tab=users'] });
+    await page.goto('/admin?tab=users');
+    await page.getByRole('button', { name: /新建用户|New User/i }).click();
+    await page.getByPlaceholder('User display name').fill('Created Student');
+    await page.getByPlaceholder('user@example.com', { exact: true }).fill('created@example.com');
+    await page.getByPlaceholder('Minimum 8 characters').fill('Created-Passw0rd');
+    await page.locator('select:has(option[value="ADMIN"])').selectOption(role);
+    await page.getByRole('button', { name: /^创建$|^Create$/ }).click();
+
+    await expect(page.getByPlaceholder('User display name')).toBeHidden();
+    await expect(page.locator('tr', { hasText: 'created@example.com' })).toContainText('Created Student');
+    expect(capturedCreate).toEqual({
+      email: 'created@example.com', displayName: 'Created Student',
+      password: 'Created-Passw0rd', role,
+    });
+  });
+}
 
 test('用户详情弹窗：真实存储用量 + 单用户配额覆盖 + 重置 + 到期校验', async ({ page }) => {
   await loginAsAdmin(page, { prewarm: ['/admin?tab=users'] });

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Prisma } from '@prisma/client';
 
 /**
  * 两组 auth 真源不变量：
@@ -46,6 +47,7 @@ import {
   verifyAuthSession,
   verifyAuthToken,
 } from '@/lib/auth';
+import { getDefaultQuotasForRole } from '@/lib/userRoles';
 
 const USER = {
   id: 'user-1',
@@ -183,6 +185,46 @@ describe('registerWithOptions：需邮箱验证时不签会话', () => {
     }));
     mocks.familyCreate.mockResolvedValue({});
   });
+
+  it.each(['FREE', 'PRO', 'ADMIN'] as const)(
+    '%s 注册不把组能力写入 User，默认与自定义配额均可创建',
+    async (role) => {
+      const userFields = new Set(
+        Prisma.dmmf.datamodel.models.find((model) => model.name === 'User')!.fields.map(
+          (field) => field.name
+        )
+      );
+      mocks.userCreate.mockImplementation(async ({ data }) => {
+        const unknownFields = Object.keys(data).filter((key) => !userFields.has(key));
+        if (unknownFields.length) throw new Error(`Unknown arguments: ${unknownFields.join(', ')}`);
+        return { id: 'new-user', tokenVersion: 0, ...data };
+      });
+
+      for (const configured of [false, true]) {
+        const quotas = configured
+          ? { ...getDefaultQuotasForRole(role), transcriptionMinutesLimit: 432, storageHoursLimit: 23.5, allowedModels: 'configured-model', chatModelId: 'chat-model' }
+          : getDefaultQuotasForRole(role);
+        mocks.siteSettingFindUnique.mockResolvedValue(
+          configured ? { value: JSON.stringify(quotas) } : null
+        );
+        const { user, token } = await registerWithOptions(
+          'new@uni.edu', 'Passw0rd-x', '新同学',
+          { role, bcryptRounds: 4, emailVerified: false, issueSession: false }
+        );
+        expect(user).toMatchObject({
+          role,
+          transcriptionMinutesLimit: quotas.transcriptionMinutesLimit,
+          storageHoursLimit: quotas.storageHoursLimit,
+          allowedModels: quotas.allowedModels,
+          storageBytesLimit: expect.any(BigInt),
+          quotaResetAt: expect.any(Date),
+          emailVerifiedAt: null,
+        });
+        expect(token).toBeNull();
+      }
+      expect(mocks.familyCreate).not.toHaveBeenCalled();
+    }
+  );
 
   it('issueSession=false：不建 AuthTokenFamily、不签 token', async () => {
     const { user, token } = await registerWithOptions(

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Prisma } from '@prisma/client';
 import { createJsonRequest } from '../../../../../../tests/utils/http';
 
 /**
@@ -14,6 +15,7 @@ const {
   emailTokenUpdateManyMock,
   transactionMock,
   getSiteSettingsMock,
+  siteSettingFindUniqueMock,
 } = vi.hoisted(() => ({
   requireAdminAccessMock: vi.fn(),
   userFindUniqueMock: vi.fn(),
@@ -22,6 +24,7 @@ const {
   emailTokenUpdateManyMock: vi.fn(),
   transactionMock: vi.fn(),
   getSiteSettingsMock: vi.fn(),
+  siteSettingFindUniqueMock: vi.fn(),
 }));
 
 vi.mock('@/lib/adminApi', () => ({ requireAdminAccess: requireAdminAccessMock }));
@@ -36,15 +39,6 @@ vi.mock('@/lib/securityAudit', () => ({
 vi.mock('@/lib/siteSettings', () => ({ getSiteSettings: getSiteSettingsMock }));
 vi.mock('@/lib/auth', () => ({ validatePassword: vi.fn().mockReturnValue(null) }));
 vi.mock('bcryptjs', () => ({ default: { hash: async () => 'hashed' } }));
-vi.mock('@/lib/userRoles', () => ({
-  normalizeUserRole: (r: string, fallback: string) => r ?? fallback,
-  resolveRoleQuotas: vi.fn().mockResolvedValue({
-    allowedModels: '',
-    transcriptionMinutesLimit: 60,
-    storageHoursLimit: 5,
-  }),
-  resolveRoleStorageBytesLimit: vi.fn().mockResolvedValue(1024),
-}));
 vi.mock('@/lib/quota', () => ({
   releaseStorageBytes: vi.fn(),
   settlePoolOnLimitChange: vi.fn(),
@@ -64,12 +58,13 @@ vi.mock('@/lib/prisma', () => ({
       update: userUpdateMock,
     },
     emailToken: { updateMany: emailTokenUpdateManyMock },
-    siteSetting: { findUnique: vi.fn() },
+    siteSetting: { findUnique: siteSettingFindUniqueMock },
     $transaction: transactionMock,
   },
 }));
 
 import { POST, PATCH } from '@/app/api/admin/users/route';
+import { getDefaultQuotasForRole } from '@/lib/userRoles';
 
 const EXISTING = {
   id: 'u1',
@@ -92,6 +87,7 @@ describe('admin 用户接口 — 邮箱验证状态（#17）', () => {
       response: null,
     });
     getSiteSettingsMock.mockResolvedValue({ bcrypt_rounds: 4, password_min_length: 8 });
+    siteSettingFindUniqueMock.mockResolvedValue(null);
     userFindUniqueMock.mockResolvedValue(null);
     userCreateMock.mockResolvedValue({ id: 'new1' });
     userUpdateMock.mockResolvedValue({ ...EXISTING });
@@ -109,6 +105,53 @@ describe('admin 用户接口 — 邮箱验证状态（#17）', () => {
     PATCH(
       createJsonRequest('http://localhost/api/admin/users', { method: 'PATCH', body })
     );
+
+  it.each(['FREE', 'PRO', 'ADMIN'] as const)(
+    '%s 建号只持久化 User 字段，同时保留后台配置的配额',
+    async (role) => {
+      // 使用真实组解析器和 Prisma 模型字段，避免精简的配额桩漏掉线上非法列。
+      const group = {
+        ...getDefaultQuotasForRole(role),
+        transcriptionMinutesLimit: 321,
+        storageHoursLimit: 12.5,
+        allowedModels: 'configured-model',
+        maxConcurrentSessions: 7,
+        realtimeSummaryModelId: 'summary-model',
+        finalSummaryModelId: 'report-model',
+        chatModelId: 'chat-model',
+        translationModelId: 'translation-model',
+      };
+      siteSettingFindUniqueMock.mockResolvedValue({ value: JSON.stringify(group) });
+      const userFields = new Set(
+        Prisma.dmmf.datamodel.models.find((model) => model.name === 'User')!.fields.map(
+          (field) => field.name
+        )
+      );
+      userCreateMock.mockImplementation(async ({ data, select }) => {
+        const unknownFields = Object.keys(data).filter((key) => !userFields.has(key));
+        if (unknownFields.length) throw new Error(`Unknown arguments: ${unknownFields.join(', ')}`);
+        const row = { id: 'new1', ...data };
+        return Object.fromEntries(Object.keys(select).map((key) => [key, row[key]]));
+      });
+
+      const res = await post({
+        email: 'new@example.com', displayName: '新用户', password: 'passw0rd', role,
+      });
+
+      expect(res.status).toBe(201);
+      expect(userCreateMock.mock.calls[0][0].data).toMatchObject({
+        role,
+        transcriptionMinutesLimit: 321,
+        storageHoursLimit: 12.5,
+        allowedModels: 'configured-model',
+        storageBytesLimit: expect.any(BigInt),
+        emailVerifiedAt: expect.any(Date),
+      });
+      expect(siteSettingFindUniqueMock).toHaveBeenCalledWith({
+        where: { key: `group_config_${role}` },
+      });
+    }
+  );
 
   it('管理员建号即视为已验证（否则门禁开着时一律登不上）', async () => {
     const res = await post({

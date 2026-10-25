@@ -1248,7 +1248,10 @@ export async function registerWithOptions(
       role,
       quotaResetAt: getNextQuotaResetAt(),
       emailVerifiedAt: emailVerified ? new Date() : null,
-      ...quotas,
+      // 组配置还包含不属于 User 的能力字段，不能整体展开到 Prisma 的创建参数。
+      transcriptionMinutesLimit: quotas.transcriptionMinutesLimit,
+      storageHoursLimit: quotas.storageHoursLimit,
+      allowedModels: quotas.allowedModels,
       storageBytesLimit,
     },
   });

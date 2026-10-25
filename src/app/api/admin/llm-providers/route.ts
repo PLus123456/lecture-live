@@ -127,7 +127,8 @@ export async function POST(req: Request) {
       );
     }
 
-    // SEC-034：LLM 使用独立、精确 origin allowlist；不得继承 Cloudreve 的私网豁免。
+    // SEC-034：LLM 走独立的出站校验（llm/outboundPolicy.ts：只认 HTTPS、只连公网地址），
+    // 不得继承 Cloudreve 的私网豁免。
     let normalizedApiBase: string;
     try {
       normalizedApiBase = await validateLlmProviderBaseUrl(apiBase);
@@ -140,7 +141,7 @@ export async function POST(req: Request) {
         },
       });
       return NextResponse.json(
-        { error: 'apiBase 必须是已加入服务端允许列表的安全 http(s) origin' },
+        { error: 'apiBase 不符合 LLM 出站规则：须为 HTTPS，不含账号密码、查询串或片段，且主机只能解析到公网地址' },
         { status: 400 }
       );
     }

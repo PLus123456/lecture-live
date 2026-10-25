@@ -579,8 +579,8 @@ async function handleConfigureLlm(req: Request, body: {
       );
     }
 
-    // SEC-034：setup 与日常管理必须使用同一份精确 origin allowlist；否则向导会成为
-    // 绕过后台出站策略、直接落库任意 provider 地址的第二写入口。
+    // SEC-034：setup 与日常管理必须走同一套出站校验（validateLlmProviderBaseUrl）；否则向导
+    // 会成为绕过后台出站策略、直接落库任意 provider 地址的第二写入口。
     let normalizedApiBase: string;
     try {
       normalizedApiBase = await validateLlmProviderBaseUrl(p.apiBase);
@@ -595,7 +595,7 @@ async function handleConfigureLlm(req: Request, body: {
         },
       });
       return NextResponse.json(
-        { error: `供应商 ${i + 1}: API 地址不在服务端 LLM origin 允许列表中` },
+        { error: `供应商 ${i + 1}: API 地址不符合 LLM 出站规则（须为 HTTPS，不含账号密码、查询串或片段，且主机只能解析到公网地址）` },
         { status: 400 }
       );
     }

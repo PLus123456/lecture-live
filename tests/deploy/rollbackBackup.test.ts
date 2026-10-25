@@ -6,6 +6,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -22,6 +23,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 const ROOT = process.cwd();
 const tempDirs: string[] = [];
+// 部署目标是 Linux，脚本刻意依赖 GNU tar 的 --anchored；macOS 自带的 bsdtar 不认这个选项，
+// 在那上面跑测的是另一个 tar。CI（ubuntu）照常执行这些用例。
+const GNU_TAR =
+  spawnSync('tar', ['--version'], { encoding: 'utf8' }).stdout?.includes('GNU tar') ?? false;
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -46,6 +51,16 @@ function extractCommand(script: string, prefix: string): string {
   return out.join('\n');
 }
 
+/** 抠出 `name() {` 到其后第一行顶格 `}` 的完整 shell 函数。 */
+function extractFunction(script: string, name: string): string {
+  const lines = script.split('\n');
+  const start = lines.findIndex((line) => line === `${name}() {`);
+  if (start === -1) throw new Error(`function not found: ${name}`);
+  const end = lines.indexOf('}', start);
+  if (end === -1) throw new Error(`function not terminated: ${name}`);
+  return lines.slice(start, end + 1).join('\n');
+}
+
 function write(file: string, contents: string) {
   mkdirSync(path.dirname(file), { recursive: true });
   writeFileSync(file, contents);
@@ -68,7 +83,7 @@ function listArchive(file: string): string[] {
 }
 
 describe('deploy/upgrade.sh 备份', () => {
-  it('只排除顶层 data/backups/.env/src，嵌套的同名目录照常备份', () => {
+  it.skipIf(!GNU_TAR)('只排除顶层 data/backups/.env/src，嵌套的同名目录照常备份', () => {
     const upgrade = readFileSync(path.join(ROOT, 'deploy/upgrade.sh'), 'utf8');
     const command = extractCommand(upgrade, 'tar czf "$BACKUP_DIR/app-');
 
@@ -132,7 +147,7 @@ describe('回滚保留源码检出', () => {
     expect(existsSync(path.join(appDir, 'data/keep.json'))).toBe(true);
   }
 
-  it('deploy/rollback.sh：清理与解包都不碰 $APP_DIR/src', () => {
+  it.skipIf(!GNU_TAR)('deploy/rollback.sh：清理与解包都不碰 $APP_DIR/src', () => {
     const rollback = readFileSync(path.join(ROOT, 'deploy/rollback.sh'), 'utf8');
     const workDir = makeTemp();
     const backup = legacyBackupWithSrc(workDir);
@@ -146,18 +161,141 @@ describe('回滚保留源码检出', () => {
     assertSourcePreserved(appDir);
   });
 
-  it('deploy/lecture-live 的内联回滚兜底与 rollback.sh 同口径', () => {
-    const cli = readFileSync(path.join(ROOT, 'deploy/lecture-live'), 'utf8');
-    const workDir = makeTemp();
-    const backup = legacyBackupWithSrc(workDir);
-    const appDir = liveAppDir(workDir);
+});
 
-    // 兜底脚本在 bash -c "…" 里，$APP_DIR / $selected 由外层展开；这里用同名变量还原
-    const commands = [
-      extractCommand(cli, 'find $APP_DIR -mindepth 1 -maxdepth 1'),
-      extractCommand(cli, "tar xzf '$selected'").replace("'$selected'", '"$selected"'),
+/**
+ * `lecture-live rollback` 只负责选备份，真正的回滚交给 deploy/rollback.sh。旧实现调用一个
+ * 从未存在过的 rollback-wrapper.sh，于是每次都落到一段内联脚本：它一律拒绝早于
+ * health-ready-v1 的备份、也不成对退回 systemd unit，和 rollback.sh 早已分叉。
+ * 这里把 CLI 里的真实函数抠出来，在临时目录里跑：root 检查换成空操作，备份目录与源码
+ * 检出指向临时目录，rollback.sh 换成只记录参数的桩。
+ */
+describe('deploy/lecture-live rollback 委托 deploy/rollback.sh', () => {
+  const cli = readFileSync(path.join(ROOT, 'deploy/lecture-live'), 'utf8');
+  const cmdRollback = extractFunction(cli, 'cmd_rollback');
+  const findRollbackScript = extractFunction(cli, 'find_rollback_script');
+
+  function layout() {
+    const dir = makeTemp();
+    const backups = path.join(dir, 'backups');
+    // ls -t 按 mtime 排序：较新的排第 1 项
+    const newer = path.join(backups, 'app-20261020_100000.tar.gz');
+    const older = path.join(backups, 'app-20261001_100000.tar.gz');
+    write(newer, 'new');
+    write(older, 'old');
+    utimesSync(older, new Date('2026-10-01T10:00:00Z'), new Date('2026-10-01T10:00:00Z'));
+    utimesSync(newer, new Date('2026-10-20T10:00:00Z'), new Date('2026-10-20T10:00:00Z'));
+    // 已安装的 CLI 在 bin 目录里，旁边放一个无关的 rollback.sh：绝不能被当成回滚脚本
+    const installedCli = path.join(dir, 'usr/local/bin/lecture-live');
+    write(installedCli, '#!/usr/bin/env bash\n');
+    const record = path.join(dir, 'called.txt');
+    write(
+      path.join(dir, 'usr/local/bin/rollback.sh'),
+      `printf 'stray:%s\\n' "$1" >> '${record}'\n`
+    );
+    return { dir, backups, installedCli, record, older, newer };
+  }
+
+  function addRollbackScript(srcDir: string, record: string) {
+    write(
+      path.join(srcDir, 'deploy/rollback.sh'),
+      `printf '%s|%s\\n' "$(basename "$(dirname "$(dirname "$0")")")" "$1" >> '${record}'\n`
+    );
+  }
+
+  /** 以 argv0 = 已安装的 CLI 路径执行 cmd_rollback；/root 候选换成临时目录里不存在的位置。 */
+  function runCmdRollback(
+    env: { dir: string; backups: string; installedCli: string; srcDir: string },
+    stdin: string
+  ) {
+    const rootCheckout = '/root/lecture-live;';
+    expect(findRollbackScript).toContain(rootCheckout);
+    const finder = findRollbackScript.replace(rootCheckout, `'${env.dir}/root-checkout';`);
+    const script = [
+      'RED= GREEN= YELLOW= BLUE= CYAN= BOLD= DIM= NC=',
+      'error() { echo "$*" >&2; }',
+      'fatal() { error "$*"; exit 1; }',
+      'need_root() { :; }',
+      'divider() { :; }',
+      `BACKUP_DIR='${env.backups}'`,
+      `SRC_DIR='${env.srcDir}'`,
+      finder,
+      cmdRollback,
+      'cmd_rollback',
     ].join('\n');
-    bash(commands, { APP_DIR: appDir, selected: backup });
-    assertSourcePreserved(appDir);
+    return spawnSync('bash', ['-euo', 'pipefail', '-c', script, env.installedCli], {
+      input: stdin,
+      encoding: 'utf8',
+    });
+  }
+
+  it('CLI 里不再有内联回滚，也不再引用不存在的 wrapper', () => {
+    // 只看命令行：注释里会提到旧写法
+    const commands = cli
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('#'))
+      .join('\n');
+    expect(commands).not.toContain('rollback-wrapper.sh');
+    expect(existsSync(path.join(ROOT, 'deploy/rollback-wrapper.sh'))).toBe(false);
+    for (const inline of ['bash -c', 'tar xzf', 'systemctl', 'check-readiness']) {
+      expect(cmdRollback).not.toContain(inline);
+    }
+    expect(cmdRollback).toContain('bash "$rollback_script" "$(basename "$selected")"');
   });
+
+  it('不去 /home/* 里找回滚脚本：那里任何本地用户都能放文件，而找到的脚本以 root 执行', () => {
+    const candidates = findRollbackScript
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('#'))
+      .join('\n');
+    expect(candidates).not.toContain('/home/');
+  });
+
+  it('把所选备份的文件名交给托管检出 $SRC_DIR 里的 rollback.sh', () => {
+    const env = layout();
+    const srcDir = path.join(env.dir, 'opt/lecturelive/src');
+    addRollbackScript(srcDir, env.record);
+
+    const result = runCmdRollback({ ...env, srcDir }, '2\n');
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    // 第 2 项是较旧的备份；rollback.sh 只收 $BACKUP_DIR 下的文件名
+    expect(readFileSync(env.record, 'utf8')).toBe(`src|${path.basename(env.older)}\n`);
+  }, 30_000);
+
+  it('直接回车默认回滚到最新备份', () => {
+    const env = layout();
+    const srcDir = path.join(env.dir, 'opt/lecturelive/src');
+    addRollbackScript(srcDir, env.record);
+
+    const result = runCmdRollback({ ...env, srcDir }, '\n');
+    expect(result.status).toBe(0);
+    expect(readFileSync(env.record, 'utf8')).toBe(`src|${path.basename(env.newer)}\n`);
+  }, 30_000);
+
+  it('找不到 rollback.sh 时在列出备份、读取选择之前就失败，也不会误用 bin 目录里的同名脚本', () => {
+    const env = layout();
+    const result = runCmdRollback({ ...env, srcDir: path.join(env.dir, 'missing') }, '1\n');
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('未找到 deploy/rollback.sh');
+    expect(result.stdout).not.toContain('可用备份');
+    expect(existsSync(env.record)).toBe(false);
+  }, 30_000);
+
+  it('从源码检出直接运行时优先用该检出自己的 rollback.sh', () => {
+    const env = layout();
+    const checkout = path.join(env.dir, 'home/ops/lecture-live');
+    const ownCli = path.join(checkout, 'deploy/lecture-live');
+    write(ownCli, '#!/usr/bin/env bash\n');
+    addRollbackScript(checkout, env.record);
+    const srcDir = path.join(env.dir, 'opt/lecturelive/src');
+    addRollbackScript(srcDir, env.record);
+
+    const result = runCmdRollback({ ...env, installedCli: ownCli, srcDir }, '1\n');
+    expect(result.status).toBe(0);
+    expect(readFileSync(env.record, 'utf8')).toBe(
+      `lecture-live|${path.basename(env.newer)}\n`
+    );
+  }, 30_000);
 });

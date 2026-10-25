@@ -61,7 +61,7 @@ export async function enforceApiRateLimit(
  * 所以这里按「能拿到多少身份就分多细」分三层，任何一层都**不会**把互不相干的调用方
  * 塞进同一个桶：
  *
- *  1. `ip:<addr>`  —— 可信代理已开启且解析出合法 IP。最理想，行为与旧实现完全一致。
+ *  1. `ip:<addr>`  —— 按 TRUSTED_PROXY_HOPS 解析出合法 IP。最理想，行为与旧实现完全一致。
  *  2. `sub:<userId>` —— 拿不到 IP，但请求带着**签名有效**的会话 JWT。
  *     受保护路由（middleware 已验签才放行）几乎都落在这一层：llm/report、share/create、
  *     soniox/temporary-key、regenerate-title…… 「一人用尽全站额度」就此消失。
@@ -76,9 +76,9 @@ export async function enforceApiRateLimit(
  *    全局的一次性引导资源，共享桶在语义上是对的；被打满 10 分钟可自愈，且真正的门禁是
  *    requireSetupAuthorization。
  *  - 拿不到真实 IP 时，匿名者的**总量**依然限不住（换路径即换桶）。这不是代码能补的：
- *    没有可信来源标识就没有「同一个人」的概念。正解是把 TRUSTED_PROXY 打开
- *    （deploy/ 模板与 .env.example 已改为推荐 true），未开启且检测到反代头时
- *    clientIp.ts 会打一次告警。聚合层面的兜底应由反代承担（nginx limit_req，
+ *    没有可信来源标识就没有「同一个人」的概念。正解是按真实拓扑配置
+ *    TRUSTED_PROXY_HOPS / TRUSTED_PROXY_CIDRS（标准 nginx 部署是 1 跳，也是缺省值；
+ *    旧的 TRUSTED_PROXY 布尔已作废）。聚合层面的兜底应由反代承担（nginx limit_req，
  *    已写进 deploy/nginx-lecturelive.conf）。
  */
 export function resolveRateLimitClientKey(req: Request): string {

@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -25,7 +26,9 @@ const LAUNCHER = path.join(ROOT, 'scripts', 'backfill-stored-artifacts.mjs');
 const tempDirs: string[] = [];
 
 function makeTemp(prefix: string) {
-  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  // 取真实路径：子进程的 process.cwd() 是解析过软链的路径，macOS 的 tmpdir（/var → /private/var）
+  // 不解析就对不上。
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), prefix)));
   tempDirs.push(dir);
   return dir;
 }

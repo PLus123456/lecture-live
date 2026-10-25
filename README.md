@@ -190,8 +190,7 @@ curl http://localhost:3000/api/health
 docker-compose exec app node scripts/check-readiness.mjs
 ```
 
-托管安装、升级、回滚和 systemd 启动均会校验深度就绪端点；检查失败会停止 Web/WS
-并返回非零。为避免恢复匿名依赖探测，安全标记上线前生成的旧备份不能直接启动。
+Bare-metal installs, upgrades, rollbacks and systemd starts all run the deep readiness check; a failed check stops both Web and WS and exits non-zero. A backup taken before the `health-ready-v1` runtime marker can only be restored together with the systemd units saved at the same timestamp (`deploy/rollback.sh` then probes that older runtime's own `/api/health`); without the paired units it is refused. See [`deploy/INSTALL.md`](deploy/INSTALL.md#回滚).
 
 The Docker stack includes the app server, WebSocket service, MySQL 8.4, Redis 7, and Cloudreve. Production access is expected to pass through the shipped Nginx configuration; ports 3000/3001 are published on host loopback only. For a single-machine direct-access development run without Nginx, explicitly set `TRUSTED_PROXY_HOPS=0` (IP identity behind Docker NAT will then be shared and is not a production topology).
 

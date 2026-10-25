@@ -16,7 +16,7 @@ LectureLive 主服务器  ── HTTPS ──▶  nginx (443, TLS)  ──▶  w
 ## 依赖
 
 - **Node.js ≥ 20**（worker 是零 npm 依赖单文件，无需 `npm install`）
-- **systemd ≥ 249**（安装器会验证单元；旧版不得忽略解析器沙箱指令）
+- **systemd ≥ 247**（单元用到的 `ProtectProc=` / `ProcSubset=` 自 247 起才生效，更旧的版本会静默忽略这些沙箱指令，`install.sh` 直接拒绝安装；Debian 11 即 247）
 - **ffmpeg / ffprobe**（`apt install ffmpeg`）
 - **deep-filter**（可选但强烈推荐；没有它会自动兜底 ffmpeg `afftdn`，降噪效果弱不少）
 

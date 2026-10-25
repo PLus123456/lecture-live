@@ -108,9 +108,6 @@ REDIS_URL=redis://:你的Redis密码@localhost:6379
 JWT_SECRET=<生成的随机字符串>
 ENCRYPTION_KEY=<生成的另一个随机字符串>
 
-# 首次进入 LLM 配置步骤前必填：逐个填写实际 provider 的精确 origin，逗号分隔
-# 只写协议 + 主机 + 非默认端口，不写路径、查询串、通配符，也不会自动放行子域
-
 # 可信代理拓扑（标准部署：公网 -> 本机 Nginx -> 回环 Web/WS）
 TRUSTED_PROXY_HOPS=1
 TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
@@ -126,9 +123,10 @@ SETUP_BOOTSTRAP_TOKEN=<openssl rand -hex 32>
 
 > **注意：** `.env` 文件中值可以用引号包裹（`KEY="value"`），`node --env-file` 会正确解析。
 >
-> **LLM 出站边界：** 不设 origin 白名单（自托管场景下管理员与能改 .env 的是同一个人，
-> 白名单只增加运维成本、挡不住任何人）。仍然强制的是与配置无关的那部分：只走 HTTPS、
-> 不跟任何 3xx 重定向、DNS 结果钉住后再连（防重绑定）、私网/回环/链路本地地址一律拒绝。
+> **LLM 出站边界：** 不设 origin 白名单，也没有对应的环境变量（自托管场景下管理员与能改
+> .env 的是同一个人，白名单只增加运维成本、挡不住任何人）。仍然强制的是与配置无关的那部分
+> （`src/lib/llm/outboundPolicy.ts`）：只走 HTTPS、地址不得带账号密码或查询串、不跟任何 3xx
+> 重定向、DNS 结果钉住后再连（防重绑定）、私网/回环/链路本地地址一律拒绝。
 
 ### 7. 编译
 
@@ -162,33 +160,39 @@ sudo ln -sf /etc/nginx/sites-available/lecturelive /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-模板里这两行**不能删也不能改成 `proxy_add_header`**：
+模板里每个反代 `location`（`/api/auth/`、`/`、`/socket.io/`）都有这两行，**不能删，
+也不能把 XFF 改成 `$proxy_add_x_forwarded_for`**：
 
 ```nginx
 proxy_set_header X-Real-IP        $remote_addr;
-proxy_set_header X-Forwarded-For  $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-For  $remote_addr;
 ```
 
-`proxy_set_header` 是**覆盖**语义——客户端自己带的同名头会被丢掉。漏配任意一个，
-该头就完全由客户端控制：每次请求换一个值即可换出一个全新的限流桶，
-`auth:login:ip`、`share:view` 等 IP 维度的限流全部失效，审计日志与登录提醒里的 IP 也不可信。
-只设置了其中一个头时，请在 `.env.local` 里用 `TRUSTED_PROXY_IP_HEADER` 钉死只信任那一个。
+`proxy_set_header` 是**覆盖**语义——客户端自己带的同名头会被丢掉，应用只看到 Nginx 写入的
+`$remote_addr`；`$proxy_add_x_forwarded_for` 则会把客户端提交的链原样往后传。应用在
+`TRUSTED_PROXY_HOPS=1` 下取 XFF 最右一段，并要求 X-Real-IP（若有）与之一致。漏掉覆盖，这两个头
+就由客户端决定：要么每次请求换一个值、换出一个全新的限流桶（`auth:login:ip`、`share:view` 等
+IP 维度限流全部失效，审计日志与登录提醒里的 IP 也不可信），要么故意让两个头不一致，把请求挤进
+所有人共用的 `unknown` 桶。只转发 XFF、不带 X-Real-IP 的代理在一跳时也能正确解析。
 
-### 9.1 打开 TRUSTED_PROXY（**必做**）
+### 9.1 确认可信代理跳数（**必做**）
 
-Nginx 就位后，在 `/opt/lecturelive/.env.local` 里确认：
+部署配置在 `/opt/lecturelive/.env`（源码目录里的 `.env.local` 只在首次安装时被复制过去一次）。
+标准拓扑「公网 → 本机 Nginx → 回环 Web/WS」只有一跳：
 
 ```bash
-TRUSTED_PROXY=true
+TRUSTED_PROXY_HOPS=1
+TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
 ```
 
-不打开的后果：应用拿不到真实客户端 IP，登录/注册的 IP 维度限流会整段跳过
-（只剩「每邮箱 N 次」，拦不住「一个弱口令遍历海量邮箱」的横向密码喷洒），
-通用限流也只能退到「登录用户 / 请求路径」维度。服务端日志会打一条
-`请求带有 X-Forwarded-For / X-Real-IP 但 TRUSTED_PROXY 未开启` 提醒。
+- `install.sh`、`upgrade.sh` 与托管 CLI 都会先跑 `deploy/ensure-security-env.sh`：缺省时写入上面两行；
+  `TRUSTED_PROXY_HOPS=0` 或不在 1–8 之间时直接中止；跳数大于 1 却没有显式 `TRUSTED_PROXY_CIDRS` 时同样中止。
+- 旧的 `TRUSTED_PROXY=true`、`TRUSTED_PROXY_IP_HEADER` 与管理后台的 `trusted_proxy` 开关都已作废，
+  留在 env 或数据库里也不会改变拓扑。
+- 拓扑是启动配置，修改后必须同时重启 Web 与 WS。Nginx 前面还有 CDN/LB 时见下文「可信代理与真实客户端 IP」。
 
-前提是应用端口不对公网开放（见下方「端口暴露面」一节：3000/3001 只监听回环）。
-若你把 3000 直接暴露给公网，**不要**打开这个开关——攻击者直连并伪造该头即可逃逸限流。
+前提是应用端口不对公网开放（见下方「端口说明」：3000/3001 只监听回环）。HTTP 侧拿不到可校验的
+socket 对端，若把 3000 直接暴露给公网，攻击者直连并伪造代理头即可逃逸 IP 维度的限流。
 
 ### 10. 验证
 
@@ -284,7 +288,22 @@ cd lecture-live
 sudo bash deploy/upgrade.sh
 ```
 
-升级脚本会自动完成：备份 → 安装依赖 → 数据库迁移 → 编译 Next.js + WS → 热切换服务 → 健康检查。
+托管安装（`sudo lecture-live install` 装的）用 `sudo lecture-live update`：先 `git pull --ff-only`
+源码检出 `/opt/lecturelive/src`，再执行同一个 `deploy/upgrade.sh`。
+
+升级**全程停机**（不是热切换），按下面的顺序执行，任一步失败都保持 Web/WS 停止：
+
+1. 校验并补齐部署 env（`ensure-security-env.sh`），停止两个服务；
+2. 装上 fail-closed 启动闸（支付预检与 readiness 脚本），把现役 systemd unit 备份成
+   `backups/systemd-<时间戳>.tar.gz` 后换上新 unit；装过托管 CLI 的机器同时刷新 `/usr/local/bin/lecture-live`；
+3. 备份当前运行产物 `backups/app-<时间戳>.tar.gz`；
+4. `npm ci` → `prisma generate` → 编译 Next.js 与 WS；
+5. 准备支付对账维护运行时 `/opt/lecturelive-maintenance`，再跑数据库编排 `ensure-database --require-database`；
+6. 部署新产物并写入 `.runtime-security-version`，启动两个服务，最后做深度就绪检查。
+
+编译读的是 `/opt/lecturelive/.env`（`node --env-file`，与运行时同一份配置、同一个解析器），
+不是源码目录里的 `.env.local`。`NEXT_PUBLIC_APP_URL` / `NEXT_PUBLIC_WS_URL` 在编译期内联进前端
+与 CSP：改了它们必须重新执行升级，只重启服务不会生效。
 
 ---
 
@@ -297,15 +316,26 @@ sudo bash deploy/rollback.sh
 # 回滚到指定版本
 sudo bash deploy/rollback.sh app-20260322_143000.tar.gz
 
+# 托管安装也可以用交互入口：列出备份供选择，然后调用同一个 deploy/rollback.sh
+sudo lecture-live rollback
+
 # 查看所有备份
 ls -lh /opt/lecturelive/backups/
 ```
 
-备份自动保留最近 5 个版本。
+备份自动保留最近 5 个版本：产物 `app-<时间戳>.tar.gz` 与升级前的 systemd unit
+`systemd-<时间戳>.tar.gz` 各 5 份，同一时间戳成对使用。
 
-回滚只允许恢复带 `health-ready-v1` 运行时标记的安全版本。早于受保护深度就绪端点的
-旧备份会被拒绝并保持 Web/WS 停止，避免重新上线匿名依赖探测；此时应修复当前版本，
-或先把旧代码移植安全补丁后重新构建，不能手工伪造标记强行启动。
+回滚先停两个服务，再恢复产物（保留 `data/`、`.env`、`backups/`、`scripts/` 与托管源码 `src/`），
+启动前跑生产支付预检，启动后做深度就绪检查；任一步失败都保持 Web/WS 停止。按备份里有没有
+`health-ready-v1` 运行时标记分两种情况：
+
+- **有标记**：沿用现役 systemd unit（带 marker / 支付预检 / readiness 启动闸），就绪检查探受保护的
+  `/api/health/ready`。
+- **早于该标记**（首次升级到加固版本时生成；那次升级若中途失败，这是唯一能上线的目标）：只有同一
+  时间戳的 `systemd-<时间戳>.tar.gz` 存在时才允许——unit 会一并退回那一代（不含上述启动闸），
+  就绪检查改探该版本自己的 `/api/health`。缺少配套的 unit 备份时直接拒绝、保持停止。这只是临时
+  退路：修好问题后尽快重新执行 `upgrade.sh` 前滚，不要长期停在旧版本，也不能手工伪造标记强行启动。
 
 ---
 
@@ -409,10 +439,13 @@ NEXT_PUBLIC_APP_URL=https://your-domain.com
 NEXT_PUBLIC_WS_URL=https://your-domain.com
 ```
 
-然后重启服务：
+这两个值在编译期内联进前端 bundle 与 CSP，只重启服务不会生效，必须重新编译部署：
 
 ```bash
-sudo systemctl restart lecturelive-web lecturelive-ws
+# 托管安装
+sudo lecture-live update
+# 手工部署：在源码目录里
+sudo bash deploy/upgrade.sh
 ```
 
 ---
@@ -426,7 +459,7 @@ sudo systemctl restart lecturelive-web lecturelive-ws
 ├── public/                # 公共资源
 ├── .env                   # 环境变量（chmod 600）
 ├── data/                  # 应用数据（转录、摘要等）
-├── backups/               # 升级时自动备份（web + ws 一起）
+├── backups/               # 升级时自动备份：产物 app-*.tar.gz（web + ws 一起）+ systemd-*.tar.gz
 └── ws-server/             # WebSocket 服务器
     ├── websocket.js       # esbuild 编译的 JS（不再需要 ts-node）
     ├── package.json       # 精简依赖（只有 socket.io/prisma/ioredis 等）

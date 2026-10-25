@@ -215,7 +215,8 @@ describe('rollback.sh readiness follows the restored runtime marker', () => {
     // 最小环境，与 sudo 下的部署脚本一致：vitest.setup 往 process.env 塞了 JWT_SECRET，
     // 继承下去会压过部署 .env（--env-file 不覆盖已有变量），探针就拿错密钥派生 token。
     // Next 的类型把 NODE_ENV 声明成必填，这里刻意不给，只能双重断言。
-    const { stdout } = await execFileAsync('bash', ['-euo', 'pipefail', '-c', script], {
+    // --norc：最小环境下 Linux 的 bash 会把 socketpair stdin 当成 rshd，去 source /etc/bash.bashrc。
+    const { stdout } = await execFileAsync('bash', ['--norc', '-euo', 'pipefail', '-c', script], {
       env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv,
     });
     return stdout.trim();

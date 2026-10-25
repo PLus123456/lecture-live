@@ -101,9 +101,11 @@ function sandbox() {
 /**
  * 最小环境执行（与 sudo 下的部署脚本一致）：vitest.setup 塞进 process.env 的密钥与
  * NODE_ENV 不能漏进来。Next 的类型把 NODE_ENV 声明成必填，这里刻意不给，只能双重断言。
+ * --norc：没有 SHLVL、stdin 又是 socketpair（Linux 上 Node 的管道）时，bash 会当成被 rshd
+ * 拉起，去 source /etc/bash.bashrc，在 -u 下报 PS1 未定义（CI 上实际出现过）。
  */
 function run(command: string, env: Record<string, string>, cwd: string) {
-  const result = spawnSync('bash', ['-euo', 'pipefail', '-c', command], {
+  const result = spawnSync('bash', ['--norc', '-euo', 'pipefail', '-c', command], {
     cwd,
     env: {
       PATH: `${env.PATH_PREFIX}:${process.env.PATH}`,

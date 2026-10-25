@@ -37,6 +37,10 @@ elif ! getent group "$APP_USER" &>/dev/null; then
 fi
 info "运行用户: $(id $APP_USER)"
 
+# 先收回 root 之后要信任的几处（$APP_DIR 本身、.env、backups/，从托管检出运行时还有 src/，见
+# ensure-root-ownership.sh），放在任何可能失败的步骤与以 root 运行的 node --env-file 之前。
+bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER" "$SRC_DIR"
+
 # ── 检查编译产物 ──
 [[ -d "$SRC_DIR/.next/standalone" ]] || error "未找到 .next/standalone，请先运行 npm run build"
 [[ -d "$SRC_DIR/.next/static" ]]     || error "未找到 .next/static，请先运行 npm run build"
@@ -207,9 +211,13 @@ ln -sfn "$APP_DIR/.env" "$WS_DIR/.env"
 
 # ── 修复权限 ──
 info "设置文件权限..."
-chown -R $APP_USER:$APP_USER "$APP_DIR"
+# 运行产物、data、ws-server 交给服务用户；src/、backups/ 与 .env 不交（.env 归 root、服务只读，
+# 见 ensure-root-ownership.sh）。上面的 cp -a 会把 standalone 目录的属主与权限带到 $APP_DIR 本身上，
+# 所以交接完再收紧一次。
+find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name src ! -name backups ! -name .env \
+    -exec chown -R "$APP_USER:$APP_USER" {} +
+bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"
 chown -R $APP_USER:$APP_USER "$MAINTENANCE_DIR"
-chmod 600 "$APP_DIR/.env"
 
 # ── 安装 systemd 服务 ──
 info "安装 systemd 服务..."

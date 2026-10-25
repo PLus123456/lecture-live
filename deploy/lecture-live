@@ -71,6 +71,54 @@ require_deep_readiness() {
     fi
 }
 
+# ── 以 root 执行源码检出里的东西之前的所有权检查 ──
+# update / install / rollback 会以 root 在源码检出里跑 git、npm ci、next build 与 deploy/*.sh，所以
+# 只认只有 root 能改的检出：路径上每一级目录与要执行的整棵目录树都归 root，且没有组/其他写权限。
+# 只看脚本文件本身不够：改名/替换条目只看父目录的写权限，能写 /opt/lecturelive 就能把整个 src 换掉；
+# git 也会执行 .git 里的 hooks 与配置。带粘滞位的上级目录（如 /tmp）例外：别人改不了不归自己的条目。
+# 归属写成「root 或当前用户」：CLI 总以 root 运行，二者是一回事（sshd StrictModes 也是这个口径），
+# 契约测试则靠它以普通用户运行。
+#
+# 打印 $1（解析过软链的绝对路径，最后一级可以尚不存在）以上每一级目录与 $1 整棵子树里第一个
+# 不满足要求的条目；全部满足时什么都不打印。
+first_writable_by_others() {
+    local path="$1" dir="$1" hit
+    # 查的必须就是随后要用的：不接受相对路径或软链
+    if [[ "$path" != /* || -L "$path" ]]; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+    while [[ "$dir" != / ]]; do
+        dir="$(dirname "$dir")"
+        hit="$(find "$dir" -maxdepth 0 \( ! \( -uid 0 -o -uid "$EUID" \) \
+            -o \( -perm -020 -o -perm -002 \) ! -perm -1000 \) -print)" || hit="$dir"
+        if [[ -n "$hit" ]]; then
+            printf '%s\n' "$hit"
+            return 0
+        fi
+    done
+    [[ -e "$path" ]] || return 0
+    # 软链自身的权限位恒为 777，不算数；它归谁照样要查
+    hit="$(find "$path" \( ! \( -uid 0 -o -uid "$EUID" \) \
+        -o ! -type l \( -perm -020 -o -perm -002 \) \) -print -quit)" || hit="$path"
+    if [[ -n "$hit" ]]; then
+        printf '%s\n' "$hit"
+    fi
+}
+
+# 以 root 执行 $1（解析过软链的路径）里的东西之前调用，$2 说明要拿它做什么。
+# 不满足 first_writable_by_others 的要求就报出第一个问题条目并退出，什么都不改。
+require_root_only() {
+    local hit
+    hit="$(first_writable_by_others "$1")"
+    [[ -n "$hit" ]] || return 0
+    error "$2，但 $1 不是只有 root 能改："
+    echo "      $(ls -ld "$hit" 2>/dev/null || printf '%s' "$hit")"
+    warn "已拒绝，未做任何改动。早于此版本的 setup/install/upgrade/rollback 会把整个 $APP_DIR（含 src、backups、.env）"
+    warn "交给服务用户：确认没被改过后按 deploy/INSTALL.md「源码检出与备份的所有权」收回，拿不准就重新克隆。"
+    exit 1
+}
+
 # ── 分隔线 ──
 divider() {
     echo -e "${DIM}────────────────────────────────────────${NC}"
@@ -284,18 +332,18 @@ cmd_log() {
 cmd_update() {
     need_root update
 
-    # 检测源码目录
+    # 检测源码目录：托管检出 $SRC_DIR，其次 root 自己的 /root/lecture-live。找到的检出会以 root 跑
+    # git pull 与其中的 deploy/upgrade.sh（npm ci、next build……），所以刻意不去 /home/*/lecture-live
+    # 里找：任何本地用户都能在家目录建 lecture-live/.git + deploy/upgrade.sh，按字母序还可能排在管理员
+    # 前面。源码放在家目录里的手工部署照 deploy/INSTALL.md 在源码目录执行 sudo bash deploy/upgrade.sh。
     local src="$SRC_DIR"
-    if [[ ! -d "$src/.git" ]]; then
-        # 尝试常见位置
-        for try_dir in /root/lecture-live /home/*/lecture-live; do
-            if [[ -d "$try_dir/.git" ]]; then
-                src="$try_dir"
-                break
-            fi
-        done
+    if [[ ! -d "$src/.git" && -d /root/lecture-live/.git ]]; then
+        src=/root/lecture-live
     fi
-    [[ -d "$src/.git" ]] || fatal "未找到源码目录，请先使用 lecture-live install 安装"
+    [[ -d "$src/.git" ]] || fatal "未找到源码目录，请先使用 lecture-live install 安装（手工部署请在源码目录执行: sudo bash deploy/upgrade.sh）"
+    # 之后一律用解析软链后的真实路径：查过的就是要执行的
+    src="$(readlink -f "$src")"
+    require_root_only "$src" "update 要以 root 在 $src 里执行 git pull 与 deploy/upgrade.sh"
 
     echo ""
     echo -e "${BOLD}  LectureLive 更新${NC}"
@@ -323,11 +371,17 @@ cmd_install() {
     done
     info "依赖检查通过"
 
-    # 克隆源码
+    # 克隆源码。检出随后要以 root 编译、执行（npm ci、next build、deploy/*.sh），所以它与路径上每一级
+    # 目录都必须只有 root 能改；之后一律用解析软链后的真实路径，查过的就是要执行的。
+    mkdir -p "$APP_DIR"
     if [[ ! -d "$SRC_DIR" ]]; then
+        SRC_DIR="$(readlink -f "$APP_DIR")/src"
+        require_root_only "$SRC_DIR" "install 要把源码克隆到 $SRC_DIR 并以 root 编译、执行"
         step "克隆仓库..."
         git clone "$REPO_URL" "$SRC_DIR"
     else
+        SRC_DIR="$(readlink -f "$SRC_DIR")"
+        require_root_only "$SRC_DIR" "install 要以 root 在 $SRC_DIR 里编译并执行部署脚本"
         step "源码目录已存在，拉取更新..."
         (cd "$SRC_DIR" && git pull --ff-only)
     fi
@@ -348,6 +402,9 @@ cmd_install() {
         fi
     fi
     [[ -f "$APP_DIR/.env" ]] || fatal "未找到可用的环境配置模板"
+    # 下面以 root 用 node --env-file 读它编译，而 node 会应用其中的 NODE_OPTIONS 等运行时选项：
+    # 它也必须只有 root 能改（新装时刚从模板复制，归 root；重装时由 install/upgrade 收归 root）。
+    require_root_only "$(readlink -f "$APP_DIR")/.env" "install 要以 root 用 node --env-file 读 $APP_DIR/.env"
 
     # 必须在首次复制模板后、任何提前 return 之前生成引导密钥并收紧权限。
     # 后续 deploy/install.sh 会幂等复核；这里保证等待管理员编辑期间也没有 0644 秘密文件。
@@ -427,15 +484,15 @@ cmd_uninstall() {
     echo ""
 }
 
-# deploy/rollback.sh 所在位置：先认本脚本自己所在的源码检出（从源码目录直接运行时），
-# 再找托管安装的 $SRC_DIR 与 /root/lecture-live。找到的脚本会以 root 执行，所以刻意不像
-# cmd_update 那样去 /home/*/lecture-live 里找：任何本地用户都能在自己家目录下放一个
-# lecture-live/deploy/rollback.sh。源码放在家目录里的手工部署直接运行该检出里的 rollback.sh。
+# 托管安装的 deploy/rollback.sh：$SRC_DIR，其次 /root/lecture-live；打印解析软链后的真实路径。
+# 找到的脚本会以 root 执行，所以刻意不去 /home/*/lecture-live 里找（任何本地用户都能在自己家目录下
+# 放一个 lecture-live/deploy/rollback.sh），调用方还要用 require_root_only 确认它所在的 deploy/
+# 只有 root 能改。源码放在家目录里的手工部署直接运行该检出里的 rollback.sh。
 find_rollback_script() {
     local dir
-    for dir in "$(dirname "$(dirname "$(readlink -f "$0")")")" "$SRC_DIR" /root/lecture-live; do
+    for dir in "$SRC_DIR" /root/lecture-live; do
         if [[ -f "$dir/deploy/rollback.sh" ]]; then
-            printf '%s\n' "$dir/deploy/rollback.sh"
+            readlink -f "$dir/deploy/rollback.sh"
             return 0
         fi
     done
@@ -454,9 +511,19 @@ cmd_rollback() {
     # 运行时的 marker 选 readiness 探测。这里只负责选备份再交给它，不另写兜底：旧写法调用
     # 一个从未存在过的 rollback-wrapper.sh，于是每次都落到一段内联脚本上，而那段脚本一律
     # 拒绝旧备份、也不退回 unit，早已和 rollback.sh 分叉。
-    local rollback_script
-    rollback_script="$(find_rollback_script)" \
-        || fatal "未找到 deploy/rollback.sh（托管安装应位于 $SRC_DIR/deploy/）；未做任何改动。手工部署请在源码目录执行: sudo bash deploy/rollback.sh"
+    #
+    # 从源码检出直接运行本脚本（sudo bash deploy/lecture-live rollback）时用同一个 deploy/ 里的
+    # rollback.sh：以 root 跑的本来就是这个检出里的代码，不另查。否则用托管检出里的那份，它所在的
+    # deploy/ 连同路径上每一级目录都必须只有 root 能改。
+    local rollback_script here
+    here="$(dirname "$(readlink -f "$0")")"
+    if [[ "$(basename "$here")" == deploy && -f "$here/rollback.sh" ]]; then
+        rollback_script="$here/rollback.sh"
+    else
+        rollback_script="$(find_rollback_script)" \
+            || fatal "未找到 deploy/rollback.sh（托管安装应位于 $SRC_DIR/deploy/）；未做任何改动。手工部署请在源码目录执行: sudo bash deploy/rollback.sh"
+        require_root_only "$(dirname "$rollback_script")" "rollback 要以 root 执行 $rollback_script"
+    fi
 
     # 列出可用备份
     if [[ ! -d "$BACKUP_DIR" ]] || ! ls "$BACKUP_DIR"/app-*.tar.gz &>/dev/null; then
@@ -543,11 +610,13 @@ _install_self() {
     local target="/usr/local/bin/lecture-live"
     local script_src
 
-    # 优先从源码 deploy 目录复制
+    # 优先从源码 deploy 目录复制（install 传入已查过的 $SRC_DIR，self-install 传入本脚本所在的检出）
     if [[ -n "$src_dir" && -f "$src_dir/deploy/lecture-live" ]]; then
         script_src="$src_dir/deploy/lecture-live"
     elif [[ -f "$APP_DIR/src/deploy/lecture-live" ]]; then
-        script_src="$APP_DIR/src/deploy/lecture-live"
+        # 装进去的这份此后每次都以 root 运行：托管检出里的也得只有 root 能改
+        script_src="$(readlink -f "$APP_DIR/src/deploy/lecture-live")"
+        require_root_only "$(dirname "$script_src")" "要把 $script_src 装成以 root 运行的管理命令"
     else
         # 如果找不到源文件，就复制自身
         script_src="$(readlink -f "$0")"

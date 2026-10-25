@@ -7,6 +7,7 @@
 # ============================================================
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="/opt/lecturelive"
 WS_DIR="/opt/lecturelive/ws-server"
 BACKUP_DIR="/opt/lecturelive/backups"
@@ -74,8 +75,11 @@ find "$APP_DIR" -mindepth 1 -maxdepth 1 \
 # 保留下来的源码检出上，混成「半新半旧」的工作区。data/.env/backups 同理只认顶层路径。
 tar xzf "$BACKUP_FILE" -C "$APP_DIR" --anchored \
     --exclude=./src --exclude=./data --exclude=./.env --exclude=./backups
-chown -R $APP_USER:$APP_USER "$APP_DIR"
-chmod 600 "$APP_DIR/.env"
+# 恢复出的运行产物交给服务用户；src/、backups/ 与 .env 不交，$APP_DIR 本身归 root
+# （.env 归 root、服务只读，见 ensure-root-ownership.sh）
+find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name src ! -name backups ! -name .env \
+    -exec chown -R "$APP_USER:$APP_USER" {} +
+bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"
 
 RUNTIME_SECURITY_MARKER="$APP_DIR/.runtime-security-version"
 # 被恢复的运行时是否早于 health-ready-v1；决定下面的 readiness 探哪条路由。

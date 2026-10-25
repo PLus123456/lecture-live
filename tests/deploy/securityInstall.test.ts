@@ -70,7 +70,7 @@ afterEach(() => {
 });
 
 describe('deployment security environment initialization', () => {
-  it('generates a non-logged bootstrap token, applies one-hop defaults and chmod 600 idempotently', () => {
+  it('generates a non-logged bootstrap token, applies one-hop defaults and chmod 640 idempotently', () => {
     const envPath = makeEnv(
       'SETUP_BOOTSTRAP_TOKEN=\nTRUSTED_PROXY_HOPS=\nTRUSTED_PROXY_CIDRS=\n'
     );
@@ -81,7 +81,7 @@ describe('deployment security environment initialization', () => {
     expect(firstValues.SETUP_BOOTSTRAP_TOKEN).toMatch(/^[a-f0-9]{64}$/);
     expect(firstValues.TRUSTED_PROXY_HOPS).toBe('1');
     expect(firstValues.TRUSTED_PROXY_CIDRS).toBe('127.0.0.1/32,::1/128');
-    expect(statSync(envPath).mode & 0o777).toBe(0o600);
+    expect(statSync(envPath).mode & 0o777).toBe(0o640);
     expect(`${first.stdout}${first.stderr}`).not.toContain(
       firstValues.SETUP_BOOTSTRAP_TOKEN
     );
@@ -106,7 +106,7 @@ describe('deployment security environment initialization', () => {
     const result = runSecurityEnv(envPath);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('TRUSTED_PROXY_CIDRS');
-    expect(statSync(envPath).mode & 0o777).toBe(0o600);
+    expect(statSync(envPath).mode & 0o777).toBe(0o640);
   });
 
 });

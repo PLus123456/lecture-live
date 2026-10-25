@@ -358,6 +358,22 @@ describe('deploy/lecture-live rollback 委托 deploy/rollback.sh', () => {
     expect(existsSync(env.record)).toBe(false);
   }, 30_000);
 
+  it('备份目录里有软链时拒绝：root 名下的软链照样能指到服务用户可写的归档', () => {
+    const env = layout();
+    const srcDir = path.join(env.dir, 'opt/lecturelive/src');
+    addRollbackScript(srcDir, env.record);
+    const planted = path.join(env.dir, 'data/evil.tar.gz');
+    write(planted, 'evil');
+
+    const result = runCmdRollback({ ...env, srcDir }, '1\n', () =>
+      symlinkSync(planted, path.join(env.backups, 'app-20261021_100000.tar.gz'))
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('不能有软链');
+    expect(result.stdout).not.toContain('可用备份');
+    expect(existsSync(env.record)).toBe(false);
+  }, 30_000);
+
   it('托管检出所在的 $APP_DIR 可被他人写入时同样拒绝：能把整个 src 换掉', () => {
     const env = layout();
     const srcDir = path.join(env.dir, 'opt/lecturelive/src');

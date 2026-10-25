@@ -529,9 +529,13 @@ cmd_rollback() {
     if [[ ! -d "$BACKUP_DIR" ]] || ! ls "$BACKUP_DIR"/app-*.tar.gz &>/dev/null; then
         fatal "没有可用的备份文件"
     fi
-    # 备份会以 root 解包（systemd-*.tar.gz 更是解进 /etc/systemd/system）：选之前先确认只有 root 能改。
-    # rollback.sh 自己还会再核对一次。
-    require_root_only "$(readlink -f "$BACKUP_DIR")" "rollback 要以 root 解包 $BACKUP_DIR 里的备份"
+    # 备份会以 root 解包（systemd-*.tar.gz 更是解进 /etc/systemd/system）：选之前先确认只有 root 能改，
+    # 而且里面只有普通文件——root 名下的软链照样能指到服务用户放在别处的归档。rollback.sh 自己还会再核对一次。
+    local backup_dir odd
+    backup_dir="$(readlink -f "$BACKUP_DIR")"
+    require_root_only "$backup_dir" "rollback 要以 root 解包 $BACKUP_DIR 里的备份"
+    odd="$(find "$backup_dir" -mindepth 1 \( ! -type f -o -links +1 \) -print -quit)"
+    [[ -z "$odd" ]] || fatal "$BACKUP_DIR 里只应有 root 打的备份文件，不能有软链、子目录或多重硬链接: $odd；未做任何改动"
 
     echo "  可用备份:"
     echo ""

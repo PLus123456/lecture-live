@@ -48,11 +48,13 @@ if [[ -f "$APP_DIR/.env" && -n "$(find "$APP_DIR/.env" -maxdepth 0 -links +1)" ]
 fi
 
 if [[ -d "$APP_DIR/backups" ]]; then
-    # 软链自身的权限位恒为 777，不算数；它归谁照样要查
-    BAD="$(find "$APP_DIR/backups" \( ! \( -uid 0 -o -uid "$EUID" \) \
-        -o ! -type l \( -perm -020 -o -perm -002 \) \) -print -quit)"
+    # 里面只该有 root 自己打的普通文件。软链、子目录、多重硬链接一律不认：旧布局下服务用户能在这里放
+    # 指向别处的软链，chown -R 收回时只会改软链自身的属主，rollback.sh 却会跟着它去解包别处的文件。
+    BAD="$(find "$APP_DIR/backups" \( ! \( -uid 0 -o -uid "$EUID" \) -o -perm -020 -o -perm -002 \) \
+        -print -quit)"
+    [[ -n "$BAD" ]] || BAD="$(find "$APP_DIR/backups" -mindepth 1 \( ! -type f -o -links +1 \) -print -quit)"
     if [[ -n "$BAD" ]]; then
-        echo "[ERROR] $APP_DIR/backups 里有 root 以外的人能改的条目：$(ls -ld "$BAD")" >&2
+        echo "[ERROR] $APP_DIR/backups 里有不可信的条目（root 以外的人能改，或是软链/子目录/硬链接）：$(ls -ld "$BAD")" >&2
         echo "[ERROR] 这些备份会以 root 解包。旧版脚本把 backups/ 交给了服务用户，chown 并不能证明里面的归档" >&2
         echo "[ERROR] 没被改过：确认可信后按 deploy/INSTALL.md「源码检出与备份的所有权」收回，或把旧备份挪走，再重试。" >&2
         exit 1

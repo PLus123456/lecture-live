@@ -30,14 +30,15 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 # 的人能改的条目就拒绝；$APP_DIR 本身同时收紧，回滚期间没人能把 backups/ 整个换掉。
 bash "$SCRIPT_DIR/ensure-root-ownership.sh" "$APP_DIR" "$APP_USER"
 
-# 找备份文件
+# 找备份文件。只认 $BACKUP_DIR 里的文件名：带路径的参数能指到 backups/ 之外，绕过上面的核对。
 if [[ -n "${1:-}" ]]; then
+    [[ "$1" != */* ]] || error "只接受 $BACKUP_DIR 下的备份文件名: $1"
     BACKUP_FILE="$BACKUP_DIR/$1"
 else
     BACKUP_FILE=$(ls -t "$BACKUP_DIR"/app-*.tar.gz 2>/dev/null | head -1)
 fi
 
-[[ -n "$BACKUP_FILE" && -f "$BACKUP_FILE" ]] || error "未找到备份文件。可用备份: $(ls "$BACKUP_DIR"/app-*.tar.gz 2>/dev/null || echo '无')"
+[[ -n "$BACKUP_FILE" && -f "$BACKUP_FILE" && ! -L "$BACKUP_FILE" ]] || error "未找到备份文件。可用备份: $(ls "$BACKUP_DIR"/app-*.tar.gz 2>/dev/null || echo '无')"
 
 info "回滚到: $(basename "$BACKUP_FILE")"
 
@@ -97,7 +98,7 @@ if [[ ! -f "$RUNTIME_SECURITY_MARKER" ]] || \
     # 旧产物一概过不去，会卡成起不来又回不去。
     # 但只要能把 systemd unit 一并退回同一代，旧 unit + 旧产物本身是自洽的一代，
     # 升级失败时必须留这条退路，否则首次升级中途失败就没有任何可上线的目标。
-    if [[ -f "$UNIT_BACKUP" ]]; then
+    if [[ -f "$UNIT_BACKUP" && ! -L "$UNIT_BACKUP" ]]; then
         info "备份早于 readiness 路由，同代回退 systemd unit: $(basename "$UNIT_BACKUP")"
         # 只取 upgrade.sh 打进去的这两个 unit：别的成员一概不解进 /etc/systemd/system
         tar xzf "$UNIT_BACKUP" -C /etc/systemd/system lecturelive-web.service lecturelive-ws.service

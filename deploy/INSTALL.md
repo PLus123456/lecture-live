@@ -490,8 +490,9 @@ sudo bash deploy/upgrade.sh
 - `.env` 归 `root:lecturelive`、`0640`：服务只读；
 - `backups/` 与托管源码检出 `src/` 归 root；其余（`data/`、`ws-server/`、运行产物）照旧归 `lecturelive`。
 
-`.env` 与 `backups/` 必须是真实的文件/目录：是软链（或 `.env` 有别的硬链接）时脚本会拒绝并停下，
-免得以 root 照着它去读、去解包别处的文件。备份要放在别的盘上，请用 bind mount 挂到 `/opt/lecturelive/backups`。
+`.env` 与 `backups/` 必须是真实的文件/目录，`backups/` 里也只能有普通文件：遇到软链、子目录或多重硬链接，
+脚本会拒绝并停下，免得以 root 照着它们去读、去解包别处的文件（root 名下的软链照样能指到服务用户可写的归档）。
+备份要放在别的盘上，请用 bind mount 挂到 `/opt/lecturelive/backups`。
 
 `setup.sh`、`install.sh`、`upgrade.sh`、`rollback.sh` 每次运行都会先经过 `deploy/ensure-root-ownership.sh`：
 收紧 `/opt/lecturelive` 本身，把 `.env` 换成一份归 root 的新文件（内容照搬），并核对 `backups/`——里面有

@@ -660,6 +660,34 @@ describe('deploy/ensure-root-ownership.sh', () => {
     expect(statSync(env).ino).toBe(envInode);
   });
 
+  it.each([
+    [
+      '软链',
+      (backups: string, root: string) => {
+        // root 名下也不行：旧布局下服务用户放的软链，chown -R 收回时只会改软链自身的属主
+        write(path.join(root, 'elsewhere/evil.tar.gz'));
+        symlinkSync(path.join(root, 'elsewhere/evil.tar.gz'), path.join(backups, 'app-20261021_100000.tar.gz'));
+      },
+    ],
+    ['子目录', (backups: string) => mkdirSync(path.join(backups, 'nested'))],
+    [
+      '多重硬链接',
+      (backups: string, root: string) => {
+        mkdirSync(path.join(root, 'elsewhere'));
+        linkSync(path.join(backups, 'app-20261020_100000.tar.gz'), path.join(root, 'elsewhere/app.tar.gz'));
+      },
+    ],
+  ])('backups/ 里有%s时拒绝：只认 root 自己打的普通文件', (_label, plant) => {
+    const root = sandbox();
+    const appDir = deployment(root);
+    plant(path.join(appDir, 'backups'), root);
+
+    const { result, chowns } = run(root, [appDir, USER]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('软链/子目录/硬链接');
+    expect(chowns).toEqual([`root:${USER} ${appDir}`]);
+  });
+
   it.skipIf(IS_ROOT)('backups/ 里的归档归别人所有同样拒绝（把「当前用户」换成无关的 uid 来模拟）', () => {
     const root = sandbox();
     const appDir = deployment(root);
@@ -862,6 +890,39 @@ describe('setup/install/upgrade/rollback 不再把整个 $APP_DIR 交给服务�
     expect(setup.indexOf(PROTECT)).toBeGreaterThan(
       setup.indexOf('mkdir -p "$APP_DIR" "$WS_DIR" "$APP_DIR/data" "$APP_DIR/backups"')
     );
+  });
+
+  it('rollback.sh：只认 $BACKUP_DIR 里的文件名，带路径的参数与软链都拒绝', () => {
+    const rollbackLines = read('deploy/rollback.sh').split('\n');
+    const start = rollbackLines.findIndex((text) => text.startsWith('# 找备份文件'));
+    const end = rollbackLines.findIndex((text) =>
+      text.startsWith('[[ -n "$BACKUP_FILE" && -f "$BACKUP_FILE"')
+    );
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const block = rollbackLines.slice(start, end + 1).join('\n');
+
+    const root = sandbox();
+    const backups = path.join(root, 'backups');
+    write(path.join(backups, 'app-1.tar.gz'));
+    write(path.join(root, 'data/evil.tar.gz'));
+    symlinkSync(path.join(root, 'data/evil.tar.gz'), path.join(backups, 'app-2.tar.gz'));
+    const pick = (name: string) =>
+      bash(
+        [
+          'error() { echo "$*" >&2; exit 1; }',
+          `BACKUP_DIR='${backups}'`,
+          block,
+          'printf "%s\\n" "$BACKUP_FILE"',
+        ].join('\n'),
+        ['rollback.sh', name]
+      );
+
+    const ok = pick('app-1.tar.gz');
+    expect(ok.stderr).toBe('');
+    expect(ok.stdout.trim()).toBe(path.join(backups, 'app-1.tar.gz'));
+    expect(pick('../data/evil.tar.gz').status).not.toBe(0);
+    expect(pick('app-2.tar.gz').status).not.toBe(0);
   });
 
   it('rollback.sh：unit 备份只解出 upgrade.sh 打进去的那两个 unit，夹带的别的成员不落地', () => {

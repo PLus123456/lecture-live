@@ -2,7 +2,8 @@
 # ============================================================
 # LectureLive 升级脚本
 # 在服务器上的源码目录中执行: sudo bash deploy/upgrade.sh
-# 会自动: 备份 → 安装依赖 → 数据库迁移 → 编译 → 热切换服务 → 健康检查
+# 会自动: 停服 → 装启动闸与新 unit（先备份现役 unit）→ 备份产物 → 安装依赖 → 编译
+#        → 数据库迁移 → 部署产物 → 启动 → 深度就绪检查。全程停机，任一步失败都保持停服。
 # ============================================================
 set -euo pipefail
 
@@ -85,6 +86,14 @@ install -m 0644 "$SCRIPT_DIR/lecturelive-ws.service" /etc/systemd/system/
 systemctl daemon-reload
 install -m 0755 "$SCRIPT_DIR/payment-reconciliation-maintenance.sh" \
     /usr/local/bin/lecturelive-payment-maintenance
+# 装过托管 CLI 的机器顺带刷新它：除此之外没有任何步骤更新 /usr/local/bin/lecture-live，
+# 回滚入口等修复就到不了存量安装。放在这里是为了让本次升级中途失败时，运维手里已经是
+# 新版 CLI。先写临时文件再 rename：正在执行 `lecture-live update` 的那份仍是旧 inode，
+# 不会被原地改写。
+if [[ -f /usr/local/bin/lecture-live ]]; then
+    install -m 0755 "$SCRIPT_DIR/lecture-live" /usr/local/bin/lecture-live.new
+    mv -f /usr/local/bin/lecture-live.new /usr/local/bin/lecture-live
+fi
 
 echo "========================================"
 echo "  LectureLive 升级 — $TIMESTAMP"
@@ -123,7 +132,15 @@ npm ci
 # Build the new security boundary before the DB preflight. If the one-time history gate stops
 # this upgrade, operators must review through this staged build, never the old live server.
 node --env-file="$APP_DIR/.env" scripts/run-prisma.mjs generate
-npm run build
+# next build 必须读部署 env，且与运行时读同一份、同一个解析器（node --env-file $APP_DIR/.env）：
+# serverSecrets.ts 在收集页面数据时 import 即校验 JWT_SECRET / ENCRYPTION_KEY，缺了直接 FATAL；
+# NEXT_PUBLIC_APP_URL / NEXT_PUBLIC_WS_URL 在构建期内联进浏览器 bundle 与 CSP，缺了直播就连
+# 观众自己的 localhost:3001。托管安装的源码目录（$APP_DIR/src）里没有 .env.local，裸跑
+# npm run build 必挂；手工部署源码目录里的 .env.local 则可能早已和运行时配置分叉。
+# 直接调 next 而不走 npm：--env-file 不能放进 NODE_OPTIONS，node --run 也不把它带给脚本；
+# prebuild（prisma generate）上一行已带 env 跑过。NODE_ENV 钉成 production：.env.example
+# 里是 development，而 --env-file 不覆盖已存在的变量。
+NODE_ENV=production node --env-file="$APP_DIR/.env" node_modules/.bin/next build
 [[ -d "$SRC_DIR/.next/standalone" ]] || error "编译失败，未生成 standalone 产物"
 npm run build:ws
 [[ -f "$SRC_DIR/dist/websocket.js" ]] || error "WebSocket 编译失败"

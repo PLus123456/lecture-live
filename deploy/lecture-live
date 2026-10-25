@@ -7,7 +7,6 @@ set -euo pipefail
 
 VERSION="1.0.0"
 APP_DIR="/opt/lecturelive"
-WS_DIR="/opt/lecturelive/ws-server"
 SRC_DIR="/opt/lecturelive/src"
 BACKUP_DIR="/opt/lecturelive/backups"
 REPO_URL="https://github.com/PLus123456/lecture-live.git"
@@ -364,7 +363,11 @@ cmd_install() {
 
     # 编译 + 部署
     step "编译项目..."
-    (cd "$SRC_DIR" && npm run build && npm run build:ws)
+    # next build 读运行时同一份 $APP_DIR/.env，口径与 deploy/upgrade.sh 相同（原因见那里的注释）
+    (cd "$SRC_DIR" \
+        && node --env-file="$APP_DIR/.env" scripts/run-prisma.mjs generate \
+        && NODE_ENV=production node --env-file="$APP_DIR/.env" node_modules/.bin/next build \
+        && npm run build:ws)
 
     step "部署服务..."
     bash "$SRC_DIR/deploy/install.sh"
@@ -424,12 +427,36 @@ cmd_uninstall() {
     echo ""
 }
 
+# deploy/rollback.sh 所在位置：先认本脚本自己所在的源码检出（从源码目录直接运行时），
+# 再找托管安装的 $SRC_DIR 与 /root/lecture-live。找到的脚本会以 root 执行，所以刻意不像
+# cmd_update 那样去 /home/*/lecture-live 里找：任何本地用户都能在自己家目录下放一个
+# lecture-live/deploy/rollback.sh。源码放在家目录里的手工部署直接运行该检出里的 rollback.sh。
+find_rollback_script() {
+    local dir
+    for dir in "$(dirname "$(dirname "$(readlink -f "$0")")")" "$SRC_DIR" /root/lecture-live; do
+        if [[ -f "$dir/deploy/rollback.sh" ]]; then
+            printf '%s\n' "$dir/deploy/rollback.sh"
+            return 0
+        fi
+    done
+    return 1
+}
+
 cmd_rollback() {
     need_root rollback
 
     echo ""
     echo -e "${BOLD}  LectureLive 回滚${NC}"
     divider
+
+    # 回滚逻辑只维护一份：deploy/rollback.sh。它按同一时间戳成对退回 systemd unit 与产物
+    # （早于 health-ready-v1 的备份只有靠这一点才有退路）、启动前跑支付预检、按被恢复
+    # 运行时的 marker 选 readiness 探测。这里只负责选备份再交给它，不另写兜底：旧写法调用
+    # 一个从未存在过的 rollback-wrapper.sh，于是每次都落到一段内联脚本上，而那段脚本一律
+    # 拒绝旧备份、也不退回 unit，早已和 rollback.sh 分叉。
+    local rollback_script
+    rollback_script="$(find_rollback_script)" \
+        || fatal "未找到 deploy/rollback.sh（托管安装应位于 $SRC_DIR/deploy/）；未做任何改动。手工部署请在源码目录执行: sudo bash deploy/rollback.sh"
 
     # 列出可用备份
     if [[ ! -d "$BACKUP_DIR" ]] || ! ls "$BACKUP_DIR"/app-*.tar.gz &>/dev/null; then
@@ -462,85 +489,8 @@ cmd_rollback() {
 
     local selected="${backups[$((choice-1))]}"
     echo ""
-    bash "$(dirname "$(readlink -f "$0")")/rollback-wrapper.sh" "$selected" 2>/dev/null \
-        || bash -c "
-            set -euo pipefail
-            echo -e '${CYAN}[→]${NC} 停止服务...'
-            systemctl stop $WEB_SERVICE 2>/dev/null || true
-            systemctl stop $WS_SERVICE 2>/dev/null || true
-            if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
-                echo -e '${RED}[✗]${NC} 无法确认旧服务已停止，拒绝覆盖运行中的回滚目标'
-                exit 1
-            fi
-            echo -e '${CYAN}[→]${NC} 恢复备份...'
-            # 与 deploy/rollback.sh 同口径：保留 src（托管安装的源码检出），解包时按锚定路径跳过旧备份里的 ./src
-            find $APP_DIR -mindepth 1 -maxdepth 1 \
-                ! -name data ! -name .env ! -name backups ! -name scripts ! -name src \
-                -exec rm -rf {} +
-            tar xzf '$selected' -C $APP_DIR --anchored \
-                --exclude=./src --exclude=./data --exclude=./.env --exclude=./backups
-            chown -R lecturelive:lecturelive $APP_DIR
-            chmod 600 $APP_DIR/.env
-            [[ -f $APP_DIR/.runtime-security-version ]] && \
-                grep -Fxq health-ready-v1 $APP_DIR/.runtime-security-version || {
-                echo -e '${RED}[✗]${NC} 该备份早于受保护 readiness 路由，服务保持停止'
-                exit 1
-            }
-            [[ -d $WS_DIR ]] && ln -sfn $APP_DIR/data $WS_DIR/data && ln -sfn $APP_DIR/.env $WS_DIR/.env
-            [[ -f $APP_DIR/scripts/check-production-payment-config.mjs ]] || {
-                echo -e '${RED}[✗]${NC} 缺少生产支付启动检查脚本，回滚版本保持停止'
-                exit 1
-            }
-            runuser -u lecturelive -- /usr/bin/node --env-file=$APP_DIR/.env \
-                $APP_DIR/scripts/check-production-payment-config.mjs || {
-                echo -e '${RED}[✗]${NC} 生产支付配置未通过安全检查，回滚版本保持停止'
-                exit 1
-            }
-            echo -e '${CYAN}[→]${NC} 启动服务...'
-            systemctl start $WEB_SERVICE $WS_SERVICE || {
-                systemctl stop $WEB_SERVICE 2>/dev/null || true
-                systemctl stop $WS_SERVICE 2>/dev/null || true
-                if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
-                    echo -e '${RED}[✗]${NC} 回滚版本启动失败且无法确认服务已停止'
-                    exit 1
-                fi
-                echo -e '${RED}[✗]${NC} 回滚版本启动失败，服务已保持停止'
-                exit 1
-            }
-            sleep 2
-            if ! systemctl is-active --quiet $WEB_SERVICE || ! systemctl is-active --quiet $WS_SERVICE; then
-                systemctl stop $WEB_SERVICE 2>/dev/null || true
-                systemctl stop $WS_SERVICE 2>/dev/null || true
-                if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
-                    echo -e '${RED}[✗]${NC} 回滚版本未全部进入 active 且无法确认服务已停止'
-                    exit 1
-                fi
-                echo -e '${RED}[✗]${NC} 回滚版本未全部进入 active，服务已保持停止'
-                exit 1
-            fi
-            runuser -u lecturelive -- /usr/bin/node --env-file=$APP_DIR/.env \
-                $APP_DIR/scripts/check-readiness.mjs --wait || {
-                systemctl stop $WEB_SERVICE 2>/dev/null || true
-                systemctl stop $WS_SERVICE 2>/dev/null || true
-                if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
-                    echo -e '${RED}[✗]${NC} readiness 失败且无法确认服务已停止'
-                    exit 1
-                fi
-                echo -e '${RED}[✗]${NC} readiness 失败，服务已保持停止'
-                exit 1
-            }
-            if ! systemctl is-active --quiet $WEB_SERVICE || ! systemctl is-active --quiet $WS_SERVICE; then
-                systemctl stop $WEB_SERVICE 2>/dev/null || true
-                systemctl stop $WS_SERVICE 2>/dev/null || true
-                if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE; then
-                    echo -e '${RED}[✗]${NC} readiness 后服务状态变化，且无法确认全部停止'
-                    exit 1
-                fi
-                echo -e '${RED}[✗]${NC} readiness 后服务未全部 active，服务已保持停止'
-                exit 1
-            fi
-            echo -e '${GREEN}[✓]${NC} 回滚完成'
-        "
+    # rollback.sh 只接受 $BACKUP_DIR 下的文件名；确认、停服与失败隔离都由它负责
+    bash "$rollback_script" "$(basename "$selected")"
 }
 
 cmd_env() {

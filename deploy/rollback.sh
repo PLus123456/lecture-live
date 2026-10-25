@@ -11,6 +11,8 @@ APP_DIR="/opt/lecturelive"
 WS_DIR="/opt/lecturelive/ws-server"
 BACKUP_DIR="/opt/lecturelive/backups"
 APP_USER="lecturelive"
+# 早于 health-ready-v1 的运行时只有这条匿名深检（Web unit 固定监听回环 3000）
+LEGACY_HEALTH_URL="http://127.0.0.1:3000/api/health"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -76,6 +78,8 @@ chown -R $APP_USER:$APP_USER "$APP_DIR"
 chmod 600 "$APP_DIR/.env"
 
 RUNTIME_SECURITY_MARKER="$APP_DIR/.runtime-security-version"
+# 被恢复的运行时是否早于 health-ready-v1；决定下面的 readiness 探哪条路由。
+LEGACY_RUNTIME=false
 if [[ ! -f "$RUNTIME_SECURITY_MARKER" ]] || \
    ! grep -Fxq 'health-ready-v1' "$RUNTIME_SECURITY_MARKER"; then
     # 该备份早于受保护 readiness 路由。禁止的是「旧产物 + 新 unit」这个组合——
@@ -87,6 +91,7 @@ if [[ ! -f "$RUNTIME_SECURITY_MARKER" ]] || \
         info "备份早于 readiness 路由，同代回退 systemd unit: $(basename "$UNIT_BACKUP")"
         tar xzf "$UNIT_BACKUP" -C /etc/systemd/system
         systemctl daemon-reload
+        LEGACY_RUNTIME=true
         warn "已退回旧版 systemd unit：本次上线不含 readiness/支付预检启动闸，"
         warn "请尽快重新执行 upgrade.sh 前滚，不要长期停留在此状态。"
     else
@@ -117,13 +122,25 @@ if ! systemctl start lecturelive-web lecturelive-ws; then
     error "回滚版本启动失败，所有实例已保持停止"
 fi
 
+# readiness 跟随被恢复运行时的 marker。早于 health-ready-v1 的旧运行时没有
+# /api/health/ready（中间件放行 /api/health* 后落到 404），而 check-readiness 对 4xx
+# 不重试、直接判失败——照探新路由，上面那条同代回退只会以「停服」收场。旧运行时自己的
+# 深检是 /api/health（依赖 down 时回 503），用 HEALTH_READINESS_URL 让同一个探针改探它；
+# 该变量自 health-ready-v1 起的每一版 check-readiness.mjs 都认。
+READINESS_PROBE=(/usr/bin/node)
+READINESS_HINT="node --env-file=$APP_DIR/.env $APP_DIR/scripts/check-readiness.mjs"
+if $LEGACY_RUNTIME; then
+    READINESS_PROBE=(/usr/bin/env "HEALTH_READINESS_URL=$LEGACY_HEALTH_URL" /usr/bin/node)
+    READINESS_HINT="HEALTH_READINESS_URL=$LEGACY_HEALTH_URL $READINESS_HINT"
+fi
+
 sleep 3
 WEB_OK=false
 WS_OK=false
 HEALTH_OK=false
 systemctl is-active --quiet lecturelive-web && WEB_OK=true
 systemctl is-active --quiet lecturelive-ws && WS_OK=true
-runuser -u "$APP_USER" -- /usr/bin/node --env-file="$APP_DIR/.env" \
+runuser -u "$APP_USER" -- "${READINESS_PROBE[@]}" --env-file="$APP_DIR/.env" \
     "$APP_DIR/scripts/check-readiness.mjs" --wait >/dev/null 2>&1 && HEALTH_OK=true
 # readiness 期间任一 unit 都可能退出；成功判定前重新读取两项状态，不能复用探测前快照。
 WEB_OK=false
@@ -138,7 +155,7 @@ else
     warn "回滚版本未通过完整启动检查，正在隔离失败实例:"
     $WEB_OK || echo "  ✗ lecturelive-web: journalctl -u lecturelive-web -n 30 --no-pager"
     $WS_OK  || echo "  ✗ lecturelive-ws:  journalctl -u lecturelive-ws -n 30 --no-pager"
-    $HEALTH_OK || echo "  ✗ readiness: node --env-file=$APP_DIR/.env $APP_DIR/scripts/check-readiness.mjs"
+    $HEALTH_OK || echo "  ✗ readiness: $READINESS_HINT"
     systemctl stop lecturelive-web 2>/dev/null || true
     systemctl stop lecturelive-ws 2>/dev/null || true
     if systemctl is-active --quiet lecturelive-web || systemctl is-active --quiet lecturelive-ws; then

@@ -265,13 +265,15 @@ describe('SEC-024 production Stripe startup preflight', () => {
     expect(rollback).toContain('systemctl is-active --quiet lecturelive-web');
     expect(rollback).toContain('systemctl is-active --quiet lecturelive-ws');
     expect(rollback).toContain('runuser -u "$APP_USER" -- /usr/bin/node');
-    expect(managementCli).toMatch(/! -name scripts/);
+    // CLI 的回滚只委托 rollback.sh（保留 scripts/、启动前预检都在上面检查过）；
+    // start / restart 前自己的预检仍以服务用户运行，且先确认旧服务已停。
+    expect(managementCli).toContain('bash "$rollback_script" "$(basename "$selected")"');
     expect(managementCli).toContain('assert_payment_startup_preflight');
     expect(managementCli).toContain(
-      'runuser -u lecturelive -- /usr/bin/node --env-file=$APP_DIR/.env'
+      'runuser -u lecturelive -- /usr/bin/node --env-file="$APP_DIR/.env" "$script"'
     );
     expect(managementCli).toContain(
-      'if systemctl is-active --quiet $WEB_SERVICE || systemctl is-active --quiet $WS_SERVICE'
+      'if systemctl is-active --quiet "$WEB_SERVICE" || systemctl is-active --quiet "$WS_SERVICE"'
     );
   });
 });

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
 import { PrismaClient } from '@prisma/client';
 import { decryptStoredSetting } from './payment-production-preflight-core.mjs';
@@ -222,11 +222,24 @@ export async function main({
   }
 }
 
-const isEntrypoint =
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+// 两边都取 realpath 再比：经软链路径启动时（如 /opt/lecturelive 或其上级是软链），Node 把
+// import.meta.url 解析成真实路径、argv[1] 却原样保留，直接比较会把入口误判成「被 import」，
+// 脚本什么都不做就 exit 0。只对 argv[1] 取 realpath 也不够：--preserve-symlinks-main 下
+// import.meta.url 保留的是软链路径。
+function isEntrypoint() {
+  if (!process.argv[1]) return false;
+  try {
+    return (
+      realpathSync(process.argv[1]) ===
+      realpathSync(fileURLToPath(import.meta.url))
+    );
+  } catch {
+    // argv[1] 解析不了：本模块不可能是经它启动的
+    return false;
+  }
+}
 
-if (isEntrypoint) {
+if (isEntrypoint()) {
   main().catch((error) => {
     console.error(
       '[stripe-history] FATAL:',

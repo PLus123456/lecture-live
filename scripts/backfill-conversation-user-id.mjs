@@ -19,8 +19,8 @@
 // 这是一次静默的越权授予，而且每次部署都会重跑。现在只回填归属唯一的行，
 // 有歧义的一律留 NULL（fail-closed，与类别 4 同语义），并在日志里点名让运维人工裁定。
 
-import { existsSync } from 'fs';
-import { pathToFileURL } from 'url';
+import { existsSync, realpathSync } from 'fs';
+import { fileURLToPath } from 'url';
 import { PrismaClient } from '@prisma/client';
 
 // 独立运行时（npm run db:backfill-conversation-user-id，无 --env-file）自动加载 env，
@@ -126,10 +126,24 @@ async function run(prisma) {
   }
 }
 
-const isEntrypoint =
-  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+// 两边都取 realpath 再比：经软链路径启动时（如 /opt/lecturelive 或其上级是软链），Node 把
+// import.meta.url 解析成真实路径、argv[1] 却原样保留，直接比较会把入口误判成「被 import」，
+// 脚本什么都不做就 exit 0。只对 argv[1] 取 realpath 也不够：--preserve-symlinks-main 下
+// import.meta.url 保留的是软链路径。
+function isEntrypoint() {
+  if (!process.argv[1]) return false;
+  try {
+    return (
+      realpathSync(process.argv[1]) ===
+      realpathSync(fileURLToPath(import.meta.url))
+    );
+  } catch {
+    // argv[1] 解析不了：本模块不可能是经它启动的
+    return false;
+  }
+}
 
-if (isEntrypoint) {
+if (isEntrypoint()) {
   main().catch((error) => {
     console.error('回填 Conversation.userId 失败:', error);
     process.exitCode = 1;

@@ -90,6 +90,7 @@ async function loginThroughUi(page: Page) {
 }
 
 interface ReportMockOptions {
+  emptyAudio?: boolean;
   /** 重新生成前 GET /api/llm/report 的初始形态：'empty'（无报告）| 'failed'（生成失败空态） */
   initialReport?: 'empty' | 'failed';
   /** 每次 POST /api/llm/report 回调（计数用） */
@@ -97,7 +98,7 @@ interface ReportMockOptions {
 }
 
 function installReportMocks(page: Page, opts: ReportMockOptions = {}) {
-  const { initialReport = 'empty', onRegenerate } = opts;
+  const { initialReport = 'empty', onRegenerate, emptyAudio } = opts;
   // POST 之后 GET 返回成功报告；之前按 initialReport 返回空/失败态。
   let regenerated = false;
 
@@ -187,7 +188,7 @@ function installReportMocks(page: Page, opts: ReportMockOptions = {}) {
       return route.fulfill({
         status: 200,
         contentType: 'audio/webm',
-        body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
+        body: emptyAudio ? Buffer.alloc(0) : Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
       });
     }
     if (p === `/api/sessions/${SESSION_ID}/full-transcribe-status` && method === 'GET') {
@@ -241,3 +242,16 @@ test('报告生成失败态：显示「重新生成报告」→ 点击后成功�
   await btn.click();
   await expect(page.getByText(REPORT_TITLE)).toBeVisible({ timeout: 10_000 });
 });
+
+for (const width of [1280, 390]) {
+  test(`空音频明确提示且不妨碍转录和报告恢复（视口 ${width}）`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await installReportMocks(page, { initialReport: 'failed', emptyAudio: true });
+    await loginThroughUi(page);
+    await page.goto(`/session/${SESSION_ID}/playback`);
+    await expect(page.getByTestId('audio-playback-error')).toBeVisible({ timeout: 15_000 });
+    await page.getByTestId('report-regen-btn').click();
+    await expect(page.getByText(REPORT_TITLE)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByTestId('audio-playback-error')).toBeVisible();
+  });
+}

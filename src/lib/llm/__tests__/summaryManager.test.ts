@@ -32,6 +32,73 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe('SummaryManager 停录补齐摘要', () => {
+  const sentences = [
+    { text: '第一段已进入在途摘要', startMs: 0, endMs: 1000 },
+    { text: '最后一句尚未达到自动摘要阈值', startMs: 1000, endMs: 2000 },
+  ];
+
+  it('等待在途摘要后补做尾段，不重复第一段', async () => {
+    const { fetchMock, calls } = makeDeferredFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    const manager = new SummaryManager({ authToken: 't' });
+    manager.onNewSentence(sentences[0].text, sentences[0]);
+    manager.triggerIncrementalSummary();
+    manager.onNewSentence(sentences[1].text, sentences[1]);
+    const flushed = manager.flush(sentences, new AbortController().signal);
+    expect(calls).toHaveLength(1);
+    calls[0].resolve({ ok: true, json: async () => okResult('first') });
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    expect(JSON.parse(String(calls[1].init.body)).newTranscript).toBe(sentences[1].text);
+    calls[1].resolve({ ok: true, json: async () => okResult('tail') });
+    expect(await flushed).toBe(true);
+    expect(manager.currentState.blocks.map(b => b.timeRange.endMs)).toEqual([1000, 2000]);
+    expect(manager.bufferedSentenceCount).toBe(0);
+  });
+
+  it('刷新后内存缓冲为空，也能根据现有块的覆盖范围补上转录尾段', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => okResult('tail') });
+    vi.stubGlobal('fetch', fetchMock);
+    const manager = new SummaryManager({ authToken: 't', getBaseline: () => ({
+      runningContext: 'first context',
+      blocks: [{ id: 'first', blockIndex: 0, timeRange: { startMs: 0, endMs: 1000 },
+        summary: 'first summary', keyPoints: [], definitions: {}, suggestedQuestions: [], frozen: false }],
+    }) });
+    expect(await manager.flush(sentences, new AbortController().signal)).toBe(true);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+      newTranscript: sentences[1].text, runningContext: 'first context',
+    });
+    expect(manager.currentState.blocks).toHaveLength(2);
+    expect(await manager.flush(sentences, new AbortController().signal)).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('摘要失败只尝试一次，并保留尾段供重试', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 502 });
+    vi.stubGlobal('fetch', fetchMock);
+    const manager = new SummaryManager({ authToken: 't' });
+    expect(await manager.flush(sentences, new AbortController().signal)).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockResolvedValue({ ok: true, json: async () => okResult('retry') });
+    expect(await manager.flush(sentences, new AbortController().signal)).toBe(true);
+    expect(manager.currentState.blocks[0].timeRange.endMs).toBe(2000);
+  });
+
+  it('等待期间切换会话，不得补做旧会话尾段', async () => {
+    const { fetchMock, calls } = makeDeferredFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    const manager = new SummaryManager({ authToken: 't' });
+    manager.onNewSentence(sentences[0].text, sentences[0]);
+    manager.triggerIncrementalSummary();
+    const flushed = manager.flush(sentences, new AbortController().signal);
+    manager.reset();
+    calls[0].reject(new Error('aborted'));
+    expect(await flushed).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(manager.currentState.blocks).toEqual([]);
+  });
+});
+
 describe('SummaryManager（M15 reset 代次隔离）', () => {
   beforeEach(() => {
     vi.clearAllMocks();

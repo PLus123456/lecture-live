@@ -118,6 +118,10 @@ export async function GET(
           expectedUserId: location.userId,
           range,
         });
+        if (upstream.headers.get('content-length') === '0') {
+          await upstream.body?.cancel();
+          return Response.json({ error: 'Recording audio is empty', code: 'audio_empty' }, { status: 404, headers: secureHeaders() });
+        }
 
         const headers = new Headers({
           'Content-Type': location.contentType,
@@ -158,6 +162,9 @@ export async function GET(
 
     if (location?.kind === 'local') {
       const totalSize = location.size;
+      if (totalSize === 0) {
+        return Response.json({ error: 'Recording audio is empty', code: 'audio_empty' }, { status: 404, headers: secureHeaders() });
+      }
       if (range) {
         const match = range.match(/bytes=(\d+)-(\d*)/);
         if (match) {
@@ -216,6 +223,9 @@ export async function GET(
 
     const data = artifact.data;
     const totalSize = data.length;
+    if (totalSize === 0) {
+      return Response.json({ error: 'Recording audio is empty', code: 'audio_empty' }, { status: 404, headers: secureHeaders() });
+    }
 
     // 支持 Range 请求（音频流式播放）—— range 已在上方读取
     if (range) {

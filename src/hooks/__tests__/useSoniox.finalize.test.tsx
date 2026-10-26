@@ -98,8 +98,9 @@ function installFetch(opts: {
   chunkUploadOk: boolean; // POST /audio/draft/chunks 是否成功（补传）
   sealStatus: number; // POST finalize?phase=seal 状态码
   finalizeStatus: number; // POST finalize 状态码
+  enforceKeepaliveQuota?: boolean;
 }) {
-  const mock = vi.fn(async (input: unknown, init?: { method?: string }) => {
+  const mock = vi.fn(async (input: unknown, init?: RequestInit) => {
     const url = String(input);
     const method = (init?.method ?? 'GET').toUpperCase();
     fetchCalls.push({ url, method });
@@ -122,6 +123,10 @@ function installFetch(opts: {
       );
     }
     if (url.includes('/audio/draft/chunks')) {
+      const file = init?.body instanceof FormData ? init.body.get('file') : null;
+      if (opts.enforceKeepaliveQuota && init?.keepalive && file instanceof Blob && file.size > 65_536) {
+        throw new TypeError('keepalive request exceeds the browser upload quota');
+      }
       // negotiateStartSeq 的 GET（本测试不触发 start）/ 补传 POST
       return json({ success: true }, opts.chunkUploadOk ? 200 : 500);
     }
@@ -152,6 +157,16 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+});
+
+it('大于 64KiB 的音频分片可以补传，不能被浏览器 keepalive 限额永久拦截', async () => {
+  localEntriesRef.entries = [{ seq: 0, blob: new Blob([new Uint8Array(96 * 1024)]) }];
+  installFetch({ draftSeqs: [], chunkUploadOk: true, sealStatus: 200, finalizeStatus: 200, enforceKeepaliveQuota: true });
+  const { result } = renderHook(() => useSoniox('sess-large-chunk'));
+  let synced: boolean | undefined;
+  await act(async () => { synced = await result.current.syncRemoteDraft(); });
+  expect(synced).toBe(true);
+  expect(useTranscriptStore.getState().backupMeta.remoteChunkCount).toBe(1);
 });
 
 describe('P0-5：数量相等但集合缺片 → 不完整，绝不 finalize', () => {

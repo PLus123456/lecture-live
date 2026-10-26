@@ -42,10 +42,11 @@ async function loginThroughUi(page: Page) {
 
 // 预置 zustand persist 的转录 store 快照：录音中刷新遗留的「暂停态 + 已有转录段」。
 async function seedRecordingSnapshot(page: Page) {
-  await page.addInitScript(() => {
+  await page.addInitScript((sessionId) => {
     const startTime = Date.now() - 60_000;
     const snapshot = {
       state: {
+        activeSessionId: sessionId,
         segments: [
           {
             id: 'seg-1',
@@ -84,7 +85,7 @@ async function seedRecordingSnapshot(page: Page) {
       'lecture-live-transcript',
       JSON.stringify(snapshot)
     );
-  });
+  }, SESSION_ID);
 }
 
 interface MockOptions {
@@ -206,6 +207,12 @@ function installSessionApiMocks(page: Page, opts: MockOptions = {}) {
     if (p === '/api/soniox/temporary-key') {
       return fulfillJson(route, { error: 'disabled in e2e' }, 503);
     }
+    if (p === '/api/llm/summarize' && method === 'POST') {
+      return fulfillJson(route, {
+        new_key_points: ['Final words preserved'], new_definitions: {},
+        new_summary: 'Final stage summary', new_questions: [], updated_running_context: 'Full context',
+      });
+    }
 
     return fulfillJson(route, { error: `Unhandled ${method} ${p}` }, 500);
   });
@@ -243,6 +250,53 @@ test('会话被回收后停止：finalize 返回 alreadyCompleted 时保留本�
 
   // 断言 2：仍停留在会话页（未静默跳转回放）
   await expect(page).toHaveURL(new RegExp(`/session/${SESSION_ID}$`));
+});
+
+test('刷新恢复后大分片能上传，结束录音先保存尾段摘要再定稿', async ({ page }) => {
+  await installSessionApiMocks(page);
+  await loginThroughUi(page);
+  await seedRecordingSnapshot(page);
+  await page.evaluate(async (sessionId) => {
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open('lecture-live-audio', 3);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains('sessions')) db.createObjectStore('sessions', { keyPath: 'sessionId' });
+        if (!db.objectStoreNames.contains('session_chunks')) {
+          const chunks = db.createObjectStore('session_chunks', { keyPath: ['sessionId', 'seq'] });
+          chunks.createIndex('bySessionId', 'sessionId');
+        }
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        const tx = db.transaction(['sessions', 'session_chunks'], 'readwrite');
+        tx.objectStore('sessions').put({ sessionId, sourceType: 'mic', deviceId: null, mimeType: 'audio/webm', startedAt: Date.now() - 60_000, updatedAt: Date.now(), chunkCount: 1, status: 'paused' });
+        tx.objectStore('session_chunks').put({ sessionId, seq: 0, blob: new Blob([new Uint8Array(96 * 1024)], { type: 'audio/webm' }), createdAt: Date.now() });
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => reject(tx.error);
+      };
+    });
+  }, SESSION_ID);
+  let uploaded = false;
+  await page.route(`**/api/sessions/${SESSION_ID}/audio/draft**`, async route => {
+    const req = route.request();
+    const path = new URL(req.url()).pathname;
+    if (path.endsWith('/chunks') && req.method() === 'POST') {
+      expect(req.postDataBuffer()!.byteLength).toBeGreaterThan(65_536);
+      uploaded = true;
+      return fulfillJson(route, { success: true });
+    }
+    if (path.endsWith('/chunks')) return fulfillJson(route, { nextSeq: uploaded ? 1 : 0 });
+    if (path.endsWith('/finalize')) return fulfillJson(route, { success: true });
+    return fulfillJson(route, { seqs: uploaded ? [0] : [] });
+  });
+  await page.goto(`/session/${SESSION_ID}`);
+  await expect.poll(() => uploaded, { timeout: 15_000 }).toBe(true);
+  const finalRequest = page.waitForRequest(request => request.url().endsWith(`/api/sessions/${SESSION_ID}/finalize`) && request.method() === 'POST');
+  await page.getByRole('button', { name: 'Stop', exact: true }).first().click();
+  const body = (await finalRequest).postDataJSON();
+  expect(body.summaries).toEqual(expect.arrayContaining([expect.objectContaining({ summary: 'Final stage summary' })]));
 });
 
 test('正常停止：finalize 成功(无 alreadyCompleted)才清空本地缓存并跳回放', async ({

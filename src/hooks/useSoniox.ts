@@ -296,7 +296,8 @@ export function useSoniox(
           {
             method: 'POST',
             headers: { Authorization: `Bearer ${token}` },
-            keepalive: true,
+            // 音频分片可能超过 64KiB；keepalive 会让浏览器在发出请求前直接拒绝上传。
+            // 正常上传不受该限额约束；离页中断时保留 IndexedDB，恢复页面后按缺片补传。
             body: formData,
           }
         );

@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   generateOrReuseSessionReport: vi.fn(),
   invalidateSessionsApiCache: vi.fn(),
   isPaymentBenefitAvailable: vi.fn(),
+  logAction: vi.fn(),
 }));
 
 vi.mock('@/lib/rateLimit', () => ({
@@ -28,11 +29,7 @@ vi.mock('@/lib/prisma', () => ({
     user: { findUnique: mocks.userFindUnique },
   },
 }));
-vi.mock('@/lib/security', () => ({
-  assertOwnership: vi.fn(),
-  assertSessionReadAccess: vi.fn(),
-}));
-vi.mock('@/lib/auditLog', () => ({ logAction: vi.fn() }));
+vi.mock('@/lib/auditLog', () => ({ logAction: mocks.logAction }));
 vi.mock('@/lib/userRoles', () => ({
   resolveUserFeatureFlags: mocks.resolveUserFeatureFlags,
   resolveUserSummaryModels: mocks.resolveUserSummaryModels,
@@ -83,9 +80,9 @@ describe('POST /api/llm/report single-flight response', () => {
     vi.resetAllMocks();
     mocks.enforceRateLimit.mockResolvedValue(null);
     mocks.isPaymentBenefitAvailable.mockResolvedValue(true);
-    mocks.verifyAuth.mockResolvedValue({ id: 'user-1' });
+    mocks.verifyAuth.mockResolvedValue({ id: 'user-1', role: 'PRO' });
     mocks.sessionFindUnique.mockResolvedValue(SESSION);
-    mocks.userFindUnique.mockResolvedValue({ role: 'USER', customGroupId: null });
+    mocks.userFindUnique.mockResolvedValue({ role: 'PRO', customGroupId: null });
     mocks.resolveUserFeatureFlags.mockResolvedValue({ allowFinalSummary: true });
     mocks.resolveUserSummaryModels.mockResolvedValue({ finalSummaryModelId: null });
     mocks.resolveSummaryModel.mockResolvedValue({
@@ -110,6 +107,43 @@ describe('POST /api/llm/report single-flight response', () => {
 
     expect(response.status).toBe(401);
     expect(mocks.enforceRateLimit).not.toHaveBeenCalled();
+  });
+
+  it('普通用户不能重生成他人报告', async () => {
+    mocks.verifyAuth.mockResolvedValue({ id: 'other-user', role: 'PRO' });
+    expect((await POST(request())).status).toBe(403);
+    expect(mocks.loadSessionTranscriptBundle).not.toHaveBeenCalled();
+    expect(mocks.generateOrReuseSessionReport).not.toHaveBeenCalled();
+  });
+
+  it('管理员修复他人报告时沿用拥有者的模型、预算与缓存，并写审计', async () => {
+    mocks.verifyAuth.mockResolvedValue({ id: 'admin-1', role: 'ADMIN' });
+    mocks.resolveUserSummaryModels.mockResolvedValue({ finalSummaryModelId: 'owner-model' });
+    mocks.generateOrReuseSessionReport.mockResolvedValue({
+      status: 'generated', reportPath: 'reports/new.json',
+      reportData: { significance: { isWorthSummarizing: true }, report: {} },
+    });
+
+    expect((await POST(request())).status).toBe(200);
+    expect(mocks.isPaymentBenefitAvailable).toHaveBeenCalledWith('user-1');
+    expect(mocks.resolveSummaryModel).toHaveBeenCalledWith('owner-model', 'FINAL_SUMMARY');
+    expect(mocks.generateOrReuseSessionReport).toHaveBeenCalledWith(expect.objectContaining({
+      session: expect.objectContaining({ userId: 'user-1' }),
+      triggeredBy: 'admin:admin-1',
+    }));
+    expect(mocks.invalidateSessionsApiCache).toHaveBeenCalledWith('user-1');
+    expect(mocks.logAction).toHaveBeenCalledWith(expect.any(Request),
+      'admin.session.report.regenerate', expect.objectContaining({ user: { id: 'admin-1', role: 'ADMIN' } }));
+  });
+
+  it('管理员不能绕过拥有者的支付冻结或组能力', async () => {
+    mocks.verifyAuth.mockResolvedValue({ id: 'admin-1', role: 'ADMIN' });
+    mocks.isPaymentBenefitAvailable.mockImplementation(async (id) => id !== 'user-1');
+    expect((await POST(request())).status).toBe(403);
+    mocks.isPaymentBenefitAvailable.mockResolvedValue(true);
+    mocks.resolveUserFeatureFlags.mockResolvedValue({ allowFinalSummary: false });
+    expect((await POST(request())).status).toBe(403);
+    expect(mocks.generateOrReuseSessionReport).not.toHaveBeenCalled();
   });
 
   it('同版本正在生成时返回明确 202 + Retry-After，不谎报完成', async () => {

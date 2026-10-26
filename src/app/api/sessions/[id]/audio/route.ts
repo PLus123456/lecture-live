@@ -309,6 +309,10 @@ export async function GET(
           expectedUserId: location.userId,
           range,
         });
+        if (upstream.headers.get('content-length') === '0') {
+          await upstream.body?.cancel();
+          return NextResponse.json({ error: 'Recording audio is empty', code: 'audio_empty' }, { status: 404 });
+        }
         const headers = new Headers({
           'Content-Type': location.contentType,
           'Accept-Ranges': 'bytes',
@@ -348,6 +352,9 @@ export async function GET(
     // 本地文件：按 [start,end] 用 createReadStream 流式读，不整包入内存。
     if (location?.kind === 'local') {
       const totalSize = location.size;
+      if (totalSize === 0) {
+        return NextResponse.json({ error: 'Recording audio is empty', code: 'audio_empty' }, { status: 404 });
+      }
       if (range) {
         const match = range.match(/bytes=(\d+)-(\d*)/);
         if (match) {
@@ -399,6 +406,9 @@ export async function GET(
 
     const data = artifact.data;
     const totalSize = data.length;
+    if (totalSize === 0) {
+      return NextResponse.json({ error: 'Recording audio is empty', code: 'audio_empty' }, { status: 404 });
+    }
 
     if (range) {
       const match = range.match(/bytes=(\d+)-(\d*)/);

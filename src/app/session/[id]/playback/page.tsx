@@ -320,6 +320,7 @@ export default function PlaybackPage() {
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [audioSegments, setAudioSegments] = useState<PlaybackAudioSegment[]>([]);
+  const [audioError, setAudioError] = useState<'unavailable' | 'failed' | null>(null);
   const [activeAudioIndex, setActiveAudioIndex] = useState(0);
   const audioRef = useRef<HTMLAudioElement>(null);
   const audioSegmentsRef = useRef<PlaybackAudioSegment[]>([]);
@@ -428,6 +429,7 @@ export default function PlaybackPage() {
     let disposed = false;
     const createdUrls: string[] = [];
     const abortController = new AbortController();
+    setAudioError(null);
 
     // 音频段被替换（新音源就绪 / 旧音源卸下）时**就地同步**重置播放状态。此前交给一个依赖
     // audioSegments 的独立 effect：它跑在提交之后，会把与新音频段同批写下的换源恢复点
@@ -462,9 +464,10 @@ export default function PlaybackPage() {
       signal: abortController.signal,
     })
       .then(async (res) => {
-        if (!res.ok) throw new Error('Audio load failed');
+        if (!res.ok) throw new Error(res.status === 404 ? 'audio_unavailable' : 'Audio load failed');
         const mimeType = res.headers.get('content-type') || 'audio/webm';
         const buffer = await res.arrayBuffer();
+        if (buffer.byteLength === 0) throw new Error('audio_unavailable');
         // 缓存完整音频 blob，供导出时复用
         recordingBlobRef.current = new Blob([buffer], { type: mimeType });
         return { mimeType, buffer };
@@ -553,6 +556,8 @@ export default function PlaybackPage() {
         setAudioSegments(nextSegments);
       })
       .catch((err) => {
+        if (disposed || abortController.signal.aborted) return;
+        setAudioError(err instanceof Error && err.message === 'audio_unavailable' ? 'unavailable' : 'failed');
         console.error('Failed to load audio:', err);
       });
 
@@ -945,7 +950,7 @@ export default function PlaybackPage() {
     if (isPlaying) {
       audioRef.current.pause();
     } else {
-      void audioRef.current.play();
+      void audioRef.current.play().catch(() => setAudioError('failed'));
     }
   }, [activeAudioSegment, isPlaying]);
 
@@ -1651,6 +1656,7 @@ export default function PlaybackPage() {
           onVolumeChange={setVolume}
           onToggleMuted={() => setMuted((m) => !m)}
           hasAudio={!!activeAudioSegment}
+          audioError={audioError ? t(audioError === 'unavailable' ? 'playback.audioUnavailable' : 'playback.audioLoadFailed') : undefined}
           onTogglePlayback={togglePlayback}
           onSeekToMs={seekToMs}
           onCycleSpeed={cycleSpeed}
@@ -1948,6 +1954,12 @@ export default function PlaybackPage() {
             </div>
           </div>
         </header>
+
+        {audioError && (
+          <p role="alert" data-testid="audio-playback-error" className="mx-4 mt-3 rounded-lg border border-rust-200 bg-rust-50 px-4 py-3 text-sm text-charcoal-700">
+            {t(audioError === 'unavailable' ? 'playback.audioUnavailable' : 'playback.audioLoadFailed')}
+          </p>
+        )}
 
         {/* Content: 2-column layout — 转录+翻译合并 | AI面板 */}
         <div className="flex-1 flex gap-4 p-4 min-h-0 overflow-hidden">

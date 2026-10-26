@@ -129,4 +129,18 @@ describe('GET /api/sessions/[id]/audio Cloudreve Range 416（审计 #7）', () =
     expect(loadSessionAudioArtifactMock).toHaveBeenCalledTimes(1);
     expect(res.status).toBe(206);
   });
+
+  it.each(['cloudreve', 'local', 'buffered'])('%s 空录音应明确报错而非返回可播放的 200', async (kind) => {
+    if (kind === 'cloudreve') {
+      openDownloadStreamMock.mockResolvedValue(new Response(null, { headers: { 'content-length': '0' } }));
+    } else if (kind === 'local') {
+      resolveSessionAudioLocationMock.mockResolvedValue({ kind: 'local', size: 0, filePath: '/unused.webm' });
+    } else {
+      resolveSessionAudioLocationMock.mockResolvedValue(null);
+      loadSessionAudioArtifactMock.mockResolvedValue({ data: Buffer.alloc(0) });
+    }
+    const res = await GET(new Request('http://localhost/api/sessions/s1/audio'), { params });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ code: 'audio_empty' });
+  });
 });

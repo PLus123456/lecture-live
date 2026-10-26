@@ -754,7 +754,7 @@ export default function ActiveSessionPage() {
       void rebuildSession();
     },
   });
-  const { init: initSummary, onNewSentence, triggerManual, reset: resetSummary } = useSummary();
+  const { init: initSummary, onNewSentence, triggerManual, flush: flushSummary, reset: resetSummary } = useSummary();
   // L46：已喂给「摘要 + 本地翻译」管线的最后一条段落 id。冷恢复批量灌入历史段落时先置成
   // 最后一条恢复段落的 id，避免历史段落被当成新句子重跑一轮 LLM 增量摘要与本地翻译。
   const lastPipelineSegmentIdRef = useRef<string | null>(null);
@@ -1568,6 +1568,11 @@ export default function ActiveSessionPage() {
 
       // ── Step 2: Best-effort 最终同步（确保服务端 draft 是最新的）──
       const transcriptSegments = useTranscriptStore.getState().segments;
+      if (realtimeSummaryEnabled) {
+        const complete = await flushSummary(transcriptSegments, ownerSignal);
+        await assertOwner();
+        if (!complete) toast.info(t('session.finalizing.summaryIncomplete'));
+      }
       const summaryBlocks = useSummaryStore.getState().blocks;
       const translationEntries = useTranslationStore.getState().translations;
 
@@ -1734,6 +1739,8 @@ export default function ActiveSessionPage() {
     }
   }, [
     stopRecording,
+    flushSummary,
+    realtimeSummaryEnabled,
     syncSessionStatus,
     sessionId,
     token,

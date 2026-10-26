@@ -287,6 +287,16 @@ beforeEach(() => {
 });
 
 describe('finalizeSession — M5：转录/摘要走 stage → CAS → publish 两阶段', () => {
+  it.each([0, 4])('自动回收遇到音频缺片时保留恢复入口（连续前缀 %i 字节）', async (bytes) => {
+    mergeDraftMock.mockResolvedValue({
+      buffer: Buffer.alloc(bytes), manifest: { mimeType: 'audio/webm' }, hasGap: true,
+    });
+    await expect(finalizeSession({ sessionId: 'sess-1', actor: null, finalizeSource: 'system_auto_reclaim' }))
+      .rejects.toMatchObject({ status: 409 });
+    expect(stageAudioMock).not.toHaveBeenCalled();
+    expect(publishMock).not.toHaveBeenCalled();
+    expect(deductMock).not.toHaveBeenCalled();
+  });
   it('▶ CAS 赢：写库的是版本化引用（非固定 key {id}.json），提交后三类产物全部 publish', async () => {
     const res = await finalizeSession({ sessionId: 'sess-1', actor: null });
 

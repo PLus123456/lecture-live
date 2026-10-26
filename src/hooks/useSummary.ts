@@ -5,6 +5,7 @@ import { useSummaryStore } from '@/stores/summaryStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { useAuthStore } from '@/stores/authStore';
 import { SummaryManager, type SentenceTiming } from '@/lib/llm/summaryManager';
+import type { TranscriptSegment } from '@/types/transcript';
 
 export function useSummary() {
   const managerRef = useRef<SummaryManager | null>(null);
@@ -71,6 +72,19 @@ export function useSummary() {
     return managerRef.current?.triggerIncrementalSummary();
   }, []);
 
+  const flush = useCallback(async (segments: TranscriptSegment[], signal: AbortSignal) => {
+    const completed = await managerRef.current?.flush(
+      segments.map((segment) => ({
+        text: segment.text,
+        startMs: segment.globalStartMs,
+        endMs: segment.globalEndMs,
+      })),
+      AbortSignal.any([signal, AbortSignal.timeout(60_000)])
+    );
+    setBatchSentences(managerRef.current?.bufferedSentenceCount ?? 0);
+    return completed ?? false;
+  }, [setBatchSentences]);
+
   const reset = useCallback(() => {
     managerRef.current?.reset();
     managerRef.current = null;
@@ -80,5 +94,5 @@ export function useSummary() {
     setBatchSentences(0);
   }, [setLoading, setBatchSentences]);
 
-  return { init, onNewSentence, triggerManual, reset };
+  return { init, onNewSentence, triggerManual, flush, reset };
 }

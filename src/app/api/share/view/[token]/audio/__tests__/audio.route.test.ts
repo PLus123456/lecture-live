@@ -79,6 +79,21 @@ describe('GET /api/share/view/[token]/audio', () => {
     });
   });
 
+  it.each(['cloudreve', 'local', 'buffered'])('%s 空音频返回明确错误并保留分享安全头', async (kind) => {
+    if (kind === 'cloudreve') {
+      openDownloadStreamMock.mockResolvedValue(new Response(null, { headers: { 'content-length': '0' } }));
+    } else if (kind === 'local') {
+      resolveSessionAudioLocationMock.mockResolvedValue({ kind: 'local', size: 0 });
+    } else {
+      resolveSessionAudioLocationMock.mockResolvedValue(null);
+      loadSessionAudioArtifactMock.mockResolvedValue({ data: Buffer.alloc(0) });
+    }
+    const response = await GET(mkReq(), { params: Promise.resolve({ token: 'ABC123' }) });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ code: 'audio_empty' });
+    expect(response.headers.get('Referrer-Policy')).toBe('no-referrer');
+  });
+
   it('P4-3：限流 key 用净化后的 token —— 加噪声不换桶', async () => {
     const noisy = new Request('http://localhost/api/share/view/x/audio');
     openDownloadStreamMock.mockResolvedValue(

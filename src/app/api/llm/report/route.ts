@@ -9,7 +9,7 @@ import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
 import { assertOwnership, assertSessionReadAccess } from '@/lib/security';
 import { logAction } from '@/lib/auditLog';
 import { resolveUserFeatureFlags, resolveUserSummaryModels } from '@/lib/userRoles';
-import { callLLM } from '@/lib/llm/gateway';
+import { callReportLLM } from '@/lib/llm/reportLlm';
 import { resolveSummaryModel } from '@/lib/llm/summaryModel';
 import { enforceRateLimit } from '@/lib/rateLimit';
 import { SessionReportBudgetExceededError } from '@/lib/llm/reportManager';
@@ -55,10 +55,18 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Session not found' }, { status: 404 });
     }
 
+    const isCrossUserAdmin = user.role === 'ADMIN' && user.id !== session.userId;
     try {
-      assertOwnership(user.id, session.userId);
+      // 管理员可以修复他人的报告；仅放行此操作，其余写接口仍遵循拥有者约束。
+      if (!isCrossUserAdmin) assertOwnership(user.id, session.userId);
     } catch {
       return NextResponse.json({ error: 'Access denied' }, { status: 403 });
+    }
+    if (isCrossUserAdmin && !(await isPaymentBenefitAvailable(session.userId))) {
+      return NextResponse.json(
+        { error: '账户存在未处理的支付争议', code: 'payment_account_frozen' },
+        { status: 403 }
+      );
     }
 
     // 用户组门禁：未开通总摘要则拒绝生成结构化报告（按会话拥有者的组解析）
@@ -104,6 +112,13 @@ export async function POST(req: Request) {
         ? `model:${finalRouting.modelId}`
         : `purpose:${finalRouting.purpose}`);
 
+    if (isCrossUserAdmin) {
+      logAction(req, 'admin.session.report.regenerate', {
+        user,
+        detail: `重新生成他人会议报告 (sessionId=${sessionId}, owner=${session.userId})`,
+      });
+    }
+
     // 手动与 finalize 后台统一经过同一个 sourceHash 单飞、复用和整次预算边界。
     const result = await generateOrReuseSessionReport({
       session,
@@ -115,15 +130,15 @@ export async function POST(req: Request) {
       summaryBlocks,
       language: session.targetLang || 'zh',
       callLLM: (system: string, userMsg: string, execution) =>
-        callLLM(system, userMsg, {
-          ...finalRouting,
+        callReportLLM(system, userMsg, {
+          routing: finalRouting,
           maxOutputTokens: execution.maxOutputTokens,
           onUsage: execution.onUsage,
         }),
       contextWindow: finalSummaryProvider?.contextWindow,
       maxOutputTokens: finalSummaryProvider?.maxTokens,
       modelKey,
-      triggeredBy: `user:${user.id}`,
+      triggeredBy: `${isCrossUserAdmin ? 'admin' : 'user'}:${user.id}`,
     });
 
     if (result.status === 'in_progress') {
@@ -138,7 +153,7 @@ export async function POST(req: Request) {
     }
 
     if (result.status === 'generated') {
-      await invalidateSessionsApiCache(user.id);
+      await invalidateSessionsApiCache(session.userId);
     }
 
     return NextResponse.json({

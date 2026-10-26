@@ -69,6 +69,7 @@ const summaryMocks = vi.hoisted(() => ({
   init: vi.fn(),
   onNewSentence: vi.fn(),
   triggerManual: vi.fn(),
+  flush: vi.fn(async () => true),
   reset: vi.fn(),
 }));
 vi.mock('@/hooks/useSummary', () => ({ useSummary: () => summaryMocks }));

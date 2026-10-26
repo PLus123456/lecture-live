@@ -72,6 +72,7 @@ interface MobilePlaybackLayoutProps {
   onVolumeChange: (v: number) => void;
   onToggleMuted: () => void;
   hasAudio: boolean;
+  audioError?: string;
   onTogglePlayback: () => void;
   onSeekToMs: (ms: number, options?: { resumePlayback?: boolean }) => void;
   onCycleSpeed: () => void;
@@ -377,6 +378,7 @@ export default function MobilePlaybackLayout({
   onVolumeChange,
   onToggleMuted,
   hasAudio,
+  audioError,
   onTogglePlayback,
   onSeekToMs,
   onCycleSpeed,
@@ -807,6 +809,9 @@ export default function MobilePlaybackLayout({
 
       {/* ─── 底部音频播放器 ─── */}
       <div className="flex-shrink-0 border-t border-cream-200 bg-white/95 backdrop-blur-md shadow-[0_-4px_20px_rgba(0,0,0,0.05)] safe-bottom">
+        {audioError && (
+          <p role="alert" data-testid="audio-playback-error" className="px-3 py-2 text-xs text-rust-600">{audioError}</p>
+        )}
         {/* 进度条 — 放在顶部，更容易点击 */}
         <div
           className="h-2 bg-cream-200 cursor-pointer active:bg-cream-300"

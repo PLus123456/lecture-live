@@ -21,6 +21,7 @@ export class SummaryManager {
   // 把上一场录音的总结污染进新 session。
   private generation = 0;
   private inflightAbort: AbortController | null = null;
+  private inflightPromise: Promise<void> | null = null;
   /** L41：连续失败次数 + 退避截止时间（成功即清零） */
   private consecutiveFailures = 0;
   private retryNotBefore = 0;
@@ -97,7 +98,63 @@ export class SummaryManager {
     }
   }
 
-  async triggerIncrementalSummary() {
+  triggerIncrementalSummary(): Promise<void> {
+    if (this.isSummarizing) return this.inflightPromise ?? Promise.resolve();
+    const pending = this.runIncrementalSummary();
+    this.inflightPromise = pending;
+    void pending.finally(() => {
+      if (this.inflightPromise === pending) this.inflightPromise = null;
+    });
+    return pending;
+  }
+
+  /** 停录前等待在途摘要，再从完整转录补上尾段；刷新后丢失的内存缓冲也能恢复。 */
+  async flush(
+    sentences: readonly (SentenceTiming & { text: string })[],
+    signal: AbortSignal
+  ): Promise<boolean> {
+    const gen = this.generation;
+    const abortPending = () => {
+      if (gen === this.generation) this.inflightAbort?.abort();
+    };
+    signal.addEventListener('abort', abortPending, { once: true });
+    try {
+      if (signal.aborted) { abortPending(); return false; }
+      await this.inflightPromise;
+      if (gen !== this.generation || signal.aborted) return false;
+      this.adoptBaselineIfFresh();
+      const coveredEndMs = Math.max(0, ...this.state.blocks.map((b) => b.timeRange.endMs));
+      const remaining = sentences.filter((s) => s.text.trim() &&
+        (this.state.blocks.length === 0 || s.endMs > coveredEndMs));
+      // 以持久化转录为准重建缓冲，避免在途调用期间累积的尾段被重复发送。
+      this.transcriptBuffer = [];
+      this.sentenceCount = 0;
+      this.bufferStartMs = null;
+      this.bufferEndMs = null;
+      for (let i = 0; i < remaining.length;) {
+        if (gen !== this.generation || signal.aborted) return false;
+        let chars = 0;
+        while (i < remaining.length) {
+          const sentence = remaining[i];
+          if (chars > 0 && chars + sentence.text.length + 1 > SummaryManager.MAX_BUFFERED_CHARS) break;
+          this.transcriptBuffer.push(sentence.text);
+          this.extendBufferRange(sentence.startMs, sentence.endMs);
+          chars += sentence.text.length + 1;
+          this.sentenceCount++;
+          i++;
+        }
+        // 用户结束录音时允许一次立即补做；失败即退出，不在收尾中循环重试。
+        this.retryNotBefore = 0;
+        await this.triggerIncrementalSummary();
+        if (gen !== this.generation || signal.aborted || this.consecutiveFailures > 0) return false;
+      }
+      return true;
+    } finally {
+      signal.removeEventListener('abort', abortPending);
+    }
+  }
+
+  private async runIncrementalSummary() {
     if (this.transcriptBuffer.length === 0) return;
     // in-flight 守卫：已有一次 summarize 在进行时直接早退，句子仍留在 buffer，
     // 待本次完成后由下一次触发一并折进去 —— 避免并发请求基于同一旧 runningContext
@@ -277,6 +334,7 @@ export class SummaryManager {
     // 顺带取消在途请求，省掉一次不会被采纳的 LLM 往返与计费。
     this.inflightAbort?.abort();
     this.inflightAbort = null;
+    this.inflightPromise = null;
     this.isSummarizing = false;
     this.consecutiveFailures = 0;
     this.retryNotBefore = 0;

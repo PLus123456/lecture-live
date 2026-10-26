@@ -292,9 +292,9 @@ test('刷新恢复后大分片能上传，结束录音先保存尾段摘要再�
     return fulfillJson(route, { seqs: uploaded ? [0] : [] });
   });
   await page.goto(`/session/${SESSION_ID}`);
-  await expect.poll(() => uploaded, { timeout: 15_000 }).toBe(true);
   const finalRequest = page.waitForRequest(request => request.url().endsWith(`/api/sessions/${SESSION_ID}/finalize`) && request.method() === 'POST');
   await page.getByRole('button', { name: 'Stop', exact: true }).first().click();
+  await expect.poll(() => uploaded, { timeout: 15_000 }).toBe(true);
   const body = (await finalRequest).postDataJSON();
   expect(body.summaries).toEqual(expect.arrayContaining([expect.objectContaining({ summary: 'Final stage summary' })]));
 });

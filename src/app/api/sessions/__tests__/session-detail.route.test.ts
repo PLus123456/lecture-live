@@ -137,6 +137,7 @@ vi.mock('@/lib/userRoles', () => ({
 }));
 
 import { DELETE, GET, PATCH } from '@/app/api/sessions/[id]/route';
+import { resolveServerRecordingDurationMs } from '@/lib/audio/recordingDuration';
 
 const params = Promise.resolve({ id: 'session-1' });
 
@@ -549,6 +550,57 @@ describe('session detail route', () => {
     );
     expect(data.serverPausedMs.increment).toBeGreaterThanOrEqual(29_000);
     expect(data.serverPausedMs.increment).toBeLessThanOrEqual(31_000);
+  });
+
+  it('保存失败后重复 FINALIZING 保留首次停止时间，不把等待重试计入录音', async () => {
+    const stoppedAt = new Date(Date.now() - 90_000);
+    const session = {
+      id: 'session-1',
+      userId: 'user-1',
+      title: 'Lecture',
+      status: 'FINALIZING',
+      serverStartedAt: new Date(stoppedAt.getTime() - 45_000),
+      serverPausedAt: stoppedAt,
+      serverPausedMs: 15_000,
+    };
+    sessionFindUniqueMock.mockResolvedValue(session);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await PATCH(
+        createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+          method: 'PATCH',
+          body: { status: 'FINALIZING' },
+        }),
+        { params }
+      );
+      expect(response.status).toBe(200);
+      const data = sessionUpdateManyMock.mock.calls[attempt][0].data;
+      expect(data.serverPausedAt).toEqual(stoppedAt);
+      expect(data.serverPausedMs).toBeUndefined();
+      expect(resolveServerRecordingDurationMs({ ...session, ...data })).toBe(30_000);
+    }
+  });
+
+  it('旧 FINALIZING 会话缺少停止时间时仍补记时间', async () => {
+    sessionFindUniqueMock.mockResolvedValue({
+      id: 'session-1',
+      userId: 'user-1',
+      status: 'FINALIZING',
+      serverStartedAt: new Date(Date.now() - 30_000),
+      serverPausedAt: null,
+    });
+    const before = Date.now();
+    const response = await PATCH(
+      createJsonRequest('http://localhost:3000/api/sessions/session-1', {
+        method: 'PATCH',
+        body: { status: 'FINALIZING' },
+      }),
+      { params }
+    );
+    expect(response.status).toBe(200);
+    const data = sessionUpdateManyMock.mock.calls[0][0].data;
+    expect(data.serverPausedAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(data.serverPausedAt.getTime()).toBeLessThanOrEqual(Date.now());
   });
 
   it('删除会话时会清理关联表记录', async () => {

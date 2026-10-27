@@ -503,7 +503,10 @@ function buildSessionUpdateData(options: {
     // 用 serverPausedAt 记录"录音实际结束时间"，这样 resolveServerRecordingDurationMs
     // 的 pendingPausedMs 会把 FINALIZING 之后经过的时间从 duration 中扣除，
     // 避免 finalize 延迟（如请求失败后恢复）时 duration 被严重高估。
-    data.serverPausedAt = now;
+    // 保存失败后的同状态重试必须保留第一次停止时间，不能把等待重试的时间计入录音和计费。
+    data.serverPausedAt = options.session.status === 'FINALIZING'
+      ? options.session.serverPausedAt ?? now
+      : now;
   }
 
   return data;

@@ -5,6 +5,7 @@
  * P1-10（源 track ended → hasLiveCapture 转 false + 上报）。
  * 这些用例在修复前的旧行为下会失败（孤儿轨未停 / 新 recorder 进入 recording / 掉线仍算在录）。
  */
+import { Buffer } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ── 可控的 audioChunkStore 桩：全部内存化，避免依赖 IndexedDB ──
@@ -439,7 +440,9 @@ describe('归档分片完整性', () => {
     expect(chunks).toHaveLength(3);
     expect(chunks.every((chunk) => chunk.size <= 1024 * 1024)).toBe(true);
     expect(appendAudioChunkMock.mock.calls.map((call) => call[1])).toEqual([0, 1, 2]);
-    expect(new Uint8Array(await new Blob(chunks).arrayBuffer())).toEqual(original);
+    // 原生逐字节比较完整内容，避免通用对象深比较数百万个数组元素的额外开销。
+    const restored = Buffer.from(await new Blob(chunks).arrayBuffer());
+    expect(restored.equals(Buffer.from(original))).toBe(true);
   });
 
   it('本地和上传同时失败时阻断停止收尾，重试后原始首片仍能保存', async () => {

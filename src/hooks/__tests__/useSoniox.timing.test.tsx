@@ -269,7 +269,7 @@ describe('U21：冷恢复续录不清零计时、段号连续', () => {
       restoreNow - durationMs
     );
 
-    // 关键断言 2：续录段号必须紧接已恢复段（seg-4 起），不与 seg-1..3 串号。
+    // 续录编号接在已有段后，并使用独立管线前缀，避免与未恢复到本机的服务端段落撞号。
     // 通过 processor 处理一条 final token 触发一个新段，检查其 id。
     const cb = capturedCallbacks[capturedCallbacks.length - 1];
     act(() => {
@@ -289,7 +289,7 @@ describe('U21：冷恢复续录不清零计时、段号连续', () => {
 
     const segs = useTranscriptStore.getState().segments;
     const newSeg = segs[segs.length - 1];
-    expect(newSeg.id).toBe('seg-4');
+    expect(newSeg.id).toMatch(/^seg-[a-f0-9-]{36}-4$/);
 
     nowSpy.mockRestore();
   });

@@ -168,6 +168,8 @@ export function useSoniox(
   const lastAudioActivityAtRef = useRef<number | null>(null);
   const autoPauseReasonRef = useRef<'idle' | 'disconnect' | null>(null);
   const shouldReconnectRef = useRef(false);
+  // stop() 等待 Soniox 发回缓冲音频的最终结果；只放行该旧代次的数据回调，不恢复连接副作用。
+  const drainingRunIdRef = useRef<number | null>(null);
   const finalizeOnUnloadSentRef = useRef(false);
   // 单飞闸：手动 start() 的在途 Promise。双击/并发开始时，第二次直接复用同一 Promise，
   // 杜绝并发建立两条 Soniox WS / 两把 temporary key / 双计费（P0-2 #2）。
@@ -528,6 +530,7 @@ export function useSoniox(
       return false;
     }
 
+    const expectedLocalCount = useTranscriptStore.getState().backupMeta.localChunkCount;
     let localSeqs: number[] = [];
     try {
       localSeqs = sessionId
@@ -537,6 +540,9 @@ export function useSoniox(
       // 读本地失败：退回已知计数，用连续 [0..count-1] 近似本地 seq，保证 stop 仍能推进。
       const knownCount = useTranscriptStore.getState().backupMeta.localChunkCount;
       localSeqs = Array.from({ length: Math.max(0, knownCount) }, (_, i) => i);
+    }
+    if (expectedLocalCount > 0 && !localSeqs.includes(expectedLocalCount - 1)) {
+      localSeqs.push(expectedLocalCount - 1);
     }
     const localChunkCount = localSeqs.length;
 
@@ -568,15 +574,18 @@ export function useSoniox(
       return false;
     }
 
+    const expectedChunkCount = Math.max(-1, ...localSeqs, ...remoteDraftSeqsRef.current) + 1;
+    const finalizeRequest = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ expectedChunkCount }),
+    };
     try {
       // P1-7 契约3 阶段①（SEAL）：先封存草稿再收尾。封存后服务端对迟到的 audio-chunk /
       // transcript-draft 写入一律 409，杜绝「merge 读快照 → 删草稿」之间的丢尾窗口。
       const sealResponse = await fetch(
         `/api/sessions/${sessionId}/audio/draft/finalize?phase=seal`,
-        {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-        }
+        finalizeRequest
       );
       // 409：会话已被并发收尾/回收（终态）——视为需重试，绝不吞数据、绝不清库。
       if (sealResponse.status === 409) {
@@ -601,10 +610,7 @@ export function useSoniox(
       // 阶段②：正式收尾（合并 + 服务端二次完整性校验 + CAS 提交）。
       const response = await fetch(
         `/api/sessions/${sessionId}/audio/draft/finalize`,
-        {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-        }
+        finalizeRequest
       );
 
       // 409：服务端合并阶段发现缺口（hasGap / leading gap）或会话已终态 —— 需重试，保留数据。
@@ -742,6 +748,9 @@ export function useSoniox(
     }
 
     const processor = new TokenProcessor({
+      // 刷新/换设备可能只恢复部分段落，单靠段数续号仍会撞到服务端已有 ID。
+      // 每次采集管线使用独立前缀，服务端合并时才能把不同来源的新句子完整保留。
+      segmentIdPrefix: `seg-${crypto.randomUUID()}`,
       onSegmentFinalized: (segment) => {
         addFinalSegment(segment);
       },
@@ -1176,10 +1185,10 @@ export function useSoniox(
           runIdRef.current = runId;
           attemptOwnerRunId = runId;
           const connectStartMs = performance.now();
-          const reconnectOwnerIsCurrent = () =>
+          const reconnectOwnerIsCurrent = (allowDraining = false) =>
             !ownerSignal.aborted &&
             !accountBoundaryInvalidatedRef.current &&
-            runId === runIdRef.current;
+            (runId === runIdRef.current || (allowDraining && drainingRunIdRef.current === runId));
 
           if (!reconnectOwnerIsCurrent()) return;
 
@@ -1188,7 +1197,7 @@ export function useSoniox(
             currentToken,
             {
               onPartialResult: (tokens) => {
-                if (!reconnectOwnerIsCurrent()) return;
+                if (!reconnectOwnerIsCurrent(true)) return;
                 if (tokens.length > 0) {
                   markAudioActivity();
                 }
@@ -1196,7 +1205,7 @@ export function useSoniox(
                 updateTranscriptionLatency(tokens as RealtimeToken[]);
               },
               onEndpoint: () => {
-                if (!reconnectOwnerIsCurrent()) return;
+                if (!reconnectOwnerIsCurrent(true)) return;
                 processorRef.current?.onEndpoint();
               },
               onError: (error) => {
@@ -1374,17 +1383,25 @@ export function useSoniox(
       return;
     }
     recordingRef.current = null;
+    const previousRunId = runIdRef.current;
+    drainingRunIdRef.current = previousRunId;
     runIdRef.current += 1;
+    const rotationRunId = runIdRef.current;
     void (async () => {
       try {
         await current.recording.stop?.();
       } catch {
-        // 旧句柄回调已失效，stop 失败无副作用（连接反正会被 Soniox 到点断掉）
+        // 断线时保留已收转录，归档录音仍连续。
+      } finally {
+        if (drainingRunIdRef.current === previousRunId) drainingRunIdRef.current = null;
       }
+      if (accountBoundaryInvalidatedRef.current || runIdRef.current !== rotationRunId ||
+          useTranscriptStore.getState().recordingState !== 'recording') return;
+      processorRef.current?.onEndpoint();
+      reconnectAttemptsRef.current = 0;
+      shouldReconnectRef.current = true;
+      void attemptReconnect();
     })();
-    reconnectAttemptsRef.current = 0;
-    shouldReconnectRef.current = true;
-    void attemptReconnect();
   }, [attemptReconnect]);
 
   useEffect(() => {
@@ -1509,10 +1526,10 @@ export function useSoniox(
 
       const runId = runIdRef.current + 1;
       runIdRef.current = runId;
-      const startOwnerIsCurrent = () =>
+      const startOwnerIsCurrent = (allowDraining = false) =>
         !ownerSignal.aborted &&
         !accountBoundaryInvalidatedRef.current &&
-        runId === runIdRef.current;
+        (runId === runIdRef.current || (allowDraining && drainingRunIdRef.current === runId));
 
       // Consume pre-acquired system audio stream if available
       const preAcquiredStream =
@@ -1580,7 +1597,7 @@ export function useSoniox(
           token,
           {
             onPartialResult: (tokens) => {
-              if (!startOwnerIsCurrent()) {
+              if (!startOwnerIsCurrent(true)) {
                 return;
               }
               if (tokens.length > 0) {
@@ -1590,7 +1607,7 @@ export function useSoniox(
               updateTranscriptionLatency(tokens as RealtimeToken[]);
             },
             onEndpoint: () => {
-              if (!startOwnerIsCurrent()) {
+              if (!startOwnerIsCurrent(true)) {
                 return;
               }
               processor.onEndpoint();
@@ -2143,13 +2160,15 @@ export function useSoniox(
     // 注意 pause() 刻意**不**清它 —— 服务端倒计时在暂停期间照走，恢复时正要靠它复核剩余寿命。
     grantHardCutAtRef.current = null;
 
-    // 递增 runId 使所有在途的录音回调全部失效
+    const stoppingRunId = runIdRef.current;
+    // 控制回调仍立即失效，但保留当前句柄 stop() 期间的末尾转录回调。
     runIdRef.current += 1;
 
     const current = recordingRef.current;
     const activeRecording = current?.recording;
     const archiveManager = archiveManagerRef.current;
     recordingRef.current = null;
+    drainingRunIdRef.current = activeRecording ? stoppingRunId : null;
 
     // v2.1: transition through FINALIZING before STOPPED
     setRecordingState('finalizing');
@@ -2159,11 +2178,15 @@ export function useSoniox(
       await activeRecording?.stop?.();
     } catch (error) {
       console.error('Error stopping recording:', error);
+    } finally {
+      if (drainingRunIdRef.current === stoppingRunId) drainingRunIdRef.current = null;
     }
 
+    let archiveStopError: unknown;
     try {
       await archiveManager?.stop();
     } catch (error) {
+      archiveStopError = error;
       console.error('Error stopping archive recorder:', error);
     }
 
@@ -2192,6 +2215,7 @@ export function useSoniox(
     setRecordingStartTime(null);
 
     setRecordingState('stopped');
+    if (archiveStopError) throw archiveStopError;
   }, [cancelStableConn, sessionId, setConnectionState, setRecordingStartTime, setRecordingState]);
 
   // H2 不变式：pause() 刻意**不** bump runIdRef —— 短暂停复用句柄（startImpl 的 paused 分支）
@@ -2370,7 +2394,7 @@ export function useSoniox(
 
       segmentOffset += 1;
       const rescuedSegment: import('@/types/transcript').TranscriptSegment = {
-        id: `seg-${segmentOffset}`,
+        id: `seg-recovered-${crypto.randomUUID()}`,
         sessionIndex: storeState.currentSessionIndex,
         speaker: '',
         language: lastSeg?.language ?? 'en',

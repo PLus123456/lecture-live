@@ -24,9 +24,9 @@ import {
   rollbackStagedArtifact,
 } from '@/lib/sessionPersistence';
 import {
-  deleteTranscriptDraft,
   loadTranscriptDraft,
 } from '@/lib/transcriptDraftPersistence';
+import { mergeTranscriptBundles } from '@/lib/mergeTranscriptBundles';
 import { invalidateRagCache } from '@/lib/llm/embedding/transcriptRag';
 import { StoredArtifactQuotaExceededError } from '@/lib/storage/storedArtifactLedger';
 
@@ -84,19 +84,12 @@ export async function POST(
     const body = await readBoundedSessionJson(req);
     let bundle = admitPersistedTranscriptBundle(body);
 
-    // 如果客户端提交的 segments 为空，尝试从服务端草稿恢复
-    if (bundle.segments.length === 0) {
-      const draft = await loadTranscriptDraft(session);
-      if (draft && draft.segments.length > 0) {
-        bundle = {
-          segments: draft.segments,
-          summaries: bundle.summaries.length ? bundle.summaries : draft.summaries,
-          translations: Object.keys(bundle.translations).length > 0
-            ? bundle.translations
-            : draft.translations,
-        };
-      }
+    const published = session.transcriptPath ? await loadSessionTranscriptBundle(session) : null;
+    if (session.transcriptPath && !published) {
+      throw new Error('Published transcript is unavailable; preserving recovery state');
     }
+    const draft = await loadTranscriptDraft(session);
+    bundle = mergeTranscriptBundles(mergeTranscriptBundles(published, draft), bundle);
 
     // Drafts written by an older deployment may predate the strict request
     // schema. Re-admit the merged graph at the last boundary before staging.
@@ -118,6 +111,8 @@ export async function POST(
           where: {
             id: id,
             status: { notIn: ['COMPLETED', 'ARCHIVED'] },
+            finalizeLockedAt: null,
+            transcriptPath: session.transcriptPath ?? null,
           },
           data: {
             transcriptPath: staged.transcript.reference,
@@ -166,7 +161,7 @@ export async function POST(
         rollbackStagedArtifact(session, staged.summary),
       ]);
       return NextResponse.json(
-        { error: 'Cannot overwrite transcript of a finalized session' },
+        { error: 'Session transcript changed or is being finalized; retry saving' },
         { status: 409 }
       );
     }
@@ -204,12 +199,7 @@ export async function POST(
     // 避免全局/单录音对话继续检索到改写前的旧文本（v3 finding U76 后半）。
     invalidateRagCache(session.id);
 
-    // 转录稿已永久保存，删除草稿临时文件
-    try {
-      await deleteTranscriptDraft(session);
-    } catch {
-      // 清理失败不影响响应
-    }
+    // 非终态会话仍可能收到新草稿；由最终收尾封存、合并成功后统一清理。
 
     return NextResponse.json({
       success: true,

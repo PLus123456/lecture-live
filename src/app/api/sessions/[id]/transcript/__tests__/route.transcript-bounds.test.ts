@@ -60,6 +60,7 @@ vi.mock('@/lib/llm/embedding/transcriptRag', () => ({
 
 import { POST } from '@/app/api/sessions/[id]/transcript/route';
 import { StoredArtifactQuotaExceededError } from '@/lib/storage/storedArtifactLedger';
+import { deleteTranscriptDraft } from '@/lib/transcriptDraftPersistence';
 
 const params = Promise.resolve({ id: 'session-1' });
 const validSegment = (overrides: Record<string, unknown> = {}) => ({
@@ -138,6 +139,21 @@ describe('session transcript persistence admission (SEC-009)', () => {
         segments: [expect.objectContaining({ id: 'segment-1' })],
       })
     );
+  });
+
+  it('非空但不完整的快照合并草稿，保存后不删除仍会更新的草稿', async () => {
+    mocks.loadDraft.mockResolvedValue({
+      segments: [validSegment({ id: 'draft-only', text: 'earlier content' })],
+      summaries: [], translations: {},
+    });
+    const response = await POST(request(), { params });
+    expect(response.status).toBe(200);
+    expect(mocks.stageArtifacts.mock.calls[0][1].segments.map((segment: { id: string }) => segment.id))
+      .toEqual(['draft-only', 'segment-1']);
+    expect(deleteTranscriptDraft).not.toHaveBeenCalled();
+    expect(mocks.sessionUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ finalizeLockedAt: null, transcriptPath: null }),
+    }));
   });
 
   it('rejects an unknown nested field before staging any artifact', async () => {

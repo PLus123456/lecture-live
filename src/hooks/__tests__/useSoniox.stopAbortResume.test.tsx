@@ -212,7 +212,7 @@ describe('useSoniox 审计 #6：stop() 收尾失败回落 paused 后续录', () 
     const created = segments[segments.length - 1];
     // 修复前：新段 id 为 seg-1（与第一段撞号）、globalStartMs 为 100（叠回开头）。
     expectUniqueIds();
-    expect(created.id).toBe('seg-4');
+    expect(created.id).toMatch(/^seg-[a-f0-9-]{36}-4$/);
     expect(created.globalStartMs).toBeGreaterThanOrEqual(35_000);
   });
 
@@ -227,7 +227,8 @@ describe('useSoniox 审计 #6：stop() 收尾失败回落 paused 后续录', () 
       lastCb().onConnectionChange('connected');
     });
     speakOneSentence('first sentence.');
-    expect(useTranscriptStore.getState().segments.map((s) => s.id)).toEqual(['seg-1']);
+    expect(useTranscriptStore.getState().segments.map((s) => s.id))
+      .toEqual([expect.stringMatching(/^seg-[a-f0-9-]{36}-1$/)]);
     const firstEnd = useTranscriptStore.getState().segments[0].globalEndMs;
 
     await act(async () => {
@@ -248,7 +249,7 @@ describe('useSoniox 审计 #6：stop() 收尾失败回落 paused 后续录', () 
 
     const segments = useTranscriptStore.getState().segments;
     expectUniqueIds();
-    expect(segments[segments.length - 1].id).toBe('seg-2');
+    expect(segments[segments.length - 1].id).toMatch(/^seg-[a-f0-9-]{36}-2$/);
     expect(segments[segments.length - 1].globalStartMs).toBeGreaterThanOrEqual(firstEnd);
   });
 });

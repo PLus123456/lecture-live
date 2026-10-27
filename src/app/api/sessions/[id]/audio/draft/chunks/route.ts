@@ -158,6 +158,13 @@ export async function POST(
       seq,
       mimeType: normalizedMimeType,
       data: buffer,
+      // multipart 解析期间会话可能已收尾。锁内重新检查，不能复用入口的旧快照。
+      guard: async () => {
+        const fresh = await prisma.session.findUnique({
+          where: { id }, select: { status: true, recordingPath: true },
+        });
+        return Boolean(fresh && fresh.status !== 'COMPLETED' && fresh.status !== 'ARCHIVED' && !fresh.recordingPath);
+      },
     });
 
     return NextResponse.json({

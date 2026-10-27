@@ -148,7 +148,10 @@ vi.mock('@/lib/storage/storedArtifactLedger', () => ({
     }
   ),
   getActiveStoredArtifactByLogicalKey: vi.fn(
-    async (logicalKey: string) => ledgerHarness.active.get(logicalKey) ?? null
+    async (logicalKey: string) => {
+      const row = ledgerHarness.active.get(logicalKey);
+      return row?.state === 'ACTIVE' ? row : null;
+    }
   ),
   getStoredArtifactById: vi.fn(
     async (id: string) => ledgerHarness.rows.get(id) ?? null
@@ -195,6 +198,12 @@ vi.mock('fs/promises', () => {
       writeFile: vi.fn(async (p: string, data: string) => {
         mockFiles.set(p, data);
       }),
+      link: vi.fn(async (from: string, to: string) => {
+        if (mockFiles.has(to)) throw Object.assign(new Error('EEXIST'), { code: 'EEXIST' });
+        if (!mockFiles.has(from)) throw enoent();
+        mockFiles.set(to, mockFiles.get(from)!);
+      }),
+      unlink: vi.fn(async (p: string) => { mockFiles.delete(p); }),
       rename: vi.fn(async (from: string, to: string) => {
         if (!mockFiles.has(from)) throw enoent();
         mockFiles.set(to, mockFiles.get(from)!);
@@ -247,7 +256,11 @@ const session = { id: 'sess-1', userId: 'user-1' };
 
 function mkPayload(n: number): TranscriptDraftPayload {
   return {
-    segments: Array.from({ length: n }, (_, i) => ({ id: `seg-${i + 1}`, text: `t${i + 1}` })),
+    segments: Array.from({ length: n }, (_, i) => ({
+      id: `seg-${i + 1}`, text: `t${i + 1}`, sessionIndex: 0,
+      speaker: '', language: 'zh', globalStartMs: i * 1000, globalEndMs: (i + 1) * 1000,
+      startMs: i * 1000, endMs: (i + 1) * 1000, isFinal: true, confidence: 1, timestamp: '00:00:00',
+    })),
     summaries: [],
     translations: {},
     clientTs: 1000 + n,
@@ -306,7 +319,7 @@ describe('persistTranscriptDraft 单调守卫（转录 draft 防覆盖）', () =
     );
     mockOpen.mockClear();
 
-    await expect(loadTranscriptDraft(session)).resolves.toBeNull();
+    await expect(loadTranscriptDraft(session)).rejects.toThrow(/read limit/);
     expect(mockOpen).not.toHaveBeenCalled();
   });
 
@@ -384,5 +397,39 @@ describe('L17② 终态守卫在临界区内复核（seal/finalize 竞态）', (
     // 旧行为：草稿目录被重建后永远没人清理（DELETE 已经过去了），冷恢复还会读到它。
     expect(await loadTranscriptDraftManifest(session)).toBeNull();
     expect(await loadTranscriptDraft(session)).toBeNull();
+  });
+});
+
+
+describe('恢复快照合并与发布保护', () => {
+  it('较短快照包含新的尾段时同时保留旧正文和新尾段', async () => {
+    await persistTranscriptDraft(session, mkPayload(5));
+    const tail = mkPayload(6);
+    tail.segments = tail.segments.slice(5);
+    await persistTranscriptDraft(session, tail);
+    expect((await loadTranscriptDraft(session))?.segments).toHaveLength(6);
+  });
+
+  it('等长快照不是完整度证明，缺失旧段时仍取两个快照的并集', async () => {
+    await persistTranscriptDraft(session, mkPayload(2));
+    const incoming = mkPayload(4);
+    incoming.segments = incoming.segments.slice(2);
+    await persistTranscriptDraft(session, incoming);
+    expect((await loadTranscriptDraft(session))?.segments).toHaveLength(4);
+  });
+
+  it('发布前守卫失效只丢弃新版本，既有转录仍可用于重试收尾', async () => {
+    await persistTranscriptDraft(session, mkPayload(3));
+    let calls = 0;
+    await expect(persistTranscriptDraft(session, mkPayload(4), {
+      guard: async () => ++calls === 1,
+    })).rejects.toBeInstanceOf(TranscriptDraftRejectedError);
+    expect((await loadTranscriptDraft(session))?.segments).toHaveLength(3);
+  });
+
+  it('账本读取失败必须上抛，不能把故障当成无草稿完成收尾', async () => {
+    const ledger = await import('@/lib/storage/storedArtifactLedger');
+    vi.mocked(ledger.getActiveStoredArtifactByLogicalKey).mockRejectedValueOnce(new Error('database offline'));
+    await expect(loadTranscriptDraft(session)).rejects.toThrow('database offline');
   });
 });

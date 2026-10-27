@@ -4,6 +4,9 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const sessionFindUnique = vi.hoisted(() => vi.fn());
+vi.mock('@/lib/prisma', () => ({ prisma: { session: { findUnique: sessionFindUnique } } }));
+
 const ledgerHarness = vi.hoisted(() => {
   class PublishConflictError extends Error {}
   class OutcomeUnknownError extends Error {}
@@ -100,7 +103,10 @@ vi.mock('@/lib/storage/storedArtifactLedger', () => ({
     }
   ),
   getActiveStoredArtifactByLogicalKey: vi.fn(
-    async (logicalKey: string) => ledgerHarness.active.get(logicalKey) ?? null
+    async (logicalKey: string) => {
+      const row = ledgerHarness.active.get(logicalKey);
+      return row?.state === 'ACTIVE' ? row : null;
+    }
   ),
   getStoredArtifactById: vi.fn(
     async (id: string) => ledgerHarness.rows.get(id) ?? null
@@ -152,6 +158,7 @@ describe('recordingDraftPersistence', () => {
 
   beforeEach(async () => {
     ledgerHarness.reset();
+    sessionFindUnique.mockReset().mockResolvedValue(null);
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'recording-draft-test-'));
   });
 
@@ -640,6 +647,87 @@ describe('recordingDraftPersistence', () => {
     expect(
       await mod.listRecordingDraftSeqs({ id: 'stale-sess', userId: 'user-1' })
     ).toEqual([]);
+  });
+
+  it('写首片中断时清单绝不暴露半截容器头，重传仍能保存完整字节', async () => {
+    const mod = await loadModule(tmpDir);
+    const write = fs.writeFile.bind(fs);
+    let fail = true;
+    vi.spyOn(fs, 'writeFile').mockImplementation(async (...args) => {
+      if (String(args[0]).includes('.chunk.') && fail) {
+        fail = false;
+        await write(args[0], Buffer.from([0x1a]));
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      }
+      return write(...args);
+    });
+    await expect(mod.persistRecordingDraftChunk(session, {
+      seq: 0, mimeType: 'audio/webm', data: mkChunk(0),
+    })).rejects.toThrow('disk full');
+    expect(await mod.listRecordingDraftSeqs(session)).toEqual([]);
+    await mod.persistRecordingDraftChunk(session, { seq: 0, mimeType: 'audio/webm', data: mkChunk(0) });
+    expect((await mod.mergeRecordingDraftChunks(session))?.buffer).toEqual(mkChunk(0));
+  });
+
+  it('旧首片只有 RESERVED 账本时重试必须重新发布，回收旧预留不会删除新首片', async () => {
+    const mod = await loadModule(tmpDir);
+    const ledger = await import('@/lib/storage/storedArtifactLedger');
+    const chunks = path.join(tmpDir, 'data', 'recording-drafts', session.id, 'chunks');
+    await fs.mkdir(chunks, { recursive: true });
+    const oldPath = path.join(chunks, '00000000.chunk');
+    const header = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3, 4]);
+    await fs.writeFile(oldPath, header);
+    const old = await ledger.reserveStoredArtifact({
+      userId: session.userId, ownerType: 'draft', ownerId: session.id, sessionId: session.id,
+      artifactType: ledger.STORED_ARTIFACT_TYPE.RECORDING_DRAFT, expectedBytes: header.length,
+      logicalKey: ledger.buildStoredArtifactLogicalKey('draft', `${session.id}:chunk:0`, ledger.STORED_ARTIFACT_TYPE.RECORDING_DRAFT),
+    });
+    await ledger.recordReservedStoredArtifactLocation(old.id, {
+      actualBytes: header.length, storage: 'local', reference: `local:recording-drafts/${session.id}/chunks/00000000.chunk`,
+    });
+    await mod.persistRecordingDraftChunk(session, { seq: 0, mimeType: 'audio/webm', data: header });
+    // 模拟后台清理原来的 RESERVED 文件；新确认上传的副本必须独立存在。
+    await fs.rm(oldPath);
+    expect(await mod.listRecordingDraftSeqs(session)).toEqual([0]);
+    expect((await mod.mergeRecordingDraftChunks(session))?.buffer).toEqual(header);
+  });
+
+  it('停止收据发现连续前缀缺尾时仍判为缺片', async () => {
+    const mod = await loadModule(tmpDir);
+    await mod.persistRecordingDraftChunk(session, { seq: 0, mimeType: 'audio/webm', data: mkChunk(0) });
+    await mod.sealRecordingDraft(session, 2);
+    expect((await mod.mergeRecordingDraftChunks(session))?.hasGap).toBe(true);
+    await mod.unsealRecordingDraft(session);
+    await mod.persistRecordingDraftChunk(session, { seq: 1, mimeType: 'audio/webm', data: mkChunk(1) });
+    await mod.sealRecordingDraft(session, 2);
+    expect((await mod.mergeRecordingDraftChunks(session))?.hasGap).toBe(false);
+  });
+
+  it('旧收尾失败者不能解除新持有者的封存', async () => {
+    const mod = await loadModule(tmpDir);
+    await mod.sealRecordingDraft(session, 1, 'old-owner');
+    await mod.sealRecordingDraft(session, 1, 'new-owner');
+    await mod.unsealRecordingDraft(session, 'old-owner');
+    expect(await mod.isRecordingDraftSealed(session)).toBe(true);
+    await mod.unsealRecordingDraft(session, 'new-owner');
+    expect(await mod.isRecordingDraftSealed(session)).toBe(false);
+  });
+
+  it.each(['RECORDING', 'PAUSED', 'FINALIZING', 'COMPLETED'])('过期清扫保留仍属于 %s 会话的恢复数据', async (status) => {
+    const mod = await loadModule(tmpDir);
+    await mod.persistRecordingDraftChunk(session, { seq: 1, mimeType: 'audio/webm', data: mkChunk(1) });
+    sessionFindUnique.mockResolvedValue({ id: session.id, status });
+    const result = await mod.sweepStaleRecordingDrafts({ now: Date.now() + 72 * 60 * 60_000 });
+    expect(result.removed).toBe(0);
+    expect(await mod.listRecordingDraftSeqs(session)).toEqual([1]);
+  });
+
+  it('存储目录读取故障不能伪装成空录音清单', async () => {
+    const mod = await loadModule(tmpDir);
+    await mod.persistRecordingDraftChunk(session, { seq: 0, mimeType: 'audio/webm', data: mkChunk(0) });
+    vi.spyOn(fs, 'readdir').mockRejectedValueOnce(Object.assign(new Error('read failed'), { code: 'EIO' }));
+    await expect(mod.loadRecordingDraftManifest(session)).rejects.toThrow('read failed');
+    expect(await mod.listRecordingDraftSeqs(session)).toEqual([0]);
   });
 
   it('deleteRecordingDraft 同时清掉 manifest 和全部 chunks', async () => {

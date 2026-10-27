@@ -335,6 +335,7 @@ export default {
       stepStop: '正在停止 Soniox 会话...',
       stepSync: '正在同步数据',
       summaryIncomplete: '部分阶段摘要未能生成；转录已保留，最终报告仍会使用完整文字稿。',
+      transcriptIncomplete: '转录稿尚未保存到服务器，已暂停收尾。请保持页面打开，网络恢复后点击「重试保存」。',
       stepFinalize: '正在服务端完成保存',
       missingToken: '认证令牌缺失',
       failed: '保存失败',

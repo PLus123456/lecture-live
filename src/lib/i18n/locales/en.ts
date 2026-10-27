@@ -349,6 +349,7 @@ export default {
       stepStop: 'Stopping Soniox session...',
       stepSync: 'Syncing final data',
       summaryIncomplete: 'Some stage summaries could not be generated. Your transcript is preserved and the final report will still use the full text.',
+      transcriptIncomplete: 'Your transcript has not been saved to the server. Keep this page open and retry saving when the connection recovers.',
       stepFinalize: 'Finalizing on server',
       missingToken: 'Missing authentication token',
       failed: 'Failed to finalize session',

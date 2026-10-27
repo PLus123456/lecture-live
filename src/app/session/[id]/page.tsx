@@ -1029,12 +1029,7 @@ export default function ActiveSessionPage() {
               { label: t('session.finalizing.stepSync'), status: 'done' },
               { label: t('session.finalizing.stepFinalize'), status: 'done' },
             ]);
-            // 清除本地缓存
-            try {
-              sessionStorage.removeItem('lecture-live-transcript');
-              sessionStorage.removeItem('lecture-live-translations');
-              sessionStorage.removeItem('lecture-live-summary');
-            } catch { /* silent */ }
+            // 仅观察到 COMPLETED 不能证明本机尾段已被接收，保留本地恢复副本。
             // 导航定时器本身也必须复验 owner；600ms 内切 B 不能再跳 A 回放。
             navigationTimer = setTimeout(() => {
               void runAuthBoundaryCommit(ownerBoundary, () => {
@@ -1089,8 +1084,19 @@ export default function ActiveSessionPage() {
           fetch(`/api/sessions/${sessionId}/finalize`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-            body: JSON.stringify({}),
-          }).catch(() => { /* server-side draft 是主要数据源，空 body 即可 */ });
+            body: JSON.stringify(
+              isLiveStoreOwnedBy(useTranscriptStore.getState().activeSessionId, sessionId)
+                ? {
+                    segments: useTranscriptStore.getState().segments,
+                    summaries: useSummaryStore.getState().blocks,
+                    translations: useTranslationStore.getState().translations,
+                  }
+                : {}
+            ),
+          }).then((response) => {
+            // 网络/存储暂时失败仍允许下一轮重试，不能只试一次后永远停在遮罩。
+            if (!response.ok) retried = false;
+          }).catch(() => { retried = false; });
         }
       } catch (error) {
         if (
@@ -1244,7 +1250,7 @@ export default function ActiveSessionPage() {
 
   // 录制期间每 15 秒自动上传转录稿草稿到服务器
   const transcriptDraftTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const lastDraftSegCountRef = useRef(0);
+  const lastDraftSnapshotRef = useRef<string | null>(null);
   useEffect(() => {
     if (transcriptDraftTimerRef.current) {
       clearInterval(transcriptDraftTimerRef.current);
@@ -1292,26 +1298,28 @@ export default function ActiveSessionPage() {
     const uploadDraft = async () => {
       if (!ownsLiveStore()) return;
       const currentSegments = useTranscriptStore.getState().segments;
-      // 没有新 segment 时跳过
-      if (currentSegments.length === 0 || currentSegments.length === lastDraftSegCountRef.current) {
-        return;
-      }
-      const attemptedCount = currentSegments.length;
+      if (currentSegments.length === 0) return;
+      const payload = JSON.parse(buildDraftBody());
+      delete payload.clientTs;
+      const snapshot = JSON.stringify(payload);
+      // 迟到译文、最后一句更新或摘要更新也需要保存，不能仅比较段数。
+      if (snapshot === lastDraftSnapshotRef.current) return;
+      const body = JSON.stringify({ ...payload, clientTs: Date.now() });
 
       try {
         const res = await fetch(`/api/sessions/${sessionId}/transcript/draft`, {
           method: 'PUT',
           headers: draftHeaders,
-          keepalive: true,
-          body: buildDraftBody(),
+          // 课堂全文会超过 keepalive 的 64KiB 上限，正常备份必须使用普通请求。
+          body,
         });
-        // 只在成功后推进已上传段数：否则一次瞬时失败/非 2xx 会把这批段永久标记为「已传」，
+        // 只在成功后推进已上传快照：否则一次瞬时失败/非 2xx 会把这批段永久标记为「已传」，
         // 该快照永不重传（审计 medium）。失败则保持不变，下个周期重试。
         if (res.ok) {
-          lastDraftSegCountRef.current = attemptedCount;
+          lastDraftSnapshotRef.current = snapshot;
         }
       } catch {
-        // 静默失败，保持 lastDraftSegCountRef 不变，下次重试
+        // 保持已上传快照不变，下次重试。
       }
     };
 
@@ -1331,13 +1339,15 @@ export default function ActiveSessionPage() {
         return;
       }
       if (tState.segments.length === 0) return;
+      const body = buildDraftBody();
       try {
         void fetch(`/api/sessions/${sessionId}/transcript/draft`, {
           method: 'PUT',
           headers: draftHeaders,
-          keepalive: true,
-          body: buildDraftBody(),
-        });
+          // 大快照在切后台/SPA 离开时仍尝试普通上传；不能让 keepalive 在发送前拒绝它。
+          keepalive: new Blob([body]).size <= 48 * 1024,
+          body,
+        }).catch(() => undefined);
       } catch {
         /* best-effort on unload */
       }
@@ -1566,7 +1576,7 @@ export default function ActiveSessionPage() {
       steps[1].status = 'active';
       setFinalizingSteps([...steps]);
 
-      // ── Step 2: Best-effort 最终同步（确保服务端 draft 是最新的）──
+      // ── Step 2: 最终同步（转录确认落库后才允许封存音频）──
       const transcriptSegments = useTranscriptStore.getState().segments;
       if (realtimeSummaryEnabled) {
         const complete = await flushSummary(transcriptSegments, ownerSignal);
@@ -1584,7 +1594,6 @@ export default function ActiveSessionPage() {
         const transcriptRes = await fetch(`/api/sessions/${sessionId}/transcript/draft`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          keepalive: true,
           body: JSON.stringify({
             segments: transcriptSegments,
             summaries: summaryBlocks,
@@ -1593,13 +1602,11 @@ export default function ActiveSessionPage() {
           }),
         });
         if (!transcriptRes.ok) {
-          console.warn(
-            `Final transcript draft flush returned ${transcriptRes.status} before seal; ` +
-              'last transcript segments may not have landed'
-          );
+          throw new Error(`Transcript draft returned ${transcriptRes.status}`);
         }
       } catch (err) {
         console.warn('Final transcript draft flush failed before seal:', err);
+        throw new Error(t('session.finalizing.transcriptIncomplete'));
       }
       await assertOwner();
 

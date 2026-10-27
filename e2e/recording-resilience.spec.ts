@@ -440,3 +440,77 @@ test('草稿收尾被存储配额拒绝(402)：本地录音必须保留，不静
     )
   ).not.toBeNull();
 });
+
+
+test('最终转录备份失败时不封存音频、不定稿，保留本地文字供重试', async ({ page }) => {
+  await installSessionApiMocks(page);
+  await page.route(`**/api/sessions/${SESSION_ID}/transcript/draft`, async (route) => {
+    if (route.request().method() === 'PUT') {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"storage unavailable"}' });
+    } else {
+      await route.fallback();
+    }
+  });
+  const finalizeRequests: string[] = [];
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && request.url().includes('/finalize')) finalizeRequests.push(request.url());
+  });
+  await loginThroughUi(page);
+  await seedRecordingSnapshot(page);
+  await page.goto(`/session/${SESSION_ID}`);
+  await page.getByRole('button', { name: 'Stop', exact: true }).first().click();
+  await expect(page.getByText('Your transcript has not been saved to the server.', { exact: false }).first()).toBeVisible();
+  expect(finalizeRequests).toEqual([]);
+  expect(await page.evaluate(() => sessionStorage.getItem('lecture-live-transcript'))).not.toBeNull();
+  await expect(page).toHaveURL(new RegExp(`/session/${SESSION_ID}$`));
+});
+
+test('长课堂全文超过 64KiB 仍持续备份，并在停止前发送完整转录', async ({ page }) => {
+  test.setTimeout(60_000);
+  await installSessionApiMocks(page);
+  await loginThroughUi(page);
+  await seedRecordingSnapshot(page);
+  await page.addInitScript(() => {
+    const raw = sessionStorage.getItem('lecture-live-transcript');
+    if (!raw) return;
+    const snapshot = JSON.parse(raw);
+    const base = snapshot.state.segments[0];
+    snapshot.state.segments = Array.from({ length: 8 }, (_, i) => ({
+      ...base, id: `long-${i}`, text: `Part ${i}: ` + 'classroom transcript '.repeat(600),
+      startMs: i * 1000, globalStartMs: i * 1000, endMs: (i + 1) * 1000, globalEndMs: (i + 1) * 1000,
+    }));
+    sessionStorage.setItem('lecture-live-transcript', JSON.stringify(snapshot));
+  });
+  const draftBodies: string[] = [];
+  const finalizeBodies: Array<{ segments?: unknown[] }> = [];
+  page.on('request', (request) => {
+    if (request.url().endsWith(`/api/sessions/${SESSION_ID}/transcript/draft`) && request.method() === 'PUT') {
+      draftBodies.push(request.postData() ?? '');
+    }
+    if (request.url().endsWith(`/api/sessions/${SESSION_ID}/finalize`) && request.method() === 'POST') {
+      finalizeBodies.push(JSON.parse(request.postData() ?? '{}'));
+    }
+  });
+  await page.goto(`/session/${SESSION_ID}`);
+  await expect.poll(() => draftBodies.some((body) => Buffer.byteLength(body) > 65_536), { timeout: 15_000 }).toBe(true);
+  await page.getByRole('button', { name: 'Stop', exact: true }).first().click();
+  await expect.poll(() => finalizeBodies[0]?.segments?.length, { timeout: 20_000 }).toBe(8);
+  expect(draftBodies.length).toBeGreaterThanOrEqual(2);
+});
+
+test('刷新恢复 FINALIZING 时提交本地独有转录，观察到完成也不删除唯一缓存', async ({ page }) => {
+  test.setTimeout(60_000);
+  await installSessionApiMocks(page, { sessionStatus: 'FINALIZING' });
+  await loginThroughUi(page);
+  await seedRecordingSnapshot(page);
+  let recoveredBody: { segments?: Array<{ text: string }> } | undefined;
+  page.on('request', (request) => {
+    if (request.url().endsWith(`/api/sessions/${SESSION_ID}/finalize`) && request.method() === 'POST') {
+      recoveredBody = JSON.parse(request.postData() ?? '{}');
+    }
+  });
+  await page.goto(`/session/${SESSION_ID}`);
+  await expect.poll(() => recoveredBody?.segments?.[0]?.text, { timeout: 20_000 }).toBe('hello world from before refresh');
+  await expect(page).toHaveURL(new RegExp(`/session/${SESSION_ID}/playback`), { timeout: 25_000 });
+  expect(await page.evaluate(() => sessionStorage.getItem('lecture-live-transcript'))).toContain('hello world from before refresh');
+});

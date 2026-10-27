@@ -1,6 +1,7 @@
 import type { Prisma, SessionStatus } from '@prisma/client';
 import type { UserPayload } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { mergeTranscriptBundles } from '@/lib/mergeTranscriptBundles';
 import { assertOwnership } from '@/lib/security';
 import {
   mergeRecordingDraftChunks,
@@ -241,26 +242,22 @@ export async function finalizeSession(
   try {
     // P1-7 契约3：持锁后先封存草稿，阻断收尾期间迟到的 audio 分片 / transcript 草稿写入
     // （seal 后两者一律 409），杜绝在「读取草稿快照 → 合并 → 删草稿」窗口内到达的写丢数据。
-    await sealRecordingDraft(session).catch(() => undefined);
+    await sealRecordingDraft(session, undefined, lockTimestamp.toISOString());
 
     let transcriptPath = session.transcriptPath;
     let summaryPath = session.summaryPath;
-    let bundle: PersistedTranscriptBundle | null = null;
-    let transcriptMissing = false;
-
-    if (!transcriptPath) {
-      bundle = await resolveTranscriptBundle(session, options.clientBundle);
-      if (!bundle || bundle.segments.length === 0) {
-        bundle = {
-          segments: [],
-          summaries: [],
-          translations: {},
-        };
-        transcriptMissing = true;
-      }
-    } else {
-      bundle = await loadSessionTranscriptBundle(session).catch(() => null);
+    const publishedBundle = transcriptPath
+      ? await loadSessionTranscriptBundle(session)
+      : null;
+    if (transcriptPath && !publishedBundle) {
+      throw new Error('Published transcript is unavailable; preserving recovery state');
     }
+    // 录制中走过旧保存接口也不能跳过草稿和最后一批客户端结果。
+    const bundle = await resolveTranscriptBundle(session, options.clientBundle, publishedBundle)
+      ?? EMPTY_TRANSCRIPT_BUNDLE;
+    const transcriptMissing = bundle.segments.length === 0;
+    const transcriptNeedsPublication = !transcriptPath ||
+      JSON.stringify(bundle) !== JSON.stringify(publishedBundle);
 
     const normalizedClientDurationMs =
       typeof options.clientDurationMs === 'number' &&
@@ -320,6 +317,10 @@ export async function finalizeSession(
     // 事务提交（CAS 成功）后 publish，锁被接管(lockLost)则 rollback 删掉临时对象，绝不残留孤儿。
     if (!recordingPath) {
       const merged = await mergeRecordingDraftChunks(session);
+      if ((isAutoReclaim && !merged) || (merged && merged.manifest.expectedChunkCount === undefined)) {
+        // 连续的前缀无法证明尾部已齐。没有客户端停止收据时保持可补传，不能自动置终态。
+        throw new FinalizeSessionError(409, { error: 'Recording is awaiting client recovery', recoveryRequired: true });
+      }
       if (merged) {
         // 草稿有缺口时，自动回收也必须保留恢复入口。发布连续前缀后删除全部草稿会永久
         // 丢掉缺口之后的音频；首块缺失时前缀甚至为空。等待原设备补传后再完成收尾。
@@ -400,7 +401,7 @@ export async function finalizeSession(
     billingDurationMs = withMeasuredStreamFloorMs(billingDurationMs, grantActualMs);
     const billableMinutes = getBillableMinutes(billingDurationMs);
 
-    if (!transcriptPath) {
+    if (transcriptNeedsPublication) {
       stagedTranscriptArtifacts = await stageSessionTranscriptArtifacts(
         session,
         bundle ?? EMPTY_TRANSCRIPT_BUNDLE
@@ -425,6 +426,9 @@ export async function finalizeSession(
           id: options.sessionId,
           status: 'FINALIZING',
           finalizeLockedAt: lockTimestamp,
+          // 入口快照之后若旧保存接口发布过内容，重试读取并合并，不能覆盖并发新版本。
+          transcriptPath: session.transcriptPath,
+          ...(recordingPathResolvedHere ? { recordingPath: session.recordingPath } : {}),
         },
         data: {
           status: 'COMPLETED',
@@ -512,12 +516,16 @@ export async function finalizeSession(
       const latest = await prisma.session.findUnique({
         where: { id: options.sessionId },
         select: {
+          status: true,
           recordingPath: true,
           transcriptPath: true,
           summaryPath: true,
           durationMs: true,
         },
       });
+      if (latest?.status !== 'COMPLETED' && latest?.status !== 'ARCHIVED') {
+        throw new FinalizeSessionError(409, { error: 'Session is still being finalized; retry later' });
+      }
       return {
         success: true,
         alreadyCompleted: true,
@@ -706,7 +714,7 @@ export async function finalizeSession(
     }
     // P1-7：本次收尾未提交（含草稿缺片抛 409 / 其它错误）—— 释放草稿封存，让客户端补传缺失
     // 分片后重试收尾，避免 seal 后永久 409 挡住补传的死锁。best-effort，不影响错误上抛。
-    await unsealRecordingDraft(session).catch(() => undefined);
+    await unsealRecordingDraft(session, lockTimestamp.toISOString()).catch(() => undefined);
     // U43：仅在仍持本次锁时释放（条件匹配 finalizeLockedAt=lockTimestamp），
     // 避免误清另一 finalizer 接管后写入的锁。
     await releaseFinalizeLock(options.sessionId, lockTimestamp);
@@ -795,48 +803,12 @@ function buildFinalizePromotionData(session: {
 
 async function resolveTranscriptBundle(
   session: FinalizeSessionRecord,
-  clientBundle?: PersistedTranscriptBundle | null
+  clientBundle?: PersistedTranscriptBundle | null,
+  publishedBundle?: PersistedTranscriptBundle | null
 ): Promise<PersistedTranscriptBundle | null> {
   const draft = await loadTranscriptDraft(session);
-  const draftSegs = draft?.segments.length ?? 0;
-  const clientSegs = clientBundle?.segments.length ?? 0;
-
-  // 取段数更多的一方为主转录（防陈旧标签用更短的 clientBundle 覆盖服务端更完整的草稿——
-  // 转录只增不减，段数是完整度的可靠代理；审计 medium）。summaries/translations 取任一非空。
-  // 段数相同时优先 clientBundle（本次收尾请求，通常最新）。
-  const pickClient = clientSegs > 0 && clientSegs >= draftSegs;
-
-  let candidate: PersistedTranscriptBundle | null = null;
-  if (pickClient && clientBundle) {
-    candidate = {
-      segments: clientBundle.segments,
-      summaries:
-        clientBundle.summaries?.length > 0
-          ? clientBundle.summaries
-          : (draft?.summaries ?? []),
-      translations:
-        Object.keys(clientBundle.translations ?? {}).length > 0
-          ? clientBundle.translations
-          : (draft?.translations ?? {}),
-    };
-  } else if (draft && draftSegs > 0) {
-    candidate = {
-      segments: draft.segments,
-      summaries:
-        clientBundle?.summaries?.length && clientBundle.summaries.length > 0
-          ? clientBundle.summaries
-          : draft.summaries,
-      translations:
-        clientBundle &&
-        Object.keys(clientBundle.translations ?? {}).length > 0
-          ? clientBundle.translations
-          : draft.translations,
-    };
-  } else if (clientBundle) {
-    candidate = clientBundle;
-  }
-
-  if (!candidate) return null;
+  if (!draft && !clientBundle && !publishedBundle) return null;
+  const candidate = mergeTranscriptBundles(mergeTranscriptBundles(publishedBundle, draft), clientBundle);
   try {
     // Old draft files can predate request admission. The merged object graph is
     // admitted again immediately before finalize persists it.

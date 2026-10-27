@@ -1,8 +1,10 @@
 import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
+import { withSessionDraftLock } from '@/lib/sessionDraftLock';
 import type { Session } from '@prisma/client';
-import { SESSION_TRANSCRIPT_LIMITS } from '@/lib/sessionApi';
+import { SESSION_TRANSCRIPT_LIMITS, admitPersistedTranscriptBundle } from '@/lib/sessionApi';
+import { mergeTranscriptBundles } from '@/lib/mergeTranscriptBundles';
 import {
   STORED_ARTIFACT_TYPE,
   STORED_ARTIFACT_STATE,
@@ -146,7 +148,14 @@ async function resolveDraftSlotPath(
   ) {
     return null;
   }
-  return pathForDraftReference(session, active.reference);
+  const resolved = pathForDraftReference(session, active.reference);
+  if (!resolved) throw new Error('Invalid draft artifact reference');
+  try {
+    await fs.access(resolved);
+  } catch (error) {
+    throw new Error('Referenced draft file is unavailable; preserving recovery state', { cause: error });
+  }
+  return resolved;
 }
 
 interface PreparedTranscriptDraftArtifact {
@@ -313,8 +322,9 @@ async function fileExists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
   }
 }
 
@@ -403,42 +413,9 @@ async function pruneConflictBackups(session: DraftSessionSource): Promise<void> 
   }
 }
 
-// L17①：单调守卫的「读 manifest → 比较段数 → 写数据 → 写 manifest」是四步非原子操作。
-// 两个并发 PUT（客户端每数秒冲刷一次快照，unload keepalive 还会再来一发）可以都读到同一份
-// 旧 manifest、都判定「不缩水、放行」，然后后写者整份覆盖先写者 —— 先写者那一批段直接丢。
-// 录音草稿侧（recordingDraftPersistence）早就用 withManifestLock 把这段关进临界区了，转录侧
-// 一直没有。注意 writeFileAtomic 的 tmp+rename **治不了这条**：原子写解决的是文件撕裂，
-// lost update 与之正交，反而让被覆盖的结果成为一份完整合法的文件、更难察觉。
-// 这里按会话排队单写者（同进程内 HTTP 路由与收尾流程共用本模块）。
-const draftWriteLocks = new Map<string, Promise<void>>();
-
-async function withDraftLock<T>(
-  session: DraftSessionSource,
-  fn: () => Promise<T>
-): Promise<T> {
-  const key = normalizeSessionId(session.id);
-  const prev = draftWriteLocks.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  // 前一个写者失败也必须放行队列，否则一次异常会把该会话的写入永久卡死。
-  const chain = prev.then(
-    () => current,
-    () => current
-  );
-  draftWriteLocks.set(key, chain);
-
-  await prev.catch(() => undefined);
-  try {
-    return await fn();
-  } finally {
-    release();
-    // 队尾仍是自己 ⇒ 无人排在后面，清掉避免 Map 随会话数无限增长。
-    if (draftWriteLocks.get(key) === chain) {
-      draftWriteLocks.delete(key);
-    }
-  }
+// 音频与转录共用同一个跨进程临界区，seal 必须等已开始的转录写入完成。
+async function withDraftLock<T>(session: DraftSessionSource, fn: () => Promise<T>): Promise<T> {
+  return withSessionDraftLock(session.id, fn);
 }
 
 /**
@@ -452,15 +429,7 @@ export class TranscriptDraftRejectedError extends Error {
 }
 
 export interface PersistTranscriptDraftOptions {
-  /**
-   * L17②：在**临界区内**、紧贴写盘前后各求值一次的终态守卫。返回 false 表示这次写入已经
-   * 不该落盘（会话被 seal / 已 finalize）。
-   *
-   * 为什么不能只在路由入口查一次：入口查完 seal 之后还要 `req.text()` + `JSON.parse` 一份
-   * 最大 8MiB 的载荷，这段时间里 finalize 完全可能跑完（读快照 → 删草稿目录）。此后本次 PUT
-   * 会把整个草稿目录**重新创建**出来，而 DELETE 已经过去了 —— 孤儿草稿永久驻留磁盘，冷恢复
-   * 还会读到它。写后再查一次并做补偿删除，把这个窗口彻底关掉。
-   */
+  /** 在共享临界区内、准备前与发布前复核；拒绝时只丢弃本次未发布版本。 */
   guard?: () => Promise<boolean>;
 }
 
@@ -491,12 +460,8 @@ async function persistTranscriptDraftLocked(
   const existing = await loadTranscriptDraftManifest(session);
   const incomingCount = Array.isArray(payload.segments) ? payload.segments.length : 0;
 
-  // 单调守卫：绝不让「更短/重置」的 payload 覆盖掉盘上更完整的草稿。
-  // 与音频 chunk 的 seq 续号防覆盖(#19)对称 —— 音频侧新录音从 maxSeq+1 续号不覆盖旧块，
-  // 转录侧此前是无守卫的整体替换，一旦刷新后「僵尸录音」从 0 段重新 PUT，就把整份转录盖成
-  // 只剩重启后那段。这里命中缩水/重置时：把 incoming 写入带时间戳的 .conflict 备份留档，
-  // 主草稿保持更完整的那份不动（备份文件随 deleteTranscriptDraft 整目录清理，不泄漏）。
-  // 转录在单次会话与冷恢复续录中都只增不减，故正常写入永远 incomingCount >= 现有段数。
+  // 更短快照保留诊断备份，但不能仅按段数拒绝：其中也可能含原草稿没有的新尾段。
+  // 下方按 ID 合并所有已保存正文和新内容，再统一检查大小与发布。
   if (existing && existing.segmentCount > 0 && incomingCount < existing.segmentCount) {
     try {
       const conflictName = `transcript.conflict-${now}-${crypto.randomUUID()}.json`;
@@ -510,26 +475,30 @@ async function persistTranscriptDraftLocked(
       // 全量副本，无上限增长且随会话永久驻留。
       await pruneConflictBackups(session);
     } catch {
-      // 备份失败不阻断：主草稿不动即可，本次 PUT 视为「已保护地忽略」
+      // 诊断备份失败不影响下方合并与正式保存。
     }
     console.warn(
       `[transcriptDraft] 拒绝覆盖草稿：incoming ${incomingCount} 段 < 现有 ${existing.segmentCount} 段，` +
-        `session=${session.id}，已存 .conflict 备份，主草稿保持不变`
+        `session=${session.id}，已存 .conflict 备份，主草稿按 ID 合并保留`
     );
     // L17②：冲突分支同样会（经 ensureDraftDir + 写 .conflict 备份）把目录建回来，补偿检查
     // 一视同仁。
     if (options.guard && !(await options.guard())) {
-      await deleteTranscriptDraft(session).catch(() => {});
       throw new TranscriptDraftRejectedError();
     }
-    return {
-      sessionId: session.id,
-      userId: session.userId,
-      createdAt: existing.createdAt,
-      updatedAt: existing.updatedAt,
-      segmentCount: existing.segmentCount,
-    };
   }
+
+  const previousPayload = await loadTranscriptDraft(session);
+  const bundle = admitPersistedTranscriptBundle(mergeTranscriptBundles(previousPayload, payload));
+  payload = {
+    ...previousPayload,
+    ...payload,
+    ...bundle,
+    clientTs: Math.max(previousPayload?.clientTs ?? 0, payload.clientTs),
+    totalDurationMs: Math.max(previousPayload?.totalDurationMs ?? 0, payload.totalDurationMs ?? 0,
+      ...bundle.segments.map((segment) => (segment as { globalEndMs?: number }).globalEndMs ?? 0)),
+    currentSessionIndex: Math.max(previousPayload?.currentSessionIndex ?? 0, payload.currentSessionIndex ?? 0),
+  };
 
   const manifest: TranscriptDraftManifest = {
     sessionId: session.id,
@@ -561,14 +530,13 @@ async function persistTranscriptDraftLocked(
     await Promise.all(prepared.map(discardPreparedTranscriptArtifact));
     throw error;
   }
-  await publishPreparedTranscriptArtifacts(session, prepared);
-
-  // L17②：写后复查。若这期间会话已被 seal / finalize（草稿目录很可能刚被删掉，而我们又把它
-  // 建了回来），就地补偿删除并让调用方回 409 —— 绝不留下一份没人会再清理的孤儿草稿。
+  // 发布之前复核，拒绝时只撤销本次临时版本，保留已经成功保存的主草稿。
+  // seal 与本函数共用锁，无法在检查与发布之间越过当前写者。
   if (options.guard && !(await options.guard())) {
-    await deleteTranscriptDraft(session).catch(() => {});
+    await Promise.all(prepared.map(discardPreparedTranscriptArtifact));
     throw new TranscriptDraftRejectedError();
   }
+  await publishPreparedTranscriptArtifacts(session, prepared);
 
   return manifest;
 }
@@ -577,87 +545,94 @@ async function persistTranscriptDraftLocked(
 export async function loadTranscriptDraftManifest(
   session: DraftSessionSource
 ): Promise<TranscriptDraftManifest | null> {
-  try {
-    const manifestPath = await resolveDraftSlotPath(
-      session,
-      TRANSCRIPT_MANIFEST_SLOT,
-      getDraftManifestPath(session)
-    );
-    if (!manifestPath || !(await fileExists(manifestPath))) return null;
-    const raw = await readDraftFileBounded(manifestPath);
-    if (raw === null) return null;
-    const parsed = JSON.parse(raw) as Partial<TranscriptDraftManifest>;
-    if (
-      parsed.sessionId !== session.id ||
-      parsed.userId !== session.userId ||
-      typeof parsed.createdAt !== 'number' ||
-      typeof parsed.updatedAt !== 'number'
-    ) {
-      return null;
-    }
+  return withSessionDraftLock(session.id, async () => {
+    try {
+      const manifestPath = await resolveDraftSlotPath(
+        session,
+        TRANSCRIPT_MANIFEST_SLOT,
+        getDraftManifestPath(session)
+      );
+      if (!manifestPath || !(await fileExists(manifestPath))) return null;
+      const raw = await readDraftFileBounded(manifestPath);
+      if (raw === null) throw new Error('Transcript draft metadata exceeds its read limit');
+      const parsed = JSON.parse(raw) as Partial<TranscriptDraftManifest>;
+      if (
+        parsed.sessionId !== session.id ||
+        parsed.userId !== session.userId ||
+        typeof parsed.createdAt !== 'number' ||
+        typeof parsed.updatedAt !== 'number'
+      ) {
+        return null;
+      }
 
-    return {
-      sessionId: parsed.sessionId,
-      userId: parsed.userId,
-      createdAt: parsed.createdAt,
-      updatedAt: parsed.updatedAt,
-      segmentCount: typeof parsed.segmentCount === 'number' ? parsed.segmentCount : 0,
-    };
-  } catch {
-    return null;
-  }
+      return {
+        sessionId: parsed.sessionId,
+        userId: parsed.userId,
+        createdAt: parsed.createdAt,
+        updatedAt: parsed.updatedAt,
+        segmentCount: typeof parsed.segmentCount === 'number' ? parsed.segmentCount : 0,
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  });
 }
 
 /** 加载完整的转录稿草稿数据 */
 export async function loadTranscriptDraft(
   session: DraftSessionSource
 ): Promise<TranscriptDraftPayload | null> {
-  try {
-    const dataPath = await resolveDraftSlotPath(
-      session,
-      TRANSCRIPT_DATA_SLOT,
-      getDraftDataPath(session)
-    );
-    if (!dataPath || !(await fileExists(dataPath))) return null;
-    const raw = await readDraftFileBounded(dataPath);
-    if (raw === null) {
-      return null;
+  return withSessionDraftLock(session.id, async () => {
+    try {
+      const dataPath = await resolveDraftSlotPath(
+        session,
+        TRANSCRIPT_DATA_SLOT,
+        getDraftDataPath(session)
+      );
+      if (!dataPath || !(await fileExists(dataPath))) return null;
+      const raw = await readDraftFileBounded(dataPath);
+      if (raw === null) throw new Error('Transcript draft exceeds its read limit; preserving draft');
+      const parsed = JSON.parse(raw) as Partial<TranscriptDraftPayload>;
+      if (!Array.isArray(parsed.segments)) throw new Error('Invalid transcript draft; preserving draft');
+      return {
+        segments: Array.isArray(parsed.segments) ? parsed.segments : [],
+        summaries: Array.isArray(parsed.summaries) ? parsed.summaries : [],
+        translations:
+          parsed.translations && typeof parsed.translations === 'object' && !Array.isArray(parsed.translations)
+            ? parsed.translations
+            : {},
+        clientTs: typeof parsed.clientTs === 'number' ? parsed.clientTs : 0,
+        recordingStartTime: typeof parsed.recordingStartTime === 'number' ? parsed.recordingStartTime : undefined,
+        pausedAt: typeof parsed.pausedAt === 'number' ? parsed.pausedAt : undefined,
+        totalPausedMs: typeof parsed.totalPausedMs === 'number' ? parsed.totalPausedMs : undefined,
+        totalDurationMs: typeof parsed.totalDurationMs === 'number' ? parsed.totalDurationMs : undefined,
+        summaryRunningContext: typeof parsed.summaryRunningContext === 'string' ? parsed.summaryRunningContext : undefined,
+        currentSessionIndex: typeof parsed.currentSessionIndex === 'number' ? parsed.currentSessionIndex : undefined,
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
     }
-    const parsed = JSON.parse(raw) as Partial<TranscriptDraftPayload>;
-    return {
-      segments: Array.isArray(parsed.segments) ? parsed.segments : [],
-      summaries: Array.isArray(parsed.summaries) ? parsed.summaries : [],
-      translations:
-        parsed.translations && typeof parsed.translations === 'object' && !Array.isArray(parsed.translations)
-          ? parsed.translations
-          : {},
-      clientTs: typeof parsed.clientTs === 'number' ? parsed.clientTs : 0,
-      recordingStartTime: typeof parsed.recordingStartTime === 'number' ? parsed.recordingStartTime : undefined,
-      pausedAt: typeof parsed.pausedAt === 'number' ? parsed.pausedAt : undefined,
-      totalPausedMs: typeof parsed.totalPausedMs === 'number' ? parsed.totalPausedMs : undefined,
-      totalDurationMs: typeof parsed.totalDurationMs === 'number' ? parsed.totalDurationMs : undefined,
-      summaryRunningContext: typeof parsed.summaryRunningContext === 'string' ? parsed.summaryRunningContext : undefined,
-      currentSessionIndex: typeof parsed.currentSessionIndex === 'number' ? parsed.currentSessionIndex : undefined,
-    };
-  } catch {
-    return null;
-  }
+  });
 }
 
 /** 删除转录稿草稿 */
 export async function deleteTranscriptDraft(
   session: DraftSessionSource
 ): Promise<void> {
-  const artifacts = await findBillableStoredArtifactsByOwner('draft', session.id);
-  const transcriptArtifacts = artifacts.filter(
-    (artifact) =>
-      artifact.artifactType === STORED_ARTIFACT_TYPE.TRANSCRIPT_DRAFT
-  );
-  await markStoredArtifactsDeletePending(
-    transcriptArtifacts.map((artifact) => artifact.id)
-  );
-  await fs.rm(getDraftDir(session), { recursive: true, force: true });
-  for (const artifact of transcriptArtifacts) {
-    await releaseStoredArtifact(artifact.id);
-  }
+  return withSessionDraftLock(session.id, async () => {
+    const artifacts = await findBillableStoredArtifactsByOwner('draft', session.id);
+    const transcriptArtifacts = artifacts.filter(
+      (artifact) =>
+        artifact.artifactType === STORED_ARTIFACT_TYPE.TRANSCRIPT_DRAFT
+    );
+    await markStoredArtifactsDeletePending(
+      transcriptArtifacts.map((artifact) => artifact.id)
+    );
+    await fs.rm(getDraftDir(session), { recursive: true, force: true });
+    for (const artifact of transcriptArtifacts) {
+      await releaseStoredArtifact(artifact.id);
+    }
+  });
 }

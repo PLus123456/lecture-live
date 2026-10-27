@@ -310,6 +310,20 @@ describe('TokenProcessor', () => {
     });
   });
 
+  it('不同恢复设备即使段数和时间相同，新句子也不会复用同一个 ID', () => {
+    const segments: TranscriptSegment[] = [];
+    for (const device of ['device-a', 'device-b']) {
+      const processor = new TokenProcessor({
+        segmentIdPrefix: `seg-${device}`,
+        onSegmentFinalized: (segment) => segments.push(segment),
+      });
+      processor.setSegmentCounterOffset(3);
+      processor.processTokens([buildToken('new sentence.', { is_final: true, start_ms: 0, end_ms: 300 })]);
+      processor.onEndpoint();
+    }
+    expect(segments.map((segment) => segment.id)).toEqual(['seg-device-a-4', 'seg-device-b-4']);
+  });
+
   it('多个实例各自独立计数 segment id，互不串号', () => {
     const segmentsA: TranscriptSegment[] = [];
     const segmentsB: TranscriptSegment[] = [];

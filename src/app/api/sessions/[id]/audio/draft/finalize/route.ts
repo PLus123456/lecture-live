@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server';
+import crypto from 'node:crypto';
+import { readBodyWithLimit } from '@/lib/requestBodyLimit';
 import { verifyAuth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 import { invalidateSessionsApiCache } from '@/lib/apiResponseCache';
@@ -64,7 +66,20 @@ export async function POST(
   // ?phase=seal 供客户端在完整性判断前显式预封存；不带该参数的正式收尾也先 seal（幂等），
   // 即便客户端未走两阶段也不留写入窗口。本次收尾若未提交（空/缺片/CAS 落空/出错），
   // 末尾会 unseal 释放封存，让客户端补传缺片后重试，避免死锁。
-  const summary = await sealRecordingDraft(session);
+  const body = await readBodyWithLimit(req, 1024);
+  if (!body.ok) return NextResponse.json({ error: 'Invalid finalize request' }, { status: 400 });
+  let expectedChunkCount: number | undefined;
+  try {
+    expectedChunkCount = body.value.length ? JSON.parse(body.value.toString('utf8')).expectedChunkCount : undefined;
+    if (expectedChunkCount !== undefined &&
+        (!Number.isSafeInteger(expectedChunkCount) || expectedChunkCount < 0 || expectedChunkCount > 50_000)) {
+      throw new Error('Invalid chunk count');
+    }
+  } catch {
+    return NextResponse.json({ error: 'Invalid expectedChunkCount' }, { status: 400 });
+  }
+  const sealToken = crypto.randomUUID();
+  const summary = await sealRecordingDraft(session, expectedChunkCount, sealToken);
 
   const url = new URL(req.url);
   if (url.searchParams.get('phase') === 'seal') {
@@ -74,7 +89,7 @@ export async function POST(
   try {
     const merged = await mergeRecordingDraftChunks(session);
     if (!merged) {
-      await unsealRecordingDraft(session).catch(() => undefined);
+      await unsealRecordingDraft(session, sealToken).catch(() => undefined);
       return NextResponse.json(
         { error: 'Recording draft is empty' },
         { status: 404 }
@@ -85,7 +100,7 @@ export async function POST(
     // seq 0）都不得定稿：返回 409、保留草稿、绝不置终态，客户端据此重试补传而非清 IndexedDB。
     if (merged.hasGap) {
       // 释放封存，让客户端补传缺失分片后重试收尾（否则 sealed 会永久 409 挡住补传）。
-      await unsealRecordingDraft(session).catch(() => undefined);
+      await unsealRecordingDraft(session, sealToken).catch(() => undefined);
       return NextResponse.json(
         {
           error: 'Recording draft has missing chunks; cannot finalize',
@@ -107,7 +122,7 @@ export async function POST(
       maxDurationMs !== null &&
       durationMs > maxDurationMs + RECORDING_DURATION_LIMIT_GRACE_MS
     ) {
-      await unsealRecordingDraft(session).catch(() => undefined);
+      await unsealRecordingDraft(session, sealToken).catch(() => undefined);
       return NextResponse.json(
         { error: 'Recording exceeds the maximum session duration' },
         { status: 422 }
@@ -148,6 +163,8 @@ export async function POST(
           where: {
             id: id,
             status: { notIn: ['COMPLETED', 'ARCHIVED'] },
+            finalizeLockedAt: null,
+            recordingPath: session.recordingPath ?? null,
           },
           data: {
             recordingPath: staged.reference,
@@ -183,7 +200,7 @@ export async function POST(
     if (!publication) {
       await rollbackStagedArtifact(session, staged);
       // 会话已被并发推到终态：本次未提交，释放封存（草稿保留，终态录音由对方定稿，不被本次触碰）。
-      await unsealRecordingDraft(session).catch(() => undefined);
+      await unsealRecordingDraft(session, sealToken).catch(() => undefined);
       return NextResponse.json(
         { error: 'Cannot overwrite recording of a finalized session' },
         { status: 409 }
@@ -202,7 +219,7 @@ export async function POST(
     });
   } catch (error) {
     // 出错未提交：释放封存，避免草稿被永久 seal 挡住后续补传/重试。
-    await unsealRecordingDraft(session).catch(() => undefined);
+    await unsealRecordingDraft(session, sealToken).catch(() => undefined);
     // P4-1：草稿超总量上限 —— 明确 413 而非 500，草稿原样留盘（可人工取回），绝不 OOM 主进程。
     if (error instanceof RecordingDraftTooLargeError) {
       return NextResponse.json(

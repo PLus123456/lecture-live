@@ -396,3 +396,63 @@ describe('RecordingArchiveManager account boundary persistence fence', () => {
     }
   });
 });
+
+
+describe('归档分片完整性', () => {
+  it('重试补写期间退出账号会等待已开始的写入，随后不再补写下一片', async () => {
+    const owner = new AbortController();
+    acquireMicrophoneStream.mockResolvedValue(new FakeMediaStream());
+    appendAudioChunkMock.mockRejectedValue(new Error('IDB full'));
+    const manager = new RecordingArchiveManager('retry-abort', { ownerSignal: owner.signal });
+    manager.setChunkStoredHandler(async () => false);
+    await manager.ensureArchive({ sourceType: 'mic' });
+    const recorder = FakeMediaRecorder.instances[0];
+    recorder.emitData(new Blob(['header']));
+    recorder.emitData(new Blob(['tail']));
+    await expect(manager.stop()).rejects.toThrow('could not be saved');
+    let finishWrite!: () => void;
+    appendAudioChunkMock.mockClear().mockImplementationOnce(() => new Promise<void>((resolve) => { finishWrite = resolve; }));
+    const stopped = manager.stop();
+    const rejected = expect(stopped).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(finishWrite).toBeTypeOf('function'));
+    owner.abort();
+    let cleaned = false;
+    const cleanup = manager.teardownForAccountBoundary().then(() => { cleaned = true; });
+    await Promise.resolve();
+    expect(cleaned).toBe(false);
+    finishWrite();
+    await Promise.all([rejected, cleanup]);
+    expect(appendAudioChunkMock).toHaveBeenCalledTimes(1);
+    appendAudioChunkMock.mockResolvedValue(undefined);
+  });
+
+  it('唤醒后的大块按字节切片，重组后的头部和全部内容不变', async () => {
+    acquireMicrophoneStream.mockResolvedValue(new FakeMediaStream());
+    const manager = new RecordingArchiveManager('large-archive');
+    await manager.ensureArchive({ sourceType: 'mic' });
+    const original = new Uint8Array(2 * 1024 * 1024 + 17);
+    original.set([0x1a, 0x45, 0xdf, 0xa3]);
+    original[original.length - 1] = 123;
+    FakeMediaRecorder.instances[0].emitData(new Blob([original]));
+    await manager.stop();
+    const chunks = appendAudioChunkMock.mock.calls.map((call) => call[2]);
+    expect(chunks).toHaveLength(3);
+    expect(chunks.every((chunk) => chunk.size <= 1024 * 1024)).toBe(true);
+    expect(appendAudioChunkMock.mock.calls.map((call) => call[1])).toEqual([0, 1, 2]);
+    expect(new Uint8Array(await new Blob(chunks).arrayBuffer())).toEqual(original);
+  });
+
+  it('本地和上传同时失败时阻断停止收尾，重试后原始首片仍能保存', async () => {
+    acquireMicrophoneStream.mockResolvedValue(new FakeMediaStream());
+    appendAudioChunkMock.mockRejectedValue(new Error('IDB full'));
+    const manager = new RecordingArchiveManager('retry-archive');
+    manager.setChunkStoredHandler(async () => false);
+    await manager.ensureArchive({ sourceType: 'mic' });
+    const header = new Blob(['original-header']);
+    FakeMediaRecorder.instances[0].emitData(header);
+    await expect(manager.stop()).rejects.toThrow('could not be saved');
+    appendAudioChunkMock.mockResolvedValue(undefined);
+    await manager.stop();
+    expect(appendAudioChunkMock).toHaveBeenLastCalledWith('retry-archive', 0, header);
+  });
+});

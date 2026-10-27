@@ -47,6 +47,8 @@ interface RecordingArchiveManagerOptions {
 // 分片粒度不影响实时转录延迟；4h 录音由 ~57.6 万片降到 4800 片，远低于服务端 5 万分片上限，
 // 也大幅缓解每片一次目录扫描/上传带来的 O(n²) 与限流压力（审计 P1-6）。
 const ARCHIVE_TIMESLICE_MS = 3000;
+// 后台休眠/系统唤醒后的 dataavailable 可能一次返回数 MiB，不能假设 timeslice 是大小上限。
+const MAX_ARCHIVE_CHUNK_BYTES = 1024 * 1024;
 // A non-conforming/backgrounded MediaRecorder may never dispatch `stop`. The
 // account boundary is already synchronously invalidated, so a bounded wait is
 // sufficient: late events are ignored and the source tracks are stopped now.
@@ -65,6 +67,8 @@ export class RecordingArchiveManager {
   private mimeType = 'audio/webm';
   private startedAt = Date.now();
   private readonly pendingWrites = new Set<Promise<unknown>>();
+  // 两条持久化路径同时失败时仍保留内存副本，停止/重试保存不能把它当作已写入。
+  private readonly unsavedChunks = new Map<number, { blob: Blob; mimeType: string }>();
   private onChunkStored: ChunkStoredHandler | null = null;
   // 硬件掉线（麦克风拔出 / 系统共享停止，track 触发 'ended'）回调。上层据此把 UI 从
   // recording 切走，而不是继续显示在录直到 WS/idle 超时（P1-10）。
@@ -441,7 +445,8 @@ export class RecordingArchiveManager {
   }
 
   private async stopInternal(): Promise<void> {
-    await this.ensureSessionRecord('finalizing');
+    // 元数据写入失败不能阻止关闭硬件和抢救真实分片。
+    await this.ensureSessionRecord('finalizing').catch(() => undefined);
 
     if (this.archiveRecorder) {
       const recorder = this.archiveRecorder;
@@ -478,7 +483,25 @@ export class RecordingArchiveManager {
     }
 
     this.stopSourceStream();
-    await this.ensureSessionRecord('stopped');
+    for (const [seq, chunk] of this.unsavedChunks) {
+      // 补写也受账号边界保护；退出必须等待已经开始的 IDB 事务，不能清库后又写回。
+      this.assertAccountBoundaryCurrent();
+      const results = await Promise.allSettled([
+        this.trackPendingWrite(appendAudioChunk(this.sessionId, seq, chunk.blob)),
+        (async () => this.onChunkStored
+          ? (await this.onChunkStored({ seq, ...chunk })) !== false
+          : false)(),
+      ]);
+      this.assertAccountBoundaryCurrent();
+      if (results[0].status === 'fulfilled' ||
+          (results[1].status === 'fulfilled' && results[1].value)) {
+        this.unsavedChunks.delete(seq);
+      }
+    }
+    if (this.unsavedChunks.size > 0) {
+      throw new Error('Some audio chunks could not be saved; keep this page open and retry saving');
+    }
+    await this.ensureSessionRecord('stopped').catch(() => undefined);
   }
 
   async buildBlob(): Promise<Blob | null> {
@@ -564,59 +587,64 @@ export class RecordingArchiveManager {
         return;
       }
 
-      const seq = this.nextSeq;
-      this.nextSeq += 1;
-      const archiveStatus = recorder.state === 'paused' ? 'paused' : 'recording';
-      this.syncArchiveSnapshot(
-        archiveStatus,
-        recorderPersistenceGeneration
-      );
+      for (let offset = 0; offset < event.data.size; offset += MAX_ARCHIVE_CHUNK_BYTES) {
+        const blob = event.data.size <= MAX_ARCHIVE_CHUNK_BYTES
+          ? event.data
+          : event.data.slice(offset, offset + MAX_ARCHIVE_CHUNK_BYTES, this.mimeType);
+        const seq = this.nextSeq;
+        this.nextSeq += 1;
+        this.unsavedChunks.set(seq, { blob, mimeType: this.mimeType });
+        const archiveStatus = recorder.state === 'paused' ? 'paused' : 'recording';
+        this.syncArchiveSnapshot(
+          archiveStatus,
+          recorderPersistenceGeneration
+        );
 
-      // Register the IDB transaction before invoking the upload callback. A
-      // synchronous auth abort from that callback must see and await this write.
-      const persistChunk = this.trackPendingWrite(
-        appendAudioChunk(this.sessionId, seq, event.data)
-      )
-        .then(() => true)
-        .catch(() => false);
-      const notifyChunk = this.onChunkStored
-        ? Promise.resolve(
-            this.onChunkStored({
-              seq,
-              blob: event.data,
-              mimeType: this.mimeType,
-            })
-          )
-            .then((result) => result !== false)
-            .catch(() => false)
-        : Promise.resolve(false);
+        // Register the IDB transaction before invoking the upload callback. A
+        // synchronous auth abort from that callback must see and await this write.
+        const persistChunk = this.trackPendingWrite(
+          appendAudioChunk(this.sessionId, seq, blob)
+        )
+          .then(() => true)
+          .catch(() => false);
+        const notifyChunk = this.onChunkStored
+          ? (async () => this.onChunkStored!({
+                seq,
+                blob,
+                mimeType: this.mimeType,
+              }))()
+              .then((result) => result !== false)
+              .catch(() => false)
+          : Promise.resolve(false);
 
-      const write = Promise.all([persistChunk, notifyChunk])
-        .then(async ([didPersist, didNotify]) => {
-          if (!this.isPersistenceCurrent(recorderPersistenceGeneration)) {
-            return;
-          }
-          if (!didPersist && !didNotify) {
-            // 本地 IndexedDB 写入与服务端上传双双失败：该分片既没落本地也没传服务端，
-            // nextSeq 已递增 → 归档将出现无法恢复的 seq 空洞。不再静默吞（旧行为直接 return），
-            // 至少告警使问题可诊断/上层可感知（审计 medium：IDB 写失败静默出洞）。
-            console.error(
-              `[archive] chunk seq=${seq} 本地写入与上传均失败，归档出现空洞，` +
-                `session=${this.sessionId}`
+        const write = Promise.all([persistChunk, notifyChunk])
+          .then(async ([didPersist, didNotify]) => {
+            if (!this.isPersistenceCurrent(recorderPersistenceGeneration)) {
+              return;
+            }
+            if (!didPersist && !didNotify) {
+              // 本地 IndexedDB 写入与服务端上传双双失败：该分片既没落本地也没传服务端，
+              // nextSeq 已递增 → 归档将出现无法恢复的 seq 空洞。不再静默吞（旧行为直接 return），
+              // 至少告警使问题可诊断/上层可感知（审计 medium：IDB 写失败静默出洞）。
+              console.error(
+                `[archive] chunk seq=${seq} 本地写入与上传均失败，归档出现空洞，` +
+                  `session=${this.sessionId}`
+              );
+              return;
+            }
+            this.unsavedChunks.delete(seq);
+            await this.ensureSessionRecord(
+              archiveStatus,
+              recorderPersistenceGeneration
             );
-            return;
-          }
-          await this.ensureSessionRecord(
-            archiveStatus,
-            recorderPersistenceGeneration
-          );
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          this.pendingWrites.delete(write);
-        });
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            this.pendingWrites.delete(write);
+          });
 
-      this.trackPendingWrite(write);
+        this.trackPendingWrite(write);
+      }
     });
 
     recorder.start(ARCHIVE_TIMESLICE_MS);

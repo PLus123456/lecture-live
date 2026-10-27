@@ -163,6 +163,7 @@ vi.mock('@/lib/logger', () => {
 });
 
 import { finalizeSession } from '@/lib/sessionFinalization';
+import { loadSessionTranscriptBundle } from '@/lib/sessionPersistence';
 
 /** settle 在事务内把每个 staged 换成可发布句柄；readback 默认判定「没提交过」。 */
 function settledStagedReset() {
@@ -224,6 +225,7 @@ const rolledBack = () =>
     .sort();
 
 beforeEach(() => {
+  vi.mocked(loadSessionTranscriptBundle).mockReset().mockResolvedValue(null);
   sessionFindUniqueMock.mockReset().mockResolvedValue(SESSION);
   sessionUpdateManyMock.mockReset().mockResolvedValue({ count: 1 }); // 抢到 finalize 锁
   txSessionUpdateManyMock.mockReset().mockResolvedValue({ count: 1 }); // CAS 赢
@@ -248,7 +250,7 @@ beforeEach(() => {
   serverDurationMock.mockReset().mockReturnValue(60_000);
   mergeDraftMock.mockReset().mockResolvedValue({
     buffer: Buffer.alloc(4),
-    manifest: { mimeType: 'audio/webm' },
+    manifest: { mimeType: 'audio/webm', expectedChunkCount: 1 },
     hasGap: false,
   });
   loadDraftMock.mockReset().mockResolvedValue({
@@ -332,7 +334,7 @@ describe('finalizeSession — M5：转录/摘要走 stage → CAS → publish �
 
   it('▶ M5 lockLost（锁被接管者先提交）：转录与摘要**也**被回滚，不只回滚录音', async () => {
     txSessionUpdateManyMock.mockResolvedValueOnce({ count: 0 }); // 锁已被 B 接管
-    sessionFindUniqueMock.mockResolvedValue(SESSION);
+    sessionFindUniqueMock.mockResolvedValueOnce(SESSION).mockResolvedValue({ ...SESSION, status: 'COMPLETED' });
 
     const res = await finalizeSession({ sessionId: 'sess-1', actor: null });
 
@@ -385,5 +387,55 @@ describe('finalizeSession — L20：事务抛错路径也要清 staged', () => {
     expect(rollbackMock).not.toHaveBeenCalled();
     // 提交后的发布照常发生（发布在抛错点之前）。
     expect(publishMock).toHaveBeenCalled();
+  });
+});
+
+
+describe('恢复收尾保留数据', () => {
+  it('已有永久转录也必须合并之后的草稿与客户端尾句', async () => {
+    sessionFindUniqueMock.mockResolvedValue({ ...SESSION, transcriptPath: 'local:transcripts/earlier.json' });
+    const draft = await loadDraftMock();
+    vi.mocked(loadSessionTranscriptBundle).mockResolvedValue({
+      ...draft, segments: [{ ...draft.segments[0], id: 'published-only', text: 'earlier sentence' }],
+    });
+    await finalizeSession({ sessionId: SESSION.id, actor: null, clientBundle: {
+      ...draft, segments: [{ ...draft.segments[0], id: 'client-tail', text: 'last sentence' }],
+    } });
+    expect(stageTranscriptMock.mock.calls[0][1].segments.map((segment: { id: string }) => segment.id))
+      .toEqual(['published-only', draft.segments[0].id, 'client-tail']);
+  });
+
+  it('已有转录读不到时保留恢复入口，不以空内容完成收尾', async () => {
+    sessionFindUniqueMock.mockResolvedValue({ ...SESSION, transcriptPath: 'local:transcripts/earlier.json' });
+    await expect(finalizeSession({ sessionId: SESSION.id, actor: null }))
+      .rejects.toThrow('Published transcript is unavailable');
+    expect(stageTranscriptMock).not.toHaveBeenCalled();
+    expect(deductMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['system_auto_reclaim', 'user', 'unload'] as const)('%s 没有客户端停止收据时不把连续前缀误认为完整录音', async (finalizeSource) => {
+    mergeDraftMock.mockResolvedValue({ buffer: Buffer.alloc(4), manifest: { mimeType: 'audio/webm' }, hasGap: false });
+    await expect(finalizeSession({ sessionId: 'sess-1', actor: null, finalizeSource }))
+      .rejects.toMatchObject({ status: 409, body: { recoveryRequired: true } });
+    expect(stageAudioMock).not.toHaveBeenCalled();
+    expect(deductMock).not.toHaveBeenCalled();
+  });
+
+  it('封存失败必须停止收尾，不能忽略错误继续发布和删除草稿', async () => {
+    const drafts = await import('@/lib/recordingDraftPersistence');
+    vi.mocked(drafts.sealRecordingDraft).mockRejectedValueOnce(new Error('disk offline'));
+    await expect(finalizeSession({ sessionId: 'sess-1', actor: null })).rejects.toThrow('disk offline');
+    expect(stageAudioMock).not.toHaveBeenCalled();
+    expect(deductMock).not.toHaveBeenCalled();
+  });
+
+  it('收尾同时保留服务端正文和客户端独有尾段', async () => {
+    const draft = await loadDraftMock();
+    const clientBundle = {
+      segments: [{ ...draft.segments[0], id: 'tail', text: '最后一句', globalStartMs: 1000, startMs: 1000, globalEndMs: 2000, endMs: 2000 }],
+      summaries: [], translations: {},
+    };
+    await finalizeSession({ sessionId: 'sess-1', actor: null, clientBundle });
+    expect(stageTranscriptMock.mock.calls[0][1].segments.map((segment: { id: string }) => segment.id)).toEqual(['s1', 'tail']);
   });
 });

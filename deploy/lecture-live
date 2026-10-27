@@ -535,7 +535,7 @@ cmd_rollback() {
     backup_dir="$(readlink -f "$BACKUP_DIR")"
     require_root_only "$backup_dir" "rollback 要以 root 解包 $BACKUP_DIR 里的备份"
     odd="$(find "$backup_dir" -mindepth 1 \( ! -type f -o -links +1 \) -print -quit)"
-    [[ -z "$odd" ]] || fatal "$BACKUP_DIR 里只应有 root 打的备份文件，不能有软链、子目录或多重硬链接: $odd；未做任何改动"
+    [[ -z "$odd" ]] || fatal "$BACKUP_DIR 里只应有 root 打的备份文件，不能有软链、子目录或多重硬链接: ${odd}；未做任何改动"
 
     echo "  可用备份:"
     echo ""

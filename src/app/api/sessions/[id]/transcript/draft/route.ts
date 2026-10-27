@@ -92,7 +92,7 @@ export async function PUT(
     // L17②：上面那两道终态守卫查完之后，还要 req.text() + JSON.parse 一份最大 8MiB 的载荷；
     // 这段时间足够 finalize 跑完（seal → 读快照 → 删草稿目录）。把守卫做成回调传下去，由
     // persistTranscriptDraft 在临界区内紧贴写盘前后各求值一次：写前拒 = 一个字节都不落，
-    // 写后拒 = 补偿删除刚被重建出来的孤儿草稿目录。
+    // 发布前拒 = 只撤销本次暂存版本，保留此前已经成功保存的草稿。
     const stillWritable = async () => {
       if (await isRecordingDraftSealed(result.session)) {
         return false;

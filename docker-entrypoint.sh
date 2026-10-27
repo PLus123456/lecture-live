@@ -5,6 +5,10 @@ set -eu
 # 任一失败由 set -e 在 Web/WS 启动前终止容器。
 node scripts/ensure-database.mjs --require-database
 
+# 此时尚未启动 Web/WS。容器重建会更换 hostname/PID 命名空间，旧锁不能靠新容器的
+# kill(pid, 0) 判活；只重置临界区锁文件，保留持久卷中的全部录音与转录草稿。
+rm -rf data/draft-locks
+
 # One-time Stripe reconciliation maintenance is intentionally Web-only. The Next middleware
 # exposes just auth + ADMIN payment-review APIs; starting WS here would bypass that HTTP boundary
 # and re-enable live-share/billing loops while production is supposed to remain quarantined.

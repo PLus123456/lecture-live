@@ -1,6 +1,8 @@
 import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
+import { prisma } from '@/lib/prisma';
+import { withSessionDraftLock } from '@/lib/sessionDraftLock';
 import type { Session } from '@prisma/client';
 import {
   STORED_ARTIFACT_STATE,
@@ -31,14 +33,16 @@ export interface RecordingDraftManifest {
   receivedSeqs: number[];
   // P1-7：草稿被收尾流程封存（seal）的时刻；非空表示不再接受任何分片写入。
   sealedAt?: number;
+  sealToken?: string;
+  expectedChunkCount?: number;
 }
 
-// manifest.json 只存元数据——完整性判定用的 receivedSeqs 始终从 chunks/ 目录扫描得到
-//（loadRecordingDraftManifest / 清单摘要 / merge 均以磁盘为权威，杜绝并发写入时 manifest 的
+// manifest 只存元数据——完整性判定用的 receivedSeqs 从 chunks/ 与 ACTIVE 账本联合读取
+//（loadRecordingDraftManifest / 清单摘要 / merge 均扫描已发布分片，杜绝并发写入时 manifest 的
 // read-modify-write 竞态误判缺片）。
 // P1-6：额外维护 chunkCount / maxSeq 作为「写入热路径」的 O(1) 近似计数，专供每片 POST 的响应
-// 与配额上限守卫使用——避免旧实现每写一片都 readdir+sort 全目录（4h 录音 O(n²)）。并发突发下
-// 该计数可能短暂偏小（多写者各自 read-modify-write 互相覆盖），故**绝不**用于完整性/nextSeq 协商；
+// 与配额上限守卫使用——避免旧实现每写一片都 readdir+sort 全目录（4h 录音 O(n²)）。进程若在
+// 发布分片之后、更新计数之前崩溃，计数可能偏小，故**绝不**用于完整性/nextSeq 协商；
 // 那些路径一律回到磁盘扫描取权威值。
 interface StoredManifestMetadata {
   sessionId: string;
@@ -48,6 +52,8 @@ interface StoredManifestMetadata {
   updatedAt: number;
   // P1-7：seal 时刻（epoch ms）。持久化在 manifest 元数据上，跨请求生效。
   sealedAt?: number;
+  sealToken?: string;
+  expectedChunkCount?: number;
   // P1-6：维护式近似计数（见上）。缺失（旧版 manifest）时由写入路径一次性扫盘播种。
   chunkCount?: number;
   maxSeq?: number;
@@ -120,7 +126,7 @@ export class RecordingDraftTooLargeError extends Error {
 
 type DraftSessionSource = Pick<Session, 'id' | 'userId'>;
 
-const CHUNK_FILENAME_RE = /^(\d+)\.chunk$/;
+const CHUNK_FILENAME_RE = /^(\d+)(?:\.([a-zA-Z0-9-]+))?\.chunk$/;
 
 function normalizeSessionId(sessionId: string): string {
   return sessionId.replace(/[^a-zA-Z0-9_-]/g, '');
@@ -146,10 +152,10 @@ function getDraftManifestLogicalKey(session: DraftSessionSource) {
   );
 }
 
-function getChunkFilePath(session: DraftSessionSource, seq: number) {
+function getChunkFilePath(session: DraftSessionSource, seq: number, version?: string) {
   return path.join(
     getDraftChunksDir(session),
-    `${String(seq).padStart(8, '0')}.chunk`
+    `${String(seq).padStart(8, '0')}${version ? `.${version}` : ''}.chunk`
   );
 }
 
@@ -191,7 +197,14 @@ async function resolveDraftManifestPath(
   ) {
     return null;
   }
-  return pathForRecordingDraftReference(session, active.reference);
+  const resolved = pathForRecordingDraftReference(session, active.reference);
+  if (!resolved) throw new Error('Invalid draft artifact reference');
+  try {
+    await fs.access(resolved);
+  } catch (error) {
+    throw new Error('Referenced draft file is unavailable; preserving recovery state', { cause: error });
+  }
+  return resolved;
 }
 
 async function ensureDraftDir(session: DraftSessionSource) {
@@ -202,31 +215,42 @@ async function fileExists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
   }
 }
 
-/** 扫描 chunks/ 目录得到当前实际已保存的 seq 列表（source of truth） */
-async function scanChunkSeqsOnDisk(
-  session: DraftSessionSource
-): Promise<number[]> {
+/** 只把完整发布的版本暴露给清单；旧固定文件名继续兼容。 */
+async function scanChunkFilesOnDisk(session: DraftSessionSource): Promise<Map<number, string>> {
+  let files: string[];
   try {
-    const files = await fs.readdir(getDraftChunksDir(session));
-    const seqs: number[] = [];
-    for (const file of files) {
-      const match = CHUNK_FILENAME_RE.exec(file);
-      if (!match) continue;
-      const seq = Number.parseInt(match[1], 10);
-      if (Number.isInteger(seq) && seq >= 0) {
-        seqs.push(seq);
-      }
-    }
-    seqs.sort((a, b) => a - b);
-    return seqs;
-  } catch {
-    return [];
+    files = await fs.readdir(getDraftChunksDir(session));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Map();
+    throw error;
   }
+  const artifacts = await findBillableStoredArtifactsByOwner('draft', session.id);
+  const trackedReferences = new Set(artifacts.map((row) => row.reference));
+  const activeReferences = new Set(artifacts.filter((row) =>
+    row.artifactType === STORED_ARTIFACT_TYPE.RECORDING_DRAFT && row.state === STORED_ARTIFACT_STATE.ACTIVE
+  ).map((row) => row.reference));
+  const result = new Map<number, string>();
+  for (const file of files) {
+    const match = CHUNK_FILENAME_RE.exec(file);
+    if (!match) continue;
+    const seq = Number(match[1]);
+    if (!Number.isSafeInteger(seq) || seq < 0) continue;
+    const reference = getDraftLocalReference(session, `chunks/${file}`);
+    if ((match[2] || trackedReferences.has(reference)) && !activeReferences.has(reference)) continue;
+    // 同一序号升级成版本文件后优先新版本，旧预留回收只能碰旧路径。
+    if (match[2] || !result.has(seq)) result.set(seq, path.join(getDraftChunksDir(session), file));
+  }
+  return result;
+}
+
+async function scanChunkSeqsOnDisk(session: DraftSessionSource): Promise<number[]> {
+  return [...(await scanChunkFilesOnDisk(session)).keys()].sort((a, b) => a - b);
 }
 
 /**
@@ -236,15 +260,12 @@ async function scanChunkSeqsOnDisk(
 async function scanChunkStatsOnDisk(
   session: DraftSessionSource
 ): Promise<{ count: number; maxSeq: number; totalBytes: number }> {
-  const seqs = await scanChunkSeqsOnDisk(session);
+  const files = await scanChunkFilesOnDisk(session);
+  const seqs = [...files.keys()].sort((a, b) => a - b);
   let totalBytes = 0;
   for (const seq of seqs) {
-    try {
-      const stat = await fs.stat(getChunkFilePath(session, seq));
-      totalBytes += stat.size;
-    } catch {
-      // 分片刚被并发删掉：忽略，计数偏小只会让闸门更宽松，不会误伤合法录音。
-    }
+    const stat = await fs.stat(files.get(seq)!);
+    totalBytes += stat.size;
   }
   return {
     count: seqs.length,
@@ -272,7 +293,7 @@ async function readStoredManifestMetadata(
       typeof parsed.createdAt !== 'number' ||
       typeof parsed.updatedAt !== 'number'
     ) {
-      return null;
+      throw new Error('Invalid recording draft metadata');
     }
     return {
       sessionId: parsed.sessionId,
@@ -281,51 +302,24 @@ async function readStoredManifestMetadata(
       createdAt: parsed.createdAt,
       updatedAt: parsed.updatedAt,
       ...(typeof parsed.sealedAt === 'number' ? { sealedAt: parsed.sealedAt } : {}),
+      ...(typeof parsed.sealToken === 'string' ? { sealToken: parsed.sealToken } : {}),
+      ...(Number.isSafeInteger(parsed.expectedChunkCount) && parsed.expectedChunkCount! >= 0
+        ? { expectedChunkCount: parsed.expectedChunkCount } : {}),
       ...(typeof parsed.chunkCount === 'number' ? { chunkCount: parsed.chunkCount } : {}),
       ...(typeof parsed.maxSeq === 'number' ? { maxSeq: parsed.maxSeq } : {}),
       ...(typeof parsed.totalBytes === 'number' ? { totalBytes: parsed.totalBytes } : {}),
     };
-  } catch {
-    return null;
+  } catch (error) {
+    throw new Error('Recording draft metadata could not be read; preserving draft', { cause: error });
   }
 }
 
-// P7-5：manifest 的 read-modify-write 必须按会话串行。
-// 旧代码「读快照 → 判 sealedAt → 用**陈旧快照**重推 sealedAt → 全量覆盖写回」，落在读与写之间的
-// seal 会被整份抹掉：cron auto-reclaim 正 seal 一个 stale 会话，而无辜客户端此刻仍在增量补传 →
-// seal 被抹 → merge 快照之后到达的分片继续落盘 → deleteRecordingDraft 连锅端 → 用户丢录音尾巴。
-// 注意 PR#225 的 tmp+rename **治不了这条**：原子写解决的是文件撕裂（lost update 与之正交），
-// 反而让被抹掉 sealedAt 的 manifest 成为一份完整合法的文件，更难察觉。
-// 这里用「按会话排队的单写者」把 读→改→写 关进临界区（同进程内 cron 与 HTTP 路由共用本模块）。
-const manifestWriteLocks = new Map<string, Promise<void>>();
-
+// Web 上传与 WS 回收必须共享文件系统锁；同一锁也保护转录快照和草稿清理。
 async function withManifestLock<T>(
   session: DraftSessionSource,
   fn: () => Promise<T>
 ): Promise<T> {
-  const key = normalizeSessionId(session.id);
-  const prev = manifestWriteLocks.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  // 前一个写者失败也必须放行队列，否则一次异常会把该会话的写入永久卡死。
-  const chain = prev.then(
-    () => current,
-    () => current
-  );
-  manifestWriteLocks.set(key, chain);
-
-  await prev.catch(() => undefined);
-  try {
-    return await fn();
-  } finally {
-    release();
-    // 队尾仍是自己 ⇒ 无人排在后面，清掉避免 Map 随会话数无限增长。
-    if (manifestWriteLocks.get(key) === chain) {
-      manifestWriteLocks.delete(key);
-    }
-  }
+  return withSessionDraftLock(session.id, fn);
 }
 
 /**
@@ -467,12 +461,14 @@ async function writeStoredManifestMetadata(
 export async function loadRecordingDraftManifest(
   session: DraftSessionSource
 ): Promise<RecordingDraftManifest | null> {
-  const metadata = await readStoredManifestMetadata(session);
-  if (!metadata) {
-    return null;
-  }
-  const receivedSeqs = await scanChunkSeqsOnDisk(session);
-  return { ...metadata, receivedSeqs };
+  return withSessionDraftLock(session.id, async () => {
+    const metadata = await readStoredManifestMetadata(session);
+    if (!metadata) {
+      return null;
+    }
+    const receivedSeqs = await scanChunkSeqsOnDisk(session);
+    return { ...metadata, receivedSeqs };
+  });
 }
 
 /**
@@ -482,22 +478,26 @@ export async function loadRecordingDraftManifest(
 export async function getRecordingDraftManifestSummary(
   session: DraftSessionSource
 ): Promise<RecordingDraftManifestSummary> {
-  const metadata = await readStoredManifestMetadata(session);
-  const seqs = await scanChunkSeqsOnDisk(session);
-  const maxSeq = seqs.length > 0 ? seqs[seqs.length - 1] : -1;
-  return {
-    maxSeq,
-    nextSeq: maxSeq + 1,
-    revision: metadata?.updatedAt ?? 0,
-    sealed: Boolean(metadata?.sealedAt),
-  };
+  return withSessionDraftLock(session.id, async () => {
+    const metadata = await readStoredManifestMetadata(session);
+    const seqs = await scanChunkSeqsOnDisk(session);
+    const maxSeq = seqs.length > 0 ? seqs[seqs.length - 1] : -1;
+    return {
+      maxSeq,
+      nextSeq: maxSeq + 1,
+      revision: metadata?.updatedAt ?? 0,
+      sealed: Boolean(metadata?.sealedAt),
+    };
+  });
 }
 
 export async function isRecordingDraftSealed(
   session: DraftSessionSource
 ): Promise<boolean> {
-  const metadata = await readStoredManifestMetadata(session);
-  return Boolean(metadata?.sealedAt);
+  return withSessionDraftLock(session.id, async () => {
+    const metadata = await readStoredManifestMetadata(session);
+    return Boolean(metadata?.sealedAt);
+  });
 }
 
 /**
@@ -506,7 +506,9 @@ export async function isRecordingDraftSealed(
  * 不改 sealedAt。若草稿元数据尚不存在则创建（确保后续迟到写也被封住）。
  */
 export async function sealRecordingDraft(
-  session: DraftSessionSource
+  session: DraftSessionSource,
+  expectedChunkCount?: number,
+  sealToken?: string
 ): Promise<RecordingDraftManifestSummary> {
   const now = Date.now();
   // P7-5：在锁内读当前 manifest 再写，且**保留**已维护的计数字段——旧实现整份重建元数据，
@@ -520,6 +522,10 @@ export async function sealRecordingDraft(
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       sealedAt: existing?.sealedAt ?? now,
+      ...(sealToken ? { sealToken } : {}),
+      ...(expectedChunkCount !== undefined ? {
+        expectedChunkCount: Math.max(existing?.expectedChunkCount ?? 0, expectedChunkCount),
+      } : {}),
     },
     result: true,
   }));
@@ -531,14 +537,16 @@ export async function sealRecordingDraft(
  * 重试收尾，避免「seal 后缺片 → 永久 409 → 无法补传」的死锁。仅在草稿仍存在时生效。
  */
 export async function unsealRecordingDraft(
-  session: DraftSessionSource
+  session: DraftSessionSource,
+  sealToken?: string
 ): Promise<void> {
   await updateStoredManifestMetadata(session, (existing) => {
-    if (!existing || !existing.sealedAt) {
+    if (!existing || !existing.sealedAt || (sealToken && existing.sealToken !== sealToken)) {
       return null;
     }
-    const { sealedAt: _sealedAt, ...rest } = existing;
+    const { sealedAt: _sealedAt, sealToken: _sealToken, ...rest } = existing;
     void _sealedAt;
+    void _sealToken;
     return { metadata: { ...rest, updatedAt: Date.now() }, result: true };
   });
 }
@@ -552,14 +560,15 @@ export async function listRecordingDraftSeqs(
 async function readChunkIfExists(chunkPath: string): Promise<Buffer | null> {
   try {
     return await fs.readFile(chunkPath);
-  } catch {
-    return null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
   }
 }
 
 export async function persistRecordingDraftChunk(
   session: DraftSessionSource,
-  options: { seq: number; mimeType: string; data: Buffer }
+  options: { seq: number; mimeType: string; data: Buffer; guard?: () => Promise<boolean> }
 ): Promise<{ idempotent: boolean; chunkCount: number; maxSeq: number }> {
   await ensureDraftDir(session);
 
@@ -570,7 +579,7 @@ export async function persistRecordingDraftChunk(
     const existing = await readStoredManifestMetadata(session);
 
     // P1-7：已封存的草稿拒绝任何新分片（收尾 seal 之后到达的迟到写）。
-    if (existing?.sealedAt) {
+    if (existing?.sealedAt || (options.guard && !(await options.guard()))) {
       throw new RecordingDraftSealedError();
     }
 
@@ -598,8 +607,14 @@ export async function persistRecordingDraftChunk(
     // P0-4：append-only —— 按 (sessionId, seq) 键写盘，目标 seq 已存在时绝不覆盖：
     // 内容(长度+字节)完全一致 → 幂等成功（网络重试）；不一致 → 冲突 409。旧代码无条件
     // writeFile 覆盖，导致冷设备续录从 seq 0 重传时把服务端已有录音开头覆盖损坏（审计 P0-4）。
-    const chunkPath = getChunkFilePath(session, options.seq);
-    const priorChunk = await readChunkIfExists(chunkPath);
+    const logicalKey = buildStoredArtifactLogicalKey(
+      'draft', `${session.id}:chunk:${options.seq}`, STORED_ARTIFACT_TYPE.RECORDING_DRAFT
+    );
+    const activeChunk = await getActiveStoredArtifactByLogicalKey(logicalKey);
+    const priorPath = activeChunk?.state === STORED_ARTIFACT_STATE.ACTIVE
+      ? pathForRecordingDraftReference(session, activeChunk.reference)
+      : getChunkFilePath(session, options.seq);
+    const priorChunk = priorPath ? await readChunkIfExists(priorPath) : null;
     let idempotent = false;
     if (priorChunk) {
       if (priorChunk.length === options.data.length && priorChunk.equals(options.data)) {
@@ -607,7 +622,10 @@ export async function persistRecordingDraftChunk(
       } else {
         throw new RecordingDraftChunkConflictError(options.seq);
       }
-    } else {
+    }
+    // 磁盘文件存在但账本未 ACTIVE 不能直接回成功：旧 RESERVED 会在 TTL 后删除它。
+    // 重新发布到唯一版本路径，旧预留即使并发回收也碰不到这份已确认的新副本。
+    if (!priorChunk || activeChunk?.state !== STORED_ARTIFACT_STATE.ACTIVE) {
       // P4-1：总量闸必须在**落盘之前**判 —— 片数闸（50000×2MiB≈97.65GiB）等于没闸。
       const projectedBytes = baseBytes + options.data.length;
       if (projectedBytes > MAX_DRAFT_TOTAL_BYTES) {
@@ -620,16 +638,10 @@ export async function persistRecordingDraftChunk(
         sessionId: session.id,
         artifactType: STORED_ARTIFACT_TYPE.RECORDING_DRAFT,
         expectedBytes: options.data.length,
-        logicalKey: buildStoredArtifactLogicalKey(
-          'draft',
-          `${session.id}:chunk:${options.seq}`,
-          STORED_ARTIFACT_TYPE.RECORDING_DRAFT
-        ),
+        logicalKey,
       });
-      const reference = getDraftLocalReference(
-        session,
-        `chunks/${String(options.seq).padStart(8, '0')}.chunk`
-      );
+      const chunkPath = getChunkFilePath(session, options.seq, reservation.id);
+      const reference = getDraftLocalReference(session, `chunks/${path.basename(chunkPath)}`);
       let previous: StoredArtifactRow | null = null;
       try {
         await recordReservedStoredArtifactLocation(reservation.id, {
@@ -637,7 +649,13 @@ export async function persistRecordingDraftChunk(
           storage: 'local',
           reference,
         });
-        await fs.writeFile(chunkPath, options.data);
+        const temporaryPath = `${chunkPath}.${reservation.id}.tmp`;
+        try {
+          await fs.writeFile(temporaryPath, options.data, { flag: 'wx' });
+          await fs.rename(temporaryPath, chunkPath);
+        } finally {
+          await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+        }
         const settled = await settleStoredArtifact(reservation.id, {
           actualBytes: options.data.length,
           storage: 'local',
@@ -689,6 +707,12 @@ export async function persistRecordingDraftChunk(
       }
     }
 
+    if (idempotent && activeChunk?.state !== STORED_ARTIFACT_STATE.ACTIVE) {
+      const adopted = await scanChunkStatsOnDisk(session);
+      baseCount = adopted.count;
+      baseMaxSeq = adopted.maxSeq;
+      baseBytes = adopted.totalBytes;
+    }
     // 新写入的分片才递增计数；幂等重传（seq 已在盘）不重复计。
     const chunkCount = idempotent ? baseCount : baseCount + 1;
     const maxSeq = idempotent ? baseMaxSeq : Math.max(baseMaxSeq, options.seq);
@@ -769,7 +793,8 @@ export async function mergeRecordingDraftChunks(
       break;
     }
   }
-  const hasGap = contiguous.length < seqs.length;
+  const hasGap = contiguous.length < seqs.length ||
+    (manifest.expectedChunkCount !== undefined && contiguous.length !== manifest.expectedChunkCount);
   if (hasGap) {
     console.warn(
       `[recordingDraft] seq 空洞：共 ${seqs.length} 片但仅前 ${contiguous.length} 片自 seq 0 起连续` +
@@ -801,7 +826,12 @@ async function mergeContiguousChunksSequential(
     return Buffer.alloc(0);
   }
 
-  const paths = seqs.map((seq) => getChunkFilePath(session, seq));
+  const files = await scanChunkFilesOnDisk(session);
+  const paths = seqs.map((seq) => {
+    const file = files.get(seq);
+    if (!file) throw new Error(`Recording chunk ${seq} disappeared; preserving draft`);
+    return file;
+  });
   const sizes: number[] = [];
   let total = 0;
   for (const chunkPath of paths) {
@@ -834,18 +864,20 @@ async function mergeContiguousChunksSequential(
 export async function deleteRecordingDraft(
   session: DraftSessionSource
 ): Promise<void> {
-  const artifacts = await findBillableStoredArtifactsByOwner('draft', session.id);
-  const recordingArtifacts = artifacts.filter(
-    (artifact) =>
-      artifact.artifactType === STORED_ARTIFACT_TYPE.RECORDING_DRAFT
-  );
-  await markStoredArtifactsDeletePending(
-    recordingArtifacts.map((artifact) => artifact.id)
-  );
-  await fs.rm(getDraftDir(session), { recursive: true, force: true });
-  for (const artifact of recordingArtifacts) {
-    await releaseStoredArtifact(artifact.id);
-  }
+  return withSessionDraftLock(session.id, async () => {
+    const artifacts = await findBillableStoredArtifactsByOwner('draft', session.id);
+    const recordingArtifacts = artifacts.filter(
+      (artifact) =>
+        artifact.artifactType === STORED_ARTIFACT_TYPE.RECORDING_DRAFT
+    );
+    await markStoredArtifactsDeletePending(
+      recordingArtifacts.map((artifact) => artifact.id)
+    );
+    await fs.rm(getDraftDir(session), { recursive: true, force: true });
+    for (const artifact of recordingArtifacts) {
+      await releaseStoredArtifact(artifact.id);
+    }
+  });
 }
 
 /** P4-1：草稿目录清扫的默认年龄阈值（48h）。远大于任何一次合法录音 + 补传窗口。 */
@@ -856,7 +888,7 @@ export const DEFAULT_DRAFT_SWEEP_MAX_AGE_MS = 48 * 60 * 60_000;
  * 全仓此前**没有任何东西**碰 data/recording-drafts：billingMaintenance 的 reclaim 只覆盖
  * RECORDING/PAUSED/FINALIZING，`CREATED` 会话永不回收 —— 只要不进 RECORDING 就能一直往草稿目录
  * 里灌字节且永久驻留。这里按 manifest.updatedAt（读不到则退回目录 mtime）删掉超龄草稿。
- * 只删「久未写入」的目录：正在录/正在补传的草稿每片都会刷新 updatedAt，绝不会被误删。
+ * 仅清理数据库中已不存在的会话；尚存会话的草稿无论多旧都保留恢复入口。
  */
 export async function sweepStaleRecordingDrafts(options?: {
   maxAgeMs?: number;
@@ -901,19 +933,20 @@ export async function sweepStaleRecordingDrafts(options?: {
       continue;
     }
     try {
-      const artifacts = await findBillableStoredArtifactsByOwner('draft', entry);
-      const recordingArtifacts = artifacts.filter(
-        (artifact) =>
-          artifact.artifactType === STORED_ARTIFACT_TYPE.RECORDING_DRAFT
-      );
-      await markStoredArtifactsDeletePending(
-        recordingArtifacts.map((artifact) => artifact.id)
-      );
-      await fs.rm(dir, { recursive: true, force: true });
-      for (const artifact of recordingArtifacts) {
-        await releaseStoredArtifact(artifact.id);
-      }
-      removed += 1;
+      await withSessionDraftLock(entry, async () => {
+        // 存在会话就保留恢复材料。年龄不证明已成功发布，缺头/缺尾的 FINALIZING
+        // 可能等待原设备数天后补传；DB 不可用也必须保留，不能当成「无会话」。
+        const owner = await prisma.session.findUnique({ where: { id: entry }, select: { id: true } });
+        if (owner) return;
+        const artifacts = await findBillableStoredArtifactsByOwner('draft', entry);
+        const recordingArtifacts = artifacts.filter(
+          (artifact) => artifact.artifactType === STORED_ARTIFACT_TYPE.RECORDING_DRAFT
+        );
+        await markStoredArtifactsDeletePending(recordingArtifacts.map((artifact) => artifact.id));
+        await fs.rm(dir, { recursive: true, force: true });
+        for (const artifact of recordingArtifacts) await releaseStoredArtifact(artifact.id);
+        removed += 1;
+      });
     } catch {
       // 单个目录删除失败不阻断整轮清扫。
     }

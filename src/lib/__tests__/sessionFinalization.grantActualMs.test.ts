@@ -357,7 +357,7 @@ describe('finalizeSession — P5-6：Soniox 实测量恒为时长下限', () => 
     });
     mergeDraftMock.mockResolvedValue({
       buffer: Buffer.from('complete-webm'),
-      manifest: { mimeType: 'audio/webm', receivedSeqs: [0, 1] },
+      manifest: { mimeType: 'audio/webm', receivedSeqs: [0, 1], expectedChunkCount: 2 },
       hasGap: false,
     });
     measureDurationMock.mockResolvedValue(10 * 60_000);
@@ -380,7 +380,7 @@ describe('finalizeSession — P5-6：Soniox 实测量恒为时长下限', () => 
     });
     mergeDraftMock.mockResolvedValue({
       buffer: Buffer.from('unreadable'),
-      manifest: { mimeType: 'audio/webm', receivedSeqs: [0] },
+      manifest: { mimeType: 'audio/webm', receivedSeqs: [0], expectedChunkCount: 1 },
       hasGap: false,
     });
     measureDurationMock.mockRejectedValue(

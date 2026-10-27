@@ -492,3 +492,20 @@ describe('useSoniox P1-3 卸载冻结 pausedAt（离页空档不计时）', () =
     nowSpy.mockRestore();
   });
 });
+
+
+it('stop 等待期间接收服务端最终尾句，停止返回后的迟到结果不再写入', async () => {
+  const { result } = renderHook(() => useSoniox('tail-flush'));
+  await act(async () => { await result.current.start(); });
+  const callbacks = capturedCallbacks[0];
+  const tokens = (text: string) => [{ text, is_final: true, speaker: '1', language: 'en', start_ms: 0, end_ms: 1000 }];
+  recordingHandles[0].stop.mockImplementationOnce(async () => {
+    callbacks.onPartialResult(tokens('This is the last sentence.'));
+    callbacks.onEndpoint();
+  });
+  await act(async () => { await result.current.stop(); });
+  expect(useTranscriptStore.getState().segments.map((segment) => segment.text).join(' ')).toContain('This is the last sentence.');
+  const count = useTranscriptStore.getState().segments.length;
+  act(() => { callbacks.onPartialResult(tokens('late old callback')); callbacks.onEndpoint(); });
+  expect(useTranscriptStore.getState().segments).toHaveLength(count);
+});

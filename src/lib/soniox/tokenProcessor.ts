@@ -84,6 +84,7 @@ export class TokenProcessor {
   // segment id 自增计数器：用实例字段而非模块级全局，避免多个 TokenProcessor
   // 并发（录音 / 同传 / 文件转录）时共享同一计数器导致 segment id 串号、碰撞
   private segmentCounter = 0;
+  private readonly segmentIdPrefix: string;
 
   private static SENTENCE_END_RE = /[.!?。！？；]\s*$/;
   private static readonly MAX_RECENT_TRANSLATION_SEGMENTS = 64;
@@ -109,6 +110,7 @@ export class TokenProcessor {
   ) => void;
 
   constructor(callbacks: {
+    segmentIdPrefix?: string;
     onSegmentFinalized?: (segment: TranscriptSegment) => void;
     onPreviewUpdate?: (preview: StreamingPreviewText) => void;
     onTranslationToken?: (
@@ -120,6 +122,7 @@ export class TokenProcessor {
       preview: StreamingPreviewTranslation
     ) => void;
   }) {
+    this.segmentIdPrefix = callbacks.segmentIdPrefix ?? 'seg';
     this.onSegmentFinalized = callbacks.onSegmentFinalized;
     this.onPreviewUpdate = callbacks.onPreviewUpdate;
     this.onTranslationToken = callbacks.onTranslationToken;
@@ -730,7 +733,7 @@ export class TokenProcessor {
 
     this.segmentCounter++;
     const segment: TranscriptSegment = {
-      id: `seg-${this.segmentCounter}`,
+      id: `${this.segmentIdPrefix}-${this.segmentCounter}`,
       sessionIndex: currentSession.index,
       speaker,
       language: dominantLanguage,
